@@ -438,6 +438,11 @@ pub fn emit_daemon_readiness(ready: bool, degraded: bool) -> DiagnosticRecord {
     } else {
         "not_ready"
     };
+    // I16.5 (issue #1841): the same observation as a bounded module-health
+    // metric, so daemon health has a real producer instead of a comment.
+    if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+        metrics.record(metrics.record_daemon_readiness(ready, degraded));
+    }
     emit_line(
         "eliotd.daemon_readiness",
         &format!("service='{SERVICE_NAME}' state='{state}'"),
@@ -472,6 +477,11 @@ pub fn emit_maintenance_trigger_decision(
         .map(|reference| sanitize_identity(reference))
         .collect::<Vec<_>>()
         .join(",");
+    // I16.5 (issue #1841): the same observation as a bounded active-claims
+    // gauge, fed by the run loop's live in-flight activation gate.
+    if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+        metrics.record(metrics.record_maintenance_observation(input.idle));
+    }
     emit_line(
         "eliotd.maintenance_trigger_decision",
         &format!(
@@ -1008,8 +1018,17 @@ impl RejectionRecord {
     }
 
     /// Builds the rejection record directly from a fabric owner error.
+    ///
+    /// The rejection is also recorded in the bounded metric group that owns its
+    /// variant when the metrics stack is installed; variants with no group keep
+    /// the diagnostics record only.
     #[must_use]
     pub fn of_fabric_error(error: &FabricError) -> Self {
+        // I16.5 (issue #1841): the same observation as a bounded lifecycle,
+        // lease, termination or route metric, by owning variant.
+        if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+            metrics.record(metrics.record_fabric_rejection(error));
+        }
         let (reason, owner) = fabric_rejection_of(error);
         Self::of(reason, owner, &error.to_string())
     }
@@ -1118,6 +1137,11 @@ pub fn emit_finish_refusal(
     owner: OwningComponent,
 ) -> DiagnosticRecord {
     let attempt = sanitize_identity(attempt_id);
+    // I16.5 (issue #1841): the same observation as a bounded finish metric, so
+    // the terminal refusal has a real producer instead of a comment.
+    if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+        metrics.record(metrics.record_finish_refusal());
+    }
     emit_line(
         "eliotd.finish_refused",
         &format!(
@@ -1153,6 +1177,12 @@ impl DrainOutcome {
 pub fn emit_drain(outcome: DrainOutcome, ticket_id: &str, result_sha256: &str) -> DiagnosticRecord {
     let ticket = sanitize_identity(ticket_id);
     let result = sanitize_identity(result_sha256);
+    // I16.5 (issue #1841): the same observation as a bounded termination
+    // metric, so an orphaned activation has a real producer instead of a
+    // comment.
+    if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+        metrics.record(metrics.record_drain_observation(outcome));
+    }
     emit_line(
         "eliotd.drain",
         &format!(
@@ -1418,6 +1448,11 @@ pub fn emit_fabric_attached(
     authority_epoch: u64,
 ) -> DiagnosticRecord {
     let service = sanitize_identity(service);
+    // I16.5 (issue #1841): the same observation as a bounded module-health
+    // metric, so the fabric attach has a real producer instead of a comment.
+    if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
+        metrics.record(metrics.record_fabric_attached());
+    }
     emit_line(
         "eliotd.fabric_attached",
         &format!("service='{service}' generation='{generation}' epoch='{authority_epoch}'"),
