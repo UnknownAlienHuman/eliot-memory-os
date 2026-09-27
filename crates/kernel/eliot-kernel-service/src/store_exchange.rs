@@ -49,7 +49,9 @@ use eliot_store_api::StoreMutationDisposition;
 use eliot_store_api::StoreRequest;
 use eliot_store_api::StoreResponse;
 use eliot_store_api::WriteReceipt;
-use eliot_store_api::decode_legacy_store_failure_v1;
+use eliot_store_api::bridge_v1_within_window;
+use eliot_store_api::v1_compat_window;
+use eliot_store_api::v1_failure_use_inventory;
 
 use super::EbpCanonicalStoreClient;
 use super::EbpStoreTransport;
@@ -368,10 +370,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         }
     }
 
-    /// Sole versioned compatibility decoder for legacy v1 string failure
-    /// shapes. This is the only live caller of
-    /// `decode_legacy_store_failure_v1`: legacy `Error`/`Unknown` variants
-    /// decode through the typed failure contract ONLY when the admitted
+    /// Sole versioned compatibility route for legacy v1 string failure
+    /// shapes. Legacy `Error`/`Unknown` variants pass through the bounded
+    /// store-api migration bridge and its decoder ONLY when the admitted
     /// session declares a protocol version older than
     /// `TYPED_FAILURE_MIN_PROTOCOL`. On current sessions they are protocol
     /// defects, so an admitted write keeps its unknown outcome for the
@@ -382,6 +383,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// arrived intact (availability is an observation, never inferred from
     /// prose), legacy detail survives only as bounded `human_detail`, and the
     /// decoded failure still passes `bind_failure` pinning before adoption.
+    /// The bridge's raw-preserving migration projection is reduced to its
+    /// typed member here; `RequestFailure` does not retain the raw v1 value.
     fn decode_legacy_compat(
         &self,
         legacy: &LegacyStoreFailureV1,
@@ -403,10 +406,17 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let Ok(legacy_value) = serde_json::to_value(legacy) else {
             return failure_defect(admitted_operation);
         };
-        match decode_legacy_store_failure_v1(&legacy_value, &context) {
-            Ok(failure) => {
-                self.bind_failure(failure, request_id, admitted_operation, idempotency_key)
-            }
+        let inventory = v1_failure_use_inventory();
+        let Ok(window) = v1_compat_window(&inventory) else {
+            return failure_defect(admitted_operation);
+        };
+        match bridge_v1_within_window(&legacy_value, &context, &window) {
+            Ok(migrated) => self.bind_failure(
+                migrated.typed().clone(),
+                request_id,
+                admitted_operation,
+                idempotency_key,
+            ),
             Err(_) => failure_defect(admitted_operation),
         }
     }

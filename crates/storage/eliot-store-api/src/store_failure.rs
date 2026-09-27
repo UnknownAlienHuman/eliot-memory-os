@@ -1125,25 +1125,21 @@ pub enum StoreFailureContractError {
 
 // ── Issue #1859: v1 string-failure migration disposition ──
 //
-// Work items W1–W5 and the acceptance clause are covered here as code
-// records per I19.16 (not prose): the use inventory (W1), the raw-preserving
-// typed mapping with explicit weak/legacy marking per I19.6 (W2), the bounded
-// read/migration bridge (W3), the MigrationDisposition record (W4), and the
-// decoder-removal precondition gate (W5). New failures are emitted only
-// through `StoreResponse::canonical_failure` (wire.rs) at every store
-// emission site. The kernel compatibility reader lives outside this scope
-// (lane W1-2806 owns `bins/eliot-kernel` and `crates/kernel`), so the bridge
-// read-path wiring and the decoder deletion itself are reported
-// BLOCKED-BY scope with STITCH references; everything in scope is wired.
+// Issue #1859 status: this module holds a static source-candidate list, a
+// typed mapping, and a bounded bridge. It is not a complete inventory or
+// migration disposition: persisted, installed, and runtime surfaces remain
+// unscanned; the active Kernel route still depends on v1 decoding; and no
+// owner-issued cutover receipt/readback exists. The decoder-removal gate must
+// therefore remain blocked. New Store failures are emitted through
+// `StoreResponse::canonical_failure` (`wire.rs`) at the known Store sites.
 
 /// Issue #1859: enumerated use sites of the v1 string-failure representation.
 ///
-/// This is the code inventory required by Work item W1: every persisted,
-/// queued, exported, fixture, integration, and compatibility use of the v1
-/// representation observable from current source. Installed and live runtime
-/// surfaces that no source scan can observe are recorded separately as
-/// [`V1UnscannedSurface`] unknown candidates per I19.6, never as verified
-/// absence.
+/// This is the owner's static list of known source-level candidates. It is not
+/// evidence that every persisted, queued, exported, fixture, integration, or
+/// compatibility use has been found. Installed and live runtime surfaces
+/// that source inspection cannot observe remain explicit
+/// [`V1UnscannedSurface`] unknown candidates per I19.6.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum V1FailureUseSite {
     /// `StoreResponse::Error` wire variant (`wire.rs`): legacy string failure
@@ -1163,10 +1159,9 @@ pub enum V1FailureUseSite {
     /// queued for deletion under #1714.
     LegacyDecoder,
     /// `decode_legacy_compat`
-    /// (`crates/kernel/eliot-kernel-service/src/store_exchange.rs`): the only
-    /// live decoder caller. Cross-scope (lane W1-2806 owns
-    /// `bins/eliot-kernel` and `crates/kernel`); the decoder must not be
-    /// removed while this route requires it.
+    /// (`crates/kernel/eliot-kernel-service/src/store_exchange.rs`): the
+    /// active Kernel compatibility route, which passes legacy values through
+    /// the bounded Store API bridge and still requires v1 decoding.
     KernelCompatDecode,
     /// `crates/storage/eliot-store-api/tests/store_failure.rs`: fixture use
     /// of the decoder and the legacy shape.
@@ -1248,7 +1243,8 @@ impl V1UnscannedSurface {
     }
 }
 
-/// Issue #1859: code inventory of v1 string-failure uses (Work item W1).
+/// Issue #1859: owner-maintained static source candidates for v1
+/// string-failure uses. This is not a complete live or persisted inventory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V1FailureUseInventory {
     /// Use sites observable from current source.
@@ -1257,7 +1253,8 @@ pub struct V1FailureUseInventory {
     pub unscanned_surfaces: &'static [V1UnscannedSurface],
 }
 
-/// Every v1 use site observable from current source (Work item W1).
+/// Known v1 use-site candidates recorded by the Store API owner. This
+/// hand-maintained list does not prove that all source uses were found.
 pub const V1_FAILURE_USE_SITES: &[V1FailureUseSite] = &[
     V1FailureUseSite::WireErrorVariant,
     V1FailureUseSite::WireUnknownVariant,
@@ -1276,7 +1273,10 @@ pub const V1_UNSCANNED_SURFACES: &[V1UnscannedSurface] = &[
     V1UnscannedSurface::RuntimeIntegrationState,
 ];
 
-/// Returns the v1 string-failure use inventory (Work item W1).
+/// Returns the Store API owner's static source-candidate inventory.
+///
+/// Live Store records, installed artifacts, and runtime integration state
+/// remain unscanned and are represented separately as unknown candidates.
 #[must_use]
 pub const fn v1_failure_use_inventory() -> V1FailureUseInventory {
     V1FailureUseInventory {
@@ -1443,10 +1443,11 @@ pub enum V1DispositionStatus {
 /// Issue #1859: migration disposition for the v1 string-failure
 /// representation (Work item W4, I19.16).
 ///
-/// Every active source object has one disposition. While the decoder is
-/// retained and the kernel compatibility route is live, the disposition is
-/// `UNRESOLVED` and the cutover receipt names the blockers instead of a
-/// cutover.
+/// This is a partial report for the v1 representation, not a complete
+/// per-object ledger: live data and installed/runtime surfaces remain
+/// unscanned. The disposition remains `UNRESOLVED` while those surfaces or an
+/// active decode route remain, and the receipt is absent until the owner has
+/// an actual cutover receipt/readback.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V1MigrationDisposition {
@@ -1457,46 +1458,52 @@ pub struct V1MigrationDisposition {
     pub transform_and_verifier_refs: String,
     pub provider_memory_or_external_effect_reconciliation: String,
     pub rollback_or_no_return_boundary: String,
-    pub canonical_cutover_receipt: String,
+    /// Actual owner-issued cutover receipt/readback, when one exists.
+    ///
+    /// This implementation has no such receipt, so the value remains `None`.
+    pub canonical_cutover_receipt: Option<String>,
 }
 
-/// Produces the migration disposition for the v1 representation (W4).
+/// Produces the current partial migration disposition from the Store API
+/// owner's inventory (W4).
 ///
-/// The verdict of [`v1_decoder_removal_gate`] decides between `UNRESOLVED`
-/// (decoder retained; the receipt names the blockers) and `SUPERSEDED` (gate
-/// clear; decoder deletion authorized for the owning lane with this receipt).
-pub fn v1_migration_disposition(
-    inventory: &V1FailureUseInventory,
-) -> Result<V1MigrationDisposition, StoreFailureContractError> {
-    let digest = v1_use_inventory_digest(inventory)?;
+/// This API accepts no caller-supplied inventory or receipt. Until the owner
+/// has actual readback evidence, the status stays `UNRESOLVED` and the receipt
+/// field stays `None`.
+pub fn v1_migration_disposition() -> Result<V1MigrationDisposition, StoreFailureContractError> {
+    let inventory = v1_failure_use_inventory();
+    let digest = v1_use_inventory_digest(&inventory)?;
     let source_object_identity_and_hash =
-        format!("v1-string-failure(LegacyStoreFailureV1) inventory-sha256:{digest}");
-    let (disposition, canonical_cutover_receipt) = match v1_decoder_removal_gate(inventory) {
-        Ok(()) => (
-            V1DispositionStatus::Superseded,
-            "removal gate clear: no active route requires v1 decoding and no unscanned surface is unknown; decoder deletion authorized for the owning lane with this receipt"
-                .to_owned(),
-        ),
+        format!("v1-string-failure(LegacyStoreFailureV1) owner-source-candidates-sha256:{digest}");
+    let (disposition, rollback_or_no_return_boundary) = match v1_decoder_removal_gate() {
         Err(blocker) => (
             V1DispositionStatus::Unresolved,
-            format!("no cutover issued: decoder removal blocked by {blocker}"),
+            format!(
+                "no-return boundary not crossed; decoder retained; live/raw-data inspection is not evidenced; retirement gate blocked by {blocker}"
+            ),
+        ),
+        Ok(()) => (
+            // A clear source scan is insufficient without an owner-issued
+            // cutover receipt/readback. The gate currently cannot return Ok.
+            V1DispositionStatus::Unresolved,
+            "no-return boundary not crossed; no owner-issued cutover receipt/readback is available"
+                .to_owned(),
         ),
     };
     Ok(V1MigrationDisposition {
         source_object_identity_and_hash,
-        source_semantics_and_owner: "weak/legacy free-string failure prose; owner: store-api compat surface with the kernel compatibility reader (lane W1-2806)"
+        source_semantics_and_owner: "v1 string-failure representation; owner: Store API static source-candidate inventory and bridge; active consumer: crates/kernel/eliot-kernel-service/src/store_exchange.rs::decode_legacy_compat; persisted/runtime ownership is not read back"
             .to_owned(),
         target_object_identity_and_hash: format!(
             "{STORE_FAILURE_CONTRACT_REVISION} (StoreFailure typed envelope)"
         ),
         disposition,
-        transform_and_verifier_refs: "transform store_failure.rs::migrate_legacy_store_failure_v1 via decode_legacy_store_failure_v1 within bridge_v1_within_window; verifiers StoreFailure::validate and StoreFailure::semantic_digest; acceptance execution deferred to TEST-PHASE"
+        transform_and_verifier_refs: "candidate transform store_failure.rs::migrate_legacy_store_failure_v1 via decode_legacy_store_failure_v1 within bridge_v1_within_window; StoreFailure::validate and StoreFailure::semantic_digest are verifier references, not migration execution evidence"
             .to_owned(),
-        provider_memory_or_external_effect_reconciliation: "none: v1 strings carry no provider memory; peer operation identity and prose are never adopted, and UnknownOutcome reconciliation stays exact-operation on the admitted context"
+        provider_memory_or_external_effect_reconciliation: "not assessed for persisted or in-flight records; typed UnknownOutcome uses exact-operation reconciliation on the admitted context, while source data reconciliation remains unscanned"
             .to_owned(),
-        rollback_or_no_return_boundary: "no-return boundary not crossed: the v1 decoder is retained and raw records remain inspectable through the current route; rollback is continued decoding"
-            .to_owned(),
-        canonical_cutover_receipt,
+        rollback_or_no_return_boundary,
+        canonical_cutover_receipt: None,
     })
 }
 
@@ -1515,16 +1522,21 @@ pub enum V1RemovalBlocker {
         /// Number of unscanned surfaces.
         count: usize,
     },
+    /// The owner has not supplied an actual canonical cutover receipt/readback.
+    #[error("owner-issued canonical cutover receipt/readback is unavailable")]
+    CanonicalCutoverReceiptUnavailable,
 }
 
 /// Issue #1859: removal precondition for the v1 decoder (Work item W5).
 ///
 /// The decoder may be removed only after reference scans and data inspection
-/// show no active dependency and the retained raw records remain inspectable
-/// through the current route. Per I19.16, missing mappings block retirement
-/// only for the affected scope: this gate returns the first blocker instead
-/// of authorizing removal.
-pub fn v1_decoder_removal_gate(inventory: &V1FailureUseInventory) -> Result<(), V1RemovalBlocker> {
+/// show no active dependency, retained raw records remain inspectable, and the
+/// owner supplies an actual canonical cutover receipt/readback. The inventory
+/// comes from [`v1_failure_use_inventory`], so callers cannot use an empty
+/// inventory to authorize retirement. This implementation has no owner
+/// receipt/readback and therefore cannot return `Ok(())`.
+pub fn v1_decoder_removal_gate() -> Result<(), V1RemovalBlocker> {
+    let inventory = v1_failure_use_inventory();
     if let Some(site) = inventory
         .sites
         .iter()
@@ -1539,5 +1551,5 @@ pub fn v1_decoder_removal_gate(inventory: &V1FailureUseInventory) -> Result<(), 
             count: inventory.unscanned_surfaces.len(),
         });
     }
-    Ok(())
+    Err(V1RemovalBlocker::CanonicalCutoverReceiptUnavailable)
 }
