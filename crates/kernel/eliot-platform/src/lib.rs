@@ -19,16 +19,15 @@
 //!
 //! This crate is the isolation layer's contract side. The mapping below records
 //! which port in this crate each I1.7 mechanism sits behind, and the I1.7
-//! future Linux equivalent. Every port and implementation named here is
-//! present in the tree; the two rows marked **no port trait** are the honest
-//! remainder, not an oversight.
+//! future Linux equivalent. Naming a port here claims only that the contract
+//! exists; it never claims that an adapter implements it.
 //!
 //! | I1.7 mechanism | port in this crate | I1.7 future Linux |
 //! |---|---|---|
 //! | SCM demand-start | [`ServicePort`] | systemd socket activation |
-//! | Task Scheduler | **no port trait** - see below | systemd timers |
+//! | Task Scheduler | [`TimerPort`] | systemd timers |
 //! | named pipes | [`SessionPort`] | Unix domain sockets |
-//! | Job Objects | **no port trait** - see below | cgroups / process groups |
+//! | Job Objects | [`ContainmentPort`] | cgroups / process groups |
 //! | DPAPI / Credential Manager | [`SecretPort`] | keyring / secret service |
 //! | Windows notifications | [`NotificationPort`] | desktop notification adapter |
 //!
@@ -37,27 +36,35 @@
 //! wall time is never causal order), [`FilesystemPort`], and
 //! [`InstallationPort`].
 //!
-//! Host state persistence is isolated by [`HostStateStore`], the eighth trait in
-//! this crate; I1.7 lists no Windows mechanism against it.
+//! Host state persistence is isolated by [`HostStateStore`]; I1.7 lists no
+//! Windows mechanism against it either.
 //!
-//! ## The two rows with no port trait
+//! ## The two Windows effects that are declared but not yet adapted
 //!
-//! - **Timers.** Task Scheduler is confined to one Windows module,
-//!   `eliot-platform-windows/src/platform_security.rs`, which reaches
-//!   `CLSID_CTaskScheduler`/`ITaskService` directly. No scheduler trait exists
-//!   in this crate, so a future Linux `systemd` timer would have to be
-//!   introduced behind a new port rather than substituted into an existing one.
-//! - **Process containment and resource controls.** Windows Job and process
-//!   lifecycle is owned by `eliot-platform-windows/src/process_job.rs`
-//!   ("Physical Windows Job and process lifecycle only") and is reached through
-//!   the Kernel execution gateway, not through a trait in this crate. The
-//!   provider-neutral vocabulary for it does exist here - [`ContainmentRequest`]
-//!   and [`ContainmentObservation`] - but the effect primitive behind it is not
-//!   yet a port, so a cgroup implementation would need one.
+//! [`TimerPort`] and [`ContainmentPort`] close the two I1.7 rows that had no
+//! port in this crate. Their contracts are declared here and are
+//! provider-neutral: a `systemd` timer and a cgroup or process group
+//! substitute into them.
 //!
-//! Recording both as gaps is the point: a portability claim that reads as
-//! "everything is behind a port" would be false, and this crate must not be the
-//! place that claim is made.
+//! The Windows implementations and their production call sites are not part of
+//! this increment, so on this branch both traits are declared and bound to
+//! nothing. `TimerPort` is unbound because the only Windows scheduler effect
+//! in the tree is one fixed Watchdog fallback task whose registration carries
+//! installer-pinned paths, digests, SID and session that P-01 deliberately
+//! does not carry, and mapping this contract onto it would invent a policy.
+//! `ContainmentPort` is unbound because the Windows Job handle, suspended
+//! launch, membership history and termination lifecycle are owned by
+//! `eliot-platform-windows/src/process_job.rs` and reached through the Kernel
+//! execution gateway; binding them here would mean a second owner for that
+//! lifecycle.
+//!
+//! The remaining gap on these two rows is therefore a Windows adapter, not a
+//! missing contract, and the fault-guard vocabulary [`ContainmentRequest`] and
+//! [`ContainmentObservation`] is a separate record of what a guard owner
+//! requested and an independent reader observed - it is not the port.
+//!
+//! Nothing here moves Linux support. The I1.7 gate stands, and this crate is
+//! not the place a portability claim is made.
 
 #![forbid(unsafe_code)]
 
@@ -85,13 +92,15 @@ pub use handle_nonce::{
     HostProcessNonce, KernelActivationNonce, NonceContractError, PlatformHandle,
 };
 pub use port_contracts::{
-    ClockObservation, ClockPort, ClockRequest, FileKind, FilesystemObservation,
+    ClockObservation, ClockPort, ClockRequest, ContainmentPort, FileKind, FilesystemObservation,
     FilesystemOperation, FilesystemPort, FilesystemRequest, InstallationObservation,
     InstallationOperation, InstallationPort, InstallationRequest, InstallationState,
     NotificationObservation, NotificationPort, NotificationRequest, PortError, PortOutcome,
-    ProviderError, ProviderErrorCode, SecretObservation, SecretPort, SecretReference,
-    SecretRequest, ServiceObservation, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
-    SessionObservation, SessionPort, SessionRequest, UnknownReason,
+    ProcessContainmentObservation, ProcessContainmentOperation, ProcessContainmentRequest,
+    ProcessContainmentState, ProcessResourceLimits, ProviderError, ProviderErrorCode,
+    SecretObservation, SecretPort, SecretReference, SecretRequest, ServiceObservation,
+    ServiceOperation, ServicePort, ServiceRequest, ServiceState, SessionObservation, SessionPort,
+    SessionRequest, TimerObservation, TimerOperation, TimerPort, TimerRequest, UnknownReason,
 };
 use port_contracts::{validate_context, validate_text};
 pub use work_scope_path::{AdapterContainment, AdapterPathInput, WorkScopePath};
