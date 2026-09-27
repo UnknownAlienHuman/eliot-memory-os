@@ -585,7 +585,8 @@ pub struct DaemonComposition {
     /// Semantics stay in [`CapabilityRegistryView`]; this field is only its
     /// owner. It is in-process state: a restart re-derives from evidence
     /// rather than reading a durable record back, and no canonical-store
-    /// persistence is claimed for it here.    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
+    /// persistence is claimed for it here.
+    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
     /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
     ///
     /// Constructed empty at [`DaemonComposition::start`] and owned by the
