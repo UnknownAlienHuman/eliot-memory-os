@@ -34,7 +34,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use eliot_authority::{GrantGraphRecoverySnapshot, RevocationHistoryEvidence};
+use eliot_authority::{
+    AuthorityError, CrossRootQuarantineEvidence, GrantGraphRecoverySnapshot,
+    RevocationHistoryEvidence, VerifiedQuarantineBinding,
+};
+use eliot_contracts::StateFence;
 use eliot_receipts::{GrantClosureDeclaration, ReceiptIdentity};
 
 use crate::error::{KernelError, validate_id};
@@ -64,7 +68,10 @@ use crate::introduction_lifecycle::IntroductionHydration;
 /// - `preserved` are the owner-declared alternate-path survivors keyed by
 ///   closure target grant identity;
 /// - `canonical_receipts` are completed canonical second-phase receipt
-///   identities keyed by the immutable ORS closure operation identity.
+///   identities keyed by the immutable ORS closure operation identity;
+/// - `quarantine_evidence` are the typed owner quarantine evidence records
+///   keyed by structural relation id, revalidated here before any omission
+///   they back may leave the fenced denominator.
 #[derive(Clone, Debug)]
 pub struct GovernorClosureRestore {
     /// Durable grant-graph snapshot the closure is enumerated from.
@@ -99,12 +106,24 @@ pub struct GovernorClosureRestore {
     /// fabricates a receipt when the owner has not completed canonical
     /// reconciliation.
     pub canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    /// Typed owner quarantine evidence records keyed by structural
+    /// relation id. Never defaulted: a missing section is a refusal, not
+    /// an empty one. Each record is revalidated against the admitted
+    /// snapshot, the current fence, and the durable receipt identities
+    /// before it may back an omission.
+    pub quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
 }
 
 /// Stable schema identity for the Governor-to-Kernel closure restore wire.
 pub const GOVERNOR_CLOSURE_RESTORE_SCHEMA: &str = "eliot.kernel.governor-closure-restore";
 /// Current Governor-to-Kernel closure restore wire version.
-pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 1;
+///
+/// v2 adds the typed quarantine-evidence map (#2976). This versions the
+/// Governor-to-Kernel restore contract once, coherently with — but
+/// separately from — the #2962 grant-graph recovery v2 it embeds: each
+/// contract carries its own single version lineage, never competing
+/// interpretations of one payload.
+pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +139,7 @@ struct GovernorClosureRestoreWire {
     preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
 }
 
 impl serde::Serialize for GovernorClosureRestore {
@@ -138,6 +158,7 @@ impl serde::Serialize for GovernorClosureRestore {
             declarations: self.declarations.clone(),
             preserved: self.preserved.clone(),
             canonical_receipts: self.canonical_receipts.clone(),
+            quarantine_evidence: self.quarantine_evidence.clone(),
         }
         .serialize(serializer)
     }
@@ -165,6 +186,7 @@ impl<'de> serde::Deserialize<'de> for GovernorClosureRestore {
             declarations: wire.declarations,
             preserved: wire.preserved,
             canonical_receipts: wire.canonical_receipts,
+            quarantine_evidence: wire.quarantine_evidence,
         })
     }
 }
@@ -327,6 +349,17 @@ impl GovernorClosureSource {
                 })
                 .map(|grant| grant.grant_id.clone()),
         );
+        // The Kernel revalidates the same typed quarantine binding the
+        // Governor validated: snapshot membership is necessary but never
+        // sufficient, so every record is re-proven against the admitted
+        // snapshot rows, the current fence, and the durable receipt
+        // identities before any declaration may rely on it.
+        let quarantine_bindings = admit_quarantine_bindings(
+            &restore.quarantine_evidence,
+            &graph_snapshot,
+            &history.state_fence,
+            &restore.canonical_receipts,
+        )?;
 
         let mut hydration_operations = BTreeSet::new();
         let mut members = BTreeMap::new();
@@ -514,7 +547,12 @@ impl GovernorClosureSource {
                     });
                 }
             }
-            check_declaration_cross_root_closure(&graph_snapshot, &declaration, &covered_edges)?;
+            check_declaration_cross_root_closure(
+                &graph_snapshot,
+                &declaration,
+                &covered_edges,
+                &quarantine_bindings,
+            )?;
             if declarations
                 .insert(declaration.target_grant_id.clone(), declaration)
                 .is_some()
@@ -702,13 +740,15 @@ fn check_preserved_membership(
 /// the single-root v1 declaration cannot fence an identity on its own
 /// root; an unresolved cross-root dependent refuses because the verdict
 /// would be partial/unknown; a quarantined dependent inside the closure
-/// consumes its separate-quarantine receipt (bound by Governor's complete
-/// gate) and its inert identity must never appear among the fenced
-/// members.
+/// is omitted only when a CURRENT verified binding with a satisfying
+/// disposition backs its exact edge — presence in the snapshot quarantine
+/// section is necessary but never sufficient — and its inert identity must
+/// never appear among the fenced members.
 fn check_declaration_cross_root_closure(
     snapshot: &GrantGraphRecoverySnapshot,
     declaration: &GrantClosureDeclaration,
     covered_edges: &BTreeSet<(&str, &str)>,
+    bindings: &BTreeMap<String, VerifiedQuarantineBinding>,
 ) -> Result<(), KernelError> {
     let target = declaration.target_grant_id.as_str();
     for admitted in &snapshot.admitted_root_transitions {
@@ -752,10 +792,22 @@ fn check_declaration_cross_root_closure(
         if !closure_edge_reaches_target(snapshot, &relation.parent_grant_id, target) {
             continue;
         }
-        // The separate-quarantine receipt (`relation_id`) is consumed
-        // here: the quarantined dependent's absence from the fenced
-        // members is backed by this exact relation, never by silent
-        // omission — and the inert identity must never be fenced.
+        // The quarantined dependent's absence from the fenced members is
+        // backed only by a CURRENT verified binding for this exact edge
+        // whose disposition satisfies the omission — never by silent
+        // omission, and never by the structural relation alone. The inert
+        // identity must never be fenced.
+        let satisfied = bindings.get(&relation.relation_id).is_some_and(|binding| {
+            binding.satisfies_omission()
+                && binding.parent_grant_id().as_str() == relation.parent_grant_id
+                && binding.child_grant_id().as_str() == relation.child.grant_id
+        });
+        if !satisfied {
+            return Err(KernelError::RecoveryUnavailable(
+                "owner declaration target has a quarantined dependent without current verified quarantine evidence; refusing an incomplete closure"
+                    .to_owned(),
+            ));
+        }
         if declared.contains(relation.child.grant_id.as_str()) {
             return Err(KernelError::RecoveryUnavailable(
                 "quarantined identity must never enter the fenced closure".to_owned(),
@@ -763,6 +815,95 @@ fn check_declaration_cross_root_closure(
         }
     }
     Ok(())
+}
+
+/// Revalidates every owner quarantine evidence record against the admitted
+/// snapshot rows, the current fence, and the durable receipt identities,
+/// returning the CURRENT verified binding map the declaration gate
+/// consumes. A record that names no retained relation, disagrees with the
+/// snapshot rows, or fails any readback clause refuses the whole restore:
+/// invalid proof never becomes a silently satisfied omission.
+fn admit_quarantine_bindings(
+    evidence_map: &BTreeMap<String, CrossRootQuarantineEvidence>,
+    snapshot: &GrantGraphRecoverySnapshot,
+    current_fence: &StateFence,
+    canonical_receipts: &BTreeMap<String, ReceiptIdentity>,
+) -> Result<BTreeMap<String, VerifiedQuarantineBinding>, KernelError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    let mut bindings = BTreeMap::new();
+    for (relation_id, evidence) in evidence_map {
+        if relation_id != &evidence.relation_id {
+            return Err(KernelError::InvalidField {
+                field: "restore.quarantine_evidence.relation_id",
+                reason: "map key disagrees with the record relation identity",
+            });
+        }
+        if !operation_ids.insert(evidence.operation_id.clone())
+            || !idempotency_keys.insert(evidence.idempotency_key.clone())
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.quarantine_evidence.operation_id",
+                reason: "operation identity is bound to more than one relation",
+            });
+        }
+        let relation = snapshot
+            .quarantined_cross_root
+            .iter()
+            .find(|candidate| &candidate.relation_id == relation_id)
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "quarantine evidence names no retained structural relation".to_owned(),
+                )
+            })?;
+        let parent_record = snapshot
+            .grants
+            .iter()
+            .find(|grant| grant.grant_id == relation.parent_grant_id)
+            .or_else(|| {
+                snapshot
+                    .quarantined_cross_root
+                    .iter()
+                    .find(|candidate| candidate.child.grant_id == relation.parent_grant_id)
+                    .map(|candidate| &candidate.child)
+            })
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "quarantine evidence names an unknown parent lineage".to_owned(),
+                )
+            })?;
+        let child_record = &relation.child;
+        let child_admitted = snapshot
+            .grants
+            .iter()
+            .any(|grant| grant.grant_id == child_record.grant_id);
+        let binding = VerifiedQuarantineBinding::admit_restored(
+            evidence,
+            relation,
+            parent_record,
+            child_record,
+            child_admitted,
+            snapshot.revision,
+            current_fence,
+            canonical_receipts,
+        )
+        .map_err(map_quarantine_error)?;
+        bindings.insert(relation_id.clone(), binding);
+    }
+    Ok(bindings)
+}
+
+/// Maps one quarantine admission refusal onto the typed Kernel failure
+/// surface. Changed same-identity content is the idempotency conflict it
+/// is; stale or unproven evidence leaves the recovery view unavailable.
+fn map_quarantine_error(error: AuthorityError) -> KernelError {
+    match error {
+        AuthorityError::IdentityConflict => KernelError::IdempotencyConflict,
+        AuthorityError::StaleQuarantineEvidence(field) => KernelError::RecoveryUnavailable(
+            format!("stale or unproven quarantine evidence: {field}"),
+        ),
+        other => KernelError::RecoveryUnavailable(format!("quarantine evidence refused: {other}")),
+    }
 }
 
 /// Reports whether `from_grant_id` is the closure target or descends from it
@@ -1207,6 +1348,9 @@ mod tests {
             // is the honest empty state: an absent entry leaves the committed
             // first phase explicitly pending rather than fabricating a receipt.
             canonical_receipts: BTreeMap::new(),
+            // No quarantine evidence was issued for this fixture: its single
+            // grant has no quarantined dependents to omit.
+            quarantine_evidence: BTreeMap::new(),
         })
     }
 

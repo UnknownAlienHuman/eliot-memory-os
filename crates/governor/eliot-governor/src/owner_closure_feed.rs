@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_authority::RevocationHistoryEvidence;
+use eliot_authority::{CrossRootQuarantineEvidence, RevocationHistoryEvidence};
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
 use eliot_receipts::ReceiptIdentity;
@@ -182,6 +182,42 @@ pub async fn synchronize_owner_feed_with_canonical_receipts<
     expected_revision: u64,
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
 ) -> Result<u64, CompositionError> {
+    synchronize_owner_feed_with_quarantine_evidence(
+        reads,
+        kernel,
+        snapshot,
+        state_fence,
+        origin_refs,
+        max_records,
+        expected_revision,
+        canonical_receipts,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+/// Runs the owner feed with canonical second-phase links plus owner
+/// quarantine evidence records read from the durable boundary. Neither map
+/// is reconstructed from process-local state; absent evidence leaves the
+/// affected omissions explicitly unresolved.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+)]
+pub async fn synchronize_owner_feed_with_quarantine_evidence<
+    R: CanonicalReadClient + ?Sized,
+    P: OwnerPublishPort + ?Sized,
+>(
+    reads: &R,
+    kernel: &P,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_refs: &[String],
+    max_records: u32,
+    expected_revision: u64,
+    canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+) -> Result<u64, CompositionError> {
     if expected_revision == 0 {
         return Err(CompositionError::Owner(
             "owner feed expected revision must be nonzero".to_owned(),
@@ -254,11 +290,12 @@ pub async fn synchronize_owner_feed_with_canonical_receipts<
         source_revision: expected_revision,
         closures: merged_closures.into_values().collect(),
     };
-    let provider = OwnerClosureProvider::restore_with_canonical_receipts(
+    let provider = OwnerClosureProvider::restore_with_quarantine_evidence(
         snapshot,
         Some(evidence),
         state_fence,
         canonical_receipts,
+        quarantine_evidence,
     )?;
     if let Some(expected_registry) = durable_registry {
         let actual_registry = provider.export_registry()?;

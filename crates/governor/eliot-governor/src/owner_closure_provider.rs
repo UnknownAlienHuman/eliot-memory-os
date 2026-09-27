@@ -35,8 +35,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::{
-    GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
-    RevocationClosureState, RevocationClosureVerdict, RevocationHistoryEvidence,
+    CrossRootQuarantineEvidence, GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId,
+    GrantRecoveryRecord, GrantStatus, QuarantineEvidenceStatus, RevocationClosureState,
+    RevocationClosureVerdict, RevocationHistoryEvidence, VerifiedQuarantineBinding,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_influence::RevocationBounds;
@@ -78,6 +79,12 @@ pub struct OwnerClosureProvider {
     /// The map is data supplied by the durable boundary; the provider never
     /// derives a receipt identity from a closure request.
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    /// Owner quarantine evidence records keyed by structural relation id,
+    /// supplied by the durable boundary or admitted through the explicit
+    /// owner operation. The map holds evidence, never bindings: every
+    /// verdict revalidates each record against CURRENT graph, fence, and
+    /// receipt state before it may satisfy an omission.
+    quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
 }
 
 /// Governor-side admitted-hydration registry.
@@ -263,7 +270,28 @@ impl OwnerClosureProvider {
         expected_fence: &StateFence,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
     ) -> Result<Self, CompositionError> {
+        Self::restore_with_quarantine_evidence(
+            snapshot,
+            history,
+            expected_fence,
+            canonical_receipts,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Restores the provider with canonical second-phase links plus owner
+    /// quarantine evidence records read from the durable boundary. Evidence
+    /// shape and map identity are proven here; CURRENT qualification
+    /// happens per verdict and per explicit admission, never at restore.
+    pub fn restore_with_quarantine_evidence(
+        snapshot: AuthorityOwnerSnapshot,
+        history: Option<RevocationHistoryEvidence>,
+        expected_fence: &StateFence,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    ) -> Result<Self, CompositionError> {
         validate_canonical_receipt_links(&canonical_receipts)?;
+        validate_quarantine_evidence_links(&quarantine_evidence)?;
         snapshot.validate()?;
         if snapshot.state_fence != *expected_fence {
             return Err(CompositionError::Recovery(
@@ -317,6 +345,7 @@ impl OwnerClosureProvider {
             owner: outcome.owner,
             registry: AdmittedHydrations::default(),
             canonical_receipts,
+            quarantine_evidence,
         };
         if let Some(hydrations) = hydrations.as_ref() {
             let durable_bytes = canonical_json_bytes(hydrations).map_err(recovery)?;
@@ -383,7 +412,7 @@ impl OwnerClosureProvider {
     /// restored revision and fence (#2100 item N3): the same-root
     /// denominator, the receipt-authorized cross-root descendants with
     /// their authorizing receipts, the quarantined frontier with its
-    /// separate-quarantine receipts, every traversed transition, and the
+    /// CURRENT verified bindings, every traversed transition, and the
     /// completeness state reconciling the bounded engine outcome against
     /// the live graph.
     ///
@@ -391,7 +420,7 @@ impl OwnerClosureProvider {
     /// partial/unknown state carrying the exact frontier and omissions.
     /// Every fencing use refuses unless the state is complete (see
     /// [`Self::complete_closure_verdict`]): completeness requires every
-    /// omission bound to a verified separate-quarantine receipt.
+    /// omission bound to a CURRENT verified quarantine binding.
     ///
     /// # Errors
     ///
@@ -404,9 +433,15 @@ impl OwnerClosureProvider {
         let target = GrantId::new(grant_id)
             .map_err(|_| CompositionError::Recovery("grant identity is invalid".to_owned()))?;
         let bounds = RevocationBounds::default_bounds();
+        let bindings = self.current_quarantine_bindings();
         self.owner
             .grants
-            .revocation_closure_verdict(&target, &self.state_fence, &bounds)
+            .revocation_closure_verdict_with_quarantine(
+                &target,
+                &self.state_fence,
+                &bounds,
+                &bindings,
+            )
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
@@ -422,10 +457,16 @@ impl OwnerClosureProvider {
         target: &GrantId,
     ) -> Result<RevocationClosureVerdict, CompositionError> {
         let bounds = RevocationBounds::default_bounds();
+        let bindings = self.current_quarantine_bindings();
         let verdict = self
             .owner
             .grants
-            .revocation_closure_verdict(target, &self.state_fence, &bounds)
+            .revocation_closure_verdict_with_quarantine(
+                target,
+                &self.state_fence,
+                &bounds,
+                &bindings,
+            )
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
             return Err(CompositionError::Owner(
@@ -434,6 +475,112 @@ impl OwnerClosureProvider {
             ));
         }
         Ok(verdict)
+    }
+
+    /// Validates one quarantine evidence record at the semantic owner
+    /// boundary and returns its CURRENT verified binding.
+    ///
+    /// This proves the exact relation and grant commitments, both roots and
+    /// graph revision, the current fence/epoch/policy relation, the exact
+    /// semantic decision operation and replay identity, the applicable
+    /// mechanical receipt readback, and non-revoked status — all against
+    /// CURRENT provider state. Equality among fields from one supplied
+    /// snapshot is not owner readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Owner`] for any failed proof, naming the
+    /// exact readback clause.
+    pub fn validate_quarantine_evidence(
+        &self,
+        evidence: &CrossRootQuarantineEvidence,
+    ) -> Result<VerifiedQuarantineBinding, CompositionError> {
+        VerifiedQuarantineBinding::admit(
+            evidence,
+            &self.owner.grants,
+            &self.state_fence,
+            &self.canonical_receipts,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Admits one owner quarantine evidence record through the explicit
+    /// owner verification operation: the only path by which a legacy
+    /// relation-only quarantine becomes current.
+    ///
+    /// Exact replay — the same relation identity with identical content —
+    /// revalidates against CURRENT state and returns the same binding.
+    /// Reusing an identity with changed content is an identity conflict
+    /// and changes nothing. A stored `Current` record moves to `Revoked`
+    /// only through this same operation presenting the revocation; a
+    /// revoked record is superseded only by a new operation identity, never
+    /// by re-presenting `Current` under the same one. Recording a
+    /// revocation reports that no current binding exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Owner`] for a shape refusal, an identity
+    /// conflict, a recorded revocation, or any failed CURRENT proof.
+    pub fn admit_quarantine_evidence(
+        &mut self,
+        evidence: CrossRootQuarantineEvidence,
+    ) -> Result<VerifiedQuarantineBinding, CompositionError> {
+        evidence
+            .validate_shape()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        for (relation_id, known) in &self.quarantine_evidence {
+            if relation_id != &evidence.relation_id
+                && (known.operation_id == evidence.operation_id
+                    || known.idempotency_key == evidence.idempotency_key)
+            {
+                return Err(CompositionError::Owner(
+                    "quarantine evidence operation identity is already bound to another relation"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(stored) = self.quarantine_evidence.get(&evidence.relation_id) {
+            match check_quarantine_replay_conflict(stored, &evidence)? {
+                QuarantineReplay::Replay => return self.validate_quarantine_evidence(&evidence),
+                QuarantineReplay::Revocation => {
+                    self.quarantine_evidence
+                        .insert(evidence.relation_id.clone(), evidence);
+                    return Err(CompositionError::Owner(
+                        "quarantine evidence revocation recorded; no current binding exists"
+                            .to_owned(),
+                    ));
+                }
+                QuarantineReplay::Supersede => {}
+            }
+        }
+        let binding = self.validate_quarantine_evidence(&evidence)?;
+        self.quarantine_evidence
+            .insert(evidence.relation_id.clone(), evidence);
+        Ok(binding)
+    }
+
+    /// Returns the stored evidence record for one structural relation id, if
+    /// the durable boundary supplied one or the owner admitted one. The
+    /// record is evidence, not a binding: CURRENT qualification still
+    /// applies at every use.
+    #[must_use]
+    pub fn quarantine_evidence(&self, relation_id: &str) -> Option<&CrossRootQuarantineEvidence> {
+        self.quarantine_evidence.get(relation_id)
+    }
+
+    /// Builds the CURRENT verified binding map for one verdict: every
+    /// stored record revalidated against CURRENT graph, fence, and receipt
+    /// state. A record that no longer validates yields no binding, so its
+    /// omission stays unresolved and the verdict stays partial/unknown —
+    /// stale proof blocks progress but never satisfies it.
+    fn current_quarantine_bindings(&self) -> BTreeMap<String, VerifiedQuarantineBinding> {
+        let mut bindings = BTreeMap::new();
+        for evidence in self.quarantine_evidence.values() {
+            if let Ok(binding) = self.validate_quarantine_evidence(evidence) {
+                bindings.insert(binding.relation_id().to_owned(), binding);
+            }
+        }
+        bindings
     }
 
     /// Returns the durable snapshot plus the CURRENT history evidence the
@@ -651,7 +798,7 @@ impl OwnerClosureProvider {
                 ));
             }
             // The complete verdict binds every omitted cross-root dependent
-            // to its verified separate-quarantine receipt: those receipts
+            // to its CURRENT verified quarantine binding: those bindings
             // are consumed by this gate, and the quarantined identities
             // stay inert, never fenced members.
             let quarantined = verdict
@@ -748,7 +895,8 @@ impl OwnerClosureProvider {
 
     /// Serves the complete restore bundle the Kernel-side mirror binds at
     /// the provider revision: durable snapshot, CURRENT history, admitted
-    /// members, roots, introductions, and preserved survivors.
+    /// members, roots, introductions, preserved survivors, canonical
+    /// receipts, and the typed quarantine evidence map.
     ///
     /// A fully closed graph may legitimately have no current grant hydrations;
     /// its graph roots and durable history still reach the Kernel so revoked
@@ -778,6 +926,7 @@ impl OwnerClosureProvider {
             declarations,
             preserved,
             canonical_receipts: self.canonical_receipts.clone(),
+            quarantine_evidence: self.quarantine_evidence.clone(),
         })
     }
 
@@ -1503,6 +1652,83 @@ fn validate_canonical_receipt_links(
         }
     }
     Ok(())
+}
+
+/// Validates owner-presented quarantine evidence records before the restore
+/// becomes a trust anchor: map identity, closed shape, and operation
+/// identity uniqueness. CURRENT qualification is proven per use, never
+/// here.
+fn validate_quarantine_evidence_links(
+    links: &BTreeMap<String, CrossRootQuarantineEvidence>,
+) -> Result<(), CompositionError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    for (relation_id, evidence) in links {
+        if relation_id != &evidence.relation_id {
+            return Err(CompositionError::Recovery(
+                "quarantine evidence map key disagrees with the record relation identity"
+                    .to_owned(),
+            ));
+        }
+        evidence
+            .validate_shape()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !operation_ids.insert(evidence.operation_id.clone())
+            || !idempotency_keys.insert(evidence.idempotency_key.clone())
+        {
+            return Err(CompositionError::Recovery(
+                "quarantine evidence operation identity is bound to more than one relation"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of the exact replay/conflict check for one incoming evidence
+/// record against the stored record under the same relation identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuarantineReplay {
+    /// Bit-identical record: revalidate against CURRENT state and return
+    /// the same binding.
+    Replay,
+    /// Only the lifecycle status moves, toward `Revoked`: record the
+    /// revocation, then report that no current binding exists.
+    Revocation,
+    /// The stored record is revoked and the incoming record carries a new
+    /// operation identity: a superseding owner operation.
+    Supersede,
+}
+
+/// Compares one incoming evidence record against the stored record under
+/// the same relation identity. Same identity with identical content
+/// replays; same identity with changed content conflicts and changes
+/// nothing; revocation is one-way and supersession needs a new operation.
+fn check_quarantine_replay_conflict(
+    stored: &CrossRootQuarantineEvidence,
+    incoming: &CrossRootQuarantineEvidence,
+) -> Result<QuarantineReplay, CompositionError> {
+    if stored == incoming {
+        return Ok(QuarantineReplay::Replay);
+    }
+    if stored.status == QuarantineEvidenceStatus::Current {
+        let mut current_view = incoming.clone();
+        current_view.status = QuarantineEvidenceStatus::Current;
+        if incoming.status == QuarantineEvidenceStatus::Revoked && current_view == *stored {
+            return Ok(QuarantineReplay::Revocation);
+        }
+        return Err(CompositionError::Owner(
+            "quarantine evidence identity conflict: changed content under a current identity"
+                .to_owned(),
+        ));
+    }
+    if incoming.operation_id == stored.operation_id {
+        return Err(CompositionError::Owner(
+            "quarantine evidence identity conflict: a revoked identity cannot be re-presented"
+                .to_owned(),
+        ));
+    }
+    Ok(QuarantineReplay::Supersede)
 }
 
 fn secret_reference_from_record(
