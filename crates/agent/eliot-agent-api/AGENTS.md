@@ -37,8 +37,9 @@ Issue #228 records confirmed contract collisions. S4 (route triple) / S5
 (candidate-only result + binding) / S6 (closed host-event envelope) have landed
 in source (`RouteSelectionCandidate` / `AdmittedRouteReceipt` /
 `PhysicalRouteObservationReceipt`; `ResultDisposition` without
-`VerifiedComplete`; `NormalizedHostEventEnvelope` alongside the legacy
-quarantine). The narrow #228 slice hardens the effect trio to
+`VerifiedComplete`; `NormalizedHostEventEnvelope` as the single normalized
+host-event wire, with the generic `HostEventEnvelope` quarantine collapsed
+away by #1709). The narrow #228 slice hardens the effect trio to
 `LowercaseSha256` / `ClockReading` at `CONTRACT_VERSION ==
 "eliot-agent-api/v7"`. Residual cross-lane work (governor `EffectReceipt`
 unification, bridge consumer migration, Finish edge, Product Pulse) remains
@@ -262,16 +263,19 @@ proof.
 
 ### Generic normalized payload
 
-Landed (S6): new producers/consumers use the closed, versioned
-`NormalizedHostEventEnvelope` (`host-event-v7`); the generic
-`HostEventEnvelope.normalized_payload: serde_json::Value` wire is a legacy
-quarantine boundary (intentionally untouched so existing consumers keep
-compiling) and must not gain new policy/authority/completion/capability
-consumers.
+Landed (S6): producers/consumers use the closed, versioned
+`NormalizedHostEventEnvelope` (`host-event-v7`). #1709 collapsed the generic
+`HostEventEnvelope.normalized_payload: serde_json::Value` quarantine wire: the
+type, its `impl` block, and the deprecated `attempt_id` field are deleted, so
+`NormalizedHostEventEnvelope` is the only normalized host-event shape in this
+crate. No alias, `From` impl, or "accepts both" phase remains; the ACP adapter's
+deprecated `AcpEvent::into_host_event` quarantine conversion is deleted with its
+compatibility test.
 
 Historical note: `HostEventEnvelope.normalized_payload: serde_json::Value` was
-not a closed policy/control contract. Do not add policy, authority, completion or capability
-logic that interprets arbitrary keys inside it.
+not a closed policy/control contract. Do not reintroduce it, and do not add
+policy, authority, completion or capability logic that interprets arbitrary keys
+inside a normalized payload.
 
 The contract wave must provide typed event payload families or one bounded
 versioned extension envelope with:

@@ -967,57 +967,6 @@ pub struct AcpEvent {
     pub payload: Value,
 }
 
-impl AcpEvent {
-    /// Legacy quarantine boundary (issue #371 T4 S7): converts a legacy generic
-    /// event to the legacy `HostEventEnvelope` wire with
-    /// `normalized_payload: serde_json::Value` and `lineage: None`.
-    ///
-    /// New code must use [`normalize_acp_event`] with explicit
-    /// [`ProviderObservationLineage`] plus the recorded #369 admission, which
-    /// returns the closed [`NormalizedHostEventEnvelope`] and its
-    /// [`HostEventNormalizationReceipt`]. This legacy path carries no receipt,
-    /// binds no normalizer identity/version, accepts caller-supplied digest and
-    /// wall-clock strings, and leaves `lineage: None` (session observation
-    /// only, rejected for attribution). Its payload/booleans (for example the
-    /// `terminal` flag on [`AcpResultEnvelope`]) are never promoted to
-    /// authority, completion, usage proof, or route admission. Retained only
-    /// because the in-crate compatibility test exercises it; no new producer or
-    /// consumer may be added.
-    #[deprecated(
-        note = "legacy quarantine boundary; use normalize_acp_event with explicit lineage plus admission for new code"
-    )]
-    #[allow(
-        deprecated,
-        reason = "legacy quarantine shim populates the legacy attempt_id for the compatibility test; new code uses normalize_acp_event"
-    )]
-    pub fn into_host_event(
-        self,
-        raw_payload_digest: String,
-        observed_at: String,
-    ) -> Result<eliot_agent_api::HostEventEnvelope, AcpAdapterError> {
-        if self.session_id.trim().is_empty() || self.sequence == 0 {
-            return Err(AcpAdapterError::InvalidInput("event session/sequence"));
-        }
-        let event = eliot_agent_api::HostEventEnvelope {
-            event_id: self.event_id,
-            attempt_id: self.attempt_id,
-            sequence: self.sequence,
-            cursor: self.cursor,
-            kind: self.kind,
-            route: self.route,
-            raw_payload_digest,
-            normalized_payload: self.payload,
-            parent_event_id: None,
-            observed_at,
-            lineage: None, // S1: S3 binds exact turn; legacy attempt_id carries attribution until then
-        };
-        event
-            .validate()
-            .map_err(AcpAdapterError::ContractValidation)?;
-        Ok(event)
-    }
-}
-
 /// Typed ACP host-event normalization input (issue #371 S7-partial).
 ///
 /// Every field is typed: the exact execution lineage travels as
@@ -1029,9 +978,10 @@ impl AcpEvent {
 /// caller-supplied strings), and observation time
 /// is a typed [`ClockReading`] (never a wall-clock string). Undecodable
 /// non-projection bytes never mint the supplied payload: they fall into typed
-/// quarantine with the real omission declared. The legacy
-/// [`AcpEvent`] with `payload: Value` plus [`AcpEvent::into_host_event`] is
-/// untouched for existing consumers.
+/// quarantine with the real omission declared. The legacy generic
+/// [`AcpEvent`] with `payload: Value` is not a normalization input and has no
+/// conversion into any ELIOT envelope; every observation reaches
+/// [`normalize_acp_event`].
 #[derive(Clone, Debug)]
 pub struct AcpHostEventInput<'a> {
     /// Event identity from the post-R1 owner.
@@ -2575,21 +2525,40 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn event_conversion_preserves_attempt_and_route() -> Result<(), Box<dyn std::error::Error>> {
-        let event = AcpEvent {
-            event_id: EventId::new("event")?,
-            attempt_id: AttemptId::new("attempt")?,
-            session_id: "session".into(),
-            sequence: 1,
-            cursor: EventCursor::new("cursor")?,
-            kind: HostEventKind::AssistantDelta,
-            route: route(),
-            payload: serde_json::json!({"text":"ok"}),
-        };
-        let host = event.into_host_event("digest".into(), "now".into())?;
-        assert_eq!(host.sequence, 1);
-        assert_eq!(host.attempt_id.as_str(), "attempt");
+        use eliot_agent_api::ExecutionUnitObservation;
+        // Moved onto the single typed wire (#1709): the closed
+        // `NormalizedHostEventEnvelope` is the only observation shape, so the
+        // exact execution-unit binding (carrying the attempt) and the route
+        // reach the envelope instead of a legacy generic payload.
+        let route = route();
+        let binding = binding_for(&route)?;
+        let admission = admission_for(&binding)?;
+        let cursor = EventCursor::new("cursor-conversion")?;
+        let (envelope, _) = normalize_acp_event(typed_acp_input(
+            EventId::new("event")?,
+            cursor.clone(),
+            1,
+            ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+                ExecutionUnitObservation {
+                    binding: binding.clone(),
+                    cursor,
+                    sequence: 1,
+                },
+            )),
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"delta":"ok"}}"#,
+            RestrictedRawSourceHandle::new("restricted-acp:frame-conversion")?,
+            Some(&admission),
+        ))?;
+        envelope.validate_for_lineage(&binding, &admission)?;
+        assert_eq!(envelope.sequence, 1);
+        let bound = envelope.lineage.attributable_binding()?;
+        assert_eq!(bound.attempt_id.as_str(), "attempt");
+        assert_eq!(bound.route, route);
+        assert_eq!(
+            envelope.admitted_route_digest,
+            Some(admission.self_digest.clone())
+        );
         Ok(())
     }
 
@@ -2965,41 +2934,6 @@ mod tests {
             delivery: HostEventDeliveryDisposition::DurableOrdered,
             admission,
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn legacy_into_host_event_is_quarantined_without_lineage_or_receipt()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Reverse-consumer proof: the only in-workspace caller of the legacy
-        // path is the compatibility test itself; new code must use
-        // `normalize_acp_event`. The legacy envelope carries no lineage and no
-        // normalization receipt, so it can never deserialize as the closed v7
-        // schema and can never feed `observe_provider_event`.
-        let event = AcpEvent {
-            event_id: EventId::new("evt-acp-legacy-q")?,
-            attempt_id: AttemptId::new("attempt")?,
-            session_id: "session".into(),
-            sequence: 1,
-            cursor: EventCursor::new("cursor-legacy-q")?,
-            kind: HostEventKind::AssistantDelta,
-            route: route(),
-            payload: serde_json::json!({"text":"ok"}),
-        };
-        let legacy = event.into_host_event("digest".into(), "now".into())?;
-        assert_eq!(legacy.lineage, None);
-        // Legacy generic payload never deserializes as the closed typed envelope.
-        let legacy_wire = serde_json::to_value(&legacy)?;
-        assert!(serde_json::from_value::<NormalizedHostEventEnvelope>(legacy_wire).is_err());
-        // Legacy caller-supplied digest/time strings are never qualified source
-        // digests or typed clock readings.
-        assert!(
-            serde_json::from_value::<eliot_agent_api::QualifiedSourceDigest>(
-                serde_json::json!({"algorithm": "unqualified", "digest": legacy.raw_payload_digest})
-            )
-            .is_err()
-        );
-        Ok(())
     }
 
     #[test]
