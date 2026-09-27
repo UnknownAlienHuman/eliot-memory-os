@@ -2989,7 +2989,7 @@ impl BlobCasFailure {
 /// capacity failure.  This is deliberately narrower than a general provider
 /// error so callers cannot mistake permission, quota, or unknown I/O for a
 /// full-volume condition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlobCapacityStage {
     RootLeaseCreate,
     RootLeaseHeartbeat,
@@ -3007,7 +3007,7 @@ pub enum BlobCapacityStage {
 /// Platform-qualified capacity evidence.  Numeric codes are retained only
 /// when they came from the matching target namespace; no cross-platform code
 /// interpretation is performed here.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlobCapacityCause {
     IoStorageFull,
     PosixEnospc { code: i32 },
@@ -3017,13 +3017,22 @@ pub enum BlobCapacityCause {
 
 /// Effect certainty is independent from the capacity cause.  In particular,
 /// a full-volume error after publication can leave a possible committed effect.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlobCapacityEffect {
     NotAttempted,
     PartialWriteUnknown,
     PossibleMutation,
-    PossiblePublication { state: PublishState },
-    DurabilityUnconfirmed { state: PublishState },
+    PossiblePublication {
+        state: PublishState,
+    },
+    /// A publication or directory/publication durability boundary failed after
+    /// the effect may already be installed. `possible_effect` records whether
+    /// the owner also left a possible physical effect; durability certainty and
+    /// effect certainty are independent axes and neither implies the other.
+    DurabilityUnconfirmed {
+        state: PublishState,
+        possible_effect: bool,
+    },
 }
 
 /// Cleanup is retained as secondary evidence and never replaces the primary
@@ -3042,6 +3051,100 @@ pub enum BlobCapacityCleanup {
 pub enum BlobCapacityRecovery {
     CapacityRevalidationRequired,
     ReconcileSameOperationThenRevalidate,
+}
+
+/// Why one publication's durability boundary is still owed. Recorded durably
+/// with the operation so recovery re-entry cannot forget the instruction the
+/// first failure issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlobPublicationFence {
+    /// The owner reported typed capacity exhaustion at this publication's
+    /// durability boundary. The effect may already be installed; the retained
+    /// cause is the one the owner actually reported.
+    Capacity { cause: BlobCapacityCause },
+    /// A non-capacity owner failure left the destination bytes matching.
+    /// Content equality establishes identity and integrity only; it never
+    /// establishes that the publication's durability boundary was crossed.
+    Unconfirmed,
+}
+
+/// A publication or durability boundary that the owner has not proven for one
+/// operation. The obligation travels with the operation's own durable journal
+/// so a later re-entry keeps reconciling the *same* operation instead of
+/// promoting matching bytes into a durable phase. It is never satisfied by
+/// reading the destination back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobPublicationObligation {
+    pub operation_id: String,
+    pub idempotency_key: String,
+    /// Storage identity the publication settles. Publication, commit and
+    /// cleanup stages always carry it.
+    pub locator: Option<BlobLocator>,
+    pub stage: BlobCapacityStage,
+    /// Normalized in-root identity of the publication destination. It is the
+    /// same relative identity the journal already records, never a host path.
+    pub destination: String,
+    pub expected_sha256: String,
+    /// Durable phase the operation held when the boundary failed.
+    pub state_before: PublishState,
+    pub fence: BlobPublicationFence,
+}
+
+impl BlobPublicationObligation {
+    /// Binds the obligation to the operation that still owns it and to the
+    /// exact bytes whose identity was established. It does not and cannot
+    /// certify durability: only the platform owner can.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        if self.operation_id.trim().is_empty() || self.idempotency_key.trim().is_empty() {
+            return Err(BlobError::InvalidField {
+                field: "publication.obligation",
+                reason: "an unresolved publication keeps its original operation identity",
+            });
+        }
+        if self.destination.trim().is_empty() {
+            return Err(BlobError::InvalidField {
+                field: "publication.obligation.destination",
+                reason: "an unresolved publication retains its destination identity",
+            });
+        }
+        if !matches!(
+            self.stage,
+            BlobCapacityStage::PayloadPublication
+                | BlobCapacityStage::MetadataPublication
+                | BlobCapacityStage::CommitWrite
+                | BlobCapacityStage::Cleanup
+        ) {
+            return Err(BlobError::InvalidField {
+                field: "publication.obligation.stage",
+                reason: "only a publication, commit or cleanup boundary can carry an obligation",
+            });
+        }
+        if self.locator.is_none() {
+            return Err(BlobError::InvalidField {
+                field: "publication.obligation.locator",
+                reason: "a publication obligation requires its stage-required storage identity",
+            });
+        }
+        if let Some(locator) = &self.locator {
+            locator.validate()?;
+        }
+        if self.expected_sha256.len() != 64
+            || !self
+                .expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BlobError::InvalidField {
+                field: "publication.obligation.expected_sha256",
+                reason: "an unresolved publication retains its expected digest",
+            });
+        }
+        match self.fence {
+            BlobPublicationFence::Capacity { cause } => validate_capacity_cause(cause),
+            BlobPublicationFence::Unconfirmed => Ok(()),
+        }
+    }
 }
 
 /// Lossless capacity evidence supplied by a platform port before the Blob
@@ -3198,7 +3301,40 @@ fn validate_capacity_cause(cause: BlobCapacityCause) -> Result<(), BlobError> {
     }
 }
 
-fn validate_capacity_identity(identity: &BlobCapacityIdentity) -> Result<(), BlobError> {
+/// Stages whose physical effect is a named storage object. Recovery for those
+/// stages is meaningless without the storage identity it settled, so a
+/// `None` locator is rejected instead of being reported as an anonymous
+/// exhaustion.
+fn capacity_stage_requires_locator(stage: BlobCapacityStage) -> bool {
+    matches!(
+        stage,
+        BlobCapacityStage::PayloadWrite
+            | BlobCapacityStage::MetadataWrite
+            | BlobCapacityStage::PayloadPublication
+            | BlobCapacityStage::MetadataPublication
+            | BlobCapacityStage::CommitWrite
+            | BlobCapacityStage::Cleanup
+            | BlobCapacityStage::GcCleanup
+    )
+}
+
+fn validate_capacity_identity(
+    identity: &BlobCapacityIdentity,
+    stage: BlobCapacityStage,
+) -> Result<(), BlobError> {
+    if capacity_stage_requires_locator(stage)
+        && !matches!(identity, BlobCapacityIdentity::RootLease { .. })
+        && match identity {
+            BlobCapacityIdentity::Operation { locator, .. }
+            | BlobCapacityIdentity::Journal { locator, .. } => locator.is_none(),
+            BlobCapacityIdentity::RootLease { .. } => false,
+        }
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.identity.locator",
+            reason: "this capacity stage requires the storage identity it settled",
+        });
+    }
     match identity {
         BlobCapacityIdentity::Operation { context, locator } => {
             context.validate_for(EffectClass::ReversibleMutation)?;
@@ -3368,7 +3504,7 @@ impl BlobCapacityFailure {
     /// into a successful commit receipt.
     pub fn validate(&self) -> Result<(), BlobError> {
         validate_capacity_cause(self.evidence.cause)?;
-        validate_capacity_identity(&self.identity)?;
+        validate_capacity_identity(&self.identity, self.stage)?;
         let requires_reconciliation = matches!(
             self.evidence.effect,
             BlobCapacityEffect::PossibleMutation

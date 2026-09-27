@@ -41,7 +41,7 @@ use blake3::Hasher;
 pub use eliot_blob_api::{
     BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
-    PublishState,
+    BlobPublicationFence, BlobPublicationObligation, PublishState,
 };
 pub mod backup_io;
 pub use backup_io::{
@@ -802,7 +802,11 @@ fn bind_platform_capacity_attempt(
     let BlobError::StorageCapacity { mut failure } = error else {
         return Ok(error);
     };
-    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    // The offered buffer length is only what reached the native write
+    // boundary. A port that observed its own progress keeps that observation;
+    // an unknown partial write stays unknown and is never restated as the full
+    // buffer, which would read as committed bytes.
+    failure.evidence.attempted_bytes = failure.evidence.attempted_bytes.or(Some(attempted_bytes));
     Ok(BlobError::StorageCapacity { failure })
 }
 
@@ -929,6 +933,37 @@ fn retain_capacity_gc_state(error: BlobError, gc_phase: GcState) -> BlobError {
     BlobError::StorageCapacity { failure }
 }
 
+/// Records a secondary cleanup observation beside the primary capacity
+/// failure it followed.
+///
+/// Cleanup is additional evidence: it never replaces the primary error, and
+/// the primary error's own identity, stage and cause are preserved verbatim.
+fn retain_cleanup_evidence(cleanup_error: BlobError, primary: BlobError) -> BlobError {
+    let BlobError::StorageCapacity {
+        failure: mut primary,
+    } = primary
+    else {
+        // A non-capacity primary error is already complete evidence; the
+        // cleanup observation is only retained beside a capacity failure,
+        // which is the family that carries a cleanup slot.
+        return primary;
+    };
+    let BlobError::StorageCapacity { failure } = cleanup_error else {
+        return BlobError::StorageCapacity { failure: primary };
+    };
+    primary.cleanup = BlobCapacityCleanup::Unknown;
+    primary.cleanup_stage = Some(BlobCapacityStage::Cleanup);
+    primary.cleanup_evidence = Some(failure.evidence);
+    if primary.validate().is_err() {
+        // Rejecting the composite must not discard the primary evidence; the
+        // cleanup observation is dropped instead.
+        primary.cleanup_stage = None;
+        primary.cleanup_evidence = None;
+        primary.cleanup = BlobCapacityCleanup::NotApplicable;
+    }
+    BlobError::StorageCapacity { failure: primary }
+}
+
 fn bind_cleanup_capacity(
     error: BlobError,
     operation_id: &str,
@@ -960,8 +995,18 @@ fn bind_cleanup_capacity(
                 return error;
             };
             // The last durable phase is known, but a cleanup error cannot
-            // prove whether this individual removal took effect.
+            // prove whether this individual removal took effect. The typed
+            // evidence the port reported is retained beside that verdict so
+            // recovery sees the cleanup cause and phase, not just `Unknown`.
             failure.cleanup = BlobCapacityCleanup::Unknown;
+            failure.cleanup_stage = Some(BlobCapacityStage::Cleanup);
+            failure.cleanup_evidence = Some(failure.evidence);
+            failure.cleanup = BlobCapacityCleanup::Failed;
+            if failure.validate().is_err() {
+                failure.cleanup_stage = None;
+                failure.cleanup_evidence = None;
+                failure.cleanup = BlobCapacityCleanup::Unknown;
+            }
             BlobError::StorageCapacity { failure }
         }
         other => other,
@@ -1425,6 +1470,17 @@ struct StageJournal {
     final_metadata: WorkScopePath,
     expected_payload_sha256: String,
     expected_metadata_sha256: String,
+    /// Storage identity this operation settles. Recovery needs it to bind a
+    /// publication capacity observation to the object it published; a journal
+    /// written before this binding keeps `None` and stays fenced.
+    #[serde(default)]
+    locator: Option<BlobLocator>,
+    /// A publication/durability boundary the platform owner has not proven for
+    /// this operation. While it is set, recovery must not promote any durable
+    /// phase and must not delete this journal: content equality proves
+    /// identity, never commit or durability.
+    #[serde(default)]
+    pending_publication: Option<BlobPublicationObligation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1472,7 +1528,38 @@ impl StageJournal {
         valid_operation_text(&self.operation_id, "journal.operation_id")?;
         valid_operation_text(&self.idempotency_key, "journal.idempotency_key")?;
         validate_sha256(&self.expected_payload_sha256, "journal.payload_sha256")?;
-        validate_sha256(&self.expected_metadata_sha256, "journal.metadata_sha256")
+        validate_sha256(&self.expected_metadata_sha256, "journal.metadata_sha256")?;
+        if let Some(obligation) = &self.pending_publication {
+            obligation.validate()?;
+            // The obligation is only meaningful while it is still owed by *this*
+            // operation at one of this journal's own publication targets. A
+            // decoded journal that pairs an obligation with another operation or
+            // an unrelated destination is a corrupt recovery record, not a
+            // licence to advance.
+            let journal_destinations = [
+                self.final_payload.normalized_identity(),
+                self.final_metadata.normalized_identity(),
+                self.temp_payload.normalized_identity(),
+                self.temp_metadata.normalized_identity(),
+            ];
+            let destination_is_ours = journal_destinations
+                .iter()
+                .any(|candidate| *candidate == obligation.destination)
+                // The commit marker is derived from this operation's own
+                // identity inside the transactions namespace; the journal keeps
+                // it as a stable derived identity rather than a caller path.
+                || (obligation.stage == BlobCapacityStage::CommitWrite
+                    && obligation.destination.starts_with("transactions/"));
+            if obligation.operation_id != self.operation_id
+                || obligation.idempotency_key != self.idempotency_key
+                || !destination_is_ours
+            {
+                return Err(BlobError::PlanGap(
+                    "stage journal obligation does not belong to this operation".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2039,8 +2126,37 @@ struct PublishVerification<'a> {
     hard_ceiling: u64,
     operation_id: &'a str,
     idempotency_key: &'a str,
+    /// Storage identity this publication settles; every publication stage
+    /// requires it so recovery never reports an anonymous exhaustion.
+    locator: &'a BlobLocator,
     state_before: PublishState,
     stage: BlobCapacityStage,
+}
+
+/// One publication attempt's durability verdict. See
+/// [`BlobStoreCore::publish_or_verify`].
+enum PublicationOutcome {
+    /// The owner reported the publication and its durability boundary.
+    ConfirmedDurable,
+    /// The destination may already hold the exact bytes, but the owner did not
+    /// prove the durability boundary. The retained error is returned unchanged
+    /// and the obligation is recorded against the original operation.
+    InstalledUnproven {
+        error: BlobError,
+        fence: BlobPublicationFence,
+    },
+}
+
+/// Retains the owner-reported capacity cause for a fenced publication so a
+/// later re-entry can re-emit the same typed evidence instead of inventing
+/// one. A non-capacity failure keeps the obligation unconfirmed.
+fn publication_fence(error: &BlobError) -> BlobPublicationFence {
+    match error {
+        BlobError::StorageCapacity { failure } => BlobPublicationFence::Capacity {
+            cause: failure.evidence.cause,
+        },
+        _ => BlobPublicationFence::Unconfirmed,
+    }
 }
 
 impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L>
@@ -2687,7 +2803,17 @@ where
         }
     }
 
-    fn publish_or_verify(&self, verification: &PublishVerification<'_>) -> Result<(), BlobError> {
+    /// One publication attempt's durability verdict.
+    ///
+    /// `ConfirmedDurable` is produced only when the platform owner itself
+    /// reported the publication and its durability boundary succeeded.
+    /// `InstalledUnproven` retains the underlying failure for a destination
+    /// whose bytes match: the effect may be installed, but nothing the caller
+    /// can read back proves the boundary was crossed.
+    fn publish_or_verify(
+        &self,
+        verification: &PublishVerification<'_>,
+    ) -> Result<PublicationOutcome, BlobError> {
         self.contained(verification.source)?;
         self.contained(verification.destination)?;
         match self.platform_rename(verification.source, verification.destination) {
@@ -2697,7 +2823,7 @@ where
                     verification.expected_sha256,
                     verification.hard_ceiling,
                 )? {
-                    Ok(())
+                    Ok(PublicationOutcome::ConfirmedDurable)
                 } else {
                     Err(BlobError::UnknownPublishOutcome {
                         operation_id: verification.operation_id.to_owned(),
@@ -2706,33 +2832,51 @@ where
                 }
             }
             Err(error @ BlobError::StorageCapacity { .. }) => {
+                // The rename reached its durability boundary and the owner
+                // reported exhaustion there: the publication may already be
+                // installed AND its durability is unconfirmed. Both axes are
+                // retained; neither is promoted to a durable phase.
                 match bind_platform_capacity_with_effect(
                     error,
                     verification.stage,
                     BlobCapacityIdentity::Journal {
                         operation_id: verification.operation_id.to_owned(),
                         idempotency_key: verification.idempotency_key.to_owned(),
-                        locator: None,
+                        locator: Some(verification.locator.clone()),
                     },
-                    Some(BlobCapacityEffect::PossiblePublication {
+                    Some(BlobCapacityEffect::DurabilityUnconfirmed {
                         state: verification.state_before,
+                        possible_effect: true,
                     }),
                 ) {
-                    Ok(bound) => Err(bound),
+                    Ok(bound) => {
+                        let fence = publication_fence(&bound);
+                        Ok(PublicationOutcome::InstalledUnproven {
+                            error: bound,
+                            fence,
+                        })
+                    }
                     Err(InvalidCapacityEvidence) => Err(BlobError::UnknownPublishOutcome {
                         operation_id: verification.operation_id.to_owned(),
                         state: verification.state_before,
                     }),
                 }
             }
-            Err(_error)
+            Err(error)
                 if self.exact_bytes_at(
                     verification.destination,
                     verification.expected_sha256,
                     verification.hard_ceiling,
                 )? =>
             {
-                Ok(())
+                // Matching destination bytes establish identity and integrity
+                // only. The owner's non-capacity failure still leaves the
+                // durability boundary unproven, so the obligation is fenced
+                // instead of being reported as a completed publication.
+                Ok(PublicationOutcome::InstalledUnproven {
+                    fence: BlobPublicationFence::Unconfirmed,
+                    error,
+                })
             }
             Err(_) => Err(BlobError::UnknownPublishOutcome {
                 operation_id: verification.operation_id.to_owned(),
@@ -2860,67 +3004,191 @@ where
         Ok(BlobCasState::Digest(sha256_hex(&bytes)))
     }
 
+    /// Fences an operation whose publication/durability boundary the platform
+    /// owner has not proven.
+    ///
+    /// The obligation is durable and bound to the original operation, so every
+    /// re-entry re-observes it and refuses to advance. Only the owner can
+    /// settle it, either by an exact operation-bound publication/durability
+    /// reconciliation or by re-establishing the boundary under this same
+    /// identity; the current platform port exposes neither, so the missing
+    /// capability stays unresolved here instead of being certified by the
+    /// caller. See #730/#946.
+    fn fenced_publication_error(
+        journal: &StageJournal,
+        obligation: &BlobPublicationObligation,
+    ) -> BlobError {
+        let BlobPublicationFence::Capacity { cause } = obligation.fence else {
+            return BlobError::UnknownPublishOutcome {
+                operation_id: obligation.operation_id.clone(),
+                state: obligation.state_before,
+            };
+        };
+        let Some(locator) = obligation.locator.clone() else {
+            return BlobError::UnknownPublishOutcome {
+                operation_id: obligation.operation_id.clone(),
+                state: obligation.state_before,
+            };
+        };
+        let bound = BlobError::StorageCapacity {
+            failure: Box::new(BlobCapacityFailure {
+                identity: BlobCapacityIdentity::Journal {
+                    operation_id: obligation.operation_id.clone(),
+                    idempotency_key: obligation.idempotency_key.clone(),
+                    locator: Some(locator),
+                },
+                stage: obligation.stage,
+                evidence: BlobCapacityEvidence {
+                    cause,
+                    // The retained cause was observed at the boundary; the
+                    // progress it left behind was never observed, so it stays
+                    // unknown rather than being restated as a byte count.
+                    attempted_bytes: None,
+                    effect: BlobCapacityEffect::DurabilityUnconfirmed {
+                        state: obligation.state_before,
+                        possible_effect: true,
+                    },
+                },
+                cas_request: None,
+                cas_observed: None,
+                cas_backend_generation: None,
+                cas_durability: None,
+                cleanup: BlobCapacityCleanup::NotApplicable,
+                cleanup_stage: None,
+                cleanup_evidence: None,
+                gc_state: None,
+                recovery: BlobCapacityRecovery::ReconcileSameOperationThenRevalidate,
+            }),
+        };
+        match bound {
+            BlobError::StorageCapacity { failure } if failure.validate().is_err() => {
+                BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: obligation.state_before,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Durably records one unresolved publication obligation under the
+    /// operation's own journal and returns the error the caller must surface.
+    ///
+    /// The primary failure is never replaced: if persisting the obligation also
+    /// fails, that failure is retained as additional cleanup evidence beside
+    /// the original error. Losing the record must not silently release the
+    /// operation, so an unrecordable obligation keeps the operation fenced.
+    fn record_publication_obligation(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+        obligation: BlobPublicationObligation,
+        primary: BlobError,
+    ) -> BlobError {
+        journal.pending_publication = Some(obligation);
+        match self.persist_journal(journal_path, journal, true) {
+            Ok(()) => primary,
+            Err(persist_error) => retain_cleanup_evidence(persist_error, primary),
+        }
+    }
+
+    /// Advances one publication phase. Matching destination bytes settle an
+    /// *interrupted* publication whose durability boundary the owner already
+    /// reported; they never settle an obligation this journal still carries.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_publication(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+        stage: BlobCapacityStage,
+    ) -> Result<(), BlobError> {
+        if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+            return Ok(());
+        }
+        if !self.exact_bytes_at(source, expected_sha256, hard_ceiling)? {
+            return Err(BlobError::UnknownPublishOutcome {
+                operation_id: journal.operation_id.clone(),
+                state: journal.state,
+            });
+        }
+        let Some(locator) = journal.locator.clone() else {
+            return Err(BlobError::PlanGap(
+                "stage journal predates the storage identity a publication obligation requires"
+                    .to_owned(),
+            ));
+        };
+        match self.publish_or_verify(&PublishVerification {
+            source,
+            destination,
+            expected_sha256,
+            hard_ceiling,
+            operation_id: &journal.operation_id,
+            idempotency_key: &journal.idempotency_key,
+            locator: &locator,
+            state_before: journal.state,
+            stage,
+        })? {
+            PublicationOutcome::ConfirmedDurable => Ok(()),
+            PublicationOutcome::InstalledUnproven { error, fence } => {
+                let obligation = BlobPublicationObligation {
+                    operation_id: journal.operation_id.clone(),
+                    idempotency_key: journal.idempotency_key.clone(),
+                    locator: Some(locator),
+                    stage,
+                    destination: destination.normalized_identity().to_owned(),
+                    expected_sha256: expected_sha256.to_owned(),
+                    state_before: journal.state,
+                    fence,
+                };
+                obligation.validate()?;
+                Err(self.record_publication_obligation(journal_path, journal, obligation, error))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn finish_journal(
         &self,
         journal_path: &WorkScopePath,
         journal: &mut StageJournal,
     ) -> Result<(), BlobError> {
-        if !self.exact_bytes_at(
-            &journal.final_payload,
-            &journal.expected_payload_sha256,
-            MAX_BLOB_ENVELOPE_BYTES,
-        )? {
-            if !self.exact_bytes_at(
-                &journal.temp_payload,
-                &journal.expected_payload_sha256,
-                MAX_BLOB_ENVELOPE_BYTES,
-            )? {
-                return Err(BlobError::UnknownPublishOutcome {
-                    operation_id: journal.operation_id.clone(),
-                    state: journal.state,
-                });
-            }
-            self.publish_or_verify(&PublishVerification {
-                source: &journal.temp_payload,
-                destination: &journal.final_payload,
-                expected_sha256: &journal.expected_payload_sha256,
-                hard_ceiling: MAX_BLOB_ENVELOPE_BYTES,
-                operation_id: &journal.operation_id,
-                idempotency_key: &journal.idempotency_key,
-                state_before: journal.state,
-                stage: BlobCapacityStage::PayloadPublication,
-            })?;
+        // A publication obligation the owner never proved outranks every phase
+        // below: no equality check, no phase advance, and no journal deletion
+        // may resolve it on this or any later re-entry.
+        if let Some(obligation) = journal.pending_publication.clone() {
+            return Err(Self::fenced_publication_error(journal, &obligation));
         }
+        let temp_payload = journal.temp_payload.clone();
+        let final_payload = journal.final_payload.clone();
+        let expected_payload_sha256 = journal.expected_payload_sha256.clone();
+        self.settle_publication(
+            journal_path,
+            journal,
+            &temp_payload,
+            &final_payload,
+            &expected_payload_sha256,
+            MAX_BLOB_ENVELOPE_BYTES,
+            BlobCapacityStage::PayloadPublication,
+        )?;
         journal.state = PublishState::PayloadDurable;
         self.persist_journal(journal_path, journal, true)?;
 
-        if !self.exact_bytes_at(
-            &journal.final_metadata,
-            &journal.expected_metadata_sha256,
+        let temp_metadata = journal.temp_metadata.clone();
+        let final_metadata = journal.final_metadata.clone();
+        let expected_metadata_sha256 = journal.expected_metadata_sha256.clone();
+        self.settle_publication(
+            journal_path,
+            journal,
+            &temp_metadata,
+            &final_metadata,
+            &expected_metadata_sha256,
             MAX_METADATA_BYTES,
-        )? {
-            if !self.exact_bytes_at(
-                &journal.temp_metadata,
-                &journal.expected_metadata_sha256,
-                MAX_METADATA_BYTES,
-            )? {
-                return Err(BlobError::UnknownPublishOutcome {
-                    operation_id: journal.operation_id.clone(),
-                    state: journal.state,
-                });
-            }
-            self.publish_or_verify(&PublishVerification {
-                source: &journal.temp_metadata,
-                destination: &journal.final_metadata,
-                expected_sha256: &journal.expected_metadata_sha256,
-                hard_ceiling: MAX_METADATA_BYTES,
-                operation_id: &journal.operation_id,
-                idempotency_key: &journal.idempotency_key,
-                state_before: journal.state,
-                stage: BlobCapacityStage::MetadataPublication,
-            })?;
-        }
+            BlobCapacityStage::MetadataPublication,
+        )?;
         journal.state = PublishState::MetadataDurable;
         self.persist_journal(journal_path, journal, true)?;
         if !self.exact_bytes_at(
@@ -2971,8 +3239,9 @@ where
                         idempotency_key: journal.idempotency_key.clone(),
                         locator: Some(metadata.locator.clone()),
                     },
-                    Some(BlobCapacityEffect::PossiblePublication {
+                    Some(BlobCapacityEffect::DurabilityUnconfirmed {
                         state: PublishState::MetadataDurable,
+                        possible_effect: true,
                     }),
                 );
                 let bound = match bound {
@@ -2984,14 +3253,54 @@ where
                         });
                     }
                 };
-                return Err(bound);
+                let fence = publication_fence(&bound);
+                let obligation = BlobPublicationObligation {
+                    operation_id: journal.operation_id.clone(),
+                    idempotency_key: journal.idempotency_key.clone(),
+                    locator: Some(metadata.locator.clone()),
+                    stage: BlobCapacityStage::CommitWrite,
+                    destination: commit_path.normalized_identity().to_owned(),
+                    expected_sha256: sha256_hex(&commit_bytes),
+                    state_before: PublishState::MetadataDurable,
+                    fence,
+                };
+                obligation.validate()?;
+                return Err(self.record_publication_obligation(
+                    journal_path,
+                    journal,
+                    obligation,
+                    bound,
+                ));
             }
-            Err(_)
+            Err(error)
                 if self.exact_bytes_at(
                     &commit_path,
                     &sha256_hex(&commit_bytes),
                     MAX_JOURNAL_BYTES,
-                )? => {}
+                )? =>
+            {
+                // An already-existing commit record proves identity, not that
+                // this operation's create completed its durability boundary.
+                // The obligation is fenced under the original identity instead
+                // of being promoted to `CommitDurable`.
+                let obligation = BlobPublicationObligation {
+                    operation_id: journal.operation_id.clone(),
+                    idempotency_key: journal.idempotency_key.clone(),
+                    locator: Some(metadata.locator.clone()),
+                    stage: BlobCapacityStage::CommitWrite,
+                    destination: commit_path.normalized_identity().to_owned(),
+                    expected_sha256: sha256_hex(&commit_bytes),
+                    state_before: PublishState::MetadataDurable,
+                    fence: BlobPublicationFence::Unconfirmed,
+                };
+                obligation.validate()?;
+                return Err(self.record_publication_obligation(
+                    journal_path,
+                    journal,
+                    obligation,
+                    error,
+                ));
+            }
             Err(_) => {
                 return Err(BlobError::UnknownPublishOutcome {
                     operation_id: journal.operation_id.clone(),
@@ -3523,6 +3832,8 @@ where
             final_metadata: metadata_path_value,
             expected_payload_sha256: sha256_hex(&sealed),
             expected_metadata_sha256: metadata_sha256.clone(),
+            locator: Some(locator.clone()),
+            pending_publication: None,
         };
         self.persist_journal(&journal_path, &journal, false)?;
         self.contained(&temp_payload)?;
@@ -4245,6 +4556,17 @@ where
             },
             |key| key.crypto.validate().is_ok(),
         );
+        // An unresolved required capacity failure on the root lease is an owner
+        // observation, not a diagnostic detail: while the heartbeat has not
+        // been re-established, this root may not report healthy evidence.
+        if let Some(heartbeat) = self
+            .owner
+            .os_owner
+            .as_ref()
+            .and_then(BlobRootOwner::heartbeat_failure)
+        {
+            degraded.push(format!("root lease heartbeat unresolved: {heartbeat}"));
+        }
         let ready = owner_matches
             && containment_proven
             && permissions_proven
