@@ -2252,6 +2252,11 @@ pub struct CodexTurnResultDrain<'a> {
 
 /// Drains one completed Codex turn into its candidate result.
 ///
+/// STITCH (#370 W23/A22): the future live caller drains one real completed
+/// turn observed from an admitted Codex session; BLOCKED-BY the
+/// native-worker provider-runtime driver (no production caller exists).
+/// Forbidden: a synthetic or test-only turn to manufacture a caller.
+///
 /// # Errors
 ///
 /// Returns [`CodexAdapterError`] when the notification does not normalize,

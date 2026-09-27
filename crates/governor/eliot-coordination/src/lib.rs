@@ -1709,6 +1709,11 @@ impl CoordinationOwner {
     /// (lease/session/epoch/fence checks, idempotent commit, ceiling stamp).
     /// The admitted reference stays a candidate event: see
     /// [`ResultAdmissionCeiling`].
+    /// STITCH (#370 W8/W28): the future live caller is the session/work-item
+    /// driver passing a real [`AgentResultDraft`] built from admitted
+    /// work-item/session material; BLOCKED-BY the integration-lane driver
+    /// (no live draft producer exists). Forbidden: a draft built from
+    /// fabricated or test-only input to manufacture a caller.
     pub fn admit_candidate_result(
         &mut self,
         draft: AgentResultDraft,
