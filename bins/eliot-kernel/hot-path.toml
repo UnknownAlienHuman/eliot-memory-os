@@ -1,0 +1,135 @@
+# I12.14 hot-path declaration for the Kernel composition root.
+#
+# One authoritative declaration source for the Kernel side of the bounded
+# synchronous control/evidence path. The shape is
+# `eliot.foundation.runtime-contracts.hot-path` / `HotPathManifestSetV1` in
+# `crates/foundation/eliot-runtime-contracts/src/hot_path.rs`; that contract is
+# the single owner of these fields and this file only declares values.
+#
+# This is a declaration. It admits nothing, starts nothing and proves no
+# measurement. Every bound below is transcribed from an existing source
+# constant on current main; a dimension whose bound is not established on main
+# is left absent rather than guessed.
+#
+# Sources of the declared values:
+#   queue_capacity 128, queue_bytes 8 MiB, operation_timeout 30 s
+#     -> bins/eliot-kernel/src/front_door_session.rs::IpcImplementation::limits
+#   max_frame_bytes 4 MiB
+#     -> crates/foundation/eliot-protocol/src/lib.rs::MAX_FRAME_BYTES
+#   64 retained queued local-read attempts
+#     -> bins/eliot-kernel/src/host_request_route.rs::MAX_QUEUED_LOCAL_READS
+
+schema = "eliot.foundation.runtime-contracts.hot-path.v1"
+contract_version = "1.0.0"
+owning_service = "eliot-kernel"
+
+[[supported_operations]]
+operation = "local_read_claim"
+operation_version = "1.0.0"
+owning_service = "eliot-kernel"
+entrypoint = "bins/eliot-kernel/src/host_request_route.rs::claim_local_read_pair"
+crate_closure = [
+  "eliot-kernel",
+  "eliot-contracts",
+  "eliot-protocol",
+]
+
+# The claim is a read of the retained admission index, so it depends on the
+# session fence and the resource generation the claim was admitted under.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence"
+revision_key = "session_state_fence.authority_epoch"
+
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence"
+revision_key = "session_state_fence.resource_generation"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read_claim"
+# An empty poll is a null result, not a wait, and not an error.
+bounds = { max_items = 64, max_bytes = 8388608, max_deadline_ms = 30000 }
+
+# No synchronous external call is declared on the claim leg. The optional
+# semantics work and the Context projection-input read are cold work and stay
+# in unsupported_operations below.
+synchronous_external_calls = []
+fallback_or_degradation = { Unknown = {} }
+# #1734 owns profile production; no profile exists for this operation yet.
+hot_path_profile_ref = {}
+
+[[supported_operations]]
+operation = "local_read"
+operation_version = "1.0.0"
+owning_service = "eliot-kernel"
+entrypoint = "bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_operation"
+crate_closure = [
+  "eliot-kernel",
+  "eliot-contracts",
+  "eliot-kernel-service",
+  "eliot-protocol",
+  "eliot-store-api",
+]
+
+# The read is bound to the fence carried by the admitted envelope and to the
+# Store named-read response revisions. I5.20: no cache invents freshness, so
+# the exact revision heads are part of the dependency.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "admitted_envelope_state_fence"
+revision_key = "admitted_envelope_state_fence.authority_epoch"
+
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "named_read_revision_heads"
+revision_key = "named_read_revision_heads.revision"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read"
+bounds = { max_items = 64, max_bytes = 4194304, max_deadline_ms = 30000 }
+
+# The Kernel store gateway is a synchronous in-process call, not a process or
+# network call. It is admitted with the Kernel's declared transport deadline.
+[[supported_operations.synchronous_external_calls]]
+call_id = "eliot-kernel-service.execute_named"
+optional = false
+deadline_ms = 30000
+
+# A late, duplicate or revoked attempt is a known stale outcome carried by the
+# typed host-request result, never a fabricated bound result.
+fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
+hot_path_profile_ref = {}
+
+[[supported_operations]]
+operation = "local_read_result"
+operation_version = "1.0.0"
+owning_service = "eliot-kernel"
+entrypoint = "bins/eliot-kernel/src/host_request_route.rs::submit_local_read_result"
+crate_closure = [
+  "eliot-kernel",
+  "eliot-contracts",
+  "eliot-protocol",
+]
+
+# The submit leg validates and fence-checks the result body and binds it to the
+# waiting host request through the ORS result path.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "submitted_result_state_fence"
+revision_key = "submitted_result_state_fence.authority_epoch"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read_result"
+# The retained queued attempts bound both the claim and the result leg; the
+# in-flight item dimension is not separately enforced on main, so it is absent.
+bounds = { max_items = 64, max_bytes = 4194304, max_deadline_ms = 30000 }
+
+synchronous_external_calls = []
+# A timeout after possible work stays an unknown outcome in the diagnostic
+# stream next to the folded expired response; the caller retains liveness.
+fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
+hot_path_profile_ref = {}
+
+[[unsupported_operations]]
+operation = "eliot.query.packet"
+reason = "eliot.packet rides the same claim/result lifecycle but is served by the production campaign compiler; I2.15 places compiler and Context-compiler work in the cold path, so it is not a declared hot operation."
+
+[[unsupported_operations]]
+operation = "store_named.GetUnderstandingProjectionInputs"
+reason = "Projection-input support is explicitly unavailable at this base: the Governor read port keeps it fail-closed as Unavailable and the Store named-read catalogue refuses it. I12.14 forbids manufacturing a successful Context hot path."
