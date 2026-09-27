@@ -361,6 +361,40 @@ impl RootTransitionActivationReceipt {
         &self,
         request: &RootTransitionActivationRequest,
     ) -> Result<(), AuthorityError> {
+        self.validate_against_record(request.record(), request.canonical_request_digest())
+    }
+
+    /// Proves that this CURRENT owner receipt authorizes the exact restored
+    /// admitted-evidence row. The stored row is unproven input until every
+    /// bound field equals live owner evidence; a restored digest, activation
+    /// identity, or ORS reference that disagrees with the CURRENT receipt is
+    /// changed same-identity content, never a second crossing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::IdentityConflict`] when any stored row field
+    /// disagrees with this receipt, plus every refusal of [`Self::validate`]
+    /// for the shared proof clauses.
+    fn validate_restored(&self, row: &AdmittedRootTransitionRecord) -> Result<(), AuthorityError> {
+        if self.canonical_request_digest != row.canonical_request_digest
+            || self.kernel_activation.activation_id != row.kernel_activation_id
+            || self.ors_record_ref != row.ors_record_ref
+        {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        self.validate_against_record(&row.record, &row.canonical_request_digest)
+    }
+
+    /// Shared receipt proof against one exact record and its canonical
+    /// request digest: schema/version, identities, record binding, Kernel
+    /// activation binding, and committed disposition. Live and restore-time
+    /// admission run this same proof, so a restored crossing is never
+    /// verified more weakly than a live one.
+    fn validate_against_record(
+        &self,
+        record: &RootTransitionRecord,
+        canonical_request_digest: &str,
+    ) -> Result<(), AuthorityError> {
         if self.schema != ROOT_TRANSITION_RECEIPT_SCHEMA
             || self.version != ROOT_TRANSITION_RECEIPT_VERSION
         {
@@ -403,10 +437,9 @@ impl RootTransitionActivationReceipt {
                 "root_transition_receipt.revision",
             ));
         }
-        let record = request.record();
         if self.transition_id != record.transition_id
             || self.operation_id != record.operation_id
-            || self.canonical_request_digest != request.canonical_request_digest()
+            || self.canonical_request_digest != canonical_request_digest
             || self.parent_grant_id != record.parent_grant_id
             || self.child_grant_id != record.child_grant_id
             || self.parent_grant_commitment != record.parent_grant_commitment
@@ -507,20 +540,27 @@ impl AdmittedRootTransition {
     }
 
     /// Admits one restored admitted-evidence row into executable graph state
-    /// under the same CURRENT readback as a live activation.
+    /// under CURRENT owner evidence: the caller presents the CURRENT
+    /// validated activation receipt for the stored operation together with
+    /// the CURRENT parent/child grants, graph revision, and owner fence.
+    /// The stored row alone — however self-consistent — authorizes nothing.
     ///
     /// # Errors
     ///
-    /// Returns the same refusals as [`Self::admit`] for the shared readback
-    /// clauses.
+    /// Returns [`AuthorityError::IdentityConflict`] when the stored row
+    /// disagrees with the CURRENT receipt, every refusal of
+    /// [`RootTransitionActivationReceipt::validate`] for the shared proof
+    /// clauses, plus the same readback refusals as [`Self::admit`].
     pub fn admit_restored(
         row: &AdmittedRootTransitionRecord,
+        receipt: &RootTransitionActivationReceipt,
         parent: &CapabilityGrant,
         child: &CapabilityGrant,
         current_revision: u64,
         current_fence: &StateFence,
     ) -> Result<Self, AuthorityError> {
-        Self::admit_record(
+        receipt.validate_restored(row)?;
+        let admitted = Self::admit_record(
             &row.record,
             &row.canonical_request_digest,
             &row.kernel_activation_id,
@@ -529,7 +569,13 @@ impl AdmittedRootTransition {
             child,
             current_revision,
             current_fence,
-        )
+        )?;
+        if receipt.admitted_graph_revision < row.record.predecessor_graph_revision {
+            return Err(AuthorityError::StaleTransitionEvidence(
+                "root_transition.admitted_graph_revision",
+            ));
+        }
+        Ok(admitted)
     }
 
     /// Emits the durable admitted-evidence row for the versioned recovery
