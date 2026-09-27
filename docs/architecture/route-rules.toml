@@ -232,7 +232,7 @@ max_required_bytes = 458752
 id = "workspace-governance"
 description = "Workspace build graph, repository policy, tests, scripts, active workstreams, and configuration changes."
 path_globs = [
-  "Cargo.toml", "Cargo.lock", "**/Cargo.toml", "rust-toolchain.toml", "deny.toml", ".typos.toml", "Justfile", "tool-versions.json", "mcpls.toml",
+  "Cargo.toml", "Cargo.lock", "**/Cargo.toml", "rust-toolchain.toml", "deny.toml", ".typos.toml", "clippy.toml", "Justfile", "tool-versions.json", "mcpls.toml",
   ".github/**", "scripts/**", "tests/**", "config/**", "workspace/**", "workstreams/**", "workers/**", "T*.md",
 ]
 topic_keywords = ["workspace", "cargo", "repository policy", "workstream", "build graph", "configuration"]
@@ -247,7 +247,7 @@ id = "repository-root"
 description = "Root-level repository identity, licensing, tool pins, and contributor entry surfaces."
 path_globs = [
   ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md", "START.md",
-  ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json",
+  ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json", "clippy.toml",
 ]
 topic_keywords = ["repository root", "license", "toolchain pin"]
 required_handles = ["A0.4", "A14.8", "I0.14", "I2.17", "I18"]
