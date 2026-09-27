@@ -53,8 +53,9 @@ pub use process_owner::{
 pub use profile::{
     AdmissionError, AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
     COMPILER_PROFILE, CompiledProfile, InstrumentClass, InstrumentKindId, InstrumentProfile,
-    InstrumentProfileResolver, InstrumentRegistry, InstrumentSpec, InstrumentSpecParams,
-    ProfileCompiler, ProfileError, ProfileScopeClasses, ResolvedProfile, ResolvedStage,
+    InstrumentProfileResolver, InstrumentRegistry, InstrumentRegistrySnapshot, InstrumentSpec,
+    InstrumentSpecParams, ProfileCompiler, ProfileError, ProfileScopeClasses,
+    REGISTRY_SNAPSHOT_SCHEMA, REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage,
     ResourceLimits, StageDag, StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope,
 };
 pub use profile_run::{
