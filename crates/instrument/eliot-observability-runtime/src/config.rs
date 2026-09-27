@@ -30,6 +30,25 @@ pub const MAX_METRIC_LABELS: usize = 8;
 /// Largest accepted metric label value length, in characters.
 pub const MAX_METRIC_LABEL_CHARS: usize = 128;
 
+/// Largest accepted usage/cost bucket count.
+///
+/// I16.5 stores usage and cost facts separately from the metric registry, and
+/// I16.9 states that telemetry consumes the same CPU, memory, I/O, queue and
+/// context resources it observes, so that separate store is bounded too rather
+/// than growing with the number of routes in flight. The bound admits the full
+/// cross product of the closed scope, truth and work-class vocabularies for
+/// several concurrent routes: three scopes times five truth levels times nine
+/// work classes is 135 buckets, so 1024 leaves room for several routes before a
+/// new bucket is refused visibly.
+pub const MAX_USAGE_COST_BUCKETS: usize = 1024;
+
+/// Largest accepted usage/cost identifier value, in characters.
+///
+/// A provider identity in the separately stored usage/cost facts is a bounded
+/// name, not a URL carrying a credential and not free text, so it is held to the
+/// same bound discipline as a metric label value.
+pub const MAX_USAGE_COST_ID_CHARS: usize = 128;
+
 /// Largest accepted spooled critical-event record, in bytes.
 pub const MAX_SPOOL_RECORD_BYTES: u64 = 8 * 1024;
 
