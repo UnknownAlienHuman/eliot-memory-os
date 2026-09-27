@@ -321,6 +321,82 @@ fn generation_cutover_terminal_code(error: &KernelServiceError) -> &'static str 
     }
 }
 
+#[derive(Clone, Copy)]
+struct ServiceFenceObservation {
+    succeeded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationCutoverApplyDisposition {
+    /// This invocation published the committed route transition.
+    Applied,
+    /// The exact committed destination is already the live route state.
+    Readback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationCutoverLiveEndpoint {
+    Apply,
+    Readback,
+    Mismatch,
+}
+
+fn classify_generation_cutover_live_endpoint(
+    router: &GenerationRouter,
+    service: &eliot_kernel_service::KernelService,
+    decision: &CutoverDecision,
+) -> GenerationCutoverLiveEndpoint {
+    if decision.state() != GenerationCutoverState::Committed {
+        return GenerationCutoverLiveEndpoint::Apply;
+    }
+    let Some(old_generation) = decision.old_generation() else {
+        return GenerationCutoverLiveEndpoint::Apply;
+    };
+
+    let service_epoch = service.authority_epoch();
+    let route = router.route(decision.route_scope()).ok();
+    let route_matches = |generation, epoch: &EpochId| {
+        route.is_some_and(|route| {
+            route.active_generation() == generation
+                && route.authority_epoch().is_same_authority(epoch)
+        })
+    };
+
+    if router.epoch().is_same_authority(decision.new_epoch())
+        && service_epoch.is_same_authority(decision.new_epoch())
+        && route_matches(decision.new_generation(), decision.new_epoch())
+        && decision
+            .new_epoch()
+            .is_direct_child_of(decision.old_epoch())
+    {
+        return GenerationCutoverLiveEndpoint::Readback;
+    }
+    if router.epoch().is_same_authority(decision.old_epoch())
+        && service_epoch.is_same_authority(decision.old_epoch())
+        && route_matches(old_generation, decision.old_epoch())
+    {
+        return GenerationCutoverLiveEndpoint::Apply;
+    }
+    GenerationCutoverLiveEndpoint::Mismatch
+}
+
+enum GenerationCutoverInnerFailure {
+    Gateway(String),
+    Refused(KernelServiceError),
+}
+
+impl ServiceFenceObservation {
+    fn emit(self) {
+        observe_generation("kernel.generation.service_fence_requested", "attempt");
+        if self.succeeded {
+            observe_generation("kernel.generation.service_fenced", "success");
+        } else {
+            observe_generation("kernel.generation.service_fence_rejected", "rejected");
+        }
+    }
+}
+
+#[cfg(test)]
 fn fence_service_after_generation_failure(
     service: &std::sync::Arc<std::sync::Mutex<eliot_kernel_service::KernelService>>,
     reason: impl Into<String>,
@@ -328,16 +404,24 @@ fn fence_service_after_generation_failure(
     // F-LOG-KERNEL-4 (#903): subordinate fence observation; the cutover
     // gateway owns the single terminal for the failed cutover. Only the
     // fence outcome is logged, never the reason body.
-    observe_generation("kernel.generation.service_fence_requested", "attempt");
-    let mut service = service
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let result = service.fence_generation(reason);
-    match &result {
-        Ok(()) => observe_generation("kernel.generation.service_fenced", "success"),
-        Err(_) => observe_generation("kernel.generation.service_fence_rejected", "rejected"),
+    let result = fence_service_after_generation_failure_without_observation(service, reason);
+    ServiceFenceObservation {
+        succeeded: result.is_ok(),
     }
+    .emit();
     result
+}
+
+fn fence_service_after_generation_failure_without_observation(
+    service: &std::sync::Arc<std::sync::Mutex<eliot_kernel_service::KernelService>>,
+    reason: impl Into<String>,
+) -> Result<(), KernelServiceError> {
+    {
+        let mut service = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        service.fence_generation(reason)
+    }
 }
 
 impl KernelComposition {
@@ -481,12 +565,13 @@ impl KernelComposition {
     ) -> Result<(), KernelServiceError> {
         observe_generation("kernel.generation.cutover_requested", "attempt");
         match self.apply_generation_cutover_inner(decision) {
-            Ok(()) => {
+            Ok(GenerationCutoverApplyDisposition::Applied) => {
                 observe_generation("kernel.generation.cutover_committed", "success");
                 // Issue #1837: durable audit evidence for epoch transition.
                 self.audit_observe(AuditEventDraft::epoch_cutover_applied(decision));
                 Ok(())
             }
+            Ok(GenerationCutoverApplyDisposition::Readback) => Ok(()),
             Err(error) => {
                 observe_generation("kernel.generation.cutover_failed", "rejected");
                 super::kernel_diagnostics::observe_terminal_error(
@@ -503,7 +588,7 @@ impl KernelComposition {
     fn apply_generation_cutover_inner(
         &self,
         decision: &CutoverDecision,
-    ) -> Result<(), KernelServiceError> {
+    ) -> Result<GenerationCutoverApplyDisposition, KernelServiceError> {
         let mut poison = self.generation_poison.lock().map_err(|_| {
             KernelServiceError::Platform("generation poison lock poisoned".to_owned())
         })?;
@@ -512,40 +597,92 @@ impl KernelComposition {
                 "generation gateway fenced: {reason}"
             )));
         }
-        let result = (|| {
-            let mut generations = self
-                .generations
-                .lock()
-                .map_err(|_| "generation lock poisoned".to_owned())?;
-            let mut service = self
-                .service
-                .lock()
-                .map_err(|_| "service lock poisoned".to_owned())?;
-            let mut policy = self
-                .front_door_policy
-                .lock()
-                .map_err(|_| "front-door policy lock poisoned".to_owned())?;
-            self.generation_gateway.persist_and_publish(
-                decision,
-                &mut generations,
-                &mut service,
-                &mut policy,
-            )
-        })();
-        if let Err(reason) = result {
-            *poison = Some(reason.clone());
-            if let Err(fence_error) =
-                fence_service_after_generation_failure(&self.service, reason.clone())
-            {
-                return Err(KernelServiceError::Platform(format!(
-                    "generation cutover failed and service fencing failed: {fence_error}"
-                )));
+        let mut persistence_observations = None;
+        let result =
+            (|| -> Result<GenerationCutoverApplyDisposition, GenerationCutoverInnerFailure> {
+                let mut generations = self.generations.lock().map_err(|_| {
+                    GenerationCutoverInnerFailure::Gateway("generation lock poisoned".to_owned())
+                })?;
+                let mut service = self.service.lock().map_err(|_| {
+                    GenerationCutoverInnerFailure::Gateway("service lock poisoned".to_owned())
+                })?;
+
+                // I14.14: the authenticated production path reaches this point
+                // after loading the committed ORS decision. The read-only
+                // classification distinguishes exact replay from stale state.
+                match classify_generation_cutover_live_endpoint(&generations, &service, decision) {
+                    GenerationCutoverLiveEndpoint::Apply => {}
+                    GenerationCutoverLiveEndpoint::Readback => {
+                        return Ok(GenerationCutoverApplyDisposition::Readback);
+                    }
+                    GenerationCutoverLiveEndpoint::Mismatch => {
+                        return Err(GenerationCutoverInnerFailure::Refused(
+                            KernelServiceError::HandshakeMismatch {
+                                field: "generation_cutover.live_state",
+                            },
+                        ));
+                    }
+                }
+
+                let mut policy = self.front_door_policy.lock().map_err(|_| {
+                    GenerationCutoverInnerFailure::Gateway(
+                        "front-door policy lock poisoned".to_owned(),
+                    )
+                })?;
+                let persisted = self.generation_gateway.persist_and_publish(
+                    decision,
+                    &mut generations,
+                    &mut service,
+                    &mut policy,
+                );
+                persistence_observations = Some(persisted.observations);
+                persisted
+                    .result
+                    .map(|()| GenerationCutoverApplyDisposition::Applied)
+                    .map_err(GenerationCutoverInnerFailure::Gateway)
+            })();
+
+        let mut fence_observation = None;
+        let result = match result {
+            Ok(GenerationCutoverApplyDisposition::Readback) => {
+                drop(poison);
+                return Ok(GenerationCutoverApplyDisposition::Readback);
             }
-            return Err(KernelServiceError::Platform(format!(
-                "generation cutover fenced: {reason}"
-            )));
+            Ok(GenerationCutoverApplyDisposition::Applied) => {
+                Ok(GenerationCutoverApplyDisposition::Applied)
+            }
+            Err(GenerationCutoverInnerFailure::Refused(error)) => {
+                drop(poison);
+                return Err(error);
+            }
+            Err(GenerationCutoverInnerFailure::Gateway(reason)) => {
+                *poison = Some(reason.clone());
+                let fence_result = fence_service_after_generation_failure_without_observation(
+                    &self.service,
+                    reason.clone(),
+                );
+                fence_observation = Some(ServiceFenceObservation {
+                    succeeded: fence_result.is_ok(),
+                });
+                if let Err(fence_error) = fence_result {
+                    Err(KernelServiceError::Platform(format!(
+                        "generation cutover failed and service fencing failed: {fence_error}"
+                    )))
+                } else {
+                    Err(KernelServiceError::Platform(format!(
+                        "generation cutover fenced: {reason}"
+                    )))
+                }
+            }
+        };
+        drop(poison);
+        if let Some(observations) = persistence_observations {
+            observations.emit(result.is_ok());
         }
-        Ok(())
+        if let Some(observation) = fence_observation {
+            observation.emit();
+        }
+        result
     }
 
     /// Applies one authenticated generation cutover from the owner's durable
