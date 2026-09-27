@@ -137,29 +137,82 @@ $allGates = @(
         Name = 'cargo-denominator'
         Profiles = @('MergeCompile')
         Command = {
-            # Deterministic denominator receipt derived at runtime from locked
-            # cargo metadata plus the standalone/excluded discovery owner. No
-            # hand-maintained package, target, binary, or standalone counts.
+            # Reuse the exact locked metadata and standalone/excluded discovery
+            # producers. Counts and manifest paths are always derived at runtime.
             if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
                 $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
             }
-            $denominatorMetadata = $script:verifyMetadataJson | ConvertFrom-Json
-            $denominatorPackages = @($denominatorMetadata.packages | Sort-Object -Property id)
-            Write-Host "VERIFY_DENOMINATOR: workspace_packages=$($denominatorPackages.Count)"
-            foreach ($denominatorPackage in $denominatorPackages) {
-                $denominatorTargets = @($denominatorPackage.targets | Sort-Object -Property name | ForEach-Object { "$($_.kind -join '+'):$($_.name)" })
-                Write-Host "VERIFY_DENOMINATOR_PACKAGE: $($denominatorPackage.id) manifest=$($denominatorPackage.manifest_path) targets=$($denominatorTargets -join ',')"
+            try {
+                $denominatorMetadata = $script:verifyMetadataJson | ConvertFrom-Json
+            } catch {
+                throw "cargo metadata output could not be parsed: $($_.Exception.Message)"
             }
-            $denominatorStandalone = (python $standaloneCrates --root $repoRoot --list | Out-String)
+            if ($null -eq $denominatorMetadata -or $null -eq $denominatorMetadata.packages) {
+                throw 'cargo metadata package denominator is unavailable'
+            }
+            $denominatorPackages = @($denominatorMetadata.packages | Sort-Object -Property id)
+            $script:verifyDenominatorWorkspacePackages = @(
+                foreach ($denominatorPackage in $denominatorPackages) {
+                    if ([string]::IsNullOrWhiteSpace([string]$denominatorPackage.id) -or [string]::IsNullOrWhiteSpace([string]$denominatorPackage.manifest_path) -or $null -eq $denominatorPackage.targets) {
+                        throw 'cargo metadata package omitted its ID, manifest path, or targets'
+                    }
+                    $relativeManifestPath = [System.IO.Path]::GetRelativePath($repoRoot, [string]$denominatorPackage.manifest_path).Replace('\', '/')
+                    $targetRecords = @(
+                        foreach ($target in @($denominatorPackage.targets | Sort-Object -Property name)) {
+                            if ([string]::IsNullOrWhiteSpace([string]$target.name) -or $null -eq $target.kind -or @($target.kind).Count -eq 0) {
+                                throw "cargo metadata target omitted its kind or name for package $($denominatorPackage.id)"
+                            }
+                            $targetKinds = @($target.kind | Sort-Object)
+                            [pscustomobject][ordered]@{ kind = $targetKinds; name = [string]$target.name }
+                        }
+                    )
+                    [pscustomobject][ordered]@{
+                        package_id = [string]$denominatorPackage.id
+                        package_name = [string]$denominatorPackage.name
+                        manifest_path = $relativeManifestPath
+                        targets = $targetRecords
+                    }
+                }
+            )
+            $denominatorStandaloneOutput = @(& python $standaloneCrates --root $repoRoot --list 2>&1)
             $denominatorListExit = $LASTEXITCODE
             if ($denominatorListExit -ne 0) {
                 throw "standalone discovery list failed with exit $denominatorListExit"
             }
-            foreach ($denominatorLine in ($denominatorStandalone -split "`n")) {
-                $denominatorTrimmed = $denominatorLine.Trim()
-                if (-not [string]::IsNullOrWhiteSpace($denominatorTrimmed)) {
-                    Write-Host "VERIFY_DENOMINATOR_STANDALONE: $denominatorTrimmed"
+            $standaloneManifestPaths = @()
+            $excludedManifestPaths = @()
+            $discoveredManifestPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($denominatorLine in $denominatorStandaloneOutput) {
+                $denominatorTrimmed = ([string]$denominatorLine).Trim()
+                if ([string]::IsNullOrWhiteSpace($denominatorTrimmed)) { continue }
+                $isExcluded = $denominatorTrimmed.StartsWith('exclude: ', [StringComparison]::Ordinal)
+                if ($denominatorTrimmed.StartsWith('exclude:', [StringComparison]::Ordinal) -and -not $isExcluded) {
+                    throw "standalone discovery emitted a malformed excluded row: $denominatorTrimmed"
                 }
+                $relativeDirectory = if ($isExcluded) { $denominatorTrimmed.Substring(9) } else { $denominatorTrimmed }
+                if ([string]::IsNullOrWhiteSpace($relativeDirectory) -or [System.IO.Path]::IsPathRooted($relativeDirectory) -or $relativeDirectory.Contains('\') -or $relativeDirectory -match '(^|/)\.\.?(/|$)') {
+                    throw "standalone discovery emitted a malformed repository-relative path: $denominatorTrimmed"
+                }
+                $manifestPath = "$relativeDirectory/Cargo.toml"
+                if (-not $discoveredManifestPaths.Add($manifestPath)) {
+                    throw "standalone discovery repeated a manifest path: $manifestPath"
+                }
+                if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $manifestPath) -PathType Leaf)) {
+                    throw "standalone discovery manifest is unavailable: $manifestPath"
+                }
+                if ($isExcluded) {
+                    $excludedManifestPaths += $manifestPath
+                } else {
+                    $standaloneManifestPaths += $manifestPath
+                }
+                Write-Host "VERIFY_DENOMINATOR_STANDALONE: $denominatorTrimmed"
+            }
+            $script:verifyDenominatorStandaloneManifests = @($standaloneManifestPaths | Sort-Object -CaseSensitive)
+            $script:verifyDenominatorExcludedManifests = @($excludedManifestPaths | Sort-Object -CaseSensitive)
+            Write-Host "VERIFY_DENOMINATOR: workspace_packages=$($script:verifyDenominatorWorkspacePackages.Count)"
+            foreach ($denominatorPackage in $script:verifyDenominatorWorkspacePackages) {
+                $denominatorTargets = @($denominatorPackage.targets | ForEach-Object { "$($_.kind -join '+'):$($_.name)" })
+                Write-Host "VERIFY_DENOMINATOR_PACKAGE: $($denominatorPackage.package_id) manifest=$($denominatorPackage.manifest_path) targets=$($denominatorTargets -join ',')"
             }
         }
     },
@@ -173,10 +226,8 @@ $allGates = @(
             # warnings are reported, and this profile claims no workspace lint
             # cleanliness and uses no `-D warnings` oracle. Changed files map
             # to packages by longest manifest-directory prefix from locked
-            # metadata; root-wide inputs (workspace manifest/lock, toolchain,
-            # workflows, scripts, config) or an unmappable candidate widen the
-            # scope to the full workspace, which still covers every changed
-            # package. Every selection carries its path-to-package reason.
+            # metadata; root-wide inputs or an unmappable candidate widen the
+            # scope to the full workspace. The receipt records this same mapping.
             if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
                 $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
             }
@@ -196,18 +247,23 @@ $allGates = @(
                 }
             }
             $clippyRootWide = @()
+            $clippyRootWideInputs = @()
             $clippySelected = @{}
+            $clippySelectionReasons = @{}
             if ([string]::IsNullOrWhiteSpace($clippyBase)) {
                 $clippyRootWide += 'no base revision for changed-package mapping'
+                $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'no base revision for changed-package mapping' }
             } else {
                 $clippyDiffRaw = (git diff --name-only $clippyBase HEAD | Out-String)
                 $clippyDiffExit = $LASTEXITCODE
                 if ($clippyDiffExit -ne 0) {
                     $clippyRootWide += 'change-set command failed; widened to workspace'
+                    $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'change-set command failed; widened to workspace' }
                 } else {
                     $clippyChanged = @($clippyDiffRaw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
                     if ($clippyChanged.Count -eq 0) {
                         $clippyRootWide += 'empty change set against base; selection unprovable'
+                        $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'empty change set against base; selection unprovable' }
                     }
                     foreach ($clippyFile in $clippyChanged) {
                         $clippyAbsolute = Join-Path $repoRoot $clippyFile
@@ -221,16 +277,57 @@ $allGates = @(
                         }
                         if ($null -eq $clippyMatched) {
                             $clippyRootWide += "root-wide input: $clippyFile"
+                            $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $clippyFile; reason = 'no workspace manifest-directory prefix matched; widened to workspace' }
                         } else {
                             $clippyName = $clippyPackageByDir[$clippyMatched]
                             if (-not $clippySelected.ContainsKey($clippyName)) {
                                 $clippySelected[$clippyName] = @()
+                                $clippySelectionReasons[$clippyName] = @()
                             }
                             $clippySelected[$clippyName] += $clippyFile
+                            $matchedManifestDirectory = [IO.Path]::GetRelativePath($repoRoot, $clippyMatched).Replace('\', '/')
+                            $clippySelectionReasons[$clippyName] += [pscustomobject][ordered]@{
+                                path = $clippyFile
+                                reason = "longest workspace manifest-directory prefix matched $matchedManifestDirectory"
+                            }
                         }
                     }
                 }
             }
+
+            $clippyOrdered = @($clippySelected.Keys | Sort-Object)
+            $changedPackageSelection = @(
+                foreach ($clippyName in $clippyOrdered) {
+                    $packageIds = @($clippyMetadata.packages | Where-Object { $_.name -eq $clippyName } | ForEach-Object { [string]$_.id } | Sort-Object)
+                    if ($packageIds.Count -ne 1) {
+                        $fallbackReason = "selected package name '$clippyName' matched $($packageIds.Count) cargo metadata package IDs; widened to workspace"
+                        $clippyRootWide += $fallbackReason
+                        $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = $fallbackReason }
+                        continue
+                    }
+                    [pscustomobject][ordered]@{
+                        package_name = $clippyName
+                        package_ids = $packageIds
+                        changed_paths = @($clippySelectionReasons[$clippyName])
+                    }
+                }
+            )
+            $clippyScope = if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0) { 'workspace' } else { 'changed' }
+            if ($clippySelected.Count -eq 0) {
+                $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'no changed workspace package mapped; widened to workspace' }
+            }
+            $denominatorReceipt = [pscustomobject][ordered]@{
+                workspace_packages = @($script:verifyDenominatorWorkspacePackages)
+                standalone_manifests = @($script:verifyDenominatorStandaloneManifests)
+                excluded_manifests = @($script:verifyDenominatorExcludedManifests)
+                base_revision = if ([string]::IsNullOrWhiteSpace($clippyBase)) { $null } else { $clippyBase }
+                clippy_scope = $clippyScope
+                changed_package_selection = $changedPackageSelection
+                root_wide_inputs = $clippyRootWideInputs
+            }
+            $receiptJson = $denominatorReceipt | ConvertTo-Json -Depth 8 -Compress
+            [Console]::Out.WriteLine("VERIFY_DENOMINATOR_RECEIPT: $receiptJson")
+
             if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0) {
                 foreach ($clippyReason in $clippyRootWide) {
                     Write-Host "VERIFY_CLIPPY_SELECTION: scope=workspace reason=$clippyReason"
@@ -240,7 +337,6 @@ $allGates = @(
                 }
                 cargo clippy --locked --workspace --all-targets --no-deps
             } else {
-                $clippyOrdered = @($clippySelected.Keys | Sort-Object)
                 foreach ($clippyName in $clippyOrdered) {
                     Write-Host "VERIFY_CLIPPY_SELECTION: scope=changed package=$clippyName reasons=$($clippySelected[$clippyName] -join ';')"
                 }
