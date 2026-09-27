@@ -356,8 +356,10 @@ impl ReceiptOwnerEvidence {
 pub(crate) struct ReceiptRescanObservation {
     /// Owner family this read observed.
     pub(crate) family: ReceiptOwnerFamily,
-    /// The read covered the whole family in one consistent snapshot. A
-    /// partial page is reported as incomplete rather than silently truncated.
+    /// The read covered the whole family in one consistent snapshot. A read
+    /// that stops before the end of the family, because its bounded page walk
+    /// reached the end of the remaining budget, reports incomplete rather than
+    /// silently truncating: truncation can never clear an obligation.
     pub(crate) complete: bool,
     /// True only when the owner's own contract makes absence proof of
     /// resolution. The ORS store-rebind family has no such contract: an abort
@@ -819,11 +821,16 @@ impl ShutdownDrainCoordinator {
     /// [`ReceiptReconciliation::Reconciled`] authorizes the next drain
     /// phase; a known-empty registry reached through an incomplete or
     /// unavailable observation is reported as a coverage failure instead.
+    ///
+    /// Each rescan receives the time still remaining on this one monotonic
+    /// deadline, so an owner read that walks a family in several bounded pages
+    /// is bounded by the same budget as the wait itself: a new scan resumes the
+    /// remaining budget and can neither reset nor extend it.
     pub(crate) async fn reconcile_pending_observation(
         &self,
         deadline: Duration,
         family: ReceiptOwnerFamily,
-        mut rescan: impl FnMut() -> Result<ReceiptRescanObservation, String>,
+        mut rescan: impl FnMut(Duration) -> Result<ReceiptRescanObservation, String>,
     ) -> ReceiptReconciliation {
         let start = Instant::now();
         // Highest owner revision already used to clear an obligation in this
@@ -841,7 +848,7 @@ impl ShutdownDrainCoordinator {
             };
             // A failed required read proves nothing in either direction and
             // can never authorize the next phase through an empty registry.
-            let Ok(observation) = rescan() else {
+            let Ok(observation) = rescan(deadline.saturating_sub(start.elapsed())) else {
                 observe_shutdown("kernel.shutdown.receipt_scan_unavailable", "unavailable");
                 return ReceiptReconciliation::Unavailable {
                     reason: "receipt-owner-observation-unavailable",
@@ -940,7 +947,7 @@ impl ShutdownDrainCoordinator {
         mut rescan: impl FnMut() -> Result<Vec<String>, String>,
     ) -> Result<Vec<String>, String> {
         match self
-            .reconcile_pending_observation(deadline, ReceiptOwnerFamily::StoreRebind, || {
+            .reconcile_pending_observation(deadline, ReceiptOwnerFamily::StoreRebind, |_| {
                 Ok(ReceiptRescanObservation {
                     family: ReceiptOwnerFamily::StoreRebind,
                     complete: true,
