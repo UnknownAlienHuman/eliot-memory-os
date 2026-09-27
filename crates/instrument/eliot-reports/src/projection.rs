@@ -539,7 +539,15 @@ impl ProjectedReport {
         generated_at: ClockReading,
         state_fence: StateFence,
     ) -> Result<Self, ProjectionError> {
-        if kind == ReportKind::ProductProgress {
+        if !matches!(
+            kind,
+            ReportKind::SystemHealth
+                | ReportKind::TaskCompletion
+                | ReportKind::WatchdogSecurity
+                | ReportKind::BackupRecovery
+                | ReportKind::ArchitectureConformance
+                | ReportKind::ReleaseReadiness
+        ) {
             return Err(ProjectionError::UnsupportedKind { kind });
         }
         let mut rows = rows.to_vec();
