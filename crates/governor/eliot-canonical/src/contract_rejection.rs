@@ -22,6 +22,17 @@
 //! mints no `write_intent_id`, and records no effect. The journal below is an
 //! in-memory, rebuildable pre-stage projection used for retry-identity
 //! fixtures only.
+//!
+//! The corrected operation identity is an owner-issued fact, not advisory
+//! prose: [`derive_corrected_operation_id`] derives it from the inputs the
+//! refusal is already fixed by, [`RetainedRejections`] keeps the operation
+//! identity each refusal rejected, and
+//! [`RetainedRejections::verify_correction_lineage`] believes a lineage claim
+//! only when that own record proves it. The Kernel pre-stage gate
+//! (`eliot-kernel-service::contract_rejection_gate`) enforces the identity
+//! half it can see on the wire - a resubmission still wearing a refused
+//! operation identity - and deliberately issues no identity of its own, so the
+//! issuance and the lineage proof stay here.
 
 use std::collections::BTreeMap;
 
@@ -81,9 +92,17 @@ pub struct ContractError {
     pub write_intent_id: Option<String>,
     /// Proposed operation under test.
     pub proposed_operation_id: String,
-    /// New operation identity for a corrected resubmission, if known.
+    /// Owner-issued operation identity a corrected resubmission must use.
+    ///
+    /// Issued by this owner through
+    /// [`derive_corrected_operation_id`] on every refusal it produces, so the
+    /// corrected request receives a new operation identity instead of a caller
+    /// inventing one.
     pub corrected_operation_id: Option<String>,
     /// Lineage to the rejected operation for a corrected resubmission.
+    ///
+    /// Present only when this owner verified the claim against a rejection it
+    /// itself retained; never defaulted from caller input alone.
     pub corrected_from_operation_id: Option<String>,
 }
 
@@ -275,6 +294,8 @@ impl AdmissionRejection {
                 field: "rejection.all_contract_errors",
             });
         }
+        let corrected_operation_id =
+            derive_corrected_operation_id(&self.proposed_operation_id, &self.rejection_id);
         for error in &self.all_contract_errors {
             error.validate()?;
             if error.proposed_operation_id != self.proposed_operation_id
@@ -284,6 +305,15 @@ impl AdmissionRejection {
                 return Err(ContractRejectionError::InvalidField {
                     field: "rejection.all_contract_errors",
                     reason: "every defect must share the proposed operation with NOT_ATTEMPTED and no write intent",
+                });
+            }
+            if error.corrected_operation_id.as_deref() != Some(corrected_operation_id.as_str())
+                || error.corrected_operation_id.as_deref()
+                    == Some(self.proposed_operation_id.as_str())
+            {
+                return Err(ContractRejectionError::InvalidField {
+                    field: "rejection.all_contract_errors",
+                    reason: "every defect must carry the owner-issued corrected operation identity, which differs from the rejected one",
                 });
             }
         }
@@ -331,6 +361,131 @@ pub fn derive_rejection_id(idempotency_key: &str, canonical_request_hash: &str) 
     sha256_hex(format!("{idempotency_key}:{canonical_request_hash}").as_bytes())
 }
 
+/// Domain separator for the owner-issued corrected operation identity.
+const CORRECTED_OPERATION_ID_DOMAIN: &str = "eliot.contract_rejection.corrected_operation_id.v1";
+
+/// Defect code for a caller-asserted correction lineage the owner never
+/// rejected.
+pub const UNPROVEN_CORRECTION_LINEAGE: &str = "UNPROVEN_CORRECTION_LINEAGE";
+
+/// Derives the owner-issued corrected operation identity for one refusal.
+///
+/// `I6.8` requires the corrected request to receive a new operation ID while
+/// `corrected_from_operation_id` preserves lineage, and requires an exact
+/// retry of the same request hash to return the same rejection. Both inputs
+/// here are already fixed by the refusal being returned: the rejected
+/// operation identity, and the rejection identity, which is itself derived
+/// only from the idempotency key and the canonical request hash. The same
+/// rejection therefore always issues the same corrected identity, and a
+/// different rejection always issues a different one. No nonce, clock,
+/// counter, or new input participates.
+#[must_use]
+pub fn derive_corrected_operation_id(rejected_operation_id: &str, rejection_id: &str) -> String {
+    let digest = sha256_hex(
+        format!("{CORRECTED_OPERATION_ID_DOMAIN}:{rejected_operation_id}:{rejection_id}")
+            .as_bytes(),
+    );
+    format!("corrected-{digest}")
+}
+
+/// One refusal this owner kept, bound to the operation identity it refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedRejection {
+    /// Operation identity this owner refused.
+    pub rejected_operation_id: String,
+    /// Stable rejection identity returned for it.
+    pub rejection_id: String,
+    /// Canonical request hash of the exact refused bytes.
+    pub canonical_request_hash: String,
+    /// Idempotency key the refused bytes arrived under.
+    pub idempotency_key: String,
+    /// Owner-issued identity a corrected resubmission must use.
+    pub corrected_operation_id: String,
+}
+
+/// Fail-closed refusals for a correction lineage claim.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CorrectionLineageError {
+    /// The caller asserted lineage from an operation this owner never
+    /// refused, so the claim is unproven and is never recorded.
+    #[error("corrected_from_operation_id {asserted} names no retained rejection")]
+    UnprovenLineage {
+        /// Asserted lineage operation identity.
+        asserted: OperationId,
+    },
+    /// The presented operation identity is one this owner already refused,
+    /// so corrected bytes may not still wear it.
+    #[error("operation_id {presented} already carries a retained rejection")]
+    RejectedOperationIdentityReuse {
+        /// Presented operation identity.
+        presented: OperationId,
+    },
+}
+
+/// Owner-retained refusals, keyed by the rejected operation identity.
+///
+/// This is the owner's own record, not a caller assertion: a lineage claim is
+/// believed only when this record proves it. The first refusal of an
+/// operation identity is the one retained, so the corrected identity issued
+/// for that operation never changes.
+#[derive(Clone, Debug, Default)]
+pub struct RetainedRejections {
+    entries: BTreeMap<String, RetainedRejection>,
+}
+
+impl RetainedRejections {
+    /// Retains one refusal under the operation identity it refused.
+    pub fn retain(&mut self, rejected_operation_id: &OperationId, rejection: &AdmissionRejection) {
+        self.entries
+            .entry(rejected_operation_id.as_str().to_owned())
+            .or_insert_with(|| RetainedRejection {
+                rejected_operation_id: rejected_operation_id.as_str().to_owned(),
+                rejection_id: rejection.rejection_id.clone(),
+                canonical_request_hash: rejection.canonical_request_hash.clone(),
+                idempotency_key: rejection.idempotency_key.clone(),
+                corrected_operation_id: derive_corrected_operation_id(
+                    rejected_operation_id.as_str(),
+                    &rejection.rejection_id,
+                ),
+            });
+    }
+
+    /// Verifies a correction lineage claim against this owner's own record.
+    ///
+    /// A presented operation identity this owner already refused is refused
+    /// outright: corrected bytes must not still wear the rejected identity. An
+    /// asserted `corrected_from_operation_id` is believed only when a
+    /// rejection for exactly that operation is retained here. With no asserted
+    /// lineage, the owner-issued [`RetainedRejection::corrected_operation_id`]
+    /// is itself the proof, because a caller cannot present it without having
+    /// read a refusal this owner issued.
+    pub fn verify_correction_lineage(
+        &self,
+        presented_operation_id: &OperationId,
+        asserted_corrected_from: Option<&OperationId>,
+    ) -> Result<Option<&RetainedRejection>, CorrectionLineageError> {
+        if self.entries.contains_key(presented_operation_id.as_str()) {
+            return Err(CorrectionLineageError::RejectedOperationIdentityReuse {
+                presented: presented_operation_id.clone(),
+            });
+        }
+        if let Some(asserted) = asserted_corrected_from {
+            return self.entries.get(asserted.as_str()).map_or_else(
+                || {
+                    Err(CorrectionLineageError::UnprovenLineage {
+                        asserted: asserted.clone(),
+                    })
+                },
+                |record| Ok(Some(record)),
+            );
+        }
+        Ok(self
+            .entries
+            .values()
+            .find(|record| record.corrected_operation_id == presented_operation_id.as_str()))
+    }
+}
+
 /// In-memory pre-stage admission journal preserving retry identity.
 ///
 /// Maps one idempotency key to the exact canonical hash and rejection first
@@ -338,9 +493,15 @@ pub fn derive_rejection_id(idempotency_key: &str, canonical_request_hash: &str) 
 /// the same `rejection_id`; changed bytes under the same key yield a fresh
 /// `IDENTITY_CONFLICT` rejection without overwriting the stored one. Valid
 /// envelopes are never stored and never consume a `write_intent_id`.
+///
+/// Every refusal is also retained under the operation identity it refused, so
+/// a corrected payload's lineage is checked against this journal's own record
+/// instead of a caller assertion, and so a rejected operation identity can
+/// never come back wearing corrected bytes.
 #[derive(Clone, Debug, Default)]
 pub struct ContractAdmissionJournal {
     entries: BTreeMap<String, StoredRejection>,
+    retained: RetainedRejections,
 }
 
 #[derive(Clone, Debug)]
@@ -354,8 +515,15 @@ impl ContractAdmissionJournal {
     ///
     /// Returns the immutable prepared plan without writing, staging, or
     /// allocating an ordering sequence. On refusal returns the typed
-    /// `AdmissionRejection` with every detected defect. This method never
-    /// mints a `write_intent_id` and never records an effect.
+    /// `AdmissionRejection` with every detected defect, each carrying the
+    /// owner-issued corrected operation identity. This method never mints a
+    /// `write_intent_id` and never records an effect.
+    ///
+    /// `corrected_from_operation_id` is a claim, not a fact: it is believed
+    /// only when this journal itself retains a rejection for exactly that
+    /// operation identity. An unproven claim is refused, never recorded, and
+    /// never defaulted. Corrected bytes are additionally refused while still
+    /// carrying an operation identity this journal already rejected.
     #[allow(
         clippy::result_large_err,
         reason = "the typed pre-stage rejection travels by value so one invalid request carries every defect"
@@ -372,11 +540,19 @@ impl ContractAdmissionJournal {
             if stored.canonical_request_hash == canonical_hash {
                 return Err(stored.rejection.clone());
             }
-            return Err(identity_conflict_rejection(
-                envelope,
-                &canonical_hash,
-                corrected_from_operation_id,
-            ));
+            let rejection =
+                identity_conflict_rejection(envelope, &canonical_hash, corrected_from_operation_id);
+            self.retain_rejected_operation(envelope, &rejection);
+            return Err(rejection);
+        }
+        if let Err(lineage) = self
+            .retained
+            .verify_correction_lineage(&envelope.operation_id, corrected_from_operation_id)
+        {
+            let rejection =
+                unproven_correction_lineage_rejection(envelope, &canonical_hash, &lineage);
+            self.retain_refusal(envelope, &canonical_hash, &rejection);
+            return Err(rejection);
         }
         let defects = collect_contract_errors(envelope, corrected_from_operation_id);
         if defects.is_empty() {
@@ -393,13 +569,7 @@ impl ContractAdmissionJournal {
                         )],
                         corrected_from_operation_id,
                     );
-                    self.entries.insert(
-                        envelope.idempotency_key.clone(),
-                        StoredRejection {
-                            canonical_request_hash: canonical_hash,
-                            rejection: rejection.clone(),
-                        },
-                    );
+                    self.retain_refusal(envelope, &canonical_hash, &rejection);
                     Err(rejection)
                 }
             }
@@ -421,13 +591,7 @@ impl ContractAdmissionJournal {
                     disposition: "Cold".to_owned(),
                 });
             }
-            self.entries.insert(
-                envelope.idempotency_key.clone(),
-                StoredRejection {
-                    canonical_request_hash: canonical_hash,
-                    rejection: rejection.clone(),
-                },
-            );
+            self.retain_refusal(envelope, &canonical_hash, &rejection);
             Err(rejection)
         }
     }
@@ -438,6 +602,40 @@ impl ContractAdmissionJournal {
         self.entries
             .get(idempotency_key)
             .map(|stored| &stored.rejection)
+    }
+
+    /// Retains one refusal under its idempotency key and under the operation
+    /// identity it refused.
+    ///
+    /// The keyed entry keeps exact same-hash retry on the identical rejection;
+    /// the retained operation identity keeps the corrected operation identity
+    /// issued with that rejection and lets a later lineage claim be checked
+    /// against this journal's own record.
+    fn retain_refusal(
+        &mut self,
+        envelope: &CanonicalWriteEnvelope,
+        canonical_hash: &str,
+        rejection: &AdmissionRejection,
+    ) {
+        self.retain_rejected_operation(envelope, rejection);
+        self.entries.insert(
+            envelope.idempotency_key.clone(),
+            StoredRejection {
+                canonical_request_hash: canonical_hash.to_owned(),
+                rejection: rejection.clone(),
+            },
+        );
+    }
+
+    /// Retains the refused operation identity without touching the keyed retry
+    /// entry: a changed-bytes `IDENTITY_CONFLICT` refusal must never overwrite
+    /// the stored rejection for that key.
+    fn retain_rejected_operation(
+        &mut self,
+        envelope: &CanonicalWriteEnvelope,
+        rejection: &AdmissionRejection,
+    ) {
+        self.retained.retain(&envelope.operation_id, rejection);
     }
 }
 
@@ -753,16 +951,24 @@ fn rejection_for_defects(
     corrected_from_operation_id: Option<&OperationId>,
 ) -> AdmissionRejection {
     let mut errors = defects;
+    let rejection_id = derive_rejection_id(&envelope.idempotency_key, canonical_hash);
+    // The owner issues the corrected operation identity here, once, from the
+    // inputs the refusal is already fixed by. Every defect in the one response
+    // carries the same identity, so a caller never has to invent one and the
+    // advisory retry rule stops being the only statement of the rule.
+    let corrected_operation_id =
+        derive_corrected_operation_id(envelope.operation_id.as_str(), &rejection_id);
     for error in &mut errors {
         error.corrected_from_operation_id =
             corrected_from_operation_id.map(|id| id.as_str().to_owned());
+        error.corrected_operation_id = Some(corrected_operation_id.clone());
     }
     AdmissionRejection {
         request_id: envelope.request.request_id.as_str().to_owned(),
         proposed_operation_id: envelope.operation_id.as_str().to_owned(),
         idempotency_key: envelope.idempotency_key.clone(),
         canonical_request_hash: canonical_hash.to_owned(),
-        rejection_id: derive_rejection_id(&envelope.idempotency_key, canonical_hash),
+        rejection_id,
         stage_state: StageState::None,
         ordering_sequence_assigned: false,
         decision: if errors.iter().any(|error| error.code == "IDENTITY_CONFLICT") {
@@ -803,6 +1009,55 @@ fn identity_conflict_rejection(
     rejection.decision = AdmissionDecision::Conflict;
     "resubmit the changed bytes under a new idempotency key with corrected_from_operation_id lineage"
         .clone_into(&mut rejection.next_allowed_action);
+    rejection
+}
+
+/// Refuses a correction whose lineage this owner cannot prove, or whose
+/// corrected bytes still carry an operation identity it already rejected.
+///
+/// The refusal records no `corrected_from_operation_id`: an unproven claim is
+/// never stamped as lineage, so a downstream layer cannot read the field and
+/// believe it. The owner-issued corrected operation identity is still carried,
+/// so the caller has exactly one identity to resubmit under.
+fn unproven_correction_lineage_rejection(
+    envelope: &CanonicalWriteEnvelope,
+    canonical_hash: &str,
+    lineage: &CorrectionLineageError,
+) -> AdmissionRejection {
+    let (code, invalid_field, next_action) = match lineage {
+        CorrectionLineageError::UnprovenLineage { .. } => (
+            UNPROVEN_CORRECTION_LINEAGE,
+            "corrected_from_operation_id",
+            "resubmit under the owner-issued corrected operation identity and a corrected_from_operation_id naming an operation this owner rejected",
+        ),
+        CorrectionLineageError::RejectedOperationIdentityReuse { .. } => (
+            "IDENTITY_CONFLICT",
+            "operation_id",
+            "resubmit the corrected bytes under the owner-issued corrected operation identity and a new idempotency key",
+        ),
+    };
+    let mut rejection = rejection_for_defects(
+        envelope,
+        canonical_hash,
+        vec![mk_defect(
+            envelope,
+            code,
+            vec![invalid_field.to_owned()],
+            Vec::new(),
+            Vec::new(),
+            "semantic",
+            "none",
+            None,
+        )],
+        None,
+    );
+    if matches!(
+        lineage,
+        CorrectionLineageError::RejectedOperationIdentityReuse { .. }
+    ) {
+        rejection.decision = AdmissionDecision::Conflict;
+    }
+    next_action.clone_into(&mut rejection.next_allowed_action);
     rejection
 }
 
