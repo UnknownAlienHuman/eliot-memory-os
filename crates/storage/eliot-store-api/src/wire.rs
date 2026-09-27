@@ -1194,6 +1194,43 @@ pub fn request_frame(
 /// that ignores `trace_context` keeps decoding; authority-aware ingress uses
 /// [`decode_request_frame_with_authority`]. Any other request shape must
 /// carry no authorities.
+///
+/// # W4 refutation: this encoder has no production producer (issue #10)
+///
+/// Issue #10 item 4 required a determination or a recorded refutation with
+/// current evidence. Determined on `origin/main` at `c43c5493`: the losslessness
+/// mechanism on the current named-operation path is present and is recorded on
+/// `eliot_store_surreal_adapter::client::json_codec`; this wire channel is a
+/// separate anti-substitution gate and **is not** that mechanism. It is
+/// currently unreachable as a producer on any production path, with exact
+/// current evidence:
+///
+/// - The only production frame builder for store requests is
+///   `crates/kernel/eliot-kernel-service/src/store_exchange.rs`, which calls
+///   [`request_frame`] (not this function) for every `StoreRequest`. No
+///   non-test caller of this function exists outside this module's
+///   `#[cfg(test)] mod tests`.
+/// - Consequently no production frame carries
+///   `PAYLOAD_AUTHORITY_COUNT_KEY`. `extract_payload_authorities` then takes
+///   its legacy early return, so the `StoreRequest::Apply` zip-compare arm of
+///   `bind_payload_authorities` is never entered from a production path and
+///   the store-side rebinding at the end of `extract_payload_authorities` is
+///   only reachable for a frame that carries the channel (which fails
+///   closed).
+/// - The decoded channel is discarded at the only production decode site,
+///   `bins/eliot-store-surreal/src/lib.rs::validate_request_frame`
+///   (`let (request_id, identity, request, _)`), and the sole production
+///   composition entry `StoreComposition::apply` supplies
+///   `vec![None; transition.named_operations.len()]` to
+///   `StoreComposition::apply_with_authority`, so
+///   `plan::select_apply_plan` keeps the legacy branch and
+///   `ApplyPlan::payload_authority` is empty for every production write.
+///
+/// Closing that gap requires a change to the governed store client frame
+/// builder above, which is outside issue #10's storage scope; no workaround,
+/// default, or derived authority is substituted here, because an authority
+/// re-derived from the admitted `Value` is not the original bytes and would be
+/// a fabricated claim.
 pub fn request_frame_with_payload_authority(
     connection_id: impl Into<String>,
     protocol_version: ProtocolVersion,
