@@ -18,7 +18,7 @@ use crate::write_execution::{
     AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
     ReconcileOutcome, ReservedAttemptTransport, current_time_ms,
 };
-use crate::{client, schema};
+use crate::{client, schema, schema_inventory};
 #[cfg(test)]
 use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};
 use eliot_store_api::{
@@ -95,37 +95,33 @@ use schema_contract::SchemaMigrationIdentity;
 use schema_contract::schema_meta_record;
 use schema_contract::{
     FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_v1_to_v2,
-    v1_identity, validate_fence_record, validate_schema_meta_record, validate_v1_pin,
+    v1_identity, validate_fence_record, validate_schema_meta_record,
 };
 
-fn is_admitted_migration(migration: &CompiledMigration) -> bool {
-    if !validate_v1_pin() {
-        return false;
-    }
-    if migration.migration_id == schema::MIGRATION_ID_V1
-        && migration.checksum_sha256 == schema::SCHEMA_DDL_V1_SHA256
-        && migration.generation_after.as_str() == schema::GENERATION_V1
-        && migration.statements.trim() == schema::SCHEMA_DDL.trim()
-    {
-        return true;
-    }
-    let v2_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
-    if migration.migration_id == schema::MIGRATION_ID_V2
-        && migration.checksum_sha256 == v2_full
-        && migration.generation_after.as_str() == schema::GENERATION_V2
-        && migration.statements.trim() == schema::SCHEMA_DDL_V2.trim()
-    {
-        return true;
-    }
-    let v2_delta = eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
-    if migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
-        && migration.checksum_sha256 == v2_delta
-        && migration.generation_after.as_str() == schema::GENERATION_V2
-        && migration.statements.trim() == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.trim()
-    {
-        return true;
-    }
-    false
+/// Fail-closed admission of one presented migration against the current
+/// schema owner's published executable graph (issue #1221).
+///
+/// The inventory in [`crate::schema_inventory`] is the only authority: a plan
+/// is admitted only when its identity, exact bytes, digest and target
+/// generation all match a published executable body. Everything else — an
+/// unknown identity, a body this owner declares but does not admit, or one of
+/// the declared non-executable roots — is refused with its typed reason, and
+/// the refusal is the operator-visible error text. No caller can name a
+/// different DDL body or a migration directory.
+fn admit_migration(migration: &CompiledMigration) -> Result<(), AdapterError> {
+    schema_inventory::resolve_executable_body(
+        &migration.migration_id,
+        &migration.statements,
+        migration.generation_after.as_str(),
+        &migration.checksum_sha256,
+    )
+    .map(|_body| ())
+    .map_err(|refusal| {
+        AdapterError::Config(format!(
+            "migration plan is not admitted by the current schema owner {}: {refusal}",
+            schema_inventory::CURRENT_MIGRATION_OWNER
+        ))
+    })
 }
 
 fn is_guard_conflict(error: &str) -> bool {
@@ -199,11 +195,7 @@ fn migration_preflight(
     record: Option<SchemaMetaRecord>,
     migration: &CompiledMigration,
 ) -> Result<MigrationPreflight, AdapterError> {
-    if !is_admitted_migration(migration) {
-        return Err(AdapterError::Config(
-            "migration plan is not admitted by the S-03 schema compiler".to_owned(),
-        ));
-    }
+    admit_migration(migration)?;
     let Some(record) = record else {
         if migration.migration_id == schema::MIGRATION_ID_V2
             && migration.generation_after.as_str() == schema::GENERATION_V2
@@ -232,8 +224,9 @@ fn migration_preflight(
     if record.generation == schema::GENERATION_V1
         && record.migration_id == schema::MIGRATION_ID_V1
         && record.migrations.len() == 1
-        && migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
         && migration.generation_after.as_str() == schema::GENERATION_V2
+        && schema_inventory::required_predecessor_generation(&migration.migration_id)
+            == Some(schema::GENERATION_V1)
     {
         let expected = v1_identity();
         if record.migration_checksum_sha256 != expected.migration_checksum_sha256 {
@@ -537,11 +530,7 @@ async fn apply_migration_direct(
     migration
         .validate()
         .map_err(|r| AdapterError::Config(r.to_owned()))?;
-    if !is_admitted_migration(migration) {
-        return Err(AdapterError::Config(
-            "migration plan is not admitted by the S-03 schema compiler".to_owned(),
-        ));
-    }
+    admit_migration(migration)?;
     let _guard = adapter.write_lock.lock().await;
     state_fence.validate().map_err(StoreError::Foundation)?;
     let existing = read_schema_meta(db, &adapter.config).await?;
