@@ -1072,6 +1072,15 @@ fn command_ids(transition: &PreparedTransition, operation_key: &str) -> Vec<Stri
 /// publications for that kind (issue #1931) and advanced by exactly one, so a
 /// publication can never claim a generation another publication already
 /// holds and a reader can fence a superseded publication out.
+///
+/// The same paragraph of `I5.8` requires the record to name the
+/// `projection_definition_digest` the candidate data was built with, so the
+/// digest is resolved here from the store's declared definition of that kind
+/// (`eliot_store_api::declared_projection_definition_digest`) and never from a
+/// literal in this file. A kind the store has no declaration for has no
+/// publication at all: the transition fails closed with the typed
+/// `StoreError::UnknownOperation` rather than publishing an unidentifiable
+/// definition.
 fn projection_records(
     transition: &PreparedTransition,
     operation_key: &str,
@@ -1096,6 +1105,8 @@ fn projection_records(
                     "projection-{operation_key}-{index}"
                 ))?,
                 projection_kind: kind.clone(),
+                projection_definition_digest:
+                    eliot_store_api::declared_projection_definition_digest(kind)?,
                 projection_generation: generation.projection_generation,
                 source_generation: generation.source_generation,
                 source_cursor,

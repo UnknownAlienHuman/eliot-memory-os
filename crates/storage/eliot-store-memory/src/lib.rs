@@ -5116,6 +5116,8 @@ fn projection_records(
                     "projection-{operation_key}-{index}"
                 ))?,
                 projection_kind: kind.clone(),
+                projection_definition_digest:
+                    eliot_store_api::declared_projection_definition_digest(kind)?,
                 projection_generation: 1,
                 source_generation: 1,
                 source_cursor,

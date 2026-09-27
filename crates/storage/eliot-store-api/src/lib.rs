@@ -4782,6 +4782,15 @@ pub enum SplitView {
 pub struct ProjectionPublicationRecord {
     pub publication_id: ProjectionPublicationId,
     pub projection_kind: String,
+    /// I5.8 `projection_definition_digest`: the identity of the projection
+    /// definition this publication's candidate data was built with.
+    ///
+    /// It is bound to the store's current declaration of
+    /// [`projection_kind`](Self::projection_kind) through
+    /// [`declared_projection_definition_digest`], so a publication whose
+    /// definition is stale is refused instead of read as current. It is
+    /// required, never defaulted, and never substituted with another digest.
+    pub projection_definition_digest: String,
     pub projection_generation: u64,
     pub source_generation: u64,
     pub source_cursor: u64,
@@ -4796,9 +4805,18 @@ pub struct ProjectionPublicationRecord {
 }
 
 impl ProjectionPublicationRecord {
-    /// Validates publication identity and same-fence source heads.
+    /// Validates publication identity, the declared definition digest, and
+    /// same-fence source heads.
+    ///
+    /// The definition digest is required here, not only at a read gate: a
+    /// record that names no declared definition cannot be published at all
+    /// (I5.8 "a stale definition ... leaves the projection PENDING/STALE").
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.projection_kind, "projection_kind")?;
+        validate_digest(
+            &self.projection_definition_digest,
+            "projection_definition_digest",
+        )?;
         validate_text(&self.provenance_manifest_ref, "provenance_manifest_ref")?;
         if self.projection_generation == 0 || self.source_generation == 0 {
             return Err(StoreError::InvalidField {
@@ -4829,6 +4847,51 @@ impl ProjectionPublicationRecord {
         }
         Ok(())
     }
+}
+
+/// Declared projection kinds and the activated read that declares each kind's
+/// definition (I5.8 `projection_definition_digest`).
+///
+/// A transition declares the kinds it publishes as
+/// [`EventProjectionRelationIntents::projection_kinds`]; this table is the
+/// store's own declaration of what each such kind IS. The definition identity
+/// of a kind is therefore the already-derived
+/// [`NamedOperationManifest::digest`] of the generated catalogue entry of its
+/// activated read — the same derivation, owner and validator every other
+/// manifest identity in the store uses, never a constant written into a
+/// publication record. Changing a kind's declared read surface (parameter
+/// schema, version, scope declaration or bounds) changes that digest, which is
+/// precisely the stale definition I5.8 refuses; an unchanged declaration
+/// leaves it identical, so a matching publication stays readable.
+///
+/// A kind that appears in no row has no declared definition at all. That is a
+/// typed refusal ([`StoreError::UnknownOperation`]), never a default, never
+/// another kind's identity, and never a skip: an undeclared kind cannot be
+/// published and cannot be read as current.
+const DECLARED_PROJECTION_KINDS: &[(&str, NamedReadOperation)] = &[(
+    "CurrentEpistemicPosition",
+    NamedReadOperation::GetCurrentEpistemicPosition,
+)];
+
+/// Returns the currently declared definition identity of one projection kind.
+///
+/// The producing path (the planner that builds a
+/// [`ProjectionPublicationRecord`]) and the consuming path (the publication
+/// read gate) both resolve the identity through this one function, so the
+/// value a publication is written with and the value it is read back against
+/// can never drift into two different notions of "the current definition".
+pub fn declared_projection_definition_digest(projection_kind: &str) -> Result<String, StoreError> {
+    let operation = DECLARED_PROJECTION_KINDS
+        .iter()
+        .find(|(kind, _)| *kind == projection_kind)
+        .map(|(_, operation)| *operation)
+        .ok_or(StoreError::UnknownOperation)?;
+    let entries = generated_operation_manifests()?;
+    entries
+        .iter()
+        .find(|entry| entry.name == named_read_operation_name(operation))
+        .map(|entry| entry.digest.as_str().to_owned())
+        .ok_or(StoreError::UnknownOperation)
 }
 
 /// Durable outbox delivery state.  Sender commit is not sink acceptance.
