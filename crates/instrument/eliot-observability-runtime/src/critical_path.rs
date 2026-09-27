@@ -258,6 +258,7 @@ pub struct CriticalPath {
     sinks: CriticalEventSinks,
     held: Arc<Mutex<VecDeque<HeldRecord>>>,
     control_loss_total: Arc<AtomicU64>,
+    retained_overflow: Arc<AtomicU64>,
     replayed_total: Arc<AtomicU64>,
 }
 
@@ -269,6 +270,7 @@ impl CriticalPath {
             sinks,
             held: Arc::new(Mutex::new(VecDeque::new())),
             control_loss_total: Arc::new(AtomicU64::new(0)),
+            retained_overflow: Arc::new(AtomicU64::new(0)),
             replayed_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -335,36 +337,39 @@ impl CriticalPath {
         // durable, visible control-loss state rather than a success
         // indication. The reported state carries the *actual* typed reason
         // each stage returned; a reason is never substituted by a generic one.
-        self.hold(record, attempts);
-        outcome(
-            &event_id,
-            CriticalEventState::ControlLoss {
-                attempts: self.control_loss_attempts(),
-            },
-        )
+        self.hold(record, attempts.clone());
+        outcome(&event_id, CriticalEventState::ControlLoss { attempts })
     }
 
-    /// The exact typed reason the most recent hold recorded.
+    /// Holds one control-loss record, keeping its exact typed reasons.
     ///
-    /// Read under the same lock as the hold, so the reported control-loss
-    /// state and the retained record cannot disagree.
-    fn control_loss_attempts(&self) -> Vec<UnavailableReason> {
-        self.held
-            .lock()
-            .ok()
-            .and_then(|held| held.back().map(|entry| entry.attempts.clone()))
-            .unwrap_or_default()
-    }
-
+    /// The total advances for every record that reached the control-loss state,
+    /// including one the bounded buffer refuses to retain, so the reported loss
+    /// is never smaller than the loss that occurred.
     fn hold(&self, record: CriticalEventRecord, attempts: Vec<UnavailableReason>) {
         let Ok(mut held) = self.held.lock() else {
             return;
         };
+        // The control-loss total counts every record that reached the state,
+        // including one the bounded buffer had to refuse. Counting only the
+        // retained ones would understate the loss, and reporting the state from
+        // another record's reasons would misattribute it.
+        self.control_loss_total.fetch_add(1, Ordering::Relaxed);
         if held.len() >= MAX_HELD_CONTROL_LOSS_RECORDS {
+            self.retained_overflow.fetch_add(1, Ordering::Relaxed);
             return;
         }
         held.push_back(HeldRecord { record, attempts });
-        self.control_loss_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotone count of control-loss records the bounded buffer refused to
+    /// retain because it was already full.
+    ///
+    /// I16.11 forbids silent loss: a record that could not be held for replay is
+    /// a distinct, visible count rather than a dropped write.
+    #[must_use]
+    pub fn control_loss_retained_overflow(&self) -> u64 {
+        self.retained_overflow.load(Ordering::Relaxed)
     }
 
     /// Replays every held control-loss record against the currently returning

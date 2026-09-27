@@ -43,6 +43,9 @@ pub const CONTROL_LOSS_METRIC: &str = "eliot_observability_control_loss_total";
 /// Metric name of the held control-loss record gauge.
 pub const CONTROL_LOSS_HELD_METRIC: &str = "eliot_observability_control_loss_held";
 
+/// Metric name of the control-loss records the bounded buffer refused.
+pub const CONTROL_LOSS_OVERFLOW_METRIC: &str = "eliot_observability_control_loss_overflow_total";
+
 /// Shared bounded metric registry.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry(Mutex<OpenMetrics>);
@@ -103,6 +106,12 @@ impl ObservabilityInstall {
             "critical events held for replay on a returning channel",
             exact_f64(u64::try_from(self.critical_path.held_control_loss()).unwrap_or(u64::MAX)),
         ));
+        self.metrics.record(&Metric::new(
+            CONTROL_LOSS_OVERFLOW_METRIC,
+            MetricKind::Counter,
+            "critical events that reached control_loss but exceeded the bounded retention",
+            exact_f64(self.critical_path.control_loss_retained_overflow()),
+        ));
     }
 }
 
@@ -141,6 +150,14 @@ impl ObservabilityInstallOutcome {
 
 static INSTALL: OnceLock<ObservabilityInstall> = OnceLock::new();
 
+/// Owner of the rolling appender's writer thread for the process lifetime.
+///
+/// `RollingLogHandle` is not cloneable and its `Drop` requests shutdown, so the
+/// handle has to be owned by something that lives as long as the process. An
+/// `OnceLock` is dropped after other statics at exit, which is the only ordering
+/// that can still join the writer thread.
+static APPENDER: OnceLock<RollingLogHandle> = OnceLock::new();
+
 /// Installs the whole observability runtime, or returns the existing one.
 ///
 /// Diagnostics never gate startup (A13.10): a rejected configuration returns a
@@ -173,6 +190,12 @@ pub fn install(
         otlp: otlp_disposition(config.otlp_endpoint.as_deref()),
         profile: config.profile,
     };
+    // The appender handle must outlive this function. `RollingLogHandle`'s Drop
+    // sets the shared shutdown flag, which makes every later `try_send` drop the
+    // record. Keeping the handle here ties the writer thread to the process
+    // lifetime, so `RollingLogHandle::shutdown` stays the only documented way to
+    // stop the appender.
+    let _ = APPENDER.set(log);
     let _ = INSTALL.set(install.clone());
     Ok(ObservabilityInstallOutcome::Installed(install))
 }
