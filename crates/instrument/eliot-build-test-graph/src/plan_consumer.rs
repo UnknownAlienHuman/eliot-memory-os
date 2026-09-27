@@ -12,7 +12,8 @@
 //! 2. revalidate the applicable inputs before execution
 //!                                     (revalidate_plan: candidate, target,
 //!                                      features, graph revision, retained
-//!                                      source commitments)
+//!                                      source commitments, and the frozen
+//!                                      discovery join)
 //! 3. refuse anything that would silently degrade, then emit the plan's own
 //!    reference                     (ChangeImpactPlan::reference)
 //! ```
@@ -24,6 +25,12 @@
 //! drift detection is not reimplemented: every applicable-input check is
 //!   routed through `revalidate_plan`, so one seam alone decides what
 //!   invalidates a plan revision;
+//! actually discovered tests are joined against the frozen plan before the
+//!   reference is emitted: the normalized snapshot observed now is compared
+//!   by value with the plan's frozen discovery join, and a moved candidate,
+//!   target, feature set, snapshot revision, digest, entry count, or
+//!   inventory completeness is refused rather than consumed as current
+//!   evidence;
 //! the emitted reference is the plan's own `reference()`; the consumer never
 //!   mints, bumps, or re-digests a revision, so consuming a plan cannot
 //!   rewrite history;
@@ -41,13 +48,14 @@
 //! (`I10.8.4`, `I18.1`).
 
 use crate::{
-    BuildTestGraph, ChangeImpactPlan, CheckDisposition, PlanCompleteness, PlanConsumer, PlanError,
-    PlanReference, SourceCommitment, StoredPlanEnvelope, revalidate_plan,
+    BuildTestGraph, ChangeImpactPlan, CheckDisposition, DiscoveredTestSnapshot, PlanCompleteness,
+    PlanConsumer, PlanError, PlanReference, SourceCommitment, StoredPlanEnvelope, revalidate_plan,
 };
 
 /// The inputs currently applicable at the resolver / `dev-fast` consume
 /// site: the exact candidate, target and features, the graph as it stands
-/// now, and the source commitments required right now.
+/// now, the source commitments required right now, and the normalized test
+/// discovery snapshot discovered now.
 ///
 /// These are observations supplied by their owning producers. The consumer
 /// verifies them against the retained plan through
@@ -64,6 +72,12 @@ pub struct ApplicableInputs {
     /// against the commitment the plan retained at plan time; a caller
     /// revision string is never trusted alone.
     pub expected_source: Vec<SourceCommitment>,
+    /// The normalized discovery snapshot under the same candidate, target and
+    /// features, as discovered now. It is joined against the plan's frozen
+    /// discovery binding by value, so a moved inventory, a moved snapshot
+    /// revision, or a snapshot from another candidate/target/feature set is
+    /// refused instead of being consumed as current evidence.
+    pub discovery: Option<DiscoveredTestSnapshot>,
 }
 
 impl ApplicableInputs {
@@ -75,6 +89,7 @@ impl ApplicableInputs {
         features: Vec<String>,
         graph: BuildTestGraph,
         expected_source: Vec<SourceCommitment>,
+        discovery: Option<DiscoveredTestSnapshot>,
     ) -> Self {
         Self {
             candidate_revision,
@@ -82,6 +97,7 @@ impl ApplicableInputs {
             features,
             graph,
             expected_source,
+            discovery,
         }
     }
 }
@@ -113,7 +129,8 @@ impl ResolverPlanConsumer {
 
     /// Validates the envelope binding, revalidates the applicable inputs
     /// before execution, and refuses silent degradation. A `PlanReference`
-    /// results; the envelope is read only.
+    /// carrying the verified discovery join results; the envelope is read
+    /// only.
     pub fn consume(&self, stored: &StoredPlanEnvelope) -> Result<PlanReference, PlanError> {
         stored.validate()?;
         revalidate_plan(
@@ -123,6 +140,7 @@ impl ResolverPlanConsumer {
             &self.inputs.target,
             &self.inputs.features,
             &self.inputs.expected_source,
+            self.inputs.discovery.as_ref(),
         )?;
         self.refuse_silent_degradation(&stored.plan)?;
         let reference = stored.plan.reference();
