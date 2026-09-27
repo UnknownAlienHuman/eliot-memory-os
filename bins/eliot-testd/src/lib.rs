@@ -21,16 +21,17 @@ use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
     EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-    KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessTreeId, SessionId,
+    KernelDispatchKey, OperationId, PermitIssuance, ProcessExecutionError, ProcessExecutor,
+    ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessTreeId, SessionId,
     SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots, TestJob, TestdError,
-    TestdSourceObservation, TestdStore, is_admitted_testd_profile, issue_process_admission,
-    testd_profile_binding, testd_profile_resource_limits, validate_running_lease,
+    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots,
+    TestJob, TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
+    issue_process_admission, testd_profile_binding, testd_profile_resource_limits,
+    validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -453,7 +454,9 @@ impl TestdComposition {
     ///
     /// The request is intentionally supplied freshly by Kernel for this
     /// attempt; the durable `TestdJob` projection can never be substituted for
-    /// its consuming permit.
+    /// its consuming permit. The sink is never caller-selected: only the
+    /// attempt-bound [`EvidenceCollector`] (issue #456, Wave B) may serve
+    /// this start, and it must already expect this exact operation.
     pub async fn start_claimed<E: ProcessExecutor + 'static>(
         &self,
         job: &TestJob,
@@ -461,7 +464,7 @@ impl TestdComposition {
         now: u64,
         permit: ProcessAdmissionPermit,
         executor: &E,
-        sink: Arc<dyn ProcessEvidenceSink>,
+        sink: &EvidenceCollector,
     ) -> Result<ProcessStartReceipt, TestdError> {
         start_claimed_from_store(&self.store, job, lease, now, permit, executor, sink).await
     }
@@ -473,6 +476,9 @@ impl TestdComposition {
 /// composition wrapper above. Keeping the store parameter explicit lets the
 /// production one-shot caller attach to the daemon's canonical job row
 /// without constructing a second composition or bypassing the store fence.
+/// The sink is the attempt-bound collector built by the production worker,
+/// never an arbitrary caller-selected sink; a collector bound to another
+/// operation (or none) refuses this start before any executor effect.
 pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
@@ -480,7 +486,7 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     now: u64,
     permit: ProcessAdmissionPermit,
     executor: &E,
-    sink: Arc<dyn ProcessEvidenceSink>,
+    sink: &EvidenceCollector,
 ) -> Result<ProcessStartReceipt, TestdError> {
     let current = store.get(&job.job_id)?.ok_or(TestdError::Invalid {
         field: "job_id",
@@ -501,6 +507,9 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
         return Err(TestdError::InvalidBinding);
     }
     let operation_id = request.operation_id().clone();
+    if !sink.accepts_operation(&operation_id) {
+        return Err(TestdError::InvalidBinding);
+    }
     let request_job_id = request.job_id().as_str().to_owned();
     let process_tree_id = request.process_tree_id().as_str().to_owned();
     let generation = request.generation().get();
@@ -519,8 +528,11 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     {
         return Err(TestdError::InvalidBinding);
     }
+    // The clone shares the worker's collector state (all interior handles
+    // are shared); the executor publishes into the same attempt record.
+    let executor_sink: Arc<dyn eliot_process::ProcessEvidenceSink> = Arc::new(sink.clone());
     executor
-        .start(request, sink)
+        .start(request, executor_sink)
         .await
         .map_err(|error: ProcessExecutionError| TestdError::Contract(error.to_string()))
 }
