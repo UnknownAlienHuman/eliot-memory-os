@@ -4614,11 +4614,12 @@ impl KernelComposition {
     /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`.
     /// `reconcile_key_version: 1` identifies this exact preimage contract;
     /// `requested_recovery_scope` plus the ORS-owned window, status,
-    /// continuation selectors, revision/floor/upper bounds, and returned
-    /// facts are observation legs and remain in the preimage. The consumer
-    /// strips exactly the key and the two later mutation-receipt legs before
-    /// re-hashing. Pure read calls report truthful zero/empty mutation legs
-    /// without running either mutation.
+    /// continuation selectors, revision/floor/upper bounds, window attach
+    /// binding (generation and presenting connection), enumeration
+    /// denominators, and returned facts are observation legs and remain in
+    /// the preimage. The consumer strips exactly the key and the two later
+    /// mutation-receipt legs before re-hashing. Pure read calls report
+    /// truthful zero/empty mutation legs without running either mutation.
     ///
     /// Issue #2731 runs the bounded handoff maintenance after the reconcile
     /// loop on the same recovery path: per presented namespace it retires
@@ -4735,6 +4736,7 @@ impl KernelComposition {
             .reconcile_bridge_events_for_owner(
                 &presenter,
                 live_generation,
+                &session.connection_id,
                 scope.recovery_scope.as_ref(),
             )
             .map_err(|error| match error {
@@ -5563,153 +5565,23 @@ pub(crate) fn bridge_gap_from_payload(
 /// Scope carried by one event reconcile request. Consumed frontiers advance
 /// monotonically at or below the durable cursor; an optional owner-issued
 /// recovery selector asks for one bounded continuation page and is read-only.
+/// The selector wire encoding is the single shared
+/// [`eliot_contracts::BridgeRecoverySelector`] contract: this route validates
+/// it mechanically and ORS owns window/page meaning.
 pub(crate) struct BridgeReconcileScope {
     pub(crate) consumed: Vec<(String, u64)>,
     pub(crate) recovery_scope: Option<serde_json::Value>,
 }
 
-const MAX_BRIDGE_RECOVERY_STREAMS: u64 = 4;
-const MAX_BRIDGE_RECOVERY_EVENTS: u64 = 128;
-const MAX_BRIDGE_RECOVERY_GAPS: u64 = 256;
 const MAX_BRIDGE_RECONCILE_TEXT_BYTES: usize = 1024;
 
-/// Requires a closed field set for one versioned recovery selector. In
-/// particular, a future field cannot silently weaken this route's bounds.
-fn bridge_recovery_scope_fields(
-    object: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> Result<(), TransportError> {
-    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
-fn bridge_recovery_scope_text<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<&'a str, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| {
-            !text.trim().is_empty()
-                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
-                && !text.chars().any(char::is_control)
-        })
-        .ok_or(TransportError::SessionFenced)
-}
-
-fn bridge_recovery_scope_u64(
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<u64, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(TransportError::SessionFenced)
-}
-
-/// Validates one bounded, versioned owner continuation selector. The raw
-/// object is forwarded unchanged to ORS only after this closed typed parse.
+/// Validates one bounded, versioned owner continuation selector against the
+/// single shared contract. The raw object is forwarded unchanged to ORS only
+/// after this closed mechanical parse; window meaning stays with ORS.
 fn validate_bridge_recovery_scope(value: &serde_json::Value) -> Result<(), TransportError> {
-    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
-    if bridge_recovery_scope_u64(object, "version")? != 1 {
-        return Err(TransportError::SessionFenced);
-    }
-    let kind = bridge_recovery_scope_text(object, "kind")?;
-    let window_key = bridge_recovery_scope_text(object, "window_key")?;
-    if window_key.len() != 64
-        || !window_key
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(TransportError::SessionFenced);
-    }
-
-    match kind {
-        "streams" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_stream",
-                    "stream_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_stream")?;
-            let limit = bridge_recovery_scope_u64(object, "stream_limit")?;
-            if limit == 0 || limit > MAX_BRIDGE_RECOVERY_STREAMS {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "stream" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "stream_id",
-                    "after_sequence",
-                    "upper_sequence",
-                    "expected_revision",
-                    "retention_floor",
-                    "event_limit",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            let stream_id = bridge_recovery_scope_text(object, "stream_id")?;
-            if stream_id.contains("::") {
-                return Err(TransportError::SessionFenced);
-            }
-            let after_sequence = bridge_recovery_scope_u64(object, "after_sequence")?;
-            let upper_sequence = bridge_recovery_scope_u64(object, "upper_sequence")?;
-            let expected_revision = bridge_recovery_scope_u64(object, "expected_revision")?;
-            let retention_floor = bridge_recovery_scope_u64(object, "retention_floor")?;
-            let event_limit = bridge_recovery_scope_u64(object, "event_limit")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if expected_revision == 0
-                || after_sequence > upper_sequence
-                || retention_floor > upper_sequence
-                || event_limit == 0
-                || event_limit > MAX_BRIDGE_RECOVERY_EVENTS
-                || gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "unscoped_gaps" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_gap_scope",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_gap_scope")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        _ => return Err(TransportError::SessionFenced),
-    }
-    Ok(())
+    eliot_contracts::BridgeRecoverySelector::parse(value)
+        .map(|_| ())
+        .map_err(|_| TransportError::SessionFenced)
 }
 
 /// Decodes the bounded consumed-frontier list and optional exact recovery

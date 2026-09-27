@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod bridge_event_capacity;
+mod bridge_recovery_selector;
 mod capability_cell_registry;
 mod cell_effective_manifest;
 mod epoch_identity;
@@ -23,6 +24,7 @@ mod module_catalog;
 mod peer_blackboard;
 
 pub use bridge_event_capacity::*;
+pub use bridge_recovery_selector::*;
 pub use capability_cell_registry::*;
 pub use cell_effective_manifest::*;
 pub use epoch_identity::*;
@@ -317,6 +319,12 @@ pub enum ContractError {
     /// A contract version component is too large for its wire form.
     #[error("contract version component is out of range")]
     VersionOutOfRange,
+    /// A closed selector leg fails its mechanical shape or bound check.
+    #[error("{field}: {reason}")]
+    InvalidSelector {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), ContractError> {

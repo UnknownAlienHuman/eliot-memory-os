@@ -41,8 +41,8 @@ pub use eliot_agent_bridge_core::{
 };
 use eliot_contracts::{
     BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
-    BridgeTransportBackpressure, ClockReading, ProductId, RequestId, RequestMetadata, SourceId,
-    StateFence, canonical_json_bytes, sha256_hex,
+    BridgeRecoverySelector, BridgeTransportBackpressure, ClockReading, ProductId, RequestId,
+    RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -1351,32 +1351,55 @@ fn decode_unscoped_gaps(
     Ok(unscoped_gaps)
 }
 
-/// Requires the requested continuation scope to still be present in the
-/// answer with a continuation that still advances past the requested
-/// predecessor; otherwise the page is foreign or stale and refuses.
+/// Encodes the requested continuation scope through the single shared
+/// selector contract, so the emitted bytes always parse where they are
+/// validated. The owner answer must still carry the requested scope with a
+/// continuation that advances past the requested predecessor; otherwise the
+/// page is foreign or stale and refuses.
 fn recovery_scope_value(
     request: &RecoveryReadRequest,
 ) -> Result<serde_json::Value, ProviderFailure> {
     if let Some((stream_id, after_sequence, cut, event_limit, gap_offset, gap_limit)) =
         request.stream_scope()
     {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "stream", "window_key": request.window_key(),
-            "stream_id": stream_id, "after_sequence": after_sequence,
-            "upper_sequence": cut.upper_sequence(), "expected_revision": cut.expected_revision(),
-            "retention_floor": cut.retention_floor(), "event_limit": event_limit,
-            "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        BridgeRecoverySelector::stream(
+            request.window_key().to_owned(),
+            stream_id.to_owned(),
+            after_sequence,
+            cut.upper_sequence(),
+            cut.expected_revision(),
+            cut.retention_floor(),
+            event_limit,
+            gap_offset,
+            gap_limit,
+        )
+        .map(|selector| selector.to_value())
+        .map_err(|_| {
+            event_shape_failure("recovery continuation carries an unencodable stream selector")
+        })
     } else if let Some((after_stream, stream_limit)) = request.stream_list_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "streams", "window_key": request.window_key(),
-            "after_stream": after_stream, "stream_limit": stream_limit,
-        }))
+        BridgeRecoverySelector::streams(
+            request.window_key().to_owned(),
+            after_stream.to_owned(),
+            stream_limit,
+        )
+        .map(|selector| selector.to_value())
+        .map_err(|_| {
+            event_shape_failure("recovery continuation carries an unencodable stream-list selector")
+        })
     } else if let Some((after_gap_scope, gap_offset, gap_limit)) = request.unscoped_gap_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "unscoped_gaps", "window_key": request.window_key(),
-            "after_gap_scope": after_gap_scope, "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        BridgeRecoverySelector::unscoped_gaps(
+            request.window_key().to_owned(),
+            after_gap_scope.to_owned(),
+            gap_offset,
+            gap_limit,
+        )
+        .map(|selector| selector.to_value())
+        .map_err(|_| {
+            event_shape_failure(
+                "recovery continuation carries an unencodable unscoped-gap selector",
+            )
+        })
     } else {
         Err(event_shape_failure(
             "recovery continuation has no bounded selector",
@@ -2135,6 +2158,13 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         };
         // Typed continuity precheck before any snapshot work.
         self.check_continuity(binding)?;
+        // #2798 item 5: a pure read (open or continuation) reconciles no
+        // consumed offer, so it must not mutate the acknowledgement cache:
+        // only a result that carried consumed frontiers confirms the
+        // owner-acked base. Benign no-op with both halves untouched.
+        if result.consumed_frontiers().is_empty() {
+            return Ok(());
+        }
         let (mut owner_acked, mut delivered_sequences) = {
             let owner = self
                 .shared
