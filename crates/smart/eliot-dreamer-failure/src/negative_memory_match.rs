@@ -63,7 +63,7 @@ const SUBJECT_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-subje
 /// or an approximate embedding has no way to be reported as a relation between
 /// two owner-issued identities.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdentityRelation {
     /// Both sides carry the same owner-issued identity.
     ExactIdentity,
@@ -105,7 +105,7 @@ pub struct PredicateComparison {
 
 /// The recorded domain a compared identity came from.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComparedScopeSource {
     /// The canonical action kind or parameter from the failed action record.
     FailedAction,
@@ -281,7 +281,7 @@ pub struct NegativeMemoryCandidatePage {
 
 /// Whether the bounded read could establish the rule scope's page total.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeclaredPageTotal {
     /// The read established the exact page total of the rule scope.
     Known {
@@ -441,7 +441,7 @@ impl NegativeMemoryMatchBound {
 /// missing page cannot certify the absence of an applicable rule. It is a
 /// value, not a comment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnumerationCoverage {
     /// Every page the rule scope names was delivered within the bound.
     Complete {
@@ -461,7 +461,7 @@ pub enum EnumerationCoverage {
 
 /// Why a bounded comparison is not decidable. Each cause keeps its own variant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IncompleteReason {
     /// The read declared a page total but did not deliver every page.
     PageTotalNotDelivered {
@@ -655,7 +655,7 @@ pub struct IncompleteMatch {
 /// `NoMatch` and `Incomplete` are different values. A `Near` payload cannot be
 /// read as an `Exact` payload by any public function in this crate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryOutcome {
     /// An admitted recorded rule's exact predicate and every owner-issued
     /// scope, action, resource, environment and horizon join are satisfied.
@@ -697,7 +697,7 @@ impl NegativeMemoryOutcome {
 
 /// The closed outcome class of a matcher result.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryMatchKind {
     /// An exact admitted match.
     Exact,

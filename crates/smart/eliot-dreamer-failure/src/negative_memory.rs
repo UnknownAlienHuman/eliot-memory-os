@@ -362,7 +362,7 @@ fn bounded(
 /// Every distinct failure keeps its own named variant, so a malformed record is
 /// never reported as a generic code and never collapsed into a string.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryRecordDefect {
     /// The record carried a schema version this owner does not admit.
     UnsupportedSchemaVersion {
@@ -454,7 +454,7 @@ pub fn negative_memory_record_defect(
 /// Why a trigger is not (yet) an admitted exact predicate. Each cause keeps its
 /// own variant; none of them can be silently upgraded to applicability.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryUnresolvedReason {
     /// The record was migrated from a legacy uninterpreted payload, so no
     /// typed trigger parameter is available.
@@ -477,7 +477,7 @@ pub enum NegativeMemoryUnresolvedReason {
 /// a record that cannot state its exact predicate is unresolved, and an
 /// unresolved record can never satisfy an exact match.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryTriggerResolution {
     /// Every owner-declared dimension carries an exact typed value.
     ExactPredicate {
@@ -647,7 +647,7 @@ fn first_divergent_dimension_name(
 /// Owner-issued resource identity kinds. Only exact identities are admitted;
 /// there is no display-name or fuzzy resource kind.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryResourceKind {
     /// An owner-issued task or work-scope target.
     WorkScopeTarget,
@@ -835,7 +835,7 @@ impl NegativeMemoryInvariant {
 /// expressed in. Two horizons are comparable only inside one domain kind and
 /// one domain identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryHorizonDomainKind {
     /// A Governor-assigned causal transaction sequence.
     TransactionSequence,
@@ -907,7 +907,7 @@ impl NegativeMemoryHorizon {
 /// How a recorded horizon relates to a caller-supplied reading of the same
 /// domain.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryHorizonRelation {
     /// Same domain, and the reading is strictly before the bound.
     WithinHorizon {
@@ -981,7 +981,7 @@ impl NegativeMemoryReopenCondition {
 
 /// A retained discriminating-check result. It is evidence, never a decision.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryCheckOutcome {
     /// The owner verifier reports the check passed.
     Passed,
@@ -993,7 +993,7 @@ pub enum NegativeMemoryCheckOutcome {
 
 /// Whether the declared discriminating check has been executed, and its result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryCheckExecution {
     /// The check is specified but not executed; this owner runs nothing.
     NotExecuted,
@@ -1340,7 +1340,7 @@ impl NegativeMemoryFingerprint {
 /// disposition: only an owner may publish this value, and publishing is the
 /// activation step that this owner does not perform.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMemoryDisposition {
     /// Semantic similarity or an unresolved trigger warns only. It never
     /// acquires blocking power.
@@ -1520,7 +1520,7 @@ impl NegativeMemoryActionPolicy {
 /// The type has exactly one value and exists so that the refusal of an
 /// any-scope reading is machine-visible on the wire rather than only prose.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WildcardApplicability {
     /// A legacy untyped payload never grants wildcard applicability.
     Refused,
@@ -1723,9 +1723,15 @@ pub fn migrate_legacy_fingerprint(
     Ok(migration)
 }
 
-/// The exact canonical spelling of an effect class, reused verbatim from the
-/// A-03 dimension vocabulary so a recorded effect class is compared by the
-/// same spelling on both sides.
+/// The exact canonical spelling of an effect class, so a recorded effect class
+/// is compared by the same spelling on both sides.
+///
+/// These four spellings are deliberately upper case while this crate's own
+/// enums are `snake_case`: they are not this crate's vocabulary. They are the
+/// wire spelling of the owning `eliot_receipts::EffectClass`, which carries
+/// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`. Mirroring the owner is what
+/// makes a recorded value comparable with one written by that owner, so these
+/// four must not be folded to this crate's casing.
 #[must_use]
 pub const fn effect_class_text(class: EffectClass) -> &'static str {
     match class {
