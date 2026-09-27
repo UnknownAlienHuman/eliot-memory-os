@@ -611,19 +611,44 @@ pub async fn commit_testd_terminal_owner_fact(
 /// presented to the delivery gate. That is the required outcome rather than a
 /// stub: an unadmitted proposed behavioural change is not delivered to the
 /// subsequent attempt, and the durable receipt records the typed refusal.
+///
+/// No owner publishes a candidate-only promotion boundary at this seam, so
+/// [`eliot_governor::PromotionBoundaryInput::absent`] is presented and the
+/// committed receipt records the withheld promotion verdict with its exact
+/// reason. The verdict is produced on every committed record, so a missing
+/// boundary stays visible as a refusal instead of being treated as admissible;
+/// the boundary-content validation itself starts running the moment an owner
+/// publishes one.
 fn close_terminal_attempt_learning(
     composition: &DaemonComposition,
     evidence: &TestdTerminalCompletionEvidence,
     decision: &eliot_governor::FinishDecisionReceipt,
 ) {
     let activity_name = evidence.job.invocation.instrument.as_str();
-    let detail = match composition.close_attempt_learning(evidence, decision, activity_name, None) {
-        Ok(eliot_governor::LearningClosureOutcome::Committed(receipt)) => if receipt.delivered {
-            "committed; admitted delivery surface is live"
-        } else {
-            "committed; unadmitted, behavioural effect withheld"
+    let detail = match composition.close_attempt_learning(
+        evidence,
+        decision,
+        activity_name,
+        None,
+        eliot_governor::PromotionBoundaryInput::absent(),
+    ) {
+        Ok(eliot_governor::LearningClosureOutcome::Committed(receipt)) => {
+            let promotion = match &receipt.promotion {
+                eliot_governor::LearningPromotionOutcome::Admitted(_) => {
+                    "promotion-admissible".to_owned()
+                }
+                eliot_governor::LearningPromotionOutcome::Withheld { reason } => {
+                    // The refusal is a bounded, redacted contract message: it
+                    // names the field that was refused and never echoes payload.
+                    format!("promotion withheld ({reason})")
+                }
+            };
+            if receipt.delivered {
+                format!("committed; admitted delivery surface is live; {promotion}")
+            } else {
+                format!("committed; unadmitted, behavioural effect withheld; {promotion}")
+            }
         }
-        .to_owned(),
         Ok(eliot_governor::LearningClosureOutcome::NonConsequential { .. }) => {
             "no consequential boundary; no record committed".to_owned()
         }

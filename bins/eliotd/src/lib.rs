@@ -1175,6 +1175,13 @@ impl DaemonComposition {
     /// unadmitted proposed behavioral change is not delivered to the subsequent
     /// attempt.
     ///
+    /// `promotion` is the owner-published candidate-only promotion boundary for
+    /// this attempt together with the attribution and experiment lineage whose
+    /// digests it consumed. The promotion verdict is produced on every committed
+    /// record here. A caller that holds no boundary presents
+    /// [`eliot_governor::PromotionBoundaryInput::absent`], and the committed
+    /// receipt records the withheld verdict with its exact reason.
+    ///
     /// The edge is non-blocking by construction: it reads retained owner
     /// images, performs no transport, and its result is returned to the caller
     /// instead of being propagated into the finish decision (I12.24 line 293).
@@ -1184,6 +1191,7 @@ impl DaemonComposition {
         decision: &eliot_governor::FinishDecisionReceipt,
         activity_name: &str,
         receipt: Option<&eliot_governor::AdmissionReceipt>,
+        promotion: eliot_governor::PromotionBoundaryInput<'_>,
     ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
         self.governor.close_attempt_learning(
             &self.learning_closure,
@@ -1192,6 +1200,7 @@ impl DaemonComposition {
             activity_name,
             None,
             receipt,
+            promotion,
         )
     }
 
