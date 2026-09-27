@@ -1006,6 +1006,74 @@ impl HostComposition {
         )
     }
 
+    /// I1.9 A1 gate: refuses a managed-dependency (Store) restart unless a
+    /// `Committed` journal `StoreRebind` binds the retained approved requirement
+    /// and the exact observed predecessor lineage under the active fence.
+    ///
+    /// The compared requirement digest is recomputed with the same owner
+    /// (`sha256_json`) used when the bind record is written, so no approval
+    /// value is invented here. A corrupt journal already fails the snapshot
+    /// read before this gate; an absent or non-`Committed` bind fails here with
+    /// manual recovery, and the caller route fences automatic restart.
+    #[cfg(windows)]
+    fn require_committed_predecessor_store_bind(
+        &self,
+        snapshot: &HostState,
+        old_process_id: u32,
+        old_process_start_time_100ns: u64,
+        old_image_path: &str,
+        old_job_name: &str,
+    ) -> Result<(), HostError> {
+        let requirement = self
+            .jobs
+            .store_bootstrap_requirement
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store restart has no retained approved bootstrap requirement; manual recovery required"
+                        .to_owned(),
+                )
+            })?;
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store restart has no runtime launch descriptor; manual recovery required"
+                    .to_owned(),
+            )
+        })?;
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store restart has no retained Kernel candidate; manual recovery required"
+                    .to_owned(),
+            )
+        })?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let requirement_digest = sha256_json(requirement)?;
+        let active_fence =
+            record_fence(&self.host, &self.activation_id, &self.activation_generation);
+        let bound = snapshot.store_rebinds.iter().any(|record| {
+            record.state == StoreRebindState::Committed
+                && record.fence == active_fence
+                && record.requirement.as_str() == requirement_digest
+                && record.candidate_binding_digest.as_str() == candidate_digest
+                && record.generation == launch.authority_generation.value()
+                && record.authority_epoch == candidate.kernel_epoch.sequence.get()
+                && record.process_id == old_process_id
+                && record.process_start_time_100ns == old_process_start_time_100ns
+                && record.process_image_path.as_str() == old_image_path
+                && record.job_name.as_str() == old_job_name
+        });
+        if bound {
+            Ok(())
+        } else {
+            Err(HostError::RecoveryRequired(
+                "Store restart refused: no Committed journal StoreRebind binds the approved requirement and predecessor lineage; manual recovery required"
+                    .to_owned(),
+            ))
+        }
+    }
+
     #[cfg(windows)]
     #[allow(clippy::too_many_lines)]
     pub(super) fn execute_store_recovery(
@@ -1158,6 +1226,20 @@ impl HostComposition {
                 "old Store Job does not contain exact process before relaunch".to_owned(),
             ));
         }
+        // I1.9/I1.11: a Host-managed dependency restarts only when the
+        // approved artifact/config binding and the predecessor lineage exist
+        // in a valid journal record. The Committed StoreRebind below carries
+        // the SHA-256 of the retained bootstrap requirement (which embeds
+        // the approved artifact/config hashes) plus the exact predecessor
+        // PID/start/image/Job lineage. A missing record refuses the restart
+        // before termination destroys evidence, and keeps manual recovery.
+        self.require_committed_predecessor_store_bind(
+            &snapshot_before,
+            old_proc.process_id,
+            old_proc.start_time_100ns,
+            &old_proc.image_path,
+            &old_job_name,
+        )?;
         self.jobs.store_restart_attempts = self
             .jobs
             .store_restart_attempts
