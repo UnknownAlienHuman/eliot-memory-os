@@ -89,8 +89,9 @@ impl DevCrateCheckError {
         match self {
             Self::InvalidInput(_) => 2,
             Self::UnknownPackage { .. } => 3,
-            Self::CorpusUnreadable { .. } | Self::CorpusMalformed { .. } => 65,
-            Self::LedgerUnusable { .. } => 65,
+            Self::CorpusUnreadable { .. }
+            | Self::CorpusMalformed { .. }
+            | Self::LedgerUnusable { .. } => 65,
         }
     }
 
@@ -337,8 +338,7 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
             continue;
         }
         if heading_verb == Some("KEEP") && sub.is_some() {
-            let mut tokens = trimmed.split('`').skip(1).step_by(2);
-            while let Some(token) = tokens.next() {
+            for token in trimmed.split('`').skip(1).step_by(2) {
                 if is_package_token(token) {
                     let row = LedgerRow {
                         package: token.to_owned(),
@@ -438,7 +438,7 @@ fn build_fingerprint(
     let manifest_path = cell
         .get("source_manifest")
         .and_then(Value::as_str)
-        .map_or_else(String::new, |path| path.to_owned());
+        .map_or_else(String::new, ToOwned::to_owned);
     let manifest_recomputed = if manifest_path.is_empty() {
         Err("no package manifest path in the corpus".to_owned())
     } else {
@@ -582,31 +582,6 @@ fn check(repo_root: &Path, package: &str) -> Result<Value, DevCrateCheckError> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let normalized: Vec<Value> = selected
-        .iter()
-        .map(|test| {
-            json!({
-                "path": test.get("path").cloned().unwrap_or(Value::Null),
-                "sha256": test.get("sha256").cloned().unwrap_or(Value::Null),
-                "test_attributes": test.get("test_attributes").cloned().unwrap_or(Value::Null),
-                "inline_cfg_test": test.get("inline_cfg_test").cloned().unwrap_or(Value::Null),
-                "classes": test.get("classes").cloned().unwrap_or(Value::Null),
-            })
-        })
-        .collect();
-    let entrypoint = capsule
-        .get("independent_proof_entrypoint")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let entrypoint_state = entrypoint
-        .get("entrypoint")
-        .and_then(|entry| entry.get("state"))
-        .and_then(Value::as_str)
-        .unwrap_or("UNDECLARED");
-    let executable = entrypoint
-        .get("executable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let support = cell
         .get("implementation_support")
         .cloned()
@@ -614,15 +589,7 @@ fn check(repo_root: &Path, package: &str) -> Result<Value, DevCrateCheckError> {
     Ok(json!({
         "receipt": "eliot.dev.crate.check",
         "package": package,
-        "cell": {
-            "cell_id": cell.get("cell_id").cloned().unwrap_or(Value::Null),
-            "crate": cell.get("crate").cloned().unwrap_or(Value::Null),
-            "source_manifest": cell.get("source_manifest").cloned().unwrap_or(Value::Null),
-            "module_manifest": cell.get("module_manifest").cloned().unwrap_or(Value::Null),
-            "reachability": cell.get("reachability").cloned().unwrap_or(Value::Null),
-            "workspace_admission": cell.get("workspace_admission").cloned().unwrap_or(Value::Null),
-            "excluded_scope": cell.get("excluded_scope").cloned().unwrap_or(Value::Null),
-        },
+        "cell": cell_identity(&cell),
         "capsule": {
             "kind": "ModuleTestCapsule",
             "path": capsule_ref.get("path").cloned().unwrap_or(Value::Null),
@@ -639,68 +606,13 @@ fn check(repo_root: &Path, package: &str) -> Result<Value, DevCrateCheckError> {
             "path": target.display().to_string(),
             "origin": target_origin,
         },
-        "applicability": {
-            "state": if entrypoint_state == "DECLARED" && executable {
-                "APPLICABLE_CHECKS_SELECTED"
-            } else {
-                "PENDING_NO_EXECUTABLE_PROOF_ENTRYPOINT"
-            },
-            "independent_proof_entrypoint": entrypoint,
-            "implementation_support": support
-                .get("implementation_support")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "support_ceiling": support.get("support_ceiling").cloned().unwrap_or(Value::Null),
-            "evidence_execution_status": support
-                .get("evidence_execution_status")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "blocking_codes": support.get("blocking_codes").cloned().unwrap_or(Value::Null),
-            "note": "Workspace membership is not applicability: a package is applicable only when the corpus declares an independently executable proof entrypoint for it.",
-        },
+        "applicability": applicability(&capsule, &support),
         "selected_count": selected.len(),
         "executed_count": 0,
         "counts_origin": "selected is the corpus capsule selected_tests slice; executed is zero because this receipt records resolution, not execution",
-        "raw_evidence": {
-            "unit_property_model_tests": capsule
-                .get("unit_property_model_tests")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "expected_nonzero_test_count": capsule
-                .get("expected_nonzero_test_count")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "source_provenance": capsule.get("source_provenance").cloned().unwrap_or(Value::Null),
-        },
-        "normalized_evidence": {
-            "selected_tests": normalized,
-            "test_attribute_count": capsule
-                .get("unit_property_model_tests")
-                .and_then(|unit| unit.get("test_attribute_count"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "fake_port_contract_tests": capsule
-                .get("fake_port_contract_tests")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "fault_restart_replay_cases": capsule
-                .get("fault_restart_replay_cases")
-                .cloned()
-                .unwrap_or(Value::Null),
-        },
-        "proof_ceiling": {
-            "proof_level_ceiling": capsule
-                .get("proof_level_ceiling")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "support_ceiling": support.get("support_ceiling").cloned().unwrap_or(Value::Null),
-            "triad_complete": support.get("triad_complete").cloned().unwrap_or(Value::Null),
-            "index_support_ceiling_with_complete_triad": index
-                .get("support_ceiling_with_complete_triad")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "index_triad_rule": index.get("triad_rule").cloned().unwrap_or(Value::Null),
-        },
+        "raw_evidence": raw_evidence(&capsule),
+        "normalized_evidence": normalized_evidence(&capsule, &selected),
+        "proof_ceiling": proof_ceiling(&capsule, &support, &index),
         "pending_consumer_edge_proof": pending_consumer_edge_proof(&capsule),
         "capability_coverage": coverage,
         "corpus": {
@@ -709,6 +621,96 @@ fn check(repo_root: &Path, package: &str) -> Result<Value, DevCrateCheckError> {
             "package_manifest": cell_path.display().to_string(),
         },
     }))
+}
+
+fn cell_identity(cell: &Value) -> Value {
+    json!({
+        "cell_id": cell.get("cell_id").cloned().unwrap_or(Value::Null),
+        "crate": cell.get("crate").cloned().unwrap_or(Value::Null),
+        "source_manifest": cell.get("source_manifest").cloned().unwrap_or(Value::Null),
+        "module_manifest": cell.get("module_manifest").cloned().unwrap_or(Value::Null),
+        "reachability": cell.get("reachability").cloned().unwrap_or(Value::Null),
+        "workspace_admission": cell.get("workspace_admission").cloned().unwrap_or(Value::Null),
+        "excluded_scope": cell.get("excluded_scope").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Applicability is decided only by the corpus: a package is applicable when
+/// the corpus declares an independently executable proof entrypoint for it.
+/// Workspace membership is recorded beside the verdict and is never the reason.
+fn applicability(capsule: &Value, support: &Value) -> Value {
+    let entrypoint = capsule
+        .get("independent_proof_entrypoint")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let declared = entrypoint
+        .get("entrypoint")
+        .and_then(|entry| entry.get("state"))
+        .and_then(Value::as_str)
+        == Some("DECLARED");
+    let executable = entrypoint
+        .get("executable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json!({
+        "state": if declared && executable {
+            "APPLICABLE_CHECKS_SELECTED"
+        } else {
+            "PENDING_NO_EXECUTABLE_PROOF_ENTRYPOINT"
+        },
+        "independent_proof_entrypoint": entrypoint,
+        "implementation_support": support.get("implementation_support").cloned().unwrap_or(Value::Null),
+        "support_ceiling": support.get("support_ceiling").cloned().unwrap_or(Value::Null),
+        "evidence_execution_status": support.get("evidence_execution_status").cloned().unwrap_or(Value::Null),
+        "blocking_codes": support.get("blocking_codes").cloned().unwrap_or(Value::Null),
+        "note": "Workspace membership is not applicability: a package is applicable only when the corpus declares an independently executable proof entrypoint for it.",
+    })
+}
+
+fn raw_evidence(capsule: &Value) -> Value {
+    json!({
+        "unit_property_model_tests": capsule.get("unit_property_model_tests").cloned().unwrap_or(Value::Null),
+        "expected_nonzero_test_count": capsule.get("expected_nonzero_test_count").cloned().unwrap_or(Value::Null),
+        "source_provenance": capsule.get("source_provenance").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn normalized_evidence(capsule: &Value, selected: &[Value]) -> Value {
+    let tests: Vec<Value> = selected
+        .iter()
+        .map(|test| {
+            json!({
+                "path": test.get("path").cloned().unwrap_or(Value::Null),
+                "sha256": test.get("sha256").cloned().unwrap_or(Value::Null),
+                "test_attributes": test.get("test_attributes").cloned().unwrap_or(Value::Null),
+                "inline_cfg_test": test.get("inline_cfg_test").cloned().unwrap_or(Value::Null),
+                "classes": test.get("classes").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    json!({
+        "selected_tests": tests,
+        "test_attribute_count": capsule
+            .get("unit_property_model_tests")
+            .and_then(|unit| unit.get("test_attribute_count"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "fake_port_contract_tests": capsule.get("fake_port_contract_tests").cloned().unwrap_or(Value::Null),
+        "fault_restart_replay_cases": capsule.get("fault_restart_replay_cases").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn proof_ceiling(capsule: &Value, support: &Value, index: &Value) -> Value {
+    json!({
+        "proof_level_ceiling": capsule.get("proof_level_ceiling").cloned().unwrap_or(Value::Null),
+        "support_ceiling": support.get("support_ceiling").cloned().unwrap_or(Value::Null),
+        "triad_complete": support.get("triad_complete").cloned().unwrap_or(Value::Null),
+        "index_support_ceiling_with_complete_triad": index
+            .get("support_ceiling_with_complete_triad")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "index_triad_rule": index.get("triad_rule").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn undeclared_cell_receipt(
