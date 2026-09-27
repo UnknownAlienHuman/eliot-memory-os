@@ -23,7 +23,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::KernelLaunchBinding;
-use crate::{ELIOTD_RECEIPT_PENDING_REJECTION, PROTOCOL_VERSION, SERVICE_NAME};
+use crate::{DaemonError, ELIOTD_RECEIPT_PENDING_REJECTION, PROTOCOL_VERSION, SERVICE_NAME};
 
 #[derive(Debug, Error)]
 pub(crate) enum KernelClientError {
@@ -122,28 +122,22 @@ impl super::DaemonKernelClient {
     }
 }
 
+/// The daemon module's published I6.4 contract projection.
+///
+/// `module_contract.required_capabilities` carries runtime dependency edges onto
+/// other hot modules. The `daemon` capability the daemon needs from the Kernel
+/// is a handshake-requested capability (carried by `ClientHello.capabilities`),
+/// not a runtime module-graph edge, so it is deliberately absent here: the two
+/// lists are never conflated.
 #[cfg(windows)]
-pub(super) fn client_hello(
-    binding: &KernelLaunchBinding,
-) -> Result<ClientHello, KernelClientError> {
-    let module_id = ContractId::new("eliotd")
-        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-    let artifact_id = ArtifactId::new(binding.daemon_artifact_sha256.as_str())
-        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-    // `module_contract.required_capabilities` carries runtime dependency edges
-    // onto other hot modules. The `daemon` capability the daemon needs from the
-    // Kernel is a handshake-requested capability (carried by
-    // `ClientHello.capabilities` below), not a runtime module-graph edge, so it
-    // is deliberately absent here: the two lists are never conflated.
-    //
-    // The projection published below is compared field-by-field with the
-    // contract parsed from the exact `module.toml` bytes admitted from the
-    // accepted artifact location, so a substituted manifest or an edited
-    // declaration is refused instead of published.
-    let contract = ModuleContract {
-        module_id: module_id.clone(),
+pub(crate) fn declared_module_contract(
+    module_id: ContractId,
+    artifact_id: ArtifactId,
+) -> ModuleContract {
+    ModuleContract {
+        module_id,
         version: ContractVersion::new(1, 0, 0),
-        artifact_id: artifact_id.clone(),
+        artifact_id,
         protocols: vec![PROTOCOL_VERSION.to_owned()],
         capabilities: Vec::new(),
         required_capabilities: Vec::new(),
@@ -171,9 +165,43 @@ pub(super) fn client_hello(
         architecture: Vec::new(),
         telemetry: "telemetry/eliotd-v1".to_owned(),
         removal_boundary: "eliotd".to_owned(),
-    };
-    compare_published_projection(&binding.admitted_manifest, &contract)
+    }
+}
+
+/// Admits the daemon's immutable runtime manifest and returns the module
+/// contract projection the Kernel handshake must publish.
+///
+/// The manifest bytes are loaded from the admitted artifact location through the
+/// protected path lease and admitted against the accepted build identity; the
+/// publisher's declaration is then compared field-by-field with the contract
+/// those exact bytes carry, so a substituted or edited manifest is refused
+/// rather than published.
+///
+/// This is the daemon's manifest admission boundary. It is deliberately not
+/// reached from the live startup path: no build/package owner emits
+/// `module.toml` beside the artifact yet, so a live call could only fail. The
+/// wiring is blocked on that absent packaging owner.
+#[cfg(windows)]
+pub fn admitted_daemon_module_contract(
+    accepted_artifact_sha256: &str,
+) -> Result<ModuleContract, DaemonError> {
+    let admitted = crate::daemon_config::admit_daemon_module_manifest(accepted_artifact_sha256)?;
+    let contract =
+        declared_module_contract(admitted.module_id.clone(), admitted.artifact_id.clone());
+    compare_published_projection(&admitted, &contract)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    Ok(contract)
+}
+
+#[cfg(windows)]
+pub(super) fn client_hello(
+    binding: &KernelLaunchBinding,
+) -> Result<ClientHello, KernelClientError> {
+    let module_id = ContractId::new("eliotd")
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+    let artifact_id = ArtifactId::new(binding.daemon_artifact_sha256.as_str())
+        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+    let contract = declared_module_contract(module_id.clone(), artifact_id.clone());
     let generation = ModuleGeneration {
         module_id,
         generation: binding.module_generation,

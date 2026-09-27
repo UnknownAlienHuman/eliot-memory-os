@@ -87,9 +87,12 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
 /// from the admitted artifact location of the running image, never from the
 /// process working directory and never from a mutable source-tree copy, and the
 /// exact bytes are admitted against the accepted build identity. A missing,
-/// unreadable, substituted or unsupported manifest refuses the load: the daemon
-/// does not start without its admitted immutable contract.
-fn admit_daemon_module_manifest(
+/// unreadable, substituted or unsupported manifest is refused.
+///
+/// This is the daemon's manifest admission entry point. It is deliberately not
+/// reached from the live startup path: no build/package owner emits
+/// `module.toml` beside the artifact yet, so a live call could only fail.
+pub fn admit_daemon_module_manifest(
     accepted_artifact_sha256: &str,
 ) -> Result<AdmittedModuleManifest, DaemonError> {
     validate_sha256(accepted_artifact_sha256, "executable digest")?;
@@ -246,7 +249,6 @@ impl DaemonConfig {
             launch_nonce: format!("eliotd:{}", launch.instance_id),
             kernel_artifact_sha256: launch.kernel.artifact_digest.clone(),
             daemon_artifact_sha256: launch.kernel.artifact_digest.clone(),
-            admitted_manifest: admit_daemon_module_manifest(&launch.kernel.artifact_digest)?,
         };
         Ok(Self {
             launch,
@@ -293,7 +295,6 @@ impl DaemonConfig {
             // peer/generation snapshot identity.
             kernel_artifact_sha256: launch.kernel.artifact_digest.clone(),
             daemon_artifact_sha256: expected_artifact_sha256.to_owned(),
-            admitted_manifest: admit_daemon_module_manifest(expected_artifact_sha256)?,
         };
         Ok(Self {
             launch,

@@ -149,7 +149,9 @@ pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
     controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
 };
-pub use daemon_config::DaemonConfig;
+pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
+#[cfg(windows)]
+pub use daemon_kernel_client::admitted_daemon_module_contract;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
@@ -308,10 +310,6 @@ struct KernelLaunchBinding {
     launch_nonce: String,
     kernel_artifact_sha256: String,
     daemon_artifact_sha256: String,
-    /// Immutable `module.toml` admitted from the accepted artifact location and
-    /// bound to `daemon_artifact_sha256`. The Kernel handshake publishes only a
-    /// projection that matches these exact bytes.
-    admitted_manifest: eliot_runtime_contracts::AdmittedModuleManifest,
 }
 
 /// Errors raised while loading or composing the daemon.
