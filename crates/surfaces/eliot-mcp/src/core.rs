@@ -18,8 +18,9 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, canonical_tool_schemas,
-    decode_protected_request_bytes, reject_duplicate_keys, validate_proof_ceiling,
+    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection,
+    decode_protected_request_bytes, published_mcp_tool_surface, reject_duplicate_keys,
+    validate_proof_ceiling, validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -2253,6 +2254,36 @@ pub fn build_host_invocation(
             json!({ "tool": bound_wire_text(tool_name) }),
         )
     })?;
+    let descriptor = published_mcp_tool_surface()
+        .map_err(|_| {
+            WireRejection::new(
+                WIRE_INTERNAL_ERROR,
+                "generated tool schemas are unavailable",
+            )
+        })?
+        .into_iter()
+        .find(|descriptor| descriptor.name == tool_name)
+        .ok_or_else(|| {
+            WireRejection::with_data(
+                WIRE_METHOD_NOT_FOUND,
+                "tool has no advertised canonical contract",
+                json!({ "tool": bound_wire_text(tool_name) }),
+            )
+        })?;
+    let owner = validate_tool_request_owner(&tool).map_err(|_| {
+        WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool has no registered semantic owner",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        )
+    })?;
+    if descriptor.definition_version != owner.method.definition_version {
+        return Err(WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool schema version does not match its decoder contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        ));
+    }
     reject_blank_wire_id(correlation)?;
     let correlation_id = HostCorrelationId::new(correlation.correlation_text()).map_err(|_| {
         WireRejection::new(
@@ -2626,7 +2657,7 @@ fn bound_wire_text(value: &str) -> String {
 }
 
 fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
-    let schemas = canonical_tool_schemas().map_err(|_| {
+    let schemas = published_mcp_tool_surface().map_err(|_| {
         WireRejection::new(
             WIRE_INTERNAL_ERROR,
             "generated tool schemas are unavailable",
@@ -2640,6 +2671,10 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
                 "description": schema.description,
                 "inputSchema": schema.input_schema,
                 "outputSchema": schema.output_schema,
+                "_meta": {
+                    "eliot/schemaSha256": schema.schema_sha256,
+                    "eliot/definitionVersion": schema.definition_version,
+                },
             })
         })
         .collect();
