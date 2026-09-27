@@ -567,6 +567,26 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Daemon-held Governor outcome registry view (issue #1961, I3.4).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`] and owned here for
+    /// the daemon's lifetime, so a broad degradation outcome recorded by one
+    /// model-invoke attempt keeps refusing later attempts instead of dying
+    /// with the call that observed it. Only evidence-backed broad scopes are
+    /// stored (installation blocks, generation blocks keyed by exact
+    /// fingerprint, session blocks keyed by session owner); item-, call- and
+    /// attempt-scoped outcomes are never stored here and stay visible on the
+    /// attempt receipt that produced them.
+    ///
+    /// Interior mutability is the established pattern on this composition
+    /// root (see `skill_catalogue`): the governed model adapter borrows
+    /// `&DaemonComposition`, so a held view it must record into cannot be
+    /// reached through a `&mut` accessor without changing that lifetime.
+    /// Semantics stay in [`CapabilityRegistryView`]; this field is only its
+    /// owner. It is in-process state: a restart re-derives from evidence
+    /// rather than reading a durable record back, and no canonical-store
+    /// persistence is claimed for it here.
+    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
     /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
     ///
     /// Constructed empty at [`DaemonComposition::start`] and owned by the
@@ -861,6 +881,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
             external_attach: None,
         })
@@ -2657,6 +2678,28 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(&mut self.capability_admission)
+    }
+
+    /// Locks the daemon-held Governor outcome registry view (#1961, I3.4).
+    ///
+    /// Post-`start` attach-style accessor, mirroring
+    /// [`Self::capability_admission`]: readiness is checked first so a
+    /// refused view is never observed on the unadmitted path. The governed
+    /// model gate records a broad outcome into this held view and reads
+    /// eligibility back from it, which is what makes a generation-scope block
+    /// outlive the attempt that observed the reproduced failure: the block is
+    /// dropped by the owner's own expiry or explicit requalification, never
+    /// by the end of a call. Locking mirrors the `skill_catalogue` handle.
+    pub fn capability_outcomes(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, CapabilityRegistryView>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(self
+            .capability_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// Consults the held capability admission before route execution (#1957).
