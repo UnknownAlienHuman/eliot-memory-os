@@ -5,8 +5,8 @@
 //!
 //! ```text
 //! PROPOSED → SHAPE_VALIDATED → LOCAL_ADMITTED → ACTIVE_FOR_NEXT_ATTEMPT
-//!   → OBSERVED → RETAIN_LOCAL | OPEN_REUSABLE_CANDIDATE | ROLLBACK
-//!   | EXPIRE | INVALIDATE
+//!   → OBSERVED → RETAIN_LOCAL | OPEN_REUSABLE_CANDIDATE | REVISE
+//!   | ROLLBACK | EXPIRE | INVALIDATE
 //! ```
 //!
 //! Admission and activation are externally owned; this module only tracks the
@@ -15,10 +15,18 @@
 //!
 //! - forward progress follows one edge at a time;
 //! - `Expire` and `Invalidate` preempt from any non-terminal state;
-//! - terminal states have no outgoing transitions;
-//! - there is intentionally no `Revise` event and no resurrection: a terminal
-//!   state never returns to an earlier state. Correcting or retrying a
-//!   terminal overlay requires composing a new overlay revision.
+//! - the six `OBSERVED` dispositions are terminal, and a terminal state never
+//!   returns to an earlier state.
+//!
+//! `REVISE` is the disposition of the observed revision whose next
+//! discriminator was inconclusive. It is terminal for that revision, exactly
+//! like the other five `OBSERVED` dispositions, and it is not a backward edge.
+//! The revised overlay is a distinct revision with a named parent
+//! (`overlay_id_revision_parent_and_state_fence`, I12.24:189); it re-freezes
+//! the pre-evaluation fields required for every nontrivial revision
+//! (I12.24:209) and re-enters this same machine at `Proposed` through
+//! [`crate::compose_campaign_harness_overlay`], then re-enters eligibility
+//! through [`crate::admit_local_with_refs`].
 //!
 //! Illegal transitions fail as [`crate::OverlayError::Contract`] with a
 //! `ScopeMismatch` on `"overlay.lifecycle"`.
@@ -46,6 +54,9 @@ pub enum OverlayLifecycle {
     RetainLocal,
     /// Terminal: handed off as a reusable candidate for external review.
     OpenReusableCandidate,
+    /// Terminal: the next discriminator was inconclusive, so this revision is
+    /// revised. The revised overlay is a new revision with a named parent.
+    Revise,
     /// Terminal: rolled back via exact inverses.
     Rollback,
     /// Terminal: expired before or during evaluation.
@@ -56,9 +67,11 @@ pub enum OverlayLifecycle {
 
 /// Governed event advancing one overlay lifecycle state.
 ///
-/// There is intentionally no `Revise` event: revision of any overlay,
-/// including a terminal one, requires a new overlay revision rather than a
-/// transition of the existing state.
+/// The single `Revise` event is admissible only from `Observed`, and only as
+/// the disposition of that observed revision. It does not reopen the state it
+/// leaves: the revised overlay is a new revision with a named parent, composed
+/// through [`crate::compose_campaign_harness_overlay`] and admitted through
+/// [`crate::admit_local_with_refs`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleEvent {
     /// Validate candidate shape: `Proposed → ShapeValidated`.
@@ -73,6 +86,8 @@ pub enum LifecycleEvent {
     RetainLocal,
     /// Open the observed overlay as a reusable candidate: `Observed → OpenReusableCandidate`.
     OpenReusableCandidate,
+    /// Revise the observed overlay: `Observed → Revise`.
+    Revise,
     /// Roll back the observed overlay: `Observed → Rollback`.
     Rollback,
     /// Expire the overlay from any non-terminal state.
@@ -86,14 +101,16 @@ impl OverlayLifecycle {
     ///
     /// Terminal states ([`OverlayLifecycle::RetainLocal`],
     /// [`OverlayLifecycle::OpenReusableCandidate`],
-    /// [`OverlayLifecycle::Rollback`], [`OverlayLifecycle::Expire`], and
-    /// [`OverlayLifecycle::Invalidate`]) accept no further events.
+    /// [`OverlayLifecycle::Revise`], [`OverlayLifecycle::Rollback`],
+    /// [`OverlayLifecycle::Expire`], and [`OverlayLifecycle::Invalidate`])
+    /// accept no further events.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::RetainLocal
                 | Self::OpenReusableCandidate
+                | Self::Revise
                 | Self::Rollback
                 | Self::Expire
                 | Self::Invalidate
@@ -105,17 +122,18 @@ impl OverlayLifecycle {
 ///
 /// Accepts exactly the normative chain `Proposed → ShapeValidated →
 /// LocalAdmitted → ActiveForNextAttempt → Observed → {RetainLocal |
-/// OpenReusableCandidate | Rollback | Expire | Invalidate}`, plus preemptive
-/// `Expire` / `Invalidate` from any non-terminal state. Terminal states have
-/// no outgoing transitions, and no event resurrects an earlier state.
+/// OpenReusableCandidate | Revise | Rollback | Expire | Invalidate}`, plus
+/// preemptive `Expire` / `Invalidate` from any non-terminal state. Terminal
+/// states have no outgoing transitions, and no event resurrects an earlier
+/// state.
 ///
 /// # Errors
 ///
 /// Returns [`crate::OverlayError::Contract`] (`ScopeMismatch` on
 /// `"overlay.lifecycle"`) for any event that is not the single governed
 /// successor of `state`, including every event applied to a terminal state.
-/// There is no `Revise` event; callers needing a correction must compose a
-/// new overlay revision.
+/// Revising a terminal revision is composition of a new revision, not an event
+/// out of [`OverlayLifecycle::Revise`].
 pub const fn transition(
     state: OverlayLifecycle,
     event: LifecycleEvent,
@@ -146,6 +164,7 @@ pub const fn transition(
         (OverlayLifecycle::Observed, LifecycleEvent::OpenReusableCandidate) => {
             Ok(OverlayLifecycle::OpenReusableCandidate)
         }
+        (OverlayLifecycle::Observed, LifecycleEvent::Revise) => Ok(OverlayLifecycle::Revise),
         (OverlayLifecycle::Observed, LifecycleEvent::Rollback) => Ok(OverlayLifecycle::Rollback),
         (_, LifecycleEvent::Expire) => Ok(OverlayLifecycle::Expire),
         (_, LifecycleEvent::Invalidate) => Ok(OverlayLifecycle::Invalidate),
