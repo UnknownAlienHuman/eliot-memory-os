@@ -87,6 +87,10 @@ mod backup_dispatch;
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+/// Structured bridge diagnostics projection (issue #742). Observability-only:
+/// the module owns vocabulary, redaction, bounded capture, and typed result
+/// projection, and changes no existing bridge behavior or eligibility.
+pub mod diagnostics;
 pub mod task_binding_gate;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
