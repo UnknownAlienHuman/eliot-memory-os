@@ -518,6 +518,32 @@ pub(super) fn run() -> Result<(), String> {
         &launch.executable_sha256,
     )
     .map_err(|error| error.to_string())?;
+    // I16.2/I16.5 (issue #1841): install the bounded-label OpenMetrics stack
+    // and publish the local scrape surface. Best-effort by contract (A13.10):
+    // a refused configuration is reported and the launch funnel continues, so
+    // telemetry can never become a reason the daemon refuses to run. The
+    // install is placed after the protected launch descriptor is known,
+    // because the installation profile is that admitted contour and not an
+    // inference. The Host launch contour carries no scrape address, so none is
+    // admitted and the install reports an absent endpoint rather than
+    // inventing a port.
+    match eliotd::execution_metrics::install_daemon_execution_metrics(&config, None) {
+        Ok(observability) => {
+            observability.publish_runtime_counters();
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.metrics_installed",
+                endpoint = observability.describe(),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.metrics_install_refused",
+                reason = error.to_string(),
+            );
+        }
+    }
     // I3.9: the load above already resolved and enforced the effective canonical
     // configuration — a script, an untyped document, or a lower-layer expansion
     // that no higher layer delegated returns `Err` there, so this line is

@@ -61,6 +61,11 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+/// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
+/// bounded schema, labels, registry and exporter stay owned by
+/// `eliot-observability-runtime`; this module only installs that stack and maps
+/// observations the daemon's own owners already hold onto its catalogue.
+pub mod execution_metrics;
 mod experience_runtime;
 pub mod external_attach_reconciliation;
 pub mod finish_attempt;
