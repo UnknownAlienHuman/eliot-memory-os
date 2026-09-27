@@ -6325,9 +6325,10 @@ impl KernelComposition {
     /// real ordinary request reaches the host request loop; a refused start
     /// fails the operation closed (the staged set stays for the delivery
     /// owner — cleanup is `#2786` territory, never an invented delete
-    /// here). The computed one-shot join gate is projected into the receipt
-    /// so the live join table can close over it; no second registry is
-    /// retained here.
+    /// here). The computed one-shot join gate is projected into the receipt,
+    /// and the composition-retained join table holds the one-shot
+    /// consumption across calls, so an exact same-delivery replay answers
+    /// spent state instead of relaunching the guest.
     #[allow(
         clippy::too_many_lines,
         reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, demand-start, and receipt projection in one audited order"
@@ -6462,27 +6463,55 @@ impl KernelComposition {
             }
             Err(_) => return Err(TransportError::SessionFenced),
         };
-        // Launch-gate admission (#2786 step 8): the staged bundle executes
-        // only against its matching owner join/grant. Expiry is re-verified
-        // at launch instant (closing the validation-to-start window), so
-        // this is a real expiry gate (`Stale` can fire here); anything else
-        // fails closed before the child starts. The join table above is
-        // function-local and dropped after this op, so the one-shot
-        // consumption by this admission is per-op only and buys zero
-        // cross-call replay protection: a repeated call with the same
-        // delivery re-arms the join through the same-delivery replay path
-        // and relaunches the guest (a second guest effect). Cross-call
-        // duplicate suppression depends on the host-half claim dedup, not
-        // on this table.
-        joins
-            .admit_claim(
+        // Launch-gate admission (#2786 steps 3 and 8): the staged bundle
+        // executes only against its matching owner join/grant. The local
+        // table above stays publish scratch (file staging never runs under
+        // the retained lock); the published bundle merges into the
+        // composition-retained join table and admits under one short lock
+        // holding no file I/O and never crossing an await, so concurrent
+        // same-delivery calls linearize here: the first consumes the
+        // one-shot admission and any exact replay observes the spent
+        // record. Expiry is re-verified at launch instant (closing the
+        // validation-to-start window), so this is a real expiry gate
+        // (`Stale` can fire here). A failed launch stays consumed — an
+        // unknown outcome reconciles, it is never blindly retried under
+        // the same delivery — and recovery resubmits under fresh claim
+        // authority (#2786 A7). Anything else fails closed before the
+        // child starts.
+        let admission = {
+            let mut retained = self
+                .wasm_join_table
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let now_ms = unix_ms();
+            retained.prune(now_ms);
+            retained.register_delivery(&bundle.join, &bundle.delivery);
+            retained.admit_claim(
                 bundle.material.claim_id.as_str(),
                 bundle.material.operation_id.as_str(),
                 bundle.join.invocation_digest.as_str(),
                 bundle.delivery.envelope_digest.as_str(),
-                unix_ms(),
+                now_ms,
             )
-            .map_err(|_| TransportError::SessionFenced)?;
+        };
+        match admission {
+            Ok(()) => {}
+            // Same-delivery replay (#2786 step 3): the retained spent
+            // record stands and no second guest effect starts. The caller
+            // receives the exact spent identity, never a fresh launch.
+            Err(eliot_kernel_service::JoinDeny::Replayed) => {
+                return Ok(serde_json::json!({
+                    "kind": "wasm_dispatch_replay",
+                    "value": {
+                        "claim_id": bundle.material.claim_id,
+                        "operation_id": bundle.material.operation_id,
+                        "expires_at": bundle.join.expires_at,
+                        "retry_condition": "resubmit under fresh claim authority",
+                    },
+                }));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        }
         let material_digest = sha256_hex(
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
