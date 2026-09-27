@@ -10,13 +10,20 @@
 //! (the Kernel/Governor grant issuance that produces admissions lives outside
 //! this crate, with issues #15/#18); this cell only validates shape and binds
 //! one exact [`ResearchQueryRequest`] to one admitted operation before any
-//! executor contact.
+//! executor contact. Because the exchange request carries no artifact/config/
+//! protocol digest, no Module Registry reference, no process generation, no
+//! Authority Epoch and no operation identity of its own, the record also
+//! re-proves those eight facts by value against the Kernel's own dispatch
+//! presentation and its sealed receipt
+//! ([`ProviderAdmission::bind_admitted_dispatch`]); carrying them is not the
+//! same as being bound to this operation.
 
 use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
+use eliot_kernel_service::{ResearchProviderDispatch, ResearchProviderDispatchReceipt};
 use eliot_process::{Generation, OperationId};
 use eliot_research_exchange_api::{DisclosureClass, ResearchQueryRequest};
 
-use crate::{BridgeIdentity, is_lowercase_sha256};
+use crate::{BridgeIdentity, admitted_disclosure_wire, is_lowercase_sha256};
 
 /// Stable reason carrier for admission construction/binding refusals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,6 +306,87 @@ impl ProviderAdmission {
             || request.protocol_revision != self.protocol_revision
             || request.required_schema != self.required_schema
             || request.coverage_goal != self.coverage_goal
+        {
+            return Err(AdmissionRefusal::RequestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Re-proves that this record is the record of exactly the Kernel-admitted
+    /// dispatch this process holds a receipt for.
+    ///
+    /// [`ProviderAdmission::validate_request`] binds an *exchange request* to
+    /// this record, and the request carries no artifact/config/protocol digest,
+    /// no Module Registry reference, no process generation, no Authority Epoch
+    /// and no operation identity of its own — those eight facts live only here.
+    /// A record that merely carries them proves nothing about which operation
+    /// was admitted, so this method compares each one **by value** against the
+    /// two records that do carry it: the presented
+    /// [`ResearchProviderDispatch`] and the sealed
+    /// [`ResearchProviderDispatchReceipt`] the Kernel issued for it.
+    ///
+    /// The owner's own proof is reused rather than restated:
+    /// [`ResearchProviderDispatchReceipt::verify_echo`] is the wire owner's
+    /// validator, and its single canonical request-digest equality
+    /// (`receipt.request_sha256` against a re-computed
+    /// `dispatch.canonical_sha256()`) is what makes the presented artifact,
+    /// config and protocol digests, the Module/Capability Registry references,
+    /// the process generation, the Authority Epoch, the State Fence and the
+    /// operation/cancellation identity *the content the live authority actually
+    /// admitted* rather than a well-formed shape. Those four digests have no
+    /// field-wise owner echo to compare against, so a second digest scheme or a
+    /// second identity authority is deliberately not invented here.
+    ///
+    /// What follows the owner proof is the field-wise comparison, so the record
+    /// is self-verifying rather than dependent on a caller's diligence: the
+    /// admission's epoch, State Fence, process generation and operation identity
+    /// are compared against the owner's own echoes, and its artifact,
+    /// config/protocol digests, Module Registry references, privacy/data class,
+    /// budget/deadline and route terms are compared against the admitted
+    /// presentation byte for byte. `coverage_goal` is deliberately absent: it is
+    /// a Researcher inquiry term carried by the exchange request, not a dispatch
+    /// field, and it is already bound by
+    /// [`ProviderAdmission::validate_request`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::RequestMismatch`] when the receipt does not
+    /// echo this dispatch exactly, is not an admitted disposition, or when any
+    /// of the eight identity facts above disagrees by value. There is no
+    /// fallback value, no partial acceptance, and no second reason code: this
+    /// record is either the record of the admitted operation or it is not.
+    pub fn bind_admitted_dispatch(
+        &self,
+        dispatch: &ResearchProviderDispatch,
+        receipt: &ResearchProviderDispatchReceipt,
+    ) -> Result<(), AdmissionRefusal> {
+        receipt
+            .verify_echo(dispatch)
+            .map_err(|_| AdmissionRefusal::RequestMismatch)?;
+        if self.bridge.executable() != dispatch.executable_path.as_str()
+            || self.bridge.executable_sha256() != dispatch.executable_sha256.as_str()
+            || self.config_digest != dispatch.config_digest
+            || self.protocol_digest != dispatch.protocol_digest
+            || self.module_id != dispatch.module_id
+            || self.module_generation_id != dispatch.module_generation_id
+            || self.process_generation.get() != dispatch.process_generation
+            || self.process_generation.get() != receipt.admitted_generation
+            || !self.epoch.is_same_authority(&dispatch.authority_epoch)
+            || !self
+                .epoch
+                .is_same_authority(&receipt.admitted_authority_epoch)
+            || self.fence != dispatch.state_fence
+            || self.fence != receipt.admitted_fence
+            || self.operation_id.as_str() != dispatch.operation_id.as_str()
+            || self.operation_id.as_str() != receipt.operation_id.as_str()
+            || admitted_disclosure_wire(self.disclosure) != dispatch.disclosure.as_str()
+            || self.budget_units != dispatch.budget_units
+            || self.deadline_ms != dispatch.deadline_ms
+            || self.protocol_revision != dispatch.protocol_revision
+            || self.required_schema != dispatch.required_schema
+            || self.bridge_generation != dispatch.bridge_generation
+            || self.inquiry_digest != dispatch.inquiry_digest
+            || self.denominator_digest != dispatch.denominator_digest
         {
             return Err(AdmissionRefusal::RequestMismatch);
         }
