@@ -30,6 +30,7 @@ use eliot_store_api::StoreRecoverySnapshot;
 use eliot_store_api::WriteReceipt;
 use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
+use crate::ReplayVerdict;
 use crate::Request;
 use crate::Response;
 use crate::StoreComposition;
@@ -341,6 +342,46 @@ pub(crate) async fn dispatch_dreamer_job(
     }
 }
 
+/// Classifies one exact-operation receipt lookup through the identity-bound
+/// unknown-write gate and projects the proven answer (issue #1933).
+///
+/// I5.19 / I14.21: the lookup is reconciled by the original operation identity
+/// before anything is reported, so this seam cannot forward an unclassified
+/// answer. A receipt is returned only when the gate proves it answers for this
+/// exact operation identity with a valid reconciliation envelope. Every
+/// non-proven answer — absent, foreign for another identity, invalid, or
+/// envelope-less — becomes the typed reconciling `UnknownOutcome` disposition
+/// with `ReconcileExactOperation` and `ReconcileUnknownOutcome`, never an
+/// empty success and never a replayable result. The gate classifies; it never
+/// authorizes a replay of the queried operation.
+async fn dispatch_receipt_lookup(
+    store: &StoreComposition,
+    operation_id: eliot_store_api::OperationId,
+) -> Response {
+    let context = StoreFailureIdentityContext {
+        operation_id: Some(operation_id.clone()),
+        ..StoreFailureIdentityContext::default()
+    };
+    match store.classified_receipt_lookup(&operation_id).await {
+        // A proven terminal receipt for the exact identity: the committed
+        // receipt itself, or the proven non-application whose resubmission
+        // rule decides between a new identity and canonical gap disposition.
+        Ok((
+            receipt,
+            ReplayVerdict::UseExistingReceipt
+            | ReplayVerdict::NewIdentityOnly
+            | ReplayVerdict::RequiresGapDisposition,
+        )) => response_for_receipt_lookup(receipt, context),
+        // Nothing proves this exact operation, so the outcome is still
+        // unknown: report the reconciling disposition bound to the queried
+        // operation identity instead of an unproven answer.
+        Ok((_, ReplayVerdict::MustReconcile)) => {
+            map_store_error(StoreError::MissingReceiptEnvelope, context)
+        }
+        Err(error) => map_store_error(error, context),
+    }
+}
+
 async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequest) -> Response {
     let context = failure_context_for_named_read(&request);
     match store.named(request).await {
@@ -393,16 +434,7 @@ impl StoreDispatchBackend for StoreComposition {
                     Err(error) => map_composition_error(error, failure_context),
                 }
             }
-            Request::Receipt { operation_id } => {
-                let context = StoreFailureIdentityContext {
-                    operation_id: Some(operation_id.clone()),
-                    ..StoreFailureIdentityContext::default()
-                };
-                match self.receipt(operation_id).await {
-                    Ok(receipt) => response_for_receipt_lookup(receipt, context),
-                    Err(error) => map_store_error(error, context),
-                }
-            }
+            Request::Receipt { operation_id } => dispatch_receipt_lookup(self, operation_id).await,
             // Issue #991: one authenticated reserved-write arm. The sealed
             // request is validated and delegated through the composition's
             // reserved-write operation only; an unsupported backend refuses
