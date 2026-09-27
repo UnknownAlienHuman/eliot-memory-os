@@ -1351,21 +1351,73 @@ fn process_reactive_context_request(
     // caller endpoint as authority.  The retained Kernel contour is selected
     // by HostComposition::current_reactive_context_contour.
     if let Some(source) = request.reactive_context.as_ref() {
-        let _outcome = HostReactiveContextProducer::from_authenticated_source(
+        let producer = match HostReactiveContextProducer::from_authenticated_source(
             source.delivery.clone(),
             source.admission_ref.clone(),
-        )
-        .map(|producer| host.deliver_reactive_context_from_producer(producer));
+        ) {
+            Ok(producer) => producer,
+            Err(error) => {
+                return HostRuntimeControlResponse::reactive_context_pre_effect_rejected_for(
+                    request,
+                    eliot_host_service::runtime_control::ReactiveContextPreEffectFailureKind::
+                        ProducerConstruction,
+                    error.to_string(),
+                );
+            }
+        };
+        return match host.deliver_reactive_context_from_producer(producer) {
+            Ok(receipt) => {
+                HostRuntimeControlResponse::reactive_context_delivery_observed_for(
+                    request, &receipt,
+                )
+            }
+            Err(eliot_host::HostReactiveContextDeliveryError::Producer(error)) => {
+                HostRuntimeControlResponse::reactive_context_pre_effect_rejected_for(
+                    request,
+                    eliot_host_service::runtime_control::ReactiveContextPreEffectFailureKind::
+                        ProducerConstruction,
+                    error.to_string(),
+                )
+            }
+            Err(eliot_host::HostReactiveContextDeliveryError::Host(error)) => {
+                HostRuntimeControlResponse::reactive_context_pre_effect_rejected_for(
+                    request,
+                    eliot_host_service::runtime_control::ReactiveContextPreEffectFailureKind::
+                        HostAdmission,
+                    error.to_string(),
+                )
+            }
+            Err(eliot_host::HostReactiveContextDeliveryError::Delivery(_)
+            | eliot_host::HostReactiveContextDeliveryError::Runtime(_)) => {
+                reactive_context_delivery_unknown(request)
+            }
+        };
     }
-    // The current authenticated Kernel wire has no application receipt or
-    // query/cancel seam.  Preserve that uncertainty on the existing control
-    // response contract even when the durable queue/transport call returned.
+    // A missing typed request cannot be attributed to a queue operation, so
+    // preserve only the runtime-control request identity as unknown.
     HostRuntimeControlResponse::unknown_for(
         request,
         eliot_host_service::runtime_control::runtime_control_unknown_ref(
             "reactive-context",
             request,
         ),
+    )
+}
+
+#[cfg(windows)]
+fn reactive_context_delivery_unknown(
+    request: &eliot_host::HostRuntimeControlRequest,
+) -> HostRuntimeControlResponse {
+    HostRuntimeControlResponse::reactive_context_delivery_unknown_for(request).unwrap_or_else(
+        |_| {
+            HostRuntimeControlResponse::unknown_for(
+                request,
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    "reactive-context-queue-response",
+                    request,
+                ),
+            )
+        },
     )
 }
 

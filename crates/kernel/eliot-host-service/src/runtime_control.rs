@@ -8,11 +8,14 @@
     reason = "provider-neutral runtime-control wire seam keeps explicit validation and frame plumbing"
 )]
 
-use crate::reactive_context_delivery::ReactiveContextDeliveryRequest;
+use crate::reactive_context_delivery::{
+    DeliveryDisposition, ReactiveContextDeliveryReceipt, ReactiveContextDeliveryRequest,
+};
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
     ResourceGeneration, SourceId, StateFence,
 };
+use eliot_host_state::IdempotencyIdentity;
 use eliot_kernel_service::{
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse,
@@ -20,7 +23,7 @@ use eliot_kernel_service::{
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity,
+    ReactiveContextStage, RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
 use serde::{Deserialize, Serialize};
@@ -759,9 +762,86 @@ pub enum HostRuntimeControlResponse {
         request_digest: PlatformHandle,
         response: UserAutomationHostExecutionResponse,
     },
+    ReactiveContextDeliveryObserved {
+        observation: ReactiveContextDeliveryObservation,
+    },
+    ReactiveContextPreEffectRejected {
+        mutation_digest: PlatformHandle,
+        request_digest: PlatformHandle,
+        failure: ReactiveContextPreEffectFailure,
+    },
+    ReactiveContextDeliveryUnknown {
+        mutation_digest: PlatformHandle,
+        request_digest: PlatformHandle,
+        operation: IdempotencyIdentity,
+        pending_ref: PlatformHandle,
+    },
     Unknown {
         pending_ref: PlatformHandle,
     },
+}
+
+/// Exact durable Host queue observation returned for one runtime-control request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveContextDeliveryObservation {
+    /// Mutation digest binding the complete typed delivery request.
+    pub mutation_digest: PlatformHandle,
+    /// Runtime-control request digest for this observation.
+    pub request_digest: PlatformHandle,
+    /// Exact durable Host queue operation identity.
+    pub operation: IdempotencyIdentity,
+    /// Canonical digest of the queued protocol payload.
+    pub payload_sha256: String,
+    /// Durable lifecycle stage reported by the Host queue.
+    pub stage: ReactiveContextStage,
+    /// Host transport/queue disposition; `Delivered` means transport delivery only.
+    pub disposition: ReactiveContextRuntimeDisposition,
+}
+
+/// Closed runtime-control projection of a Host delivery disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReactiveContextRuntimeDisposition {
+    Queued,
+    Delivered,
+    DeliveryUnknown,
+    NotAttempted,
+    Replay,
+    AlreadyAcknowledged,
+    AlreadyTerminal,
+}
+
+impl From<DeliveryDisposition> for ReactiveContextRuntimeDisposition {
+    fn from(value: DeliveryDisposition) -> Self {
+        match value {
+            DeliveryDisposition::Queued => Self::Queued,
+            DeliveryDisposition::Delivered => Self::Delivered,
+            DeliveryDisposition::DeliveryUnknown => Self::DeliveryUnknown,
+            DeliveryDisposition::NotAttempted => Self::NotAttempted,
+            DeliveryDisposition::Replay => Self::Replay,
+            DeliveryDisposition::AlreadyAcknowledged => Self::AlreadyAcknowledged,
+            DeliveryDisposition::AlreadyTerminal => Self::AlreadyTerminal,
+        }
+    }
+}
+
+/// Pre-effect rejection class reported by the Host runtime-control boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReactiveContextPreEffectFailureKind {
+    ProducerConstruction,
+    HostAdmission,
+}
+
+/// Typed reason for a request refused before delivery coordination.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveContextPreEffectFailure {
+    /// Failure boundary that rejected the request before queue/send effects.
+    pub kind: ReactiveContextPreEffectFailureKind,
+    /// Diagnostic from the typed producer or Host admission error.
+    pub reason: String,
 }
 
 fn is_sha256_text(value: &str) -> bool {
@@ -853,6 +933,60 @@ impl HostRuntimeControlResponse {
         }
     }
 
+    /// Bind the durable Host queue receipt to the exact typed delivery request.
+    pub fn reactive_context_delivery_observed_for(
+        request: &HostRuntimeControlRequest,
+        receipt: &ReactiveContextDeliveryReceipt,
+    ) -> Self {
+        Self::ReactiveContextDeliveryObserved {
+            observation: ReactiveContextDeliveryObservation {
+                mutation_digest: request.mutation_digest.clone(),
+                request_digest: request.request_digest.clone(),
+                operation: receipt.entry.operation.clone(),
+                payload_sha256: receipt.entry.payload_sha256.clone(),
+                stage: receipt.entry.stage,
+                disposition: receipt.disposition.into(),
+            },
+        }
+    }
+
+    /// Preserve a typed pre-coordinator refusal without implying a queue entry.
+    pub fn reactive_context_pre_effect_rejected_for(
+        request: &HostRuntimeControlRequest,
+        kind: ReactiveContextPreEffectFailureKind,
+        reason: String,
+    ) -> Self {
+        Self::ReactiveContextPreEffectRejected {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            failure: ReactiveContextPreEffectFailure { kind, reason },
+        }
+    }
+
+    /// Preserve uncertainty while correlating it with the stable intended queue operation.
+    pub fn reactive_context_delivery_unknown_for(
+        request: &HostRuntimeControlRequest,
+    ) -> Result<Self, String> {
+        let source = request
+            .reactive_context
+            .as_ref()
+            .ok_or_else(|| "reactive Context request is absent".to_owned())?;
+        let operation = IdempotencyIdentity {
+            operation_id: PlatformHandle::new(
+                source.delivery.payload.operation_id.as_str().to_owned(),
+            )
+            .map_err(|error| error.to_string())?,
+            idempotency_key: PlatformHandle::new(source.delivery.payload.idempotency_key.clone())
+                .map_err(|error| error.to_string())?,
+        };
+        Ok(Self::ReactiveContextDeliveryUnknown {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            operation,
+            pending_ref: operation_unknown_ref(&request.operation, "queue-response", request),
+        })
+    }
+
     pub fn unknown_for(request: &HostRuntimeControlRequest, pending_ref: PlatformHandle) -> Self {
         let _ = request;
         Self::Unknown { pending_ref }
@@ -890,6 +1024,38 @@ impl HostRuntimeControlResponse {
                 }
                 validate_user_automation_response(false, response)
             }
+            Self::ReactiveContextDeliveryObserved { observation } => {
+                validate_reactive_context_observation(observation)
+            }
+            Self::ReactiveContextPreEffectRejected {
+                mutation_digest,
+                request_digest,
+                failure,
+            } => {
+                validate_runtime_control_digest(mutation_digest, "mutation_digest")?;
+                validate_runtime_control_digest(request_digest, "request_digest")?;
+                if failure.reason.trim().is_empty() {
+                    return Err("reactive Context pre-effect reason is blank".to_owned());
+                }
+                Ok(())
+            }
+            Self::ReactiveContextDeliveryUnknown {
+                mutation_digest,
+                request_digest,
+                operation,
+                pending_ref,
+            } => {
+                validate_runtime_control_digest(mutation_digest, "mutation_digest")?;
+                validate_runtime_control_digest(request_digest, "request_digest")?;
+                if operation.operation_id.as_str().trim().is_empty()
+                    || operation.idempotency_key.as_str().trim().is_empty()
+                {
+                    return Err("reactive Context queue operation identity is blank".to_owned());
+                }
+                parse_runtime_control_unknown_ref(pending_ref)
+                    .map(|_| ())
+                    .ok_or_else(|| "pending_ref is not canonical".to_owned())
+            }
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -914,7 +1080,7 @@ pub fn response_matches_request(
     request: &HostRuntimeControlRequest,
     response: &HostRuntimeControlResponse,
 ) -> bool {
-    if response.validate().is_err() {
+    if request.validate().is_err() || response.validate().is_err() {
         return false;
     }
     match response {
@@ -945,6 +1111,34 @@ pub fn response_matches_request(
                 && *mutation_digest == request.mutation_digest
                 && *request_digest == request.request_digest
                 && user_automation_response_matches_request(request, response)
+        }
+        HostRuntimeControlResponse::ReactiveContextDeliveryObserved { observation } => {
+            request.operation == HostRuntimeControlOperation::DeliverReactiveContext
+                && observation.mutation_digest == request.mutation_digest
+                && observation.request_digest == request.request_digest
+                && reactive_context_observation_matches_request(request, observation)
+        }
+        HostRuntimeControlResponse::ReactiveContextPreEffectRejected {
+            mutation_digest,
+            request_digest,
+            ..
+        } => {
+            request.operation == HostRuntimeControlOperation::DeliverReactiveContext
+                && request.reactive_context.is_some()
+                && *mutation_digest == request.mutation_digest
+                && *request_digest == request.request_digest
+        }
+        HostRuntimeControlResponse::ReactiveContextDeliveryUnknown {
+            mutation_digest,
+            request_digest,
+            operation,
+            pending_ref,
+        } => {
+            request.operation == HostRuntimeControlOperation::DeliverReactiveContext
+                && *mutation_digest == request.mutation_digest
+                && *request_digest == request.request_digest
+                && reactive_context_operation_matches_request(request, operation)
+                && pending_ref_matches_request(pending_ref, request)
         }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
@@ -983,6 +1177,103 @@ fn user_automation_response_matches_request(
     }
     response.validate_for(carrier).is_ok()
 }
+
+fn validate_runtime_control_digest(value: &PlatformHandle, field: &str) -> Result<(), String> {
+    if is_sha256_digest(value) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be sha256"))
+    }
+}
+
+fn validate_reactive_context_observation(
+    observation: &ReactiveContextDeliveryObservation,
+) -> Result<(), String> {
+    validate_runtime_control_digest(&observation.mutation_digest, "mutation_digest")?;
+    validate_runtime_control_digest(&observation.request_digest, "request_digest")?;
+    if !is_sha256_text(&observation.payload_sha256) {
+        return Err("reactive Context payload_sha256 must be sha256".to_owned());
+    }
+    if observation
+        .operation
+        .operation_id
+        .as_str()
+        .trim()
+        .is_empty()
+        || observation
+            .operation
+            .idempotency_key
+            .as_str()
+            .trim()
+            .is_empty()
+    {
+        return Err("reactive Context queue operation identity is blank".to_owned());
+    }
+    let stage_matches = match observation.disposition {
+        ReactiveContextRuntimeDisposition::Queued | ReactiveContextRuntimeDisposition::Replay => {
+            observation.stage == ReactiveContextStage::EnqueuedPersisted
+        }
+        ReactiveContextRuntimeDisposition::Delivered => {
+            observation.stage == ReactiveContextStage::DeliveredToExactEndpoint
+        }
+        ReactiveContextRuntimeDisposition::DeliveryUnknown => matches!(
+            observation.stage,
+            ReactiveContextStage::DeliveryAttempted | ReactiveContextStage::UnknownDelivery
+        ),
+        ReactiveContextRuntimeDisposition::NotAttempted => matches!(
+            observation.stage,
+            ReactiveContextStage::RejectedNotAttempted | ReactiveContextStage::UnavailableFenced
+        ),
+        ReactiveContextRuntimeDisposition::AlreadyAcknowledged => matches!(
+            observation.stage,
+            ReactiveContextStage::RecipientReceived
+                | ReactiveContextStage::RecipientDurable
+                | ReactiveContextStage::NormalizedProjection
+                | ReactiveContextStage::AppliedProjection
+        ),
+        ReactiveContextRuntimeDisposition::AlreadyTerminal => matches!(
+            observation.stage,
+            ReactiveContextStage::RejectedNotAttempted
+                | ReactiveContextStage::AcknowledgementRejected
+                | ReactiveContextStage::AcknowledgementUnknown
+                | ReactiveContextStage::ExpiredBeforeAck
+                | ReactiveContextStage::CancelledRetracted
+                | ReactiveContextStage::StaleSuperseded
+                | ReactiveContextStage::UnavailableFenced
+                | ReactiveContextStage::InvalidAcknowledgement
+        ),
+    };
+    if !stage_matches {
+        return Err("reactive Context disposition does not match durable stage".to_owned());
+    }
+    Ok(())
+}
+
+fn reactive_context_operation_matches_request(
+    request: &HostRuntimeControlRequest,
+    operation: &IdempotencyIdentity,
+) -> bool {
+    let Some(source) = request.reactive_context.as_ref() else {
+        return false;
+    };
+    operation.operation_id.as_str() == source.delivery.payload.operation_id.as_str()
+        && operation.idempotency_key.as_str() == source.delivery.payload.idempotency_key.as_str()
+}
+
+fn reactive_context_observation_matches_request(
+    request: &HostRuntimeControlRequest,
+    observation: &ReactiveContextDeliveryObservation,
+) -> bool {
+    if !reactive_context_operation_matches_request(request, &observation.operation) {
+        return false;
+    }
+    request
+        .reactive_context
+        .as_ref()
+        .and_then(|source| source.delivery.payload.payload_sha256().ok())
+        .is_some_and(|payload_sha256| payload_sha256 == observation.payload_sha256)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1104,7 +1395,14 @@ pub fn runtime_control_response_frame(
         HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
         | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
             request_digest, ..
-        } => request_digest.as_str().to_owned(),
+        }
+        | HostRuntimeControlResponse::ReactiveContextPreEffectRejected { request_digest, .. }
+        | HostRuntimeControlResponse::ReactiveContextDeliveryUnknown { request_digest, .. } => {
+            request_digest.as_str().to_owned()
+        }
+        HostRuntimeControlResponse::ReactiveContextDeliveryObserved { observation } => {
+            observation.request_digest.as_str().to_owned()
+        }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
@@ -1176,8 +1474,15 @@ pub fn decode_runtime_control_response_frame(
         HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
         | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
             request_digest, ..
-        } => {
+        }
+        | HostRuntimeControlResponse::ReactiveContextPreEffectRejected { request_digest, .. }
+        | HostRuntimeControlResponse::ReactiveContextDeliveryUnknown { request_digest, .. } => {
             if frame_request_id.as_str() != request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
+        HostRuntimeControlResponse::ReactiveContextDeliveryObserved { observation } => {
+            if frame_request_id.as_str() != observation.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }
         }
