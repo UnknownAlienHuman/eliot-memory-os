@@ -863,9 +863,12 @@ pub enum CompositionError {
         verdict: GuardVerdict,
         report: Box<TriggerReport>,
     },
-    /// WorkScope readiness or authenticated scan readback failed.
+    /// `WorkScope` readiness or authenticated scan readback failed.
     #[error("WorkScope readiness failed: {0}")]
     WorkScope(#[from] WorkScopeError),
+    /// A `ColdStartLease` admission result retains the exact discovery-lease cause.
+    #[error("cold-start admission degraded: {0:?}")]
+    ColdStartLease(eliot_workscope::OnboardingDegraded),
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
     StartupOrder { expected: String, observed: String },
@@ -5388,7 +5391,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     CompositionError::WorkScope(error)
                 }
                 eliot_workscope::CompileDriverError::Lease(error) => {
-                    CompositionError::Recovery(error.to_string())
+                    CompositionError::ColdStartLease(error)
                 }
             })
     }
@@ -5442,7 +5445,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             receipt.readiness,
             ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
         ) {
-            verify_ready_scan_readback(receipt, scan_readback)?;
+            verify_ready_scan_readback(&receipt, scan_readback)?;
         }
         let surface = receipt
             .surface(&lease)

@@ -142,6 +142,12 @@ pub enum SkillError {
     Surface(String),
     #[error("Skill lifecycle store failure: {0:?}")]
     Store(eliot_store_api::StoreFailure),
+    /// Exact typed `WorkScope` readiness or scan readback failure.
+    #[error("Skill lifecycle WorkScope readiness failed: {0}")]
+    WorkScope(#[from] eliot_workscope::WorkScopeError),
+    /// Exact typed discovery-lease degradation from cold-start admission.
+    #[error("Skill lifecycle cold-start admission degraded: {0:?}")]
+    ColdStartLease(eliot_workscope::OnboardingDegraded),
 }
 
 /// Typed evidence for a canonical write withheld by the `WorkScope` guard.

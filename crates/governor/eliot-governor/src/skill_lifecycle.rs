@@ -254,6 +254,8 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             StoreRecoveryAction::RefreshStateFence,
             ctx,
         ),
+        CompositionError::WorkScope(error) => SkillError::WorkScope(error),
+        CompositionError::ColdStartLease(error) => SkillError::ColdStartLease(error),
         CompositionError::NotReady => map_composition_store_failure(
             StoreFailureDisposition::Unavailable,
             "GOVERNOR_NOT_READY",
