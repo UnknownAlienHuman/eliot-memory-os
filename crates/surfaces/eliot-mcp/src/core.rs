@@ -840,7 +840,7 @@ impl McpCore {
         request: ApplicationRequest,
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
-        validate_application_request(&request)?;
+        let semantic_profile = validate_application_request(&request)?;
         let correlation = RequestCorrelation {
             request_id: request
                 .identity
@@ -916,7 +916,11 @@ impl McpCore {
             }
             Err(other) => return Err(BridgeError::Port(other)),
         };
-        validate_projection(&forwarded.request.session, &projection)?;
+        validate_projection(
+            &forwarded.request.session,
+            &projection,
+            semantic_profile.evidence_ceiling,
+        )?;
         let kind = match projection.kind {
             ProjectionKind::Candidate => ResponseKind::Candidate,
             ProjectionKind::Projection => ResponseKind::Projection,
@@ -1073,7 +1077,9 @@ impl BridgeError {
     }
 }
 
-fn validate_application_request(request: &ApplicationRequest) -> Result<(), BridgeError> {
+fn validate_application_request(
+    request: &ApplicationRequest,
+) -> Result<crate::ToolSemanticProfile, BridgeError> {
     request
         .identity
         .validate()
@@ -1116,7 +1122,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
         ));
     }
     request.tool.validate().map_err(contract_violation)?;
-    validate_tool_semantic_owner(&request.tool)?;
+    let semantic_profile = validate_tool_semantic_owner(&request.tool)?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1135,7 +1141,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
             ));
         }
     }
-    Ok(())
+    Ok(semantic_profile)
 }
 
 fn contract_violation(value: ContractViolation) -> BridgeError {
@@ -1160,14 +1166,15 @@ fn canonical_tool_count() -> usize {
 /// registered [`crate::ToolSemanticProfile`] before any port call; a method
 /// with no owner fails closed here. Routing behavior is read from the profile
 /// by downstream consumers, never inferred from the tool name.
-fn validate_tool_semantic_owner(tool: &ToolRequest) -> Result<(), BridgeError> {
+fn validate_tool_semantic_owner(
+    tool: &ToolRequest,
+) -> Result<crate::ToolSemanticProfile, BridgeError> {
     crate::validate_tool_request_owner(tool).map_err(|error| {
         BridgeError::invalid(
             "tool.name",
             format!("no registered semantic owner: {error}"),
         )
-    })?;
-    Ok(())
+    })
 }
 
 fn validate_active_session_binding(
@@ -1597,8 +1604,15 @@ pub fn derive_transformed_lineage(
 fn validate_projection(
     request_session: &SessionBinding,
     projection: &PortProjection,
+    evidence_ceiling: ProofCeiling,
 ) -> Result<(), BridgeError> {
     validate_proof_ceiling(projection.proof_ceiling).map_err(contract_violation)?;
+    if !projection.proof_ceiling.is_at_most(evidence_ceiling) {
+        return Err(BridgeError::invalid(
+            "response.proof_ceiling",
+            "must not exceed the tool semantic profile evidence ceiling",
+        ));
+    }
     let mut artifacts = BTreeSet::new();
     for artifact in &projection.artifacts {
         if !is_sha256(&artifact.sha256) {
