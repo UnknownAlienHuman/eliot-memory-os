@@ -246,8 +246,9 @@ pub use experience_store::{
 };
 
 pub use write_admission::{
-    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
-    ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservationEnvelopeState,
+    ReservedScopeBinding, ReservedWriteOutcome, ReservedWriteReconciliation, ReservedWriteRequest,
+    ReservedWriteUnsupported, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
     WriteAdmissionProjection, WriterEpochBinding, prepared_transition_digest,
 };
 
@@ -5731,19 +5732,20 @@ pub trait CanonicalStoreClient: Send + Sync {
     /// authenticated Store path (issue #991).
     ///
     /// The default body validates the closed #990 request shape and then
-    /// refuses with [`StoreError::UnknownOperation`] without manufacturing
-    /// durable evidence, touching provider state, or falling back to ordinary
-    /// `Apply`. No successful default body exists: backends without an
-    /// accepted scheduler explicitly report unsupported, and support is
-    /// advertised only from the accepted concrete backend. Real execution
-    /// lands in a later backend slice; the exact Kernel client override lives
-    /// in `eliot-kernel-service`.
+    /// refuses with [`ReservedWriteUnsupported`], which is
+    /// [`StoreError::UnknownOperation`]. It does so without manufacturing
+    /// durable evidence, touching provider state, or delegating to the
+    /// ordinary unreserved `Apply` as a fallback. No successful default body
+    /// exists: backends without an accepted reserved-write backend explicitly
+    /// report unsupported, and support is advertised only from the accepted
+    /// concrete backend. Real execution lands in a later backend slice; the
+    /// exact Kernel client override lives in `eliot-kernel-service`.
     async fn apply_reserved_write(
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        Err(ReservedWriteUnsupported::REFUSAL.into_error())
     }
 
     /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the
