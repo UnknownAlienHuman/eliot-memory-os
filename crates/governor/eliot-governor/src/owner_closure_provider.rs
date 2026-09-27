@@ -2361,8 +2361,13 @@ mod owner_closure_provider_tests {
             .expect("authority"),
             inherited_source_ceiling: None,
             binding: binding(fence),
-            issued_at: LogicalTime::new(1),
-            expires_at: LogicalTime::new(10),
+            // The canonical lifetime the compiled mechanical subset commits to.
+            // It matches the lifetime [`grant_params`] declares, because an
+            // admission whose declared expiry diverges from its canonical grant
+            // cannot be reconciled with the projection compiled from it and is
+            // refused rather than widened.
+            issued_at: LogicalTime::new(1_000),
+            expires_at: LogicalTime::new(10_000),
             max_uses: 2,
             status: GrantStatus::Active,
         }
@@ -2403,6 +2408,20 @@ mod owner_closure_provider_tests {
         OwnerClosureProvider::restore(owner_snapshot(&fence), Some(history(&fence)), &fence)
     }
 
+    /// The one revision token these fixtures declare. No fixture models a
+    /// separate policy, configuration, or lease revision, so all three compiled
+    /// groups carry it; each stays independently content-committed, so changing
+    /// one is a different projection.
+    const FIXTURE_REVISION: &str = "fixture-revision-1";
+
+    /// Canonical-decision digest recorded as the compiled subset's source
+    /// receipt. The compiler only proves the digest contour (lowercase
+    /// SHA-256), so the fixture pins one value for the same reason
+    /// [`PRESERVED_REQUEST_HASH`] is pinned: no test builds the canonical
+    /// decision whose bytes it would be.
+    const FIXTURE_SOURCE_DIGEST: &str =
+        "8c1d0f7a4b6e2391d5c70a8f3b62e9147d0c5a83f1e6b27d9048ac35f1e6b720";
+
     fn grant_params(
         fence: &StateFence,
         operation_id: &str,
@@ -2418,6 +2437,23 @@ mod owner_closure_provider_tests {
             holder_principal: "principal:holder".to_owned(),
             session_id: "session-1".to_owned(),
             scope_id: "scope-1".to_owned(),
+            token_id: format!("token-{grant_id}"),
+            // The canonical grant entry these fixtures already admit names
+            // `op.read` on `res:1`, so the compiled transition and data classes
+            // are that same vocabulary rather than a new label.
+            transition_classes: vec!["op.read".to_owned()],
+            data_classes: vec!["res:1".to_owned()],
+            policy_revision: FIXTURE_REVISION.to_owned(),
+            configuration_revision: FIXTURE_REVISION.to_owned(),
+            lease_revision: FIXTURE_REVISION.to_owned(),
+            heartbeat_interval_ms: None,
+            canonical_source_receipt_ref: format!("decision-{grant_id}"),
+            canonical_source_receipt_sha256: FIXTURE_SOURCE_DIGEST.to_owned(),
+            required_approvals: vec![ApprovalReference {
+                approval_record_id: format!("approval-{grant_id}"),
+                approved_action_hash: PRESERVED_REQUEST_HASH.to_owned(),
+                allowed_once: false,
+            }],
             binding: binding(fence),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,

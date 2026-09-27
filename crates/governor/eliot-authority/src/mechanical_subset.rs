@@ -262,7 +262,15 @@ pub struct MechanicalAuthoritySubset {
     pub binding: AuthorityBinding,
     /// Logical issuance time in Unix milliseconds.
     pub issued_at_ms: i64,
-    /// Logical expiry time in Unix milliseconds. `None` never expires by time.
+    /// Logical expiry time in Unix milliseconds.
+    ///
+    /// Always `Some` for a compiled subset: a canonical `GrantRecoveryRecord`
+    /// has a mandatory `expires_at`, and `compile` refuses a record whose
+    /// lifetime is not strictly increasing. An absent expiry is therefore not
+    /// reachable from the compiler, and an intent that declares none is a
+    /// divergence from the source authority rather than a wider right. The
+    /// caller reconciles the two in exactly one place
+    /// (`eliot-kernel-core::grant_activation_port::MECHANICAL_SUBSET_EXPIRY_MISMATCH`).
     pub expires_at_ms: Option<i64>,
     /// Heartbeat cadence in milliseconds, when the source requires liveness.
     pub heartbeat_interval_ms: Option<u64>,
