@@ -938,9 +938,21 @@ impl DaemonComposition {
                 source_closure,
             )
             .map_err(DaemonError::Composition)?;
+        let (sources, privacy) = source_closure.ok_or_else(|| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "canonical write has no governing-source closure".to_owned(),
+            ))
+        })?;
         let receipt = self
             .governor
-            .commit_canonical_with_readiness(identity, envelope, readiness)
+            .commit_canonical_with_readiness(
+                identity,
+                envelope,
+                readiness,
+                observed_work_scope,
+                sources,
+                privacy,
+            )
             .await
             .map_err(DaemonError::Composition)?;
         if self.governor.refresh_from_kernel().is_err() {

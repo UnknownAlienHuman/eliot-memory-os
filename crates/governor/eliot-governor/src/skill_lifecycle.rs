@@ -313,7 +313,40 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             verdict,
             report,
         })),
+        CompositionError::ScopeSensitiveGuardInputsMissing {
+            trigger,
+            missing_observed_binding,
+            missing_source_closure,
+        } => map_scope_guard_inputs_missing(
+            trigger,
+            missing_observed_binding,
+            missing_source_closure,
+        ),
     }
+}
+
+fn map_scope_guard_inputs_missing(
+    trigger: eliot_workscope::GuardTrigger,
+    missing_observed_binding: bool,
+    missing_source_closure: bool,
+) -> SkillError {
+    use eliot_workscope::GuardTrigger;
+    let field = match (trigger, missing_observed_binding, missing_source_closure) {
+        (GuardTrigger::CanonicalWrite, true, true) => "canonical_write.guard_inputs",
+        (GuardTrigger::CanonicalWrite, true, false) => "canonical_write.observed_work_scope",
+        (GuardTrigger::CanonicalWrite, false, true) => "canonical_write.source_closure",
+        (GuardTrigger::MaterialEffect, true, true) => "material_effect.guard_inputs",
+        (GuardTrigger::MaterialEffect, true, false) => "material_effect.observed_work_scope",
+        (GuardTrigger::MaterialEffect, false, true) => "material_effect.source_closure",
+        _ => "scope_guard.inputs",
+    };
+    let reason = match (missing_observed_binding, missing_source_closure) {
+        (true, true) => "observed WorkScope and governing-source closure are required",
+        (true, false) => "caller-observed WorkScope is required",
+        (false, true) => "governing-source closure is required",
+        (false, false) => "scope guard input failure is inconsistent",
+    };
+    SkillError::InvalidField { field, reason }
 }
 
 fn action_str(action: eliot_skill::LifecycleAction) -> &'static str {
