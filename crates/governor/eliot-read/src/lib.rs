@@ -122,8 +122,8 @@ pub mod provider_memory_feed;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
-    StateFence, TaskId, contract_identity as make_contract_identity,
+    ContractIdentity, ContractVersion, OperationId, ProductId, RequestId, RequestMetadata,
+    SessionId, SourceId, StateFence, TaskId, contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
     AutomationContinuationFailure, CanonicalReadClient, ExperienceRangePage, NamedReadOperation,
@@ -1295,6 +1295,11 @@ pub enum StoreReadFailure {
     ReceiptNotFound,
     /// The receipt envelope is missing; write outcome is unknown.
     MissingReceiptEnvelope,
+    /// A possible write effect remains bound to the admitted operation.
+    UnknownOutcome {
+        /// The exact admitted operation that requires receipt reconciliation.
+        operation_id: OperationId,
+    },
     /// The payload exceeds the named-operation limit.
     PayloadTooLarge,
     /// The store is unavailable; never an empty success.
@@ -1348,7 +1353,7 @@ impl std::fmt::Display for StoreReadFailure {
                 "transition digest mismatch: expected {expected}, observed {observed}"
             ),
             Self::ReceiptNotFound => formatter.write_str("receipt not found"),
-            Self::MissingReceiptEnvelope => {
+            Self::MissingReceiptEnvelope | Self::UnknownOutcome { .. } => {
                 formatter.write_str("receipt envelope is missing; write outcome is unknown")
             }
             Self::PayloadTooLarge => formatter.write_str("payload exceeds named-operation limit"),
@@ -1404,6 +1409,7 @@ impl From<StoreError> for StoreReadFailure {
             }
             StoreError::ReceiptNotFound => Self::ReceiptNotFound,
             StoreError::MissingReceiptEnvelope => Self::MissingReceiptEnvelope,
+            StoreError::UnknownOutcome { operation_id } => Self::UnknownOutcome { operation_id },
             StoreError::PayloadTooLarge => Self::PayloadTooLarge,
             StoreError::Unavailable | StoreError::SnapshotClosePending { .. } => Self::Unavailable,
             StoreError::Serialization(detail) => Self::Serialization(detail),

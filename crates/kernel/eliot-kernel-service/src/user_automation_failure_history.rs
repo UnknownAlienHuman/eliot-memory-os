@@ -85,9 +85,11 @@ fn map_store_error(error: StoreError) -> UserAutomationRuntimeError {
         StoreError::Unavailable => {
             UserAutomationRuntimeError::Unavailable("canonical store unavailable".to_owned())
         }
-        StoreError::MissingReceiptEnvelope => UserAutomationRuntimeError::UnknownOutcome(
-            "receipt envelope is missing; write outcome is unknown".to_owned(),
-        ),
+        StoreError::MissingReceiptEnvelope | StoreError::UnknownOutcome { .. } => {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "receipt envelope is missing; write outcome is unknown".to_owned(),
+            )
+        }
         other => UserAutomationRuntimeError::Rejected(other.to_string()),
     }
 }

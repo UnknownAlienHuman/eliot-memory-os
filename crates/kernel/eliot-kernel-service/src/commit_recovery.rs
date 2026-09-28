@@ -869,7 +869,11 @@ where
     let key = open.idempotency_key.clone();
     let receipt = match query().await {
         Ok(receipt) => receipt,
-        Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
+        Err(
+            StoreError::MissingReceiptEnvelope
+            | StoreError::UnknownOutcome { .. }
+            | StoreError::Unavailable,
+        ) => {
             return Err(CommitRecoveryError::UnknownCommitOpen {
                 idempotency_key: key,
                 paused_scopes: open.ordering_scopes.clone(),
@@ -1056,14 +1060,13 @@ where
                 // operation/key/hash verifier runs here too, so a terminal
                 // record never adopts a different operation's receipt.
                 let receipt = query().await.map_err(|error| match error {
-                    StoreError::MissingReceiptEnvelope | StoreError::Unavailable => {
-                        CommitRecoveryError::ReceiptQueryFailed {
-                            idempotency_key: key.clone(),
-                            detail:
-                                "resolving receipt evidence vanished after terminal disposition"
-                                    .to_owned(),
-                        }
-                    }
+                    StoreError::MissingReceiptEnvelope
+                    | StoreError::UnknownOutcome { .. }
+                    | StoreError::Unavailable => CommitRecoveryError::ReceiptQueryFailed {
+                        idempotency_key: key.clone(),
+                        detail: "resolving receipt evidence vanished after terminal disposition"
+                            .to_owned(),
+                    },
                     error => CommitRecoveryError::ReceiptQueryFailed {
                         idempotency_key: key.clone(),
                         detail: error.to_string(),
@@ -1180,9 +1183,11 @@ where
                 }
             }
         }
-        Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
-            open_problem_state(ors, paused, identity, ordering_scopes)
-        }
+        Err(
+            StoreError::MissingReceiptEnvelope
+            | StoreError::UnknownOutcome { .. }
+            | StoreError::Unavailable,
+        ) => open_problem_state(ors, paused, identity, ordering_scopes),
         Err(error) => {
             // Deterministic refusal: the staged record (if any, from the
             // disposition path) stays open, because the earlier attempt it
@@ -1229,9 +1234,11 @@ where
             }
             Ok(receipt)
         }
-        Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
-            open_problem_state(ors, paused, identity, ordering_scopes)
-        }
+        Err(
+            StoreError::MissingReceiptEnvelope
+            | StoreError::UnknownOutcome { .. }
+            | StoreError::Unavailable,
+        ) => open_problem_state(ors, paused, identity, ordering_scopes),
         Err(error) => Err(CommitRecoveryError::CommitRefused {
             detail: error.to_string(),
         }),

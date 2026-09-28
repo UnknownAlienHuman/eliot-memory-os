@@ -43,8 +43,8 @@
 //! observed success); one `execute_raw` send; strict response binding. A
 //! wrong-kind response is a typed contract defect (`InvalidReceipt`); a
 //! right-kind response misbound to another operation is `IdentityConflict`;
-//! an unknown outcome projects through `into_store_error`
-//! (`MissingReceiptEnvelope`) with no second send and no retry.
+//! an unknown outcome retains the admitted `OperationId` in
+//! `StoreError::UnknownOutcome` with no second send and no retry.
 //!
 //! Reads (`backup_page`, `backup_validate`, `backup_status`) cross no effect
 //! boundary: they keep the pre-commit refusal but skip the post-commit hook,
@@ -114,7 +114,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // into unknown.
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let expected_digest = request.compute_digest()?;
         // Coherence rule: `Begin` requires the envelope identity to equal the
@@ -139,7 +139,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match result {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
+                    return Err(StoreError::UnknownOutcome {
+                        operation_id: admitted_identity.operation_id.clone(),
+                    });
                 }
                 Self::check_backup_begin(&admitted_identity, &expected_digest, &response)
             }
@@ -151,12 +153,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             // unknown-outcome failure already bound to the admitted operation)
             // project to the typed unknown-outcome error. The peer identity is
             // mismatch evidence only; the admitted operation stays unknown.
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-            }) => {
-                let _ = observed;
-                Err(StoreError::MissingReceiptEnvelope)
-            }
+            Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
+                operation_id: admitted_identity.operation_id.clone(),
+            }),
             Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
             Err(error) => Err(error.into_store_error()),
         }
@@ -212,7 +211,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // still refuses before any send, while an armed write fault survives
         // for the admitted write it was armed for.
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_operation_id = handle.operation_id.clone();
         let idempotency_key = handle.idempotency_key.clone();
@@ -278,7 +277,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_handle = handle.clone();
         let idempotency_key = handle.idempotency_key.clone();
@@ -307,17 +306,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match result {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
+                    return Err(StoreError::UnknownOutcome {
+                        operation_id: admitted_handle.operation_id.clone(),
+                    });
                 }
                 Self::check_backup_end(&admitted_handle, &response)
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-            }) => {
-                let _ = observed;
-                Err(StoreError::MissingReceiptEnvelope)
-            }
+            Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
+                operation_id: admitted_handle.operation_id.clone(),
+            }),
             Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
             Err(error) => Err(error.into_store_error()),
         }
@@ -360,7 +358,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_evidence = destination.evidence.clone();
         let idempotency_projection = format!(
@@ -381,6 +379,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             idempotency_key: idempotency_projection,
             canonical_request_hash,
         };
+        let admitted_operation_id = identity.operation_id.clone();
         let idempotency_key = identity.idempotency_key.clone();
         let envelope = StoreBackupRequest {
             context: ctx.clone(),
@@ -398,17 +397,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match result {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
+                    return Err(StoreError::UnknownOutcome {
+                        operation_id: admitted_operation_id.clone(),
+                    });
                 }
                 Self::check_backup_prepare(&admitted_evidence, &response)
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-            }) => {
-                let _ = observed;
-                Err(StoreError::MissingReceiptEnvelope)
-            }
+            Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
+                operation_id: admitted_operation_id,
+            }),
             Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
             Err(error) => Err(error.into_store_error()),
         }
@@ -446,7 +444,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
@@ -472,7 +470,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match result {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
+                    return Err(StoreError::UnknownOutcome {
+                        operation_id: admitted_operation.operation_id.clone(),
+                    });
                 }
                 Self::check_backup_restore(
                     &admitted_operation,
@@ -483,12 +483,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 )
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-            }) => {
-                let _ = observed;
-                Err(StoreError::MissingReceiptEnvelope)
-            }
+            Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
+                operation_id: admitted_operation.operation_id.clone(),
+            }),
             Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
             Err(error) => Err(error.into_store_error()),
         }
@@ -512,7 +509,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
@@ -607,7 +604,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let idempotency_key = format!("store-backup-status:{operation_id}");
         let operation = StoreBackupOperation::Status {
@@ -677,7 +674,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::Unavailable);
         }
         let admitted_operation = first.clone();
         let admitted_first_digest = first.canonical_request_hash.clone();
@@ -703,7 +700,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match result {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
+                    return Err(StoreError::UnknownOutcome {
+                        operation_id: admitted_operation.operation_id.clone(),
+                    });
                 }
                 Self::check_backup_reconcile(
                     &admitted_operation,
@@ -713,12 +712,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 )
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-            }) => {
-                let _ = observed;
-                Err(StoreError::MissingReceiptEnvelope)
-            }
+            Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
+                operation_id: admitted_operation.operation_id.clone(),
+            }),
             Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
             Err(error) => Err(error.into_store_error()),
         }
