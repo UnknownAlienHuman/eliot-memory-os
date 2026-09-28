@@ -53,6 +53,14 @@
 //! qualification proof, so `validate_record` rejects such a record at parse
 //! time and the verdict is maintenance.
 //!
+//! Maintenance is a RUNNING state, not a startup abort: an unrecorded or
+//! unqualified installation resolves through [`resolve_compatibility_verdict`]
+//! to [`CompatibilityVerdict::Maintenance`], the bridge comes up, its startup
+//! report names the exact active version and decision, and every canonical
+//! mutation is refused through [`require_installation_writer`] with that same
+//! report as the refusal's bounded detail. Only the writer path maps a
+//! maintenance verdict to an `Err`.
+//!
 //! Scope honesty: this gate binds the RECORD to installation-visible bytes
 //! (the sibling evidence-snapshot document) and to config claims and the
 //! compiled pin. It does not re-derive the snapshot content address — that
@@ -190,6 +198,34 @@ impl CompatibilityVerdict {
     pub fn report(&self) -> &str {
         match self {
             Self::WriterAdmitted { report } | Self::Maintenance { report, .. } => report,
+        }
+    }
+
+    /// Returns the bounded machine-readable maintenance reason, when this
+    /// verdict is a maintenance one.
+    #[must_use]
+    pub fn maintenance_reason(&self) -> Option<&str> {
+        match self {
+            Self::WriterAdmitted { .. } => None,
+            Self::Maintenance { reason, .. } => Some(reason),
+        }
+    }
+
+    /// Combines two startup-stage verdicts of one launch, fail-closed.
+    ///
+    /// The startup order is gate → connect → re-verify → observed identity, and
+    /// each stage observes a strictly stronger fact than the previous one. A
+    /// maintenance verdict at ANY stage therefore keeps the installation in
+    /// visible non-writer readiness; a later admitted verdict can never
+    /// re-admit a writer an earlier stage refused. When both stages are
+    /// maintenance the earlier reason is kept, because it names the first
+    /// qualification that was missing.
+    #[must_use]
+    pub fn combine(self, later: Self) -> Self {
+        if self.is_writer_admitted() {
+            later
+        } else {
+            self
         }
     }
 }
@@ -337,6 +373,138 @@ fn verify_recorded_evidence_snapshot(
         ));
     }
     EvidenceSnapshotVerification::Matched
+}
+
+/// Resolves the installation-visible compatibility decision for one Store
+/// config path (issue #1932, I5.9).
+///
+/// This is the production decision source of the whole bridge: the recorded
+/// `compatibility.toml` beside the selected Store config, qualified against the
+/// I0.5 evidence snapshot installed beside it and against the
+/// installation-approved artifact digest and bridge schema expectation.
+///
+/// A missing, unreadable or malformed record is an EXPLICIT
+/// [`CompatibilityVerdict::Maintenance`] value, not an error: the
+/// installation has no qualified decision, so the bridge must come up in
+/// visible non-writer readiness and refuse mutations instead of aborting
+/// startup before the provider, the readiness surface and the authenticated
+/// pipe exist. The verdict therefore always states the exact active version
+/// and decision, and the refusal path is
+/// [`require_installation_writer`].
+#[must_use]
+pub fn resolve_compatibility_verdict(
+    config_path: &Path,
+    observed_artifact_digest: &str,
+    expected_schema_generation: &str,
+) -> CompatibilityVerdict {
+    match load_compatibility_for_config(config_path) {
+        Ok(file) => {
+            // The I0.5 evidence qualification is an observed property of the
+            // installed snapshot document, never state of the record.
+            let evidence_verification =
+                load_evidence_snapshot_verification(config_path, &file.surrealdb);
+            evaluate_compatibility(
+                &file.surrealdb,
+                observed_artifact_digest,
+                expected_schema_generation,
+                &evidence_verification,
+            )
+        }
+        Err(reason) => unrecorded_maintenance(&reason),
+    }
+}
+
+/// Enforces the installation-visible decision on the canonical write path.
+///
+/// Returns the startup-shaped report when the installation's decision admits a
+/// canonical writer, and the same report as an explicit refusal otherwise, so a
+/// refused mutation is queryable with the exact active version, decision and
+/// reason. The refusal is fail-closed for every unrecorded or unqualified
+/// record: no qualified generation, no canonical write.
+///
+/// This is deliberately NOT [`resolve_compatibility_verdict`]: the write path
+/// must not admit on a cached verdict. It re-reads the installation-visible
+/// record, so a decision record that is rotated, revoked or removed while the
+/// process runs stops admitting writers at the next mutation instead of
+/// leaving a process-local decision in charge.
+pub fn require_installation_writer(
+    config_path: &Path,
+    observed_artifact_digest: &str,
+    expected_schema_generation: &str,
+) -> Result<String, String> {
+    let file =
+        load_compatibility_for_config(config_path).map_err(|reason| unrecorded_report(&reason))?;
+    let evidence_verification = load_evidence_snapshot_verification(config_path, &file.surrealdb);
+    require_compatibility_for_writer(
+        &file.surrealdb,
+        observed_artifact_digest,
+        expected_schema_generation,
+        &evidence_verification,
+    )
+}
+
+/// Binds one recorded decision to the LIVE observed provider identity and
+/// returns the resulting verdict (issue #1932, backend handoff §3).
+///
+/// The provider child has by now been spawned and its artifact identity proved
+/// over the ownership-verified channel, so the observed digest is the observed
+/// side of the qualification check and record echo alone can never admit: the
+/// recorded digest must equal the observed one, and the recorded active
+/// version must equal the observed `provider.version`.
+///
+/// A rotated binary or a drifted record is an explicit
+/// [`CompatibilityVerdict::Maintenance`] verdict naming the drift, not a
+/// startup abort. The installation stays running and queryable as a non-writer
+/// so the operator can observe the exact decision that refused the write.
+///
+/// The schema generation is compared against the record itself here because
+/// this stage runs after the configuration gate, which already compared it
+/// against the bridge's configured expectation; the caller combines the two
+/// fail-closed, so a schema drift observed there keeps the installation
+/// non-writer.
+#[must_use]
+pub fn observed_identity_verdict(
+    record: &SurrealCompatibility,
+    observed_version: &str,
+    observed_digest: &str,
+    evidence_verification: &EvidenceSnapshotVerification,
+) -> CompatibilityVerdict {
+    let verdict = evaluate_compatibility(
+        record,
+        observed_digest,
+        record.schema_generation.as_str(),
+        evidence_verification,
+    );
+    if !verdict.is_writer_admitted() {
+        return verdict;
+    }
+    match require_observed_identity_match(record, observed_version, observed_digest) {
+        Ok(report) => CompatibilityVerdict::WriterAdmitted { report },
+        Err(reason) => CompatibilityVerdict::Maintenance {
+            report: startup_report(record, "maintenance", &reason, evidence_verification),
+            reason,
+        },
+    }
+}
+
+/// Renders the maintenance verdict for an installation that has no readable
+/// qualified decision record at all. The report keeps the exact field shape of
+/// a recorded decision so one bounded line states `unrecorded` for every absent
+/// fact instead of silently reporting an empty or default version.
+fn unrecorded_maintenance(reason: &str) -> CompatibilityVerdict {
+    CompatibilityVerdict::Maintenance {
+        reason: reason.to_owned(),
+        report: unrecorded_report(reason),
+    }
+}
+
+/// Renders the startup-visible report for an installation with no decision
+/// record. `detail` is the exact load refusal, so an unrecorded installation
+/// still names why no qualified generation is available.
+fn unrecorded_report(detail: &str) -> String {
+    format!(
+        "surrealdb compatibility: active_version=unrecorded transport=unrecorded schema_generation=unrecorded migration_id=unrecorded fallback_line=unrecorded fallback_version=unrecorded canonical_writes=withheld evidence_snapshot=unrecorded evidence_verified=no decision=maintenance detail={detail}"
+    )
 }
 
 /// Evaluates one validated record against the observed installation state.

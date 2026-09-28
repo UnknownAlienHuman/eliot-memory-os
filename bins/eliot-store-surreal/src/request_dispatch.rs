@@ -18,6 +18,7 @@ use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::NamedReadRequest;
+use eliot_store_api::ReadinessReceipt;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreBackupOperation;
 use eliot_store_api::StoreBackupRequest;
@@ -25,11 +26,14 @@ use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
 use eliot_store_api::StoreGenesisRequest;
+use eliot_store_api::StoreHealth;
+use eliot_store_api::StoreHealthStatus;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
 use eliot_store_api::WriteReceipt;
 use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
+use crate::CompatibilityVerdict;
 use crate::ReplayVerdict;
 use crate::Request;
 use crate::Response;
@@ -394,6 +398,159 @@ async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequ
     }
 }
 
+/// Classifies one closed request as a canonical mutation and returns its typed
+/// failure identity context, or `None` for the health/readiness/read surfaces.
+///
+/// The classification is exhaustive over the closed request catalogue, so a new
+/// mutation variant cannot join the catalogue without an explicit decision here.
+/// Reads, health, readiness and reconciliation stay observable while the
+/// installation is in non-writer maintenance; `Backup` is classified as a
+/// mutation because the closed administrative envelope can capture, close,
+/// prepare and restore the canonical durable format.
+fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityContext> {
+    match request {
+        Request::Apply {
+            context,
+            transition,
+            ..
+        } => Some(failure_context_for_operation(
+            context,
+            transition.identity.operation_id.clone(),
+            transition.identity.idempotency_key.clone(),
+        )),
+        Request::ReservedWrite { request } => Some(failure_context_for_operation(
+            &request.context,
+            request.transition.identity.operation_id.clone(),
+            request.transition.identity.idempotency_key.clone(),
+        )),
+        Request::Backup { request } => Some(failure_context_for_backup(request)),
+        Request::InitializeGenesis { context, request } => Some(failure_context_for_operation(
+            context,
+            request.operation_id.clone(),
+            request.idempotency_key.clone(),
+        )),
+        Request::DreamerJob { context, request } => Some(failure_context_for_operation(
+            context,
+            request.request_identity.operation.operation_id.clone(),
+            request.request_identity.operation.idempotency_key.clone(),
+        )),
+        Request::Health
+        | Request::Readiness
+        | Request::Named { .. }
+        | Request::Receipt { .. }
+        | Request::RevisionHeads { .. }
+        | Request::OrderingHeads { .. }
+        | Request::ValidationSnapshot
+        | Request::Recovery { .. } => None,
+    }
+}
+
+/// Resolves the installation-visible compatibility decision for exactly the
+/// requests that observe it or depend on it: health, readiness and every
+/// mutation.
+///
+/// The Q0–Q4 named reads, revision/ordering heads, the validation snapshot,
+/// receipt lookup and recovery snapshot are pure reads and do not read the
+/// decision, so the bounded read path keeps its cost. A mutation is never in
+/// that set, so the gate can never be skipped by a write.
+fn compatibility_verdict_for(
+    composition: &StoreComposition,
+    request: &Request,
+) -> Option<CompatibilityVerdict> {
+    if mutation_failure_context(request).is_some()
+        || matches!(request, Request::Health | Request::Readiness)
+    {
+        Some(composition.compatibility_verdict())
+    } else {
+        None
+    }
+}
+
+/// Refuses one mutation while the installation-visible I5.9 compatibility
+/// decision does not admit a canonical writer (issue #1932).
+///
+/// Returns `None` only for a writer-admitted decision; the caller then runs the
+/// admitted operation unchanged. Otherwise the mutation is refused before any
+/// provider I/O as a typed deterministic rejection bound to the admitted
+/// identity, with `NotAttempted` mutation disposition, and its bounded
+/// `human_detail` carries the exact compatibility report — the active version,
+/// the decision, the transport, the schema generation, the qualified fallback
+/// line and the maintenance reason — so the refusal itself is the queryable
+/// statement of why this installation may not write.
+///
+/// The verdict handed in is resolved from the installation-visible record by
+/// [`StoreComposition::compatibility_verdict`] on the same dispatch, never from
+/// a process-local admission flag cached at startup.
+fn refuse_unqualified_mutation(
+    verdict: &CompatibilityVerdict,
+    failure_context: StoreFailureIdentityContext,
+) -> Option<Response> {
+    if verdict.is_writer_admitted() {
+        return None;
+    }
+    let sanitized = sanitized_identity_context(failure_context);
+    let Ok(mut failure) = StoreFailure::from_store_error(
+        StoreError::InvalidField {
+            field: "store.compatibility",
+            reason: "canonical writes are not admitted by the active compatibility decision",
+        },
+        sanitized.clone(),
+    ) else {
+        return Some(internal_defect_fallback(&sanitized));
+    };
+    // Bounded diagnostic prose only: the control fields above are the contract,
+    // and an out-of-bound or control-bearing report is dropped rather than
+    // turned into an invalid failure.
+    failure.human_detail = Some(verdict.report().to_owned()).filter(|report| {
+        !report.is_empty()
+            && report.len() <= eliot_store_api::MAX_STORE_FAILURE_DETAIL_LEN
+            && !report.chars().any(char::is_control)
+    });
+    if failure.validate().is_err() {
+        return Some(internal_defect_fallback(&sanitized));
+    }
+    Some(Response::canonical_failure(failure))
+}
+
+/// Projects the installation's compatibility state onto the existing health
+/// answer (issue #1932, I5.9).
+///
+/// The provider health observation itself is unchanged. A running store whose
+/// installed generation is not admitted for canonical writes is `Degraded`, so
+/// the supervision plane sees an explicit running-but-degraded store instead of
+/// a healthy writer, and it is never projected to `Ready` while maintenance
+/// holds.
+fn project_compatibility_health(
+    record: StoreHealth,
+    verdict: &CompatibilityVerdict,
+) -> StoreHealth {
+    let mut record = record;
+    if !verdict.is_writer_admitted() {
+        record.status = StoreHealthStatus::Degraded;
+    }
+    record
+}
+
+/// Projects the installation's compatibility state onto the existing readiness
+/// answer (issue #1932, I5.9).
+///
+/// Semantic schema readiness is a provider fact and is not rewritten here: this
+/// projection is the CANONICAL readiness verdict a caller acts on, and while the
+/// installed generation is not admitted for canonical writes that verdict is not
+/// available. Reporting the non-writer state through the existing closed
+/// readiness vocabulary keeps the installation queryable and non-writer at the
+/// same time, instead of advertising a ready writer that refuses every mutation.
+fn project_compatibility_readiness(
+    receipt: ReadinessReceipt,
+    verdict: &CompatibilityVerdict,
+) -> ReadinessReceipt {
+    if verdict.is_writer_admitted() {
+        receipt
+    } else {
+        ReadinessReceipt::unavailable()
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait StoreDispatchBackend: Send + Sync {
     async fn dispatch_request(&self, request: Request) -> Response;
@@ -441,13 +598,35 @@ pub async fn dispatch_with_log<B: StoreDispatchBackend + ?Sized>(
 
 impl StoreDispatchBackend for StoreComposition {
     async fn dispatch_request(&self, request: Request) -> Response {
+        // I5.9 compatibility gate (issue #1932). The decision is resolved from
+        // the installation-visible record on the request surfaces that observe
+        // or perform it, so health and readiness answer with the current
+        // installation state and no mutation can rely on a decision cached at
+        // startup. The gate sits ahead of the whole closed catalogue: a mutation
+        // is refused before any dispatch arm runs, and the read surfaces stay
+        // observable.
+        let verdict = compatibility_verdict_for(self, &request);
+        if let Some(failure_context) = mutation_failure_context(&request)
+            && let Some(verdict) = verdict.as_ref()
+            && let Some(refusal) = refuse_unqualified_mutation(verdict, failure_context)
+        {
+            return refusal;
+        }
         match request {
             Request::Health => match self.health().await {
-                Ok(record) => Response::Health { record },
+                Ok(record) => Response::Health {
+                    record: verdict.map_or(record.clone(), |verdict| {
+                        project_compatibility_health(record, &verdict)
+                    }),
+                },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::Readiness => match self.readiness().await {
-                Ok(receipt) => Response::Readiness { receipt },
+                Ok(receipt) => Response::Readiness {
+                    receipt: verdict.map_or(receipt.clone(), |verdict| {
+                        project_compatibility_readiness(receipt, &verdict)
+                    }),
+                },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::Named { request } => dispatch_named_request(self, request).await,
@@ -497,7 +676,8 @@ impl StoreDispatchBackend for StoreComposition {
             // arm delegates once to the backup dispatch seam. An
             // unimplemented/default port refuses with a typed failure
             // before any provider I/O and never falls back to `Apply` or
-            // any other operation.
+            // any other operation. The envelope is a durable-format
+            // surface, so a non-writer installation refuses it in full.
             Request::Backup { request } => {
                 let failure_context = failure_context_for_backup(&request);
                 // Boxed: restore batches carry bounded head lists plus the
