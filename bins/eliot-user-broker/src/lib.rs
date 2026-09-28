@@ -2041,15 +2041,10 @@ impl BrokerComposition {
         };
         let artifact = self.operator_artifact()?;
         Self::observe_operator_client(redeemed_peer, &artifact)?;
-        if authority.role != granted.role
-            || authority
-                .capabilities
-                .iter()
-                .any(|capability| !granted.capabilities.contains(capability))
-        {
+        if authority.role != granted.role || authority.capabilities != granted.capabilities {
             return Err(
                 BrokerAdmissionRefusal::HumanCapabilityNotGranted.with_platform(
-                    "state-changing request names a role/capability outside the granted binding",
+                    "state-changing request role and capability set must exactly match the redeemed binding",
                 ),
             );
         }
