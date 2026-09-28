@@ -867,6 +867,7 @@ fn anchor_wire(precision: AnchorPrecision) -> &'static str {
         AnchorPrecision::Section => "section",
         AnchorPrecision::Paragraph => "paragraph",
         AnchorPrecision::Line => "line",
+        AnchorPrecision::Symbol => "symbol",
         AnchorPrecision::ByteRange => "byte_range",
     }
 }
