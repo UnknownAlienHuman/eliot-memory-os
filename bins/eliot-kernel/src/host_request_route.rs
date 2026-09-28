@@ -7443,6 +7443,16 @@ pub(crate) fn check_local_state_admission(
 /// take the fresh-answer leg instead of serving a partial answer. A forged
 /// pair fails closed instead of serving. Pure: readback performs no dispatch
 /// and no store IO by construction.
+///
+/// Replay preserves the ORIGINAL execution and result identity — the record is
+/// returned unchanged, nothing re-executes, nothing is overwritten and no
+/// earlier delivery is erased — while the retained result's class is checked
+/// against the class the row actually recorded. The check is one-directional:
+/// it can refuse a replay whose retained claims are internally inconsistent,
+/// and it never promotes a class. A class it does not recognise, or a row that
+/// records no class at all, is served with that unknown intact rather than
+/// resolved here: the disclosure owner has no producer on this path, and this
+/// function is not allowed to become one.
 pub(crate) fn local_read_replay_response(
     receipt: &HostRequestAdmissionReceipt,
     record: &HostRequestRecord,
@@ -7451,6 +7461,22 @@ pub(crate) fn local_read_replay_response(
     let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
         return Ok(None);
     };
+    if let Some(lineage) = &record.result_lineage {
+        // Compare the ORIGINALLY RECORDED retained digest with the ORIGINALLY
+        // RECORDED result digest. Nothing is recomputed over the bytes handed
+        // to this function: a fresh checksum would replace the proof instead of
+        // checking it.
+        if lineage.output_digest != *digest {
+            return Err(TransportError::SessionFenced);
+        }
+        let canonical = matches!(
+            lineage.result_class,
+            HostRequestRetainedResultClass::CanonicalWriteReceipt
+        );
+        if canonical != lineage.semantic_receipt_ref.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+    }
     HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
