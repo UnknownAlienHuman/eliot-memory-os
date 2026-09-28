@@ -782,6 +782,12 @@ fn abandon_partial_claim(
             }
             _ => notes.push("PID file left in place: not provably this attempt".to_owned()),
         }
+        // Marker restoration runs inside the `path_names_owned_lock` fence
+        // above, so it executes while the lock path still names this attempt.
+        // That live lock is the serialization: no successor can pass
+        // `create_new` and publish its markers, so the byte checks inside
+        // `restore_marker_or_remove` classify content rather than provide the
+        // exclusion. The lock is released only after both restorations return.
         restore_marker_or_remove(
             startup_marker_path,
             startup_backup,
@@ -819,6 +825,70 @@ fn abandon_partial_claim(
     format!("cleanup: {}", notes.join("; "))
 }
 
+/// Outcome of retiring a marker this attempt published over a previously
+/// absent state.
+enum MarkerRetirement {
+    /// The exact owned object was retired.
+    Retired,
+    /// The path no longer names an object this attempt owns.
+    NotOwned,
+    /// The object was owned but the disposition failed; residue remains.
+    Failed(String),
+}
+
+/// Retires a marker this attempt owns, binding the unlink to the exact file
+/// object instead of a pathname resolved twice.
+///
+/// The caller runs this while its owned lock still names the attempt, so no
+/// successor can publish a marker concurrently; that lock is the serialization
+/// this function relies on. The object binding closes the remaining
+/// check-then-unlink window: on Windows the pinned handle denies write and
+/// delete sharing from the moment the content is read until the disposition is
+/// applied, so the bytes proved to be ours and the object unlinked are the same
+/// object. A non-reparse, non-regular path is never retired.
+fn retire_owned_marker(path: &Path, owner_pid: u32) -> MarkerRetirement {
+    #[cfg(windows)]
+    {
+        let mut pinned = match eliot_windows_ipc::RetirablePinnedFile::open(path) {
+            Ok(pinned) => pinned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return MarkerRetirement::NotOwned;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                return MarkerRetirement::NotOwned;
+            }
+            Err(error) => return MarkerRetirement::Failed(error.to_string()),
+        };
+        let owned = match pinned.read_all() {
+            Ok(bytes) => parse_owner_marker(&bytes) == Some(owner_pid),
+            Err(error) => return MarkerRetirement::Failed(error.to_string()),
+        };
+        if !owned {
+            return MarkerRetirement::NotOwned;
+        }
+        match pinned.retire() {
+            Ok(()) => MarkerRetirement::Retired,
+            Err(error) => MarkerRetirement::Failed(error.to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let owned = std::fs::read(path)
+            .ok()
+            .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid));
+        if !owned {
+            return MarkerRetirement::NotOwned;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => MarkerRetirement::Retired,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                MarkerRetirement::NotOwned
+            }
+            Err(error) => MarkerRetirement::Failed(error.to_string()),
+        }
+    }
+}
+
 fn restore_marker_or_remove(
     path: &Path,
     backup: MarkerBackup,
@@ -831,26 +901,32 @@ fn restore_marker_or_remove(
             notes.push(format!("{role} left in place: previous state unknown"));
         }
         MarkerBackup::WasMissing => {
-            let own = std::fs::read(path)
-                .ok()
-                .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid));
-            if own {
-                match std::fs::remove_file(path) {
-                    Ok(()) => notes.push(format!("removed own {role}")),
-                    Err(_) => notes.push(format!("own {role} removal failed; residue remains")),
+            // The previous state was absent, so the only correct disposition is
+            // to unlink the marker this attempt published. The content check
+            // classifies the object; the retirement itself is bound to that
+            // exact file object, so a replacement object can never be unlinked
+            // through a path the check happened to resolve.
+            match retire_owned_marker(path, owner_pid) {
+                MarkerRetirement::Retired => notes.push(format!("removed own {role}")),
+                MarkerRetirement::NotOwned => {
+                    notes.push(format!("{role} left in place: not provably this attempt"));
                 }
-            } else {
-                notes.push(format!("{role} left in place: not provably this attempt"));
+                MarkerRetirement::Failed(detail) => {
+                    notes.push(format!(
+                        "own {role} removal failed; residue remains ({detail})"
+                    ));
+                }
             }
         }
         MarkerBackup::Previous(previous) => {
-            // Never overwrite a successor's marker publication: a failed
-            // claimant that restores unconditionally could clobber objects a
-            // new owner published after this attempt's lock was removed. Only
-            // our own content or a missing marker may be restored. A present
-            // but unreadable or partially written marker (legacy
-            // bare-timestamp, halfway write, or successor partial) is not
-            // ownerless evidence and is never overwritten.
+            // Never overwrite a successor's marker publication. The caller
+            // runs this while the owned lock still names this attempt, so no
+            // successor has published; these checks classify the content found
+            // rather than supply the exclusion. Only our own content or a
+            // missing marker may be restored. A present but unreadable or
+            // partially written marker (legacy bare-timestamp, halfway write,
+            // or a later owner's partial) is not ownerless evidence and is
+            // never overwritten.
             match std::fs::read(path) {
                 Ok(current) if parse_owner_marker(&current) == Some(owner_pid) => {
                     match std::fs::write(path, &previous) {
