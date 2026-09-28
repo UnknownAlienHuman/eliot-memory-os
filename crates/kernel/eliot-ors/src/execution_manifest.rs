@@ -869,6 +869,34 @@ pub struct KernelReconciliationItem {
     pub observed_at_ms: i64,
 }
 
+impl KernelReconciliationItem {
+    /// Validates the affected identity, the recorded digests and the observed
+    /// clock of one durable reconciliation intent.
+    ///
+    /// A durable row is re-validated on every readback, so an absent operation
+    /// identity, a malformed digest or a non-positive observation time fails
+    /// closed as corruption rather than surviving as escalation evidence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.module_id, "kernel_reconciliation_item_module_id")?;
+        if let Some(bound) = &self.bound_manifest_sha256 {
+            validate_digest(bound, "kernel_reconciliation_item_bound_manifest_sha256")?;
+        }
+        if let Some(recorded) = &self.recorded_manifest_sha256 {
+            validate_digest(
+                recorded,
+                "kernel_reconciliation_item_recorded_manifest_sha256",
+            )?;
+        }
+        if self.observed_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "kernel_reconciliation_item_observed_at_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// One restart/replay/launch decision over the immutable manifest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct KernelRestartDecision {

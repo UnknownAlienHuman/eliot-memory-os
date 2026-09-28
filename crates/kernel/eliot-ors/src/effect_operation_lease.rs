@@ -609,6 +609,50 @@ fn classify_effect_replay(
     }
 }
 
+/// Denies one effect replay that no effect operation lease covers (I1.9).
+///
+/// A replay whose operation has no recorded lease is a *new* operation, not a
+/// replay of an already-authorized one, so it is refused outright. The caller
+/// holds no already-authorized effect, no effect receipt and no admitted route
+/// scope for it, so this accepts only the identity and clock it genuinely
+/// observes: the exact operation identity, the affected module identity and
+/// generation, the manifest digest when one was actually read, and the
+/// observation time. No digest, epoch or scope is defaulted or invented and no
+/// request is fabricated — the decision is built here, in the module that owns
+/// the sealed [`EffectDispatchAuthority`] constructors, so the result is still
+/// a shadow/no-effect authority carrying a durable reconciliation intent.
+///
+/// This is the denial an effect-capable dispatch path reaches whenever the
+/// store has no lease row for the operation, which is what stops a
+/// generation from resuming a new operation after catalog/policy freshness is
+/// lost.
+#[must_use]
+pub fn deny_unleased_effect_replay(
+    operation_id: &OperationIdentity,
+    module_id: &str,
+    generation: ResourceGeneration,
+    bound_manifest_sha256: Option<String>,
+    observed_at_ms: i64,
+) -> EffectReplayDecision {
+    EffectReplayDecision {
+        authority: EffectDispatchAuthority::shadow_only(ShadowEffectDiagnostics {
+            module_id: module_id.to_owned(),
+            generation,
+            bound_manifest_sha256: bound_manifest_sha256.clone().unwrap_or_default(),
+        }),
+        reconciliation: Some(KernelReconciliationItem {
+            kind: KernelReconciliationKind::EffectLeaseAbsent,
+            module_id: module_id.to_owned(),
+            generation,
+            bound_manifest_sha256,
+            recorded_manifest_sha256: None,
+            lease_id: None,
+            operation_id: Some(operation_id.clone()),
+            observed_at_ms,
+        }),
+    }
+}
+
 /// Builds the reconciliation item for one replay-side defect.
 fn effect_reconciliation_item(
     kind: KernelReconciliationKind,

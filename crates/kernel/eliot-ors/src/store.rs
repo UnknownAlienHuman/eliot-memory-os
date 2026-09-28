@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, EpochId, EpochRelation, EpochTransition,
-    HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
+    AuthorityEpoch, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
+    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, EpochId, EpochRelation,
+    EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
     canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
@@ -2020,6 +2020,24 @@ const GRANT_CLOSURE_MIGRATION_KEY_PREFIX: &str = "grant_closure_migration:v1:";
 /// the stored revision only moves forward.
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
+/// Durable effect operation leases (issue #1885; I1.9). Keyed by the lease
+/// identity. One row per exact already-authorized effect the Kernel may
+/// replay; a second insert under the same key with different content is a
+/// durable conflict, never an overwrite.
+const EFFECT_OPERATION_LEASES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_operation_leases_v1");
+/// Durable execution manifests copied into the Generation Registry (issue
+/// #1885; I1.9). Keyed by `{module_id}::{generation}`. The row is the exact
+/// immutable manifest, so a restart reads the same artifact/config/protocol
+/// hashes, start command, restart class and accepted Catalog revision.
+const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_kernel_execution_manifests_v1");
+/// Durable effect-replay reconciliation intents (issue #1885; I1.9). Keyed by
+/// `{module_id}::{generation}::{operation_id}`, so a repeated denied replay of
+/// the same exact operation updates one row instead of growing the table, and
+/// every distinct denied operation keeps its own durable escalation.
+const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_replay_reconciliations_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 /// Durable monotone revision of the process-stream recovery family (issue
 /// #2884).
@@ -17770,6 +17788,255 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads the recorded effect operation lease for one exact authorized
+    /// operation (issue #1885; I1.9).
+    ///
+    /// Keyed by the lease identity, exactly like the supervision-lease current
+    /// projection. The row is re-validated on readback and the key is checked
+    /// against the row's own lease identity, so a mismatched row fails closed
+    /// as corruption. Returns `Ok(None)` for an absent lease: the effect
+    /// replay gate reads that as "no lease" and denies the replay.
+    pub fn load_effect_operation_lease(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<crate::EffectOperationLease>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?;
+        current
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let lease: crate::EffectOperationLease = decode(value.value())?;
+                if &lease.lease_id != lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "effect_operation_lease",
+                        reason: "effect operation lease key does not match lease identity"
+                            .to_owned(),
+                    });
+                }
+                Ok(lease)
+            })
+            .transpose()
+    }
+
+    /// Loads the recorded execution manifest for one generation (issue #1885;
+    /// I1.9).
+    ///
+    /// Keyed by `{module_id}::{generation}` in the Generation Registry. The
+    /// stored manifest re-verifies its own bound digest on readback, so a
+    /// tampered row cannot authorize a restart. Returns `Ok(None)` for an
+    /// absent manifest, which the effect replay gate treats as `ManifestAbsent`.
+    pub fn load_kernel_execution_manifest(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::KernelExecutionManifest>, OrsError> {
+        crate::model::validate_text(module_id, "kernel_execution_manifest_module_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let manifests = read
+            .open_table(KERNEL_EXECUTION_MANIFESTS)
+            .map_err(storage)?;
+        let key = Self::effect_manifest_key(module_id, generation);
+        manifests
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let manifest: crate::KernelExecutionManifest = decode(value.value())?;
+                if manifest.admission.module_id != module_id
+                    || manifest.admission.generation.value() != generation
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "kernel_execution_manifest",
+                        reason: "execution manifest key does not match the recorded admission"
+                            .to_owned(),
+                    });
+                }
+                Ok(manifest)
+            })
+            .transpose()
+    }
+
+    /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
+    ///
+    /// A denied, expired or unknown replay escalates here instead of being
+    /// discarded. Keyed by `{module_id}::{generation}::{operation_id}`, so a
+    /// repeated denial of the same exact operation updates one durable row
+    /// instead of growing the table, while every distinct denied operation
+    /// keeps its own escalation. An exact re-persist is idempotent.
+    pub fn persist_effect_replay_reconciliation(
+        &self,
+        item: &crate::KernelReconciliationItem,
+    ) -> Result<(), OrsError> {
+        item.validate()?;
+        let Some(operation_id) = item.operation_id.as_ref() else {
+            return Err(OrsError::InvalidField {
+                field: "kernel_reconciliation_item_operation_id",
+                reason: "an effect replay reconciliation must name the replayed operation",
+            });
+        };
+        let key = format!(
+            "{}::{:020}::{}",
+            Self::encode_key_component(item.module_id.as_str()),
+            item.generation.value(),
+            Self::encode_key_component(operation_id.as_str())
+        );
+        let payload = encode(item)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut intents = write
+                .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?;
+            intents
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    fn effect_manifest_key(module_id: &str, generation: u64) -> String {
+        format!(
+            "{}::{:020}",
+            Self::encode_key_component(module_id),
+            generation
+        )
+    }
+
+    /// Gates one effect replay against its durable effect operation lease
+    /// (issue #1885; I1.9, W2/W5).
+    ///
+    /// This is the one store-backed query an effect-capable dispatch or replay
+    /// path consults before it dispatches an external effect. The caller passes
+    /// only what its spawn seam actually holds: the effect operation lease
+    /// identity it is acting for, the module identity and generation the spawn
+    /// is bound to, its live Authority Epoch and the observation time of the
+    /// decision. Everything else is read from the durable rows, so the gate can
+    /// neither invent an effect receipt nor widen a recorded scope.
+    ///
+    /// A recorded lease **is** the exact already-authorized effect, so the
+    /// request's `operation_id`, `effect_receipt_sha256`, `allowed_scope` and
+    /// `bound_manifest_sha256` are the lease's own recorded values and the
+    /// manifest is the lease's own recorded execution manifest. Every liveness
+    /// and currency check in [`crate::authorize_effect_replay`] still runs
+    /// against them, so this is a real gate and not a tautology: the lease must
+    /// still be active, unexpired at `observed_at_ms`, un-revoked, gap-free,
+    /// issued under the caller's current Authority Epoch, bound to the caller's
+    /// module/generation, and issued against a Governor-admitted manifest.
+    /// `catalog_revision` and `policy_revision` are the **loaded manifest's**
+    /// admitting revisions — the exact revisions the lease was issued against.
+    ///
+    /// `current.catalog_view` is reported as
+    /// [`crate::CatalogPolicyView::Unavailable`]: the Kernel holds no
+    /// independent live Module Catalog/Policy owner at this seam, so it can
+    /// never prove a current view here. I1.9 lines 48-49 then require denial
+    /// rather than an unproven admission, and the verifier produces
+    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`]. No view
+    /// is ever upgraded to `Current` here. `current.revocation` is
+    /// [`crate::RevocationAcknowledgement::None`] because no revocation event is
+    /// observed at this seam, and `current.delivery` is the lease's own recorded
+    /// delivery acknowledgement, so a lease whose delivery gap is open still
+    /// denies.
+    ///
+    /// A replay is denied whenever no lease covers the operation, the recorded
+    /// manifest is missing or receipt-less, the lease is not active or is
+    /// expired, or any recorded binding disagrees with the caller's identity.
+    /// Every denied, expired or unknown replay is escalated durably through
+    /// [`Self::persist_effect_replay_reconciliation`] before this returns, so a
+    /// denied attempt is never discarded (W5). Only
+    /// `decision.authority.authorized_lease()` carries effect authority; the
+    /// shadow decision carries none and can produce no external effect or
+    /// canonical write admission.
+    pub fn authorize_effect_replay_for_operation(
+        &self,
+        lease_id: &OperationIdentity,
+        module_id: &str,
+        generation: u64,
+        current_authority_epoch: AuthorityEpoch,
+        observed_at_ms: i64,
+    ) -> Result<crate::EffectReplayDecision, OrsError> {
+        let Some(lease) = self.load_effect_operation_lease(lease_id)? else {
+            // No recorded lease covers this operation, so there is no
+            // already-authorized effect to replay and the caller holds no
+            // effect receipt, route scope or manifest digest to name one. The
+            // gate refuses here without fabricating a request; the durable
+            // reconciliation intent is still produced below, naming the exact
+            // operation that was refused.
+            return self.deny_effect_replay_without_lease(
+                lease_id,
+                module_id,
+                generation,
+                observed_at_ms,
+            );
+        };
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        let request = crate::EffectReplayRequest {
+            operation_id: lease.operation_id.clone(),
+            manifest_module_id: lease.manifest_module_id.clone(),
+            manifest_generation: lease.manifest_generation,
+            bound_manifest_sha256: lease.bound_manifest_sha256.clone(),
+            effect_receipt_sha256: lease.effect_receipt_sha256.clone(),
+            allowed_scope: lease.allowed_scope.clone(),
+            current: crate::EffectAuthorizationView {
+                authority_epoch: current_authority_epoch,
+                // Admitting Catalog/Policy revisions of the loaded manifest — the
+                // exact revisions this lease was issued against. Never
+                // defaulted; a receipt-less manifest is refused downstream as
+                // `ManifestReceiptless` and an absent one as `ManifestAbsent`.
+                catalog_revision: manifest
+                    .as_ref()
+                    .map_or(0, |recorded| recorded.admission.catalog_revision),
+                policy_revision: manifest
+                    .as_ref()
+                    .map_or(0, |recorded| recorded.admission.policy_revision),
+                catalog_view: crate::CatalogPolicyView::Unavailable,
+                revocation: crate::RevocationAcknowledgement::None,
+                delivery: lease.delivery,
+            },
+            observed_at_ms,
+        };
+        let decision = crate::authorize_effect_replay(Some(&lease), manifest.as_ref(), &request)?;
+        if let Some(item) = decision.reconciliation.as_ref() {
+            self.persist_effect_replay_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
+    /// Denies one replay that no effect operation lease covers, and makes the
+    /// denial durable (issue #1885; W5).
+    ///
+    /// A caller with no recorded lease holds no effect receipt, route scope or
+    /// manifest digest, so there is nothing exact to name and no request can be
+    /// built. The shadow/no-effect authority and its durable reconciliation item
+    /// come from [`crate::deny_unleased_effect_replay`], the one place the
+    /// absence is asserted, so no request is fabricated here.
+    fn deny_effect_replay_without_lease(
+        &self,
+        lease_id: &OperationIdentity,
+        module_id: &str,
+        generation: u64,
+        observed_at_ms: i64,
+    ) -> Result<crate::EffectReplayDecision, OrsError> {
+        // The manifest is read even on the no-lease path, so the durable intent
+        // names the generation's real manifest digest when one is recorded
+        // rather than an absence marker.
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        let decision = crate::deny_unleased_effect_replay(
+            lease_id,
+            module_id,
+            eliot_contracts::ResourceGeneration::new(generation).map_err(|_error| {
+                OrsError::InvalidField {
+                    field: "effect_replay_manifest_generation",
+                    reason: "must be greater than zero",
+                }
+            })?,
+            manifest.map(|recorded| recorded.manifest_sha256),
+            observed_at_ms,
+        );
+        if let Some(item) = decision.reconciliation.as_ref() {
+            self.persist_effect_replay_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
     /// Reads newest-first bounded committed history for one lease.
     pub fn load_supervision_lease_history(
         &self,
@@ -18131,6 +18398,23 @@ impl RedbRecoveryStore {
         drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
         drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
         drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+        // #1885: the effect-operation-lease, execution-manifest and
+        // effect-replay-reconciliation families are part of the base family,
+        // materialized empty on every open like every other base table, so a
+        // replay gate on a store that never admitted an effect operation reads
+        // authoritatively absent instead of failing on a missing table. No row
+        // is backfilled or inferred here.
+        drop(write.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?);
+        drop(
+            write
+                .open_table(KERNEL_EXECUTION_MANIFESTS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?,
+        );
         // #2571: the logical host-request index is part of the base family,
         // materialized empty on every open like every other base table, so a
         // lookup on a pre-index store reads authoritatively absent instead

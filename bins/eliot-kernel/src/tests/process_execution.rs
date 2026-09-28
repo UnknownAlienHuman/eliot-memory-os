@@ -228,6 +228,18 @@ impl ProcessStartPorts for GatewayTestPorts {
         Ok(ProcessExecutionReplayBegin::Acquired)
     }
 
+    fn require_effect_replay_authority(
+        &self,
+        _owner: &ProcessOwnerBinding,
+        _operation_id: &OperationId,
+    ) -> Result<(), ProcessExecutionError> {
+        // The effect operation lease is an ORS-owned durable record; this
+        // fixture has no ORS store, so it admits every replay it is asked
+        // about. Adding the trait method keeps the existing process-execution
+        // scenarios exercising the pipeline itself.
+        Ok(())
+    }
+
     async fn completed_receipt(
         &self,
         _record: ProcessExecutionReplayRecord,

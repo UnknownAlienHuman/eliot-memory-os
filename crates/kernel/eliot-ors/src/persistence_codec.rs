@@ -19,6 +19,9 @@ use super::OperationalKind;
 use super::ScopeReservationHead;
 use crate::AuthorityHandoffRecord;
 use crate::CanonicalDisposition;
+use crate::EffectOperationLease;
+use crate::KernelExecutionManifest;
+use crate::KernelReconciliationItem;
 use crate::OpaqueLabel;
 use crate::OperationalPhase;
 use crate::OrsError;
@@ -841,6 +844,30 @@ impl PersistedValue for StoredCutoverOwnership {
 
 impl PersistedValue for UnknownCommitRecord {
     const RECORD_TYPE: &'static str = "unknown_commit_recovery";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for EffectOperationLease {
+    const RECORD_TYPE: &'static str = "effect_operation_lease";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for KernelExecutionManifest {
+    const RECORD_TYPE: &'static str = "kernel_execution_manifest";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for KernelReconciliationItem {
+    const RECORD_TYPE: &'static str = "effect_replay_reconciliation";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
