@@ -1112,6 +1112,10 @@ impl CoordinationOwner {
     }
 
     #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen epoch-fence ownership seam: 9 call sites span three non-whitelisted modules (peer_communication, work_lease_issuance, integration_candidate), so the &EpochId rewrite is outside this issue's path scope"
+    )]
     fn common(&self, epoch: EpochId, fence: &StateFence) -> Result<(), CoordinationError> {
         if !epoch.is_same_authority(&fence.authority_epoch) {
             return Err(CoordinationError::EpochMismatch);
@@ -1271,6 +1275,10 @@ impl CoordinationOwner {
             observed_at: observed,
         })
     }
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen epoch-fence ownership seam: 1 of 5 call sites is integration_candidate.rs:417, a non-whitelisted module, so the &EpochId rewrite is outside this issue's path scope"
+    )]
     fn session(
         &self,
         id: &str,
@@ -1298,7 +1306,7 @@ impl CoordinationOwner {
         id: &str,
         holder: &str,
         now: u64,
-        epoch: EpochId,
+        epoch: &EpochId,
         fence: &StateFence,
     ) -> Result<WorkLease, CoordinationError> {
         let l = self
@@ -1316,7 +1324,7 @@ impl CoordinationOwner {
         if now > l.expires_at {
             return Err(CoordinationError::LeaseExpired);
         }
-        if !l.authority_epoch.is_same_authority(&epoch.clone()) || l.state_fence != *fence {
+        if !l.authority_epoch.is_same_authority(epoch) || l.state_fence != *fence {
             return Err(CoordinationError::FenceMismatch);
         }
         if l.retired_at.is_some() {
@@ -1491,7 +1499,7 @@ impl CoordinationOwner {
             &req.lease_id,
             &req.session_id,
             req.now,
-            req.authority_epoch.clone(),
+            &req.authority_epoch,
             &req.state_fence,
         )?;
         nonzero(req.extend_to, "extend_to")?;
@@ -1590,7 +1598,7 @@ impl CoordinationOwner {
         work_item_id: &str,
         lease_id: &str,
         session_id: &str,
-        epoch: EpochId,
+        epoch: &EpochId,
         fence: &StateFence,
         now: u64,
         state: WorkState,
@@ -1599,7 +1607,7 @@ impl CoordinationOwner {
         kind: CoordinationEventKind,
     ) -> Result<CoordinationEvent, CoordinationError> {
         self.common(epoch.clone(), fence)?;
-        self.lease(lease_id, session_id, now, epoch.clone(), fence)?;
+        self.lease(lease_id, session_id, now, epoch, fence)?;
         let current = self
             .work
             .get(work_item_id)
@@ -1659,7 +1667,7 @@ impl CoordinationOwner {
             &req.work_item_id,
             &req.lease_id,
             &req.session_id,
-            req.authority_epoch.clone(),
+            &req.authority_epoch,
             &req.state_fence,
             req.now,
             WorkState::Checkpointed,
@@ -1682,7 +1690,7 @@ impl CoordinationOwner {
             &req.work_item_id,
             &req.lease_id,
             &req.session_id,
-            req.authority_epoch.clone(),
+            &req.authority_epoch,
             &req.state_fence,
             req.now,
             WorkState::Submitted,
