@@ -1634,14 +1634,21 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
     Ok(())
 }
 
-/// Resolves every reference edge this batch claims to have closed, against the
-/// member set that is actually *present*.
+/// Resolves every reference edge this batch carries, against the member set that
+/// is actually *present*.
 ///
-/// `dispositions[i]` is the disposition of `batch.members[i]` at this exact
-/// point: the planned set before an apply commit, the observed set at receipt
-/// time. This is the typed half of the closure, and it is deliberately not a
+/// `dispositions_by_member` maps each member's own deterministic destination
+/// identity — [`member_reference`] over the admitted archive member digest — to
+/// the disposition observed for *that* member at this exact point: the planned
+/// set before an apply commit, the set re-read from the destination at receipt
+/// time. Dispositions are therefore looked up by identity, never by position, so
+/// no member's edge can be examined against another member's disposition and a
+/// replay carrying a changed member set cannot borrow a disposition it was never
+/// recorded with. A member with no entry is not a target and not an exempt edge.
+///
+/// This is the typed half of the closure, and it is deliberately not a
 /// digest-membership test over the batch's own declarations. A reference edge
-/// resolves only against a member that
+/// names its target only when some member of this batch
 ///
 /// 1. carries the referenced content digest **under the same residency domain**
 ///    as the referring member. Equal bytes under a different obligation domain
@@ -1650,11 +1657,15 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
 /// 2. is itself importable — a `Record` or `Blob` member rather than another
 ///    reference edge — so a reference chain is refused instead of followed.
 ///
-/// Only an edge the batch actually claims to have closed — a `Rejected` edge,
-/// which is what an importable batch records for a reference — carries that
-/// obligation. A purge-suppressed or still-unresolved member set makes nothing
-/// servable, so its edges are accounted as suppressed or unresolved rather than
-/// demanded to resolve: a suppressed archive cannot fail to be closed.
+/// **Every** reference member of the batch is examined, whatever its
+/// disposition. An edge whose `reference_digest` names no member of the batch is
+/// dangling in the archive itself, and no disposition of the referring member
+/// can make it closed: a suppressed, unresolved or rejected edge all fail the
+/// naming test, and a batch can never report a closed graph for a reference that
+/// resolves to nothing. Only an edge the batch additionally claims to have
+/// *closed* — a `Rejected` edge, which is what an importable batch records for a
+/// reference — must additionally land on a member the destination actually
+/// serves.
 ///
 /// A member that is not present is not a target, so a batch cannot close a graph
 /// it never imported. A cross-batch target, an object an authorized earlier
@@ -1665,17 +1676,19 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
 /// its own.
 fn validate_reference_closure_against(
     batch: &CanonicalRestoreBatch,
-    dispositions: &[MemberDisposition],
+    dispositions_by_member: &BTreeMap<String, MemberDisposition>,
 ) -> Result<(), StoreError> {
-    if dispositions.len() != batch.members.len() {
+    if dispositions_by_member.len() != batch.members.len() {
         return Err(StoreError::InvalidReceipt);
     }
-    for (member, disposition) in batch.members.iter().zip(dispositions) {
-        if member.member_type != SnapshotMemberType::Reference
-            || *disposition != MemberDisposition::Rejected
-        {
+    for member in &batch.members {
+        if member.member_type != SnapshotMemberType::Reference {
             continue;
         }
+        let member_ref = member_reference(&batch.archive_member_digest, &member.logical_identity());
+        let disposition = dispositions_by_member
+            .get(&member_ref)
+            .ok_or(StoreError::InvalidReceipt)?;
         let reference = member
             .reference_digest
             .as_deref()
@@ -1683,18 +1696,32 @@ fn validate_reference_closure_against(
                 field: "restore.reference_digest",
                 reason: "reference member requires a reference digest",
             })?;
-        let resolved_target =
-            batch
-                .members
-                .iter()
-                .zip(dispositions)
-                .any(|(target, target_disposition)| {
-                    *target_disposition == MemberDisposition::Restored
-                        && target.content_digest == reference
-                        && target.residency.domain == member.residency.domain
-                });
-        if !resolved_target {
+        // The target must be named by this batch under the referring member's own
+        // obligation domain. This holds for every disposition: an edge naming
+        // nothing in the batch is refused rather than excused.
+        let named_target = batch.members.iter().any(|target| {
+            target.content_digest == reference
+                && target.residency.domain == member.residency.domain
+        });
+        if !named_target {
             return Err(StoreError::IdentityConflict);
+        }
+        // A `Rejected` edge is the batch's own claim that it closed the graph, so
+        // the named member must additionally be served by the destination.
+        if *disposition == MemberDisposition::Rejected {
+            let served = batch.members.iter().any(|target| {
+                if target.content_digest != reference
+                    || target.residency.domain != member.residency.domain
+                {
+                    return false;
+                }
+                let target_ref =
+                    member_reference(&batch.archive_member_digest, &target.logical_identity());
+                dispositions_by_member.get(&target_ref) == Some(&MemberDisposition::Restored)
+            });
+            if !served {
+                return Err(StoreError::IdentityConflict);
+            }
         }
     }
     Ok(())
