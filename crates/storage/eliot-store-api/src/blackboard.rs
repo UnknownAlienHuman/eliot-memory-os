@@ -58,7 +58,9 @@ pub struct BlackboardItemRecord {
 
 impl BlackboardItemRecord {
     /// Validates the closed persisted record without assigning candidate
-    /// semantics or granting any decision/effect authority.
+    /// semantics or granting any decision/effect authority. Every required
+    /// handle is re-validated through its canonical constructor, so the
+    /// semantic gate enforces the same bound the handle type guarantees.
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.item_id, "blackboard.item_id")?;
         validate_text(&self.author_principal, "blackboard.author_principal")?;
@@ -66,6 +68,13 @@ impl BlackboardItemRecord {
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
+        validate_handle(&self.payload_handle, "blackboard.payload_handle")?;
+        for handle in &self.evidence_handles {
+            validate_handle(handle, "blackboard.evidence_handle")?;
+        }
+        for handle in &self.durable_references {
+            validate_handle(handle, "blackboard.durable_reference")?;
+        }
         if self.revision == 0 || self.revision > i64::MAX as u64 {
             return Err(StoreError::InvalidField {
                 field: "blackboard.revision",
@@ -88,6 +97,15 @@ impl BlackboardItemRecord {
         }
         Ok(())
     }
+}
+
+/// Re-validates one durable handle through its canonical constructor.
+fn validate_handle(handle: &DurableRecordHandle, field: &'static str) -> Result<(), StoreError> {
+    DurableRecordHandle::new(handle.as_str()).map_err(|_| StoreError::InvalidField {
+        field,
+        reason: "must be a bounded durable record handle",
+    })?;
+    Ok(())
 }
 
 /// One item revision and the exact current revision expected at its head.
