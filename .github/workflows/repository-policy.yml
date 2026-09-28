@@ -794,12 +794,30 @@ jobs:
           pair_sha="$(sha256sum docs/normative-pair.toml | cut -d' ' -f1)"
           active_sha="$(sha256sum workstreams/ACTIVE.toml | cut -d' ' -f1)"
           inventory_sha="$(sha256sum workstreams/core-daemons/inventory.json | cut -d' ' -f1)"
+          python scripts/verify-github-workflows.py --root . --json-out "$RUNNER_TEMP/gwf-actions.json"
+          actions_row="$(python - "$RUNNER_TEMP/gwf-actions.json" <<'PY'
+          import json
+          import sys
+          payload = json.load(open(sys.argv[1], encoding='utf-8'))
+          if payload.get('status') != 'pass':
+              raise SystemExit('GITHUB_WORKFLOWS_MANIFEST_REJECTED: verifier payload status is not pass')
+          seen = []
+          for entry in payload.get('actions', []):
+              if entry.get('workflow') == '.github/workflows/repository-policy.yml':
+                  item = str(entry.get('action', '')) + '@' + str(entry.get('ref', ''))
+                  if item not in seen:
+                      seen.append(item)
+          if not seen:
+              raise SystemExit('GITHUB_WORKFLOWS_MANIFEST_REJECTED: derived record holds no action identities for repository-policy.yml')
+          print(', '.join(seen))
+          PY
+          )"
           {
             echo '### Manual Repository Policy Run Manifest'
             echo "- Repository: $GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME ref=$GITHUB_REF run=$GITHUB_RUN_ID"
             echo "- Source SHA: $source_sha"
             echo "- Workflow: .github/workflows/repository-policy.yml sha256=$workflow_sha"
-            echo '- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+            echo "- Actions: $actions_row"
             echo "- Policy inputs: normative-pair=$pair_sha ACTIVE=$active_sha inventory=$inventory_sha"
             echo '- Ordered checks: branch identity, authority receipts, retired-surface rejection, normative identity, stale-link rejection, trigger/profile/privilege/cache/candidate wiring'
             echo '- Gate states: fail-fast job; this manifest runs only after every prior step passed'
