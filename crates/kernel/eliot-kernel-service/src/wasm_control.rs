@@ -325,7 +325,8 @@ pub enum ControlDisposition {
     Completed,
     /// Response lost (supervised termination without ack, or an
     /// unreadable disposition record); preserved under the same
-    /// identity, never silently re-sent as a fresh command.
+    /// identity, never silently re-sent as a fresh command and never
+    /// re-reported as accepted from a retained `enqueued` ack.
     Unknown,
     /// Delivery refused with typed evidence; terminal.
     Refused,
@@ -827,15 +828,29 @@ fn validate_disposition_record(
 }
 
 /// Advances one disposition through a validated ack phase. Terminal
-/// dispositions never move; anything else follows the ack, with
-/// `completed` and `refused` closing the delivery.
+/// dispositions never move; a decisive ack closes an open one; anything
+/// else follows the ack, with `completed` and `refused` closing the
+/// delivery.
+///
+/// A retained `enqueued` ack is the one input this must distrust: it proves
+/// the command channel took the command at the moment the child wrote it,
+/// and nothing about what happened to the worker afterwards. Once the owner
+/// has recorded a lost response for the delivery, that ack is pre-loss
+/// evidence and cannot re-assert the enqueue, so `Unknown` stays `Unknown`
+/// with its recovery reason instead of being reported as `Accepted` (issue
+/// #2896 A3). This is the same rule
+/// [`note_wasm_control_supervised_end`] already applies at termination time,
+/// where an `enqueued` ack deliberately does not decide. A later `completed`
+/// or `refused` ack from a re-offered delivery still closes it: those are
+/// decisive, and a terminal disposition is never revived.
 fn advance_disposition(
     current: ControlDisposition,
+    reason: Option<String>,
     ack: &WasmControlAck,
     sidecar_valid: bool,
 ) -> (ControlDisposition, Option<String>) {
     if current.is_terminal() {
-        return (current, None);
+        return (current, reason);
     }
     // A decisive ack over an unreadable sidecar still closes honestly,
     // but the recovery marker preserves the forensic trace.
@@ -847,6 +862,9 @@ fn advance_disposition(
         }
     };
     match ack.phase {
+        ControlAckPhase::Enqueued if current == ControlDisposition::Unknown => {
+            (ControlDisposition::Unknown, recovered(reason))
+        }
         ControlAckPhase::Enqueued => (ControlDisposition::Accepted, recovered(None)),
         ControlAckPhase::Completed => (ControlDisposition::Completed, recovered(None)),
         ControlAckPhase::Refused => (ControlDisposition::Refused, recovered(ack.detail.clone())),
@@ -927,7 +945,7 @@ fn join_scanned_delivery(
         match parsed {
             Some(ack) if validate_control_ack(&ack, delivery).is_ok() => {
                 let (advanced, advanced_reason) =
-                    advance_disposition(disposition, &ack, sidecar_valid);
+                    advance_disposition(disposition, reason, &ack, sidecar_valid);
                 if advanced != disposition || advanced_reason != reason {
                     disposition = advanced;
                     reason = advanced_reason;
