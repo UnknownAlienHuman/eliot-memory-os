@@ -1072,28 +1072,18 @@ impl<'de> Deserialize<'de> for WorkClass {
 /// grow without bound.
 pub const FAIRNESS_QUANTUM: u64 = 1_000_000;
 
-/// Name of the frozen selection algorithm recorded in every pull outcome.
-pub const FAIR_PULL_ALGORITHM: &str = "eliot-agent-coordinator/smooth-weighted-fair-pull-v1";
-
-/// I14.8 age semantics for one work class, frozen in the profile.
+/// Name of the frozen selection algorithm recorded in every pull outcome,
+/// including the frozen within-class age rule it implements.
 ///
-/// [`WorkClassAgeRule::OldestCanonicalEnqueueFirst`] is the only representable
-/// rule and its clock domain is the durable canonical enqueue sequence assigned
-/// when an attempt is admitted or reassigned, not a wall clock: replaying the
-/// event log re-derives the same sequence, so neither a projection rebuild nor
-/// a coordinator restart can renew an item's age, and no caller-supplied clock
-/// participates in the decision.
-///
-/// The field carries the frozen rule on the wire and in the profile revision
-/// rather than leaving it implied by code; the selector implements exactly this
-/// rule for every class, so the value cannot currently vary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum WorkClassAgeRule {
-    /// Oldest canonical enqueue sequence first inside the class, with stable
-    /// work identity as the final tie-break.
-    OldestCanonicalEnqueueFirst,
-}
+/// The age rule is `oldest-canonical-enqueue-first` and its clock domain is the
+/// durable canonical enqueue ordinal assigned when an attempt is admitted or
+/// reassigned, not a wall clock: replaying the event log re-derives the same
+/// ordinal, so neither a projection rebuild nor a coordinator restart can renew
+/// an item's age, and no caller-supplied clock participates in the decision.
+/// The ordinal is unique per attempt, so the within-class order is total and
+/// no further tie-break exists.
+pub const FAIR_PULL_ALGORITHM: &str =
+    "eliot-agent-coordinator/smooth-weighted-fair-pull-v1/oldest-canonical-enqueue-first";
 
 /// I14.8 WIP partition dimension, restricted to the dimensions a stored
 /// `AttemptRecord` can actually derive.
@@ -1132,6 +1122,14 @@ pub struct WipPartitionLimit {
 /// class's byte, concurrency or WIP partition; the item ceiling bounds that
 /// class's own scan window. Every value is positive; a missing or zero value is
 /// rejected instead of being read as unlimited.
+///
+/// Deliberate narrowing of issue #1683 W1, which lists an "age rule" per class:
+/// the within-class age rule is **not** per-class policy here. I14.8 fixes
+/// "weighted fair polling and age within class" and the issue fixes the
+/// within-class order to the oldest eligible canonical enqueue ordinal, so there
+/// is exactly one rule. A per-class field able to hold only that one value
+/// would be a declaration that steers nothing, so the rule lives in
+/// [`FAIR_PULL_ALGORITHM`] and in the ordering itself instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkClassProfile {
@@ -1147,7 +1145,6 @@ pub struct WorkClassProfile {
     pub deadline_ms: u64,
     /// I14.8 weight of this class in the weighted fair pull.
     pub weight: u32,
-    pub age_rule: WorkClassAgeRule,
     pub wip_partitions: Vec<WipPartitionLimit>,
 }
 
@@ -1210,6 +1207,11 @@ pub struct PolicyBoundClassLimits {
 
 /// Versioned per-class scheduling policy: exactly one [`WorkClassProfile`] for
 /// each of the nine I14.1 classes.
+///
+/// The age rule is deliberately not a field of this set. It is fixed by the
+/// governing fragment and the issue to the oldest canonical enqueue ordinal and
+/// is recorded once in [`FAIR_PULL_ALGORITHM`], which every pull outcome
+/// publishes; see [`WorkClassProfile`] for the narrowing note.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulingProfile {
@@ -1290,7 +1292,6 @@ impl SchedulingProfile {
                 max_concurrency: entry.max_concurrency,
                 deadline_ms: entry.deadline_ms,
                 weight: entry.weight,
-                age_rule: WorkClassAgeRule::OldestCanonicalEnqueueFirst,
                 wip_partitions: entry.wip_partitions.clone(),
             });
         }
@@ -1334,7 +1335,12 @@ impl SchedulingProfile {
 /// Why one ready item was passed over inside its class during a pull.
 ///
 /// A passed-over item is retained: it stays admitted and keeps its canonical
-/// enqueue sequence, so skipping it never re-queues or re-ages it.
+/// enqueue ordinal, so skipping it never re-queues or re-ages it.
+///
+/// One writer per deliverable is not a member of this set: it is enforced once
+/// at the owning transition (`plan`, `admit`, `reassign`) on the Work/Action
+/// lease identity and cannot be violated from the selection side, so no
+/// unreachable reason is published here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReadyItemSkipReason {
@@ -1347,8 +1353,6 @@ pub enum ReadyItemSkipReason {
     /// A declared WIP partition of this class already holds
     /// `max_in_flight` started items with the same partition value.
     WipPartitionAtLimit,
-    /// Another attempt holds this item's mutation scope in this projection.
-    ScopeWriterHeld,
 }
 
 /// Why one class offered no work to a pull.
@@ -1446,13 +1450,14 @@ pub struct WorkClassSelectionReport {
     pub concurrency_ceiling: Option<u64>,
     pub byte_ceiling: Option<u64>,
     /// Admitted items actually examined. The scan is bounded by the item
-    /// ceiling (or by the whole class on the profile-free path) and looks at
-    /// the oldest items first, so a truncated window can only leave later items
-    /// unserved, never displace an older one.
+    /// ceiling (or by the whole class on the profile-free path) and walks the
+    /// items in ascending canonical enqueue ordinal, so a truncated window can
+    /// only leave later items unserved, never displace an older one.
     pub scanned_ready_items: usize,
-    /// Canonical enqueue sequence of the oldest admitted item, if any. This is
-    /// the age of the oldest ready work in this class's clock domain (the
-    /// durable enqueue ordinal, not wall-clock milliseconds).
+    /// Canonical enqueue ordinal of the oldest admitted item, if any, under the
+    /// frozen age rule named in [`FAIR_PULL_ALGORITHM`]. This is the age of the
+    /// oldest ready work in this class's clock domain: the durable enqueue
+    /// ordinal, unique per attempt and not wall-clock milliseconds.
     pub oldest_ready_enqueue_sequence: Option<u64>,
     /// The item this class offered, if any.
     pub offered_attempt_id: Option<AttemptId>,
@@ -1470,18 +1475,23 @@ pub struct WorkClassSelectionReport {
 /// Published claim state of one deliverable (mutation scope) that currently
 /// holds admitted work.
 ///
-/// This is published state for the caller, not a new gate: `admit` already
-/// rejects a second concurrent holder of one scope, so `ready_items` above one
-/// is unreachable today. `writer_holders` is rebuilt by replaying this
-/// coordinator's own admissions, so the exclusion it establishes holds only
-/// within one snapshot lineage and is not a canonical one-writer authority.
+/// This is published state for the caller, not a gate: the one-writer property
+/// is enforced at the owning transition (`plan`, `admit`, `reassign`) on the
+/// Work/Action lease identity, so a second concurrent holder of one scope is
+/// rejected there and `ready_items` above one is unreachable. What this
+/// publishes is the identity and state of the current holder.
+///
+/// `writer_holders` is rebuilt by replaying this coordinator's own admissions,
+/// so the exclusion it reflects holds only within one snapshot lineage; it is
+/// not a canonical one-writer authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliverableClaim {
     pub mutation_scope: String,
     pub holder_attempt_id: Option<AttemptId>,
     pub holder_state: Option<CoordinatedAttemptState>,
-    /// Admitted items declaring this scope, including the holder.
+    /// Admitted items declaring this scope, including the holder. Always one
+    /// today, because the owning transition rejects a second holder.
     pub ready_items: usize,
 }
 
@@ -1492,6 +1502,8 @@ pub struct DeliverableClaim {
 /// published projection, never an input wire.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReadySelectionOutcome {
+    /// Always [`FAIR_PULL_ALGORITHM`], which also names the frozen within-class
+    /// age rule and its clock domain.
     pub algorithm: &'static str,
     /// Profile revision the per-class partitions were taken from, or `None` on
     /// the profile-free [`AgentCoordinator::next_ready`](crate::AgentCoordinator::next_ready)
@@ -1501,8 +1513,13 @@ pub struct ReadySelectionOutcome {
     pub capacity_revision: RevisionId,
     pub selected_attempt_id: Option<AttemptId>,
     pub selected_work_class: Option<WorkClass>,
+    /// Canonical enqueue ordinal of the selected item, under the age rule named
+    /// in `algorithm`. The ordinal is unique per attempt, so in that clock
+    /// domain it is the item's exact age rather than an approximation of one.
+    /// It is not a wall-clock duration.
     pub selected_enqueue_sequence: Option<u64>,
-    /// Canonical enqueue sequence of the oldest admitted item overall.
+    /// Canonical enqueue ordinal of the oldest admitted item overall, under the
+    /// same age rule.
     pub oldest_ready_enqueue_sequence: Option<u64>,
     /// Exactly nine entries in scheduler rank order.
     pub classes: Vec<WorkClassSelectionReport>,

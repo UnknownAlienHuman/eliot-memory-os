@@ -352,8 +352,8 @@ impl ClassPullView<'_> {
 /// observed value and limit of the capacity dimension that closed it.
 ///
 /// `dimension` is `None` for a block that is not a capacity closure: a deadline
-/// ceiling mismatch and a held scope are properties of the item, not of a
-/// saturated class, so they publish no capacity deferral.
+/// ceiling mismatch is a property of the item, not of a saturated class, so it
+/// publishes no capacity deferral.
 struct ItemBlock {
     reason: ReadyItemSkipReason,
     dimension: Option<CapacityLimitDimension>,
@@ -458,9 +458,10 @@ fn class_views<'a>(
         }
     }
     for view in &mut views {
-        // Stable sort over the canonical enqueue ordinal. The `BTreeMap` walk
-        // above is already in attempt-identity order, so an ordinal tie keeps
-        // stable work identity as the final tie-break.
+        // Order by the canonical enqueue ordinal, which is unique per attempt,
+        // so no further tie-break is needed or possible. The sort is stable and
+        // the walk above is over a `BTreeMap`, so the result is deterministic
+        // and independent of hash iteration order.
         view.ready.sort_by_key(|(sequence, _)| *sequence);
     }
     views
@@ -469,7 +470,6 @@ fn class_views<'a>(
 /// Decides what one class offers to this pull: its oldest eligible admitted
 /// item, or the exact reason it offers nothing.
 fn offer_class_head(
-    writer_holders: &BTreeMap<String, AttemptId>,
     view: &mut ClassPullView<'_>,
     work_class: WorkClass,
     class_profile: Option<&WorkClassProfile>,
@@ -496,7 +496,7 @@ fn offer_class_head(
     let window = class_profile.map_or(usize::MAX, |profile| profile.max_items);
     for (_, attempt) in view.ready.iter().take(window) {
         view.scanned += 1;
-        let Some(block) = item_block(writer_holders, view, attempt, class_profile) else {
+        let Some(block) = item_block(view, attempt, class_profile) else {
             view.head = Some(attempt);
             return;
         };
@@ -525,62 +525,58 @@ fn offer_class_head(
 /// Why one admitted item cannot be offered by a pull, with the exact observed
 /// value and limit of the capacity dimension that blocked it.
 ///
-/// With no class profile there is no deadline ceiling and no WIP partition; the
-/// one-writer scope guard still applies.
+/// With no class profile there is nothing to check, so on the profile-free peek
+/// no item is ever passed over.
+///
+/// One writer per deliverable is deliberately *not* re-checked here. It is
+/// already enforced once, at the owning transition, by `plan`, `admit` and
+/// `reassign` on the Work/Action lease identity, and it cannot be violated from
+/// this side: `writer_holders` is written only where that lease is taken, and
+/// each of its four release sites immediately settles the releasing attempt
+/// terminally, so a scope's holder is always the only non-terminal attempt on
+/// that scope and is never a different admitted item. A second check here
+/// could not fail, so it is not written.
 fn item_block(
-    writer_holders: &BTreeMap<String, AttemptId>,
     view: &ClassPullView<'_>,
     attempt: &AttemptRecord,
     class_profile: Option<&WorkClassProfile>,
 ) -> Option<ItemBlock> {
-    if let Some(profile) = class_profile {
-        if attempt.budget.wall_time_ms > profile.deadline_ms {
-            return Some(ItemBlock::unclosed(
-                ReadyItemSkipReason::ClassDeadlineCeiling,
+    let profile = class_profile?;
+    if attempt.budget.wall_time_ms > profile.deadline_ms {
+        return Some(ItemBlock::unclosed(
+            ReadyItemSkipReason::ClassDeadlineCeiling,
+        ));
+    }
+    if let Some(byte_cap) = profile.max_bytes {
+        let requested = view
+            .in_flight_bytes
+            .saturating_add(attempt.budget.output_bytes);
+        if requested > byte_cap {
+            return Some(ItemBlock::closed(
+                ReadyItemSkipReason::ClassByteCapReached,
+                CapacityLimitDimension::ClassBytes,
+                requested,
+                byte_cap,
             ));
         }
-        if let Some(byte_cap) = profile.max_bytes {
-            let requested = view
-                .in_flight_bytes
-                .saturating_add(attempt.budget.output_bytes);
-            if requested > byte_cap {
-                return Some(ItemBlock::closed(
-                    ReadyItemSkipReason::ClassByteCapReached,
-                    CapacityLimitDimension::ClassBytes,
-                    requested,
-                    byte_cap,
-                ));
-            }
-        }
-        for partition in &profile.wip_partitions {
-            let value = wip_partition_value(attempt, partition.key);
-            let observed = view
-                .in_flight
-                .iter()
-                .filter(|other| wip_partition_value(other, partition.key) == value)
-                .count();
-            if observed >= partition.max_in_flight {
-                return Some(ItemBlock::closed(
-                    ReadyItemSkipReason::WipPartitionAtLimit,
-                    CapacityLimitDimension::WipPartition,
-                    count_as_u64(observed),
-                    count_as_u64(partition.max_in_flight),
-                ));
-            }
+    }
+    for partition in &profile.wip_partitions {
+        let value = wip_partition_value(attempt, partition.key);
+        let observed = view
+            .in_flight
+            .iter()
+            .filter(|other| wip_partition_value(other, partition.key) == value)
+            .count();
+        if observed >= partition.max_in_flight {
+            return Some(ItemBlock::closed(
+                ReadyItemSkipReason::WipPartitionAtLimit,
+                CapacityLimitDimension::WipPartition,
+                count_as_u64(observed),
+                count_as_u64(partition.max_in_flight),
+            ));
         }
     }
-    // One writer per deliverable, in this projection. `admit` and `reassign`
-    // already reject a second holder of one mutation scope, so this guard is
-    // defence in depth: it is unreachable through the current admission path
-    // and it establishes no durable one-writer authority.
-    let Some(scope) = &attempt.mutation_scope else {
-        return None;
-    };
-    let holder = writer_holders.get(scope)?;
-    if *holder == attempt.attempt_id {
-        return None;
-    }
-    Some(ItemBlock::unclosed(ReadyItemSkipReason::ScopeWriterHeld))
+    None
 }
 
 /// Smooth weighted round robin over the classes that offered a head.
@@ -1269,14 +1265,23 @@ impl AgentCoordinator {
     /// [`SchedulingProfile`]: every class then carries equal weight and **no
     /// per-class I14.2 item, byte, concurrency, deadline or WIP partition is
     /// applied** — the ceilings it publishes are `None`, not unlimited ones.
-    /// Only the canonical enqueue age order, the one-writer scope guard and the
-    /// class-rank tie-break apply, on top of the coordinator's existing global
-    /// limits. The call is a read: it consumes no fairness credit, so two peeks
-    /// over unchanged state return the same item and a peek never changes what
-    /// a later pull selects.
+    /// Only the canonical enqueue age order inside a class and the cross-class
+    /// rank tie-break on an exact virtual-time tie apply, on top of the
+    /// coordinator's existing global limits. The call is a read: it consumes no
+    /// fairness credit, so two peeks over unchanged state return the same item
+    /// and a peek never changes what a later pull selects.
     ///
-    /// The profile-bound path, and the only one that partitions capacity per
-    /// class, is [`Self::pull_next`].
+    /// Known limitation, stated here so a reader of the code does not need the
+    /// delivery report: the per-class I14.2 partition is reachable only through
+    /// the profile-bound path [`Self::pull_next`], and `pull_next` has **no
+    /// in-tree caller** — the composition root that could supply a
+    /// `SchedulingProfile` is out of this crate's grant. So on every path that
+    /// runs today, selection applies the age order and the class-rank order but
+    /// no per-class item, byte, concurrency, deadline or WIP limit, and
+    /// `profile_revision` in the published outcome is `None`. A reader must not
+    /// conclude from this method that saturated low-priority work is prevented
+    /// from consuming another class's partition: nothing on this path does
+    /// that.
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1285,8 +1290,11 @@ impl AgentCoordinator {
     /// Profile-bound fair pull (issue #1683 W2/W7).
     ///
     /// One deterministic pull: bounded weighted round robin over the classes
-    /// that currently admit work, oldest canonical enqueue sequence first inside
-    /// a class, stable work identity as the final tie-break. Per-class limits
+    /// that currently admit work, and inside a class the oldest canonical
+    /// enqueue ordinal first. That ordinal is unique per attempt, so the
+    /// within-class order is total and needs no further tie-break; the ordering
+    /// walk is over a `BTreeMap` and the sort is stable, so the result is
+    /// deterministic and independent of hash iteration order. Per-class limits
     /// come from `profile` and are counted per class only — the item ceiling
     /// bounds the class scan, and the byte, concurrency, deadline and WIP
     /// ceilings gate the head — so a saturated class cannot consume another
@@ -1298,9 +1306,9 @@ impl AgentCoordinator {
     ///   receives at least its `w / W` share of the selections it stays
     ///   eligible for, and a class that becomes eligible again wins the next
     ///   pull against classes that were scheduled while it was closed;
-    /// - the per-class scan is bounded by the class item ceiling and looks at
-    ///   the oldest items first, so a truncated window can only leave later
-    ///   items unserved, never displace an older one;
+    /// - the per-class scan is bounded by the class item ceiling and walks the
+    ///   items in ascending canonical enqueue ordinal, so a truncated window
+    ///   can only leave later items unserved, never displace an older one;
     /// - every credit is a virtual time difference of at most
     ///   [`FAIRNESS_QUANTUM`], so scheduler state is bounded;
     /// - work that is not *temporarily* closed but permanently outside the
@@ -1311,6 +1319,11 @@ impl AgentCoordinator {
     /// The pull selects; it does not start anything. A caller that receives a
     /// `selected_attempt_id` starts that attempt through the existing
     /// [`Self::start_attempt`], which remains the only state transition.
+    ///
+    /// This entry point has no in-tree caller yet: the composition root that
+    /// would compile and supply a `SchedulingProfile` is outside this crate, so
+    /// the per-class partition it enforces is currently unexercised in
+    /// production. See the limitation note on [`Self::next_ready`].
     ///
     /// # Errors
     ///
@@ -1332,6 +1345,11 @@ impl AgentCoordinator {
     /// limit exists. When it is `Some`, the caller has already run
     /// [`SchedulingProfile::validate`], so exactly one profile per class
     /// resolves and the ceilings below are always the profile's own values.
+    ///
+    /// Within a class the order is the canonical enqueue ordinal, which is
+    /// unique per attempt; across classes it is [`choose_fair_head`]. Nothing
+    /// here re-checks one-writer exclusion, which its owning transition already
+    /// enforces — see [`item_block`].
     fn select_ready(
         &mut self,
         profile: Option<&SchedulingProfile>,
@@ -1345,7 +1363,6 @@ impl AgentCoordinator {
         let mut views = class_views(&self.attempts, &self.enqueue_sequence);
         for (index, work_class) in WorkClass::ALL.into_iter().enumerate() {
             offer_class_head(
-                &self.writer_holders,
                 &mut views[index],
                 work_class,
                 resolve(work_class),
