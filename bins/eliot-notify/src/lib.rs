@@ -73,6 +73,91 @@ impl fmt::Display for NotifyBuildError {
 
 impl std::error::Error for NotifyBuildError {}
 
+/// One-shot stdin wire schema for `eliot-notify.exe` (issue #1780, I11.6).
+///
+/// The adapter is a per-user one-shot: every normal-mode operation arrives as
+/// one JSON line on stdin. This enum is the single schema both ends speak.
+/// [`parse_notify_stdin_request`] is the binary's production parser
+/// (`bins/eliot-notify/src/main.rs`); [`render_acknowledge_request`] is the
+/// exact line constructor for the acknowledgement leg. I11.6 admits exactly
+/// one spawner for the normal route (the authorized User Broker), so the
+/// broker-side acknowledge spawn that writes this line consumes this schema
+/// instead of a second spelling of it.
+///
+/// I11.3 admits the actor ("any authorized role ... acknowledge
+/// notifications"). The principal travels as record data and the admitted
+/// Kernel route re-validates the transition before the store applies it, so
+/// this constructor mints no authority.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NotifyStdinRequest {
+    Deliver {
+        envelope: NotificationEnvelope,
+        request: NotificationRequest,
+    },
+    DeliverUserAutomationFailure {
+        failure: UserAutomationFailureRequest,
+        request: NotificationRequest,
+    },
+    RunUserAutomation {
+        invocation: UserAutomationInvocation,
+        request: NotificationRequest,
+    },
+    ReadInbox {
+        parent: NotificationRequest,
+        read: NotificationStateReadRequest,
+    },
+    /// Records one operator acknowledgement on the canonical record. It
+    /// suppresses repeated toast attempts and deliberately leaves the record
+    /// unresolved, so the problem and any critical attention stay in the
+    /// canonical inbox.
+    Acknowledge {
+        parent: NotificationRequest,
+        notification_id: PlatformHandle,
+        principal: String,
+    },
+    /// Records one evidence-backed authorized disposition. Without the
+    /// protected authority receipt that binds the evidence handles, the leg is
+    /// refused and the record stays open.
+    Resolve {
+        parent: NotificationRequest,
+        notification_id: PlatformHandle,
+        disposition: String,
+        authorization: ResolutionAuthorization,
+    },
+}
+
+/// Parses one stdin line of the one-shot wire schema.
+///
+/// This is the binary's production entry to the schema above: the line the
+/// spawner wrote with [`render_acknowledge_request`] (or the matching
+/// delivery/read/disposition constructor) decodes here, and anything else is
+/// the caller's `serde_json::Error`, never a second schema.
+pub fn parse_notify_stdin_request(line: &str) -> Result<NotifyStdinRequest, serde_json::Error> {
+    serde_json::from_str(line)
+}
+
+/// Renders the exact one-line acknowledgement request a spawner writes to the
+/// one-shot's stdin.
+///
+/// The bytes are the compact JSON of [`NotifyStdinRequest::Acknowledge`]: the
+/// spawner writes them as one stdin line and the binary parses them with
+/// [`parse_notify_stdin_request`], so writer and reader share one schema by
+/// construction. The acknowledgement principal is the authorized Human role's
+/// identity as record data (I11.3); authority over the transition stays with
+/// the admitted Kernel route, not with this line.
+pub fn render_acknowledge_request(
+    parent: &NotificationRequest,
+    notification_id: PlatformHandle,
+    principal: &str,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&NotifyStdinRequest::Acknowledge {
+        parent: parent.clone(),
+        notification_id,
+        principal: principal.to_owned(),
+    })
+}
+
 /// The complete A-10 composition. Verification and replay authority are
 /// supplied by the owning control plane; this process owns only the P-01
 /// adapter binding and the A-10 coordinator.

@@ -4,7 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{
-    DeliveryOutcome, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
+    DeliveryOutcome, NotificationComposition, NotifyStdinRequest, PROTOCOL_VERSION, SERVICE_NAME,
+    UnsatisfiedObligation, parse_notify_stdin_request,
 };
 use eliot_notify_core::{
     NotificationEnvelope, NotificationStateReadRequest, NotificationStateResponse, NotifyError,
@@ -12,7 +13,7 @@ use eliot_notify_core::{
     UserAutomationInvocation, UserAutomationPreflightDecision,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 const REQUEST_INVALID_EXIT: i32 = 2;
 const PROVIDER_REJECTED_EXIT: i32 = 69;
@@ -23,45 +24,6 @@ enum LaunchMode {
     WatchdogFallback,
     RegisterWatchdogFallback,
     ActivateWatchdogFallback,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Deliver {
-        envelope: NotificationEnvelope,
-        request: NotificationRequest,
-    },
-    DeliverUserAutomationFailure {
-        failure: UserAutomationFailureRequest,
-        request: NotificationRequest,
-    },
-    RunUserAutomation {
-        invocation: UserAutomationInvocation,
-        request: NotificationRequest,
-    },
-    ReadInbox {
-        parent: NotificationRequest,
-        read: NotificationStateReadRequest,
-    },
-    /// Records one operator acknowledgement on the canonical record. It
-    /// suppresses repeated toast attempts and deliberately leaves the record
-    /// unresolved, so the problem and any critical attention stay in the
-    /// canonical inbox.
-    Acknowledge {
-        parent: NotificationRequest,
-        notification_id: PlatformHandle,
-        principal: String,
-    },
-    /// Records one evidence-backed authorized disposition. Without the
-    /// protected authority receipt that binds the evidence handles, the leg is
-    /// refused and the record stays open.
-    Resolve {
-        parent: NotificationRequest,
-        notification_id: PlatformHandle,
-        disposition: String,
-        authorization: ResolutionAuthorization,
-    },
 }
 
 #[derive(Serialize)]
@@ -239,14 +201,14 @@ fn main() {
             "one JSON notification request is required".to_owned(),
         )
     };
-    let response = match serde_json::from_str::<Request>(&line) {
-        Ok(Request::Deliver { envelope, request }) => {
+    let response = match parse_notify_stdin_request(&line) {
+        Ok(NotifyStdinRequest::Deliver { envelope, request }) => {
             match NotificationComposition::from_kernel_with_quiet_hours(root, &request) {
                 Ok(mut composition) => dispatch_deliver(&mut composition, &envelope, &request),
                 Err(error) => composition_error(error.to_string()),
             }
         }
-        Ok(Request::DeliverUserAutomationFailure { failure, request }) => {
+        Ok(NotifyStdinRequest::DeliverUserAutomationFailure { failure, request }) => {
             match NotificationComposition::from_kernel_with_quiet_hours(root, &request) {
                 Ok(mut composition) => {
                     dispatch_user_automation_failure(&mut composition, failure, &request)
@@ -254,7 +216,7 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
-        Ok(Request::RunUserAutomation {
+        Ok(NotifyStdinRequest::RunUserAutomation {
             invocation,
             request,
         }) => {
@@ -269,13 +231,13 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
-        Ok(Request::ReadInbox { parent, read }) => {
+        Ok(NotifyStdinRequest::ReadInbox { parent, read }) => {
             match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
                 Ok(mut composition) => dispatch_read_inbox(&mut composition, &parent, &read),
                 Err(error) => composition_error(error.to_string()),
             }
         }
-        Ok(Request::Acknowledge {
+        Ok(NotifyStdinRequest::Acknowledge {
             parent,
             notification_id,
             principal,
@@ -285,7 +247,7 @@ fn main() {
             }
             Err(error) => composition_error(error.to_string()),
         },
-        Ok(Request::Resolve {
+        Ok(NotifyStdinRequest::Resolve {
             parent,
             notification_id,
             disposition,
