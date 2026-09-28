@@ -1185,6 +1185,9 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::BridgeRecoveryWindowCapacityExceeded => {
             invalid_field("bridge_recovery_window_capacity")
         }
+        OrsError::BridgeRecoveryCutCapacityExceeded => {
+            invalid_field("bridge_recovery_cut_capacity")
+        }
         OrsError::UnsupportedContractVersion(_) => invalid_field("envelope_contract_version"),
         OrsError::PayloadTooLarge => invalid_field("payload_length"),
         OrsError::PayloadIntegrityMismatch => invalid_field("payload_integrity"),

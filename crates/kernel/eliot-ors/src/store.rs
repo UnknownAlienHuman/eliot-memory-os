@@ -261,6 +261,11 @@ const BRIDGE_EVENT_RECORDS: TableDefinition<&str, &str> =
 /// with staging provenance. Keyed by `stream_id`; never synthesized.
 const BRIDGE_EVENT_CURSORS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_cursors_v1");
+/// Owner-scope maintenance continuation for bounded handoff repair/retirement.
+/// The stored row binds the complete presenter identity and owner-index schema;
+/// caller input supplies neither its position nor cutoff.
+const BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_owner_maintenance_cursors_v1");
 /// Durable bridge-event coverage gaps (issue #2561): forwarded gaps stay
 /// visible without moving any cursor. Keyed by `gap_id`.
 const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
@@ -1134,7 +1139,95 @@ impl persistence_codec::PersistedValue for BridgeEventProjectionRow {
 /// acknowledgement (`last_acked_sequence`), and the compacted/retired
 /// boundary (`last_compacted_sequence`). The downstream application
 /// frontier stays separate in the handoff rows. A gap record explains
-/// missing coverage; it never moves any field here.
+/// missing coverage; it never moves any field here. The two maintenance
+/// scan continuations are separate, bounded work cursors, each tied to the
+/// exact owner revision/incarnation and recovery view it is scanning; neither
+/// changes event identity or any of the four frontiers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventHandoffScanCursor {
+    owner_revision: u64,
+    owner_incarnation: u64,
+    recovery_revision: u64,
+    after_sequence: u64,
+    upper_sequence: u64,
+}
+
+struct BridgeRetirementPage {
+    eligible: Vec<(u64, String, BridgeEventHandoffRow)>,
+    continuation: bool,
+    after_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventOwnerMaintenanceCursorRow {
+    contract_version: u16,
+    owner_scope_digest: String,
+    authority_lineage: String,
+    principal: String,
+    owner_list_index_schema: String,
+    after_sequence: u64,
+    owner_cutoff: u64,
+}
+
+impl BridgeEventOwnerMaintenanceCursorRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(&self.owner_scope_digest, "owner_scope_digest")?;
+        bridge_owner_component(&self.authority_lineage, "owner_authority_lineage")?;
+        bridge_owner_component(&self.principal, "owner_principal")?;
+        if RedbRecoveryStore::bridge_owner_scope_digest(&self.authority_lineage, &self.principal)?
+            != self.owner_scope_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_owner_maintenance_cursor",
+                reason: "owner-scope digest does not bind the stored lineage and principal"
+                    .to_owned(),
+            });
+        }
+        if self.owner_list_index_schema != BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2 {
+            return Err(OrsError::MigrationRequired {
+                reason: "owner maintenance cursor is bound to a stale owner-list index schema"
+                    .to_owned(),
+            });
+        }
+        if self.after_sequence > self.owner_cutoff {
+            return Err(OrsError::InvalidField {
+                field: "owner_maintenance_cursor",
+                reason: "owner-list continuation cannot pass its fixed cutoff",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventOwnerMaintenanceCursorRow {
+    const RECORD_TYPE: &'static str = "bridge_event_owner_maintenance_cursor";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl BridgeEventHandoffScanCursor {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.owner_revision == 0
+            || self.owner_incarnation == 0
+            || self.recovery_revision == 0
+            || self.after_sequence >= self.upper_sequence
+        {
+            return Err(OrsError::InvalidField {
+                field: "handoff_scan_cursor",
+                reason: "maintenance continuation must bind a nonempty owner revision and sequence range",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventCursorRow {
@@ -1162,6 +1255,15 @@ struct BridgeEventCursorRow {
     /// boundary is retired, never a new event.
     #[serde(default)]
     last_compacted_sequence: u64,
+    /// Bounded restart-safe repair position. Owner and recovery revisions
+    /// invalidate it when an intervening source change could add a lower
+    /// sequence or change the handoff relation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_repair_scan: Option<BridgeEventHandoffScanCursor>,
+    /// Separate bounded restart-safe retirement position. Repair writes
+    /// invalidate this scan because they change the handoff relation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_retirement_scan: Option<BridgeEventHandoffScanCursor>,
 }
 
 impl BridgeEventCursorRow {
@@ -1184,6 +1286,22 @@ impl BridgeEventCursorRow {
         }
         if !self.owner_namespace.is_empty() {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
+        for scan in [
+            self.handoff_repair_scan.as_ref(),
+            self.handoff_retirement_scan.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            scan.validate()?;
+            if self.owner_namespace.is_empty() || scan.upper_sequence > self.last_observed_sequence
+            {
+                return Err(OrsError::InvalidField {
+                    field: "handoff_scan_cursor",
+                    reason: "maintenance continuation must belong to the owner cursor's observed range",
+                });
+            }
         }
         Ok(())
     }
@@ -9949,6 +10067,8 @@ impl RedbRecoveryStore {
             owner_namespace: String::new(),
             last_observed_sequence: durable,
             last_compacted_sequence: 0,
+            handoff_repair_scan: None,
+            handoff_retirement_scan: None,
         };
         cursor.validate()?;
         {
@@ -9993,6 +10113,8 @@ impl RedbRecoveryStore {
                 .as_ref()
                 .map_or(durable, |row| row.last_observed_sequence.max(durable)),
             last_compacted_sequence: prior.as_ref().map_or(0, |row| row.last_compacted_sequence),
+            handoff_repair_scan: None,
+            handoff_retirement_scan: None,
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -11140,7 +11262,7 @@ impl RedbRecoveryStore {
                 .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
                 .map_err(storage)?;
             if cuts.len().map_err(storage)? >= MAX_BRIDGE_RECOVERY_CUTS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeRecoveryCutCapacityExceeded);
             }
         }
         let key = Self::bridge_recovery_cut_key(window_key, &owner.namespace);
@@ -11492,6 +11614,174 @@ impl RedbRecoveryStore {
         })
     }
 
+    fn bridge_owner_maintenance_cursor_in(
+        write: &redb::WriteTransaction,
+        scope_digest: &str,
+        lineage: &str,
+        principal: &str,
+    ) -> Result<Option<BridgeEventOwnerMaintenanceCursorRow>, OrsError> {
+        let cursors = write
+            .open_table(BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS)
+            .map_err(storage)?;
+        let Some(value) = cursors.get(scope_digest).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: BridgeEventOwnerMaintenanceCursorRow = decode(value.value())?;
+        if row.owner_scope_digest != scope_digest
+            || row.authority_lineage != lineage
+            || row.principal != principal
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_owner_maintenance_cursor",
+                reason: "owner maintenance cursor key and presenter binding disagree".to_owned(),
+            });
+        }
+        Ok(Some(row))
+    }
+
+    fn bridge_owner_maintenance_page_in(
+        write: &redb::WriteTransaction,
+        cursor: &BridgeEventOwnerMaintenanceCursorRow,
+    ) -> Result<(Vec<(BridgeStreamOwnerRow, u64)>, bool), OrsError> {
+        cursor.validate()?;
+        let limit = MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE;
+        if cursor.after_sequence >= cursor.owner_cutoff {
+            return Ok((Vec::new(), false));
+        }
+        let meta = write.open_table(META).map_err(storage)?;
+        let schema = meta
+            .get(BRIDGE_OWNER_LIST_INDEX_SCHEMA_KEY)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned());
+        if schema.as_deref() != Some(BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2) {
+            return Err(OrsError::MigrationRequired {
+                reason: "owner maintenance requires the current owner-list index".to_owned(),
+            });
+        }
+        let prefix = Self::bridge_owner_list_index_prefix(
+            &cursor.owner_scope_digest,
+            BRIDGE_STREAM_OWNER_KIND_STREAM,
+        );
+        let start_sequence = cursor
+            .after_sequence
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let start = format!("{prefix}{start_sequence:020}");
+        let end = Self::bridge_owner_list_index_key(
+            &cursor.owner_scope_digest,
+            BRIDGE_STREAM_OWNER_KIND_STREAM,
+            cursor.owner_cutoff,
+        );
+        let index = write
+            .open_table(BRIDGE_STREAM_OWNER_LIST_INDEX)
+            .map_err(storage)?;
+        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        let mut page = Vec::with_capacity(limit);
+        let mut seen = BTreeSet::new();
+        let mut has_more = false;
+        for entry in index
+            .range(start.as_str()..=end.as_str())
+            .map_err(storage)?
+            .take(limit.saturating_add(1))
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let sequence = key
+                .value()
+                .strip_prefix(prefix.as_str())
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner_list_index",
+                    reason: "owner-list key carries a malformed sequence".to_owned(),
+                })?;
+            if sequence == 0
+                || sequence <= cursor.after_sequence
+                || sequence > cursor.owner_cutoff
+                || key.value()
+                    != Self::bridge_owner_list_index_key(
+                        &cursor.owner_scope_digest,
+                        BRIDGE_STREAM_OWNER_KIND_STREAM,
+                        sequence,
+                    )
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner_list_index",
+                    reason: "owner maintenance page escaped its exact indexed range".to_owned(),
+                });
+            }
+            let namespace = Self::decode_bridge_owner_index_namespace(value.value())?;
+            if !seen.insert(namespace.clone()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner_list_index",
+                    reason: "stream owner occurs more than once in a bounded page".to_owned(),
+                });
+            }
+            let Some(value) = owners.get(namespace.as_str()).map_err(storage)? else {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            };
+            let owner: BridgeStreamOwnerRow = decode(value.value())?;
+            if owner.namespace != namespace
+                || owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
+                || owner.authority_lineage != cursor.authority_lineage
+                || owner.principal != cursor.principal
+                || Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)?
+                    != cursor.owner_scope_digest
+            {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            }
+            if page.len() == limit {
+                has_more = true;
+                break;
+            }
+            page.push((owner, sequence));
+        }
+        Ok((page, has_more))
+    }
+
+    fn bridge_cursor_stable_and_scan_bytes(encoded: &str) -> Result<(u64, u64), OrsError> {
+        let _: BridgeEventCursorRow = decode(encoded)?;
+        let full: Value =
+            serde_json::from_str(encoded).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: error.to_string(),
+            })?;
+        let canonical_full =
+            serde_json::to_string(&full).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if canonical_full.len() != encoded.len() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "stored cursor is not compact canonical JSON".to_owned(),
+            });
+        }
+        let mut stable = full.clone();
+        let Some(fields) = stable.as_object_mut() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "stored cursor is not a JSON object".to_owned(),
+            });
+        };
+        fields.remove("handoff_repair_scan");
+        fields.remove("handoff_retirement_scan");
+        let stable = serde_json::to_string(&stable)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let full_bytes = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let stable_bytes = u64::try_from(stable.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let scan_bytes =
+            full_bytes
+                .checked_sub(stable_bytes)
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_cursor",
+                    reason: "stable cursor encoding exceeds the stored cursor".to_owned(),
+                })?;
+        if stable_bytes.checked_add(scan_bytes) != Some(full_bytes) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "stable and handoff scan byte accounting does not match the stored row"
+                    .to_owned(),
+            });
+        }
+        Ok((stable_bytes, scan_bytes))
+    }
+
     fn bridge_recovery_owner_by_stream_in(
         write: &redb::WriteTransaction,
         window: &BridgeEventRecoveryWindowRow,
@@ -11715,6 +12005,7 @@ impl RedbRecoveryStore {
             "unscoped_gaps_continuation": serde_json::Value::Null,
             "unscoped_gaps_proof": serde_json::Value::Null,
             "unscoped_gap_total": window.unscoped_gap_total,
+            "unscoped_gap_capacity": serde_json::Value::Null,
             "unresolved_frontier": unresolved,
             "streams": stream_pages,
             "unscoped_gaps": unscoped_gaps,
@@ -11918,6 +12209,7 @@ impl RedbRecoveryStore {
         match marker.as_deref() {
             Some(BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2) => return Ok(()),
             Some("v1") => {
+                Self::clear_bridge_owner_maintenance_cursors_in(write)?;
                 let mut index = write
                     .open_table(BRIDGE_STREAM_OWNER_LIST_INDEX)
                     .map_err(storage)?;
@@ -11942,7 +12234,7 @@ impl RedbRecoveryStore {
                     reason: "bridge owner-list index schema marker is not current".to_owned(),
                 });
             }
-            None => {}
+            None => Self::clear_bridge_owner_maintenance_cursors_in(write)?,
         }
         let mut rows = {
             let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
@@ -11987,6 +12279,30 @@ impl RedbRecoveryStore {
             BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2,
         )
         .map_err(storage)?;
+        Ok(())
+    }
+
+    fn clear_bridge_owner_maintenance_cursors_in(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let mut cursors = write
+            .open_table(BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS)
+            .map_err(storage)?;
+        if cursors.len().map_err(storage)? > MAX_BRIDGE_STREAM_OWNERS as u64 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let keys: Vec<String> = cursors
+            .iter()
+            .map_err(storage)?
+            .map(|entry| {
+                entry
+                    .map(|(key, _)| key.value().to_owned())
+                    .map_err(storage)
+            })
+            .collect::<Result<_, _>>()?;
+        for key in keys {
+            cursors.remove(key.as_str()).map_err(storage)?;
+        }
         Ok(())
     }
 
@@ -12426,6 +12742,12 @@ impl RedbRecoveryStore {
             owner_namespace: access.namespace.clone(),
             last_observed_sequence: observed.max(durable),
             last_compacted_sequence: compacted,
+            handoff_repair_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_repair_scan.clone()),
+            handoff_retirement_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_retirement_scan.clone()),
         };
         cursor.validate()?;
         {
@@ -12479,6 +12801,12 @@ impl RedbRecoveryStore {
                 .as_ref()
                 .map_or(durable, |row| row.last_observed_sequence.max(durable)),
             last_compacted_sequence: prior.as_ref().map_or(0, |row| row.last_compacted_sequence),
+            handoff_repair_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_repair_scan.clone()),
+            handoff_retirement_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_retirement_scan.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -12532,6 +12860,12 @@ impl RedbRecoveryStore {
                 .as_ref()
                 .map_or(durable, |row| row.last_observed_sequence.max(durable)),
             last_compacted_sequence: compacted,
+            handoff_repair_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_repair_scan.clone()),
+            handoff_retirement_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_retirement_scan.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -12713,6 +13047,123 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Resumes only a scan whose owner and recovery view still match. Any
+    /// other source change restarts at the beginning of the current observed
+    /// range so an out-of-order newly staged position cannot be skipped.
+    fn bridge_handoff_scan_for(
+        prior: Option<&BridgeEventHandoffScanCursor>,
+        owner: &BridgeStreamOwnerRow,
+        recovery_revision: u64,
+        upper_sequence: u64,
+    ) -> Option<BridgeEventHandoffScanCursor> {
+        prior
+            .filter(|scan| {
+                scan.owner_revision == owner.revision
+                    && scan.owner_incarnation == owner.incarnation
+                    && scan.recovery_revision == recovery_revision
+            })
+            .cloned()
+            .or_else(|| {
+                (upper_sequence > 0).then_some(BridgeEventHandoffScanCursor {
+                    owner_revision: owner.revision,
+                    owner_incarnation: owner.incarnation,
+                    recovery_revision,
+                    after_sequence: 0,
+                    upper_sequence,
+                })
+            })
+    }
+
+    /// Reads one bounded page from the namespace's immutable sequence index.
+    /// The one lookahead row distinguishes an exhausted page from a true
+    /// continuation without scanning to the table end.
+    fn bridge_handoff_position_page_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        scan: &BridgeEventHandoffScanCursor,
+        budget: usize,
+    ) -> Result<(Vec<(u64, String)>, bool), OrsError> {
+        scan.validate()?;
+        let mut page = Vec::with_capacity(budget);
+        let mut continuation = false;
+        let start = Self::bridge_position_key(&access.namespace, scan.after_sequence);
+        let end = Self::bridge_position_key(&access.namespace, scan.upper_sequence);
+        let positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        for entry in positions
+            .range::<&str>((
+                Bound::Excluded(start.as_str()),
+                Bound::Included(end.as_str()),
+            ))
+            .map_err(storage)?
+            .take(budget.saturating_add(1))
+        {
+            let (key, value) = entry.map_err(storage)?;
+            if page.len() == budget {
+                continuation = true;
+                break;
+            }
+            let (namespace, sequence) = Self::parse_bridge_position_key(key.value())?;
+            if namespace != access.namespace
+                || key.value() != Self::bridge_position_key(&access.namespace, sequence)
+                || sequence <= scan.after_sequence
+                || sequence > scan.upper_sequence
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "maintenance page escaped its owner sequence range".to_owned(),
+                });
+            }
+            let position: BridgeEventPosition = decode(value.value())?;
+            position.validate()?;
+            page.push((sequence, position.event_id));
+        }
+        Ok((page, continuation))
+    }
+
+    /// Resolves one indexed position to its exact retained event and durable
+    /// normalized projection. A position below the compacted boundary with
+    /// no source is historical; any missing source above that boundary is a
+    /// torn relation and cannot authorize a repair or retirement.
+    fn bridge_event_record_for_maintenance_position_in(
+        write: &redb::WriteTransaction,
+        owner: &BridgeStreamOwnerRow,
+        sequence: u64,
+        event_id: &str,
+        compacted_boundary: u64,
+    ) -> Result<Option<BridgeEventRow>, OrsError> {
+        let key = format!("{}::{event_id}", owner.namespace);
+        let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        let row = records
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<BridgeEventRow>(value.value()))
+            .transpose()?;
+        let Some(row) = row else {
+            if sequence <= compacted_boundary {
+                return Ok(None);
+            }
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_record",
+                reason: "owner position above the compacted boundary has no retained source"
+                    .to_owned(),
+            });
+        };
+        row.validate()?;
+        if key != format!("{}::{}", owner.namespace, row.event_id)
+            || row.owner_namespace != owner.namespace
+            || row.stream_id != owner.local_stream
+            || row.event_id != event_id
+            || row.sequence != sequence
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_record",
+                reason: "position, source key, owner, and event identity disagree".to_owned(),
+            });
+        }
+        Self::require_bridge_event_relation_in(write, &row, key.as_str())?;
+        Ok(Some(row))
+    }
+
     /// Loads one per-namespace cursor row inside a write transaction without
     /// synthesizing anything: `None` when the namespace never staged.
     fn load_bridge_cursor_row_in(
@@ -12792,6 +13243,8 @@ impl RedbRecoveryStore {
             owner_namespace: access.namespace.clone(),
             last_observed_sequence: sequence,
             last_compacted_sequence: row.last_compacted_sequence,
+            handoff_repair_scan: row.handoff_repair_scan.clone(),
+            handoff_retirement_scan: row.handoff_retirement_scan.clone(),
         };
         next.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -14967,19 +15420,19 @@ impl RedbRecoveryStore {
     /// including rows staged by the former split commits or left
     /// handoff-less by the expired-submit early return — gains its
     /// `handed_off` row under the ORIGINAL identity (same key, sequence,
-    /// digest, staging connection). No new logical event is created: the
-    /// row's identity facts are re-validated, the owner binding is checked
-    /// against the expected revision/incarnation, and rows at or below the
-    /// retained compacted boundary are skipped (their disposition is already
-    /// the explicit retired one — historical observation retention there is
-    /// not authority to mint fresh delivery evidence). A timeout after stage
-    /// is not proof of non-acceptance, so expiry never blocks repair. At
-    /// most [`MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY`] rows repair per call;
-    /// `repair_continuation` reports whether more missing handoffs remain
-    /// for the next legitimate recovery entry. A conflicting handoff fails
-    /// the call with [`OrsError::DuplicateConflict`]; a full handoff table
-    /// fails with [`OrsError::ProjectionLimitExceeded`] (truthful
-    /// backpressure) instead of declaring the missing evidence complete.
+    /// digest, staging connection). A retained source row is processed even
+    /// at or below the compacted boundary; only a missing source at or below
+    /// that boundary is historical. Historical observation retention does
+    /// not authorize a late semantic effect, and ORS does not infer effect
+    /// authority from expiry. A timeout after stage is not proof of
+    /// non-acceptance. At most
+    /// [`MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY`] indexed positions are scanned
+    /// per call; `repair_continuation` reports whether more positions remain
+    /// for the next legitimate recovery entry, not whether the full owner is
+    /// repaired. A conflicting handoff fails the call with
+    /// [`OrsError::DuplicateConflict`]; a full handoff table returns typed
+    /// pending-handoff backpressure instead of declaring missing evidence
+    /// complete.
     pub fn repair_bridge_event_handoffs_checked(
         &self,
         request: &serde_json::Value,
@@ -15034,13 +15487,6 @@ impl RedbRecoveryStore {
             expected_incarnation,
             budget,
         )?;
-        if outcome
-            .get("repaired")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|repaired| repaired > 0)
-        {
-            Self::bump_bridge_recovery_revision_in(&write, &namespace)?;
-        }
         write.commit().map_err(storage)?;
         Ok(outcome)
     }
@@ -15053,10 +15499,11 @@ impl RedbRecoveryStore {
     /// reconcile tuple; it has no receiver receipt, so no current row is
     /// eligible. Existing owner revision/incarnation checks still reject a
     /// stale writer, but do not substitute for terminal evidence. At most
-    /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] safely eligible rows retire
-    /// per call; `retirement_continuation` reports only eligible rows beyond
-    /// the budget, not whether unresolved handoffs exist. Pending rows and
-    /// their payload/projection/replay identities stay intact. When the
+    /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] positions are scanned per
+    /// call; `retirement_continuation` reports whether more positions remain
+    /// for this owner, not whether a row is eligible or unresolved handoffs
+    /// exist. Pending rows and their payload/projection/replay identities stay
+    /// intact. When the
     /// bounded handoff table fills, admission returns typed backpressure;
     /// cursors are never reset and missing evidence is never declared
     /// complete.
@@ -15118,20 +15565,115 @@ impl RedbRecoveryStore {
         Ok(outcome)
     }
 
-    /// Repairs one namespace's missing handoffs inside the recovery
-    /// transaction (issue #2731, items 3 and 4). The scan filters by the
-    /// namespaced key prefix before decoding, so foreign and legacy rows
-    /// cost no decode; every touched row is re-validated and
-    /// namespace-checked, and the created handoff binds the row's exact
-    /// identity facts. Candidates are live retained records at any
-    /// sequence: a live record below the compacted boundary still carries
-    /// a real delivery obligation (terminal retirement always deletes the
-    /// record together with its handoff, so a retained record is pending
-    /// or a legacy split — never terminal), and receipt-driven retirement
-    /// may advance the boundary past interleaved pending sequences, so a
-    /// boundary skip would blind repair to exactly the rows item 3 must
-    /// restore. Terminalized rows have no retained record and are never
-    /// candidates, so repair cannot resurrect them.
+    /// Advances one bounded owner-index page of independent handoff repair
+    /// and eligible-retirement maintenance (issue #2731, item 5). The
+    /// presenter supplies only its retained lineage/principal; ORS derives
+    /// scope and persists the cutoff/position. The returned owner traversal
+    /// continuation is separate from each stream's repair/retirement scan
+    /// continuation and does not claim that unresolved obligations are done.
+    pub fn maintain_bridge_event_handoffs_for_owner_checked(
+        &self,
+        presenter: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
+        let scope_digest = Self::bridge_owner_scope_digest(&lineage, &principal)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let latest_cutoff = Self::bridge_owner_list_cutoff_in(&write)?;
+        let existing =
+            Self::bridge_owner_maintenance_cursor_in(&write, &scope_digest, &lineage, &principal)?;
+        let is_new = existing.is_none();
+        let mut cursor = existing.unwrap_or(BridgeEventOwnerMaintenanceCursorRow {
+            contract_version: crate::CONTRACT_VERSION,
+            owner_scope_digest: scope_digest.clone(),
+            authority_lineage: lineage,
+            principal,
+            owner_list_index_schema: BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2.to_owned(),
+            after_sequence: 0,
+            owner_cutoff: latest_cutoff,
+        });
+        if cursor.after_sequence == 0 {
+            cursor.owner_cutoff = latest_cutoff;
+        } else if cursor.owner_cutoff > latest_cutoff {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_owner_maintenance_cursor",
+                reason: "fixed owner-list cutoff exceeds the durable sequence".to_owned(),
+            });
+        }
+        let (owners, continuation) = Self::bridge_owner_maintenance_page_in(&write, &cursor)?;
+        if is_new && owners.is_empty() {
+            write.commit().map_err(storage)?;
+            return Ok(json!({
+                "owner_maintenance_continuation": false,
+                "owner_maintenance_cursor_bytes": 0_u64,
+                "owners_processed": [],
+            }));
+        }
+        if owners.is_empty() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_stream_owner_list_index",
+                reason: "persisted owner maintenance continuation has no indexed stream page"
+                    .to_owned(),
+            });
+        }
+        let mut owners_processed = Vec::with_capacity(owners.len());
+        for (owner, _) in &owners {
+            owners_processed.push(Self::maintain_bridge_event_handoffs_for_stream_in(
+                &write, owner,
+            )?);
+        }
+        cursor.after_sequence = if continuation {
+            owners
+                .last()
+                .map(|(_, sequence)| *sequence)
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner_list_index",
+                    reason: "owner maintenance continuation has no included owner".to_owned(),
+                })?
+        } else {
+            cursor.owner_cutoff = Self::bridge_owner_list_cutoff_in(&write)?;
+            0
+        };
+        cursor.validate()?;
+        let encoded_cursor = encode(&cursor)?;
+        {
+            let mut cursors = write
+                .open_table(BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS)
+                .map_err(storage)?;
+            if is_new && cursors.len().map_err(storage)? >= MAX_BRIDGE_STREAM_OWNERS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            cursors
+                .insert(scope_digest.as_str(), encoded_cursor.as_str())
+                .map_err(storage)?;
+        }
+        let owner_maintenance_cursor_bytes = u64::try_from(
+            scope_digest
+                .len()
+                .checked_add(encoded_cursor.len())
+                .ok_or(OrsError::PayloadTooLarge)?,
+        )
+        .map_err(|_| OrsError::PayloadTooLarge)?;
+        write.commit().map_err(storage)?;
+        Ok(json!({
+            "owner_maintenance_continuation": continuation,
+            "owner_maintenance_cursor_bytes": owner_maintenance_cursor_bytes,
+            "owners_processed": owners_processed,
+        }))
+    }
+
+    /// Repairs a bounded page of one namespace's missing handoffs inside the
+    /// recovery transaction (issue #2731, items 3 and 5). The immutable
+    /// position index bounds the scan; each position is joined back to its
+    /// retained source and normalized projection before a handoff is
+    /// reconstructed under the original identity. A retained record below
+    /// the compacted boundary still carries a delivery obligation; only a
+    /// missing source at or below that boundary is historical. The persisted
+    /// continuation is owner/revision bound and reports whether more indexed
+    /// rows remain to scan, not whether the whole owner is repaired.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The bounded source join, capacity preflight, cursor advance, and repair inserts must remain one reviewable write-transaction flow."
+    )]
     fn repair_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -15149,126 +15691,245 @@ impl RedbRecoveryStore {
             expected_incarnation,
             BridgeStreamRight::Append,
         )?;
-        let prefix = format!("{namespace}::");
-        let mut candidates: Vec<BridgeEventRow> = Vec::new();
-        {
-            let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for entry in records.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                if !key.value().starts_with(prefix.as_str()) {
-                    continue;
-                }
-                let row: BridgeEventRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace != access.namespace {
-                    continue;
-                }
-                candidates.push(row);
-            }
+        let mut cursor = Self::load_bridge_cursor_row_in(write, namespace)?.ok_or(
+            OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "admitted stream owner has no retained position cursor".to_owned(),
+            },
+        )?;
+        cursor.validate()?;
+        if cursor.owner_namespace != access.namespace || cursor.stream_id != owner.local_stream {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "position cursor does not match its admitted owner".to_owned(),
+            });
         }
-        candidates.sort_by_key(|row| row.sequence);
-        let now_ms = current_unix_ms_u64()?;
-        let mut missing: Vec<BridgeEventRow> = Vec::new();
-        {
-            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for row in &candidates {
-                let key = format!("{}::{}", access.namespace, row.event_id);
-                let existing: Option<BridgeEventHandoffRow> = handoffs
-                    .get(key.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode(value.value()))
-                    .transpose()?;
-                match existing {
-                    None => missing.push(row.clone()),
-                    Some(handoff) => {
-                        handoff.validate()?;
-                        if handoff.owner_namespace != access.namespace
-                            || handoff.envelope_sha256 != row.envelope_sha256
-                            || handoff.sequence != row.sequence
-                        {
-                            return Err(OrsError::DuplicateConflict);
-                        }
-                    }
-                }
-            }
-        }
-        let mut repaired = 0_u64;
-        if !missing.is_empty() {
-            let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for row in missing.iter().take(budget) {
-                // Exact per-row pressure enforcement: the slice either fits
-                // its bounded charge or the call answers backpressure with
-                // nothing committed.
-                if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
-                    return Err(OrsError::BridgeEventCapacityExceeded(
-                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
-                            eliot_contracts::BridgeEventLocalPhase::Durable,
-                        ),
-                    ));
-                }
-                let key = format!("{}::{}", access.namespace, row.event_id);
-                if handoffs.get(key.as_str()).map_err(storage)?.is_some() {
-                    continue;
-                }
-                let handoff = BridgeEventHandoffRow {
-                    contract_version: crate::CONTRACT_VERSION,
-                    stream_id: row.stream_id.clone(),
-                    event_id: row.event_id.clone(),
-                    sequence: row.sequence,
-                    envelope_sha256: row.envelope_sha256.clone(),
-                    state: BRIDGE_EVENT_HANDOFF_HANDED_OFF.to_owned(),
-                    staging_connection: row.staging_connection.clone(),
-                    handed_off_at_ms: now_ms,
-                    reconcile_key: String::new(),
-                    reconciled_at_ms: 0,
-                    owner_namespace: access.namespace.clone(),
-                    reconcile_acked_sequence: 0,
-                    reconcile_owner_revision: 0,
-                    reconcile_owner_incarnation: 0,
-                };
+        let recovery_revision = Self::bridge_recovery_revision_for_in(write, namespace)?;
+        let Some(scan) = Self::bridge_handoff_scan_for(
+            cursor.handoff_repair_scan.as_ref(),
+            &owner,
+            recovery_revision,
+            cursor.last_observed_sequence,
+        ) else {
+            cursor.handoff_repair_scan = None;
+            cursor.validate()?;
+            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .insert(namespace, encode(&cursor)?.as_str())
+                .map_err(storage)?;
+            drop(cursors);
+            let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, namespace)?;
+            return Ok(json!({
+                "namespace": access.namespace,
+                "repaired": 0_u64,
+                "repair_continuation": false,
+                "handoff_scan_bytes": scan_bytes,
+            }));
+        };
+        let (positions, continuation) =
+            Self::bridge_handoff_position_page_in(write, &access, &scan, budget)?;
+        let mut next_scan = if continuation {
+            let after_sequence = positions.last().map(|(sequence, _)| *sequence).ok_or(
+                OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "bounded repair continuation has no processed position".to_owned(),
+                },
+            )?;
+            Some(BridgeEventHandoffScanCursor {
+                after_sequence,
+                ..scan.clone()
+            })
+        } else {
+            None
+        };
+        let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+        let mut missing = Vec::new();
+        for (sequence, event_id) in &positions {
+            let Some(row) = Self::bridge_event_record_for_maintenance_position_in(
+                write,
+                &owner,
+                *sequence,
+                event_id,
+                cursor.last_compacted_sequence,
+            )?
+            else {
+                continue;
+            };
+            let key = format!("{}::{}", access.namespace, row.event_id);
+            let existing: Option<BridgeEventHandoffRow> = handoffs
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            if let Some(handoff) = existing {
                 handoff.validate()?;
-                handoffs
-                    .insert(key.as_str(), encode(&handoff)?.as_str())
-                    .map_err(storage)?;
-                repaired += 1;
+                if handoff.owner_namespace != access.namespace
+                    || handoff.stream_id != row.stream_id
+                    || handoff.event_id != row.event_id
+                    || handoff.envelope_sha256 != row.envelope_sha256
+                    || handoff.sequence != row.sequence
+                    || handoff.staging_connection != row.staging_connection
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+            } else {
+                missing.push((key, row));
             }
         }
+        let missing_count =
+            u64::try_from(missing.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        let existing_count = handoffs.len().map_err(storage)?;
+        if existing_count > MAX_BRIDGE_EVENT_HANDOFFS as u64 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_handoff",
+                reason: "pending handoff table already exceeds its admitted capacity".to_owned(),
+            });
+        }
+        if existing_count
+            .checked_add(missing_count)
+            .is_none_or(|count| count > MAX_BRIDGE_EVENT_HANDOFFS as u64)
+        {
+            return Err(OrsError::BridgeEventCapacityExceeded(
+                eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                    eliot_contracts::BridgeEventLocalPhase::Durable,
+                ),
+            ));
+        }
+        let mut now_ms = None;
+        let mut repaired = 0_u64;
+        for (key, row) in missing {
+            let handed_off_at_ms = if let Some(timestamp) = now_ms {
+                timestamp
+            } else {
+                let timestamp = current_unix_ms_u64()?;
+                now_ms = Some(timestamp);
+                timestamp
+            };
+            let handoff = BridgeEventHandoffRow {
+                contract_version: crate::CONTRACT_VERSION,
+                stream_id: row.stream_id.clone(),
+                event_id: row.event_id.clone(),
+                sequence: row.sequence,
+                envelope_sha256: row.envelope_sha256.clone(),
+                state: BRIDGE_EVENT_HANDOFF_HANDED_OFF.to_owned(),
+                staging_connection: row.staging_connection.clone(),
+                handed_off_at_ms,
+                reconcile_key: String::new(),
+                reconciled_at_ms: 0,
+                owner_namespace: access.namespace.clone(),
+                reconcile_acked_sequence: 0,
+                reconcile_owner_revision: 0,
+                reconcile_owner_incarnation: 0,
+            };
+            handoff.validate()?;
+            handoffs
+                .insert(key.as_str(), encode(&handoff)?.as_str())
+                .map_err(storage)?;
+            repaired += 1;
+        }
+        cursor.handoff_repair_scan = next_scan.take();
+        if repaired > 0 {
+            let updated_revision = Self::bump_bridge_recovery_revision_in(write, namespace)?;
+            if let Some(scan) = &mut cursor.handoff_repair_scan {
+                scan.recovery_revision = updated_revision;
+            }
+            cursor.handoff_retirement_scan = None;
+        }
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(namespace, encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        drop(cursors);
+        let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, namespace)?;
         Ok(json!({
             "namespace": access.namespace,
             "repaired": repaired,
-            "repair_continuation": missing.len() as u64 > repaired,
+            "repair_continuation": continuation,
+            "handoff_scan_bytes": scan_bytes,
         }))
     }
 
-    /// Collects one namespace's handoffs that have owner-issued terminal
-    /// evidence (issue #2731, item 5), sorted by sequence then key so any
-    /// terminalization advances the boundary in order. The current persisted
-    /// producer reconcile tuple is insufficient, so those rows remain
-    /// pending. Called by [`Self::retire_bridge_handoffs_in`]; kept separate
-    /// so the recovery transaction stays within its line budget.
+    /// Collects terminal-eligible handoffs from one bounded position page.
+    /// The current producer reconcile tuple is not receiver evidence, so no
+    /// present row is eligible. Source/projection joins still run before a
+    /// row could enter a future terminalization path.
     fn bridge_retire_eligible_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
-    ) -> Result<Vec<(u64, String, BridgeEventHandoffRow)>, OrsError> {
-        let prefix = format!("{}::", access.namespace);
+        owner: &BridgeStreamOwnerRow,
+        cursor: &BridgeEventCursorRow,
+        scan: &BridgeEventHandoffScanCursor,
+        budget: usize,
+    ) -> Result<BridgeRetirementPage, OrsError> {
+        let (positions, continuation) =
+            Self::bridge_handoff_position_page_in(write, access, scan, budget)?;
+        let after_sequence = positions.last().map(|(sequence, _)| *sequence);
         let mut eligible: Vec<(u64, String, BridgeEventHandoffRow)> = Vec::new();
         let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-        for entry in handoffs.iter().map_err(storage)? {
-            let (key, value) = entry.map_err(storage)?;
-            if !key.value().starts_with(prefix.as_str()) {
+        for (sequence, event_id) in positions {
+            let Some(record) = Self::bridge_event_record_for_maintenance_position_in(
+                write,
+                owner,
+                sequence,
+                &event_id,
+                cursor.last_compacted_sequence,
+            )?
+            else {
+                let key = format!("{}::{event_id}", access.namespace);
+                let handoff = handoffs
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<BridgeEventHandoffRow>(value.value()))
+                    .transpose()?;
+                if let Some(handoff) = handoff {
+                    handoff.validate()?;
+                    if handoff.owner_namespace != access.namespace
+                        || handoff.stream_id != owner.local_stream
+                        || handoff.event_id != event_id
+                        || handoff.sequence != sequence
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_event_handoff",
+                            reason: "handoff does not bind its retained owner position".to_owned(),
+                        });
+                    }
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_handoff",
+                        reason: "retained handoff has no retained source or terminal disposition"
+                            .to_owned(),
+                    });
+                }
                 continue;
-            }
+            };
+            let key = format!("{}::{}", access.namespace, event_id);
+            let Some(value) = handoffs.get(key.as_str()).map_err(storage)? else {
+                continue;
+            };
             let row: BridgeEventHandoffRow = decode(value.value())?;
             row.validate()?;
-            if row.owner_namespace != access.namespace {
-                continue;
+            if row.owner_namespace != access.namespace
+                || row.stream_id != owner.local_stream
+                || row.event_id != record.event_id
+                || row.sequence != record.sequence
+                || row.envelope_sha256 != record.envelope_sha256
+                || row.staging_connection != record.staging_connection
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_handoff",
+                    reason: "handoff does not bind its retained source and owner position"
+                        .to_owned(),
+                });
             }
             if row.retirement_eligible() {
-                eligible.push((row.sequence, key.value().to_owned(), row));
+                eligible.push((row.sequence, key, row));
             }
         }
-        eligible.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        Ok(eligible)
+        Ok(BridgeRetirementPage {
+            eligible,
+            continuation,
+            after_sequence,
+        })
     }
 
     /// Retires one namespace's handoffs inside the recovery transaction
@@ -15278,10 +15939,15 @@ impl RedbRecoveryStore {
     /// receipt or admitted terminal disposition; therefore no current row is
     /// eligible. Pending payloads and handoffs, replay commitments, and
     /// cursors remain untouched. In the result,
-    /// `retirement_continuation` means additional safely eligible rows remain
-    /// beyond this call's budget; false does not mean there are no unresolved
-    /// handoffs. Admission at the existing handoff capacity continues to
-    /// return typed pending-handoff backpressure instead of evicting them.
+    /// `retirement_continuation` means additional indexed positions remain to
+    /// scan for this owner; it does not assert that any row is eligible or
+    /// that there are no unresolved handoffs. Admission at the existing
+    /// handoff capacity continues to return typed pending-handoff
+    /// backpressure instead of evicting them.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The owner-bound retirement proof, payload/projection mutation, and cursor update must remain one atomic write-transaction flow."
+    )]
     fn retire_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -15299,32 +15965,55 @@ impl RedbRecoveryStore {
             expected_incarnation,
             BridgeStreamRight::Acknowledge,
         )?;
-        let cursor = Self::load_bridge_cursor_row_in(write, namespace)?;
-        let (durable, acked, compacted) = cursor.as_ref().map_or((0, 0, 0), |row| {
-            (
-                row.last_durable_sequence,
-                row.last_acked_sequence,
-                row.last_compacted_sequence,
-            )
-        });
-        let eligible = Self::bridge_retire_eligible_in(write, &access)?;
-        if eligible.is_empty() {
+        let mut cursor = Self::load_bridge_cursor_row_in(write, namespace)?.ok_or(
+            OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "admitted stream owner has no retained position cursor".to_owned(),
+            },
+        )?;
+        cursor.validate()?;
+        if cursor.owner_namespace != access.namespace || cursor.stream_id != owner.local_stream {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "position cursor does not match its admitted owner".to_owned(),
+            });
+        }
+        let durable = cursor.last_durable_sequence;
+        let acked = cursor.last_acked_sequence;
+        let compacted = cursor.last_compacted_sequence;
+        let recovery_revision = Self::bridge_recovery_revision_for_in(write, namespace)?;
+        let Some(scan) = Self::bridge_handoff_scan_for(
+            cursor.handoff_retirement_scan.as_ref(),
+            &owner,
+            recovery_revision,
+            cursor.last_observed_sequence,
+        ) else {
+            cursor.handoff_retirement_scan = None;
+            cursor.validate()?;
+            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .insert(namespace, encode(&cursor)?.as_str())
+                .map_err(storage)?;
+            drop(cursors);
+            let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, namespace)?;
             return Ok(json!({
                 "namespace": access.namespace,
                 "retired": 0_u64,
                 "terminalized": 0_u64,
                 "retirement_continuation": false,
+                "handoff_scan_bytes": scan_bytes,
             }));
-        }
+        };
+        let BridgeRetirementPage {
+            eligible,
+            continuation,
+            after_sequence,
+        } = Self::bridge_retire_eligible_in(write, &access, &owner, &cursor, &scan, budget)?;
         let now_ms = current_unix_ms_u64()?;
-        let mut retired = 0_u64;
+        let retired = 0_u64;
         let mut terminalized = 0_u64;
         let mut terminalized_boundary = compacted;
-        let mut spent = 0_usize;
         for (_, key, row) in &eligible {
-            if spent >= budget {
-                break;
-            }
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
                 let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
@@ -15335,23 +16024,25 @@ impl RedbRecoveryStore {
                     .transpose()?
             };
             let Some(record) = record else {
-                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-                handoffs.remove(key.as_str()).map_err(storage)?;
-                retired += 1;
-                spent += 1;
-                continue;
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_record",
+                    reason: "eligible handoff lost its retained source".to_owned(),
+                });
             };
             record.validate()?;
-            // The handoff must bind the exact retained record; a torn
-            // identity is skipped, never repaired by guessing here.
             if record.owner_namespace != access.namespace
+                || record.stream_id != owner.local_stream
                 || record.event_id != row.event_id
                 || record.sequence != row.sequence
                 || record.envelope_sha256 != row.envelope_sha256
                 || record.phase != BRIDGE_EVENT_PHASE_DURABLE
             {
-                continue;
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_record",
+                    reason: "terminal handoff does not bind its exact retained source".to_owned(),
+                });
             }
+            Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
             if !row.retirement_eligible() {
                 continue;
             }
@@ -15365,8 +16056,13 @@ impl RedbRecoveryStore {
                 let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
                 handoffs.remove(key.as_str()).map_err(storage)?;
             }
+            {
+                let mut projections = write
+                    .open_table(BRIDGE_EVENT_PROJECTIONS)
+                    .map_err(storage)?;
+                projections.remove(record_key.as_str()).map_err(storage)?;
+            }
             terminalized += 1;
-            spent += 1;
             terminalized_boundary = terminalized_boundary.max(row.sequence);
         }
         if terminalized_boundary > compacted {
@@ -15378,16 +16074,173 @@ impl RedbRecoveryStore {
                 acked,
                 terminalized_boundary,
             )?;
+            cursor.last_compacted_sequence = terminalized_boundary;
         }
-        if retired > 0 || terminalized > 0 {
-            Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+        let mut next_scan = if continuation {
+            Some(BridgeEventHandoffScanCursor {
+                after_sequence: after_sequence.ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "bounded retirement continuation has no processed position".to_owned(),
+                })?,
+                ..scan
+            })
+        } else {
+            None
+        };
+        if terminalized > 0 {
+            let updated_revision =
+                Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+            if let Some(scan) = &mut next_scan {
+                scan.recovery_revision = updated_revision;
+            }
+            cursor.handoff_repair_scan = None;
         }
+        cursor.handoff_retirement_scan = next_scan;
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(namespace, encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        drop(cursors);
+        let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, namespace)?;
         Ok(json!({
             "namespace": access.namespace,
             "retired": retired,
             "terminalized": terminalized,
-            "retirement_continuation": eligible.len() as u64 > spent as u64,
+            "retirement_continuation": continuation,
+            "handoff_scan_bytes": scan_bytes,
         }))
+    }
+
+    fn maintain_bridge_event_handoffs_for_stream_in(
+        write: &redb::WriteTransaction,
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<serde_json::Value, OrsError> {
+        let retirement = Self::retire_bridge_handoffs_in(
+            write,
+            &owner.namespace,
+            owner.revision,
+            owner.incarnation,
+            MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY,
+        )?;
+        let repair = Self::repair_bridge_handoffs_in(
+            write,
+            &owner.namespace,
+            owner.revision,
+            owner.incarnation,
+            MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY,
+        );
+        let repair = match repair {
+            Ok(repair) => repair,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure))
+                if pressure
+                    == eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                        eliot_contracts::BridgeEventLocalPhase::Durable,
+                    ) =>
+            {
+                let continuation = Self::bridge_repair_scan_continuation_in(
+                    write,
+                    &owner.namespace,
+                    owner.revision,
+                    owner.incarnation,
+                    MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY,
+                )?;
+                let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, &owner.namespace)?;
+                let mut item = Self::bridge_maintenance_result_object(&retirement)?;
+                Self::validate_bridge_maintenance_namespace(&item, &owner.namespace)?;
+                item.insert("repaired".to_owned(), json!(0_u64));
+                item.insert("repair_continuation".to_owned(), json!(continuation));
+                item.insert("handoff_scan_bytes".to_owned(), json!(scan_bytes));
+                item.insert(
+                    "capacity_pressure".to_owned(),
+                    serde_json::to_value(pressure)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                );
+                return Ok(serde_json::Value::Object(item));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut item = Self::bridge_maintenance_result_object(&retirement)?;
+        Self::validate_bridge_maintenance_namespace(&item, &owner.namespace)?;
+        let repair = Self::bridge_maintenance_result_object(&repair)?;
+        Self::validate_bridge_maintenance_namespace(&repair, &owner.namespace)?;
+        for (key, value) in repair {
+            item.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(item))
+    }
+
+    fn validate_bridge_maintenance_namespace(
+        item: &serde_json::Map<String, serde_json::Value>,
+        namespace: &str,
+    ) -> Result<(), OrsError> {
+        if item.get("namespace").and_then(Value::as_str) != Some(namespace) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_handoff",
+                reason: "maintenance result changed its validated owner namespace".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn bridge_maintenance_result_object(
+        value: &serde_json::Value,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, OrsError> {
+        value
+            .as_object()
+            .cloned()
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_event_handoff",
+                reason: "owner maintenance subresult is not an object".to_owned(),
+            })
+    }
+
+    fn bridge_repair_scan_continuation_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        budget: usize,
+    ) -> Result<bool, OrsError> {
+        let owner = Self::load_bridge_owner_row_in(write, namespace)?;
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            expected_revision,
+            expected_incarnation,
+            BridgeStreamRight::Append,
+        )?;
+        let cursor = Self::load_bridge_cursor_row_in(write, namespace)?.ok_or(
+            OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "admitted stream owner has no retained position cursor".to_owned(),
+            },
+        )?;
+        let recovery_revision = Self::bridge_recovery_revision_for_in(write, namespace)?;
+        let Some(scan) = Self::bridge_handoff_scan_for(
+            cursor.handoff_repair_scan.as_ref(),
+            &owner,
+            recovery_revision,
+            cursor.last_observed_sequence,
+        ) else {
+            return Ok(false);
+        };
+        let (_, continuation) =
+            Self::bridge_handoff_position_page_in(write, &access, &scan, budget)?;
+        Ok(continuation)
+    }
+
+    fn bridge_handoff_scan_bytes_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+    ) -> Result<u64, OrsError> {
+        let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let Some(value) = cursors.get(namespace).map_err(storage)? else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "admitted stream owner has no retained position cursor".to_owned(),
+            });
+        };
+        Ok(Self::bridge_cursor_stable_and_scan_bytes(value.value())?.1)
     }
 
     /// Reconciles event ownership and cursors for one proven presenter
@@ -16055,6 +16908,10 @@ impl RedbRecoveryStore {
             stream_pages_pending,
             unproven_scope_present,
         };
+        let unscoped_gap_capacity = match &gap_owner_for_page {
+            Some((owner, _)) => Self::bridge_unscoped_gap_capacity_accounting_for(&read, owner)?,
+            None => serde_json::Value::Null,
+        };
         let response = json!({
             "window_key": read_window.window_key,
             "window_identity_version": read_window.version,
@@ -16074,6 +16931,7 @@ impl RedbRecoveryStore {
             "unscoped_gaps_continuation": gap_continuation,
             "unscoped_gaps_proof": unscoped_gaps_proof,
             "unscoped_gap_total": read_window.unscoped_gap_total,
+            "unscoped_gap_capacity": unscoped_gap_capacity,
             "unresolved_frontier": unresolved,
             "streams": stream_pages,
             "unscoped_gaps": unscoped_gaps,
@@ -16262,9 +17120,20 @@ impl RedbRecoveryStore {
             let (key, value) = entry.map_err(storage)?;
             let row: BridgeEventGapRow = decode(value.value())?;
             row.validate()?;
-            if row.owner_namespace != namespace
-                || key.value() != format!("{namespace}::{}", row.gap_id)
-            {
+            let key = key.value();
+            if row.owner_namespace.is_empty() {
+                // Legacy gaps use the bare gap_id key; validate and exclude
+                // them even when an ID containing `::` falls under this
+                // namespace prefix. Their scope remains unproven.
+                if key != row.gap_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_gap",
+                        reason: "legacy gap key does not match its identity".to_owned(),
+                    });
+                }
+                continue;
+            }
+            if row.owner_namespace != namespace || key != format!("{namespace}::{}", row.gap_id) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_gap",
                     reason: "gap key or owner does not match its indexed scope".to_owned(),
@@ -16274,7 +17143,7 @@ impl RedbRecoveryStore {
                 return Err(OrsError::ProjectionLimitExceeded);
             }
             gaps += 1;
-            gap_bytes += (key.value().len() + value.value().len()) as u64;
+            gap_bytes += (key.len() + value.value().len()) as u64;
         }
         Ok((gaps, gap_bytes))
     }
@@ -16363,15 +17232,111 @@ impl RedbRecoveryStore {
         Ok((count, bytes))
     }
 
-    /// Accounts one namespace's bridge-event capacity under its owner
-    /// (issue #2731, item 4): pending live events, handoffs, retained replay
-    /// commitments, the #2730 ordered position index, stream/cursor
-    /// metadata, and scoped gaps with their total encoded bytes. Every byte
-    /// count sums key bytes plus serialized-record bytes — the accountable
-    /// persisted size, never the source payload length (which is not exact
-    /// persisted size or heap use). Engine index structure and in-memory
-    /// heap stay outside this measure; the global admission caps absorb
-    /// them. The #2730 position index is owned, written, and capped by
+    fn bridge_projection_accounting_for(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<(u64, u64), OrsError> {
+        let namespace = owner.namespace.as_str();
+        let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
+        let prefix = format!("{namespace}::");
+        let prefix_end = format!("{prefix}\u{10ffff}");
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for entry in projections
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let row: BridgeEventProjectionRow = decode(value.value())?;
+            row.validate()?;
+            let key = key.value();
+            if row.owner_namespace.is_empty() {
+                // Legacy projections use stream_id::event_id; validate and
+                // exclude them even when the local stream collides with this
+                // namespace digest. Their scope remains unproven.
+                if key != format!("{}::{}", row.stream_id, row.event_id) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_projection",
+                        reason: "legacy projection key does not match its stream identity"
+                            .to_owned(),
+                    });
+                }
+                continue;
+            }
+            if row.owner_namespace != namespace
+                || row.stream_id != owner.local_stream
+                || key != format!("{namespace}::{}", row.event_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_projection",
+                    reason: "projection key, owner, and stream identity disagree".to_owned(),
+                });
+            }
+            if count >= MAX_BRIDGE_EVENT_PROJECTIONS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            count += 1;
+            bytes += (key.len() + value.value().len()) as u64;
+        }
+        Ok((count, bytes))
+    }
+
+    fn bridge_unscoped_gap_capacity_accounting_for(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<serde_json::Value, OrsError> {
+        owner.validate()?;
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let namespace = owner.namespace.as_str();
+        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
+        let owner_bytes = {
+            let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+            let Some(value) = owners.get(namespace).map_err(storage)? else {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            };
+            let stored: BridgeStreamOwnerRow = decode(value.value())?;
+            stored.validate()?;
+            if stored.namespace != owner.namespace
+                || stored.kind != owner.kind
+                || stored.local_stream != owner.local_stream
+                || stored.authority_lineage != owner.authority_lineage
+                || stored.principal != owner.principal
+                || stored.producer != owner.producer
+                || stored.creating_connection != owner.creating_connection
+                || stored.creating_launch_nonce != owner.creating_launch_nonce
+                || stored.creating_session_epoch != owner.creating_session_epoch
+                || stored.incarnation != owner.incarnation
+                || stored.revision != owner.revision
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner",
+                    reason: "unscoped-gap capacity owner changed during its inventory page"
+                        .to_owned(),
+                });
+            }
+            (namespace.len() + value.value().len()) as u64
+        };
+        Ok(json!({
+            "gaps": gaps,
+            "gap_bytes": gap_bytes,
+            "owner_bytes": owner_bytes,
+            "reported_bytes": gap_bytes.saturating_add(owner_bytes),
+        }))
+    }
+
+    /// Accounts one namespace's stable bridge-event capacity under its owner
+    /// (issue #2731, item 4): pending live events, normalized projections,
+    /// handoffs, retained replay commitments, the #2730 ordered position
+    /// index, stable stream/cursor metadata, and scoped gaps with their
+    /// encoded bytes. The mutable handoff scan fields are excluded from this
+    /// recovery-window snapshot and are reported as `handoff_scan_bytes` in
+    /// the post-key maintenance result. Each count sums key bytes plus the
+    /// exact encoded value bytes for the stable projection, never source
+    /// payload length or engine/heap overhead. This is a report only; it
+    /// makes no aggregate-byte admission claim. The #2730 position index is owned,
+    /// written, and capped by
     /// #2730/#2885 — this view only reads its per-namespace rows into the
     /// denominator so quiet streams cannot hide lifetime occupancy behind
     /// historical windows, and never writes, deletes, or resets it. Served
@@ -16387,13 +17352,21 @@ impl RedbRecoveryStore {
             Self::bridge_position_accounting_for(read, owner)?;
         let (handoffs_count, handoff_bytes) = Self::bridge_handoff_accounting_for(read, owner)?;
         let (commitments, commitment_bytes) = Self::bridge_commitment_accounting_for(read, owner)?;
+        let (projections, projection_bytes) = Self::bridge_projection_accounting_for(read, owner)?;
         let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-            cursors
-                .get(namespace)
-                .map_err(storage)?
-                .map_or(0, |value| (namespace.len() + value.value().len()) as u64)
+            match cursors.get(namespace).map_err(storage)? {
+                Some(value) => {
+                    let (stable_bytes, _) =
+                        Self::bridge_cursor_stable_and_scan_bytes(value.value())?;
+                    u64::try_from(namespace.len())
+                        .ok()
+                        .and_then(|key_bytes| key_bytes.checked_add(stable_bytes))
+                        .ok_or(OrsError::PayloadTooLarge)?
+                }
+                None => 0,
+            }
         };
         // Position counts/bytes were gathered with the owner-indexed live
         // event rows above, so this view has no second position-table scan.
@@ -16405,6 +17378,7 @@ impl RedbRecoveryStore {
                 .map_or(0, |value| (namespace.len() + value.value().len()) as u64)
         };
         let total_bytes = pending_event_bytes
+            .saturating_add(projection_bytes)
             .saturating_add(handoff_bytes)
             .saturating_add(commitment_bytes)
             .saturating_add(position_bytes)
@@ -16414,6 +17388,8 @@ impl RedbRecoveryStore {
         Ok(json!({
             "pending_events": pending_events,
             "pending_event_bytes": pending_event_bytes,
+            "projections": projections,
+            "projection_bytes": projection_bytes,
             "handoffs": handoffs_count,
             "handoff_bytes": handoff_bytes,
             "replay_commitments": commitments,
@@ -21091,6 +22067,11 @@ impl RedbRecoveryStore {
         // a missing table. Legacy rows are never backfilled here.
         drop(write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?);
         drop(write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?);
+        drop(
+            write
+                .open_table(BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS)
+                .map_err(storage)?,
+        );
         drop(write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?);
         drop(write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?);
         drop(write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?);
