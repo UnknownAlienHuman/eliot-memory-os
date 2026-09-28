@@ -155,26 +155,16 @@ impl std::fmt::Display for TypedWorld {
     }
 }
 
-/// Returns true when a component export name identifies the expected
-/// interface, accepting both bare (`admission`) and fully qualified
-/// (`eliot:current@0.1.0/admission`) spellings. Anything else is a
-/// missing/wrong export, never an implicit match.
+/// Matches a registered interface only when the export also names the exact
+/// frozen package version. A bare interface or a foreign package cannot prove
+/// that identity before instantiation.
 #[must_use]
 pub fn export_matches_interface(export_name: &str, interface: &str) -> bool {
-    if export_name == interface {
-        return true;
-    }
-    if let Some((_, tail)) = export_name.rsplit_once('/')
-        && tail == interface
-    {
-        return true;
-    }
-    if let Some((_, tail)) = export_name.rsplit_once(':')
-        && tail == interface
-    {
-        return true;
-    }
-    false
+    TypedWorld::all()
+        .iter()
+        .any(|world| world.interface_name() == interface)
+        && (export_name == format!("{TYPED_PACKAGE_ID}/{interface}")
+            || export_name == format!("eliot:current/{interface}@{TYPED_WIT_VERSION}"))
 }
 
 /// Stable digest of the exact frozen WIT bytes (all seven files, sorted

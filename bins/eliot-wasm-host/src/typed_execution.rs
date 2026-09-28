@@ -23,7 +23,7 @@ use eliot_wasm_runtime::{
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
-use crate::typed_bindings::{TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld, typed_wit_digest};
+use crate::typed_bindings::{TypedWorld, typed_wit_digest};
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -286,16 +286,21 @@ fn validate_descriptor(
             EngineTermination::OutputLimit
         )));
     }
-    let canonical = format!(
-        "{}|{}|{}|{}|{}|{}",
-        descriptor.world_name,
-        descriptor.package_id,
-        descriptor.abi_revision,
-        descriptor.native_contract,
-        descriptor.native_revision,
-        descriptor.abi_digest
-    );
-    Ok((Sha256Digest::of_bytes(canonical.as_bytes()), output_bytes))
+    let mut canonical = b"eliot-typed-descriptor/v1\0".to_vec();
+    for value in [
+        descriptor.world_name.as_str(),
+        descriptor.package_id.as_str(),
+        descriptor.native_contract.as_str(),
+        descriptor.native_revision.as_str(),
+        descriptor.abi_digest.as_str(),
+    ] {
+        let value_len = u64::try_from(value.len())
+            .map_err(|_| TypedExecutionError::OutputViolation("field-length".to_owned()))?;
+        canonical.extend_from_slice(&value_len.to_be_bytes());
+        canonical.extend_from_slice(value.as_bytes());
+    }
+    canonical.extend_from_slice(&descriptor.abi_revision.to_be_bytes());
+    Ok((Sha256Digest::of_bytes(&canonical), output_bytes))
 }
 
 fn semantic_digest(
@@ -340,12 +345,8 @@ pub fn execute_describe_experimental(
     config.consume_fuel(true);
     config.epoch_interruption(true);
     config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config).map_err(|error| {
-        TypedExecutionError::Engine(format!(
-            "config:{}",
-            error.to_string().chars().take(120).collect::<String>()
-        ))
-    })?;
+    let engine = wasmtime::Engine::new(&config)
+        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
     let component = wasmtime::component::Component::new(&engine, artifact)
         .map_err(|error| map_compile_error(&error))?;
 
@@ -426,17 +427,7 @@ fn preflight_component_type(
     if *name == crate::typed_bindings::LEGACY_EXPORT || *name == "run" {
         return Err(TypedExecutionError::LegacyMismatch);
     }
-    let package_interface = format!("{TYPED_PACKAGE_ID}/{}", world.interface_name());
-    let canonical_interface = format!(
-        "eliot:current/{0}@{TYPED_WIT_VERSION}",
-        world.interface_name()
-    );
-    let accepted_names = [
-        world.interface_name().to_owned(),
-        package_interface.clone(),
-        canonical_interface.clone(),
-    ];
-    if !accepted_names.iter().any(|candidate| candidate == name) {
+    if !crate::typed_bindings::export_matches_interface(name, world.interface_name()) {
         return Err(TypedExecutionError::MissingExport(
             world.interface_name().to_owned(),
         ));
@@ -578,52 +569,61 @@ fn map_compile_error(error: &wasmtime::Error) -> TypedExecutionError {
     if message.contains("expected component") || message.contains("expected a component") {
         return TypedExecutionError::Artifact(PreflightError::CoreModuleRejected);
     }
-    let bounded: String = error.to_string().chars().take(160).collect();
-    // Never echo raw bytes or backtraces; classify only.
     if message.contains("import") && message.contains("unknown") {
-        TypedExecutionError::ForbiddenImport(bounded)
+        TypedExecutionError::ForbiddenImport("unregistered-import".to_owned())
     } else {
-        TypedExecutionError::Engine(format!("compile:{bounded}"))
+        TypedExecutionError::Engine("compile:component-error".to_owned())
     }
 }
 
-fn map_call_error(error: &wasmtime::Error) -> TypedExecutionError {
-    let message = error.to_string();
-    let lowered = message.to_ascii_lowercase();
-    if lowered.contains("out of fuel") {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::FuelExhausted))
-    } else if lowered.contains("interrupt")
-        || lowered.contains("epoch")
-        || lowered.contains("deadline")
-    {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::EpochDeadline))
-    } else if lowered.contains("memory") || lowered.contains("oom") {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::MemoryLimit))
-    } else if lowered.contains("table") {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::TableLimit))
-    } else if lowered.contains("instance") {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::InstanceLimit))
-    } else if lowered.contains("stack") {
-        TypedExecutionError::Engine(format!("{:?}", EngineTermination::StackLimit))
-    } else {
-        let bounded: String = message.chars().take(160).collect();
-        TypedExecutionError::Engine(format!("describe:{bounded}"))
-    }
+#[derive(Clone, Copy)]
+enum ResourceLimitHit {
+    Memory,
+    Table,
 }
 
-fn map_instantiate_error(error: &wasmtime::Error) -> TypedExecutionError {
-    let message = error.to_string();
-    let lowered = message.to_ascii_lowercase();
+fn resource_limit_error(hit: ResourceLimitHit) -> TypedExecutionError {
+    let termination = match hit {
+        ResourceLimitHit::Memory => EngineTermination::MemoryLimit,
+        ResourceLimitHit::Table => EngineTermination::TableLimit,
+    };
+    TypedExecutionError::Engine(format!("{termination:?}"))
+}
+
+fn map_call_error(
+    error: &wasmtime::Error,
+    limit_hit: Option<ResourceLimitHit>,
+) -> TypedExecutionError {
+    if let Some(hit) = limit_hit {
+        return resource_limit_error(hit);
+    }
+    let Some(trap) = error.downcast_ref::<wasmtime::Trap>() else {
+        return TypedExecutionError::Engine("describe:component-call".to_owned());
+    };
+    let termination = match *trap {
+        wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
+        wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
+        wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
+        _ => return TypedExecutionError::Engine("describe:guest-trap".to_owned()),
+    };
+    TypedExecutionError::Engine(format!("{termination:?}"))
+}
+
+fn map_instantiate_error(
+    error: &wasmtime::Error,
+    limit_hit: Option<ResourceLimitHit>,
+) -> TypedExecutionError {
+    if let Some(hit) = limit_hit {
+        return resource_limit_error(hit);
+    }
+    let lowered = error.to_string().to_ascii_lowercase();
     if lowered.contains("import") {
-        let bounded: String = message.chars().take(96).collect();
-        TypedExecutionError::ForbiddenImport(bounded)
+        TypedExecutionError::ForbiddenImport("component-import".to_owned())
     } else if lowered.contains("export") || lowered.contains("missing") || lowered.contains("type")
     {
-        let bounded: String = message.chars().take(96).collect();
-        TypedExecutionError::MissingExport(bounded)
+        TypedExecutionError::MissingExport("component-export".to_owned())
     } else {
-        let bounded: String = message.chars().take(160).collect();
-        TypedExecutionError::Engine(format!("instantiate:{bounded}"))
+        TypedExecutionError::Engine("instantiate:component-error".to_owned())
     }
 }
 
@@ -635,6 +635,34 @@ struct ObservedUsage {
 
 struct StoreState {
     limits: wasmtime::StoreLimits,
+    peak_memory_bytes: Option<u64>,
+    pending_memory_bytes: Option<u64>,
+    table_elements: Option<u32>,
+    pending_table_elements: Option<u32>,
+    limit_hit: Option<ResourceLimitHit>,
+}
+
+impl StoreState {
+    fn observe_memory(&mut self, bytes: u64) {
+        self.peak_memory_bytes = Some(self.peak_memory_bytes.map_or(bytes, |peak| peak.max(bytes)));
+    }
+
+    fn observe_table(&mut self, elements: u32) {
+        self.table_elements = Some(
+            self.table_elements
+                .map_or(elements, |peak| peak.max(elements)),
+        );
+    }
+
+    fn finish_measurements(&mut self) -> (Option<u64>, Option<u32>) {
+        if let Some(bytes) = self.pending_memory_bytes.take() {
+            self.observe_memory(bytes);
+        }
+        if let Some(elements) = self.pending_table_elements.take() {
+            self.observe_table(elements);
+        }
+        (self.peak_memory_bytes, self.table_elements)
+    }
 }
 
 fn new_store(
@@ -649,9 +677,14 @@ fn new_store(
                 .table_elements(usize::try_from(limits.max_table_elements).unwrap_or(usize::MAX))
                 .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                 .build(),
+            peak_memory_bytes: None,
+            pending_memory_bytes: None,
+            table_elements: None,
+            pending_table_elements: None,
+            limit_hit: None,
         },
     );
-    store.limiter(|state| &mut state.limits);
+    store.limiter(|state| state);
     store
         .set_fuel(limits.max_fuel)
         .map_err(|_| TypedExecutionError::LimitDenied("fuel".to_owned()))?;
@@ -666,7 +699,26 @@ impl wasmtime::ResourceLimiter for StoreState {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
-        self.limits.memory_growing(current, desired, maximum)
+        // The current value is an observed allocation. A requested value is
+        // provisional until Wasmtime either reaches another growth callback
+        // (whose `current` proves it landed) or the Store is inspected after
+        // the invocation. Wasmtime calls `memory_grow_failed` on an allowed
+        // request that still fails allocation/maximum checks.
+        self.observe_memory(u64::try_from(current).unwrap_or(u64::MAX));
+        self.pending_memory_bytes = None;
+        let allowed = self.limits.memory_growing(current, desired, maximum)?;
+        if allowed {
+            self.pending_memory_bytes = Some(u64::try_from(desired).unwrap_or(u64::MAX));
+        } else {
+            self.limit_hit.get_or_insert(ResourceLimitHit::Memory);
+        }
+        Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> Result<(), wasmtime::Error> {
+        self.pending_memory_bytes = None;
+        self.limit_hit.get_or_insert(ResourceLimitHit::Memory);
+        Ok(())
     }
 
     fn table_growing(
@@ -675,7 +727,21 @@ impl wasmtime::ResourceLimiter for StoreState {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
-        self.limits.table_growing(current, desired, maximum)
+        self.observe_table(u32::try_from(current).unwrap_or(u32::MAX));
+        self.pending_table_elements = None;
+        let allowed = self.limits.table_growing(current, desired, maximum)?;
+        if allowed {
+            self.pending_table_elements = Some(u32::try_from(desired).unwrap_or(u32::MAX));
+        } else {
+            self.limit_hit.get_or_insert(ResourceLimitHit::Table);
+        }
+        Ok(allowed)
+    }
+
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> Result<(), wasmtime::Error> {
+        self.pending_table_elements = None;
+        self.limit_hit.get_or_insert(ResourceLimitHit::Table);
+        Ok(())
     }
 
     fn instances(&self) -> usize {
@@ -722,15 +788,23 @@ fn run_guarded(
     let _ = driver.join();
     let remaining_fuel = store.get_fuel().unwrap_or(0);
     let fuel_consumed = limits.max_fuel.saturating_sub(remaining_fuel);
+    let limit_hit = store.data().limit_hit;
+    let (peak_memory_bytes, table_elements) = store.data_mut().finish_measurements();
     match outcome {
-        Ok(descriptor) => Ok((
-            descriptor,
-            ObservedUsage {
-                fuel_consumed,
-                peak_memory_bytes: Some(0),
-                table_elements: Some(0),
-            },
-        )),
+        Ok(descriptor) => {
+            if let Some(hit) = limit_hit {
+                Err(resource_limit_error(hit))
+            } else {
+                Ok((
+                    descriptor,
+                    ObservedUsage {
+                        fuel_consumed,
+                        peak_memory_bytes,
+                        table_elements,
+                    },
+                ))
+            }
+        }
         Err(error) => Err(error),
     }
 }
@@ -765,11 +839,11 @@ fn describe_context_admission(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = ContextAdmission::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_admission()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -790,11 +864,11 @@ fn describe_context_assembly(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = ContextAssembly::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_assembly()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -815,11 +889,11 @@ fn describe_cue_activation(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = CueActivation::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_activation()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -840,11 +914,11 @@ fn describe_dreamer_handler(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = DreamerHandler::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_handler()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -865,11 +939,11 @@ fn describe_memory_curation_screen(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_screen()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -890,11 +964,11 @@ fn describe_dreamer_cycle(
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
         let instance = DreamerCycle::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error))?;
+            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
             .eliot_current_cycle()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error))?;
+            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
