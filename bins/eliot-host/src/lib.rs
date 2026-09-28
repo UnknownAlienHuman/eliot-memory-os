@@ -7605,13 +7605,29 @@ impl HostComposition {
         }
         // I1.9 A1: this explicit restart is permitted only when the valid
         // journal record binds the approved relaunch artifact and carries
-        // the full process lineage for it. The gate runs before termination
-        // destroys evidence, so a missing or unbound record refuses the
-        // restart as manual recovery instead of relaunching first.
+        // the full process lineage for it, the relaunch config is the
+        // approved config, and the record is owned by the current activation
+        // fence. The gate runs before termination destroys evidence, so a
+        // missing or unbound record refuses the restart as manual recovery
+        // instead of relaunching first.
         let (kernel_artifact, _) = active_manifest
             .host_child_artifact_digests()
             .map_err(|e| HostError::ProcessContour(e.to_string()))?;
-        require_journal_kernel_restart_record(&current_kernel, kernel_artifact)?;
+        let materialized_config_digest = self.jobs.config_digest.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Kernel restart has no materialized config binding the approved config; manual recovery required"
+                    .to_owned(),
+            )
+        })?;
+        require_journal_kernel_restart_record(
+            &current_kernel,
+            kernel_artifact,
+            &active_manifest.config_digest,
+            &materialized_config_digest,
+            &self.host,
+            &self.activation_id,
+            &self.activation_generation,
+        )?;
         let old_generation = current_kernel.kernel_generation.clone();
         let host_clone = self.host.clone();
         let activation_id = self.activation_id.clone();
@@ -9205,13 +9221,24 @@ impl HostComposition {
             })?;
             // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
             // the valid journal record binds this relaunch's approved
-            // artifact and carries the full process lineage for it. The
-            // shared choke revalidates the original recorded record, refuses
-            // an artifact mismatch as manual recovery instead of relaunching
-            // an unapproved image, and refuses a record without PID/Job
-            // lineage instead of reconstructing it. The snapshot above
-            // already fails a corrupt journal.
-            require_journal_kernel_restart_record(&current, kernel_artifact)?;
+            // artifact and carries the full process lineage for it, the
+            // relaunch config is the approved config, and the record is
+            // owned by the current activation fence. The shared choke
+            // revalidates the original recorded record, refuses an artifact
+            // or config mismatch as manual recovery instead of relaunching
+            // an unapproved image or config, refuses a record without
+            // PID/Job lineage instead of reconstructing it, and refuses a
+            // stale-activation record instead of restarting from prior
+            // lineage. The snapshot above already fails a corrupt journal.
+            require_journal_kernel_restart_record(
+                &current,
+                kernel_artifact,
+                &active.manifest.config_digest,
+                &materialized_config_digest,
+                &self.host,
+                &self.activation_id,
+                &self.activation_generation,
+            )?;
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }
