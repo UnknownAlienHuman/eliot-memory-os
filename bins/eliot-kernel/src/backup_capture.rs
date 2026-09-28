@@ -97,6 +97,8 @@ pub struct CaptureRequest {
     pub plan: FrozenCapturePlan,
     /// Coherent canonical export fence binding the capture.
     pub export_fence: ExportFence,
+    /// The Kernel's live authority fence the evidence was admitted under.
+    pub kernel_fence: StateFence,
     /// Canonical event records carried by the capture.
     pub canonical_events: Vec<CanonicalRecord>,
     /// Canonical projection records carried by the capture.
@@ -110,6 +112,13 @@ pub struct CaptureRequest {
     /// Logical ORS snapshot fence, when the class carries one.
     pub ors_snapshot: Option<OrsSnapshotFence>,
     /// Count of suspended recovery entries derived from the ORS snapshot.
+    ///
+    /// This is the PRODUCER'S CLAIM, never this owner's authority. The
+    /// unresolved-effect frontier that decides the capture state and the
+    /// suspended marker is read from the ORS owner's own
+    /// `ors_snapshot.pending_operation_ids` (see `observed_unresolved_frontier`);
+    /// this field only has to agree with that evidence, and a disagreement
+    /// refuses the capture instead of silently preferring one of the two.
     pub suspended_count: u64,
     /// Checksummed config, policy, module, and build manifest artifacts.
     pub artifacts: Vec<BackupArtifact>,
@@ -134,6 +143,7 @@ pub fn request_from_ports(
         caller: ports.caller.clone(),
         plan,
         export_fence: ports.export_fence.clone(),
+        kernel_fence: ports.kernel_fence.clone(),
         canonical_events: ports.canonical_events.to_vec(),
         projections: ports.projections.to_vec(),
         receipts: ports.receipts.to_vec(),
@@ -564,6 +574,17 @@ impl KernelBackupCapture {
     /// has a real, validated archive and no owner receipt, so it is reported as
     /// [`CaptureState::Cancelled`] at the structurally-valid evidence level
     /// rather than published past its budget or discarded silently.
+    ///
+    /// A wrong source or fence is refused BEFORE any protected read, and before
+    /// any owner evidence is used. The presented export fence is compared for
+    /// COMPLETE equality against the Kernel's own live authority fence — not
+    /// through `StateFence::is_compatible_with`, whose one-directional `None`
+    /// wildcards would let an absent revision match. I15-02 keeps "Principal
+    /// identity is issued by Kernel, never self-declared", and I5.6 requires
+    /// admission to "verify State Fence, authority and expected current
+    /// revisions": the Kernel's own fence is therefore the only acceptable
+    /// authority for the evidence it admits, and a presented fence that is not
+    /// it is not a proof of anything this owner is willing to act on.
     #[allow(
         clippy::unused_self,
         reason = "governed owner seam keeps &self receivers; the work root binds composition"
@@ -575,8 +596,14 @@ impl KernelBackupCapture {
     ) -> Result<CaptureReport, KernelCaptureError> {
         require_capture_admitted(&request.caller)?;
         request.plan.validate()?;
+        // Kernel authority fence first: a wrong fence is refused before evidence.
+        gate_kernel_authority_fence(request)?;
         let duration = CaptureDuration::start(request.plan.budgets);
         gate_class_capability(request)?;
+        gate_approved_manifest_digests(request)?;
+        // The ORS owner's own pending-operation identities are the frontier.
+        let unresolved_count = observed_unresolved_frontier(request).len() as u64;
+        require_suspended_claim_matches_frontier(request, unresolved_count)?;
         let relation = snapshot_relation(&SnapshotEvidence::from_request(request));
         Self::validate_snapshot_relation(&relation)?;
         duration.check()?;
@@ -632,19 +659,11 @@ impl KernelBackupCapture {
         {
             return Err(KernelCaptureError::PublicationUnknown(operation_id));
         }
-        let state =
-            if request.suspended_count > 0 && request.plan.class != BackupClass::FullRecovery {
-                CaptureState::Incomplete {
-                    reason: "bounded suspended operations exceed degraded class ceiling".to_owned(),
-                }
-            } else {
-                CaptureState::Complete
-            };
-        let receipt_identity = if request.suspended_count > 0 {
-            Some(format!("suspended:{}", request.suspended_count))
-        } else {
-            Some(operation_id.clone())
-        };
+        // The frontier is the OBSERVED unresolved-effect count read from the ORS
+        // owner's own pending-operation identities, cross-checked against the
+        // producer's claim above. A caller-asserted integer never decides this.
+        let (state, receipt_identity) =
+            terminal_capture_decision(request, unresolved_count, &operation_id);
         // The publication receipt is the owner-issued proof that this operation
         // durably published THESE bytes, and it was already proved to match the
         // operation identity and archive digest above. It is therefore the exact
@@ -808,7 +827,7 @@ impl KernelBackupCapture {
             &bundle.blobs,
             &bundle.purge_ledger,
             &bundle.artifacts,
-        );
+        )?;
         let state = if class == BackupClass::FullRecovery {
             CaptureState::Complete
         } else {
@@ -1085,6 +1104,158 @@ fn gate_class_capability(request: &CaptureRequest) -> Result<(), KernelCaptureEr
     Ok(())
 }
 
+/// Refuses evidence presented under anything but the Kernel's own live
+/// authority fence.
+///
+/// `CapturePorts::kernel_fence` is the Kernel's own authority, and I15-02 keeps
+/// "Principal identity is issued by Kernel, never self-declared": the same
+/// reasoning applies to the fence the export was admitted under, and I5.6
+/// requires admission to "verify State Fence, authority and expected current
+/// revisions" before any source is read. A `CaptureRequest` that carried no
+/// Kernel fence at all made that verification impossible — the presented fence
+/// would have been checked against nothing.
+///
+/// The comparison is COMPLETE `StateFence` equality. `is_compatible_with` is
+/// deliberately not used: its one-directional `None` wildcards would let an
+/// absent optional revision pass as a match, which is exactly the
+/// validated-then-discarded guarantee this gate closes.
+fn gate_kernel_authority_fence(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
+    if request.export_fence.state_fence != request.kernel_fence {
+        return Err(KernelCaptureError::RelationIncoherent(
+            "export fence does not match the Kernel authority fence it was admitted under"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The exact artifact kinds the archive format's own class gate requires
+/// (`eliot-backup`'s `validate_class_requirements` `REQUIRED` set), spelled
+/// once here so this owner refuses an unknown kind with the same vocabulary the
+/// bundle would later refuse it with.
+const REQUIRED_ARTIFACT_KINDS: [&str; 4] = ["config", "policy", "module", "host_dependency_build"];
+
+/// Binds the frozen plan's approved digests to the artifacts actually carried.
+///
+/// `FrozenCapturePlan::build_digest` and `.policy_digest` are otherwise only
+/// SHAPE-validated 64-hex strings: nothing would ever compare them to the
+/// package actually being used, which is exactly the guarantee I00-14 requires
+/// ("manifest/package digest equality for the package actually being used").
+/// A 64-hex value that is never compared is a claim, not a binding.
+///
+/// The check is deliberately over each artifact's OWN recorded `sha256` rather
+/// than a checksum recomputed here. `BackupArtifact::validate` already re-derives
+/// the digest from the carried bytes and the bundle re-validates every artifact,
+/// so the recorded field is the original recorded value: recomputing over the
+/// bytes in hand would REPLACE the proof instead of checking it.
+///
+/// That also closes the substitution hole: an artifact whose `kind` is one of
+/// the four approved names can only satisfy the plan if its recorded digest IS
+/// the approved digest, so a key file, a credential or a live database
+/// presented under an approved `kind` cannot be laundered into a full-recovery
+/// archive.
+fn gate_approved_manifest_digests(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
+    if request.artifacts.is_empty() {
+        return Ok(());
+    }
+    for artifact in &request.artifacts {
+        if !REQUIRED_ARTIFACT_KINDS.contains(&artifact.kind.as_str()) {
+            return Err(KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "artifact.kind {} is not one of the four class-gate manifest kinds",
+                artifact.kind
+            )));
+        }
+    }
+    if !request
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == "policy" && artifact.sha256 == request.plan.policy_digest)
+    {
+        return Err(KernelCaptureError::OwnerEvidenceInvalid(
+            "artifact kind policy is not bound to the frozen plan field policy_digest".to_owned(),
+        ));
+    }
+    if !request.artifacts.iter().any(|artifact| {
+        artifact.kind == "host_dependency_build" && artifact.sha256 == request.plan.build_digest
+    }) {
+        return Err(KernelCaptureError::OwnerEvidenceInvalid(
+            "artifact kind host_dependency_build is not bound to the frozen plan field build_digest"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The unresolved-effect frontier this owner observes, read from the ORS
+/// owner's own evidence rather than from a caller's arithmetic.
+///
+/// I5.13 requires the `OrsSnapshotFence` to record "pending-operation identities
+/// and hashes", and the identities it records ARE the frontier: a capture that
+/// reports completeness against an independently supplied integer could claim a
+/// clean frontier while the ORS owner recorded unresolved operations. An absent
+/// ORS snapshot is an empty frontier, never a default of "none claimed".
+fn observed_unresolved_frontier(request: &CaptureRequest) -> Vec<String> {
+    request
+        .ors_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.pending_operation_ids.clone())
+        .unwrap_or_default()
+}
+
+/// Refuses a producer whose asserted suspended count disagrees with the ORS
+/// owner's own pending-operation identities.
+///
+/// The observed frontier is authoritative (I5.13 requires the ORS snapshot to
+/// record "pending-operation identities and hashes"), but silently preferring
+/// the owner's count over the producer's would hide that the two disagree, so
+/// the disagreement itself is the refusal: a caller cannot mark a capture
+/// `Complete` by asserting a count the ORS owner contradicts.
+fn require_suspended_claim_matches_frontier(
+    request: &CaptureRequest,
+    observed: u64,
+) -> Result<(), KernelCaptureError> {
+    if request.suspended_count != observed {
+        return Err(KernelCaptureError::OwnerEvidenceInvalid(
+            "capture.suspended_count does not match the observed ORS pending-operation frontier"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The terminal state and the report's receipt identity, decided from the
+/// OBSERVED unresolved-effect frontier.
+///
+/// A bounded frontier is not corruption: a `full_recovery` capture with
+/// suspended operations still completes and records the suspended marker as its
+/// receipt identity, which is what I5.13 requires for a legitimate independent
+/// snapshot with bounded unresolved operations. A degraded class that cannot
+/// carry them reports an explicit incomplete result instead of over-claiming,
+/// and an empty frontier reports the publication operation identity.
+///
+/// `unresolved_count` is the observed frontier length, already cross-checked
+/// against the producer's claim; nothing here reads `CaptureRequest::
+/// suspended_count`.
+fn terminal_capture_decision(
+    request: &CaptureRequest,
+    unresolved_count: u64,
+    operation_id: &str,
+) -> (CaptureState, Option<String>) {
+    let state = if unresolved_count > 0 && request.plan.class != BackupClass::FullRecovery {
+        CaptureState::Incomplete {
+            reason: "bounded suspended operations exceed degraded class ceiling".to_owned(),
+        }
+    } else {
+        CaptureState::Complete
+    };
+    let receipt_identity = if unresolved_count > 0 {
+        Some(format!("suspended:{unresolved_count}"))
+    } else {
+        Some(operation_id.to_owned())
+    };
+    (state, receipt_identity)
+}
+
 /// The exact per-owner evidence one snapshot relation is derived from.
 ///
 /// `capture` reads it from the admitted [`CaptureRequest`]; `verify_only` reads
@@ -1341,9 +1512,35 @@ fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
     }
 }
 
+/// The opaque residency-key digest of one carried blob's full residency
+/// identity.
+///
+/// I5.13 requires every export and backup entry to "preserve the opaque
+/// residency-key digest" and never to merge blob records "solely because their
+/// content digests match"; I5.12 derives the physical path from
+/// `<residency-key-digest>` and deduplicates equal bytes "only when all
+/// residency-domain identities are equivalent". `BlobLocator::hash` is only the
+/// versioned CONTENT digest, so using it as a blob's identity here would
+/// collapse two obligations over equal bytes into one logical object.
+///
+/// The digest is taken over the canonical encoding the repository already has,
+/// over the whole `ObjectResidencyKey` (all six obligation domain ids plus the
+/// versioned content digest) — not over a hand-assembled concatenation of
+/// domain ids, which would be a second, differing digest scheme.
+fn blob_residency_key_digest(blob: &BackupBlob) -> Result<String, KernelCaptureError> {
+    let bytes = canonical_json_bytes(&blob.locator.residency).map_err(|_| {
+        KernelCaptureError::OwnerEvidenceInvalid(
+            "blob residency key is not serializable".to_owned(),
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// Builds exactly one `captured` disposition per expected source member.
 /// Domain prefixes keep obligation domains disjoint so equal bytes under
-/// different obligations never coalesce into one logical object.
+/// different obligations never coalesce into one logical object, and each blob
+/// is keyed by its full residency identity (see [`blob_residency_key_digest`])
+/// for the same reason: the content digest alone is not a logical object.
 fn member_disposition_list(
     events: &[CanonicalRecord],
     projections: &[CanonicalRecord],
@@ -1351,7 +1548,7 @@ fn member_disposition_list(
     blobs: &[BackupBlob],
     purge_ledger: &[PurgeLedgerEntry],
     artifacts: &[BackupArtifact],
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, KernelCaptureError> {
     let mut dispositions = Vec::new();
     for event in events {
         dispositions.push((
@@ -1373,7 +1570,7 @@ fn member_disposition_list(
     }
     for blob in blobs {
         dispositions.push((
-            format!("{}{}", MEMBER_DOMAIN_BLOB, blob.locator.hash.as_str()),
+            format!("{}{}", MEMBER_DOMAIN_BLOB, blob_residency_key_digest(blob)?),
             "captured".to_owned(),
         ));
     }
@@ -1386,7 +1583,7 @@ fn member_disposition_list(
             "captured".to_owned(),
         ));
     }
-    dispositions
+    Ok(dispositions)
 }
 
 /// Checks the complete reconciliation denominator: a consistent export fence,
@@ -1394,6 +1591,16 @@ fn member_disposition_list(
 /// range matching the carried canonical events, and exactly one disposition
 /// per expected member. Expired or mixed-generation evidence (an inconsistent
 /// fence) cannot stitch into a complete result.
+///
+/// The export fence's own `blob_reachability_manifest` is a `Vec<BlobHash>`, so
+/// the fence bijection is still over CONTENT digests — that is the fence's own
+/// element type and changing it is not this owner's to do. The per-member
+/// "exactly one" count and the duplicate check, however, are over the
+/// disposition list, whose blob keys are residency identities: two blobs with
+/// equal content under different obligations are two distinct logical objects
+/// (I5.13: "equal bytes under different obligations remain distinct logical
+/// objects"), while one blob under one obligation appearing twice is a real
+/// duplicate and refuses.
 fn check_denominator(
     request: &CaptureRequest,
 ) -> Result<Vec<(String, String)>, KernelCaptureError> {
@@ -1402,15 +1609,24 @@ fn check_denominator(
             "export fence is not consistent".to_owned(),
         ));
     }
+    // REACHABILITY IS COVERAGE, NOT MULTIPLICITY. The manifest is a `Vec<BlobHash>`
+    // — a set of content digests that must be reachable — so the obligation it
+    // states is "every reachable content digest is carried", not "carried exactly
+    // once". I5.13:42 keeps "equal bytes under different obligations ... distinct
+    // logical objects", so two carried blobs sharing a content digest under two
+    // different residency identities is a LEGITIMATE set that this check must not
+    // reject. Multiplicity is not dropped by making this a coverage check: the
+    // same logical object appearing twice is still refused, by the residency-keyed
+    // duplicate check below, which is strictly finer than a content-hash one.
     for hash in &request.export_fence.blob_reachability_manifest {
         let count = request
             .blobs
             .iter()
             .filter(|blob| blob.locator.hash == *hash)
             .count();
-        if count != 1 {
+        if count == 0 {
             return Err(KernelCaptureError::DenominatorIncomplete(format!(
-                "blob {} has {count} members, want exactly one",
+                "reachable blob {} is not carried by this capture",
                 hash.as_str()
             )));
         }
@@ -1441,7 +1657,7 @@ fn check_denominator(
         &request.blobs,
         &request.purge_ledger,
         &request.artifacts,
-    );
+    )?;
     for event in &request.canonical_events {
         let want = format!("canonical:{}", event.record_id);
         let count = dispositions.iter().filter(|entry| entry.0 == want).count();
