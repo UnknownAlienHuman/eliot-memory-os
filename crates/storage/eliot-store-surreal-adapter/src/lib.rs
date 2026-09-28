@@ -42,6 +42,9 @@ pub use backup_restore::{
     shared_restore_ledger, validate_isolated_destination, validate_reference_closure,
     validate_restore_batch,
 };
+pub use backup_snapshot::{
+    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, capture_ecxf_source,
+};
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,

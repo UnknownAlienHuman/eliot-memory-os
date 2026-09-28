@@ -142,11 +142,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
-    BlobResidency, BlobResidencyDomain, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
-    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OperationId, OrderingHead, RequestMeta,
-    RevisionHead, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
-    SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
-    StateFence, StoreError, canonical_json_bytes, sha256_hex,
+    BlobResidency, BlobResidencyDomain, EcxfExportRequest, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OperationId,
+    OperationIdentity, OrderingHead, RequestMeta, RevisionHead, ScopeId, SnapshotBeginRequest,
+    SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotMember, SnapshotMemberType, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
+    sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -160,6 +161,66 @@ pub(crate) const SNAPSHOT_BEGIN_OPERATION: &str = "snapshot.begin";
 pub(crate) const SNAPSHOT_PAGE_OPERATION: &str = "snapshot.page";
 /// Closed named-operation label for closing a capture with an end receipt.
 pub(crate) const SNAPSHOT_END_OPERATION: &str = "snapshot.end";
+
+/// One logical source class returned by the coherent ECXF source capture.
+///
+/// Each record is the canonical JSON encoding of the complete row returned by
+/// the fixed `snapshot.members` batch. Records are sorted by the adapter-owned
+/// logical member identity, not by provider row order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcxfSourceClassCapture {
+    /// Stable logical class token from the adapter's closed source-class list.
+    pub class_token: String,
+    /// Canonical bytes for every observed row in this class.
+    pub records: Vec<Vec<u8>>,
+}
+
+/// Why the observed source rows cannot currently prove a complete ECXF view.
+///
+/// These are explicit evidence gaps, not zero counts or empty source values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EcxfCaptureGap {
+    /// The adapter has no complete scope-to-record closure for the requested scope.
+    RequestedScopeClosureUnproven,
+    /// The admitted v2 schema does not capture the source erasure/purge ledger.
+    SourcePurgeLedgerUnavailable,
+    /// The adapter is not the `BlobStore` owner and cannot read sealed bytes or
+    /// prove residency-key reachability.
+    BlobStoreEvidenceUnavailable,
+    /// Architecture and `NormativePair` source identity receipts are owned
+    /// outside this adapter.
+    ExternalSourceIdentityEvidenceUnavailable,
+    /// The adapter has no durable source-side ECXF export receipt.
+    SourceExportReceiptUnavailable,
+}
+
+/// Exact transaction observation available to the ECXF composition owner.
+///
+/// This carries real canonical source rows and the fence observed beside them,
+/// while explicitly remaining partial. It must not be projected to a complete
+/// ECXF source view until every `missing_evidence` item is supplied by its
+/// owning component and the requested scope closure is established.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcxfSourceCapture {
+    /// Requested logical operation identity for which the capture was requested.
+    pub identity: OperationIdentity,
+    /// Scope requested by the caller; its source closure is not yet proven.
+    pub scope_id: ScopeId,
+    /// State fence observed in the same fixed transaction as `source_classes`.
+    pub state_fence: StateFence,
+    /// Schema generation observed in that transaction.
+    pub schema_generation: String,
+    /// Next commit sequence observed in that transaction.
+    pub next_commit_sequence: u64,
+    /// Next outbox sequence observed in that transaction.
+    pub next_outbox_sequence: u64,
+    /// Provider rows retained as canonical JSON source bytes by logical class.
+    pub source_classes: Vec<EcxfSourceClassCapture>,
+    /// Completeness of the ECXF view, not merely success of the DB transaction.
+    pub completeness: SnapshotCompleteness,
+    /// Concrete evidence still required before export can be complete.
+    pub missing_evidence: Vec<EcxfCaptureGap>,
+}
 
 /// Members served per page: the closed per-page ceiling from `backup_io`.
 const SNAPSHOT_PAGE_CHUNK: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64;
@@ -1941,6 +2002,102 @@ async fn read_enumeration(
         rows.push(class_rows);
     }
     Ok((point, rows))
+}
+
+/// Captures the adapter-owned canonical source rows and their exact fence for
+/// an ECXF request.
+///
+/// The rows and fence come from the same fixed `BEGIN`/`COMMIT` member batch.
+/// Caller values never enter the provider statement. The request's scope is
+/// retained but not treated as a filter: this adapter cannot prove the full
+/// scope-to-record closure, so the returned capture is always explicitly
+/// `Partial` and lists the missing purge, `BlobStore` and external identity
+/// evidence. The ECXF exporter must refuse to build or publish from it until
+/// those gaps are resolved by their owners.
+pub async fn capture_ecxf_source(
+    adapter: &SurrealStoreAdapter,
+    request: &EcxfExportRequest,
+) -> Result<EcxfSourceCapture, StoreError> {
+    request.validate()?;
+    bind_capture_principal(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION)?;
+    verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
+
+    let (point, class_rows) = read_enumeration(adapter).await?;
+    if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
+        return Err(StoreError::Unavailable);
+    }
+    if point.state_fence != request.context.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+
+    let mut total_source_bytes = 0_u64;
+    let source_classes = captured_member_classes()
+        .zip(class_rows)
+        .map(|(class, rows)| {
+            let records = canonical_source_rows(class, &rows)?;
+            for record in &records {
+                total_source_bytes = total_source_bytes.saturating_add(
+                    u64::try_from(record.len()).map_err(|_| StoreError::PayloadTooLarge)?,
+                );
+                if total_source_bytes > MAX_SNAPSHOT_BYTES {
+                    return Err(StoreError::PayloadTooLarge);
+                }
+            }
+            Ok(EcxfSourceClassCapture {
+                class_token: class.token.to_owned(),
+                records,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+    Ok(EcxfSourceCapture {
+        identity: request.identity.clone(),
+        scope_id: request.scope_id.clone(),
+        state_fence: point.state_fence,
+        schema_generation: point.schema_generation,
+        next_commit_sequence: point.next_commit_sequence,
+        next_outbox_sequence: point.next_outbox_sequence,
+        source_classes,
+        completeness: SnapshotCompleteness::Partial,
+        missing_evidence: vec![
+            EcxfCaptureGap::RequestedScopeClosureUnproven,
+            EcxfCaptureGap::SourcePurgeLedgerUnavailable,
+            EcxfCaptureGap::BlobStoreEvidenceUnavailable,
+            EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
+            EcxfCaptureGap::SourceExportReceiptUnavailable,
+        ],
+    })
+}
+
+/// Produces deterministic canonical row bytes under the adapter-owned member
+/// identity and refuses duplicate identities instead of preserving ambiguous
+/// provider ordering as apparent source order.
+fn canonical_source_rows(
+    class: &MemberClass,
+    rows: &[Map<String, Value>],
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut observed_bytes = 0_u64;
+    let mut identified = rows
+        .iter()
+        .map(|row| {
+            let member_id = row_member_id(class, row)?;
+            let bytes = canonical_json_bytes(row).map_err(snapshot_serialization_error)?;
+            observed_bytes = observed_bytes.saturating_add(
+                u64::try_from(bytes.len()).map_err(|_| StoreError::PayloadTooLarge)?,
+            );
+            if observed_bytes > MAX_SNAPSHOT_BYTES {
+                return Err(StoreError::PayloadTooLarge);
+            }
+            Ok((member_id, bytes))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    identified.sort_by(|left, right| left.0.cmp(&right.0));
+    if identified.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(StoreError::Duplicate {
+            field: "ecxf.source_rows",
+        });
+    }
+    Ok(identified.into_iter().map(|(_, bytes)| bytes).collect())
 }
 
 /// Charges the decoded representation of one provider class result.

@@ -235,6 +235,7 @@ mod tests {
     use eliot_blob_api::{
         BlobFuture, BlobGcReceipt, BlobGcRequest, BlobHealth, BlobReachabilityRequest,
         BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobStageRequest,
+        SealedBlobRead,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -288,6 +289,10 @@ mod tests {
         }
 
         fn read(&self, _request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {
+            Box::pin(async { Err(eliot_blob_api::BlobError::ProviderUnavailable("fake")) })
+        }
+
+        fn read_sealed(&self, _request: BlobReadRequest) -> BlobFuture<'_, SealedBlobRead> {
             Box::pin(async { Err(eliot_blob_api::BlobError::ProviderUnavailable("fake")) })
         }
 

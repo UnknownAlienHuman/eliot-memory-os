@@ -66,7 +66,8 @@ use eliot_blob_api::{
     BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
     BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
     BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
-    SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
+    SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
+    verify_receipt,
 };
 use eliot_platform::WorkScopePath;
 use eliot_receipts::{
@@ -4132,7 +4133,7 @@ where
     fn read_verified(
         &self,
         request: &BlobReadRequest,
-    ) -> Result<(BlobReadyReceipt, Vec<u8>), BlobError> {
+    ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
         // The request names a locator but no residency scope; the caller
@@ -4208,7 +4209,7 @@ where
         {
             return Err(BlobError::IntegrityMismatch);
         }
-        Ok((ready, plaintext))
+        Ok((ready, plaintext, sealed))
     }
 
     fn stage_sync(&self, request: BlobStageRequest) -> Result<BlobReadyReceipt, BlobError> {
@@ -4232,7 +4233,7 @@ where
     fn read_sync(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
         let content_idx = content_shard(&request.locator.hash);
         let _guard = self.lock_shards(&[content_idx])?;
-        let (ready, bytes) = self.read_verified(request)?;
+        let (ready, bytes, _sealed_bytes) = self.read_verified(request)?;
         let read_residency_digest = request.locator.residency_key_digest()?;
         let artifact = ArtifactBinding {
             artifact_id: format!("blob-read-{}", request.locator.hash)
@@ -4258,6 +4259,13 @@ where
             BlobReceiptBinding::for_blob(&request.context, &request.locator)?,
         )?;
         BlobReadChunk::from_verified(verified_receipt, &self.issuer_anchor, ready, bytes)
+    }
+
+    fn read_sealed_sync(&self, request: &BlobReadRequest) -> Result<SealedBlobRead, BlobError> {
+        let content_idx = content_shard(&request.locator.hash);
+        let _guard = self.lock_shards(&[content_idx])?;
+        let (ready, _plaintext, sealed_bytes) = self.read_verified(request)?;
+        SealedBlobRead::from_verified(ready, sealed_bytes)
     }
 
     fn reference(
@@ -4994,6 +5002,11 @@ where
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {
         let core = Arc::clone(&self.core);
         Box::pin(async move { core.read_sync(&request) })
+    }
+
+    fn read_sealed(&self, request: BlobReadRequest) -> BlobFuture<'_, SealedBlobRead> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.read_sealed_sync(&request) })
     }
 
     fn reachability(

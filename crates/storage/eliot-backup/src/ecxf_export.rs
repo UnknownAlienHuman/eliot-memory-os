@@ -60,10 +60,11 @@ use std::path::{Path, PathBuf};
 
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
+pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, SnapshotCompleteness, WriteReceipt};
 use serde::{Deserialize, Serialize};
 
-use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256, text};
+use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256};
 
 /// Record-type label of one canonical store write receipt inside the `ECXF/1`
 /// receipt stream.
@@ -175,60 +176,15 @@ pub struct CoherentSourceExport {
 /// bridge that can prove a consistent snapshot owns the read and the
 /// consistency point. The method has no default body, so no caller can obtain a
 /// successful export without a real owner behind it.
-pub trait EcxfSourceStore {
-    /// Reads one coherent, fenced source view for `export_id`.
-    ///
-    /// `export_id` names the export identity the caller will publish; an
-    /// implementation records it in whatever owner-issued export receipt it
-    /// holds. It grants no authority and selects no scope by itself.
-    fn coherent_export(&self, export_id: &str) -> Result<CoherentSourceExport, BackupError>;
-}
-
-/// Product arguments of one `ECXF/1` export.
-///
-/// Only the export identity is a request field. Every fence value is read from
-/// the source view, so no request field can be copied into the manifest fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EcxfExportRequest {
-    /// Identity this export publishes under.
-    pub export_id: String,
-}
-
-impl EcxfExportRequest {
-    /// Validates the request shape before any source read.
-    pub fn validate(&self) -> Result<(), BackupError> {
-        text(&self.export_id, "ecxf.export_id")
-    }
-}
-
-/// Serializable report for one published `ECXF/1` package.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EcxfExportReport {
-    /// Identity this export published under.
-    pub export_id: String,
-    /// Exchange format the package carries.
-    pub format: String,
-    /// Caller-supplied path of the published package directory.
-    pub package_path: String,
-    /// Digest re-read from the published `manifest.json`; equal to the manifest
-    /// digest the archive's own `integrity.json` attests.
-    pub manifest_sha256: String,
-    /// Whole-archive digest from the published `integrity.json`.
-    pub archive_sha256: String,
-    /// Number of files in the published package.
-    pub file_count: u64,
-    /// Records in the emitted event stream.
-    pub event_count: u64,
-    /// Records in the emitted projection stream.
-    pub projection_count: u64,
-    /// Records in the emitted receipt stream.
-    pub receipt_count: u64,
-    /// Residency-keyed blob entries in the published package.
-    pub blob_count: u64,
-    /// Entries in the published `privacy-purge-ledger.json`.
-    pub purge_ledger_entries: u64,
+#[allow(async_fn_in_trait)]
+pub trait EcxfSourceStore: Send + Sync {
+    /// Reads one coherent, fenced source view for the authenticated operation
+    /// and its required scope. Implementations obtain every fence value from
+    /// the source owner; request fields do not become source evidence.
+    async fn coherent_export(
+        &self,
+        request: &EcxfExportRequest,
+    ) -> Result<CoherentSourceExport, BackupError>;
 }
 
 /// Exports one coherent `ECXF/1` package from a source store and publishes it.
@@ -254,17 +210,18 @@ pub struct EcxfExportReport {
     clippy::too_many_lines,
     reason = "one linear export path: read, prove the fence, build, render, publish, report"
 )]
-pub fn export_ecxf_package(
+pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     request: &EcxfExportRequest,
-    source: &dyn EcxfSourceStore,
+    source: &S,
     out_dir: &Path,
 ) -> Result<EcxfExportReport, BackupError> {
-    request.validate()?;
-    let snapshot = source.coherent_export(&request.export_id)?;
-    prove_coherent_boundary(&snapshot)?;
+    request.validate().map_err(BackupError::Store)?;
+    let export_id = request.identity.operation_id.to_string();
+    let snapshot = source.coherent_export(request).await?;
+    prove_coherent_boundary(&snapshot, request)?;
     let (revision_start, revision_end) = revision_range(&snapshot.revision_heads);
     let fence = eliot_ecxf::ExportFence {
-        export_id: request.export_id.clone(),
+        export_id: export_id.clone(),
         schema_generation: snapshot.schema_generation.clone(),
         store_generation: snapshot.store_generation.clone(),
         state_fence: snapshot.state_fence.clone(),
@@ -323,23 +280,23 @@ pub fn export_ecxf_package(
     let files = archive
         .layout(&eliot_ecxf::IdentitySectionCodec)
         .map_err(ecxf_error)?;
-    publish_package(&files, out_dir, &request.export_id)?;
+    publish_package(&files, out_dir, &export_id)?;
     // The rename has already made the destination exist, so every refusal from
     // here on is a publication/reconciliation outcome carrying the published
     // identity and path, never a claim that nothing was written.
-    let manifest_sha256 = readback_digest(out_dir, "manifest.json", &files, &request.export_id)?;
+    let manifest_sha256 = readback_digest(out_dir, "manifest.json", &files, &export_id)?;
     if manifest_sha256 != archive.integrity.manifest_sha256 {
         return Err(BackupError::PublishReconciliationRequired {
-            export_id: request.export_id.clone(),
+            export_id: export_id.clone(),
             package_path: out_dir.display().to_string(),
             reason:
                 "the published manifest digest disagrees with the archive integrity attestation"
                     .to_owned(),
         });
     }
-    readback_digest(out_dir, "integrity.json", &files, &request.export_id)?;
-    Ok(EcxfExportReport {
-        export_id: request.export_id.clone(),
+    readback_digest(out_dir, "integrity.json", &files, &export_id)?;
+    let report = EcxfExportReport {
+        export_id,
         format: eliot_ecxf::FORMAT_VERSION.to_owned(),
         package_path: out_dir.display().to_string(),
         manifest_sha256,
@@ -350,7 +307,15 @@ pub fn export_ecxf_package(
         receipt_count: section_records(&archive, eliot_ecxf::SectionKind::Receipts),
         blob_count: archive.blobs.len() as u64,
         purge_ledger_entries: archive.privacy_purge_ledger.len() as u64,
-    })
+    };
+    report
+        .validate()
+        .map_err(|error| BackupError::PublishReconciliationRequired {
+            export_id: report.export_id.clone(),
+            package_path: report.package_path.clone(),
+            reason: error.to_string(),
+        })?;
+    Ok(report)
 }
 
 /// Refuses a source view that cannot prove one coherent export boundary.
@@ -361,9 +326,22 @@ pub fn export_ecxf_package(
 /// fence and the source owner reports that as
 /// [`SnapshotCompleteness::Complete`]. Anything else refuses here, before the
 /// archive is assembled.
-fn prove_coherent_boundary(snapshot: &CoherentSourceExport) -> Result<(), BackupError> {
+fn prove_coherent_boundary(
+    snapshot: &CoherentSourceExport,
+    request: &EcxfExportRequest,
+) -> Result<(), BackupError> {
     if !snapshot.completeness.is_complete() {
         return Err(BackupError::InconsistentBoundary);
+    }
+    if snapshot.scope_id.as_ref() != Some(&request.scope_id) {
+        return Err(BackupError::FenceMismatch {
+            subject: "export scope".to_owned(),
+        });
+    }
+    if snapshot.state_fence != request.context.state_fence {
+        return Err(BackupError::FenceMismatch {
+            subject: "authenticated request state fence".to_owned(),
+        });
     }
     if snapshot.event_range.count != snapshot.events.len() as u64 {
         return Err(BackupError::FenceMismatch {
