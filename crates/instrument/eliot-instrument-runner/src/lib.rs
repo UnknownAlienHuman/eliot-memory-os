@@ -69,9 +69,9 @@ pub use profile::{
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, ProviderDispatch, StageEvidence, StageIdentity, StageLauncher,
-    StageOrchestrator, StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,
-    compose_provider_dispatch,
+    ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
+    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
+    TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
