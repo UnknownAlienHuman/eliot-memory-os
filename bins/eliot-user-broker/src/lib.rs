@@ -820,7 +820,13 @@ impl ProcessPort for LocalProcessPort {
         );
         if self
             .pending_requests
-            .insert(operation_id, (request, stdin_payload.map(<[u8]>::to_vec)))
+            .insert(
+                operation_id,
+                (
+                    request,
+                    stdin_payload.map(<str>::as_bytes).map(<[u8]>::to_vec),
+                ),
+            )
             .is_some()
         {
             return Err(PortError::Invalid(
@@ -851,12 +857,16 @@ impl ProcessPort for LocalProcessPort {
         });
         // The payload is the one retained at preparation, never one supplied at
         // the start boundary, so the bytes the child reads are the bytes the
-        // durably committed request digest covers.
-        let start = match stdin_payload.as_deref() {
-            Some(payload) => self.executor.start_with_stdin(request, sink, Some(payload)),
-            None => self.executor.start(request, sink),
-        };
-        match self.runtime.block_on(start) {
+        // durably committed request digest covers. `None` takes the same path
+        // `start_with_stdin` takes with no payload: the pipe is created, never
+        // written, and closed.
+        // `start_with_stdin` is the synchronous physical start, the same driver
+        // the async `ProcessExecutor::start` method reaches, so it is driven on
+        // this single-threaded runtime through `ready` rather than spawned.
+        let start = self
+            .executor
+            .start_with_stdin(request, sink, stdin_payload.as_deref());
+        match self.runtime.block_on(std::future::ready(start)) {
             Ok(receipt) => Ok(ProcessStartOutcome::Started {
                 request_digest,
                 receipt,

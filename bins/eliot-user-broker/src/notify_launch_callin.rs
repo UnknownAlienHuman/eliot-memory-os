@@ -44,9 +44,11 @@
 use std::path::{Path, PathBuf};
 
 use eliot_notify::{
-    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
+    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, render_acknowledge_request,
+    resolve_notify_launch_inputs,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
+use eliot_user_broker_core::MAX_LAUNCH_STDIN_PAYLOAD_BYTES;
 
 /// Verified Notify launch inputs staged for one broker-bound grant.
 ///
@@ -430,29 +432,47 @@ pub struct NotifyAcknowledge {
 /// [`eliot_notify::parse_notify_stdin_request`] reader expects; the carriage in
 /// `SuspendedLaunchSpec::with_stdin` writes these bytes verbatim and then
 /// closes the sole parent writer, so the adapter reads this exact line and then
-/// observes deterministic EOF.
+/// observes deterministic EOF. It is appended here because the line protocol is
+/// a line protocol, and the broker's own launch admission requires it, so a
+/// payload that reached the child without one would be a payload this broker
+/// itself refuses to admit.
 ///
 /// # Errors
 ///
 /// Returns [`BrokerNotifyError::InvalidIdentity`] when the admitted principal is
-/// blank (an acknowledgement with no actor is not a Human action), and
-/// [`BrokerNotifyError::InvalidDeclaration`] when the line cannot be rendered.
-/// Both are fail-closed stable codes; no payload material is echoed.
+/// blank or carries a control character (an acknowledgement with no actor is not
+/// a Human action), and [`BrokerNotifyError::InvalidDeclaration`] when the
+/// acknowledged record is not a valid typed request, the line cannot be encoded,
+/// or it exceeds the bound this broker's own launch admission enforces. Every
+/// refusal is a fail-closed stable code; no payload material is echoed.
 pub fn render_notify_acknowledge_line(
     acknowledgement: &NotifyAcknowledge,
     principal: &str,
 ) -> Result<String, BrokerNotifyError> {
-    if principal.trim().is_empty() {
+    if principal.trim().is_empty() || principal.chars().any(char::is_control) {
         return Err(BrokerNotifyError::InvalidIdentity);
     }
-    let mut line = eliot_notify::render_acknowledge_request(
+    acknowledgement
+        .parent
+        .validate()
+        .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
+    if acknowledgement.notification_id.as_str().trim().is_empty() {
+        return Err(BrokerNotifyError::InvalidDeclaration);
+    }
+    let line = render_acknowledge_request(
         &acknowledgement.parent,
         acknowledgement.notification_id.clone(),
         principal,
     )
     .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
-    line.push('\n');
-    Ok(line)
+    let payload = format!("{line}\n");
+    // The same bound the broker's own launch admission applies, checked here so
+    // an over-long record is refused before a grant is asked for rather than
+    // after the child exists.
+    if payload.len() > MAX_LAUNCH_STDIN_PAYLOAD_BYTES {
+        return Err(BrokerNotifyError::InvalidDeclaration);
+    }
+    Ok(payload)
 }
 
 /// Stages normal Notify launch inputs at the broker edge and RETAINS the
@@ -508,5 +528,12 @@ fn stage_deferral_code(error: &BrokerNotifyError) -> &'static str {
         BrokerNotifyError::InvalidDeclaration => "INVALID_DECLARATION",
         BrokerNotifyError::BindingRejected => "BINDING_REJECTED",
         BrokerNotifyError::NotNotifyImage => "NOT_NOTIFY_IMAGE",
+        // The two request-time admission refusals never reach staging, for the
+        // same reason as the arms above: staging runs at broker startup, before
+        // any request exists to carry a payload or to be composed into a line.
+        // The variants are named rather than folded into a sibling so a future
+        // caller that does reach this match cannot silently report a request
+        // refusal as a deferred declaration.
+        BrokerNotifyError::UnexpectedStdinPayload => "UNEXPECTED_STDIN_PAYLOAD",
     }
 }
