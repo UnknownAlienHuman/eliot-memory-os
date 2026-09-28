@@ -842,8 +842,20 @@ struct ActivatedApplicationBinding {
     activation_generation: ResourceGeneration,
     /// Exact Kernel-issued activation ticket the accepted result answered.
     activation_ticket_id: String,
+    /// Digest of the exact ticket, which seals its request and admission receipt.
+    activation_ticket_sha256: String,
+    /// Request identity and digest copied from the exact validated ticket.
+    activation_request_id: String,
+    activation_request_sha256: String,
+    /// Exact peer-admission receipt joined by the activation ticket.
+    peer_admission_receipt_sha256: String,
     /// Digest of the exact typed semantic resolution result that was accepted.
     resolution_result_sha256: String,
+    /// Full owner-resolved identity from the exact typed result.
+    resolved_binding: eliot_protocol::AgentActivationResolvedBinding,
+    /// Current P-07 owner projection under which the result was accepted.
+    kernel_owner_revision: u64,
+    kernel_owner_bundle_sha256: String,
 }
 
 #[cfg(windows)]

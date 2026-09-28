@@ -1535,23 +1535,155 @@ impl KernelComposition {
     /// displaced by a different result under the same ticket, or that is only
     /// a `NotReady` deferral is not an authentication, so the binding cannot
     /// carry a later request.
-    fn activation_result_still_retained(
-        &self,
+    fn activation_result_still_retained_in(
+        pending: &super::AgentActivationPendingState,
         retained: &super::ActivatedApplicationBinding,
     ) -> bool {
-        let Ok(pending) = self.agent_activation_pending.lock() else {
-            return false;
-        };
         pending
             .results
             .get(&retained.activation_ticket_id)
             .is_some_and(|record| {
-                record.result.result_sha256 == retained.resolution_result_sha256
+                record.result.validate().is_ok()
+                    && record.result.ticket_id == retained.activation_ticket_id
+                    && record.result.ticket_sha256 == retained.activation_ticket_sha256
+                    && record.result.result_sha256 == retained.resolution_result_sha256
+                    && record.result.resolved_binding() == Some(&retained.resolved_binding)
+                    && retained.resolved_binding.principal_id == retained.principal_id
+                    && retained.resolved_binding.session_id == retained.session_id
+                    && retained.resolved_binding.task_id == retained.task_id
+                    && retained.resolved_binding.work_scope_id == retained.work_scope_id
+                    && retained.resolved_binding.task_revision
+                        == retained.task_revision.to_string()
+                    && record
+                        .result
+                        .ticket_state_fence
+                        .authority_epoch
+                        .is_same_authority(&retained.authority_epoch)
+                    && record.result.ticket_state_fence.resource_generation
+                        == retained.activation_generation
                     && matches!(
                         record.phase,
                         super::AgentActivationResultPhase::AcceptedTerminal
                     )
             })
+    }
+
+    /// Joins the in-memory activation result projection back to its exact
+    /// durable ticket, request, peer receipt, and accepted result. The ORS
+    /// lifecycle is authoritative for retention and terminal state; the
+    /// bridge's `Resolved` projection alone cannot keep authority alive.
+    fn activation_result_still_retained(
+        &self,
+        pending: &super::AgentActivationPendingState,
+        retained: &super::ActivatedApplicationBinding,
+        connection_id: &str,
+    ) -> bool {
+        if !Self::activation_result_still_retained_in(pending, retained) {
+            return false;
+        }
+        let Some(local_result) = pending.results.get(&retained.activation_ticket_id) else {
+            return false;
+        };
+        let Ok(Some(lifecycle)) = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&retained.activation_ticket_id)
+        else {
+            return false;
+        };
+        if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
+            || lifecycle.ticket_id != retained.activation_ticket_id
+            || lifecycle.ticket_sha256 != retained.activation_ticket_sha256
+            || lifecycle.activation_request_id != retained.activation_request_id
+            || lifecycle.activation_request_sha256 != retained.activation_request_sha256
+            || lifecycle.connection_id != connection_id
+            || lifecycle.result_sha256.as_deref()
+                != Some(retained.resolution_result_sha256.as_str())
+        {
+            return false;
+        }
+        let Ok(Some(retained_result)) = self
+            .generation_gateway
+            .ors
+            .load_activation_result(
+                &retained.activation_ticket_id,
+                &retained.resolution_result_sha256,
+            )
+        else {
+            return false;
+        };
+        if retained_result.phase != eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
+            || retained_result.ticket_id != lifecycle.ticket_id
+            || retained_result.ticket_sha256 != lifecycle.ticket_sha256
+            || retained_result.ticket_payload != lifecycle.ticket_payload
+            || retained_result.result_sha256 != retained.resolution_result_sha256
+            || retained_result.connection_id != connection_id
+            || retained_result.state_fence != lifecycle.state_fence
+        {
+            return false;
+        }
+        let Ok(ticket) = serde_json::from_str::<eliot_protocol::AgentActivationResolutionTicket>(
+            &lifecycle.ticket_payload,
+        ) else {
+            return false;
+        };
+        let Ok(ticket_state_fence_sha256) = sha256_json(&ticket.state_fence) else {
+            return false;
+        };
+        if ticket.validate().is_err()
+            || ticket.ticket_id != retained.activation_ticket_id
+            || ticket.ticket_sha256 != retained.activation_ticket_sha256
+            || ticket.activation_request_id.as_str() != retained.activation_request_id
+            || ticket.activation_request_sha256 != retained.activation_request_sha256
+            || ticket.peer_admission_receipt_sha256 != retained.peer_admission_receipt_sha256
+            || ticket.connection_id != connection_id
+            || ticket.kernel_deadline_unix_ms != lifecycle.kernel_deadline_unix_ms
+            || ticket.cancellation_id != lifecycle.cancellation_id
+            || lifecycle.state_fence != ticket_state_fence_sha256
+        {
+            return false;
+        }
+        let Ok(result) = serde_json::from_str::<eliot_protocol::AgentActivationResolutionResult>(
+            &retained_result.result_payload,
+        ) else {
+            return false;
+        };
+        if result.validate_against(&ticket).is_err()
+            || result != local_result.result
+            || result.resolved_binding() != Some(&retained.resolved_binding)
+            || result.ticket_id != lifecycle.ticket_id
+            || result.ticket_sha256 != lifecycle.ticket_sha256
+            || result.result_sha256 != retained.resolution_result_sha256
+            || result.ticket_state_fence != ticket.state_fence
+            || !result
+                .ticket_state_fence
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || result.ticket_state_fence.resource_generation != retained.activation_generation
+        {
+            return false;
+        }
+        self.activation_owner_projection_is_live(retained)
+    }
+
+    /// The activation's exact P-07 owner revision and bundle digest must still
+    /// be current at dispatch and at each queued claim.
+    fn activation_owner_projection_is_live(
+        &self,
+        retained: &super::ActivatedApplicationBinding,
+    ) -> bool {
+        let Ok(_transition) = self.p07_owner_transition.read() else {
+            return false;
+        };
+        let Ok(owner) = self.p07_owner.lock() else {
+            return false;
+        };
+        let Ok(digest) = self.p07_owner_digest.lock() else {
+            return false;
+        };
+        owner.as_ref().map(|bound| bound.bound_revision())
+            == Some(retained.kernel_owner_revision)
+            && digest.as_deref() == Some(retained.kernel_owner_bundle_sha256.as_str())
     }
 
     /// Verifies claimed application session/task/scope continuity against the
@@ -1562,9 +1694,10 @@ impl KernelComposition {
     /// binds the authenticated transport to the activation-derived
     /// application authority. It is mechanical only: claimed values are
     /// compared for exact equality against retained values, nothing is
-    /// re-resolved and no task is ever selected here. Absent claims are not
-    /// invented: discovery stays reachable without a task, and whether a
-    /// capability requires a task remains the Governor's semantic decision.
+    /// re-resolved and no task is ever selected here. An absent task claim is
+    /// allowed only for capabilities classified as task-safe after this
+    /// connection has a `Resolved` activation. `TaskSelectionRequired` does
+    /// not publish an application binding, so this is not a preselection route.
     ///
     /// A claim naming a different session, task, scope, or task revision than
     /// the retained activation binding is `IdentityConflict`: the request must
@@ -1577,14 +1710,15 @@ impl KernelComposition {
     /// Two further legs come from the same retained record (issue #1746 W2).
     /// The presented fence must still be the activation's current epoch and
     /// generation, so a request arriving after a generation or epoch move is
-    /// fenced instead of running under a stored `Resolved` projection. And the
-    /// requested capability is classified through the frozen operation table
-    /// below: a task-relative/effectful capability receives no task-bound
-    /// authority unless the envelope names exactly the retained task, scope,
-    /// and revision, while authenticated discovery/read-only and safe raw
-    /// capture stay reachable with no task at all. A principal is never taken
-    /// from the envelope — there is none — and the bridge peer identity is
-    /// never substituted for the activation-resolved principal.
+    /// fenced instead of running under a stored `Resolved` projection. The
+    /// fail-closed safe-capability allowlist requires task-relative Invocations
+    /// to name exactly the retained task, scope, and revision. Status,
+    /// Cancellation, and Reconciliation rely on their exact parent authority;
+    /// the explicitly safe Invocation capabilities may omit task fields after
+    /// a `Resolved` activation. A principal is never taken from the envelope
+    /// — there is none — and the bridge peer identity is never substituted for
+    /// the activation-resolved principal. There is no preselection HostRequest
+    /// route when activation returns `TaskSelectionRequired`.
     fn host_request_application_binding_gate_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1612,7 +1746,15 @@ impl KernelComposition {
         if retained.principal_id.trim().is_empty() {
             return Err(TransportError::SessionFenced);
         }
-        if !self.activation_result_still_retained(&retained) {
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(
+            &admission_owner,
+            &retained,
+            &envelope.connection_id,
+        ) {
             return Err(TransportError::SessionFenced);
         }
         if !envelope
@@ -1623,17 +1765,27 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        if let Some(claimed) = envelope.identity.session_id.as_deref() {
-            if claimed != retained.session_id {
-                return Err(TransportError::IdentityConflict);
-            }
+        if envelope
+            .identity
+            .session_id
+            .as_deref()
+            .is_some_and(|claimed| claimed != retained.session_id)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let claimed_session = retained.session_id.as_str();
+        let session_claimed = envelope.identity.session_id.is_some();
+        if envelope.kind == HostRequestKind::Invocation || session_claimed {
             let now = unix_ms();
             let sessions = self
                 .agent_application_sessions
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            let live = sessions.get(claimed).is_some_and(|session| {
-                !session.state().is_terminal()
+            let live = sessions.get(claimed_session).is_some_and(|session| {
+                session.session_id() == retained.session_id
+                    && !session.state().is_terminal()
+                    && (envelope.kind != HostRequestKind::Invocation
+                        || session.state() == eliot_ipc::ApplicationSessionState::Active)
                     && session
                         .authority_epoch()
                         .is_same_authority(&envelope.state_fence.authority_epoch)
@@ -1644,7 +1796,14 @@ impl KernelComposition {
                     && session
                         .bound_leases()
                         .values()
-                        .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+                        // Activation creates no session-bound capability
+                        // leases. This rejects expired/revoked records when
+                        // present; per-capability grants remain #1745.
+                        .all(|lease| {
+                            !lease.revoked
+                                && lease.issued_at_unix_ms <= now
+                                && now < lease.expires_at_unix_ms
+                        })
             });
             if !live {
                 return Err(TransportError::SessionFenced);
@@ -1665,12 +1824,15 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        // A task-relative/effectful capability is exactly the case I7.8 steps
-        // 7-12 and the A1 acceptance forbid without task-bound authority: the
-        // envelope must therefore carry the retained task, scope, and
-        // revision. Discovery, read-only, and cold capture keep their no-task
-        // route and are unaffected by this leg.
-        if host_request_capability_is_task_relative(envelope.identity.capability.as_str()) {
+        // A task-relative/effectful Invocation is the case I7.8 steps 7-12
+        // and the A1 acceptance forbid without task-bound authority: its
+        // envelope must carry the retained task, scope, and revision. The
+        // explicitly safe Invocation capabilities may omit task fields only
+        // after a Resolved activation. Status, Cancellation, and Reconciliation
+        // use their exact parent/session authority instead of task binding.
+        if envelope.kind == HostRequestKind::Invocation
+            && host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+        {
             let task_named =
                 envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
             let scope_named =
@@ -2157,6 +2319,7 @@ impl KernelComposition {
     fn application_binding_live_for_claim(
         &self,
         envelope: &HostRequestEnvelope,
+        pending: &super::AgentActivationPendingState,
     ) -> Result<bool, TransportError> {
         let retained = {
             let connections = self
@@ -2167,12 +2330,26 @@ impl KernelComposition {
                 .get(&envelope.connection_id)
                 .and_then(|state| state.activated_binding.clone())
         };
-        if let Some(retained) = retained.as_ref() {
+        let task_relative = envelope.kind == HostRequestKind::Invocation
+            && host_request_capability_is_task_relative(envelope.identity.capability.as_str());
+        let session_id = if let Some(retained) = retained.as_ref() {
+            if !self.activation_result_still_retained(
+                pending,
+                retained,
+                &envelope.connection_id,
+            ) {
+                return Ok(false);
+            }
             if envelope
                 .identity
-                .task_id
+                .session_id
                 .as_deref()
-                .is_some_and(|claimed| claimed != retained.task_id)
+                .is_some_and(|claimed| claimed != retained.session_id)
+                || envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != retained.task_id)
                 || envelope
                     .identity
                     .work_scope_id
@@ -2185,9 +2362,9 @@ impl KernelComposition {
             {
                 return Ok(false);
             }
-            // The generation/epoch leg and the task-relative capability leg
-            // are rechecked here too, so a task-bound write cannot be claimed
-            // under a fence the activation never held (issue #1746 W2/A1).
+            // The generation/epoch leg and the task-relative capability leg are
+            // rechecked here too, so a task-bound write cannot be claimed under
+            // a fence the activation never held (issue #1746 W2/A1).
             if !envelope
                 .state_fence
                 .authority_epoch
@@ -2196,7 +2373,7 @@ impl KernelComposition {
             {
                 return Ok(false);
             }
-            if host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+            if task_relative
                 && (envelope.identity.task_id.as_deref() != Some(retained.task_id.as_str())
                     || envelope.identity.work_scope_id.as_deref()
                         != Some(retained.work_scope_id.as_str())
@@ -2204,22 +2381,41 @@ impl KernelComposition {
             {
                 return Ok(false);
             }
-        } else if envelope.identity.task_id.is_some()
-            || envelope.identity.work_scope_id.is_some()
-            || envelope.state_fence.task_revision.is_some()
+            Some(retained.session_id.as_str())
+        } else {
+            if task_relative
+                || envelope.identity.task_id.is_some()
+                || envelope.identity.work_scope_id.is_some()
+                || envelope.state_fence.task_revision.is_some()
+            {
+                // Preserve the historical safe no-task queue case, but never
+                // let a task-relative request gain authority from a missing
+                // activation binding. This is not an admission bypass: the
+                // public HostRequest gate requires activation for non-activation
+                // envelopes.
+                return Ok(false);
+            }
+            envelope.identity.session_id.as_deref()
+        };
+        let Some(claimed) = session_id else {
+            return Ok(true);
+        };
+        if envelope
+            .identity
+            .session_id
+            .as_deref()
+            .is_some_and(|presented| presented != claimed)
         {
             return Ok(false);
         }
-        let Some(claimed) = envelope.identity.session_id.as_deref() else {
-            return Ok(true);
-        };
         let now = unix_ms();
         let sessions = self
             .agent_application_sessions
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(sessions.get(claimed).is_some_and(|session| {
-            !session.state().is_terminal()
+            session.session_id() == claimed
+                && session.state() == eliot_ipc::ApplicationSessionState::Active
                 && session
                     .authority_epoch()
                     .is_same_authority(&envelope.state_fence.authority_epoch)
@@ -2230,7 +2426,11 @@ impl KernelComposition {
                 && session
                     .bound_leases()
                     .values()
-                    .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+                    .all(|lease| {
+                        !lease.revoked
+                            && lease.issued_at_unix_ms <= now
+                            && now < lease.expires_at_unix_ms
+                    })
         }))
     }
 
@@ -2259,7 +2459,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2281,7 +2481,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -2429,7 +2629,7 @@ impl KernelComposition {
         request_digest: &str,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2972,26 +3172,26 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 /// Whether one requested capability is task-relative or effectful and
 /// therefore needs the exact applicable task binding (issue #1746, W2).
 ///
-/// This mirrors the frozen operation table the MCP contract surface already
-/// publishes (`eliot_mcp::semantic_profile::CanonicalOperation::requirement`,
-/// I7.8 steps 7-12) over the closed capability set this module already routes.
-/// It is a table lookup, not a second classifier: an unknown capability is not
-/// task-relative here and is refused by its own per-tool linkage gate instead,
-/// so this predicate can only ever remove task-bound authority, never grant
-/// it.
+/// This is a fail-closed safe-capability allowlist. Unknown capabilities are
+/// task-relative until explicitly classified safe; host-request admission
+/// separately checks the capability against the current Kernel descriptor.
 ///
 /// - `eliot.packet` is `Packet`, classified `TaskRelativeEffectful` with
 ///   `ExactApplicableTask`;
 /// - `skill.activate` and `skill.execute` activate or run a task-scoped skill,
 ///   which is control/action work and needs the same exact task binding;
-/// - `eliot.state` and `eliot.query` stay authenticated discovery/read-only
-///   and remain reachable before a task is selected;
+/// - `eliot.state` and `eliot.query` are authenticated discovery/read-only and
+///   may omit task fields after a `Resolved` activation;
 /// - `eliot.observe` stays safe raw capture with no task effect, and the
-///   Watchdog intent route is a parentless observation submission.
+///   Watchdog intent route is a parentless observation submission; and
+/// - every other capability, including an unclassified future name, remains
+///   task-relative until an explicit safe classification exists. The current
+///   HostRequest route does not provide preselection access when activation
+///   returns `TaskSelectionRequired`.
 fn host_request_capability_is_task_relative(capability: &str) -> bool {
-    matches!(
+    !matches!(
         capability,
-        "eliot.packet" | "skill.activate" | "skill.execute"
+        "eliot.state" | "eliot.query" | "eliot.observe" | "eliot.watchdog.intent.submit"
     )
 }
 
@@ -3473,7 +3673,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -3498,7 +3698,7 @@ impl KernelComposition {
                     position += 1;
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
                     position += 1;
                     continue;
                 }

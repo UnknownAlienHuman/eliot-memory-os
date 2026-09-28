@@ -1713,7 +1713,22 @@ impl KernelComposition {
         binding: &AgentActivationResolvedBinding,
         pending: &AgentActivationPending,
         result: &AgentActivationResolutionResult,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        connection_id: &str,
     ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        pending
+            .ticket
+            .validate_against(&pending.request, receipt)
+            .map_err(|_| TransportError::SessionFenced)?;
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if pending.ticket.connection_id != connection_id
+            || receipt.connection_id != connection_id
+            || result.resolved_binding() != Some(binding)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let task_revision = binding
             .task_revision
             .parse::<u64>()
@@ -1728,11 +1743,29 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        // The retained record correlates to the exact ticket and typed result
-        // that were accepted, never to a stored projection alone.
-        if pending.ticket.ticket_id != result.ticket_id
-            || result.ticket_sha256 != pending.ticket.ticket_sha256
-            || result.ticket_state_fence != pending.ticket.state_fence
+        let owner_evidence = result
+            .owner_evidence
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let owner_readback = pending
+            .owner_readback
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let kernel_owner = owner_readback
+            .kernel_owner
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        owner_readback
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        owner_readback
+            .validate_against_binding(binding, &pending.ticket.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if owner_readback.evidence.owner_id != owner_evidence.owner_id
+            || owner_readback.evidence.owner_revision < owner_evidence.owner_revision
+            || owner_readback.evidence.state_fence != owner_evidence.state_fence
+            || owner_readback.evidence.binding != owner_evidence.binding
+            || owner_evidence.binding.as_ref() != binding
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -1744,8 +1777,15 @@ impl KernelComposition {
             task_revision,
             authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
             activation_generation: pending.ticket.state_fence.resource_generation,
-            activation_ticket_id: result.ticket_id.clone(),
+            activation_ticket_id: pending.ticket.ticket_id.clone(),
+            activation_ticket_sha256: pending.ticket.ticket_sha256.clone(),
+            activation_request_id: pending.ticket.activation_request_id.as_str().to_owned(),
+            activation_request_sha256: pending.ticket.activation_request_sha256.clone(),
+            peer_admission_receipt_sha256: pending.ticket.peer_admission_receipt_sha256.clone(),
             resolution_result_sha256: result.result_sha256.clone(),
+            resolved_binding: binding.clone(),
+            kernel_owner_revision: kernel_owner.revision,
+            kernel_owner_bundle_sha256: kernel_owner.bundle_sha256.clone(),
         })
     }
 
@@ -1775,6 +1815,7 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?
             .clone();
+        let receipt = accepted.admission_receipt().clone();
         let session = Session::establish_agent_bridge(
             connection_id,
             accepted.peer().clone(),
@@ -1841,7 +1882,13 @@ impl KernelComposition {
         // Retain the exact Resolved task/scope binding for later dispatch
         // continuity (issue #1746); fails closed here, before any retained
         // state is mutated.
-        let activated_binding = Self::activated_application_binding(binding, pending, result)?;
+        let activated_binding = Self::activated_application_binding(
+            binding,
+            pending,
+            result,
+            &receipt,
+            connection_id,
+        )?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.
