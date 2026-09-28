@@ -30,8 +30,8 @@ use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, TargetRoots, TestJob,
     TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
-    issue_process_admission, testd_profile_binding, testd_profile_resource_limits,
-    validate_running_lease, verify_layout_binding,
+    issue_process_admission, testd_profile_resource_limits, validate_running_lease,
+    verify_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

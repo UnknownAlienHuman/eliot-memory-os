@@ -32,8 +32,8 @@ use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage};
 use crate::registry::{RegistryEntry, RegistryError};
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
 use crate::{
-    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError,
-    bridge_executor_observation,
+    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
+    RunnerError, bridge_executor_observation,
 };
 
 /// Failures raised while planning or recording profile runs.
@@ -343,6 +343,26 @@ pub struct StageTargetLayout {
     pub target_root_observed: Option<String>,
     /// `CARGO_HOME` sealed from the launch request, when carried.
     pub cache_root_observed: Option<String>,
+}
+
+impl StageTargetLayout {
+    /// Seals the layout evidence for one launched stage.
+    ///
+    /// Workspace and checkout identities are not issued to this boundary, so
+    /// they stay explicitly absent: a declared but never-issued identity is
+    /// never inferred from branch names, paths, or caller strings.
+    #[must_use]
+    pub fn sealed(planned: &PlannedStage, receipt: &InstrumentStartReceipt) -> Self {
+        Self {
+            layout_revision: TARGET_LAYOUT_REVISION,
+            build_class: planned.stage.build_class(),
+            workspace_id: None,
+            checkout_id: None,
+            working_directory_observed: receipt.working_directory.clone(),
+            target_root_observed: receipt.target_root_observed.clone(),
+            cache_root_observed: receipt.cache_root_observed.clone(),
+        }
+    }
 }
 
 /// One durable run record per stage (I16.17).
@@ -815,18 +835,7 @@ impl StageOrchestrator {
         match runner.launch(&mut binding, launcher.sink(planned)).await {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
-                // Workspace/checkout identities are not issued to this
-                // boundary, so they stay explicitly absent: a declared but
-                // never-issued identity is never inferred into evidence.
-                let target_layout = StageTargetLayout {
-                    layout_revision: TARGET_LAYOUT_REVISION,
-                    build_class: planned.stage.build_class(),
-                    workspace_id: None,
-                    checkout_id: None,
-                    working_directory_observed: receipt.working_directory.clone(),
-                    target_root_observed: receipt.target_root_observed.clone(),
-                    cache_root_observed: receipt.cache_root_observed.clone(),
-                };
+                let target_layout = StageTargetLayout::sealed(planned, &receipt);
                 InstrumentRun::launched(route, operation, &grant, Some(target_layout))
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
