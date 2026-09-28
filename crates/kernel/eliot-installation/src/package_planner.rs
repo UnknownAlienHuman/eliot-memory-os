@@ -2548,7 +2548,9 @@ mod tests {
     )]
 
     use super::*;
-    use crate::InstallationTransactionStore;
+    use crate::{
+        InstallationTransactionStore, provider_bootstrap_credential_target_for_store_target,
+    };
     use eliot_platform::PlatformHandle;
     use eliot_platform_windows::PackageManifest;
     use tempfile::TempDir;
