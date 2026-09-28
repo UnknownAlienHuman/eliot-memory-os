@@ -46,16 +46,17 @@
 //! is refused unless an explicit receipted policy-authorized degradation was
 //! recorded first.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_contracts::{
-    ExecutionUpdateProposal, RevisionId, SupersessionLink, SwarmAdmissionId, SwarmExecutionId,
-    SwarmExecutionRevision, SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
-    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_update,
-    check_owner_join, check_stored_links, check_supersession, join_view,
+    ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
+    SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmPlanAdmission,
+    SwarmPlanAdmissionDisposition, SwarmPlanDefinition, SwarmPlanDefinitionLifecycle,
+    SwarmPlanView, check_definition_author, check_execution_update, check_owner_join,
+    check_stored_links, check_supersession, join_view, reassign_coordinator,
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
@@ -1138,12 +1139,13 @@ fn staffing_rejection(error: &crate::staffing_policy::StaffingPolicyError) -> Fa
 /// key must equal its record identity; every stored execution must satisfy
 /// the structural ownership links against its stored definition and
 /// admission; every supersession link must join its stored prior and
-/// replacement. Every stored staffing plan receipt must still bind its own
-/// body. Legacy snapshots carry no semantic records and no staffing receipts
-/// and pass trivially. A contradictory image fails closed so torn persistence
-/// never restores authority; live coherence (leases, active dispositions) is
-/// rehydrated independently by the owners after restore, never from saved
-/// labels alone.
+/// replacement, and every replacement chain must stay acyclic so one current
+/// authority always resolves. Every stored staffing plan receipt must still
+/// bind its own body. Legacy snapshots carry no semantic records and no
+/// staffing receipts and pass trivially. A contradictory image fails closed so
+/// torn persistence never restores authority; live coherence (leases, active
+/// dispositions) is rehydrated independently by the owners after restore,
+/// never from saved labels alone.
 fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
     // Issue #1963: a restored staffing plan receipt is only usable while it
     // still binds its own body, so a tampered or torn persisted receipt refuses
@@ -1205,6 +1207,29 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
             ));
         }
         check_supersession(prior, next).map_err(contract_rejection)?;
+    }
+    check_supersession_chains(snapshot)?;
+    Ok(())
+}
+
+/// Rejects cyclic replacement chains in a durable snapshot.
+///
+/// Each link is valid on its own, but a cycle (A supersedes B while B
+/// transitively supersedes A) orders no current authority: revision order
+/// must stay a DAG. The walk follows prior links from every replacement; a
+/// revisited replacement is contradictory history and restores nothing.
+fn check_supersession_chains(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for start in snapshot.semantic_supersessions.keys() {
+        let mut visited = BTreeSet::new();
+        let mut current = start.as_str();
+        while let Some(link) = snapshot.semantic_supersessions.get(current) {
+            if !visited.insert(current) {
+                return Err(FabricError::BrokenOwnershipLink(
+                    "semantic supersession chain is cyclic".to_owned(),
+                ));
+            }
+            current = link.prior_definition_id.as_str();
+        }
     }
     Ok(())
 }
@@ -2290,7 +2315,10 @@ impl AgentFabric {
     /// and this composition only records the transition after validating it
     /// against the I14.20 admission lifecycle. Mirroring `SUPERSEDED` or
     /// `CANCELLED` freezes new execution updates under the old admission;
-    /// retained records stay readable history.
+    /// retained records stay readable history. Re-noting the stored
+    /// disposition replays exactly (a retried Governor acknowledgement after a
+    /// crash commits nothing twice); a different disposition must still pass
+    /// the lifecycle.
     ///
     /// # Errors
     ///
@@ -2302,10 +2330,15 @@ impl AgentFabric {
         disposition: SwarmPlanAdmissionDisposition,
     ) -> Result<(), FabricError> {
         let key = admission_id.as_str().to_owned();
-        let mut admission =
+        let stored =
             self.semantic_admissions.get(&key).cloned().ok_or_else(|| {
                 FabricError::Contract(format!("unknown semantic admission {key}"))
             })?;
+        if stored.disposition == disposition {
+            self.record("semantic_admission_disposition_replayed", &key);
+            return Ok(());
+        }
+        let mut admission = stored;
         admission.disposition = admission
             .disposition
             .decide(disposition)
@@ -2321,21 +2354,37 @@ impl AgentFabric {
     ///
     /// Validates the full ownership join at record time: the definition must
     /// be registered, the admission bound, and the execution linked to both.
-    /// Same-identity replay is exact; changed content conflicts. Terminal
-    /// states are retained verbatim: history is never rewritten and
+    /// The presenter must hold the execution's current coordinator lease: a
+    /// stale or foreign coordinator cannot write execution fields, nor can
+    /// another owner's holder under its own labels. Only a
+    /// live wave takes new execution identities: once a replacement
+    /// definition is recorded, or once the admission leaves `ADMITTED`, the
+    /// old wave freezes and new identities record through the replacement
+    /// admission. Same-identity replay is exact; changed content conflicts.
+    /// Terminal states are retained verbatim: history is never rewritten and
     /// `UNKNOWN_OUTCOME` never becomes a clean failure here.
     ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] when the definition or admission is
-    /// unknown, the semantic contract rejection for a broken join, or
-    /// [`FabricError::DefinitionConflict`] for changed content under a live
-    /// execution identity.
+    /// unknown, [`FabricError::StaleOwnerLease`] for a stale or foreign
+    /// coordinator, [`FabricError::Superseded`] for a new identity under a
+    /// superseded definition, the semantic contract rejection for a broken
+    /// join, or [`FabricError::DefinitionConflict`] for changed content under
+    /// a live execution identity.
     pub fn record_semantic_execution(
         &mut self,
         execution: SwarmExecutionRevision,
+        coordinator_holder: &str,
+        coordinator_epoch: u64,
     ) -> Result<(), FabricError> {
         execution.validate().map_err(contract_rejection)?;
+        if !execution
+            .coordinator
+            .authorizes(coordinator_holder, coordinator_epoch)
+        {
+            return Err(FabricError::StaleOwnerLease("swarm coordinator".to_owned()));
+        }
         let definition_key = execution.definition_id.as_str().to_owned();
         let definition = self
             .semantic_definitions
@@ -2352,7 +2401,6 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::Contract(format!("unknown semantic admission {admission_key}"))
             })?;
-        check_owner_join(&definition, &admission, &execution).map_err(contract_rejection)?;
         let key = execution.execution_id.as_str().to_owned();
         if let Some(stored) = self.semantic_executions.get(&key).cloned() {
             if stored == execution {
@@ -2363,8 +2411,66 @@ impl AgentFabric {
                 "semantic execution {key} reused with different bytes"
             )));
         }
+        if self
+            .semantic_supersessions
+            .values()
+            .any(|link| link.prior_definition_id.as_str() == definition_key)
+        {
+            return Err(FabricError::Superseded(format!(
+                "semantic definition {definition_key} superseded; record through the replacement admission"
+            )));
+        }
+        if admission.disposition != SwarmPlanAdmissionDisposition::Admitted {
+            return Err(FabricError::BrokenOwnershipLink(
+                "new semantic execution requires an admitted admission".to_owned(),
+            ));
+        }
+        check_owner_join(&definition, &admission, &execution).map_err(contract_rejection)?;
         self.semantic_executions.insert(key.clone(), execution);
         self.record("semantic_execution_recorded", &key);
+        Ok(())
+    }
+
+    /// Rebinds one retained execution to a new coordinator epoch after owner
+    /// loss (issue #1702).
+    ///
+    /// Only the affected owner's lease moves: the presenter must be the
+    /// incoming holder at the incoming epoch, the epoch must advance past the
+    /// retained one, and the definition, admission, wave, root, state and
+    /// coverage bindings are preserved verbatim through
+    /// [`reassign_coordinator`]. Spend is never reset and `UNKNOWN_OUTCOME`
+    /// never becomes a clean failure here. Re-presenting the stored lease
+    /// replays exactly; presenting a stale epoch or a foreign holder fails
+    /// with [`FabricError::StaleOwnerLease`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] for an unknown execution,
+    /// [`FabricError::StaleOwnerLease`] for a presenter outside the incoming
+    /// lease or a non-advancing epoch, or the mapped semantic rejection
+    /// otherwise.
+    pub fn reassign_semantic_coordinator(
+        &mut self,
+        execution_id: &SwarmExecutionId,
+        new_coordinator: &SwarmCoordinatorLease,
+        presenter_holder: &str,
+        presenter_epoch: u64,
+    ) -> Result<(), FabricError> {
+        if !new_coordinator.authorizes(presenter_holder, presenter_epoch) {
+            return Err(FabricError::StaleOwnerLease("swarm coordinator".to_owned()));
+        }
+        let key = execution_id.as_str().to_owned();
+        let stored =
+            self.semantic_executions.get(&key).cloned().ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {key}"))
+            })?;
+        if stored.coordinator == *new_coordinator {
+            self.record("semantic_coordinator_reassigned_replayed", &key);
+            return Ok(());
+        }
+        let next = reassign_coordinator(&stored, new_coordinator).map_err(contract_rejection)?;
+        self.semantic_executions.insert(key.clone(), next);
+        self.record("semantic_coordinator_reassigned", &key);
         Ok(())
     }
 
@@ -2374,10 +2480,12 @@ impl AgentFabric {
     /// Mechanical updates under the current coordinator lease and the exact
     /// active admission pass; any attempt to change the work graph,
     /// objective, acceptance, ceilings, stop conditions, wave or root fails
-    /// with [`FabricError::SemanticDrift`]. Updates against a superseded
-    /// definition fail with [`FabricError::Superseded`]: replacement work
-    /// needs the new definition and its distinct admission. A stale or
-    /// foreign coordinator fails with [`FabricError::StaleOwnerLease`].
+    /// with [`FabricError::SemanticDrift`]. Updates against a cancelled or
+    /// superseded old wave fail with [`FabricError::Superseded`]: replacement
+    /// work needs the new definition and its distinct admission. A draining
+    /// old wave still admits mechanical progress under its recorded
+    /// disposition, but never semantic change. A stale or foreign coordinator
+    /// fails with [`FabricError::StaleOwnerLease`].
     ///
     /// # Errors
     ///
@@ -2412,14 +2520,19 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::Contract(format!("unknown semantic definition {definition_key}"))
             })?;
-        if self
+        if let Some(link) = self
             .semantic_supersessions
             .values()
-            .any(|link| link.prior_definition_id.as_str() == definition_key)
+            .find(|link| link.prior_definition_id.as_str() == definition_key)
         {
-            return Err(FabricError::Superseded(format!(
-                "semantic definition {definition_key} superseded; update through the replacement admission"
-            )));
+            match link.disposition {
+                OldWaveDisposition::Drain => {}
+                OldWaveDisposition::Cancel | OldWaveDisposition::Supersede => {
+                    return Err(FabricError::Superseded(format!(
+                        "semantic definition {definition_key} superseded; update through the replacement admission"
+                    )));
+                }
+            }
         }
         check_execution_update(
             definition,
@@ -2446,12 +2559,15 @@ impl AgentFabric {
     /// admission ([`AgentFabric::bind_semantic_admission`]) before any
     /// execution runs under it, and the old admission disposition is mirrored
     /// through [`AgentFabric::note_semantic_admission_disposition`].
+    /// Re-proposing the stored replacement replays exactly (a retried Task
+    /// Controller acknowledgement after a crash records no duplicate
+    /// revision); any other reuse of the replacement identity conflicts.
     ///
     /// # Errors
     ///
     /// Returns the semantic contract rejection, or
     /// [`FabricError::DefinitionConflict`] when the replacement identity is
-    /// already registered.
+    /// already registered with different bytes.
     pub fn supersede_semantic_definition(
         &mut self,
         next: SwarmPlanDefinition,
@@ -2481,7 +2597,11 @@ impl AgentFabric {
         }
         check_supersession(&prior, &next).map_err(contract_rejection)?;
         let next_key = next.definition_id.as_str().to_owned();
-        if self.semantic_definitions.contains_key(&next_key) {
+        if let Some(stored) = self.semantic_definitions.get(&next_key).cloned() {
+            if stored == next && self.semantic_supersessions.get(&next_key) == Some(&link) {
+                self.record("semantic_definition_supersession_replayed", &next_key);
+                return Ok(());
+            }
             return Err(FabricError::DefinitionConflict(format!(
                 "replacement semantic definition {next_key} already registered"
             )));
