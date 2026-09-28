@@ -536,9 +536,13 @@ pub fn owner_suspended_recovery_refs(
 /// `WatchdogSpoolFence` declares its own unresolved signals; and the optional
 /// `HostStateAuditFence` declares its own forensic dispositions. Deriving the
 /// same keys from the caller's carried records instead would compare one
-/// caller-supplied list with itself: two copies of the same list cannot detect
-/// a member the owner declared and the capture dropped, which is the
-/// completeness guarantee A16/A18 require.
+/// caller-supplied list with itself: two copies of the same list agree with each
+/// other whatever the owners declared, so they cannot state "every expected
+/// source/member has one disposition" about a member no carried list mentions.
+///
+/// What this cannot do, and does not claim: it cannot detect a member an owner
+/// omitted from its OWN fence before this owner saw it. A fence is the owner's
+/// declaration; a fence that under-declares is that owner's evidence gap.
 ///
 /// The ORS pending-operation dispositions are read through the owner's own
 /// suspended derivation (see [`owner_suspended_recovery_refs`]), so an ORS

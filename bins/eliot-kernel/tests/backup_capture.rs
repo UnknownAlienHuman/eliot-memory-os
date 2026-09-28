@@ -26,9 +26,7 @@ use eliot_backup::{
     CanonicalRecord, EventRange, ExportFence, HostStateAuditFence, OrsSnapshotFence,
     WatchdogSpoolFence,
 };
-use eliot_contracts::{
-    EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
-};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
     CaptureBudgets, CaptureCallerAuth, CaptureEvidenceLevel, CaptureRequest, CaptureState,
     FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
@@ -660,13 +658,24 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
         report_disposition_keys(&report.member_dispositions),
         expected_disposition_keys(&input)
     );
-    assert_eq!(report.member_dispositions.len(), 10);
-    assert!(
-        report
-            .member_dispositions
-            .iter()
-            .all(|(_, disposition)| disposition == "captured")
-    );
+    // 10 carried-content members (2 canonical, 1 projection, 1 receipt, 1 blob,
+    // 1 purge, 4 artifacts) plus the members each OWNER declared in its own
+    // fence: 1 ORS pending operation, 1 ORS job checkpoint, 1 Watchdog
+    // unresolved signal, and 1 forensic Host audit disposition.
+    assert_eq!(report.member_dispositions.len(), 14);
+    // The carried-content domains are `captured`; an ORS pending operation and an
+    // unresolved Watchdog signal are `suspended`, and the optional Host audit
+    // disposition is `forensic` — retained, never restored as active authority.
+    for (key, disposition) in &report.member_dispositions {
+        let expected = if key.starts_with("ors_pending:") || key.starts_with("watchdog_signal:") {
+            "suspended"
+        } else if key.starts_with("host_audit:") {
+            "forensic"
+        } else {
+            "captured"
+        };
+        assert_eq!(disposition, expected, "disposition for {key}");
+    }
     for prefix in [
         "canonical:",
         "projection:",

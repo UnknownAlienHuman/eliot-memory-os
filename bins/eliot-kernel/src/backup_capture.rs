@@ -1216,7 +1216,9 @@ fn gate_approved_manifest_digests(request: &CaptureRequest) -> Result<(), Kernel
 /// (`owner_suspended_recovery_refs`), which validates the fence before counting
 /// it. A raw read of `pending_operation_ids` would count rows the archive owner
 /// itself refuses.
-fn observed_unresolved_frontier(request: &CaptureRequest) -> Result<Vec<String>, KernelCaptureError> {
+fn observed_unresolved_frontier(
+    request: &CaptureRequest,
+) -> Result<Vec<String>, KernelCaptureError> {
     request
         .ors_snapshot
         .as_ref()
@@ -1551,8 +1553,8 @@ fn snapshot_relation(
 /// alone is not a logical object.
 ///
 /// The members an OWNER declared rather than carried are emitted separately by
-/// [`owner_fence_dispositions`]; [`merge_member_dispositions`] joins the two
-/// halves into the one disposition list the denominator is checked against.
+/// [`owner_fence_dispositions`], and the denominator joins the two halves into
+/// the one disposition list it is checked against.
 fn member_disposition_list(
     events: &[CanonicalRecord],
     projections: &[CanonicalRecord],
