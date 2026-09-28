@@ -626,11 +626,14 @@ impl StartupCoordinator {
     /// Returns the blocking [`StartupRejection`] or a profile-ceiling
     /// rejection when the profile does not permit Material authority.
     ///
-    /// Production reaches this through
-    /// [`KernelComposition::admit_material_authority`](super::KernelComposition::admit_material_authority),
-    /// which the origin-control decide path consults; it is the startup-gate
-    /// half of the Material/Critical decision, and the dynamic Watchdog-coverage
-    /// half is [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).
+    /// Production does not reach this directly. Every production
+    /// Material/Critical effect, including the origin-control decide path,
+    /// reaches it through
+    /// [`KernelComposition::admit_material_authority_for_governor_issued_fence`](super::KernelComposition::admit_material_authority_for_governor_issued_fence),
+    /// which first binds the current Governor-issued governance profile; it is
+    /// the startup-gate half of that decision, and the dynamic
+    /// Watchdog-coverage half is
+    /// [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).
     pub(crate) fn admit_material_authority(
         &self,
         profile: GovernanceProfile,

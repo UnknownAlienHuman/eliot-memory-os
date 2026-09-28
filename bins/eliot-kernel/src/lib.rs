@@ -2573,10 +2573,14 @@ impl KernelComposition {
     /// Startup completeness is checked first with its named prerequisite;
     /// the profile ceiling alone decides once startup is complete.
     ///
-    /// This is the startup-gate half of the Material decision and is the
-    /// surface the origin-control decide path consults. It does not stand in
-    /// for current independent Watchdog coverage: a protected effect that must
-    /// be admitted as independently supervised additionally passes
+    /// This is the startup-gate half of the Material decision. It is not the
+    /// production Material/Critical boundary: every production effect,
+    /// including origin-control decide, goes through
+    /// [`Self::admit_material_authority_for_governor_issued_fence`], which
+    /// first requires the current Governor-issued governance profile. It
+    /// stands neither for that recorded profile nor for current independent
+    /// Watchdog coverage: a protected effect that must be admitted as
+    /// independently supervised additionally passes
     /// [`Self::admit_material_authority_for_fence`], which verifies the live
     /// Watchdog branch for the exact target fence.
     ///

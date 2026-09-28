@@ -5712,11 +5712,19 @@ impl KernelComposition {
         validate_origin_session_fence(session, presentation.request().state_fence())?;
         validate_origin_control_operation(presentation.request().operation())?;
         // Implements #1967 W3: an origin-control grant issues authority, so
-        // the decide path requires Material admission (startup gates plus a
-        // material-grade profile) before touching the process gateway. The
-        // rejection names the unmet prerequisite. Emergency process kills
-        // continue through the Job/watchdog owners, never this grant path.
-        if let Some(rejection) = self.material_authority_admission_response() {
+        // the decide path requires Material admission before touching the
+        // process gateway. Issue #1892 W4: that admission runs through the
+        // one production Material/Critical gate
+        // (`admit_material_authority_for_governor_issued_fence`) under the
+        // current Governor-issued governance profile, for the exact target
+        // fence this decision presents. No compile-time profile constant is
+        // injected, so an unrecorded Governor derivation fails this grant
+        // closed. The rejection names the unmet prerequisite. Emergency
+        // process kills continue through the Job/watchdog owners, never this
+        // grant path.
+        if let Some(rejection) =
+            self.material_authority_admission_response(presentation.request().state_fence())
+        {
             return Ok(rejection);
         }
         let (owner, _) =
@@ -7904,32 +7912,57 @@ impl KernelComposition {
         })
     }
 
-    /// Returns the typed rejection when startup or the Governance Profile
-    /// has not admitted Material authority for one origin-control decision.
+    /// Returns the typed rejection when the current Governor-issued
+    /// Governance Profile has not admitted Material authority for one
+    /// origin-control decision.
     ///
     /// Implements #1967 W3/A1: origin-control grants issue authority, so the
-    /// decide path consults [`Self::admit_material_authority`] (startup gates
-    /// first, then the profile ceiling) rather than inferring authority from
-    /// pipe liveness. The named prerequisite and the current ceiling travel
-    /// in `recovery`; `status`/`value.kind` keep the existing error shape.
-    /// Origin-control decisions require a material-grade profile: once every
-    /// mandatory prerequisite completes, the profile ceiling alone decides.
-    fn material_authority_admission_response(&self) -> Option<serde_json::Value> {
-        let profile = GovernanceProfile::material_grade();
-        if self.admit_material_authority(profile).is_ok() {
+    /// decide path consults the single production Material/Critical gate
+    /// rather than inferring authority from pipe liveness. Issue #1892 W4
+    /// restores the missing half: the gate is
+    /// [`Self::admit_material_authority_for_governor_issued_fence`], the same
+    /// one every other Material/Critical route uses, and it admits under the
+    /// **recorded** Governor derivation for the exact target fence this
+    /// decision presents. A compile-time `GovernanceProfile` constant no
+    /// longer reaches this path: `current_governor_issued_authority()` is
+    /// `None` until a Governor derivation is recorded, and `None` refuses
+    /// closed rather than defaulting to a material-grade preset. The named
+    /// prerequisite and the recorded ceiling travel in `recovery`;
+    /// `status`/`value.kind` keep the existing error shape. The reported
+    /// ceiling is the recorded one, and `null` when no derivation is
+    /// recorded, because the gate refuses before any ceiling is consulted.
+    fn material_authority_admission_response(
+        &self,
+        target: &StateFence,
+    ) -> Option<serde_json::Value> {
+        if self
+            .admit_material_authority_for_governor_issued_fence(target)
+            .is_ok()
+        {
             return None;
         }
+        let recorded = self
+            .startup_coordinator
+            .lock()
+            .ok()
+            .and_then(|coordinator| coordinator.current_governor_issued_authority())
+            .map(|issued| issued.profile());
         let status = self.startup_status(GovernanceProfile::minimal());
-        let ceiling = self.startup_authority_ceiling(profile);
+        // An incomplete mandatory gate keeps the existing fixed startup
+        // vocabulary. With every mandatory gate complete the blocking
+        // prerequisite is the current Governor-derived profile, which
+        // [`StartupCoordinator::admit_governor_issued_authority`] itself
+        // names as the I1.11 step 11 supervision/enforcement prerequisite.
         let prerequisite = status
             .blocking_prerequisite
-            .unwrap_or("governance-profile-ceiling");
+            .unwrap_or("supervision-evidence");
+        let ceiling = recorded.map(|profile| self.startup_authority_ceiling(profile));
         Some(serde_json::json!({
             "status": "error",
             "value": { "kind": "origin_control_decide", "value": null },
             "recovery": {
                 "prerequisite": prerequisite,
-                "authority_ceiling": ceiling.as_str(),
+                "authority_ceiling": ceiling.as_ref().map(|ceiling| ceiling.as_str()),
             },
         }))
     }
