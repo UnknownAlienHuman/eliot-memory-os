@@ -285,6 +285,14 @@ pub(crate) enum ExecutableBodyRefusal {
         /// The named condition under which the root leaves the tree.
         removal_condition: &'static str,
     },
+    /// The presented identity names a legacy table, which has a stated
+    /// disposition but is never an executable migration body.
+    LegacyTableNotExecutable {
+        /// The legacy table that was presented.
+        table: &'static str,
+        /// What the current owner does with that table.
+        disposition: LegacyTableDisposition,
+    },
     /// The presented statements differ from the current bytes published for
     /// that migration id.
     BodyBytesDiffer {
@@ -337,6 +345,20 @@ impl fmt::Display for ExecutableBodyRefusal {
                 write!(
                     formatter,
                     "{path} is a {disposition}: {rationale} Removal condition: {removal_condition}"
+                )
+            }
+            Self::LegacyTableNotExecutable { table, disposition } => {
+                let disposition = match disposition {
+                    LegacyTableDisposition::Transform {
+                        current_table, ..
+                    } => format!("an explicit transform into {current_table}"),
+                    LegacyTableDisposition::ArchiveOnly { .. } => {
+                        "an archive-only disposition".to_owned()
+                    }
+                };
+                write!(
+                    formatter,
+                    "legacy table {table} carries {disposition} and is not an executable migration body"
                 )
             }
             Self::BodyBytesDiffer { migration_id } => {
@@ -527,6 +549,7 @@ pub(crate) struct LegacySchemaObject {
 /// declare is stale. Fields are censused the same way as tables and indexes;
 /// the legacy roots declare no `DEFINE FIELD` because every legacy table is
 /// `SCHEMALESS`, and the census proves that rather than assuming it.
+#[must_use]
 pub(crate) fn census_legacy_schema_objects() -> Vec<LegacySchemaObject> {
     let mut census: Vec<LegacySchemaObject> = Vec::new();
     for root in &LEGACY_SCHEMA_ROOTS {
@@ -647,6 +670,7 @@ pub(crate) enum LegacyTableDisposition {
 
 impl LegacyTableDisposition {
     /// The current owner that carries this table's capability, if any.
+    #[must_use]
     pub(crate) fn capability_owner(&self) -> Option<&'static str> {
         match self {
             Self::Transform {
@@ -654,6 +678,13 @@ impl LegacyTableDisposition {
             } => Some(capability_owner),
             Self::ArchiveOnly { .. } => None,
         }
+    }
+
+    /// Whether this disposition names an explicit transform into a current
+    /// table rather than an archive-only rationale.
+    #[must_use]
+    pub(crate) const fn is_transform(&self) -> bool {
+        matches!(self, Self::Transform { .. })
     }
 }
 
@@ -670,12 +701,6 @@ pub(crate) struct LegacyTableMapping {
     pub(crate) disposition: LegacyTableDisposition,
 }
 
-impl LegacyTableMapping {
-    /// The current owner that carries this table's capability, if any.
-    pub(crate) fn capability_owner(&self) -> Option<&'static str> {
-        self.disposition.capability_owner()
-    }
-}
 
 /// Rationale shared by every legacy table no current capability owner writes.
 ///
@@ -1235,6 +1260,15 @@ pub(crate) fn resolve_executable_body(
         return Err(ExecutableBodyRefusal::DeclaredNotAdmitted {
             const_name: body.const_name,
             note: body.note,
+        });
+    }
+    if let Some(table) = LEGACY_TABLE_MAPPINGS
+        .iter()
+        .find(|mapping| mapping.table == identity)
+    {
+        return Err(ExecutableBodyRefusal::LegacyTableNotExecutable {
+            table: table.table,
+            disposition: table.disposition,
         });
     }
     if let Some(root) = NON_EXECUTABLE_MIGRATION_ROOTS

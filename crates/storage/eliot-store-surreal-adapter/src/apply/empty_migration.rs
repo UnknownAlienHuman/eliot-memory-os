@@ -81,7 +81,7 @@ pub(super) async fn handle_empty_migration(
             if fence.state_fence != *state_fence {
                 return Err(AdapterError::PartialOutcome);
             }
-            Ok(super::migration_receipt(migration))
+            Ok(super::migration_receipt(config, migration, state_fence)?)
         }
         _ => Err(AdapterError::PartialOutcome),
     }
