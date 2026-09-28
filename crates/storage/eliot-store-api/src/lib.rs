@@ -331,6 +331,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub const RECOVERY_PACKET_SCHEMA: &str = "eliot.storage.recovery.v1";
 /// Versioned schema for opaque Governor owner snapshots.
 pub const OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.owner.snapshot.v1";
+/// Namespace for immutable maintenance-trigger decision owner records.
+pub const MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE: &str = "maintenance_trigger_decision";
+/// Versioned schema for Governor-produced maintenance-trigger decision records.
+pub const MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA: &str =
+    "eliot.maintenance-trigger.decision-owner.v1";
 /// Namespace for immutable TaskController-owned swarm definition revisions.
 pub const SWARM_DEFINITION_OWNER_NAMESPACE: &str = "swarm-definition-v1";
 /// Namespace for immutable Governor-owned swarm admission revisions.
@@ -3780,6 +3785,11 @@ pub enum NamedMutationOperation {
     /// through the same fenced `RecoverySchema` transition. The store treats
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
+    /// Persists a Governor-produced maintenance-trigger decision and its
+    /// downstream intent bindings in the canonical transaction. The store
+    /// stores the decision payload opaquely and does not execute the referenced
+    /// job, recommendation, or wake intent.
+    RecordMaintenanceTriggerDecision,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -3900,6 +3910,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
+            | Self::RecordMaintenanceTriggerDecision
             | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,

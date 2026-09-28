@@ -42,10 +42,12 @@
 //! (`CaptureCandidate` with the `Candidate` ceiling; verbatim record
 //! document plus presented digests, decimal owner revision, and
 //! idempotency key).
+//! W4 (#1694) also activates `RecordMaintenanceTriggerDecision` under
+//! `RecoverySchema`, binding the exact trigger, evaluation/policy revisions,
+//! scope, downstream intent references, and opaque Governor decision bytes.
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
-//! variant stays known-but-unsupported and unadvertised, and no other mutation
-//! has an owner-approved typed schema yet.
+//! variant stays known-but-unsupported and unadvertised unless named above.
 //!
 //! This module is the single source of truth for those contracts: the closed
 //! operation-name mapping, the declared parameter list per activated
@@ -378,6 +380,62 @@ static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
     },
     ParameterDeclaration {
         name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+/// Governor-issued maintenance-trigger decision fields. The opaque decision
+/// JSON and the trigger/evaluation/policy/scope/intent identities are bound as
+/// one named operation; Store persists them without interpreting decision
+/// semantics or executing any referenced downstream intent.
+static RECORD_MAINTENANCE_TRIGGER_DECISION_PARAMETERS: [ParameterDeclaration; 10] = [
+    ParameterDeclaration {
+        name: "trigger_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "operation_hash",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "trigger_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "evaluation_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "policy_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "scope_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "job_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "recommendation_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "wake_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "decision_json",
         shape: ParameterShape::Subject,
         required: true,
     },
@@ -1215,6 +1273,9 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
+        NamedMutationOperation::RecordMaintenanceTriggerDecision => {
+            "RecordMaintenanceTriggerDecision"
+        }
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1243,6 +1304,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
+        b"RecordMaintenanceTriggerDecision" => {
+            Some(NamedMutationOperation::RecordMaintenanceTriggerDecision)
+        }
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1395,7 +1459,10 @@ pub const fn declared_read_parameters(
 /// `ApplyInstrumentRegistryState` declares the opaque versioned
 /// `snapshot_json` string; its expected current revision comes from the
 /// prepared transition's revision-head CAS. It remains unadvertised pending
-/// canonical store handlers. Every other variant declares none,
+/// canonical store handlers; `RecordMaintenanceTriggerDecision` declares the
+/// exact trigger identity/hash/revision, evaluation and policy revisions,
+/// affected scope, optional downstream intent references, and opaque decision
+/// JSON. Every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -1409,6 +1476,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
+        NamedMutationOperation::RecordMaintenanceTriggerDecision => {
+            &RECORD_MAINTENANCE_TRIGGER_DECISION_PARAMETERS
+        }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,

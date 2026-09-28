@@ -50,7 +50,7 @@ mod store_client;
 mod store_gateway;
 #[cfg(windows)]
 pub use store_gateway::{
-    MaintenanceTriggerCommitOutcome, MaintenanceTriggerIntakeFailure,
+    MaintenanceTriggerCommitOutcome, MaintenanceTriggerDelivery, MaintenanceTriggerIntakeFailure,
     MaintenanceTriggerLifecycleFailure, MaintenanceTriggerSessionRecovery,
 };
 mod store_write_reservation;
