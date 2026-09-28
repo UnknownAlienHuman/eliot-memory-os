@@ -50,7 +50,7 @@ use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    writer_epoch_for_fence_from_epoch,
+    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationExecutionError, UserAutomationRemovalResult,
@@ -947,17 +947,11 @@ impl KernelStoreGateway {
             Err(error) => {
                 // Deterministic refusal: the Store owner proves no effect, so
                 // the still-`Eligible` token releases cleanly and nothing
-                // orphans. `UnknownOperation` is explicit unsupported behavior
-                // from a backend without reserved capability, never a reason
-                // to fall back to unreserved `Apply`.
-                let _ = cancel_before_send(&owner, &sealed.token);
+                // orphans.
+                let refusal =
+                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
                 drop(lease);
-                if matches!(error, StoreError::UnknownOperation) {
-                    return Err(format!(
-                        "reserved write unsupported for operation {operation_id}: Store backend has no reserved-write capability; refusing without unreserved Apply fallback"
-                    ));
-                }
-                Err(error.to_string())
+                Err(refusal)
             }
         }
     }
@@ -5424,6 +5418,58 @@ fn validate_route(
     Ok(())
 }
 
+/// Handles one determinate reserved-write refusal (issue #1927, I05-06).
+///
+/// The Store owner has proved no external effect, so the still-`Eligible`
+/// token releases cleanly and nothing orphans. `UnknownOperation` is explicit
+/// unsupported behavior from a backend without reserved capability, never a
+/// reason to fall back to unreserved `Apply`.
+///
+/// A `ManifestMismatch` is the one determinate refusal I05-06 treats as a
+/// PRESERVED plan rather than a discarded one: the plan's recorded operation
+/// manifest is outside current admissible support, so this build refuses to
+/// execute it and must not reinterpret it under newer code. The reserved order
+/// is still released, but the staged plan is first recorded as a visible
+/// durable Recovery Problem keyed by its own operation identity, so it enters
+/// visible recovery instead of vanishing with the release. Recording precedes
+/// the release because the retention reads the staged operation's own epoch,
+/// fence, recovery owner and reservation identity.
+///
+/// A failure to record never discards the refusal itself: the original cause is
+/// reported and the retention failure is appended, so the caller still learns
+/// the plan was refused. In that case the order is still released, so a
+/// recorder fault cannot strand an `Eligible` reservation.
+fn refuse_determinate_reserved_write(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+    error: &StoreError,
+    operation_id: &str,
+) -> String {
+    if matches!(error, StoreError::ManifestMismatch) {
+        let retained = retain_unsupported_prepared_plan(
+            owner,
+            token,
+            "prepared transition outside current operation-manifest support",
+        );
+        if let Err(retained) = retained {
+            let _ = cancel_before_send(owner, token);
+            return format!(
+                "reserved write refused for operation {operation_id}: the staged prepared \
+                 transition is outside current operation-manifest support and could not be \
+                 retained as visible recovery work ({retained}); cause: {error}"
+            );
+        }
+    }
+    let _ = cancel_before_send(owner, token);
+    if matches!(error, StoreError::UnknownOperation) {
+        return format!(
+            "reserved write unsupported for operation {operation_id}: Store backend has no \
+             reserved-write capability; refusing without unreserved Apply fallback"
+        );
+    }
+    error.to_string()
+}
+
 /// Deterministic `PreparedTransition` admission before store execution (1927).
 ///
 /// Guards the unreserved `apply` entry point: identity/shape validation, fence equality, canonical
@@ -5478,10 +5524,14 @@ fn admit_prepared_transition(
 /// caller, fence equality): the caller rule lives at this boundary while the
 /// binding rules live in the reservation module. The canonical request-hash
 /// recompute runs in the entry body before reservation, and manifest support
-/// is enforced at store execution by the bridge catalogue gate, so a staged
-/// plan that the replacement store no longer supports stays staged as
-/// visible recovery work instead of being reinterpreted here. Staging step so
-/// the entry point stays a composition of audited gates.
+/// is enforced at store execution by the bridge catalogue gate.
+///
+/// A staged plan the replacement store no longer supports is therefore NOT
+/// reinterpreted here. On that determinate refusal the reserved order is still
+/// safely released, and the plan is recorded as a visible durable Recovery
+/// Problem keyed by its own operation identity, so it enters visible recovery
+/// instead of vanishing with the release. Staging step so the entry point stays
+/// a composition of audited gates.
 fn apply_reserved_admission(
     context: &RequestMetadata,
     transition: &PreparedTransition,

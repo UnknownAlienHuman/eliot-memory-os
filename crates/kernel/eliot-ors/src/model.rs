@@ -2901,6 +2901,20 @@ pub enum RecoveryProblemKind {
     EnvelopeIntegrity,
     MissingKey,
     DecryptionFailure,
+    /// A staged `PreparedTransition` the current Kernel/store bridge no
+    /// longer supports, so it was refused rather than executed (issue #1927,
+    /// I05-06).
+    ///
+    /// I05-06: a staged plan remains executable after daemon replacement only
+    /// when the replacement Kernel/store bridge still supports the exact
+    /// recorded contract/manifests; "otherwise it stays staged and enters
+    /// visible recovery instead of being reinterpreted by newer code". This
+    /// kind is that visible recovery: the refusal becomes a retained durable
+    /// record keyed by the staged operation identity instead of a transient
+    /// error string that leaves no trace once the reservation is released.
+    /// It records no payload bytes, and the refused plan is never translated,
+    /// widened or re-derived under the new code.
+    UnsupportedPreparedTransition,
 }
 
 /// Visible durable Recovery Problem for one staged opaque operation.
