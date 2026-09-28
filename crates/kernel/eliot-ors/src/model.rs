@@ -4083,6 +4083,10 @@ pub struct MaintenanceTriggerLifecycleRecord {
     pub decision_record: Option<MaintenanceTriggerCanonicalRecord>,
     /// Exact canonical downstream intent retained before acknowledgement.
     pub downstream_intent_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact claim record that owned the effect when the intent was first retained.
+    /// `None` on a legacy row with an intent means its effect origin is unproven.
+    #[serde(default)]
+    pub downstream_intent_origin_claim_record: Option<MaintenanceTriggerCanonicalRecord>,
     /// Exact canonical acknowledgement record, if acknowledged.
     pub acknowledgement_record: Option<MaintenanceTriggerCanonicalRecord>,
     /// Exact canonical revocation record retained across return to Pending.
@@ -4107,6 +4111,7 @@ impl MaintenanceTriggerLifecycleRecord {
     pub fn validate(&self) -> Result<(), OrsError> {
         self.validate_identity_and_timestamps()?;
         self.validate_claim_and_terminal_records()?;
+        self.validate_downstream_intent_origin()?;
         self.validate_phase_record_combination()?;
         self.validate_retention_and_compaction()?;
         Ok(())
@@ -4166,6 +4171,7 @@ impl MaintenanceTriggerLifecycleRecord {
             self.claim_record.as_ref(),
             self.decision_record.as_ref(),
             self.downstream_intent_record.as_ref(),
+            self.downstream_intent_origin_claim_record.as_ref(),
             self.acknowledgement_record.as_ref(),
             self.revocation_record.as_ref(),
             self.terminal_record.as_ref(),
@@ -4200,6 +4206,18 @@ impl MaintenanceTriggerLifecycleRecord {
             return Err(OrsError::InvalidField {
                 field: "maintenance_trigger_terminal_record",
                 reason: "expiry and supersession require a terminal record, and other phases forbid it",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_downstream_intent_origin(&self) -> Result<(), OrsError> {
+        if self.downstream_intent_origin_claim_record.is_some()
+            && (self.claim.is_none() || self.downstream_intent_record.is_none())
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_downstream_intent_origin_claim_record",
+                reason: "effect origin requires a retained claim and downstream intent",
             });
         }
         Ok(())
@@ -4336,22 +4354,25 @@ impl MaintenanceTriggerGapStorageRecord {
 
 /// Bounded durable enumeration projection for retained maintenance triggers.
 ///
-/// The ORS cursor freezes `high_water_sequence` and the current page window.
-/// Replaying the same continuation therefore returns the same member set,
-/// even after a restart or when newer intake rows are appended. Lifecycle
-/// phases may be newer on replay, but intake membership and continuation
-/// boundaries never move.
+/// The ORS cursor freezes `high_water_sequence`, the current lifecycle page
+/// window, and an independently ordered bounded gap stream. Replaying the
+/// same continuation therefore returns the same lifecycle membership and gap
+/// position after a restart. Lifecycle phases may be newer on replay, but
+/// lifecycle membership and continuation boundaries never move. A changed
+/// retained gap set invalidates the continuation as incomplete; callers must
+/// start a new enumeration and can retrieve all retained gaps through the
+/// bounded gap-list API.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceTriggerLifecyclePageProjection {
     /// Lifecycle rows in the frozen page window, ordered by intake sequence.
     pub lifecycles: Vec<MaintenanceTriggerLifecycleRecord>,
-    /// Explicit gap rows intersecting the frozen page window.
+    /// Explicit gap rows from the independently ordered frozen gap stream.
     pub gaps: Vec<MaintenanceTriggerGapStorageRecord>,
     /// Highest intake sequence included in this enumeration snapshot.
     pub high_water_sequence: u64,
-    /// Resume cursor; present exactly when another page remains.
+    /// Resume cursor; present exactly when either stream has another page.
     pub continuation: Option<String>,
-    /// Whether more lifecycle rows remain at the frozen high-water mark.
+    /// Whether lifecycle rows or gaps remain in the frozen streams.
     pub has_more: bool,
     /// True when an exact page request replayed its retained cursor window.
     pub replayed: bool,

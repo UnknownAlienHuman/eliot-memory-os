@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{
     GovernorGenesisRequest, KernelNamedReadReply, KernelNamedReadRequest, KernelPortError,
-    KernelRecoveryPort,
+    KernelRecoveryPort, MaintenanceTriggerRecoveryPage, MaintenanceTriggerRecoveryProjection,
 };
 use eliot_maintenance::MaintenanceJob;
 use eliot_protocol::RequestIdentity;
@@ -39,6 +39,12 @@ use super::{DaemonKernelClient, SERVICE_NAME, kind_value, unix_ms, unix_ms_i64};
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
 const JOB_RECOVERY_NAMESPACE: &str = "job";
+
+#[derive(Clone, Copy)]
+struct MaintenanceTriggerContinuations<'a> {
+    claim: Option<&'a str>,
+    pending: Option<&'a str>,
+}
 
 impl KernelRecoveryPort for DaemonKernelClient {
     fn named_read(
@@ -237,6 +243,26 @@ impl KernelRecoveryPort for DaemonKernelClient {
             })
             .collect()
     }
+
+    fn maintenance_trigger_recovery_page(
+        &self,
+        state_fence: &StateFence,
+        protected_snapshot_digest: &str,
+        claim_continuation: Option<&str>,
+        pending_continuation: Option<&str>,
+    ) -> Result<MaintenanceTriggerRecoveryProjection, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_recovery").entered();
+        let (_, projection) = self.recovery_snapshot_with_trigger(
+            state_fence,
+            protected_snapshot_digest,
+            Vec::new(),
+            false,
+            false,
+            claim_continuation,
+            pending_continuation,
+        )?;
+        Ok(projection)
+    }
 }
 
 fn stable_genesis_identity(
@@ -288,6 +314,51 @@ impl DaemonKernelClient {
         include_receipts: bool,
         include_jobs: bool,
     ) -> Result<StoreRecoverySnapshot, KernelPortError> {
+        self.recovery_snapshot_inner(
+            state_fence,
+            protected_snapshot_digest,
+            records,
+            include_receipts,
+            include_jobs,
+            None,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    fn recovery_snapshot_with_trigger(
+        &self,
+        state_fence: &StateFence,
+        protected_snapshot_digest: &str,
+        records: Vec<RecoveryRecordKey>,
+        include_receipts: bool,
+        include_jobs: bool,
+        claim_continuation: Option<&str>,
+        pending_continuation: Option<&str>,
+    ) -> Result<(StoreRecoverySnapshot, MaintenanceTriggerRecoveryProjection), KernelPortError>
+    {
+        self.recovery_snapshot_inner(
+            state_fence,
+            protected_snapshot_digest,
+            records,
+            include_receipts,
+            include_jobs,
+            Some(MaintenanceTriggerContinuations {
+                claim: claim_continuation,
+                pending: pending_continuation,
+            }),
+        )
+    }
+
+    fn recovery_snapshot_inner(
+        &self,
+        state_fence: &StateFence,
+        protected_snapshot_digest: &str,
+        records: Vec<RecoveryRecordKey>,
+        include_receipts: bool,
+        include_jobs: bool,
+        trigger_continuations: Option<MaintenanceTriggerContinuations<'_>>,
+    ) -> Result<(StoreRecoverySnapshot, MaintenanceTriggerRecoveryProjection), KernelPortError>
+    {
         if self.snapshot.state_fence() != *state_fence {
             return Err(KernelPortError::Contract(
                 "Kernel recovery request fence does not match the admitted snapshot".to_owned(),
@@ -309,10 +380,31 @@ impl DaemonKernelClient {
         request
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-        let value =
-            self.request_blocking("store_recovery", serde_json::json!({ "request": request }))?;
-        let value = kind_value(&value, "store_recovery")?;
-        let snapshot: StoreRecoverySnapshot = serde_json::from_value(value)
+        let mut operation = serde_json::json!({ "request": request });
+        let operation_fields = operation.as_object_mut().ok_or_else(|| {
+            KernelPortError::Contract("Kernel Store recovery operation is not an object".to_owned())
+        })?;
+        if let Some(continuation) = trigger_continuations.and_then(|value| value.claim) {
+            operation_fields.insert(
+                "maintenance_trigger_claim_continuation".to_owned(),
+                serde_json::Value::String(continuation.to_owned()),
+            );
+        }
+        if let Some(continuation) = trigger_continuations.and_then(|value| value.pending) {
+            operation_fields.insert(
+                "maintenance_trigger_pending_continuation".to_owned(),
+                serde_json::Value::String(continuation.to_owned()),
+            );
+        }
+        let response = self.request_blocking("store_recovery", operation)?;
+        let (application, projection) =
+            store_recovery_application(&response, trigger_continuations.is_some())?;
+        let snapshot_value = application.get("value").cloned().ok_or_else(|| {
+            KernelPortError::Contract(
+                "Kernel Store recovery snapshot is missing payload".to_owned(),
+            )
+        })?;
+        let snapshot: StoreRecoverySnapshot = serde_json::from_value(snapshot_value)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         snapshot
             .validate()
@@ -343,6 +435,94 @@ impl DaemonKernelClient {
                 "Kernel Store recovery returned excluded durable jobs".to_owned(),
             ));
         }
-        Ok(snapshot)
+        Ok((snapshot, projection))
     }
+}
+
+fn store_recovery_application(
+    response: &serde_json::Value,
+    require_trigger_recovery: bool,
+) -> Result<
+    (
+        &serde_json::Map<String, serde_json::Value>,
+        MaintenanceTriggerRecoveryProjection,
+    ),
+    KernelPortError,
+> {
+    let envelope = response.as_object().ok_or_else(|| {
+        KernelPortError::Contract("Kernel Store recovery application is not an object".to_owned())
+    })?;
+    if envelope.get("kind").and_then(serde_json::Value::as_str) != Some("store_recovery") {
+        return Err(KernelPortError::Contract(
+            "Kernel returned unexpected Store recovery application kind".to_owned(),
+        ));
+    }
+    let projection = match envelope.get("maintenance_trigger_recovery") {
+        Some(value) => match maintenance_trigger_recovery_projection(value) {
+            Ok(projection) => projection,
+            Err(error) if require_trigger_recovery => return Err(error),
+            Err(error) => MaintenanceTriggerRecoveryProjection::unavailable(error.to_string()),
+        },
+        None if require_trigger_recovery => {
+            return Err(KernelPortError::Contract(
+                "Kernel Store recovery omitted maintenance trigger recovery".to_owned(),
+            ));
+        }
+        None => MaintenanceTriggerRecoveryProjection::unavailable(
+            "Kernel Store recovery omitted the optional maintenance trigger projection".to_owned(),
+        ),
+    };
+    Ok((envelope, projection))
+}
+
+fn maintenance_trigger_recovery_projection(
+    envelope: &serde_json::Value,
+) -> Result<MaintenanceTriggerRecoveryProjection, KernelPortError> {
+    let object = envelope.as_object().ok_or_else(|| {
+        KernelPortError::Contract(
+            "Kernel maintenance trigger recovery envelope is not an object".to_owned(),
+        )
+    })?;
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            KernelPortError::Contract(
+                "Kernel maintenance trigger recovery status is missing".to_owned(),
+            )
+        })?;
+    let value = match object.get("value") {
+        Some(value) if value.is_object() => {
+            let page = serde_json::from_value::<MaintenanceTriggerRecoveryPage>(value.clone())
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if page.kind.as_deref() != Some("maintenance_trigger_session_recovery") {
+                return Err(KernelPortError::Contract(
+                    "Kernel returned an unexpected maintenance trigger recovery kind".to_owned(),
+                ));
+            }
+            Some(page)
+        }
+        Some(value) if value.is_null() => None,
+        Some(_) => {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger recovery value is not an object".to_owned(),
+            ));
+        }
+        None => None,
+    };
+    Ok(MaintenanceTriggerRecoveryProjection {
+        status: Some(status),
+        value,
+        recovery: object
+            .get("recovery")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        error: object
+            .get("error")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        raw_envelope: Some(envelope.clone()),
+        unavailable_detail: None,
+    })
 }
