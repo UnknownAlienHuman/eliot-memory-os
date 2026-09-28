@@ -480,6 +480,10 @@ impl WorkQueueService {
                     && run.required_for_done
                     && run.status == VerifierStatus::Passed
                     && run.write_receipt.is_some()
+                    // Issue #1852 W3, second half: a quarantined legacy-lane
+                    // run is never selectable as a satisfied required
+                    // verifier, no matter its status.
+                    && !crate::patch::is_quarantined_legacy_run(run)
             });
             let Some(run) = run else {
                 return Err(EngineError::WriteRejected(format!(
