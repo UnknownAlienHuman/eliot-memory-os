@@ -55,8 +55,25 @@
 #    A `[[donor]] disposition` in a `module.toml` is a DONOR disposition in a donor
 #    vocabulary and is never read as an admission disposition.
 
+# MEASURED 2026-09-28 (issue #1721 W27, `scripts/crate_reachability_inventory.py`
+# over origin/main@524010ae). The root manifest `exclude` array is EMPTY:
+# `scripts/verify-excluded-dispositions-1811.py` reports root_exclude_count = 0
+# against workspace_member_count = 188, and `scripts/verify-standalone-crates.py
+# --list` prints no `exclude:` row. No package recorded below is pending removal
+# from `exclude`, so this registry lifts nothing: a future owner's only motion
+# on that array is ADDING an entry, which the #1811 gate rejects without a
+# standalone disposition row.
+#
+# The denominator below is therefore the tree-derived admission set, never the
+# content of an `exclude` array. Measured `module.toml`
+# `[agent_task].workspace_admission` values: #966 -> 6 packages, #967 -> 5,
+# #968 -> 3, total 14. Issue #1721's "13 currently excluded crates" is those 14
+# minus eliot-self-quality, the #967 member the root manifest records as a
+# former standalone nonmember that joined `members` directly and was never in
+# `exclude`. The five other waves the issue names admit different packages:
+# #829 -> 6 contract crates, #836 -> 5, #965 -> 6, #969 -> 5, #830 -> none.
 schema = "eliot.crate-extraction-decision.v1"
-revision = "2026-09-27.2"
+revision = "2026-09-28.1"
 
 # Honest residual, recorded rather than hidden: `decision` is STILL EMPTY. No
 # decision row has ever been recorded here - the array has been empty since this
@@ -70,6 +87,15 @@ revision = "2026-09-27.2"
 # and the fail-closed admission-defect path are implemented and enforced regardless.
 # The I2.23 admission decisions for the wave-admitted packages are recorded below, in
 # the record shape and vocabulary I2.23 fixes for them.
+#
+# MEASURED 2026-09-28: 34 production-admitted, binary-unreachable workspace packages
+# are UNCLASSIFIED under the four verbs above. Exactly 9 of them are the
+# `extract_contract` records below and 25 hold no record in this file at all. Of
+# those 9, 5 declare a consumer that DOES exist as a package in this repository
+# (`eliot-dreamer-curation`) and 4 declare prose consumers that do not, so the
+# residual is an absent #1720 decision rather than nine broken records. Filling
+# those rows is #1720's reviewed act under its own four verbs; issue #1721 puts no
+# decision here that no documentation names.
 decision = []
 [[admission_decision]]
 package = "eliot-dreamer-clarification"
@@ -84,7 +110,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 45 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -100,7 +126,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 30 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -116,7 +142,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 39 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -132,7 +158,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 55 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -148,7 +174,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 8 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -164,7 +190,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 64 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -180,7 +206,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 59 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -196,7 +222,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 71 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -212,7 +238,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 9 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "keep"
 
 [[admission_decision]]
@@ -228,7 +254,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 40 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: remove the package only after both observed production Cargo dependents (bins/eliotd and eliot-context) migrate their references and zero reverse fan-out is re-verified; the frozen compile_with_campaign_learning_state method currently has no callers"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "keep"
 
 [[admission_decision]]
@@ -244,7 +270,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 44 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "keep"
 
 [[admission_decision]]
@@ -260,7 +286,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 58 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"
 
 [[admission_decision]]
@@ -276,7 +302,7 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 57 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "keep"
 
 [[admission_decision]]
@@ -292,5 +318,5 @@ expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is pack
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 56 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
 migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
-evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "keep"
