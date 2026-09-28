@@ -80,7 +80,7 @@ use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
-/// Monotonic per-process counter behind one UserAutomation send claim.
+/// Monotonic per-process counter behind one `UserAutomation` send claim.
 ///
 /// The durable claim is first-writer-wins, so a second acquisition of the same
 /// obligation must never be able to replay as the first caller's attempt. Every
@@ -1771,7 +1771,7 @@ impl KernelStoreGateway {
     /// obligation before its owner effect is handed to the transport
     /// (issue #2970).
     ///
-    /// This is the existing ORS HostRequest claim seam, not a new outbox: the
+    /// This is the existing ORS `HostRequest` claim seam, not a new outbox: the
     /// claim is a `HostRequestAttempt` on the same row the obligation already
     /// owns, and [`RedbRecoveryStore::claim_host_request_attempt`] performs the
     /// whole acquisition in one ORS write transaction. Two guarantees come
@@ -1844,7 +1844,7 @@ impl KernelStoreGateway {
         Ok(())
     }
 
-    /// Builds the exact ORS `HostRequestAttempt` one UserAutomation send claim
+    /// Builds the exact ORS `HostRequestAttempt` one `UserAutomation` send claim
     /// presents, bound by content to this obligation and to the live Kernel
     /// route.
     ///
