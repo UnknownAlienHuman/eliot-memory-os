@@ -89,7 +89,7 @@ pub struct IntegrationReport {
     ///
     /// `LIVE` is computed by the explicitly limited [`evaluate`] comparison
     /// only; the authoritative [`verify_profile`] gate never emits it because
-    /// the handshake runner is absent (PLAN_GAP pending A-06 provider
+    /// the handshake runner is absent (`PLAN_GAP` pending A-06 provider
     /// injection). `INSTALLED_NOT_LIVE` is emitted by [`verify_profile`] when
     /// every read-back file hash matches and the expectation names no
     /// registrations or hook events — the whole static surface is then
@@ -248,7 +248,7 @@ pub fn evaluate(
 /// Authority rule: file hashes come from real readback — every named target
 /// is re-hashed here and the caller-supplied `actual_file_hashes` map never
 /// enters the verdict. There is no observation port for registrations, hook
-/// events, or the handshake in this front door (PLAN_GAP pending A-06
+/// events, or the handshake in this front door (`PLAN_GAP` pending A-06
 /// provider injection), so caller-supplied lists and booleans stay capped to
 /// unverified: any expected registration or hook event withholds `installed`
 /// (`UNVERIFIED_PLAN_GAP` when the read-back hashes match, `NOT_INSTALLED`
@@ -304,12 +304,11 @@ pub fn verify_profile(
         !expected.expected_registrations.is_empty() || !expected.expected_hook_events.is_empty();
     if static_unverifiable || !report.file_hash_ok {
         report.installed = false;
-        report.disposition = if report.file_hash_ok {
-            "UNVERIFIED_PLAN_GAP"
+        if report.file_hash_ok {
+            "UNVERIFIED_PLAN_GAP".clone_into(&mut report.disposition);
         } else {
-            "NOT_INSTALLED"
+            "NOT_INSTALLED".clone_into(&mut report.disposition);
         }
-        .to_owned();
     }
     Ok(report_json(&report))
 }
