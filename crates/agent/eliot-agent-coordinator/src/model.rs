@@ -15,6 +15,7 @@ use eliot_kernel_core::NormalWorkClass;
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 macro_rules! local_id {
@@ -973,6 +974,29 @@ impl WorkClass {
         }
     }
 
+    /// The nine I14.1 classes in scheduler rank order. This is the closed
+    /// denominator every per-class profile set, per-class report and weight
+    /// table is indexed by, so a class can never be added, dropped or
+    /// reordered without a compile-time change here.
+    pub const ALL: [Self; 9] = [
+        Self::Control,
+        Self::Normal(NormalWorkClass::Interactive),
+        Self::Normal(NormalWorkClass::Verification),
+        Self::Normal(NormalWorkClass::CanonicalWrite),
+        Self::Normal(NormalWorkClass::NormalBackground),
+        Self::Normal(NormalWorkClass::ModelJob),
+        Self::Normal(NormalWorkClass::Swarm),
+        Self::Normal(NormalWorkClass::Reporting),
+        Self::Normal(NormalWorkClass::Maintenance),
+    ];
+
+    /// Whether the I14.2 table binds a byte cap to this class. Only canonical
+    /// writes carry one (`2048 + byte cap`); every other class may still
+    /// declare a byte cap, but canonical writes may not omit it.
+    pub const fn requires_byte_cap(self) -> bool {
+        matches!(self, Self::Normal(NormalWorkClass::CanonicalWrite))
+    }
+
     /// Deterministic scheduler rank (issue #1698): protected `control` first
     /// (the reserve exists so control is never crowded out by normal work),
     /// then the eight normal classes in I14.1 document order. There is no
@@ -1027,4 +1051,463 @@ impl<'de> Deserialize<'de> for WorkClass {
         let value = String::deserialize(deserializer)?;
         Self::parse_wire(&value).map_err(serde::de::Error::custom)
     }
+}
+
+// -------------------------------------------------------------------------
+// Issue #1683: I14.2/I14.8 per-class scheduling policy and the pull outcome.
+//
+// The nine I14.1 classes, their closed `WorkClass` boundary type and the
+// existing `WorkClass::rank` order are reused unchanged. Nothing here adds a
+// second class vocabulary, a second capacity owner, a scheduler service, a
+// process launcher, a task store or a poll loop: this is policy input plus the
+// deterministic outcome projection of one pull.
+// -------------------------------------------------------------------------
+
+/// Normalization unit of the weighted fair pull (issue #1683 W2).
+///
+/// It is a pure scaling constant that turns integer profile weights into
+/// integer virtual times. It is not a capacity, a limit, a credit budget or a
+/// timeout. The credit of a class that participates in one pull is a virtual
+/// time difference and is at most this value, so scheduler credit state cannot
+/// grow without bound.
+pub const FAIRNESS_QUANTUM: u64 = 1_000_000;
+
+/// Name of the frozen selection algorithm recorded in every pull outcome.
+pub const FAIR_PULL_ALGORITHM: &str = "eliot-agent-coordinator/smooth-weighted-fair-pull-v1";
+
+/// I14.8 age semantics for one work class, frozen in the profile.
+///
+/// [`WorkClassAgeRule::OldestCanonicalEnqueueFirst`] is the only representable
+/// rule and its clock domain is the durable canonical enqueue sequence assigned
+/// when an attempt is admitted or reassigned, not a wall clock: replaying the
+/// event log re-derives the same sequence, so neither a projection rebuild nor
+/// a coordinator restart can renew an item's age, and no caller-supplied clock
+/// participates in the decision.
+///
+/// The field carries the frozen rule on the wire and in the profile revision
+/// rather than leaving it implied by code; the selector implements exactly this
+/// rule for every class, so the value cannot currently vary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkClassAgeRule {
+    /// Oldest canonical enqueue sequence first inside the class, with stable
+    /// work identity as the final tie-break.
+    OldestCanonicalEnqueueFirst,
+}
+
+/// I14.8 WIP partition dimension, restricted to the dimensions a stored
+/// `AttemptRecord` can actually derive.
+///
+/// I14.8 names per-principal, per-module, per-swarm, per-route and
+/// per-auth-profile WIP limits. The attempt projection carries a route, a task
+/// and the executing worker, so only those three dimensions are representable.
+/// Principal, module, swarm and auth-profile partitions stay BLOCKED-BY until an
+/// admitted attempt carries those exact identities; declaring them here would be
+/// a partition over a value this projection does not have.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WipPartitionKey {
+    /// `RouteFingerprint` of the attempt, compared through the same canonical
+    /// key the route-capacity check uses.
+    Route,
+    /// `TaskId` of the attempt.
+    Task,
+    /// `WorkerId` executing the attempt.
+    Worker,
+}
+
+/// One I14.8 WIP partition limit inside a class profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WipPartitionLimit {
+    pub key: WipPartitionKey,
+    /// Positive in-flight ceiling for this partition inside this class. Zero
+    /// is rejected: it would close the partition permanently.
+    pub max_in_flight: usize,
+}
+
+/// I14.2/I14.8 profile of exactly one I14.1 work class.
+///
+/// Limits are counted per class, so a saturated class cannot consume another
+/// class's byte, concurrency or WIP partition; the item ceiling bounds that
+/// class's own scan window. Every value is positive; a missing or zero value is
+/// rejected instead of being read as unlimited.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkClassProfile {
+    pub work_class: WorkClass,
+    /// I14.2 item ceiling for this class.
+    pub max_items: usize,
+    /// I14.2 byte cap. Required for canonical writes; optional elsewhere.
+    pub max_bytes: Option<u64>,
+    /// I14.2 concurrency ceiling for this class.
+    pub max_concurrency: usize,
+    /// I14.1 deadline ceiling for this class. An admitted item whose own
+    /// `wall_time_ms` budget exceeds it is not serviceable by this class.
+    pub deadline_ms: u64,
+    /// I14.8 weight of this class in the weighted fair pull.
+    pub weight: u32,
+    pub age_rule: WorkClassAgeRule,
+    pub wip_partitions: Vec<WipPartitionLimit>,
+}
+
+impl WorkClassProfile {
+    pub fn validate(&self) -> Result<(), CoordinatorError> {
+        if self.max_items == 0 {
+            return Err(CoordinatorError::InvalidField("max_items"));
+        }
+        if self.max_concurrency == 0 {
+            return Err(CoordinatorError::InvalidField("max_concurrency"));
+        }
+        if self.deadline_ms == 0 {
+            return Err(CoordinatorError::InvalidField("deadline_ms"));
+        }
+        if self.weight == 0 || u64::from(self.weight) > FAIRNESS_QUANTUM {
+            return Err(CoordinatorError::InvalidField("weight"));
+        }
+        if self.max_bytes == Some(0) {
+            return Err(CoordinatorError::InvalidField("max_bytes"));
+        }
+        if self.work_class.requires_byte_cap() && self.max_bytes.is_none() {
+            return Err(CoordinatorError::InvalidField("max_bytes"));
+        }
+        if self.wip_partitions.is_empty() {
+            return Err(CoordinatorError::InvalidField("wip_partitions"));
+        }
+        let mut keys = BTreeSet::new();
+        for partition in &self.wip_partitions {
+            if partition.max_in_flight == 0 {
+                return Err(CoordinatorError::InvalidField("wip_max_in_flight"));
+            }
+            if !keys.insert(partition.key) {
+                return Err(CoordinatorError::DuplicateIdentity("wip_partition_key"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The I14.2 values the fragment does not fix, supplied by the policy owner.
+///
+/// I14.2 fixes no concurrency, deadline, byte, weight or WIP value for any
+/// class, and fixes no item ceiling at all for `control`, `model_jobs`,
+/// `swarm` and `maintenance`; those stay required inputs here instead of being
+/// invented by this crate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyBoundClassLimits {
+    pub work_class: WorkClass,
+    /// Required (`Some`) for the four classes I14.2 leaves to policy and
+    /// rejected (`None`) for the five classes whose item ceiling I14.2 fixes.
+    pub max_items: Option<usize>,
+    /// Required for `canonical_write`, optional for every other class.
+    pub max_bytes: Option<u64>,
+    pub max_concurrency: usize,
+    pub deadline_ms: u64,
+    pub weight: u32,
+    pub wip_partitions: Vec<WipPartitionLimit>,
+}
+
+/// Versioned per-class scheduling policy: exactly one [`WorkClassProfile`] for
+/// each of the nine I14.1 classes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulingProfile {
+    /// Caller-owned version of this policy set. It is recorded in every pull
+    /// outcome so a decision can be attributed to the exact profile revision.
+    pub profile_revision: String,
+    pub classes: Vec<WorkClassProfile>,
+}
+
+impl SchedulingProfile {
+    /// I14.2 initial item ceilings, verbatim: interactive 512, verification
+    /// 512, canonical writes 2048, background 1024, reports 128. `None` marks
+    /// the classes whose ceiling I14.2 leaves to policy.
+    fn fixed_items(work_class: WorkClass) -> Option<usize> {
+        match work_class {
+            WorkClass::Normal(NormalWorkClass::Interactive | NormalWorkClass::Verification) => {
+                Some(512)
+            }
+            WorkClass::Normal(NormalWorkClass::CanonicalWrite) => Some(2048),
+            WorkClass::Normal(NormalWorkClass::NormalBackground) => Some(1024),
+            WorkClass::Normal(NormalWorkClass::Reporting) => Some(128),
+            // I14.2 names no item ceiling for these four; they stay policy-bound
+            // and are required from the caller. Every I14.1 class is listed, so
+            // a Kernel-side addition fails to compile here instead of silently
+            // inheriting a ceiling.
+            WorkClass::Control
+            | WorkClass::Normal(
+                NormalWorkClass::ModelJob | NormalWorkClass::Swarm | NormalWorkClass::Maintenance,
+            ) => None,
+        }
+    }
+
+    /// Builds the I14.2 initial profile: the fixed item ceilings above plus a
+    /// required canonical-write byte cap, with every remaining value taken from
+    /// `policy`.
+    ///
+    /// This is not a second configuration source. It reads no file, no
+    /// environment variable and no working directory; the Kernel runtime
+    /// profile loader that produces these values is a separate owner
+    /// (#1679 item 2, #1687) and is not wired here.
+    pub fn i14_2_initial(
+        profile_revision: impl Into<String>,
+        policy: &[PolicyBoundClassLimits],
+    ) -> Result<Self, CoordinatorError> {
+        let mut classes = Vec::with_capacity(WorkClass::ALL.len());
+        for work_class in WorkClass::ALL {
+            let mut supplied = policy.iter().filter(|entry| entry.work_class == work_class);
+            let entry = supplied
+                .next()
+                .ok_or(CoordinatorError::IdentityConflict("work_class_profile"))?;
+            if supplied.next().is_some() {
+                return Err(CoordinatorError::DuplicateIdentity("work_class_profile"));
+            }
+            let max_items = match Self::fixed_items(work_class) {
+                Some(fixed) => {
+                    if entry.max_items.is_some() {
+                        return Err(CoordinatorError::IdentityConflict("max_items"));
+                    }
+                    fixed
+                }
+                None => entry
+                    .max_items
+                    .ok_or(CoordinatorError::InvalidField("max_items"))?,
+            };
+            let max_bytes = if work_class.requires_byte_cap() {
+                Some(
+                    entry
+                        .max_bytes
+                        .ok_or(CoordinatorError::InvalidField("max_bytes"))?,
+                )
+            } else {
+                entry.max_bytes
+            };
+            classes.push(WorkClassProfile {
+                work_class,
+                max_items,
+                max_bytes,
+                max_concurrency: entry.max_concurrency,
+                deadline_ms: entry.deadline_ms,
+                weight: entry.weight,
+                age_rule: WorkClassAgeRule::OldestCanonicalEnqueueFirst,
+                wip_partitions: entry.wip_partitions.clone(),
+            });
+        }
+        let profile = Self {
+            profile_revision: profile_revision.into(),
+            classes,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<(), CoordinatorError> {
+        validate_text(&self.profile_revision, "profile_revision")?;
+        if self.classes.len() != WorkClass::ALL.len() {
+            return Err(CoordinatorError::InvalidField("classes"));
+        }
+        for work_class in WorkClass::ALL {
+            let mut matching = self
+                .classes
+                .iter()
+                .filter(|profile| profile.work_class == work_class);
+            let profile = matching
+                .next()
+                .ok_or(CoordinatorError::IdentityConflict("work_class_profile"))?;
+            if matching.next().is_some() {
+                return Err(CoordinatorError::DuplicateIdentity("work_class_profile"));
+            }
+            profile.validate()?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn class_profile(&self, work_class: WorkClass) -> Option<&WorkClassProfile> {
+        self.classes
+            .iter()
+            .find(|profile| profile.work_class == work_class)
+    }
+}
+
+/// Why one ready item was passed over inside its class during a pull.
+///
+/// A passed-over item is retained: it stays admitted and keeps its canonical
+/// enqueue sequence, so skipping it never re-queues or re-ages it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReadyItemSkipReason {
+    /// The item's own `wall_time_ms` budget exceeds the class deadline
+    /// ceiling. This is not a temporary condition, so no service is promised
+    /// for it by this selector; the item is reported as infeasible instead.
+    ClassDeadlineCeiling,
+    /// One more item's `output_bytes` budget would cross the class byte cap.
+    ClassByteCapReached,
+    /// A declared WIP partition of this class already holds
+    /// `max_in_flight` started items with the same partition value.
+    WipPartitionAtLimit,
+    /// Another attempt holds this item's mutation scope in this projection.
+    ScopeWriterHeld,
+}
+
+/// Why one class offered no work to a pull.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClassSkipReason {
+    /// The class already holds `max_concurrency` in-flight items.
+    ClassConcurrencyAtLimit,
+    /// Every admitted item inside the scan window was passed over.
+    AllReadyItemsSkipped,
+}
+
+/// The per-class capacity dimension that closed admission for one class.
+///
+/// The I14.2 item ceiling is deliberately absent: it bounds the per-class scan
+/// window and belongs to admission, not to a pull, so this selector never
+/// reports it as the limiting dimension of a refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CapacityLimitDimension {
+    ClassConcurrency,
+    ClassBytes,
+    WipPartition,
+}
+
+/// The live capacity view a deferral is reset by: a new identity or revision is
+/// what re-opens a closed class, so the refusal names the exact source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityResetSource {
+    pub capacity_identity: String,
+    pub capacity_revision: RevisionId,
+}
+
+/// Exact capacity disposition of one class for one pull (issue #1683 W7).
+///
+/// This is the selector's own read-only projection of the measurement it just
+/// made: the limiting per-class dimension, the exact observed value and the
+/// exact limit, and the live capacity view a new revision of which re-opens the
+/// dimension. It mints no recovery directive. The accepted #1679 directive
+/// fields that describe the *admission* consequence — cause, accepted/staged
+/// outcome, poll-versus-retry action, earliest condition and safe alternative —
+/// stay with that owner and are not restated here: a pull declines to start one
+/// item, which is not a durable `DEFERRED_CAPACITY` admission transition, and
+/// restating the directive vocabulary locally would create a second authority
+/// for it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityDeferral {
+    pub work_class: WorkClass,
+    /// The exact per-class dimension that closed admission.
+    pub limiting_dimension: CapacityLimitDimension,
+    /// Observed value of that dimension for this class right now.
+    pub dimension_value: u64,
+    /// The profile limit that was reached.
+    pub dimension_limit: u64,
+    pub reset_source: CapacityResetSource,
+}
+
+impl CapacityDeferral {
+    pub(crate) fn new(
+        work_class: WorkClass,
+        limiting_dimension: CapacityLimitDimension,
+        dimension_value: u64,
+        dimension_limit: u64,
+        reset_source: &CapacityResetSource,
+    ) -> Self {
+        Self {
+            work_class,
+            limiting_dimension,
+            dimension_value,
+            dimension_limit,
+            reset_source: reset_source.clone(),
+        }
+    }
+}
+
+/// Per-class result of one pull, in scheduler rank order.
+///
+/// Every ceiling is `None` on the profile-free peek path, which applies no
+/// per-class limit at all; that absence is published rather than presented as
+/// an unlimited default.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkClassSelectionReport {
+    pub work_class: WorkClass,
+    /// Admitted items of this class.
+    pub ready_items: usize,
+    /// Non-terminal items of this class that have started (`Running` or
+    /// `CancellationRequested`): the set that holds a concurrency slot.
+    pub in_flight_items: usize,
+    /// Sum of the `output_bytes` budgets of this class's in-flight items.
+    pub in_flight_bytes: u64,
+    pub item_ceiling: Option<u64>,
+    pub concurrency_ceiling: Option<u64>,
+    pub byte_ceiling: Option<u64>,
+    /// Admitted items actually examined. The scan is bounded by the item
+    /// ceiling (or by the whole class on the profile-free path) and looks at
+    /// the oldest items first, so a truncated window can only leave later items
+    /// unserved, never displace an older one.
+    pub scanned_ready_items: usize,
+    /// Canonical enqueue sequence of the oldest admitted item, if any. This is
+    /// the age of the oldest ready work in this class's clock domain (the
+    /// durable enqueue ordinal, not wall-clock milliseconds).
+    pub oldest_ready_enqueue_sequence: Option<u64>,
+    /// The item this class offered, if any.
+    pub offered_attempt_id: Option<AttemptId>,
+    /// Credit the class carried into this pull. `None` when the class did not
+    /// participate, in which case the pull did not schedule it at all.
+    pub scheduled_credit: Option<u64>,
+    pub class_skip_reason: Option<ClassSkipReason>,
+    /// Admitted items passed over inside this class, retained and not re-queued.
+    pub skipped_ready_items: usize,
+    /// Passed-over items that are not temporarily closed and therefore get no
+    /// service promise from this selector.
+    pub infeasible_items: usize,
+}
+
+/// Published claim state of one deliverable (mutation scope) that currently
+/// holds admitted work.
+///
+/// This is published state for the caller, not a new gate: `admit` already
+/// rejects a second concurrent holder of one scope, so `ready_items` above one
+/// is unreachable today. `writer_holders` is rebuilt by replaying this
+/// coordinator's own admissions, so the exclusion it establishes holds only
+/// within one snapshot lineage and is not a canonical one-writer authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverableClaim {
+    pub mutation_scope: String,
+    pub holder_attempt_id: Option<AttemptId>,
+    pub holder_state: Option<CoordinatedAttemptState>,
+    /// Admitted items declaring this scope, including the holder.
+    pub ready_items: usize,
+}
+
+/// Exact outcome of one fair pull (issue #1683 W7).
+///
+/// Diagnostics only: nothing here is an authority, and no field re-decides
+/// admission, ordering or capacity. It derives `Serialize` only because it is a
+/// published projection, never an input wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReadySelectionOutcome {
+    pub algorithm: &'static str,
+    /// Profile revision the per-class partitions were taken from, or `None` on
+    /// the profile-free [`AgentCoordinator::next_ready`](crate::AgentCoordinator::next_ready)
+    /// path, which applies no per-class I14.2 partition at all.
+    pub profile_revision: Option<String>,
+    pub capacity_identity: String,
+    pub capacity_revision: RevisionId,
+    pub selected_attempt_id: Option<AttemptId>,
+    pub selected_work_class: Option<WorkClass>,
+    pub selected_enqueue_sequence: Option<u64>,
+    /// Canonical enqueue sequence of the oldest admitted item overall.
+    pub oldest_ready_enqueue_sequence: Option<u64>,
+    /// Exactly nine entries in scheduler rank order.
+    pub classes: Vec<WorkClassSelectionReport>,
+    pub deliverable_claims: Vec<DeliverableClaim>,
+    /// One entry per class that held ready work and was closed, in scheduler
+    /// rank order. Empty when a class offered work.
+    pub deferrals: Vec<CapacityDeferral>,
 }
