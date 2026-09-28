@@ -363,6 +363,16 @@ pub(crate) fn freeze(preimage: &str) -> String {
     sha256_hex(preimage.as_bytes())
 }
 
+/// Stable canonical spelling of a boolean inside a digest preimage.
+///
+/// Digest preimages in this module never encode a `bool` through its `Debug`
+/// spelling, because `true`/`false` are the same words in every revision while
+/// a domain bump is what says the preimage changed. Shared inside this crate so
+/// every boolean field is spelled one way.
+pub(crate) fn bool_text(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
 /// Returns the canonical weakest-first rank of a frozen grade name.
 pub fn grade_rank(name: &str) -> Result<u8, PortfolioError> {
     GRADE_ORDER
@@ -1740,6 +1750,17 @@ impl CoverageAccount {
     #[must_use]
     pub fn denominator_size(&self) -> usize {
         self.expected.len()
+    }
+
+    /// The exact expected denominator members, in canonical order.
+    ///
+    /// The declared membership itself, not the accounted remainder: a consumer
+    /// that needs to know what the run was obliged to close reads it here, and a
+    /// consumer that needs to know what it did not close reads
+    /// [`Self::open_members`].
+    #[must_use]
+    pub fn expected_members(&self) -> Vec<String> {
+        self.expected.iter().cloned().collect()
     }
 
     /// Expected members that carry neither a recorded disposition nor an
@@ -6880,6 +6901,292 @@ pub fn audit_claim(
         root_context_revision: binding.root_context_revision().to_owned(),
         run_reference_manifest_digest: binding.run_reference_manifest_digest().to_owned(),
         state_fence: binding.state_fence().clone(),
+    }
+}
+
+/// Stable identity of this coverage surface.
+pub const CLAIM_COVERAGE_CONTRACT: &str = "eliot.research.claim-coverage";
+
+/// The final coverage map over the material claims a released artifact carries
+/// (I21.8).
+///
+/// # Why the expected roster is independent
+///
+/// A completeness check that compares two copies of the same caller-supplied
+/// list proves nothing: a caller who forgot a claim also omits it from the
+/// "expected" copy, and the two agree. This map therefore takes the expected
+/// roster from an owner that the release does not control — [`EvidencePortfolio`]
+/// over the frozen [`AuthorizedManifest`] — and takes the *released* roster from
+/// the audit trail the release actually bound. The two are computed by
+/// different code from different inputs, so a member present in one and absent
+/// from the other is a real, observable defect.
+///
+/// # What "complete" means here
+///
+/// [`Self::is_complete`] is the gate a release asks before it may say its audit
+/// covered everything it released. It is `false` whenever the two rosters differ
+/// in either direction: an expected member with no verdict is an unaudited
+/// material claim, and a verdict with no expected member is a claim resting on
+/// nothing the frozen owner admitted. Neither is smoothed, and neither is
+/// reported as complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimCoverageMap {
+    /// Frozen authorized manifest the expected roster was derived from.
+    ///
+    /// Kept as the digest only: the manifest itself is re-proved through the
+    /// binding at every consume site, and a coverage map that carried a second
+    /// copy of it could disagree with the one the audit ran under.
+    authorized_manifest_digest: String,
+    /// The material-claim identities the frozen owner admitted, in canonical
+    /// order. Derived from the portfolio, never supplied by the release.
+    expected_material_claims: Vec<String>,
+    /// The material-claim identities the release actually bound a verdict for,
+    /// in canonical order.
+    released_material_claims: Vec<String>,
+    /// Every material claim that appears in exactly one of the two rosters,
+    /// sorted. Non-empty is exactly the incompleteness condition.
+    unaccounted: Vec<String>,
+    /// Digest over the coverage shape, with both rosters inside.
+    digest: String,
+}
+
+impl ClaimCoverageMap {
+    /// Builds the coverage map by comparing the released audit trail against the
+    /// material claims the frozen owner admitted.
+    ///
+    /// # Independent expected roster
+    ///
+    /// `expected` is [`MaterialClaimRoster::derive`], the projection of the
+    /// [`EvidencePortfolio`] and the [`AuthorizedManifest`] it was frozen
+    /// against. The release cannot shrink it: dropping a verdict removes a member
+    /// from `released`, not from `expected`, and the map reports the member under
+    /// [`Self::unaccounted`].
+    ///
+    /// `released` is derived from `verdicts` — the trail the release actually
+    /// holds. A caller cannot pass a pre-shortened list in its place, because
+    /// there is no such parameter: the set is read off the verdicts themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] when the authorized
+    /// manifest did not re-prove its own frozen digest, because a map derived
+    /// from a manifest whose bytes no longer hash to the commitment frozen beside
+    /// them has no trustworthy expected roster.
+    pub fn build(
+        expected: &MaterialClaimRoster,
+        binding: &AuditReferenceBinding,
+        verdicts: &[ClaimVerdict],
+    ) -> Result<Self, AuditBindingError> {
+        // The expected roster is re-derived from the binding's own manifests
+        // rather than trusted from the value handed in, so a roster built against
+        // a different manifest cannot be presented as this run's.
+        if expected.authorized_manifest_digest != binding.authorized().digest {
+            return Err(AuditBindingError::AuthorizedManifest {
+                cause: PortfolioError::InvalidDigest {
+                    field: "claim_coverage.expected_manifest_digest",
+                },
+            });
+        }
+        binding.verify_integrity()?;
+        let released_material_claims: BTreeSet<String> = verdicts
+            .iter()
+            .map(|verdict| verdict.claim_id.clone())
+            .collect();
+        let expected_set: BTreeSet<String> = expected.material_claim_ids.iter().cloned().collect();
+        let unaccounted: Vec<String> = released_material_claims
+            .symmetric_difference(&expected_set)
+            .cloned()
+            .collect();
+        let mut map = Self {
+            authorized_manifest_digest: expected.authorized_manifest_digest.clone(),
+            expected_material_claims: expected_set.into_iter().collect(),
+            released_material_claims: released_material_claims.into_iter().collect(),
+            unaccounted,
+            digest: String::new(),
+        };
+        map.digest = map.compute_digest();
+        Ok(map)
+    }
+
+    /// Whether every material claim the frozen owner admitted carries exactly
+    /// one released verdict, and no verdict rests on an unadmitted claim.
+    ///
+    /// This is the gate a complete-audit claim has to pass. A missing member is
+    /// not a formatting difference: the release asserted a material statement it
+    /// never audited, which is the exact failure I21.8 forbids.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unaccounted.is_empty()
+    }
+
+    /// Material claims present in exactly one of the two rosters, sorted. A
+    /// non-empty list is the incompleteness condition, named member by member.
+    #[must_use]
+    pub fn unaccounted(&self) -> &[String] {
+        &self.unaccounted
+    }
+
+    /// The independently derived expected roster, in canonical order.
+    #[must_use]
+    pub fn expected_material_claims(&self) -> &[String] {
+        &self.expected_material_claims
+    }
+
+    /// The released roster, in canonical order.
+    #[must_use]
+    pub fn released_material_claims(&self) -> &[String] {
+        &self.released_material_claims
+    }
+
+    /// Digest over the coverage shape, with both rosters and the unaccounted
+    /// remainder inside.
+    ///
+    /// Published so a consumer can re-ask the completeness question about the
+    /// exact map it was handed: the digest moves when a member enters or leaves
+    /// either roster, so a map that stopped describing the release cannot
+    /// re-present the old identity.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Re-proves this map's own digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] when the recomputed digest
+    /// disagrees with the stored one.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.compute_digest() != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "claim_coverage.digest",
+            });
+        }
+        Ok(())
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("claim-coverage/v1;");
+        push_field(
+            &mut preimage,
+            "authorized_manifest_digest",
+            &self.authorized_manifest_digest,
+        );
+        for (tag, members) in [
+            ("expected", &self.expected_material_claims),
+            ("released", &self.released_material_claims),
+            ("unaccounted", &self.unaccounted),
+        ] {
+            push_count(&mut preimage, tag, members.len());
+            for member in members {
+                push_field(&mut preimage, tag, member);
+            }
+        }
+        push_field(&mut preimage, "complete", bool_text(self.is_complete()));
+        freeze(&preimage)
+    }
+}
+
+/// Whether the coverage map permits a complete-audit claim.
+///
+/// Kept as its own check rather than a bare `is_complete()` read at the release
+/// site so the two are provably the same question: this is the function the
+/// release gate calls, and it calls nothing else.
+///
+/// On failure the unaccounted members are returned sorted and de-duplicated, so
+/// the caller is told exactly which claim is unaudited rather than only that the
+/// map is incomplete.
+pub fn require_complete_claim_coverage(map: &ClaimCoverageMap) -> Result<(), Vec<String>> {
+    if map.is_complete() {
+        return Ok(());
+    }
+    let mut missing = map.unaccounted().to_vec();
+    missing.sort();
+    missing.dedup();
+    Err(missing)
+}
+
+/// Frozen answer to "which material claims does this evidence set assert?",
+/// derived by the portfolio owner and carried as its own value.
+///
+/// This is the independent expected roster [`ClaimCoverageMap::build`] compares
+/// the release against. It is produced only by [`Self::derive`], from the
+/// [`EvidencePortfolio`] and the [`AuthorizedManifest`] frozen over it, and it is
+/// deliberately not constructible from a caller-supplied list: a release that
+/// could hand-build the expected roster would be handing itself a completeness
+/// claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialClaimRoster {
+    /// Digest of the manifest this roster was derived against.
+    pub authorized_manifest_digest: String,
+    /// The declared denominator members each material claim is derived from, in
+    /// canonical order.
+    pub material_claim_ids: Vec<String>,
+    /// The claim identities the frozen owner admits as material, in canonical
+    /// order.
+    pub claim_ids: Vec<String>,
+}
+
+impl MaterialClaimRoster {
+    /// Derives the material-claim roster from the portfolio and its manifest.
+    ///
+    /// One material claim per **admitted citable source handle** the frozen
+    /// manifest commits, which is the roster the release must cover: a released
+    /// artifact that cites an admitted source has asserted something material
+    /// about it, and the audit has to have examined that something. A handle the
+    /// manifest revoked, never admitted, or admits without a provable record is
+    /// not a material claim — there is nothing released to audit about it — which
+    /// is why the derivation reads standing facts and not a caller list.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`AuditBindingError`] when the binding's manifests fail their
+    /// own re-proof, so a roster is never derived from an unproven authorization.
+    pub fn derive(
+        portfolio: &EvidencePortfolio,
+        binding: &AuditReferenceBinding,
+    ) -> Result<Self, AuditBindingError> {
+        binding.verify_integrity()?;
+        let manifest = binding.authorized();
+        let mut claim_ids: Vec<String> = portfolio
+            .records
+            .keys()
+            .filter(|handle| {
+                // Only a handle the run was authorized to quote AND the manifest
+                // commits a provable record for is a released material claim.
+                // `classify_handle` is not reachable here (it is claim-scoped), so
+                // the two manifest conditions are read directly, and the record
+                // commitment is checked against the record the portfolio holds.
+                manifest.allows(handle)
+                    && binding.allowed_references().allows(handle)
+                    && manifest.source_commitment(handle).is_some_and(|_| {
+                        portfolio
+                            .records
+                            .get(*handle)
+                            .is_some_and(|record| manifest.binds_source_record(record))
+                    })
+            })
+            .cloned()
+            .collect();
+        claim_ids.sort();
+        claim_ids.dedup();
+        Ok(Self {
+            authorized_manifest_digest: manifest.digest.clone(),
+            material_claim_ids: portfolio.coverage.expected_members(),
+            claim_ids,
+        })
+    }
+
+    /// Number of material claims this roster declares.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.claim_ids.len()
+    }
+
+    /// Whether the roster declares no material claims at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.claim_ids.is_empty()
     }
 }
 

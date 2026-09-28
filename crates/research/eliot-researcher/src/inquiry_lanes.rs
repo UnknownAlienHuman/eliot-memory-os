@@ -81,7 +81,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::StateFence;
 
-use crate::evidence_portfolio::{PortfolioError, digest, freeze, push_count, push_field, text};
+use crate::evidence_portfolio::{
+    PortfolioError, bool_text, digest, freeze, push_count, push_field, text,
+};
 use crate::inquiry_governance::{
     BlindedField, EvidenceGrade, InquiryError, InquiryLane, InquiryProfileParams,
     InquiryProtocolProfile,
@@ -376,10 +378,6 @@ fn require_text(value: &str, field: &'static str) -> Result<(), LaneRegistration
 
 fn require_digest(value: &str, field: &'static str) -> Result<(), LaneRegistrationError> {
     digest(value, field).map_err(LaneRegistrationError::from)
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 // ---------------------------------------------------------------------------
