@@ -2005,7 +2005,7 @@ impl KernelComposition {
             || (parent.session_ref.is_none()
                 && parent.connection_ref.as_str() == envelope.connection_id);
         if !same_application_owner {
-            return Err(TransportError::IdentityConflict);
+            return Err(host_request_parent_owner_mismatch(envelope));
         }
         if envelope
             .identity
@@ -2020,7 +2020,7 @@ impl KernelComposition {
                     parent.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
                 })
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(host_request_parent_owner_mismatch(envelope));
         }
         Ok(())
     }
@@ -2044,7 +2044,7 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &parent_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
-        require_current_generation_parent(&parent, descriptor)?;
+        require_host_request_parent_generation(envelope, &parent, descriptor)?;
         self.require_host_request_parent_owner(
             envelope,
             &parent,
@@ -2194,7 +2194,7 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &parent_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
-        require_current_generation_parent(&parent, descriptor)?;
+        require_host_request_parent_generation(envelope, &parent, descriptor)?;
         self.require_host_request_parent_owner(
             envelope,
             &parent,
@@ -2250,7 +2250,7 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &parent_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
-        require_current_generation_parent(&parent, descriptor)?;
+        require_host_request_parent_generation(envelope, &parent, descriptor)?;
         self.require_host_request_parent_owner(
             envelope,
             &parent,
@@ -2280,7 +2280,7 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &parent_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
-        require_current_generation_parent(&parent, descriptor)?;
+        require_host_request_parent_generation(envelope, &parent, descriptor)?;
         self.require_host_request_parent_owner(
             envelope,
             &parent,
@@ -4859,6 +4859,33 @@ fn require_current_generation_parent(
         return Err(TransportError::SessionFenced);
     }
     Ok(())
+}
+
+/// Hides a foreign parent's existence from observation-only Status callers,
+/// while preserving a typed identity conflict for mutating recovery requests.
+fn host_request_parent_owner_mismatch(envelope: &HostRequestEnvelope) -> TransportError {
+    if envelope.kind == HostRequestKind::Status {
+        TransportError::UnknownRequest
+    } else {
+        TransportError::IdentityConflict
+    }
+}
+
+/// A stale or foreign parent is indistinguishable from absence on Status.
+/// Cancellation and Reconciliation retain their current-generation conflict
+/// behavior because they request a parent mutation.
+fn require_host_request_parent_generation(
+    envelope: &HostRequestEnvelope,
+    parent: &HostRequestRecord,
+    descriptor: &AgentBridgeAdmissionDescriptor,
+) -> Result<(), TransportError> {
+    require_current_generation_parent(parent, descriptor).map_err(|error| {
+        if envelope.kind == HostRequestKind::Status {
+            TransportError::UnknownRequest
+        } else {
+            error
+        }
+    })
 }
 
 impl KernelComposition {
