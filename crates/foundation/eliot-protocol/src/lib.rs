@@ -4083,6 +4083,39 @@ const fn unknown_result_influence() -> InfluenceState {
     InfluenceState::Unknown
 }
 
+/// Validates the source revisions a lineage claims, if it claims any.
+///
+/// Each key must be a bounded non-empty string, unique across the set so one
+/// revision cannot be listed twice, and carry a non-zero revision with its own
+/// valid state fence, so a result cannot present a stale or self-contradicting
+/// source position as its origin.
+fn validate_source_revisions(
+    revisions: &[HostRequestResultSourceRevision],
+) -> Result<(), ProtocolError> {
+    let mut revision_keys = std::collections::BTreeSet::new();
+    for revision in revisions {
+        bounded_text(
+            &revision.key,
+            "host_request_result_body.lineage.source_revisions.key",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !revision_keys.insert(&revision.key) {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.source_revisions",
+                reason: "source revision keys must be unique",
+            });
+        }
+        if revision.revision == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.source_revisions.revision",
+                reason: "source revision must be non-zero",
+            });
+        }
+        revision.state_fence.validate()?;
+    }
+    Ok(())
+}
+
 impl HostRequestResultLineage {
     fn validate(
         &self,
@@ -4148,27 +4181,7 @@ impl HostRequestResultLineage {
             }
         }
         if let Some(revisions) = &self.source_revisions {
-            let mut revision_keys = std::collections::BTreeSet::new();
-            for revision in revisions {
-                bounded_text(
-                    &revision.key,
-                    "host_request_result_body.lineage.source_revisions.key",
-                    MAX_HOST_REQUEST_TEXT_BYTES,
-                )?;
-                if !revision_keys.insert(&revision.key) {
-                    return Err(ProtocolError::InvalidField {
-                        field: "host_request_result_body.lineage.source_revisions",
-                        reason: "source revision keys must be unique",
-                    });
-                }
-                if revision.revision == 0 {
-                    return Err(ProtocolError::InvalidField {
-                        field: "host_request_result_body.lineage.source_revisions.revision",
-                        reason: "source revision must be non-zero",
-                    });
-                }
-                revision.state_fence.validate()?;
-            }
+            validate_source_revisions(revisions)?;
         }
         if let Some(policy_fence) = &self.policy_fence {
             bounded_text(

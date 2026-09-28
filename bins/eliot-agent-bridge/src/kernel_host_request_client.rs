@@ -365,12 +365,20 @@ pub(crate) struct AdmittedReplyView {
 pub(crate) struct RetainedResultLineageView {
     /// Which kind of record these retained bytes are. Unknown for a row whose
     /// lineage was written before the class existed; never an admitted class.
-    #[serde(default)]
+    #[serde(default = "unclassified_result_class")]
     pub(crate) result_class: HostRequestResultClass,
     /// Exact admitted semantic receipt, present only for
     /// [`HostRequestResultClass::CanonicalWriteReceipt`].
     #[serde(default)]
     pub(crate) semantic_receipt_ref: Option<String>,
+}
+
+/// Missing class means the row predates the field: unknown provenance, which is
+/// exactly [`HostRequestResultClass::Unclassified`] and never an admitted
+/// class. The bridge repeats the protocol crate's own defaulting rule instead of
+/// treating an absent field as a class it may pick.
+const fn unclassified_result_class() -> HostRequestResultClass {
+    HostRequestResultClass::Unclassified
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
