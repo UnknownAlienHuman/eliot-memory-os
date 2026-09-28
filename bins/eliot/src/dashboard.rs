@@ -739,6 +739,32 @@ fn served_row_lines(view: &View) -> Vec<String> {
             display_text(row.recovery_owner.as_str()),
             row.view_revision
         ));
+        // The four projection-supplied identities are bound per row. An
+        // unobserved row binds none of them, which is reported as "not
+        // observed" rather than as an unknown or empty value.
+        lines.push(format!(
+            "    capability={} owner={} generation={} evidence_handle={}",
+            row.capability
+                .as_ref()
+                .map_or("(not observed)".to_owned(), |value| display_text(
+                    value.as_str()
+                )),
+            row.owner
+                .as_ref()
+                .map_or("(not observed)".to_owned(), |value| display_text(
+                    value.as_str()
+                )),
+            row.generation
+                .as_ref()
+                .map_or("(not observed)".to_owned(), |value| display_text(
+                    value.as_str()
+                )),
+            row.evidence_handle
+                .as_ref()
+                .map_or("(not observed)".to_owned(), |value| display_text(
+                    value.as_str()
+                )),
+        ));
         lines.push(format!(
             "    contour_digest={}",
             display_text(&row.contour_digest)

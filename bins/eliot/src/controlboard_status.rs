@@ -17,8 +17,9 @@
 //! board.
 
 use eliot_runtime_status::{
-    CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportMessage,
-    RenderedControlBoard,
+    CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardCapability,
+    ControlBoardEvidenceHandle, ControlBoardGeneration, ControlBoardOwner,
+    ControlBoardTransportMessage, RenderedControlBoard,
 };
 
 /// Re-exported operation selector so the composition root names the exact
@@ -79,6 +80,10 @@ pub fn render_status_json(
                 "entry_id": row.entry_id,
                 "disposition": row.disposition.label(),
                 "summary": row.summary,
+                "capability": row.capability.as_ref().map(ControlBoardCapability::as_str),
+                "owner": row.owner.as_ref().map(ControlBoardOwner::as_str),
+                "generation": row.generation.as_ref().map(ControlBoardGeneration::as_str),
+                "evidence_handle": row.evidence_handle.as_ref().map(ControlBoardEvidenceHandle::as_str),
                 "installation": row.installation.as_str(),
                 "observed_at": row.observed_at.get(),
                 "source_digest": row.source_digest.as_str(),
@@ -126,8 +131,8 @@ mod tests {
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
     use eliot_runtime_status::{
         ControlBoardInstallation, ControlBoardObservationTime, ControlBoardRecoveryOwner,
-        ControlBoardRowDisposition, ControlBoardSourceDigest, RenderedControlBoardRow,
-        build_controlboard_frame, open_controlboard_frame,
+        ControlBoardRowDisposition, ControlBoardSourceDigest, build_controlboard_frame,
+        open_controlboard_frame,
     };
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -150,6 +155,14 @@ mod tests {
             entry_id: entry_id.to_owned(),
             disposition,
             summary: summary.map(str::to_owned),
+            capability: Some(ControlBoardCapability::new("controlboard.read").expect("capability")),
+            owner: Some(ControlBoardOwner::new("owner-consumer-test").expect("owner")),
+            generation: Some(
+                ControlBoardGeneration::new("generation-consumer-test").expect("generation"),
+            ),
+            evidence_handle: Some(
+                ControlBoardEvidenceHandle::new("evidence-consumer-test").expect("evidence"),
+            ),
             installation: ControlBoardInstallation::new("installation-consumer-test")
                 .expect("installation"),
             observed_at: ControlBoardObservationTime::new(1_786_000_000_002).expect("observed_at"),

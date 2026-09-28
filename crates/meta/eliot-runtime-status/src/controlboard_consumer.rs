@@ -40,8 +40,23 @@
 //! bindings ([`ControlBoardInstallation`], [`ControlBoardObservationTime`],
 //! [`ControlBoardSourceDigest`], [`ControlBoardRecoveryOwner`]) plus the
 //! projection-owned typed identities (`view_revision: u64`,
-//! `view_fence: StateFence`, `contour_digest`). No caller-opaque string stands
-//! in for a value the projection owns.
+//! `view_fence: StateFence`, `contour_digest`). Every observed row additionally
+//! carries the projected row's capability, canonical owner, generation, and
+//! evidence handle as typed bindings reproduced verbatim
+//! ([`ControlBoardCapability`], [`ControlBoardOwner`],
+//! [`ControlBoardGeneration`], [`ControlBoardEvidenceHandle`]). The expiry and
+//! invalidation bindings are rendered once at [`RenderedControlBoard`],
+//! because the contour states one expiry and one invalidation for the whole
+//! board rather than one per row. No caller-opaque string stands in
+//! for a value the projection owns.
+//!
+//! The per-row projection bindings are never reduced to a summary: the
+//! layer crossing carries the whole projected [`ControlBoardStatusRow`], so an
+//! observed row keeps every identity the projection bound. An unobserved row
+//! binds no capability, owner, generation, or evidence handle, so those
+//! bindings are `None` — the row was not observed, which is never reported as
+//! an unknown or empty value. No capability, owner, generation, or evidence
+//! handle is ever inferred or filled in.
 //!
 //! Secret handling: rendered rows carry no session, credential, challenge,
 //! access-digest, token, or nonce fields by construction. The inert
@@ -59,7 +74,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::controlboard_projection::{
-    ControlBoardContour, ControlBoardProjectionBindings, read_controlboard_contour,
+    ControlBoardContour, ControlBoardProjectionBindings, ControlBoardStatusRow,
+    read_controlboard_contour,
 };
 
 /// Stable contract identity for this read-only consumer rendering.
@@ -201,6 +217,102 @@ impl ControlBoardRecoveryOwner {
 
     fn validate(&self) -> Result<(), ControlBoardConsumerError> {
         bound_text(&self.0, "recovery_owner")
+    }
+}
+
+/// Typed admitted read capability a projected row was read under.
+///
+/// Carried verbatim from the observed projection row; an unobserved row has
+/// no capability and binds none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlBoardCapability(String);
+
+impl ControlBoardCapability {
+    /// Binds one admitted read capability name (non-empty, no control
+    /// characters, bounded length).
+    pub fn new(value: impl Into<String>) -> Result<Self, ControlBoardConsumerError> {
+        let inner = value.into();
+        bound_text(&inner, "capability")?;
+        Ok(Self(inner))
+    }
+
+    /// Returns the bound capability name text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Typed owner-issued generation a projected row was read at.
+///
+/// Carried verbatim from the observed projection row; an unobserved row was
+/// read at no generation and binds none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlBoardGeneration(String);
+
+impl ControlBoardGeneration {
+    /// Binds one owner-issued generation (non-empty, no control characters,
+    /// bounded length).
+    pub fn new(value: impl Into<String>) -> Result<Self, ControlBoardConsumerError> {
+        let inner = value.into();
+        bound_text(&inner, "generation")?;
+        Ok(Self(inner))
+    }
+
+    /// Returns the bound generation text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Typed evidence handle a projected row was read against.
+///
+/// Carried verbatim from the observed projection row; an unobserved row was
+/// read against no evidence handle and binds none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlBoardEvidenceHandle(String);
+
+impl ControlBoardEvidenceHandle {
+    /// Binds one evidence handle (non-empty, no control characters, bounded
+    /// length).
+    pub fn new(value: impl Into<String>) -> Result<Self, ControlBoardConsumerError> {
+        let inner = value.into();
+        bound_text(&inner, "evidence")?;
+        Ok(Self(inner))
+    }
+
+    /// Returns the bound evidence handle text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Typed canonical owner a projected row was read under.
+///
+/// Carried verbatim from the observed projection row; an unobserved row has no
+/// canonical owner and binds none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlBoardOwner(String);
+
+impl ControlBoardOwner {
+    /// Binds one canonical owner (non-empty, no control characters, bounded
+    /// length).
+    pub fn new(value: impl Into<String>) -> Result<Self, ControlBoardConsumerError> {
+        let inner = value.into();
+        bound_text(&inner, "owner")?;
+        Ok(Self(inner))
+    }
+
+    /// Returns the bound canonical owner text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -367,6 +479,18 @@ pub struct RenderedControlBoardRow {
     /// Entry summary/content reproduced 1:1 from the contour when observed;
     /// `None` for `Missing` rows (nothing was observed to reproduce).
     pub summary: Option<String>,
+    /// Admitted read capability the observed row was projected under, carried
+    /// verbatim from the projection row; `None` for `Missing` rows.
+    pub capability: Option<ControlBoardCapability>,
+    /// Canonical owner the observed row was projected under, carried verbatim
+    /// from the projection row; `None` for `Missing` rows.
+    pub owner: Option<ControlBoardOwner>,
+    /// Owner-issued generation the observed row was projected at, carried
+    /// verbatim from the projection row; `None` for `Missing` rows.
+    pub generation: Option<ControlBoardGeneration>,
+    /// Evidence handle the observed row was projected against, carried
+    /// verbatim from the projection row; `None` for `Missing` rows.
+    pub evidence_handle: Option<ControlBoardEvidenceHandle>,
     /// Stamped from the observer context installation.
     pub installation: ControlBoardInstallation,
     /// Stamped from the observer context observation time.
@@ -477,15 +601,15 @@ pub fn render_controlboard_status(
             });
         }
     }
-    let mut observed_by_id: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut observed_by_id: BTreeMap<&str, &ControlBoardStatusRow> = BTreeMap::new();
     for row in &contour.rows {
-        observed_by_id.insert(row.entry_id.as_str(), row.summary.as_str());
+        observed_by_id.insert(row.entry_id.as_str(), row);
     }
     let mut rows = Vec::with_capacity(expected.len());
     let mut observed_count = 0_usize;
     for entry_id in expected.entries() {
         let rendered = match observed_by_id.get(entry_id.as_str()) {
-            Some(summary) => {
+            Some(observed) => {
                 observed_count = observed_count.saturating_add(1);
                 RenderedControlBoardRow {
                     entry_id: entry_id.clone(),
@@ -493,7 +617,13 @@ pub fn render_controlboard_status(
                         .get(entry_id.as_str())
                         .copied()
                         .unwrap_or(ControlBoardRowDisposition::Unknown),
-                    summary: Some((*summary).to_owned()),
+                    summary: Some(observed.summary.clone()),
+                    capability: Some(ControlBoardCapability::new(observed.capability.clone())?),
+                    owner: Some(ControlBoardOwner::new(observed.owner.clone())?),
+                    generation: Some(ControlBoardGeneration::new(observed.generation.clone())?),
+                    evidence_handle: Some(ControlBoardEvidenceHandle::new(
+                        observed.evidence.clone(),
+                    )?),
                     installation: context.installation.clone(),
                     observed_at: context.observed_at,
                     source_digest: context.source_digest.clone(),
@@ -506,6 +636,14 @@ pub fn render_controlboard_status(
                 entry_id: entry_id.clone(),
                 disposition: ControlBoardRowDisposition::Missing,
                 summary: None,
+                // An unobserved row was never projected under a capability, at a
+                // generation, or against an evidence handle. These bindings are
+                // `None` because nothing was observed, never because the value
+                // is unknown or empty; nothing here is inferred or filled in.
+                capability: None,
+                owner: None,
+                generation: None,
+                evidence_handle: None,
                 installation: context.installation.clone(),
                 observed_at: context.observed_at,
                 source_digest: context.source_digest.clone(),
