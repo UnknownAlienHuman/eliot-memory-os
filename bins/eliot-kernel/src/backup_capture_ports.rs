@@ -572,19 +572,19 @@ pub fn owner_fence_dispositions(
     if let Some(snapshot) = ors_snapshot {
         for pending in owner_suspended_recovery_refs(snapshot)? {
             dispositions.push((
-                format!("{}{pending}", MEMBER_DOMAIN_ORS_PENDING),
+                format!("{MEMBER_DOMAIN_ORS_PENDING}{pending}"),
                 "suspended".to_owned(),
             ));
         }
         for checkpoint in &snapshot.job_checkpoint_ids {
             dispositions.push((
-                format!("{}{checkpoint}", MEMBER_DOMAIN_ORS_CHECKPOINT),
+                format!("{MEMBER_DOMAIN_ORS_CHECKPOINT}{checkpoint}"),
                 "captured".to_owned(),
             ));
         }
         for cutover in &snapshot.generation_cutover_ids {
             dispositions.push((
-                format!("{}{cutover}", MEMBER_DOMAIN_ORS_CUTOVER),
+                format!("{MEMBER_DOMAIN_ORS_CUTOVER}{cutover}"),
                 "captured".to_owned(),
             ));
         }
@@ -592,7 +592,7 @@ pub fn owner_fence_dispositions(
     if let Some(spool) = watchdog_spool {
         for signal in &spool.unresolved_signal_digests {
             dispositions.push((
-                format!("{}{signal}", MEMBER_DOMAIN_WATCHDOG_SIGNAL),
+                format!("{MEMBER_DOMAIN_WATCHDOG_SIGNAL}{signal}"),
                 "suspended".to_owned(),
             ));
         }
@@ -600,7 +600,7 @@ pub fn owner_fence_dispositions(
     if let Some(audit) = host_audit {
         for disposition in &audit.observed_dispositions {
             dispositions.push((
-                format!("{}{disposition}", MEMBER_DOMAIN_HOST_AUDIT),
+                format!("{MEMBER_DOMAIN_HOST_AUDIT}{disposition}"),
                 "forensic".to_owned(),
             ));
         }

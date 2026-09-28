@@ -1580,7 +1580,11 @@ fn member_disposition_list(
     }
     for blob in blobs {
         dispositions.push((
-            format!("{}{}", MEMBER_DOMAIN_BLOB, owner_residency_key_digest(blob)?),
+            format!(
+                "{}{}",
+                MEMBER_DOMAIN_BLOB,
+                owner_residency_key_digest(blob)?
+            ),
             "captured".to_owned(),
         ));
     }
@@ -1702,7 +1706,10 @@ fn check_denominator(
         }
     }
     for (declared, _) in &owner_declared {
-        let count = dispositions.iter().filter(|entry| &entry.0 == declared).count();
+        let count = dispositions
+            .iter()
+            .filter(|entry| &entry.0 == declared)
+            .count();
         if count != 1 {
             return Err(KernelCaptureError::DenominatorIncomplete(format!(
                 "owner-declared member {declared} has {count} dispositions, want exactly one"
