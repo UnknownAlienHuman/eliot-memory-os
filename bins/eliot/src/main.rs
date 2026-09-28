@@ -15,10 +15,11 @@ use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass,
-    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
-    require_published_source_bundle_journal, validate_installation_transaction_json,
+    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
+    ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
+    WindowsInstallationCoordinator, parse_installation_transaction_id,
+    post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
+    validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
@@ -294,6 +295,46 @@ enum InstallationCommand {
         /// Bounded deadline in milliseconds from now (default 2000).
         #[arg(long, default_value = "2000")]
         deadline_ms: u64,
+    },
+    /// Resolve the I3.1 layout for one explicitly selected profile, read-only.
+    ///
+    /// Reports the selected profile, its four resolved root roles, its
+    /// supervision type, its enforced/unsupported guarantees, and the
+    /// structural proof that a non-service selection carries no SCM,
+    /// administrative or `ProgramData` dependency. Creates nothing, reserves
+    /// no service, and mutates nothing. An invalid profile, a missing or
+    /// ambiguous anchor, or a write into the versioned immutable binaries root
+    /// is a typed refusal.
+    ResolveProfile {
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root: `%ProgramData%` for
+        /// `system_service`, `%LocalAppData%` for `user_mode`, and the
+        /// retained repository root for `portable_dev`.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Lowercase SHA-256 installation key; required for `system_service`
+        /// and `user_mode`, refused for `portable_dev`.
+        #[arg(long)]
+        installation_key: Option<String>,
+        /// Component name for the versioned immutable root of the Windows profiles.
+        #[arg(long)]
+        component: String,
+        /// Component version for the versioned immutable root of the Windows profiles.
+        #[arg(long)]
+        version: String,
+        /// Immutable-root generation for `portable_dev`; required only there.
+        #[arg(long)]
+        generation: Option<String>,
+        /// Absolute immutable source-bundle directory the plan would consume.
+        /// Checked against the versioned immutable binaries root.
+        #[arg(long, value_parser = absolute_path)]
+        source_root: PathBuf,
+        /// Absolute immutable staging destination the plan would use.
+        /// Checked against the versioned immutable binaries root.
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
     },
     /// Report the unsupported canary-removal seam without mutating the machine.
     RemoveCanary {
@@ -2083,6 +2124,25 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             store,
             transaction_id,
         } => run_installation_effect(&store, &transaction_id, true),
+        InstallationCommand::ResolveProfile {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        } => run_installation_resolve_profile(ResolveProfileRequest {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        }),
         InstallationCommand::Status {
             host_state_root,
             deadline_ms,
@@ -2500,6 +2560,11 @@ where
             reconciliation,
         ));
     }
+    // I3.1: report the selected profile, its resolved root roles, its
+    // supervision type and its enforced/unsupported guarantees. The value is
+    // rehydrated from the binding this transaction durably records, so the
+    // report is the recorded selection rather than a fresh resolution.
+    let profile_governance = installation_profile_governance_projection(&transaction);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -2509,6 +2574,7 @@ where
             "transaction_id": transaction.transaction_id,
             "generation": transaction.candidate_manifest.generation,
             "profile": transaction.profile,
+            "profile_governance": profile_governance,
             "effect_count": transaction.effect_progress().len(),
             "package_file_count": transaction
                 .installer_effects
@@ -3947,6 +4013,265 @@ where
     }
 }
 
+/// Projects the recorded profile selection for a CLI response (I3.1).
+///
+/// The value is rehydrated from the binding the durable transaction actually
+/// records — the ORIGINAL recorded value, never a fresh resolution from
+/// today's environment — and reports the selected profile, its resolved root
+/// roles, its supervision type and its enforced/unsupported guarantees. A
+/// transaction with no recorded binding, or one whose recorded binding
+/// disagrees with its recorded profile or retained roots, reports a typed
+/// refusal rather than a freshly derived layout. No key, secret or credential
+/// value is ever included.
+fn installation_profile_governance_projection(
+    transaction: &InstallationTransaction,
+) -> serde_json::Value {
+    match transaction.rehydrate_profile_binding() {
+        Ok(resolution) => json!({
+            "state": "REHYDRATED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "requires_admin": resolution.unprivileged_proof.requires_admin,
+            "compared_roots": resolution.unprivileged_proof.compared_roots,
+        }),
+        Err(error) => json!({
+            "state": "REHYDRATION_REFUSED",
+            "reason": error.to_string(),
+        }),
+    }
+}
+
+/// The raw CLI inputs of one read-only I3.1 profile resolution.
+///
+/// Every field is consumed once, in [`profile_selection_input`]; nothing here
+/// is defaulted from a process environment variable, the current directory, or
+/// today's ambient state.
+struct ResolveProfileRequest {
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    installation_key: Option<String>,
+    component: String,
+    version: String,
+    generation: Option<String>,
+    source_root: PathBuf,
+    staging_root: PathBuf,
+}
+
+/// Resolves the I3.1 layout for one explicitly selected profile, read-only.
+///
+/// This is the production caller of the existing selector. The anchors are
+/// proved by the Windows adapter — `%ProgramFiles%`, `%ProgramData%` and the
+/// current user's `%LocalAppData%` come from the OS known-folder lookups, and
+/// the repository contour for `portable_dev` is the caller-named retained
+/// anchor — so no root is inferred from a process environment variable, the
+/// current directory or ambient state. Nothing is created, reserved or
+/// mutated: an invalid profile, a missing or ambiguous anchor, a write into
+/// the versioned immutable binaries root, or a selection that cannot prove it
+/// depends on no service-only authority is a typed refusal.
+fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i32> {
+    let selection = match profile_selection_input(request) {
+        Ok(selection) => selection,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_PROFILE_RESOLUTION_REJECTED",
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let resolution = match GenerationPackagePlanner::resolve_profile_selection(&selection) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_PROFILE_RESOLUTION_REJECTED",
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "PROFILE_RESOLVED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "requires_admin": resolution.unprivileged_proof.requires_admin,
+            "compared_roots": resolution.unprivileged_proof.compared_roots,
+            "scope": INSTALLATION_SCOPE,
+            "mutated": false,
+        }))?
+    );
+    Ok(0)
+}
+
+/// Proves the complete explicit input set for one read-only resolution.
+///
+/// Path and key values are validated exactly as the planner's own CLI seam
+/// validates them, so a resolution can never be computed from a value the
+/// planner would refuse.
+fn profile_selection_input(
+    request: ResolveProfileRequest,
+) -> Result<ProfileSelectionInput, InstallationError> {
+    let ResolveProfileRequest {
+        profile,
+        profile_anchor_root,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    } = request;
+    let path_handle =
+        |path: PathBuf, field: &'static str| -> Result<PlatformHandle, InstallationError> {
+            cli_path_handle(&path, field).map_err(|error| InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: error.to_string(),
+            })
+        };
+    let source_root = path_handle(source_root, "source_root")?;
+    let staging_root = path_handle(staging_root, "staging_root")?;
+    let installation_key =
+        match installation_key {
+            None => None,
+            Some(value) => Some(PlatformHandle::new(value).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "installation_key".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?),
+        };
+    proved_profile_selection(
+        profile,
+        &profile_anchor_root,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    )
+}
+
+/// Proves the anchor set the I3.1 selector needs for one selected profile.
+///
+/// `system_service` needs `%ProgramFiles%` and `%ProgramData%`;
+/// `user_mode` and `portable_dev` need the current user's `%LocalAppData%`;
+/// `portable_dev` additionally needs the retained repository contour the
+/// caller named. Every OS-known anchor is read through the Windows adapter's
+/// known-folder lookup, and the caller's named anchor is checked against that
+/// same lookup rather than trusted, so a caller cannot point a profile at a
+/// contour the OS does not resolve.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proved selection carries its complete explicit input set"
+)]
+fn proved_profile_selection(
+    profile: InstallationProfile,
+    profile_anchor_root: &Path,
+    installation_key: Option<PlatformHandle>,
+    component: String,
+    version: String,
+    generation: Option<String>,
+    source_root: PlatformHandle,
+    staging_root: PlatformHandle,
+) -> Result<ProfileSelectionInput, InstallationError> {
+    let anchor_handle =
+        |path: &Path, field: &'static str| -> Result<PlatformHandle, InstallationError> {
+            if !path.is_absolute() {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "profile anchor must be absolute".to_owned(),
+                });
+            }
+            PlatformHandle::new(path.to_string_lossy().into_owned()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: error.to_string(),
+                }
+            })
+        };
+    let local_app_data = eliot_platform_windows::current_user_local_app_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let local_app_data = anchor_handle(&local_app_data, "local_app_data")?;
+    let program_data = eliot_platform_windows::protected_program_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let program_data = anchor_handle(&program_data, "program_data")?;
+    let named_anchor = anchor_handle(profile_anchor_root, "profile_anchor_root")?;
+    let (anchors, runtime_anchor) = match profile {
+        InstallationProfile::SystemService => {
+            if !eliot_platform_windows::windows_paths_equal(
+                profile_anchor_root,
+                Path::new(program_data.as_str()),
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "system_service profile_anchor_root must equal the OS-resolved ProgramData contour"
+                        .to_owned(),
+                ));
+            }
+            let program_files = eliot_platform_windows::program_files_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            (
+                ProfileRootAnchors {
+                    program_files: Some(anchor_handle(&program_files, "program_files")?),
+                    program_data: Some(program_data),
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::UserMode => {
+            if !eliot_platform_windows::windows_paths_equal(
+                profile_anchor_root,
+                Path::new(local_app_data.as_str()),
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "user_mode profile_anchor_root must equal the OS-resolved current-user LocalAppData contour"
+                        .to_owned(),
+                ));
+            }
+            (
+                ProfileRootAnchors {
+                    program_files: None,
+                    program_data: Some(program_data),
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::PortableDev => (
+            ProfileRootAnchors {
+                program_files: None,
+                program_data: Some(program_data),
+                local_app_data,
+                repository_root: Some(named_anchor.clone()),
+            },
+            named_anchor,
+        ),
+    };
+    Ok(ProfileSelectionInput {
+        profile,
+        anchors,
+        profile_anchor_root: runtime_anchor,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    })
+}
+
 fn print_transaction_projection(
     status: &str,
     store_path: &Path,
@@ -3961,6 +4286,11 @@ fn print_transaction_projection(
         .or_else(|| outcome.map(installation_outcome_status))
         .unwrap_or(status);
     let completed = installation_projection_completed(transaction.stage());
+    // I3.1: the response shows the selected profile, its resolved root roles,
+    // its supervision type and its enforced/unsupported guarantees, taken from
+    // the binding the durable transaction actually records. Nothing here
+    // exposes a key.
+    let profile_governance = installation_profile_governance_projection(transaction);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -3973,6 +4303,7 @@ fn print_transaction_projection(
             "stage": transaction.stage(),
             "revision": transaction.revision(),
             "completed": completed,
+            "profile_governance": profile_governance,
             "outcome": outcome_value,
             "staging": staging.map(|value| {
                 json!({
