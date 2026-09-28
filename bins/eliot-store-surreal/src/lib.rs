@@ -1988,6 +1988,7 @@ mod tests {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-bridge-1").expect("operation id"),
                 idempotency_key: "idem-1927-bridge-1".to_owned(),
@@ -3071,6 +3072,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-bridge").expect("operation id"),
                 idempotency_key: "idem-bridge".to_owned(),
@@ -3147,6 +3149,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
                 idempotency_key: "idem-erasure-bridge".to_owned(),

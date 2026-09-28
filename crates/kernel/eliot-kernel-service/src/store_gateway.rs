@@ -7788,6 +7788,7 @@ mod tests {
         let entries = generated_operation_manifests().unwrap_or_else(|_| unreachable!());
         let set_digest = operation_manifest_set_digest(&entries).unwrap_or_else(|_| unreachable!());
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-1").unwrap_or_else(|_| unreachable!()),
                 idempotency_key: "idem-1927-1".to_owned(),
@@ -8627,6 +8628,7 @@ mod live_surreal_evidence_pack_e2e {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),

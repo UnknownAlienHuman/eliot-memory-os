@@ -59,6 +59,7 @@ fn transition(
     let entries = eliot_store_api::generated_operation_manifests().expect("catalogue");
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).expect("set digest");
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-1929-1").expect("operation id"),
             idempotency_key: "idem-1929-1".to_owned(),

@@ -90,6 +90,7 @@ fn transition(
 ) -> Result<PreparedTransition, Box<dyn std::error::Error>> {
     let operation_id = OperationId::new(operation)?;
     let mut prepared = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: eliot_store_api::OperationIdentity {
             operation_id,
             idempotency_key: format!("idem-{operation}"),

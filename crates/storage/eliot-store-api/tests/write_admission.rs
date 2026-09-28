@@ -66,6 +66,7 @@ fn context() -> RequestMeta {
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
     let mut transition = eliot_store_api::PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-admit-1").unwrap(),
             idempotency_key: "idem-admit-1".to_owned(),

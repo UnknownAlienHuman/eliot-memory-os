@@ -79,6 +79,7 @@ fn capture_transition(tag: &str) -> (RequestMeta, PreparedTransition) {
         operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
             .expect("set digest");
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-cold-live-{tag}")).expect("operation"),
             idempotency_key: format!("idem-cold-live-{tag}"),

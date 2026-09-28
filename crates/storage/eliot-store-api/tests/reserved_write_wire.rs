@@ -64,6 +64,7 @@ fn context() -> RequestMeta {
 
 fn transition() -> PreparedTransition {
     let mut transition = PreparedTransition {
+        contract_version: CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-1").unwrap(),
             idempotency_key: "idem-991-1".to_owned(),

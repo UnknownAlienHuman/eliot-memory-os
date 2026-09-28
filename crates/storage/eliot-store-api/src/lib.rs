@@ -4904,6 +4904,7 @@ pub fn genesis_transition(
     request.validate_for_context(context)?;
     let manifest = genesis_manifest()?;
     let mut transition = PreparedTransition {
+        contract_version: CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: request.operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
@@ -6327,6 +6328,7 @@ mod tests {
         let mut operations = BTreeMap::new();
         operations.insert("subject".to_owned(), serde_json::json!("observation-1"));
         let transition = PreparedTransition {
+            contract_version: CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: id("op-1")?,
                 idempotency_key: "retry-1".to_owned(),

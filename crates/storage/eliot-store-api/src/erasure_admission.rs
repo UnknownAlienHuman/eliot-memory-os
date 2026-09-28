@@ -210,6 +210,7 @@ pub fn admit_erasure_transition(
         Value::String(request.identity.operation_id.to_string()),
     );
     let mut transition = PreparedTransition {
+        contract_version: CONTRACT_VERSION,
         identity: request.identity.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: request.scope_id.clone(),

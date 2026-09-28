@@ -153,6 +153,7 @@ pub fn build_failure_transition(
     );
     let automation_id = request.revision.automation_id.clone();
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: request.identity.clone(),
         state_fence: request.context.state_fence.clone(),
         scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,

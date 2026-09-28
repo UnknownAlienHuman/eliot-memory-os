@@ -2133,6 +2133,7 @@ mod admitted_operation_gate_tests {
         named_operations: Vec<eliot_store_api::NamedMutationRequest>,
     ) -> eliot_store_api::PreparedTransition {
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new("op-gate").expect("operation"),
                 idempotency_key: "idem-gate".to_owned(),
@@ -2823,6 +2824,7 @@ mod concurrent_allocation_tests {
         fn admitted(operation: &str, scope: &str, subject: &str) -> PreparedTransitionForTest {
             let ctx = fixture_ctx();
             let mut transition = eliot_store_api::PreparedTransition {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
                 identity: OperationIdentity {
                     operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
                     idempotency_key: format!("idem-{operation}"),

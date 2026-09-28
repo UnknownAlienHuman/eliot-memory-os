@@ -3610,6 +3610,7 @@ mod admitted_read_tests {
         };
         let fence = test_fence();
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -4136,6 +4137,7 @@ mod admitted_read_tests {
         };
         let fence = test_fence();
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -4194,6 +4196,7 @@ mod admitted_read_tests {
         };
         let fence = test_fence();
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -4257,6 +4260,7 @@ mod admitted_read_tests {
         };
         let fence = test_fence();
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
