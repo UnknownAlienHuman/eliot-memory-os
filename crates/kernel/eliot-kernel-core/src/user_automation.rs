@@ -447,6 +447,14 @@ impl NormalizedSchedule {
     /// [`ReceiptEnvelope::issue`], which derives the receipt id from canonical
     /// core bytes, and projects the schedule's own evidence fields out of it.
     ///
+    /// `core` must already carry the compiled result as one of its artifacts,
+    /// with `ArtifactBinding::sha256` equal to [`Self::compiled_occurrences_digest`].
+    /// That is the owner's own declaration of WHAT it compiled, and it is what
+    /// the preflight assembly later re-checks against the envelope this call
+    /// mints. Requiring it here means the constructor cannot mint an envelope
+    /// that covers some other occurrence set, so a receipt and the set it names
+    /// can never be produced apart from one another.
+    ///
     /// It grants no admission and reads no clock, locale or expression text
     /// beyond hashing it. A revision constructed any other way carries no
     /// authority, because `UserAutomationPreflightProjection` requires the
@@ -456,6 +464,18 @@ impl NormalizedSchedule {
         core: eliot_receipts::ReceiptCore,
         normalizer_authority: &str,
     ) -> Result<ScheduleNormalizationReceipt, UserAutomationError> {
+        let occurrences_digest = self.compiled_occurrences_digest()?;
+        if !core
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.sha256 == occurrences_digest)
+        {
+            return Err(UserAutomationError::Receipt(
+                "normalization receipt core does not carry the compiled occurrence set as an \
+                 artifact"
+                    .to_owned(),
+            ));
+        }
         let envelope = ReceiptEnvelope::issue(core)
             .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
         Ok(ScheduleNormalizationReceipt {
@@ -463,7 +483,7 @@ impl NormalizedSchedule {
             normalizer_authority: normalizer_authority.to_owned(),
             source_digest: self.source_digest()?,
             zone_database_revision: user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
-            occurrences_digest: self.compiled_occurrences_digest()?,
+            occurrences_digest,
         })
     }
 
@@ -3495,6 +3515,77 @@ mod tests {
         let mut fence = StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis());
         fence.policy_revision = Some(PolicyRevision::genesis());
         fence
+    }
+
+    /// A minimal owner core for the schedule normalization receipt.
+    ///
+    /// The caller replaces `artifacts` with the compiled occurrence set before
+    /// minting, because the artifact digest is the owner's declaration of what
+    /// it compiled and therefore cannot be a constant here.
+    fn normalization_receipt_core() -> eliot_receipts::ReceiptCore {
+        use eliot_receipts::{
+            ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
+            ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptKind, RequestBinding,
+            WorkScopeBinding,
+        };
+
+        let state_fence = fence();
+        let request_id = RequestId::new("normalize-request").expect("request id");
+        let metadata = RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("eliot-test").expect("product"),
+            source_id: SourceId::new("calendar-owner-1").expect("source"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading::default(),
+        };
+        ReceiptCore {
+            contract: contract_identity().expect("receipt contract"),
+            kind: ReceiptKind::Verification,
+            work_scope: WorkScopeBinding {
+                scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
+                product_id: metadata.product_id.clone(),
+                resource_generation: eliot_contracts::ResourceGeneration::genesis(),
+                state_fence: state_fence.clone(),
+            },
+            task: None,
+            session: None,
+            causal: CausalBinding {
+                state_fence: state_fence.clone(),
+                transaction_sequence: eliot_contracts::TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            operation: OperationBinding {
+                operation_id: OperationId::new("normalize-schedule").expect("operation"),
+                request_id,
+                idempotency_key: "normalize-schedule".to_owned(),
+                operation_kind: "user-automation.schedule.normalize".to_owned(),
+                effect: EffectClass::Read,
+                state_fence: state_fence.clone(),
+            },
+            authority: AuthorityBinding {
+                authority_id: eliot_contracts::ContractId::new("calendar-normalizer")
+                    .expect("authority id"),
+                authority_owner: "kernel-test-calendar-owner".to_owned(),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+                allowed_effect: EffectClass::Read,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+            },
+            artifacts: Vec::<ArtifactBinding>::new(),
+            verifier: None,
+            problem: None,
+            coordination: None,
+            disposition: ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+        }
     }
 
     fn revision(state: UserAutomationConfigurationState) -> UserAutomationRevision {
