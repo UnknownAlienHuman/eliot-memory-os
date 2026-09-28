@@ -1,15 +1,24 @@
+use crate::writer::WriterHandle;
 use crate::{CompletionGate, EngineError};
+use eliot_bootstrap::{
+    BootstrapBoundIdentity, BootstrapCompileError, BootstrapDraftImportReceipt,
+    DraftIdentityVerdict,
+};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_types::{
     ClaimCardInput, CommandContext, CompletionStatus, EpistemicStatus, EvidenceAtomInput,
     FailureFingerprintInput, FailureRecordCommand, IdempotencyOptions, LifecycleWriteOptions,
     MemoryWriteEnvelope, OperationId, RelationInput, RelationType, SemanticCommand,
     SourceSnapshotInput, TaskContractInput, TaskContractStatus, ToolObservationInput, UlArtifact,
-    VerificationResult, VerificationRunInput, WriteRejectReason, normalize_bindings,
+    VerificationResult, VerificationRunInput, WriteRejectReason, WriteStatus, normalize_bindings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
@@ -802,6 +811,179 @@ fn reject_unless_hex_digest(value: &str, field: &str) -> Result<(), EngineError>
         return Err(EngineError::WriteRejected(format!(
             "{field} must be a lowercase 64-character hex digest"
         )));
+    }
+    Ok(())
+}
+
+/// Governed canonical-import trigger for bootstrap drafts (issue #1854 W2/A2).
+///
+/// The immutable candidate draft is never mutated or auto-promoted: `import`
+/// revalidates its bound identity against the current product identity, admits
+/// it through `WriteAdmissionService::admit_bootstrap_draft`, submits the
+/// envelope through the canonical writer, and persists the resulting explicit
+/// import receipt durably. `reject_draft` records an explicit rejection
+/// receipt without any canonical write. Both outcomes are content-addressed,
+/// create-new receipts; filename presence alone still promotes nothing.
+pub struct BootstrapDraftImportService;
+
+impl BootstrapDraftImportService {
+    /// Imports one published candidate-only bootstrap draft into canonical memory.
+    ///
+    /// `draft` is the published draft JSON value; `current` is the current
+    /// product identity freshly captured by the governed caller and is never
+    /// invented here; `context` supplies the write identity, scope, and
+    /// authority for the admitting write; `receipt_root` is the caller-owned
+    /// absolute directory receiving the durable receipt. The import fails
+    /// closed when the bound identity no longer matches `current`, when
+    /// admission rejects the draft, or when the canonical write does not
+    /// commit: no imported receipt is produced unless the write holds.
+    pub async fn import(
+        writer: &WriterHandle,
+        admission: &WriteAdmissionService,
+        draft: &Value,
+        current: &BootstrapBoundIdentity,
+        context: CommandContext,
+        receipt_root: &Path,
+    ) -> Result<BootstrapDraftImportReceipt, EngineError> {
+        let bound = BootstrapBoundIdentity::from_draft(draft)
+            .map_err(|error| bootstrap_rejected(&error))?;
+        if bound
+            .revalidate_against(current)
+            .map_err(|error| bootstrap_rejected(&error))?
+            != DraftIdentityVerdict::Current
+        {
+            return reject(
+                "bootstrap draft bound identity no longer matches the current product identity; revalidate before import",
+            );
+        }
+        let import = admission.admit_bootstrap_draft(draft, context)?;
+        let input_hash = import.envelope.input_hash.clone();
+        let receipt = writer.submit(import.envelope).await?;
+        if !matches!(
+            receipt.status,
+            WriteStatus::Committed | WriteStatus::IdempotentReplay
+        ) {
+            return Err(EngineError::WriteRejected(format!(
+                "canonical write {} did not commit: status={:?} reason={:?}",
+                receipt.write_id, receipt.status, receipt.rejected_reason
+            )));
+        }
+        let import_receipt = BootstrapDraftImportReceipt::imported(
+            &import.draft_digest,
+            &input_hash,
+            &receipt.write_id.to_string(),
+        )
+        .map_err(|error| bootstrap_rejected(&error))?;
+        persist_bootstrap_import_receipt(receipt_root, &import_receipt)?;
+        Ok(import_receipt)
+    }
+
+    /// Records the explicit rejection of one published candidate-only draft.
+    ///
+    /// Rejection performs no canonical write, so no writer, identity, or
+    /// context is required; the draft shape is still validated and the
+    /// resulting rejection receipt is persisted durably under `receipt_root`.
+    pub fn reject_draft(
+        draft: &Value,
+        reason: &str,
+        receipt_root: &Path,
+    ) -> Result<BootstrapDraftImportReceipt, EngineError> {
+        let material = bootstrap_draft_import_material(draft)?;
+        let receipt = BootstrapDraftImportReceipt::rejected(&material.draft_digest, reason)
+            .map_err(|error| bootstrap_rejected(&error))?;
+        persist_bootstrap_import_receipt(receipt_root, &receipt)?;
+        Ok(receipt)
+    }
+}
+
+fn bootstrap_rejected(error: &BootstrapCompileError) -> EngineError {
+    EngineError::WriteRejected(error.to_string())
+}
+
+static RECEIPT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn persist_bootstrap_import_receipt(
+    receipt_root: &Path,
+    receipt: &BootstrapDraftImportReceipt,
+) -> Result<PathBuf, EngineError> {
+    if !receipt_root.is_absolute() {
+        return reject("bootstrap import receipt root must be absolute");
+    }
+    receipt
+        .validate()
+        .map_err(|error| bootstrap_rejected(&error))?;
+    let digest = receipt.receipt_digest.clone();
+    let value = serde_json::to_value(receipt)?;
+    let mut bytes = canonical_json_bytes(&value)?;
+    bytes.push(b'\n');
+    fs::create_dir_all(receipt_root)?;
+    let destination = receipt_root.join(format!("{digest}.json"));
+    if destination.exists() {
+        let existing = fs::read(&destination)?;
+        verify_persisted_receipt_bytes(&existing, &bytes, &digest)?;
+        return Ok(destination);
+    }
+    let temporary = receipt_root.join(format!(
+        ".{digest}.{}.{}.tmp",
+        std::process::id(),
+        RECEIPT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let write_result = (|| -> io::Result<()> {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(EngineError::from(error));
+    }
+    // A hard-link publishes the already-synced bytes without replacing an
+    // existing destination on either Windows or Unix. `rename` is not a
+    // no-clobber primitive on Unix.
+    if let Err(error) = fs::hard_link(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            let existing = fs::read(&destination)?;
+            verify_persisted_receipt_bytes(&existing, &bytes, &digest)?;
+            return Ok(destination);
+        }
+        return Err(EngineError::from(error));
+    }
+    fs::remove_file(&temporary)?;
+    let readback = fs::read(&destination)?;
+    verify_persisted_receipt_bytes(&readback, &bytes, &digest)?;
+    Ok(destination)
+}
+
+fn verify_persisted_receipt_bytes(
+    actual: &[u8],
+    expected: &[u8],
+    digest: &str,
+) -> Result<(), EngineError> {
+    if actual != expected {
+        return Err(EngineError::WriteRejected(format!(
+            "existing bootstrap import receipt {digest} differs from canonical bytes"
+        )));
+    }
+    let parsed: Value = serde_json::from_slice(actual)?;
+    let embedded = parsed
+        .get("receipt_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            EngineError::WriteRejected("persisted import receipt digest is missing".to_owned())
+        })?;
+    if embedded != digest {
+        return reject("persisted import receipt digest does not match its filename");
+    }
+    let mut unsigned = parsed.clone();
+    unsigned["receipt_digest"] = Value::String(String::new());
+    if sha256_hex(&canonical_json_bytes(&unsigned)?) != digest {
+        return reject("persisted import receipt content digest is invalid");
     }
     Ok(())
 }
