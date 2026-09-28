@@ -1605,7 +1605,7 @@ impl KernelComposition {
                     && retained.resolved_binding.task_id == retained.task_id
                     && retained.resolved_binding.work_scope_id == retained.work_scope_id
                     && retained.resolved_binding.task_revision
-                        == retained.task_revision.to_string()
+                        == retained.task_revision.value().to_string()
                     && record
                         .result
                         .ticket_state_fence
@@ -2838,27 +2838,46 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.live_local_read_attempt_under_transition(operation_id, request_digest)
+        self.live_local_read_attempt_under_transition(
+            operation_id,
+            request_digest,
+            &admission_owner,
+        )
     }
 
     fn live_local_read_attempt_under_transition(
         &self,
         operation_id: &str,
         request_digest: &str,
+        pending: &super::AgentActivationPendingState,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
-        let index = self
-            .host_request_connection_index
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Ok(index
-            .values()
-            .flatten()
-            .find(|candidate| {
-                candidate.operation_id == operation_id
-                    && candidate.request_digest == request_digest
-                    && candidate.local_read_envelope.is_some()
-            })
-            .map(|candidate| candidate.local_read_attempt.clone())
+        let candidate = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == request_digest
+                        && candidate.local_read_envelope.is_some()
+                })
+                .cloned()
+        };
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let Some(envelope) = candidate.local_read_envelope.as_ref() else {
+            return Ok(None);
+        };
+        if !self.application_binding_live_for_claim(envelope, pending, false)? {
+            return Ok(None);
+        }
+        Ok(candidate
+            .local_read_attempt
+            .clone()
             .filter(LocalReadAttemptState::is_live))
     }
 
@@ -3022,7 +3041,7 @@ impl KernelComposition {
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -3103,6 +3122,7 @@ impl KernelComposition {
             DaemonReadQueue::LocalRead => self.live_local_read_attempt_under_transition(
                 &body.operation_id,
                 &body.request_sha256,
+                &admission_owner,
             )?,
             DaemonReadQueue::CampaignPacket => self.live_campaign_packet_attempt_under_transition(
                 &body.operation_id,
