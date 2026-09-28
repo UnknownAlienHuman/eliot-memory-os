@@ -664,7 +664,6 @@ pub struct AdmittedWatchdogBackupRequest {
 /// Every variant carries the owner's own values, read from the owner that
 /// produced them, never a value copied out of the request that asked for them.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub enum WatchdogBackupChannelOutcome {
     /// The `#955` spool capture owner produced one bounded fence for this exact
     /// operation, and the requested page was read from that retained fence.
@@ -1118,9 +1117,13 @@ impl BackupControlHandle {
                     .read_page(&fence, admitted.request.page.page_index)?;
                 Ok(WatchdogBackupChannelOutcome::Capture { fence, page })
             }
-            _ => Err(executable_owner_method(admitted.method.op).expect_err(
-                "executable_owner_method admits exactly the ReadSnapshotPage arm",
-            )),
+            _ => match executable_owner_method(admitted.method.op) {
+                Ok(()) => Err(SpoolError::Corrupt(
+                    "watchdog backup control reached an owner arm its executable set does not admit"
+                        .to_owned(),
+                )),
+                Err(refusal) => Err(refusal),
+            },
         }
     }
 
@@ -1142,10 +1145,8 @@ impl BackupControlHandle {
         outcome: &WatchdogBackupChannelOutcome,
     ) -> Result<(), BackupControlError> {
         let identity = &admitted.request.identity;
-        let WatchdogBackupChannelOutcome::Capture { fence, page } = outcome else {
-            return Err(BackupControlError::Rejected(
-                "watchdog backup control received an owner result of an unexpected shape".to_owned(),
-            ));
+        let (fence, page) = match outcome {
+            WatchdogBackupChannelOutcome::Capture { fence, page } => (fence, page),
         };
         if fence.source_installation != self.admission.owner_installation
             || fence.watchdog_generation != self.admission.owner_generation
