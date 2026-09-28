@@ -35,6 +35,11 @@ serde = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
 eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
+# Issue #1742: the owner-issued impact class (I6.3 `ImpactClass`) is the
+# applicability key of the applicable Decision Safety Floor, so the floor gate
+# binds the authority owner's own class rather than a renamed local enum. The
+# edge stays in the non-wasm section to keep the guest contour unchanged.
+eliot-authority = { path = "../../governor/eliot-authority", version = "0.1.0" }
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }

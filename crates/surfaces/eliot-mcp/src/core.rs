@@ -21,10 +21,10 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection,
-    bind_list_surface_budget, canonical_tool_schemas, decode_protected_request_bytes,
-    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
-    validate_tool_request_owner,
+    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, bind_act_owner_inputs,
+    bind_list_surface_budget, canonical_tool_schemas, classify_tool_request,
+    decode_protected_request_bytes, is_act_request, published_mcp_tool_surface,
+    reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1147,7 +1147,7 @@ fn validate_application_request(
                 "tool has no generated descriptor on the live surface",
             )
         })?;
-    let dispatch_task = dispatch_task_ref(request);
+    let dispatch_task = dispatch_task_binding(request, &semantic_profile)?;
     admit_dispatch_surface(
         request.tool.canonical_name(),
         &live_descriptor.definition_version,
@@ -1214,7 +1214,22 @@ fn validate_tool_semantic_owner(
 /// Binds the Kernel-verified task identity and fence revision carried into
 /// dispatch admission. Pre-task discovery requests carry no task and bind
 /// `None` rather than an invented reference.
-fn dispatch_task_ref(request: &ApplicationRequest) -> Option<String> {
+///
+/// Issue #1742: an `eliot.act` request is not dispatched from its caller
+/// contributions alone. It takes the explicit
+/// [`bind_act_owner_inputs`](crate::bind_act_owner_inputs) path, which resolves
+/// the effect class from the single registered semantic owner, refuses a
+/// read-only downgrade of a material effect, and refuses an effectful action
+/// request whose retained fence carries no task/acceptance revision - the
+/// revision the applicable Decision Safety Floor and the phase-aware decision
+/// lineage must be bound to. The caller fields travel as non-evidence
+/// contributions, and every owner input still owed is named rather than
+/// fabricated here; the semantic owner resolves them downstream.
+fn dispatch_task_binding(
+    request: &ApplicationRequest,
+    semantic_profile: &crate::ToolSemanticProfile,
+) -> Result<Option<String>, BridgeError> {
+    let fence = request.identity.request.state_fence.clone();
     let task_id = request
         .identity
         .request
@@ -1222,17 +1237,37 @@ fn dispatch_task_ref(request: &ApplicationRequest) -> Option<String> {
         .task_id
         .as_ref()
         .map(|id| id.as_str().to_owned());
-    let task_revision = request
-        .identity
-        .request
-        .state_fence
-        .task_revision
-        .as_ref()
-        .map(|revision| revision.value());
-    match (task_id, task_revision) {
-        (Some(id), Some(revision)) => Some(format!("{id}@{revision}")),
-        (Some(id), None) => Some(id),
-        (None, Some(revision)) => Some(format!("task-revision:{revision}")),
+    if !is_act_request(&request.tool) {
+        return Ok(task_ref(&fence, task_id.as_deref()));
+    }
+    let ToolRequest::Act(input) = &request.tool else {
+        return Err(BridgeError::invalid(
+            "tool.name",
+            "only an eliot.act request carries an action input",
+        ));
+    };
+    let requirement = classify_tool_request(&request.tool).map_err(|_| {
+        BridgeError::invalid(
+            "tool.name",
+            "eliot.act has no canonical operation requirement",
+        )
+    })?;
+    let binding = bind_act_owner_inputs(
+        input,
+        &requirement,
+        semantic_profile,
+        &fence,
+        task_id.as_deref(),
+    )?;
+    Ok(binding.owner_task_ref)
+}
+
+/// The exact task reference the dispatch gate is given for a non-action request.
+fn task_ref(fence: &eliot_contracts::StateFence, task_id: Option<&str>) -> Option<String> {
+    match (task_id, fence.task_revision) {
+        (Some(task), Some(revision)) => Some(format!("{task}@{}", revision.value())),
+        (Some(task), None) => Some(task.to_owned()),
+        (None, Some(revision)) => Some(format!("task-revision:{}", revision.value())),
         (None, None) => None,
     }
 }
