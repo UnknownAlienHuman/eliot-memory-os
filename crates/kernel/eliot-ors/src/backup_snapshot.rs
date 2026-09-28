@@ -2222,8 +2222,8 @@ impl OrsBackupSnapshot {
     /// makes the `EmptyDenominator` arm equally safe.
     pub fn expected_member_roster(&self) -> Result<Vec<(RowFamilyKind, String)>, OrsError> {
         match &self.completeness {
-            BackupCompleteness::Complete => {}
-            BackupCompleteness::Partial {
+            BackupCompleteness::Complete
+            | BackupCompleteness::Partial {
                 reason: BackupPartialReason::EmptyDenominator,
             } => {}
             BackupCompleteness::Partial { .. } | BackupCompleteness::Incomplete { .. } => {
@@ -2663,20 +2663,18 @@ fn measure_family_tail(
         .unwrap_or(u64::MAX);
     let base = page_family_continuation(page, family)
         .map_or(0, |continuation| continuation.cursor.emitted_rows);
-    let walked = base
-        .checked_add(emitted)
-        .ok_or(OrsError::InvalidField {
-            field: "backup_family_continuation",
-            reason: "emitted family row count overflow",
-        })?;
+    let walked = base.checked_add(emitted).ok_or(OrsError::InvalidField {
+        field: "backup_family_continuation",
+        reason: "emitted family row count overflow",
+    })?;
     Ok(FamilyPageTail { emitted, walked })
 }
 /// The one page's continuation for `family`, or `None` when the page declares no
 /// denominator for it.
-fn page_family_continuation<'a>(
-    page: &'a OrsBackupPage,
+fn page_family_continuation(
+    page: &OrsBackupPage,
     family: RowFamilyKind,
-) -> Option<&'a OrsFamilyContinuation> {
+) -> Option<&OrsFamilyContinuation> {
     match family {
         RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
         RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
@@ -2737,12 +2735,7 @@ fn check_family_successor(
     next_tail: &FamilyPageTail,
 ) -> Result<(), OrsError> {
     let field = family_continuation_field(family);
-    let refused = |reason: &'static str| -> OrsError {
-        OrsError::InvalidField {
-            field,
-            reason,
-        }
-    };
+    let refused = |reason: &'static str| -> OrsError { OrsError::InvalidField { field, reason } };
     let Some(successor) = page_family_continuation(next_page, family) else {
         return Err(refused(
             "a page after a declared cursor-paged family must carry that family's continuation",
@@ -2750,9 +2743,9 @@ fn check_family_successor(
     };
     if successor.cursor != *continuation.frontier() {
         return Err(match &continuation.state {
-            OrsAxisState::Open(_) => refused(
-                "the next page did not continue from this page's exact emitted family tail",
-            ),
+            OrsAxisState::Open(_) => {
+                refused("the next page did not continue from this page's exact emitted family tail")
+            }
             OrsAxisState::Exhausted(_) => refused(
                 "a page after an exhausted family did not resume from the family's exact final frontier",
             ),
@@ -2760,10 +2753,14 @@ fn check_family_successor(
     }
     if let OrsAxisState::Exhausted(_) = &continuation.state {
         if successor.state.is_open() {
-            return Err(refused("an exhausted family axis may not become open again"));
+            return Err(refused(
+                "an exhausted family axis may not become open again",
+            ));
         }
         if next_tail.emitted != 0 {
-            return Err(refused("an exhausted family axis must emit no further rows"));
+            return Err(refused(
+                "an exhausted family axis must emit no further rows",
+            ));
         }
     }
     Ok(())
