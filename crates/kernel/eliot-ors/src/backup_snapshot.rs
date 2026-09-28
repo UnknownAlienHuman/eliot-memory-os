@@ -9,12 +9,22 @@
 //! I14-21: unknown stays reconciling. Import receipts keep an explicit
 //! per-entry outcome including `Unresolved`; callers attest full validation
 //! via [`OrsBackupImportReceipt::known_zero_unresolved`], which since issue
-//! #953/A17 requires a [`CurrentOwnerValidation`] — a record of what the
+//! #953/A17 requires a [`CurrentOwnerValidation`] - a record of what the
 //! CURRENT owner was asked about the receipt's members and what it answered,
-//! observed from the store's own live recovery rows — and compares that
+//! observed from the store's own live recovery rows - and compares that
 //! record's asked-about roster against the receipt's members in both
 //! directions. A zero `unresolved_count` is not a zero somebody validated, so
 //! it is not trusted. No blind retry.
+//!
+//! A17 also requires the RESTORE OWNER's own receipt, not only ORS reading
+//! ORS: every [`OrsBackupImportReceipt`] carries a required
+//! [`eliot_store_api::RestoreValidationReceipt`], and the rule that decides it
+//! is the owner's own `validate()` - `unresolved_members == 0` requires
+//! `completeness.is_complete()`, and resolved plus unresolved must sum to the
+//! denominator. The owner is asked twice, in [`OrsBackupImportReceipt::new`] and
+//! again on every [`OrsBackupImportReceipt::known_zero_unresolved`], and the
+//! owner's recorded `unresolved_members` is bound to the receipt's own count by
+//! content. Presence of the field is never the proof.
 //!
 //! Issue #2884 adds the typed row-family cursor. A family that has no canonical
 //! operation order cannot share the operational `after_order` window, so it is
@@ -2871,8 +2881,27 @@ pub struct OrsBackupImportReceipt {
     /// receipt, and it is what a replayed receipt re-evaluates from instead of
     /// carrying a verdict forward.
     pub current_owner_validation: CurrentOwnerValidation,
+    /// The owner-issued validation receipt covering this import (issue #953,
+    /// A17).
+    ///
+    /// This is the RESTORE contour's own type, not the capture one: an import
+    /// moves an archive into an isolated destination, so
+    /// [`eliot_store_api::RestoreValidationReceipt`] is the truthful receipt and
+    /// [`eliot_store_api::SnapshotValidationReceipt`] (which binds a capture
+    /// handle and a capture denominator) is not. It is REQUIRED, not optional:
+    /// a receipt that exists at all carries one, so a zero `unresolved_count` is
+    /// never trusted without an owner receipt beside it.
+    ///
+    /// It is validated by the OWNER's own method,
+    /// [`eliot_store_api::RestoreValidationReceipt::validate`], which is where
+    /// A17's rule actually lives: `unresolved_members == 0` requires
+    /// `completeness.is_complete()`, and resolved plus unresolved must sum to
+    /// the denominator. Presence of this field is not the proof and never is
+    /// treated as one; the owner decides, twice — once in
+    /// [`Self::new`], once again on every [`Self::known_zero_unresolved`].
+    pub owner_validation: eliot_store_api::RestoreValidationReceipt,
     /// Typed verdict of [`Self::known_zero_unresolved`] for
-    /// [`Self::current_owner_validation`].
+    /// [`Self::current_owner_validation`] and [`Self::owner_validation`].
     pub known_zero_verdict: KnownZeroVerdict,
 }
 impl OrsBackupImportReceipt {
@@ -2886,6 +2915,14 @@ impl OrsBackupImportReceipt {
     /// A gate refusal is a verdict, not a construction failure, so it is
     /// recorded on the receipt and does not fail `new` — the caller reads the
     /// verdict and the standalone gate.
+    ///
+    /// `owner_validation` is required and is checked by the OWNER's own
+    /// [`eliot_store_api::RestoreValidationReceipt::validate`], the only place
+    /// A17's rule is stated. Two obligations are added here and are NOT the same
+    /// refusal as the gate: an owner receipt the owner itself refuses fails
+    /// construction, and a count/vector disagreement fails construction. Neither
+    /// is a known-zero verdict — a quarantined import legitimately carries
+    /// unresolved members, so a nonzero count is never a construction failure.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot_digest: String,
@@ -2895,10 +2932,40 @@ impl OrsBackupImportReceipt {
         unresolved_count: u64,
         import_at_ms: i64,
         current_owner_validation: CurrentOwnerValidation,
+        owner_validation: eliot_store_api::RestoreValidationReceipt,
     ) -> Result<Self, OrsError> {
         require_digest(&snapshot_digest, "backup_snapshot_digest")?;
         require_installation_id(&source_installation, "source_installation_id")?;
         require_installation_id(&destination_installation, "destination_installation_id")?;
+        // The owner decides whether its own receipt is a receipt. Owner prose is
+        // never propagated: ORS reports a fixed typed variant so provider text
+        // cannot change control meaning (the `StoreFailureRetentionRecord`
+        // precedent in `model.rs`).
+        owner_validation
+            .validate()
+            .map_err(|_| OrsError::InvalidField {
+                field: "backup_owner_validation",
+                reason: "owner contract rejected the restore validation receipt",
+            })?;
+        // The count is caller-supplied and the vector is caller-supplied, so
+        // until this cross-check they could disagree: a caller could declare
+        // `unresolved_count: 0` beside a `per_entry` full of `Unresolved`, and
+        // the declared count is the number a reader trusts. Recomputed from the
+        // vector here, by content, on the ORIGINAL outcomes.
+        let observed_unresolved = per_entry
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, PerEntryOutcome::Unresolved { .. }))
+            .count();
+        let observed_unresolved =
+            u64::try_from(observed_unresolved).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        if observed_unresolved != unresolved_count {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "backup_import_unresolved_count",
+                reason: format!(
+                    "declared unresolved count is {unresolved_count} but the per-entry outcomes carry {observed_unresolved}"
+                ),
+            });
+        }
         let mut receipt = Self {
             snapshot_digest,
             source_installation,
@@ -2907,6 +2974,7 @@ impl OrsBackupImportReceipt {
             unresolved_count,
             import_at_ms,
             current_owner_validation,
+            owner_validation,
             known_zero_verdict: KnownZeroVerdict::Refused {
                 reason: "the known-zero gate has not been evaluated for this receipt".to_owned(),
             },
@@ -2951,8 +3019,23 @@ impl OrsBackupImportReceipt {
     ///    [`RowFamilyKind::RecoveryInbox`] and
     ///    [`RowFamilyKind::RecoveryProblems`] — a validation that did not read
     ///    the current owner's live recovery state proves nothing about it;
-    /// 6. `unresolved_count == 0` and no `per_entry` outcome is
+    /// 6. the OWNER's own
+    ///    [`eliot_store_api::RestoreValidationReceipt::validate`] accepts
+    ///    [`Self::owner_validation`] — re-run here on the recorded value, so a
+    ///    receipt edited after construction is refused at the gate and not only
+    ///    at [`Self::new`];
+    /// 7. the owner RECORDED `unresolved_members` equals [`Self::unresolved_count`]
+    ///    — a content comparison against the value the owner wrote down, not a
+    ///    digest recomputed over what ORS holds, so the owner and the receipt
+    ///    cannot both be self-consistent about different imports;
+    /// 8. `unresolved_count == 0` and no `per_entry` outcome is
     ///    [`PerEntryOutcome::Unresolved`].
+    ///
+    /// Clauses 6-8 CONJUNCT with clauses 1-5; none replaces another. In
+    /// particular clause 8 keeps the `per_entry` scan, and clauses 1-5 keep the
+    /// ORS-side record checks: the owner's counts and ORS's per-entry outcomes
+    /// are two different observations and both must agree that nothing is
+    /// unresolved.
     ///
     /// Every refusal is [`OrsError::ReconciliationMismatch`]: I14-21 — unknown
     /// stays reconciling, and a zero that nobody validated is unknown, not
@@ -2975,6 +3058,19 @@ impl OrsBackupImportReceipt {
                 .consulted_families
                 .contains(&RowFamilyKind::RecoveryProblems)
         {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        // The owner's own rule, re-run at the gate on the recorded receipt. A
+        // refusal here is a fixed typed variant, never the owner's prose, so
+        // owner text cannot change what ORS reports.
+        self.owner_validation
+            .validate()
+            .map_err(|_| OrsError::ReconciliationMismatch)?;
+        // The owner's recorded unresolved count must be the ORS count. Compared
+        // by content against the value the owner recorded: a digest recomputed
+        // over what ORS holds would only ever agree with itself and would let a
+        // receipt for a different import vouch for this one.
+        if self.owner_validation.unresolved_members != self.unresolved_count {
             return Err(OrsError::ReconciliationMismatch);
         }
         let any_unresolved = self

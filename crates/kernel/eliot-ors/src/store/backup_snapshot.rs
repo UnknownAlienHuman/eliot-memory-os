@@ -256,6 +256,19 @@
 //! derived from the untrusted import vector's own length: a validation whose
 //! asked-about roster is built from the vector it is meant to police can never
 //! disagree with it, and its gate could then never fire.
+//!
+//! The ORS-side record above is necessary and not sufficient: it is ORS reading
+//! ORS, so it cannot be the whole of "complete current owner validation". The
+//! receipt therefore ALSO carries the RESTORE owner's own validation receipt,
+//! `eliot_store_api::RestoreValidationReceipt`, and that receipt is checked by
+//! the owner's own `validate()` — the method in which the known-zero rule is
+//! actually written down (`unresolved_members == 0` requires
+//! `completeness.is_complete()`, and resolved plus unresolved must sum to the
+//! denominator). `observe_restore_owner_validation` builds it from the live
+//! store state in the SAME read transaction as the ORS-side record, so the two
+//! answers describe one instant, and the gate binds the owner's recorded
+//! `unresolved_members` to the receipt's own count. Presence of either field is
+//! never the proof: the owner's method is what decides.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -3527,11 +3540,24 @@ fn observe_current_owner_validation(
 /// the receipt it lands on describe one instant. `import_page_quarantined` opens
 /// its own read the same way, for the same reason: a validation assembled from
 /// reads taken at different moments would not be an answer to any question.
+///
+/// `owner_validation` is the RESTORE owner's own
+/// [`eliot_store_api::RestoreValidationReceipt`], and it is REQUIRED, not
+/// derived. ORS does not mint it: a validation receipt is the owner's own
+/// statement about the restore it performed, and ORS reconstructing one from its
+/// local tables would be ORS answering on the owner's behalf — the authority
+/// grant I05-13 forbids. The caller that performed or received the restore
+/// supplies it, and the builder's only business with it is to hand it to
+/// [`OrsBackupImportReceipt::new`], which asks the OWNER's own `validate()`
+/// whether it is a receipt at all. Consequently a receipt cannot be built here
+/// without a validating owner receipt beside it: a zero `unresolved_count` is
+/// never reachable on this path unaccompanied.
 pub(super) fn reconcile_import_receipt(
     database: &Database,
     import: &OrsBackupImportRequest,
     per_entry: &[(String, PerEntryOutcome)],
     import_at_ms: i64,
+    owner_validation: eliot_store_api::RestoreValidationReceipt,
 ) -> Result<OrsBackupImportReceipt, OrsError> {
     let unresolved_count = per_entry
         .iter()
@@ -3553,6 +3579,7 @@ pub(super) fn reconcile_import_receipt(
         unresolved_count,
         import_at_ms,
         current_owner_validation,
+        owner_validation,
     )
 }
 
@@ -3566,10 +3593,14 @@ pub(super) fn reconcile_import_receipt(
 /// disagrees with the validation it was recorded beside, is corrected on replay
 /// instead of being trusted. That re-evaluation is the whole point: the verdict
 /// is a report of the gate, never the gate's input, so a caller cannot replay a
-/// receipt into a satisfied gate by writing a satisfied verdict into it. No
-/// store read happens here either — the recorded validation is the record, and
-/// re-reading live state would make a replay's answer depend on when it was
-/// replayed rather than on what it attests.
+/// receipt into a satisfied gate by writing a satisfied verdict into it. The
+/// re-evaluation covers BOTH recorded validations — the ORS-side
+/// [`CurrentOwnerValidation`] and the restore owner's own
+/// [`eliot_store_api::RestoreValidationReceipt`], whose `validate()` is re-run
+/// here as well, so a replay cannot launder an owner-invalid receipt into a
+/// satisfied gate either. No store read happens here either — the recorded
+/// validation is the record, and re-reading live state would make a replay's
+/// answer depend on when it was replayed rather than on what it attests.
 pub(super) fn reconcile_lost_import_response(
     prior: &OrsBackupImportReceipt,
 ) -> OrsBackupImportReceipt {

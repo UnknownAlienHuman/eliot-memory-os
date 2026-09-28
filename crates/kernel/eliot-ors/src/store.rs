@@ -3607,13 +3607,34 @@ impl RedbRecoveryStore {
     /// `current_owner_validation` covers this receipt's members completely, is
     /// bound to this snapshot, was read from the live recovery families, and
     /// reports no still-unresolved identity.
+    ///
+    /// `owner_validation` is the RESTORE owner's own
+    /// [`eliot_store_api::RestoreValidationReceipt`] and is REQUIRED on this
+    /// production entrypoint. It is the only path that builds an
+    /// [`crate::backup_snapshot::OrsBackupImportReceipt`], so requiring it here
+    /// is what makes A17 reachable rather than merely declared: every receipt
+    /// this store issues carries an owner receipt the owner's own `validate()`
+    /// accepted, and the known-zero gate additionally binds the owner's recorded
+    /// `unresolved_members` to the receipt's own count. ORS does not derive this
+    /// value from its local tables — a validation receipt is the owner's own
+    /// statement, and reconstructing one here would be ORS answering for the
+    /// owner. A receipt the owner refuses fails construction with a fixed typed
+    /// error, and a quarantined import with genuinely unresolved members still
+    /// builds: nonzero is not a construction failure.
     pub fn reconcile_backup_import(
         &self,
         import: &crate::backup_snapshot::OrsBackupImportRequest,
         per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
         import_at_ms: i64,
+        owner_validation: eliot_store_api::RestoreValidationReceipt,
     ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
-        backup_snapshot::reconcile_import_receipt(&self.database, import, per_entry, import_at_ms)
+        backup_snapshot::reconcile_import_receipt(
+            &self.database,
+            import,
+            per_entry,
+            import_at_ms,
+            owner_validation,
+        )
     }
 
     /// Replays a lost import response without any duplicate effect.
