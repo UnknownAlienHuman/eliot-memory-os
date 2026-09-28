@@ -999,10 +999,19 @@ fn read_frozen_outer(
 
 /// Re-reads the documentation evidence package from this machine.
 ///
-/// The package and every live workspace file are read from disk here, so both
-/// byte sides of the re-extraction comparison are machine-observed rather than
-/// asserted by the bundle. The re-extracted package bytes are the archive
-/// members the frozen package really holds.
+/// What is machine-observed here, exactly: the package exists and is a real
+/// ZIP archive, and every live workspace file is read from disk. What is NOT
+/// observed here: the archive members themselves. Extracting a ZIP member needs
+/// a decompressor, this workspace declares none, and a hand-rolled inflate for
+/// a verification check would be exactly the invented mechanism the item does
+/// not name. So `packaged_bytes` stays the byte side the record carries and is
+/// compared against the recorded manifest digest and against the live workspace
+/// bytes; the archive re-extraction that I18.31:56 requires is performed by the
+/// FROZEN outer script itself, whose own exit code `run_frozen_outer_check`
+/// requires. The two are complementary and neither stands in for the other:
+/// this function ties the record to the machine, the frozen script re-extracts
+/// the archive. This paragraph exists so no reviewer reads a guarantee into the
+/// `PK` check that the code does not perform.
 fn read_package_documents(
     freeze: &DocumentationFreezeRecord,
     recorded: &[PackageDocument],
@@ -1015,7 +1024,7 @@ fn read_package_documents(
     })?;
     if bytes.len() < 4 || &bytes[..2] != b"PK" {
         return Err(CliError::Contract(format!(
-            "evidence package {} is not a re-extractable ZIP",
+            "evidence package {} is not a ZIP archive",
             freeze.package.display()
         )));
     }
@@ -1054,12 +1063,23 @@ fn run_frozen_outer_check(
 ) -> Result<(), CliError> {
     let command = DiscriminatorCommand {
         executable: freeze.interpreter.clone(),
-        argv: vec![
-            freeze.script.to_string_lossy().into_owned(),
-            "verify".to_owned(),
-            "--package".to_owned(),
-            freeze.package.to_string_lossy().into_owned(),
-        ],
+        argv: {
+            let mut argv = vec![
+                freeze.script.to_string_lossy().into_owned(),
+                "verify".to_owned(),
+                "--package".to_owned(),
+                freeze.package.to_string_lossy().into_owned(),
+            ];
+            // The frozen script takes `--workspace` itself, so when a live
+            // workspace is configured the independent side runs its own
+            // divergence check too instead of this process being the only one
+            // that ever compares the package against the workspace.
+            if let Some(workspace) = &freeze.workspace {
+                argv.push("--workspace".to_owned());
+                argv.push(workspace.to_string_lossy().into_owned());
+            }
+            argv
+        },
         working_directory: freeze
             .script
             .parent()
@@ -1102,13 +1122,17 @@ fn observe_documentation_evidence(
             "the documentation evidence special case requires a frozen outer script".to_owned(),
         ));
     };
-    run_frozen_outer_check(freeze, admission)?;
+    // The pin is read and the script bytes are re-hashed BEFORE the script is
+    // launched, never after: `freeze.script` is a bundle-supplied absolute path,
+    // so launching first would execute whatever that path names and only then
+    // discover it is not the frozen script. Verify first, then execute.
     let (pin, script_bytes) = read_frozen_outer(freeze)?;
     if record.script.pin != pin {
         return Err(CliError::Contract(
             "recorded documentation freeze differs from the pin on this machine".to_owned(),
         ));
     }
+    run_frozen_outer_check(freeze, admission)?;
     let script = FrozenOuterScript::new(pin, script_bytes)?;
     let documents = read_package_documents(freeze, &record.documents)?;
     let rebuilt = DocumentationEvidenceRecord::new(
