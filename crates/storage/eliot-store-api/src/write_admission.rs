@@ -140,30 +140,35 @@
 //! [`WriteSubmission::validate`] enforces the I5.19 state invariants rather
 //! than describing them.
 //!
-//! The decision is taken at the I5.6 steps 1-12 gate boundary, which is strictly
-//! before I5.6 step 13 stages the operation in ORS. That placement is what
-//! makes `not_accepted` honest here: no Ordering Scope sequence has been
-//! reserved and no external effect has been issued, so the state can claim
-//! exactly that. A refusal taken after a reservation is issued is a different
-//! act with a different owner (the Kernel reserved-write path) and is not
-//! represented here.
+//! The decisions this module can take are taken at the I5.6 steps 1-12 gate
+//! boundary, which is strictly before I5.6 step 13 stages the operation in
+//! ORS. That placement is what makes them honest here: no Ordering Scope
+//! sequence has been reserved and no external effect has been issued, so each
+//! state can claim exactly that. A refusal taken after a reservation is issued
+//! is a different act with a different owner (the Kernel reserved-write path)
+//! and is not represented here.
 //!
-//! `ors_stage_ref` is the deterministic Store-side handle derived from the exact
-//! operation identity (see [`derive_ors_stage_ref`]). It is the handle the
-//! owner stages and polls under and it carries no ORS authority, no sequence,
-//! and no epoch. When a sealed reservation projection exists, its
-//! `reservation_id` is the owner-issued ORS label under this same module owner.
+//! # `staged` is not produced here
 //!
-//! The HANDLE and the STATE are separate claims and only the handle is
-//! derived. `ors_stage_ref` is a pure function of the operation identity, so it
-//! is computable before any ORS exists. `WriteSubmissionState::Staged` is the
-//! pre-ORS admission DECISION to stage, taken at the I5.6 steps 1-12 gate
-//! boundary; the ORS-backed staging act of I5.6 step 13 follows it and is the
-//! first point at which an owner-issued stage record exists. Nothing in this
-//! crate keys ORS state by the handle, and a `staged` submission is not
-//! evidence that ORS accepted anything — it is evidence that this exact
-//! operation identity is the one the owner will stage next, and that the
-//! caller must not create a duplicate.
+//! I5.19 fixes the meaning of the third token and it is not a Store-API
+//! meaning: "`staged` means ORS accepted the exact operation identity; caller
+//! must not create a duplicate and may poll." I5.6 step 13 is the ORS-backed
+//! staging act that makes that true, and I5.2 forbids reporting
+//! `accepted_pending` at all "if ORS cannot durably stage the complete opaque
+//! operation". A decision taken at the steps 1-12 boundary has staged nothing,
+//! so this module does not build a [`WriteSubmissionState::Staged`] value and
+//! the accepted arm of [`admit_write_submission`] reports that no
+//! front-door submission is owed instead of a `staged` one.
+//!
+//! That is the whole reason `ors_stage_ref` is not filled in here. A handle
+//! computed from the operation identity names an operation, but naming an
+//! operation is not evidence that the ORS owner accepted it, and a value whose
+//! state is the I5.19 `staged` token asserts exactly that evidence. Filling the
+//! field from a pure derivation let the token carry a guarantee no act
+//! performed; the field stays absent here and the state is not emitted. When a
+//! sealed reservation projection exists, its owner-issued `reservation_id`
+//! under this same module owner is the real label, and the ORS-owning route
+//! that stages is the only place a `staged` submission can be built.
 //!
 //! # Activated named-mutation inventory
 //!
@@ -1196,12 +1201,11 @@ pub const NOT_ACCEPTED_RETRY_IDENTITY_RULE: &str = "a corrected payload uses a n
 /// I5.19: the exact operation identity is accepted once, so the caller must not
 /// create a duplicate and may poll.
 ///
-/// The acceptance named here is scoped to the admission DECISION to stage, and
-/// that scope is exact: the rule is decided at the I5.6 steps 1-12 gate
-/// boundary, strictly before the I5.6 step 13 ORS-backed staging act. It binds
-/// the caller to one operation identity for the request and nothing more; it
-/// grants no Ordering Scope sequence, no epoch, and no external effect, and it
-/// is not evidence that ORS holds a record for this operation.
+/// The acceptance named here is the I5.19 acceptance, because the I5.19
+/// `staged` state is: it is written by the owner that performed the I5.6 step
+/// 13 ORS staging act and binds the caller to that one operation identity. It
+/// grants no Ordering Scope sequence, no epoch, and no external effect of its
+/// own, and it is not carried by any decision this module takes.
 pub const STAGED_RETRY_IDENTITY_RULE: &str = "the exact operation identity is accepted once; the caller must not create a duplicate and \
      may poll for the terminal receipt";
 
@@ -1231,19 +1235,20 @@ pub enum WriteSubmissionState {
     /// The requested domain mutation was not staged, no Ordering Scope sequence
     /// was reserved, and no external effect was issued.
     NotAccepted,
-    /// The admission decision to stage the exact operation identity under one
-    /// stage handle, taken at the pre-ORS gate boundary.
+    /// I5.19: "`staged` means ORS accepted the exact operation identity;
+    /// caller must not create a duplicate and may poll."
     ///
-    /// The scope of this claim is exact and is deliberately narrower than the
-    /// word "staged" suggests on its own. This state says: the request passed
-    /// the pre-ORS gates, and this is the one operation identity the owner will
-    /// stage next, under the derived handle carried beside it. It does NOT say
-    /// ORS has accepted the operation. The decision is emitted before the ORS
-    /// exists in the call — strictly before the I5.6 step 13 ORS-backed
-    /// staging act, which is the separate act that will key an owner-issued
-    /// stage record under that handle. Nothing at this point has reserved a
-    /// sequence, issued an epoch, or produced an external effect, and this
-    /// state grants none of those.
+    /// The claim is the I5.19 claim verbatim, so it is exactly as strong as the
+    /// ORS-backed staging act of I5.6 step 13 and no stronger. This module
+    /// takes its decisions at the I5.6 steps 1-12 boundary, before that act,
+    /// and therefore never builds a value in this arm: a caller that observed
+    /// the `staged` token anywhere would be told that ORS accepted this exact
+    /// operation identity, and nothing before step 13 can support that. The
+    /// state stays in the closed vocabulary because I5.19 names exactly three
+    /// of them, and [`WriteSubmission::validate`] keeps the invariant that a
+    /// `staged` submission carries a stage reference and no receipt — but the
+    /// reference has to come from the owner that staged, not from a name
+    /// computed from the operation identity.
     Staged,
     /// An already final canonical receipt exists for the idempotency key.
     ResolvedExisting,
@@ -1430,33 +1435,6 @@ impl WriteSubmission {
         Ok(submission)
     }
 
-    /// Reports an accepted exact operation identity as a `staged` decision.
-    ///
-    /// The stage handle is derived from the exact operation identity, so the
-    /// owner and the caller name the same staged operation without a second
-    /// identity scheme. No final receipt is referenced: a staged submission is
-    /// not final.
-    ///
-    /// The claim is scoped to the decision, not to ORS. This value is produced
-    /// at the pre-ORS admission gate, strictly before the I5.6 step 13
-    /// ORS-backed staging act that the derived handle will key, and nothing
-    /// here observes an ORS record.
-    pub fn staged(operation_id: &OperationId, request_hash: &str) -> Result<Self, StoreError> {
-        let submission = Self {
-            submission_id: derive_submission_id(operation_id, request_hash)?,
-            operation_id: operation_id.clone(),
-            request_hash: request_hash.to_owned(),
-            state: WriteSubmissionState::Staged,
-            reason_codes: Vec::new(),
-            ors_stage_ref: Some(derive_ors_stage_ref(operation_id)),
-            canonical_receipt_ref: None,
-            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
-            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
-        };
-        submission.validate()?;
-        Ok(submission)
-    }
-
     /// Reports that an already final receipt exists for the idempotency key.
     ///
     /// `receipt_operation_id` is the operation identity of the final receipt
@@ -1594,9 +1572,7 @@ impl WriteSubmission {
                 // staged nothing, a staged decision requires it because it did
                 // — and an unpolled third arm would let a wire-decoded
                 // submission carry a stage handle for an operation that will
-                // never be staged under it, which is exactly the false
-                // "ORS accepted this" claim `WriteSubmissionState::Staged`
-                // documents that it does not make.
+                // never be staged under it.
                 if self.ors_stage_ref.is_some() {
                     return Err(StoreError::InvalidField {
                         field: "submission.ors_stage_ref",
@@ -1663,14 +1639,14 @@ pub fn derive_submission_id(
 
 /// Derives the deterministic stage handle of one exact operation identity.
 ///
-/// The handle is derived, not issued: it names the staged operation for its
-/// exact operation identity so the owner stages and the caller polls under the
-/// same value, without a second identity scheme and without a clock, sequence,
-/// epoch, or ORS authority. Because it is a pure function of the operation
-/// identity it is computable before ORS exists in the call, and nothing in this
-/// crate keys an ORS record by it: it is the key the later I5.6 step 13
-/// ORS-backed staging act will use, not evidence that such a record is
-/// already held.
+/// The handle is derived, not issued: it is a pure function of the operation
+/// identity, computable with no clock, sequence, epoch, or ORS authority. That
+/// is exactly why it cannot be a `WriteSubmission::ors_stage_ref`. A derived
+/// name identifies an operation; I5.19's `staged` state asserts that the ORS
+/// owner accepted it, and only the owner's own staging act of I5.6 step 13 can
+/// support that. Attaching a derived handle to a `staged` submission put a
+/// predictable name where owner-issued evidence belongs, so this handle is no
+/// longer used as a submission's stage reference.
 #[must_use = "a derived stage handle must be used or checked"]
 pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
     sha256_hex(
@@ -1682,7 +1658,7 @@ pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
     )
 }
 
-/// Decides one I5.19 admission result from the ordered pre-reservation gates.
+/// Decides the I5.19 admission result this boundary owes, if it owes one.
 ///
 /// This is the single admission decision function. It is pure over data the
 /// caller already holds, reads no clock, queries no owner, reserves nothing,
@@ -1694,10 +1670,14 @@ pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
 ///   request hash, otherwise this is an identity conflict;
 /// - a gate refusal is a typed `not_accepted` decision carrying the closed
 ///   reason code and, for an over-bound envelope, the split directive;
-/// - an accepted exact operation identity with no final receipt is `staged`
-///   under the stage handle derived from that identity. That is the decision
-///   to stage, taken at the pre-ORS gate; it precedes the I5.6 step 13
-///   ORS-backed staging act and observes no ORS record.
+/// - a passing gate with no final receipt owes NO submission and reports
+///   `Ok(None)`. I5.19's remaining token for an accepted operation is
+///   `staged`, which means ORS accepted the exact operation identity, and this
+///   boundary is I5.6 steps 1-12 — before the step 13 staging act that would
+///   make that true. Reporting a submission here would put the I5.19 `staged`
+///   vocabulary word on a value nothing staged, so the accepted path returns no
+///   front-door result at all and the caller proceeds to the canonical receipt
+///   the I5.6 step 14 wait-for-receipt path produces.
 ///
 /// A request whose own identity is unnameable — a malformed operation identity
 /// or canonical request hash — has no submission identity to report a decision
@@ -1707,19 +1687,20 @@ pub fn admit_write_submission(
     transition: &PreparedTransition,
     gate: Result<(), StoreError>,
     existing_final_receipt: Option<&WriteReceipt>,
-) -> Result<WriteSubmission, StoreError> {
+) -> Result<Option<WriteSubmission>, StoreError> {
     let identity: &OperationIdentity = &transition.identity;
     if let Some(receipt) = existing_final_receipt {
-        return resolve_existing_submission(identity, receipt);
+        return resolve_existing_submission(identity, receipt).map(Some);
     }
     match gate {
-        Ok(()) => WriteSubmission::staged(&identity.operation_id, &identity.canonical_request_hash),
+        Ok(()) => Ok(None),
         Err(refusal) => WriteSubmission::not_accepted(
             &identity.operation_id,
             &identity.canonical_request_hash,
             &refusal,
             split_directive_for(transition, &refusal),
-        ),
+        )
+        .map(Some),
     }
 }
 

@@ -41,9 +41,8 @@ use eliot_store_api::{
     PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, WriteSubmission, WriteSubmissionState, admit_write_submission,
-    canonical_request_hash, dreamer_job_queue_key, generated_operation_manifests,
-    verify_canonical_request_hash,
+    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -799,17 +798,17 @@ impl KernelStoreGateway {
             ));
         }
         // I5.19: `admit_prepared_transition` is the single decision point for
-        // this route. It returns the typed `staged` decision on its accepted
-        // arm and `Err` on every other outcome, so a `not_accepted` or
-        // `resolved_existing` value can never reach the store send below and no
-        // state re-check is owed here. There is deliberately no second
-        // `admission.state != Staged` guard: that check could not fire, and
-        // claiming it as a live defence against a second canonical transition
-        // for one identity would assert a guarantee the code never performs.
-        // A gate that later resolves an existing receipt must refuse inside
-        // `admit_prepared_transition` (it has no existing-receipt lookup
-        // today) rather than return that decision as a success this route
-        // would then have to re-inspect.
+        // this route. It reports the typed `not_accepted` or
+        // `resolved_existing` decision as an `Err` and returns nothing on its
+        // accepted arm, so a refused submission can never reach the store send
+        // below and no state re-check is owed here. The accepted arm carries no
+        // `staged` value: this is the I5.6 steps 1-12 boundary, and the I5.19
+        // `staged` state asserts an ORS acceptance that happens at step 13, so
+        // there is deliberately nothing here for this route to re-inspect and
+        // nothing that could be read as one. A gate that later resolves an
+        // existing receipt must refuse inside `admit_prepared_transition` (it
+        // has no existing-receipt lookup today) rather than return that
+        // decision as a success this route would then have to re-inspect.
         admit_prepared_transition(
             context,
             &transition,
@@ -6430,22 +6429,28 @@ fn refuse_determinate_reserved_write(
 /// ORS. The reserved-write path is a different owner with a different act and
 /// deliberately does not come through here.
 ///
-/// The accepted arm returns the typed `staged` decision, and this function has
-/// no existing-receipt lookup in front of it, so it can only ever return
-/// `staged` or refuse. Every non-`staged` decision is therefore converted
-/// into the `Err` arm HERE, which is why the decision point is this function
-/// and not [`KernelStoreGateway::apply`]: there is no second state check
-/// downstream that a `not_accepted` or `resolved_existing` value would have to
-/// be caught by. The refusal is the typed [`StoreApplyRefusal`], whose rendered
-/// line keeps both the typed decision and the gate's own cause, so the
-/// operational response can name the I5.19 decision that was taken and the
-/// specific refusal under it.
+/// The only decisions converted into the `Err` arm HERE are the two refusals,
+/// which is why the decision point is this function and not
+/// [`KernelStoreGateway::apply`]: there is no second state check downstream
+/// that a `not_accepted` or `resolved_existing` value would have to be caught
+/// by. The refusal is the typed [`StoreApplyRefusal`], whose rendered line
+/// keeps both the typed decision and the gate's own cause, so the operational
+/// response can name the I5.19 decision that was taken and the specific
+/// refusal under it.
+///
+/// A passing gate returns no submission at all. This is the I5.6 steps 1-12
+/// boundary, before the step 13 ORS staging act, and I5.19's `staged` state
+/// means "ORS accepted the exact operation identity" — so the accepted path has
+/// no I5.19 front-door result to report and must not borrow the `staged` token
+/// for a value nothing staged. The unit return carries the only claim this
+/// boundary can make: this exact transition is admitted to be sent, and its
+/// outcome is the canonical receipt the send produces.
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<WriteSubmission, StoreApplyRefusal> {
+) -> Result<(), StoreApplyRefusal> {
     let gate: Result<(), StoreError> = (|| {
         context.validate().map_err(StoreError::Foundation)?;
         transition.validate()?;
@@ -6471,7 +6476,11 @@ fn admit_prepared_transition(
     // both the typed `not_accepted` decision and the specific cause under it.
     let gate_cause = gate.as_ref().err().map(ToString::to_string);
     let submission = match admit_write_submission(transition, gate, None) {
-        Ok(submission) => submission,
+        // `Ok(None)` is the passing gate: this boundary has no I5.19 front-door
+        // result to report, because the I5.19 `staged` state means ORS accepted
+        // this exact operation identity and nothing here has staged it.
+        Ok(None) => return Ok(()),
+        Ok(Some(submission)) => submission,
         // A request whose own identity is unnameable has no submission to
         // report under, so the gate's own typed refusal is reported instead.
         Err(unnameable) => {
@@ -6480,16 +6489,13 @@ fn admit_prepared_transition(
             ));
         }
     };
-    if submission.state != WriteSubmissionState::Staged {
-        // The gate ORDER above is load-bearing and this runs before any store
-        // send, so a non-`staged` decision is always produced BY one of those
-        // gates: `gate_cause` is therefore present on every armed
-        // `Admission` refusal and the composed text stays byte-identical to
-        // the single line this arm has always rendered.
-        let cause = gate_cause.unwrap_or_else(|| submission.to_string());
-        return Err(StoreApplyRefusal::admission(submission, cause));
-    }
-    Ok(submission)
+    // The gate ORDER above is load-bearing and this runs before any store
+    // send, so the decision below is always produced BY one of those gates:
+    // `gate_cause` is therefore present on every armed `Admission` refusal and
+    // the composed text stays byte-identical to the single line this arm has
+    // always rendered.
+    let cause = gate_cause.unwrap_or_else(|| submission.to_string());
+    Err(StoreApplyRefusal::admission(submission, cause))
 }
 
 /// Reserved-write admission gates shared by the gateway entry point.
