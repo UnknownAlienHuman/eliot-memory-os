@@ -837,11 +837,24 @@ pub(super) async fn run_registered_cargo_verifier(
     timeout_seconds: u64,
     verifier_name: &str,
 ) -> Result<()> {
+    // I18.26 line 3 (issue #1902 AUD1): the registered cargo verifiers launch
+    // Cargo on agent work, so their argv is admitted through the one
+    // InstrumentRunner-controlled build projection before anything spawns, and
+    // only the admitted argv is launched. A refusal is the typed W4 outcome:
+    // launch nothing and fail the verifier instead.
+    let argv: Vec<String> = std::iter::once("cargo".to_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()))
+        .collect();
+    let admitted = eliot_engine::patch::admit_agent_cargo_argv(&argv).with_context(|| {
+        format!(
+            "registered {verifier_name} verifier refused by the agent cargo projection (issue #1902)"
+        )
+    })?;
     let cargo_target_dir = prepare_registered_cargo_target(worktree, runtime_root)?;
-    let mut command = tokio::process::Command::new("cargo");
+    let mut command = tokio::process::Command::new(&admitted[0]);
     command
         .current_dir(worktree)
-        .args(args)
+        .args(&admitted[1..])
         .env("CARGO_TARGET_DIR", cargo_target_dir)
         .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
         .env_remove("SURREAL_USER")
