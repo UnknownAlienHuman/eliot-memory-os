@@ -86,6 +86,15 @@ MANIFEST_PARSE_BYTES_MAX = 1024 * 1024
 # pin format and fails explicitly.
 PAYLOAD_MODE_FILE = "verbatim_copy"
 PAYLOAD_MODE_TREE = "verbatim_tree_copy"
+# Tree-digest provenance (issue #2615 AUD3): the byte recipe computed by
+# `_tree_digest` is reader-inferred, NOT owner-sourced — it was matched against
+# the existing generation pins, and no producer-owned helper or tool defines it.
+# The governing I07-29 fragment names only a generic versioned digest, not this
+# byte recipe, so it cannot source it either. The producer manifest declares the
+# recipe label per tree (`tree_digest_recipe`) and any other label fails
+# explicitly in `_verify_tree_payload`. A different concatenation or order
+# requires an explicit schema migration of the producer manifest plus every
+# reader — never a second recipe alongside this one.
 TREE_DIGEST_RECIPE = "sha256-canonical-json-tree-members-v1"
 DISPOSITIONS = (
     "live-admitted",
@@ -635,7 +644,14 @@ def _read_snapshot(root: Path, relative: PurePosixPath, limits: dict[str, int]) 
 
 
 def _tree_digest(member_entries: list[dict[str, Any]]) -> str:
-    """Versioned tree recipe: SHA-256 over canonical sorted member JSON."""
+    """Compute the tree digest with the reader-inferred recipe (provenance unverified).
+
+    Recipe: SHA-256 over the canonical JSON of member entries sorted by path.
+    This recipe is NOT owner-sourced (issue #2615 AUD3): it was inferred by
+    matching existing generation pins. The declared `tree_digest_recipe` label
+    is still enforced and the computed value is still compared with the DECLARED
+    `tree_digest_sha256` pin — this function never verifies by itself.
+    """
     ordered = sorted(member_entries, key=lambda entry: entry["path"])
     return sha256_bytes(canonical_json_bytes(ordered))
 
