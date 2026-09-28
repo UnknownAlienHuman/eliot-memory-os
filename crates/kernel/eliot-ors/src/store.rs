@@ -2850,6 +2850,245 @@ fn maintenance_trigger_gap_sequence_key(first_sequence: u64, gap_identity: &str)
     format!("{first_sequence:020}:{gap_identity}")
 }
 
+fn load_maintenance_trigger_gap_for_update(
+    write: &redb::WriteTransaction,
+    gap_identity: &str,
+) -> Result<Option<MaintenanceTriggerGapStorageRecord>, OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_GAPS)
+        .map_err(storage)?
+        .get(gap_identity)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
+        .transpose()
+}
+
+fn load_maintenance_trigger_gap_index(
+    write: &redb::WriteTransaction,
+    sequence_key: &str,
+) -> Result<Option<String>, OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .get(sequence_key)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned())
+}
+
+fn persist_maintenance_trigger_gap(
+    write: &redb::WriteTransaction,
+    gap: &MaintenanceTriggerGapStorageRecord,
+    sequence_key: &str,
+) -> Result<(), OrsError> {
+    let payload = encode(gap)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_GAPS)
+        .map_err(storage)?
+        .insert(gap.gap_identity.as_str(), payload.as_str())
+        .map_err(storage)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .insert(sequence_key, gap.gap_identity.as_str())
+        .map_err(storage)?;
+    Ok(())
+}
+
+fn validate_maintenance_trigger_gap_write_readback(
+    write: &redb::WriteTransaction,
+    gap: &MaintenanceTriggerGapStorageRecord,
+    sequence_key: &str,
+) -> Result<(), OrsError> {
+    let local = load_maintenance_trigger_gap_for_update(write, gap.gap_identity.as_str())?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_gap",
+            reason: "gap is missing on transaction read-back".to_owned(),
+        })?;
+    local.validate()?;
+    let local_index = load_maintenance_trigger_gap_index(write, sequence_key)?;
+    if local != *gap || local_index.as_deref() != Some(gap.gap_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_gap_index",
+            reason: "gap or its sequence index changed on transaction read-back".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn readback_maintenance_trigger_gap(
+    read: &redb::ReadTransaction,
+    gap: &MaintenanceTriggerGapStorageRecord,
+    exact_replay: bool,
+) -> Result<MaintenanceTriggerGapStorageRecord, OrsError> {
+    let persisted = read
+        .open_table(MAINTENANCE_TRIGGER_GAPS)
+        .map_err(storage)?
+        .get(gap.gap_identity.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_gap",
+            reason: if exact_replay {
+                "gap disappeared on exact replay read-back".to_owned()
+            } else {
+                "committed gap is missing on read-back".to_owned()
+            },
+        })?;
+    persisted.validate()?;
+    if persisted != *gap {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_gap",
+            reason: if exact_replay {
+                "exact replay gap changed on read-back".to_owned()
+            } else {
+                "committed gap differs from accepted input".to_owned()
+            },
+        });
+    }
+    Ok(persisted)
+}
+
+fn load_maintenance_trigger_compaction_payloads(
+    write: &redb::WriteTransaction,
+    trigger_id: &str,
+) -> Result<
+    (
+        MaintenanceTriggerIntakeStorageRecord,
+        RecoveryPayloadEnvelope,
+    ),
+    OrsError,
+> {
+    let envelope_id = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(trigger_id)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned())
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "lifecycle has no retained trigger index".to_owned(),
+        })?;
+    let intake = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .get(envelope_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "trigger index points to a missing intake row".to_owned(),
+        })?;
+    let envelope = write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(envelope_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_payload_compaction",
+            reason: "uncompacted pinned envelope is missing".to_owned(),
+        })?;
+    Ok((intake, envelope))
+}
+
+fn validate_maintenance_trigger_compaction_binding(
+    trigger_id: &str,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+    envelope: &RecoveryPayloadEnvelope,
+) -> Result<(), OrsError> {
+    intake.validate()?;
+    envelope.validate()?;
+    if intake.trigger_id != trigger_id
+        || intake.source_event_identity != lifecycle.source_event_identity
+        || envelope.operation_or_checkpoint_id != intake.envelope_operation_id
+        || envelope.payload_sha256 != intake.envelope_payload_sha256
+        || envelope.payload_length != intake.envelope_payload_length
+        || envelope.state_fence.sha256 != intake.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != intake.source_observed_authority_epoch
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_payload_compaction",
+            reason: "payload identity changed before compaction".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_maintenance_trigger_compaction_safety(
+    write: &redb::WriteTransaction,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+    envelope: &RecoveryPayloadEnvelope,
+    now_ms: u64,
+) -> Result<(), OrsError> {
+    if envelope
+        .expires_at_ms
+        .is_some_and(|deadline| i64::try_from(now_ms).unwrap_or(i64::MAX) < deadline)
+    {
+        return Err(OrsError::InvalidTransition);
+    }
+    if let Some(raw_reservation) = write
+        .open_table(RESERVATIONS)
+        .map_err(storage)?
+        .get(intake.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned())
+    {
+        let reservation: ReservationRecord = decode(&raw_reservation)?;
+        if reservation.token.operation_id != intake.envelope_operation_id
+            || !reservation.state.is_terminal()
+        {
+            return Err(OrsError::UnsafeExpiry);
+        }
+    }
+    if let Some(problem) = write
+        .open_table(RECOVERY_PROBLEMS)
+        .map_err(storage)?
+        .get(intake.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<RecoveryProblem>(value.value()))
+        .transpose()?
+    {
+        problem.validate()?;
+        if !problem.is_resolved() {
+            return Err(OrsError::UnsafeExpiry);
+        }
+    }
+    let pin = write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .get(intake.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if pin.as_deref() != Some(intake.source_event_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "payload compaction pin is missing or mismatched".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn remove_maintenance_trigger_payload(
+    write: &redb::WriteTransaction,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .remove(intake.envelope_operation_id.as_str())
+        .map_err(storage)?;
+    write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .remove(intake.envelope_operation_id.as_str())
+        .map_err(storage)?;
+    Ok(())
+}
+
 fn maintenance_trigger_page_owner_key(request_id: &str) -> String {
     let material = format!("eliot.ors.maintenance-trigger-owner-page.v1\0{request_id}");
     format!("request:{}", crate::model::sha256_hex(material.as_bytes()))
@@ -2882,6 +3121,768 @@ fn maintenance_trigger_page_continuation(
         "eliot.ors.maintenance-trigger-page.v1\0{cursor_id}\0{high_water_sequence}\0{after_sequence}\0{end_sequence}\0{limit}"
     );
     crate::model::sha256_hex(material.as_bytes())
+}
+
+fn load_maintenance_trigger_expiry_pin_records(
+    write: &redb::WriteTransaction,
+    operation_id: &str,
+) -> Result<
+    (
+        Option<MaintenanceTriggerIntakeStorageRecord>,
+        Option<String>,
+    ),
+    OrsError,
+> {
+    let intake = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?;
+    let pin_source_event = write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    Ok((intake, pin_source_event))
+}
+
+fn is_compacted_maintenance_trigger_expiry_replay(
+    write: &redb::WriteTransaction,
+    operation_id: &str,
+    pinned: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<bool, OrsError> {
+    let lifecycle = write
+        .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
+        .map_err(storage)?
+        .get(pinned.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerLifecycleRecord>(value.value()))
+        .transpose()?;
+    let Some(lifecycle) = lifecycle else {
+        return Ok(false);
+    };
+    lifecycle.validate()?;
+    let indexed_event = write
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .get(pinned.source_event_identity.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    let indexed_trigger = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(pinned.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    let envelope_exists = write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .is_some();
+    Ok(lifecycle.payload_compacted_at_ms.is_some()
+        && lifecycle.trigger_id == pinned.trigger_id
+        && lifecycle.source_event_identity == pinned.source_event_identity
+        && lifecycle.expires_at_ms == Some(pinned.applicable_until_unix_ms)
+        && indexed_event.as_deref() == Some(operation_id)
+        && indexed_trigger.as_deref() == Some(operation_id)
+        && !envelope_exists)
+}
+
+fn validate_live_maintenance_trigger_expiry_binding(
+    write: &redb::WriteTransaction,
+    operation_id: &str,
+    pinned: &MaintenanceTriggerIntakeStorageRecord,
+    pin_source_event: Option<&str>,
+) -> Result<(), OrsError> {
+    let Some(pin_source_event) = pin_source_event else {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "retained intake row is missing its envelope-keyed pin".to_owned(),
+        });
+    };
+    pinned.validate()?;
+    if pinned.envelope_operation_id.as_str() != operation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "retained row does not match its envelope-operation key".to_owned(),
+        });
+    }
+    if pin_source_event != pinned.source_event_identity {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "envelope-keyed pin does not match the retained source event".to_owned(),
+        });
+    }
+    let indexed_event = write
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .get(pinned.source_event_identity.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    let trigger_envelope = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(pinned.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if indexed_event.as_deref() != Some(operation_id)
+        || trigger_envelope.as_deref() != Some(operation_id)
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "retained trigger identity index is missing or mismatched".to_owned(),
+        });
+    }
+    let envelope = write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "pinned recovery envelope is missing".to_owned(),
+        })?;
+    envelope.validate()?;
+    if envelope.operation_or_checkpoint_id != pinned.envelope_operation_id
+        || envelope.payload_sha256 != pinned.envelope_payload_sha256
+        || envelope.payload_length != pinned.envelope_payload_length
+        || envelope.state_fence.sha256 != pinned.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != pinned.source_observed_authority_epoch
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "pinned recovery envelope binding changed".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn try_replay_compacted_maintenance_trigger_intake(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<Option<MaintenanceTriggerIntakeStorageProjection>, OrsError> {
+    let (existing, pin_source_event) = load_maintenance_trigger_intake_and_pin(
+        write,
+        record.envelope_operation_id.as_str(),
+    )?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    existing.validate()?;
+    if existing != *record {
+        return Err(OrsError::DuplicateConflict);
+    }
+    if pin_source_event.is_some() {
+        return Ok(None);
+    }
+    let lifecycle = load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "compacted intake has no retained lifecycle row".to_owned(),
+        })?;
+    lifecycle.validate()?;
+    if lifecycle.trigger_id != record.trigger_id
+        || lifecycle.source_event_identity != record.source_event_identity
+        || lifecycle.expires_at_ms != Some(record.applicable_until_unix_ms)
+        || lifecycle.payload_compacted_at_ms.is_none()
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "compacted intake does not match its lifecycle summary".to_owned(),
+        });
+    }
+    validate_maintenance_trigger_intake_identity_indexes(write, record, &lifecycle)?;
+    let envelope_exists = write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .is_some();
+    if envelope_exists {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_payload_compaction",
+            reason: "compacted lifecycle still has its pinned envelope".to_owned(),
+        });
+    }
+    Ok(Some(MaintenanceTriggerIntakeStorageProjection {
+        record: existing,
+        replayed: true,
+    }))
+}
+
+fn load_maintenance_trigger_lifecycle_from_write(
+    write: &redb::WriteTransaction,
+    trigger_id: &str,
+) -> Result<Option<MaintenanceTriggerLifecycleRecord>, OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
+        .map_err(storage)?
+        .get(trigger_id)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerLifecycleRecord>(value.value()))
+        .transpose()
+}
+
+fn validate_maintenance_trigger_intake_identity_indexes(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
+    let indexed_event = load_maintenance_trigger_event_index(
+        write,
+        record.source_event_identity.as_str(),
+    )?;
+    let indexed_trigger = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(record.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if indexed_event.as_deref() != Some(record.envelope_operation_id.as_str())
+        || indexed_trigger.as_deref() != Some(record.envelope_operation_id.as_str())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "compacted intake identity index is missing or mismatched".to_owned(),
+        });
+    }
+    let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
+    let indexed_sequence = write
+        .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .get(sequence_key.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if indexed_sequence.as_deref() != Some(record.trigger_id.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_index",
+            reason: "compacted intake sequence index is missing or mismatched".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_maintenance_trigger_intake_envelope(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let envelope = write
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+        .transpose()?
+        .ok_or(OrsError::ReservationNotFound)?;
+    envelope.validate()?;
+    if envelope.operation_or_checkpoint_id != record.envelope_operation_id {
+        return Err(OrsError::DuplicateConflict);
+    }
+    if envelope.payload_sha256 != record.envelope_payload_sha256
+        || envelope.payload_length != record.envelope_payload_length
+    {
+        return Err(OrsError::PayloadIntegrityMismatch);
+    }
+    if envelope.state_fence.sha256 != record.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != record.source_observed_authority_epoch
+    {
+        return Err(OrsError::FenceMismatch);
+    }
+    Ok(())
+}
+
+fn load_maintenance_trigger_event_index(
+    write: &redb::WriteTransaction,
+    source_event_identity: &str,
+) -> Result<Option<String>, OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .get(source_event_identity)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned())
+}
+
+fn load_maintenance_trigger_intake_and_pin(
+    write: &redb::WriteTransaction,
+    operation_id: &str,
+) -> Result<
+    (
+        Option<MaintenanceTriggerIntakeStorageRecord>,
+        Option<String>,
+    ),
+    OrsError,
+> {
+    let existing = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?;
+    let pin_source_event = write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .get(operation_id)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    Ok((existing, pin_source_event))
+}
+
+fn validate_maintenance_trigger_intake_replay(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    indexed_envelope: Option<&str>,
+    existing: Option<&MaintenanceTriggerIntakeStorageRecord>,
+    pin_source_event: Option<&str>,
+) -> Result<bool, OrsError> {
+    if indexed_envelope.is_some_and(|value| value != record.envelope_operation_id.as_str()) {
+        return Err(OrsError::DuplicateConflict);
+    }
+    match (existing, pin_source_event) {
+        (Some(existing), Some(pin)) if pin == existing.source_event_identity => {}
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_pin",
+                reason: "retained intake row is missing its envelope-keyed pin".to_owned(),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_pin",
+                reason: "envelope-keyed pin exists without its retained intake row".to_owned(),
+            });
+        }
+        (Some(_), Some(_)) => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_pin",
+                reason: "envelope-keyed pin does not match the retained source event".to_owned(),
+            });
+        }
+    }
+    let replayed = if let Some(existing) = existing {
+        existing.validate()?;
+        if existing.envelope_operation_id != record.envelope_operation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake",
+                reason: "record identity does not match its envelope-operation key".to_owned(),
+            });
+        }
+        if existing != record {
+            return Err(OrsError::DuplicateConflict);
+        }
+        if indexed_envelope != Some(record.envelope_operation_id.as_str()) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_index",
+                reason: "source-event identity index is missing for retained row".to_owned(),
+            });
+        }
+        true
+    } else {
+        if indexed_envelope.is_some() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_index",
+                reason: "source-event identity index is dangling".to_owned(),
+            });
+        }
+        false
+    };
+    if !replayed {
+        validate_new_maintenance_trigger_id_index(write, record)?;
+    }
+    Ok(replayed)
+}
+
+fn validate_new_maintenance_trigger_id_index(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let trigger_envelope = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(record.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if let Some(trigger_envelope) = trigger_envelope {
+        if trigger_envelope == record.envelope_operation_id.as_str() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_intake_index",
+                reason: "trigger identity index is dangling".to_owned(),
+            });
+        }
+        return Err(OrsError::DuplicateConflict);
+    }
+    Ok(())
+}
+
+fn persist_new_maintenance_trigger_intake(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let payload = encode(record)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .insert(record.envelope_operation_id.as_str(), payload.as_str())
+        .map_err(storage)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .insert(
+            record.envelope_operation_id.as_str(),
+            record.source_event_identity.as_str(),
+        )
+        .map_err(storage)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .insert(
+            record.source_event_identity.as_str(),
+            record.envelope_operation_id.as_str(),
+        )
+        .map_err(storage)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .insert(
+            record.trigger_id.as_str(),
+            record.envelope_operation_id.as_str(),
+        )
+        .map_err(storage)?;
+    create_pending_maintenance_trigger_lifecycle(write, record)
+}
+
+fn create_pending_maintenance_trigger_lifecycle(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let last_sequence = write
+        .open_table(META)
+        .map_err(storage)?
+        .get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
+        .map_err(storage)?
+        .map(|value| {
+            value
+                .value()
+                .parse::<u64>()
+                .map_err(|_| OrsError::IntegrityProblem {
+                    record_type: "maintenance_trigger_sequence_meta",
+                    reason: "sequence high-water marker is not an unsigned integer".to_owned(),
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let intake_sequence = last_sequence
+        .checked_add(1)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    let sequence_key = maintenance_trigger_sequence_key(intake_sequence);
+    if write
+        .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .get(sequence_key.as_str())
+        .map_err(storage)?
+        .is_some()
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_index",
+            reason: "next assigned intake sequence is already present".to_owned(),
+        });
+    }
+    let retained_at_ms = current_unix_ms_u64()?;
+    let lifecycle = MaintenanceTriggerLifecycleRecord {
+        contract_version: crate::CONTRACT_VERSION,
+        intake_sequence,
+        retained_revision: 1,
+        state_revision: 1,
+        source_event_identity: record.source_event_identity.clone(),
+        trigger_id: record.trigger_id.clone(),
+        phase: MaintenanceTriggerLifecyclePhase::Pending,
+        claim: None,
+        claim_record: None,
+        decision_record: None,
+        downstream_intent_record: None,
+        acknowledgement_record: None,
+        revocation_record: None,
+        terminal_record: None,
+        retained_at_ms,
+        updated_at_ms: retained_at_ms,
+        expires_at_ms: Some(record.applicable_until_unix_ms),
+        downstream_retention: None,
+        payload_compacted_at_ms: None,
+    };
+    lifecycle.validate()?;
+    let lifecycle_payload = encode(&lifecycle)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
+        .map_err(storage)?
+        .insert(record.trigger_id.as_str(), lifecycle_payload.as_str())
+        .map_err(storage)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .insert(sequence_key.as_str(), record.trigger_id.as_str())
+        .map_err(storage)?;
+    write
+        .open_table(META)
+        .map_err(storage)?
+        .insert(
+            MAINTENANCE_TRIGGER_SEQUENCE_META_KEY,
+            intake_sequence.to_string().as_str(),
+        )
+        .map_err(storage)?;
+    Ok(())
+}
+
+fn validate_maintenance_trigger_intake_transaction_readback(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let lifecycle = readback_maintenance_trigger_intake_rows(write, record)?;
+    validate_maintenance_trigger_intake_index_readback(write, record, &lifecycle)
+}
+
+fn readback_maintenance_trigger_intake_rows(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
+    let staged = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "staged row is missing on transaction read-back".to_owned(),
+        })?;
+    staged.validate()?;
+    if staged != *record {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "staged row changed during transaction read-back".to_owned(),
+        });
+    }
+    let lifecycle = load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "retained intake has no lifecycle row".to_owned(),
+        })?;
+    lifecycle.validate()?;
+    if lifecycle.source_event_identity != record.source_event_identity
+        || lifecycle.trigger_id != record.trigger_id
+        || lifecycle.expires_at_ms != Some(record.applicable_until_unix_ms)
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "lifecycle row does not match the retained intake identities".to_owned(),
+        });
+    }
+    Ok(lifecycle)
+}
+
+fn validate_maintenance_trigger_intake_index_readback(
+    write: &redb::WriteTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
+    let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
+    let indexed_trigger = write
+        .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
+        .map_err(storage)?
+        .get(sequence_key.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if indexed_trigger.as_deref() != Some(record.trigger_id.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_index",
+            reason: "lifecycle sequence index is missing or mismatched".to_owned(),
+        });
+    }
+    let high_water = maintenance_trigger_sequence_high_water(write)?;
+    if high_water < lifecycle.intake_sequence {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_meta",
+            reason: "sequence high-water marker precedes the retained lifecycle".to_owned(),
+        });
+    }
+    let pin_source_event = write
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if pin_source_event.as_deref() != Some(record.source_event_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "envelope-keyed pin failed transaction read-back".to_owned(),
+        });
+    }
+    let indexed_event = load_maintenance_trigger_event_index(
+        write,
+        record.source_event_identity.as_str(),
+    )?;
+    let trigger_envelope = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(record.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if indexed_event.as_deref() != Some(record.envelope_operation_id.as_str())
+        || trigger_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "source-event or trigger identity index failed transaction read-back".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn maintenance_trigger_sequence_high_water(
+    write: &redb::WriteTransaction,
+) -> Result<u64, OrsError> {
+    write
+        .open_table(META)
+        .map_err(storage)?
+        .get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
+        .map_err(storage)?
+        .map(|value| value.value().parse::<u64>())
+        .transpose()
+        .map_err(|_| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_meta",
+            reason: "sequence high-water marker is not an unsigned integer".to_owned(),
+        })
+        .map(|value| value.unwrap_or(0))
+}
+
+fn readback_committed_maintenance_trigger_intake(
+    read: &redb::ReadTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<MaintenanceTriggerIntakeStorageRecord, OrsError> {
+    let persisted = read
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "committed row is missing on read-back".to_owned(),
+        })?;
+    persisted.validate()?;
+    if persisted != *record {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "committed row differs from the accepted input".to_owned(),
+        });
+    }
+    let (pair_record, pair_lifecycle) =
+        read_maintenance_trigger_pair(read, record.trigger_id.as_str())?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: "committed intake lifecycle disappeared on read-back".to_owned(),
+            }
+        })?;
+    validate_committed_maintenance_trigger_identity(
+        read,
+        record,
+        &persisted,
+        &pair_record,
+        &pair_lifecycle,
+    )?;
+    validate_committed_maintenance_trigger_envelope(read, record)?;
+    Ok(persisted)
+}
+
+fn validate_committed_maintenance_trigger_identity(
+    read: &redb::ReadTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    persisted: &MaintenanceTriggerIntakeStorageRecord,
+    pair_record: &MaintenanceTriggerIntakeStorageRecord,
+    pair_lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
+    if pair_record != persisted
+        || pair_lifecycle.source_event_identity != record.source_event_identity
+        || pair_lifecycle.trigger_id != record.trigger_id
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "committed lifecycle identity differs from staged intake".to_owned(),
+        });
+    }
+    let pin_source_event = read
+        .open_table(MAINTENANCE_TRIGGER_PINS)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    let indexed_event = read
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .get(record.source_event_identity.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    let trigger_envelope = read
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .get(record.trigger_id.as_str())
+        .map_err(storage)?
+        .map(|value| value.value().to_owned());
+    if pin_source_event.as_deref() != Some(record.source_event_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "committed envelope-keyed pin is missing or mismatched".to_owned(),
+        });
+    }
+    if indexed_event.as_deref() != Some(record.envelope_operation_id.as_str())
+        || trigger_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "committed source-event or trigger identity index is missing or mismatched"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_committed_maintenance_trigger_envelope(
+    read: &redb::ReadTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+) -> Result<(), OrsError> {
+    let envelope = read
+        .open_table(ENVELOPES)
+        .map_err(storage)?
+        .get(record.envelope_operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "referenced recovery envelope is missing on read-back".to_owned(),
+        })?;
+    envelope.validate()?;
+    if envelope.operation_or_checkpoint_id != record.envelope_operation_id
+        || envelope.payload_sha256 != record.envelope_payload_sha256
+        || envelope.payload_length != record.envelope_payload_length
+        || envelope.state_fence.sha256 != record.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != record.source_observed_authority_epoch
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "referenced recovery envelope binding changed on read-back".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn read_maintenance_trigger_pair(
@@ -2960,6 +3961,29 @@ fn read_maintenance_trigger_pair(
             reason: "intake row does not match its lifecycle and trigger indexes".to_owned(),
         });
     }
+    validate_maintenance_trigger_read_indexes(
+        read,
+        trigger_id,
+        &record,
+        &lifecycle,
+        envelope_operation.as_str(),
+    )?;
+    validate_maintenance_trigger_read_payload(
+        read,
+        &record,
+        &lifecycle,
+        envelope_operation.as_str(),
+    )?;
+    Ok(Some((record, lifecycle)))
+}
+
+fn validate_maintenance_trigger_read_indexes(
+    read: &redb::ReadTransaction,
+    trigger_id: &str,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+    envelope_operation: &str,
+) -> Result<(), OrsError> {
     let source_event_envelope = {
         let events = read
             .open_table(MAINTENANCE_TRIGGER_EVENTS)
@@ -2969,7 +3993,7 @@ fn read_maintenance_trigger_pair(
             .map_err(storage)?
             .map(|value| value.value().to_owned())
     };
-    if source_event_envelope.as_deref() != Some(envelope_operation.as_str()) {
+    if source_event_envelope.as_deref() != Some(envelope_operation) {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_intake_index",
             reason: "source-event index is missing or mismatched".to_owned(),
@@ -3010,35 +4034,43 @@ fn read_maintenance_trigger_pair(
             reason: "active lifecycle phase and active index disagree".to_owned(),
         });
     }
-    let sequence_high_water = {
-        let meta = read.open_table(META).map_err(storage)?;
-        meta.get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
-            .map_err(storage)?
-            .map(|value| value.value().parse::<u64>())
-            .transpose()
-            .map_err(|_| OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_sequence_meta",
-                reason: "sequence high-water marker is not an unsigned integer".to_owned(),
-            })?
-            .unwrap_or(0)
-    };
+    let sequence_high_water = read
+        .open_table(META)
+        .map_err(storage)?
+        .get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
+        .map_err(storage)?
+        .map(|value| value.value().parse::<u64>())
+        .transpose()
+        .map_err(|_| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_meta",
+            reason: "sequence high-water marker is not an unsigned integer".to_owned(),
+        })?
+        .unwrap_or(0);
     if sequence_high_water < lifecycle.intake_sequence {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_sequence_meta",
             reason: "sequence high-water marker precedes the retained lifecycle".to_owned(),
         });
     }
+    Ok(())
+}
 
+fn validate_maintenance_trigger_read_payload(
+    read: &redb::ReadTransaction,
+    record: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+    envelope_operation: &str,
+) -> Result<(), OrsError> {
     let pin = {
         let pins = read.open_table(MAINTENANCE_TRIGGER_PINS).map_err(storage)?;
-        pins.get(envelope_operation.as_str())
+        pins.get(envelope_operation)
             .map_err(storage)?
             .map(|value| value.value().to_owned())
     };
     let envelope = {
         let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
         envelopes
-            .get(envelope_operation.as_str())
+            .get(envelope_operation)
             .map_err(storage)?
             .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
             .transpose()?
@@ -3050,32 +4082,31 @@ fn read_maintenance_trigger_pair(
                 reason: "compacted lifecycle still retains a pin or envelope".to_owned(),
             });
         }
-    } else {
-        if pin.as_deref() != Some(record.source_event_identity.as_str()) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_pin",
-                reason: "uncompacted intake has a missing or mismatched envelope pin".to_owned(),
-            });
-        }
-        let envelope = envelope.ok_or_else(|| OrsError::IntegrityProblem {
-            record_type: "maintenance_trigger_intake",
-            reason: "pinned recovery envelope is missing".to_owned(),
-        })?;
-        envelope.validate()?;
-        if envelope.operation_or_checkpoint_id != record.envelope_operation_id
-            || envelope.payload_sha256 != record.envelope_payload_sha256
-            || envelope.payload_length != record.envelope_payload_length
-            || envelope.state_fence.sha256 != record.source_state_fence_sha256
-            || envelope.state_fence.observed_authority_epoch
-                != record.source_observed_authority_epoch
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "pinned recovery envelope binding changed".to_owned(),
-            });
-        }
+        return Ok(());
     }
-    Ok(Some((record, lifecycle)))
+    if pin.as_deref() != Some(record.source_event_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "uncompacted intake has a missing or mismatched envelope pin".to_owned(),
+        });
+    }
+    let envelope = envelope.ok_or_else(|| OrsError::IntegrityProblem {
+        record_type: "maintenance_trigger_intake",
+        reason: "pinned recovery envelope is missing".to_owned(),
+    })?;
+    envelope.validate()?;
+    if envelope.operation_or_checkpoint_id != record.envelope_operation_id
+        || envelope.payload_sha256 != record.envelope_payload_sha256
+        || envelope.payload_length != record.envelope_payload_length
+        || envelope.state_fence.sha256 != record.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != record.source_observed_authority_epoch
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "pinned recovery envelope binding changed".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn build_maintenance_trigger_page_cursor(
@@ -3171,6 +4202,259 @@ fn next_maintenance_trigger_page_cursor(
     build_maintenance_trigger_page_cursor(next)
 }
 
+fn load_maintenance_trigger_page_cursor(
+    write: &redb::WriteTransaction,
+    key: &str,
+) -> Result<Option<MaintenanceTriggerPageCursorState>, OrsError> {
+    write
+        .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
+        .map_err(storage)?
+        .get(key)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerPageCursorState>(value.value()))
+        .transpose()
+}
+
+fn serve_maintenance_trigger_page_cursor(
+    write: &redb::WriteTransaction,
+    key: &str,
+    state: MaintenanceTriggerPageCursorState,
+) -> Result<(MaintenanceTriggerPageCursorState, bool), OrsError> {
+    if state.served {
+        return Ok((state, true));
+    }
+    let mut served_state = state;
+    served_state.served = true;
+    let payload = encode(&served_state)?;
+    write
+        .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
+        .map_err(storage)?
+        .insert(key, payload.as_str())
+        .map_err(storage)?;
+    Ok((served_state, false))
+}
+
+fn resolve_maintenance_trigger_page_cursor(
+    write: &redb::WriteTransaction,
+    request_id: &str,
+    daemon_session: &str,
+    fence_sha256: &str,
+    continuation: Option<&str>,
+    limit: u16,
+) -> Result<(MaintenanceTriggerPageCursorState, bool), OrsError> {
+    let cursor_key = continuation.map_or_else(
+        || maintenance_trigger_page_owner_key(request_id),
+        maintenance_trigger_page_continuation_key,
+    );
+    if let Some(state) = load_maintenance_trigger_page_cursor(write, cursor_key.as_str())? {
+        if state.contract_version != crate::CONTRACT_VERSION
+            || state.limit != limit
+            || state.request_continuation.as_deref() != continuation
+            || state.cursor_id.is_empty()
+            || state.origin_session.is_empty()
+            || validate_digest(
+                &state.origin_fence_sha256,
+                "maintenance_trigger_page_origin_fence_sha256",
+            )
+            .is_err()
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let replayed = state.served;
+        let (state, _) = serve_maintenance_trigger_page_cursor(write, cursor_key.as_str(), state)?;
+        return Ok((state, replayed));
+    }
+    if continuation.is_some() {
+        return Err(OrsError::DuplicateConflict);
+    }
+    let high_water_sequence = maintenance_trigger_sequence_high_water(write)?;
+    let cursor_id = crate::model::sha256_hex(
+        format!(
+            "eliot.ors.maintenance-trigger-cursor.v1\0{cursor_key}\0{high_water_sequence}\0{limit}"
+        )
+        .as_bytes(),
+    );
+    let state = build_maintenance_trigger_page_cursor(MaintenanceTriggerPageCursorState {
+        contract_version: crate::CONTRACT_VERSION,
+        cursor_id,
+        origin_session: daemon_session.to_owned(),
+        origin_fence_sha256: fence_sha256.to_owned(),
+        high_water_sequence,
+        limit,
+        active_only: false,
+        active_member_count: 0,
+        active_member_start: 0,
+        active_member_end: 0,
+        request_continuation: None,
+        window_start_exclusive: 0,
+        window_end_inclusive: high_water_sequence,
+        next_continuation: None,
+        has_more: false,
+        served: true,
+    })?;
+    persist_maintenance_trigger_page_cursor(write, cursor_key.as_str(), &state)?;
+    Ok((state, false))
+}
+
+fn validate_maintenance_trigger_page_request(
+    request_id: &str,
+    daemon_session: &str,
+    fence_sha256: &str,
+    continuation: Option<&str>,
+    limit: u16,
+    recovery: bool,
+) -> Result<(), OrsError> {
+    let (request_field, session_field, fence_field) = if recovery {
+        (
+            "maintenance_trigger_recovery_request_id",
+            "maintenance_trigger_recovery_daemon_session",
+            "maintenance_trigger_recovery_fence_sha256",
+        )
+    } else {
+        (
+            "maintenance_trigger_page_request_id",
+            "maintenance_trigger_page_daemon_session",
+            "maintenance_trigger_page_fence_sha256",
+        )
+    };
+    validate_text(request_id, request_field)?;
+    validate_text(daemon_session, session_field)?;
+    validate_digest(fence_sha256, fence_field)?;
+    if limit == 0 || limit > crate::MAX_MAINTENANCE_TRIGGER_PAGE {
+        return Err(OrsError::InvalidCursorLimit);
+    }
+    if continuation.is_some_and(|token| {
+        validate_digest(token, "maintenance_trigger_continuation").is_err()
+    }) {
+        return Err(OrsError::InvalidCursorLimit);
+    }
+    Ok(())
+}
+
+fn finish_maintenance_trigger_page(
+    write: redb::WriteTransaction,
+    state: MaintenanceTriggerPageCursorState,
+    replayed: bool,
+) -> Result<crate::MaintenanceTriggerLifecyclePageProjection, OrsError> {
+    let (lifecycles, gaps) = maintenance_trigger_page_rows(&write, &state)?;
+    write.commit().map_err(storage)?;
+    Ok(crate::MaintenanceTriggerLifecyclePageProjection {
+        lifecycles,
+        gaps,
+        high_water_sequence: state.high_water_sequence,
+        continuation: state.next_continuation,
+        has_more: state.has_more,
+        replayed,
+    })
+}
+
+fn persist_maintenance_trigger_following_page_cursor(
+    write: &redb::WriteTransaction,
+    state: &MaintenanceTriggerPageCursorState,
+) -> Result<(), OrsError> {
+    let Some(continuation) = state.next_continuation.as_deref() else {
+        return Ok(());
+    };
+    let next_state = next_maintenance_trigger_page_cursor(state)?;
+    let next_key = if state.active_only {
+        maintenance_trigger_recovery_continuation_key(continuation)
+    } else {
+        maintenance_trigger_page_continuation_key(continuation)
+    };
+    persist_maintenance_trigger_page_cursor(write, next_key.as_str(), &next_state)
+}
+
+fn resolve_maintenance_trigger_recovery_cursor(
+    write: &redb::WriteTransaction,
+    request_id: &str,
+    daemon_session: &str,
+    fence_sha256: &str,
+    continuation: Option<&str>,
+    limit: u16,
+) -> Result<(MaintenanceTriggerPageCursorState, bool), OrsError> {
+    let cursor_key = continuation.map_or_else(
+        || maintenance_trigger_recovery_request_key(request_id),
+        maintenance_trigger_recovery_continuation_key,
+    );
+    if let Some(state) = load_maintenance_trigger_page_cursor(write, cursor_key.as_str())? {
+        if !state.active_only
+            || state.contract_version != crate::CONTRACT_VERSION
+            || state.limit != limit
+            || state.request_continuation.as_deref() != continuation
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        persist_maintenance_trigger_page_cursor(write, cursor_key.as_str(), &state)?;
+        let replayed = state.served;
+        let (state, _) = serve_maintenance_trigger_page_cursor(write, cursor_key.as_str(), state)?;
+        return Ok((state, replayed));
+    }
+    if continuation.is_some() {
+        return Err(OrsError::DuplicateConflict);
+    }
+    let high_water_sequence = maintenance_trigger_sequence_high_water(write)?;
+    let active_sequences =
+        snapshot_active_maintenance_trigger_members(write, high_water_sequence)?;
+    let active_member_count = u64::try_from(active_sequences.len())
+        .map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let cursor_id = crate::model::sha256_hex(
+        format!(
+            "eliot.ors.maintenance-trigger-recovery-cursor.v1\0{cursor_key}\0{high_water_sequence}\0{limit}"
+        )
+        .as_bytes(),
+    );
+    let state = build_maintenance_trigger_page_cursor(MaintenanceTriggerPageCursorState {
+        contract_version: crate::CONTRACT_VERSION,
+        cursor_id: cursor_id.clone(),
+        origin_session: daemon_session.to_owned(),
+        origin_fence_sha256: fence_sha256.to_owned(),
+        high_water_sequence,
+        limit,
+        active_only: true,
+        active_member_count,
+        active_member_start: 0,
+        active_member_end: 0,
+        request_continuation: None,
+        window_start_exclusive: 0,
+        window_end_inclusive: high_water_sequence,
+        next_continuation: None,
+        has_more: false,
+        served: true,
+    })?;
+    persist_maintenance_trigger_recovery_page_members(write, cursor_id.as_str(), &active_sequences)?;
+    persist_maintenance_trigger_page_cursor(write, cursor_key.as_str(), &state)?;
+    Ok((state, false))
+}
+
+fn persist_maintenance_trigger_recovery_page_members(
+    write: &redb::WriteTransaction,
+    cursor_id: &str,
+    active_sequences: &[u64],
+) -> Result<(), OrsError> {
+    let mut members = write
+        .open_table(MAINTENANCE_TRIGGER_RECOVERY_PAGE_MEMBERS)
+        .map_err(storage)?;
+    let prefix = format!("{cursor_id}:");
+    for entry in members.iter().map_err(storage)? {
+        let (key, _) = entry.map_err(storage)?;
+        if key.value().starts_with(prefix.as_str()) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_recovery_page_member",
+                reason: "orphaned member rows exist without their frozen cursor".to_owned(),
+            });
+        }
+    }
+    for (offset, sequence) in active_sequences.iter().enumerate() {
+        let offset = u64::try_from(offset).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        let member_key = format!("{cursor_id}:{offset:020}");
+        let sequence = sequence.to_string();
+        members
+            .insert(member_key.as_str(), sequence.as_str())
+            .map_err(storage)?;
+    }
+    Ok(())
+}
+
 fn persist_maintenance_trigger_page_cursor(
     write: &redb::WriteTransaction,
     key: &str,
@@ -3204,7 +4488,22 @@ fn maintenance_trigger_page_rows(
     ),
     OrsError,
 > {
-    let mut lifecycles = Vec::new();
+    let member_sequences = maintenance_trigger_page_member_sequences(write, state)?;
+    let lifecycles = maintenance_trigger_page_lifecycles(write, &member_sequences)?;
+    let gaps = maintenance_trigger_page_gaps(write, state, &member_sequences)?;
+    if lifecycles.len() > usize::from(state.limit) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_page_cursor",
+            reason: "frozen sequence window exceeds its declared page size".to_owned(),
+        });
+    }
+    Ok((lifecycles, gaps))
+}
+
+fn maintenance_trigger_page_member_sequences(
+    write: &redb::WriteTransaction,
+    state: &MaintenanceTriggerPageCursorState,
+) -> Result<Vec<u64>, OrsError> {
     let mut member_sequences = Vec::new();
     if state.active_only {
         for offset in state.active_member_start..state.active_member_end {
@@ -3241,7 +4540,14 @@ fn maintenance_trigger_page_rows(
             member_sequences.extend(first_sequence..=state.window_end_inclusive);
         }
     }
+    Ok(member_sequences)
+}
 
+fn maintenance_trigger_page_lifecycles(
+    write: &redb::WriteTransaction,
+    member_sequences: &[u64],
+) -> Result<Vec<MaintenanceTriggerLifecycleRecord>, OrsError> {
+    let mut lifecycles = Vec::new();
     for sequence in member_sequences.iter().copied() {
         let sequence_key = maintenance_trigger_sequence_key(sequence);
         let trigger_id = {
@@ -3289,7 +4595,14 @@ fn maintenance_trigger_page_rows(
         }
         lifecycles.push(lifecycle);
     }
+    Ok(lifecycles)
+}
 
+fn maintenance_trigger_page_gaps(
+    write: &redb::WriteTransaction,
+    state: &MaintenanceTriggerPageCursorState,
+    member_sequences: &[u64],
+) -> Result<Vec<MaintenanceTriggerGapStorageRecord>, OrsError> {
     let mut gaps = Vec::new();
     let gap_count = {
         let table = write
@@ -3362,13 +4675,7 @@ fn maintenance_trigger_page_rows(
             }
         }
     }
-    if lifecycles.len() > usize::from(state.limit) {
-        return Err(OrsError::IntegrityProblem {
-            record_type: "maintenance_trigger_page_cursor",
-            reason: "frozen sequence window exceeds its declared page size".to_owned(),
-        });
-    }
-    Ok((lifecycles, gaps))
+    Ok(gaps)
 }
 
 fn load_maintenance_trigger_lifecycle_for_update(
@@ -3393,30 +4700,68 @@ fn load_maintenance_trigger_lifecycle_for_update(
             reason: "lifecycle identity does not match its row key".to_owned(),
         });
     }
-    let envelope_operation = {
-        let ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-        ids.get(trigger_id)
-            .map_err(storage)?
-            .map(|value| value.value().to_owned())
-            .ok_or_else(|| OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_index",
-                reason: "lifecycle trigger identity has no envelope index".to_owned(),
-            })?
-    };
-    let intake = {
-        let intakes = write
-            .open_table(MAINTENANCE_TRIGGER_INTAKES)
-            .map_err(storage)?;
-        intakes
-            .get(envelope_operation.as_str())
-            .map_err(storage)?
-            .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-            .transpose()?
-            .ok_or_else(|| OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "trigger identity index points to a missing intake row".to_owned(),
-            })?
-    };
+    let envelope_operation = load_maintenance_trigger_envelope_operation(write, trigger_id)?;
+    let intake = load_maintenance_trigger_intake_for_update(write, &envelope_operation)?;
+    validate_maintenance_trigger_write_identity(
+        trigger_id,
+        &envelope_operation,
+        &intake,
+        &lifecycle,
+    )?;
+    validate_maintenance_trigger_write_indexes(
+        write,
+        trigger_id,
+        &envelope_operation,
+        &intake,
+        &lifecycle,
+    )?;
+    validate_maintenance_trigger_write_payload(
+        write,
+        &envelope_operation,
+        &intake,
+        &lifecycle,
+    )?;
+    Ok(lifecycle)
+}
+
+fn load_maintenance_trigger_envelope_operation(
+    write: &redb::WriteTransaction,
+    trigger_id: &str,
+) -> Result<String, OrsError> {
+    let ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
+    ids.get(trigger_id)
+        .map_err(storage)?
+        .map(|value| value.value().to_owned())
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_index",
+            reason: "lifecycle trigger identity has no envelope index".to_owned(),
+        })
+}
+
+fn load_maintenance_trigger_intake_for_update(
+    write: &redb::WriteTransaction,
+    envelope_operation: &str,
+) -> Result<MaintenanceTriggerIntakeStorageRecord, OrsError> {
+    let intakes = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?;
+    intakes
+        .get(envelope_operation)
+        .map_err(storage)?
+        .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "trigger identity index points to a missing intake row".to_owned(),
+        })
+}
+
+fn validate_maintenance_trigger_write_identity(
+    trigger_id: &str,
+    envelope_operation: &str,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
     intake.validate()?;
     if intake.trigger_id != trigger_id
         || intake.envelope_operation_id.as_str() != envelope_operation
@@ -3428,6 +4773,16 @@ fn load_maintenance_trigger_lifecycle_for_update(
             reason: "lifecycle row does not match its retained intake".to_owned(),
         });
     }
+    Ok(())
+}
+
+fn validate_maintenance_trigger_write_indexes(
+    write: &redb::WriteTransaction,
+    trigger_id: &str,
+    envelope_operation: &str,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
     let indexed_event = {
         let events = write
             .open_table(MAINTENANCE_TRIGGER_EVENTS)
@@ -3437,7 +4792,7 @@ fn load_maintenance_trigger_lifecycle_for_update(
             .map_err(storage)?
             .map(|value| value.value().to_owned())
     };
-    if indexed_event.as_deref() != Some(envelope_operation.as_str()) {
+    if indexed_event.as_deref() != Some(envelope_operation) {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_intake_index",
             reason: "source-event index is missing or mismatched".to_owned(),
@@ -3478,18 +4833,27 @@ fn load_maintenance_trigger_lifecycle_for_update(
             reason: "active lifecycle phase and active index disagree".to_owned(),
         });
     }
+    Ok(())
+}
+
+fn validate_maintenance_trigger_write_payload(
+    write: &redb::WriteTransaction,
+    envelope_operation: &str,
+    intake: &MaintenanceTriggerIntakeStorageRecord,
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
     let pin = {
         let pins = write
             .open_table(MAINTENANCE_TRIGGER_PINS)
             .map_err(storage)?;
-        pins.get(envelope_operation.as_str())
+        pins.get(envelope_operation)
             .map_err(storage)?
             .map(|value| value.value().to_owned())
     };
     let envelope = {
         let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
         envelopes
-            .get(envelope_operation.as_str())
+            .get(envelope_operation)
             .map_err(storage)?
             .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
             .transpose()?
@@ -3501,38 +4865,74 @@ fn load_maintenance_trigger_lifecycle_for_update(
                 reason: "compacted lifecycle still retains a pin or envelope".to_owned(),
             });
         }
-    } else {
-        if pin.as_deref() != Some(intake.source_event_identity.as_str()) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_pin",
-                reason: "uncompacted intake has a missing or mismatched envelope pin".to_owned(),
-            });
-        }
-        let envelope = envelope.ok_or_else(|| OrsError::IntegrityProblem {
-            record_type: "maintenance_trigger_intake",
-            reason: "pinned recovery envelope is missing".to_owned(),
-        })?;
-        envelope.validate()?;
-        if envelope.operation_or_checkpoint_id != intake.envelope_operation_id
-            || envelope.payload_sha256 != intake.envelope_payload_sha256
-            || envelope.payload_length != intake.envelope_payload_length
-            || envelope.state_fence.sha256 != intake.source_state_fence_sha256
-            || envelope.state_fence.observed_authority_epoch
-                != intake.source_observed_authority_epoch
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "pinned recovery envelope binding changed".to_owned(),
-            });
-        }
+        return Ok(());
     }
-    Ok(lifecycle)
+    if pin.as_deref() != Some(intake.source_event_identity.as_str()) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake_pin",
+            reason: "uncompacted intake has a missing or mismatched envelope pin".to_owned(),
+        });
+    }
+    let envelope = envelope.ok_or_else(|| OrsError::IntegrityProblem {
+        record_type: "maintenance_trigger_intake",
+        reason: "pinned recovery envelope is missing".to_owned(),
+    })?;
+    envelope.validate()?;
+    if envelope.operation_or_checkpoint_id != intake.envelope_operation_id
+        || envelope.payload_sha256 != intake.envelope_payload_sha256
+        || envelope.payload_length != intake.envelope_payload_length
+        || envelope.state_fence.sha256 != intake.source_state_fence_sha256
+        || envelope.state_fence.observed_authority_epoch != intake.source_observed_authority_epoch
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_intake",
+            reason: "pinned recovery envelope binding changed".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+struct MaintenanceTriggerActiveSnapshot {
+    indexed_active: BTreeMap<String, String>,
+    sequence_index: BTreeMap<String, String>,
+    lifecycle_rows: Vec<(String, String)>,
+    intake_count: u64,
+    trigger_index_count: u64,
+    event_index_count: u64,
 }
 
 fn snapshot_active_maintenance_trigger_members(
     write: &redb::WriteTransaction,
     high_water_sequence: u64,
 ) -> Result<Vec<u64>, OrsError> {
+    let snapshot = load_maintenance_trigger_active_snapshot(write)?;
+    validate_maintenance_trigger_active_snapshot(write, &snapshot, high_water_sequence)?;
+    snapshot
+        .indexed_active
+        .keys()
+        .map(|key| {
+            let sequence = key.parse::<u64>().map_err(|_| OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_active_index",
+                reason: "active index key is not an unsigned sequence".to_owned(),
+            })?;
+            if sequence == 0
+                || sequence > high_water_sequence
+                || maintenance_trigger_sequence_key(sequence).as_str() != key.as_str()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "maintenance_trigger_active_index",
+                    reason: "active index sequence is not canonical or exceeds high-water"
+                        .to_owned(),
+                });
+            }
+            Ok(sequence)
+        })
+        .collect()
+}
+
+fn load_maintenance_trigger_active_snapshot(
+    write: &redb::WriteTransaction,
+) -> Result<MaintenanceTriggerActiveSnapshot, OrsError> {
     let indexed_active = {
         let table = write
             .open_table(MAINTENANCE_TRIGGER_ACTIVE_INDEX)
@@ -3572,30 +4972,44 @@ fn snapshot_active_maintenance_trigger_members(
             })
             .collect::<Result<Vec<_>, OrsError>>()?
     };
-    let intake_count = {
-        let table = write
-            .open_table(MAINTENANCE_TRIGGER_INTAKES)
-            .map_err(storage)?;
-        table.len().map_err(storage)?
-    };
-    let trigger_index_count = {
-        let table = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-        table.len().map_err(storage)?
-    };
-    let event_index_count = {
-        let table = write
-            .open_table(MAINTENANCE_TRIGGER_EVENTS)
-            .map_err(storage)?;
-        table.len().map_err(storage)?
-    };
+    let intake_count = write
+        .open_table(MAINTENANCE_TRIGGER_INTAKES)
+        .map_err(storage)?
+        .len()
+        .map_err(storage)?;
+    let trigger_index_count = write
+        .open_table(MAINTENANCE_TRIGGER_IDS)
+        .map_err(storage)?
+        .len()
+        .map_err(storage)?;
+    let event_index_count = write
+        .open_table(MAINTENANCE_TRIGGER_EVENTS)
+        .map_err(storage)?
+        .len()
+        .map_err(storage)?;
+    Ok(MaintenanceTriggerActiveSnapshot {
+        indexed_active,
+        sequence_index,
+        lifecycle_rows,
+        intake_count,
+        trigger_index_count,
+        event_index_count,
+    })
+}
+
+fn validate_maintenance_trigger_active_snapshot(
+    write: &redb::WriteTransaction,
+    snapshot: &MaintenanceTriggerActiveSnapshot,
+    high_water_sequence: u64,
+) -> Result<(), OrsError> {
     let lifecycle_count =
-        u64::try_from(lifecycle_rows.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        u64::try_from(snapshot.lifecycle_rows.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
     let sequence_index_count =
-        u64::try_from(sequence_index.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        u64::try_from(snapshot.sequence_index.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
     if lifecycle_count != sequence_index_count
-        || lifecycle_count != intake_count
-        || lifecycle_count != trigger_index_count
-        || lifecycle_count != event_index_count
+        || lifecycle_count != snapshot.intake_count
+        || lifecycle_count != snapshot.trigger_index_count
+        || lifecycle_count != snapshot.event_index_count
         || lifecycle_count != high_water_sequence
     {
         return Err(OrsError::IntegrityProblem {
@@ -3603,69 +5017,67 @@ fn snapshot_active_maintenance_trigger_members(
             reason: "lifecycle, intake, and identity-index cardinalities disagree".to_owned(),
         });
     }
-
     let mut expected_sequences = BTreeMap::new();
     let mut expected_active = BTreeMap::new();
-    for (trigger_id, payload) in lifecycle_rows {
-        let lifecycle: MaintenanceTriggerLifecycleRecord = decode(&payload)?;
-        lifecycle.validate()?;
-        if lifecycle.trigger_id != trigger_id || lifecycle.intake_sequence > high_water_sequence {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_lifecycle",
-                reason: "lifecycle key or sequence is outside the frozen high-water mark"
-                    .to_owned(),
-            });
-        }
-        let indexed_lifecycle =
-            load_maintenance_trigger_lifecycle_for_update(write, trigger_id.as_str())?;
-        if indexed_lifecycle != lifecycle {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_lifecycle",
-                reason: "lifecycle changed during active-page snapshot read-back".to_owned(),
-            });
-        }
-        let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
-        if sequence_index.get(&sequence_key).map(String::as_str) != Some(trigger_id.as_str())
-            || expected_sequences
-                .insert(sequence_key.clone(), trigger_id.clone())
-                .is_some()
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_sequence_index",
-                reason: "lifecycle sequence index is duplicated or mismatched".to_owned(),
-            });
-        }
-        if maintenance_trigger_phase_is_active(lifecycle.phase) {
-            expected_active.insert(sequence_key, trigger_id);
-        }
+    for (trigger_id, payload) in &snapshot.lifecycle_rows {
+        validate_maintenance_trigger_active_snapshot_row(
+            write,
+            trigger_id,
+            payload,
+            high_water_sequence,
+            &snapshot.sequence_index,
+            &mut expected_sequences,
+            &mut expected_active,
+        )?;
     }
-    if expected_sequences != sequence_index || expected_active != indexed_active {
+    if expected_sequences != snapshot.sequence_index || expected_active != snapshot.indexed_active {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_active_index",
             reason: "active or ordered sequence index differs from retained lifecycles".to_owned(),
         });
     }
+    Ok(())
+}
 
-    indexed_active
-        .keys()
-        .map(|key| {
-            let sequence = key.parse::<u64>().map_err(|_| OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_active_index",
-                reason: "active index key is not an unsigned sequence".to_owned(),
-            })?;
-            if sequence == 0
-                || sequence > high_water_sequence
-                || maintenance_trigger_sequence_key(sequence).as_str() != key.as_str()
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_active_index",
-                    reason: "active index sequence is not canonical or exceeds high-water"
-                        .to_owned(),
-                });
-            }
-            Ok(sequence)
-        })
-        .collect()
+fn validate_maintenance_trigger_active_snapshot_row(
+    write: &redb::WriteTransaction,
+    trigger_id: &str,
+    payload: &str,
+    high_water_sequence: u64,
+    sequence_index: &BTreeMap<String, String>,
+    expected_sequences: &mut BTreeMap<String, String>,
+    expected_active: &mut BTreeMap<String, String>,
+) -> Result<(), OrsError> {
+    let lifecycle: MaintenanceTriggerLifecycleRecord = decode(payload)?;
+    lifecycle.validate()?;
+    if lifecycle.trigger_id != trigger_id || lifecycle.intake_sequence > high_water_sequence {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "lifecycle key or sequence is outside the frozen high-water mark".to_owned(),
+        });
+    }
+    let indexed_lifecycle = load_maintenance_trigger_lifecycle_for_update(write, trigger_id)?;
+    if indexed_lifecycle != lifecycle {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "lifecycle changed during active-page snapshot read-back".to_owned(),
+        });
+    }
+    let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
+    if sequence_index.get(&sequence_key).map(String::as_str) != Some(trigger_id)
+        || expected_sequences
+            .insert(sequence_key.clone(), trigger_id.to_owned())
+            .is_some()
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_sequence_index",
+            reason: "lifecycle sequence index is duplicated or mismatched".to_owned(),
+        });
+    }
+    if maintenance_trigger_phase_is_active(lifecycle.phase) {
+        expected_active.insert(sequence_key, trigger_id.to_owned());
+    }
+    Ok(())
 }
 
 fn persist_maintenance_trigger_lifecycle(
@@ -27712,148 +29124,32 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 return Err(OrsError::UnsafeExpiry);
             }
         }
-        let (pinned, pin_source_event) = {
-            let intakes = write
-                .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                .map_err(storage)?;
-            let pinned = intakes
-                .get(token.operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                .transpose()?;
-            let pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            let pin_source_event = pins
-                .get(token.operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned());
-            (pinned, pin_source_event)
-        };
+        let (pinned, pin_source_event) =
+            load_maintenance_trigger_expiry_pin_records(&write, token.operation_id.as_str())?;
         if let Some(pinned) = pinned {
-            let Some(pin_source_event) = pin_source_event else {
-                let lifecycle = {
-                    let lifecycles = write
-                        .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
-                        .map_err(storage)?;
-                    lifecycles
-                        .get(pinned.trigger_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<MaintenanceTriggerLifecycleRecord>(value.value()))
-                        .transpose()?
-                };
-                if let Some(lifecycle) = lifecycle {
-                    lifecycle.validate()?;
-                    let indexed_event = {
-                        let events = write
-                            .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                            .map_err(storage)?;
-                        events
-                            .get(pinned.source_event_identity.as_str())
-                            .map_err(storage)?
-                            .map(|value| value.value().to_owned())
-                    };
-                    let indexed_trigger = {
-                        let trigger_ids =
-                            write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-                        trigger_ids
-                            .get(pinned.trigger_id.as_str())
-                            .map_err(storage)?
-                            .map(|value| value.value().to_owned())
-                    };
-                    let envelope_exists = {
-                        let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-                        envelopes
-                            .get(token.operation_id.as_str())
-                            .map_err(storage)?
-                            .is_some()
-                    };
-                    if lifecycle.payload_compacted_at_ms.is_some()
-                        && lifecycle.trigger_id == pinned.trigger_id
-                        && lifecycle.source_event_identity == pinned.source_event_identity
-                        && lifecycle.expires_at_ms == Some(pinned.applicable_until_unix_ms)
-                        && indexed_event.as_deref() == Some(token.operation_id.as_str())
-                        && indexed_trigger.as_deref() == Some(token.operation_id.as_str())
-                        && !envelope_exists
-                    {
-                        write.commit().map_err(storage)?;
-                        return Ok(record);
-                    }
-                }
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_pin",
-                    reason: "retained intake row is missing its envelope-keyed pin".to_owned(),
-                });
-            };
-            pinned.validate()?;
-            if pinned.envelope_operation_id != token.operation_id {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "retained row does not match its envelope-operation key".to_owned(),
-                });
-            }
-            if pin_source_event != pinned.source_event_identity {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_pin",
-                    reason: "envelope-keyed pin does not match the retained source event"
-                        .to_owned(),
-                });
-            }
-            let indexed_envelope = {
-                let events = write
-                    .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                    .map_err(storage)?;
-                events
-                    .get(pinned.source_event_identity.as_str())
-                    .map_err(storage)?
-                    .map(|value| value.value().to_owned())
-            };
-            let trigger_envelope = {
-                let trigger_ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-                trigger_ids
-                    .get(pinned.trigger_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| value.value().to_owned())
-            };
-            if indexed_envelope.as_deref() != Some(token.operation_id.as_str())
-                || trigger_envelope.as_deref() != Some(token.operation_id.as_str())
+            if pin_source_event.is_none()
+                && is_compacted_maintenance_trigger_expiry_replay(
+                    &write,
+                    token.operation_id.as_str(),
+                    &pinned,
+                )?
             {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_index",
-                    reason: "retained trigger identity index is missing or mismatched".to_owned(),
-                });
+                write.commit().map_err(storage)?;
+                return Ok(record);
             }
-            let envelope = {
-                let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-                envelopes
-                    .get(token.operation_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
-                    .transpose()?
-                    .ok_or_else(|| OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_intake",
-                        reason: "pinned recovery envelope is missing".to_owned(),
-                    })?
-            };
-            envelope.validate()?;
-            if envelope.operation_or_checkpoint_id != pinned.envelope_operation_id
-                || envelope.payload_sha256 != pinned.envelope_payload_sha256
-                || envelope.payload_length != pinned.envelope_payload_length
-                || envelope.state_fence.sha256 != pinned.source_state_fence_sha256
-                || envelope.state_fence.observed_authority_epoch
-                    != pinned.source_observed_authority_epoch
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "pinned recovery envelope binding changed".to_owned(),
-                });
-            }
+            validate_live_maintenance_trigger_expiry_binding(
+                &write,
+                token.operation_id.as_str(),
+                &pinned,
+                pin_source_event.as_deref(),
+            )?;
             // Terminal reservation cleanup cannot release a trigger-owned
             // envelope. The trigger row and its pin remain until a dedicated
             // trigger retention owner explicitly retires that relationship.
             write.commit().map_err(storage)?;
             return Ok(record);
-        } else if pin_source_event.is_some() {
+        }
+        if pin_source_event.is_some() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "maintenance_trigger_intake_pin",
                 reason: "envelope-keyed pin exists without its retained intake row".to_owned(),
@@ -28006,607 +29302,44 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         record: &MaintenanceTriggerIntakeStorageRecord,
     ) -> Result<MaintenanceTriggerIntakeStorageProjection, OrsError> {
         record.validate()?;
-        let source_event_identity = record.source_event_identity.as_str();
         let write = self.database.begin_write().map_err(storage)?;
-
-        // A completed compaction removes the pinned envelope payload but
-        // deliberately retains the exact producer input and identity indexes.
-        // Recognize that durable tombstone before trying to load the envelope,
-        // so an exact retry remains idempotent without resurrecting payload.
-        let compacted_existing = {
-            let intakes = write
-                .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                .map_err(storage)?;
-            intakes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                .transpose()?
-        };
-        let compacted_pin = {
-            let pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            pins.get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if let Some(existing) = compacted_existing.as_ref() {
-            existing.validate()?;
-            if existing != record {
-                return Err(OrsError::DuplicateConflict);
-            }
-            if compacted_pin.is_none() {
-                let lifecycle = {
-                    let lifecycles = write
-                        .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
-                        .map_err(storage)?;
-                    lifecycles
-                        .get(record.trigger_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<MaintenanceTriggerLifecycleRecord>(value.value()))
-                        .transpose()?
-                        .ok_or_else(|| OrsError::IntegrityProblem {
-                            record_type: "maintenance_trigger_lifecycle",
-                            reason: "compacted intake has no retained lifecycle row".to_owned(),
-                        })?
-                };
-                lifecycle.validate()?;
-                if lifecycle.trigger_id != record.trigger_id
-                    || lifecycle.source_event_identity != record.source_event_identity
-                    || lifecycle.expires_at_ms != Some(record.applicable_until_unix_ms)
-                    || lifecycle.payload_compacted_at_ms.is_none()
-                {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_lifecycle",
-                        reason: "compacted intake does not match its lifecycle summary".to_owned(),
-                    });
-                }
-                let indexed_event = {
-                    let events = write
-                        .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                        .map_err(storage)?;
-                    events
-                        .get(source_event_identity)
-                        .map_err(storage)?
-                        .map(|value| value.value().to_owned())
-                };
-                let indexed_trigger = {
-                    let trigger_ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-                    trigger_ids
-                        .get(record.trigger_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| value.value().to_owned())
-                };
-                if indexed_event.as_deref() != Some(record.envelope_operation_id.as_str())
-                    || indexed_trigger.as_deref() != Some(record.envelope_operation_id.as_str())
-                {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_intake_index",
-                        reason: "compacted intake identity index is missing or mismatched"
-                            .to_owned(),
-                    });
-                }
-                let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
-                let indexed_sequence = {
-                    let sequence_index = write
-                        .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
-                        .map_err(storage)?;
-                    sequence_index
-                        .get(sequence_key.as_str())
-                        .map_err(storage)?
-                        .map(|value| value.value().to_owned())
-                };
-                if indexed_sequence.as_deref() != Some(record.trigger_id.as_str()) {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_sequence_index",
-                        reason: "compacted intake sequence index is missing or mismatched"
-                            .to_owned(),
-                    });
-                }
-                let envelope_exists = {
-                    let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-                    envelopes
-                        .get(record.envelope_operation_id.as_str())
-                        .map_err(storage)?
-                        .is_some()
-                };
-                if envelope_exists {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_payload_compaction",
-                        reason: "compacted lifecycle still has its pinned envelope".to_owned(),
-                    });
-                }
-                write.commit().map_err(storage)?;
-                return Ok(MaintenanceTriggerIntakeStorageProjection {
-                    record: existing.clone(),
-                    replayed: true,
-                });
-            }
+        if let Some(projection) = try_replay_compacted_maintenance_trigger_intake(&write, record)? {
+            write.commit().map_err(storage)?;
+            return Ok(projection);
         }
 
-        // Read, decode, and validate the staged envelope inside the same
-        // write transaction that installs the primary intake row, direct pin,
-        // and identity indexes. This serializes intake against `expire()`:
-        // either expiry removes the envelope first and intake fails, or intake
-        // commits every pin record before expiry can consider removal.
-        let envelope = {
-            let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-            let value = envelopes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .ok_or(OrsError::ReservationNotFound)?;
-            decode::<RecoveryPayloadEnvelope>(value.value())?
-        };
-        envelope.validate()?;
-        if envelope.operation_or_checkpoint_id != record.envelope_operation_id {
-            return Err(OrsError::DuplicateConflict);
-        }
-        if envelope.payload_sha256 != record.envelope_payload_sha256
-            || envelope.payload_length != record.envelope_payload_length
-        {
-            return Err(OrsError::PayloadIntegrityMismatch);
-        }
-        if envelope.state_fence.sha256 != record.source_state_fence_sha256
-            || envelope.state_fence.observed_authority_epoch
-                != record.source_observed_authority_epoch
-        {
-            return Err(OrsError::FenceMismatch);
-        }
-
-        let indexed_envelope = {
-            let events = write
-                .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                .map_err(storage)?;
-            events
-                .get(source_event_identity)
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
+        validate_maintenance_trigger_intake_envelope(&write, record)?;
+        let indexed_envelope = load_maintenance_trigger_event_index(
+            &write,
+            record.source_event_identity.as_str(),
+        )?;
         if indexed_envelope
             .as_deref()
             .is_some_and(|value| value != record.envelope_operation_id.as_str())
         {
             return Err(OrsError::DuplicateConflict);
         }
-        let existing = {
-            let intakes = write
-                .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                .map_err(storage)?;
-            intakes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                .transpose()?
-        };
-        let pin_source_event = {
-            let pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            pins.get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        match (existing.as_ref(), pin_source_event.as_deref()) {
-            (Some(existing), Some(pin_source_event))
-                if pin_source_event == existing.source_event_identity => {}
-            (None, None) => {}
-            (Some(_), None) => {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_pin",
-                    reason: "retained intake row is missing its envelope-keyed pin".to_owned(),
-                });
-            }
-            (None, Some(_)) => {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_pin",
-                    reason: "envelope-keyed pin exists without its retained intake row".to_owned(),
-                });
-            }
-            (Some(_), Some(_)) => {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_pin",
-                    reason: "envelope-keyed pin does not match the retained source event"
-                        .to_owned(),
-                });
-            }
-        }
-        let replayed = if let Some(existing) = existing {
-            existing.validate()?;
-            if existing.envelope_operation_id != record.envelope_operation_id {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "record identity does not match its envelope-operation key".to_owned(),
-                });
-            }
-            if existing != *record {
-                return Err(OrsError::DuplicateConflict);
-            }
-            if indexed_envelope.as_deref() != Some(record.envelope_operation_id.as_str()) {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_index",
-                    reason: "source-event identity index is missing for retained row".to_owned(),
-                });
-            }
-            true
-        } else {
-            if indexed_envelope.is_some() {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_index",
-                    reason: "source-event identity index is dangling".to_owned(),
-                });
-            }
-            false
-        };
-
+        let (existing, pin_source_event) = load_maintenance_trigger_intake_and_pin(
+            &write,
+            record.envelope_operation_id.as_str(),
+        )?;
+        let replayed = validate_maintenance_trigger_intake_replay(
+            &write,
+            record,
+            indexed_envelope.as_deref(),
+            existing.as_ref(),
+            pin_source_event.as_deref(),
+        )?;
         if !replayed {
-            let trigger_envelope = {
-                let trigger_ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-                trigger_ids
-                    .get(record.trigger_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| value.value().to_owned())
-            };
-            if let Some(trigger_envelope) = trigger_envelope {
-                if trigger_envelope == record.envelope_operation_id.as_str() {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_intake_index",
-                        reason: "trigger identity index is dangling".to_owned(),
-                    });
-                }
-                return Err(OrsError::DuplicateConflict);
-            }
-
-            let payload = encode(record)?;
-            {
-                let mut intakes = write
-                    .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                    .map_err(storage)?;
-                intakes
-                    .insert(record.envelope_operation_id.as_str(), payload.as_str())
-                    .map_err(storage)?;
-            }
-            {
-                let mut pins = write
-                    .open_table(MAINTENANCE_TRIGGER_PINS)
-                    .map_err(storage)?;
-                pins.insert(record.envelope_operation_id.as_str(), source_event_identity)
-                    .map_err(storage)?;
-            }
-            {
-                let mut events = write
-                    .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                    .map_err(storage)?;
-                events
-                    .insert(source_event_identity, record.envelope_operation_id.as_str())
-                    .map_err(storage)?;
-            }
-            {
-                let mut trigger_ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-                trigger_ids
-                    .insert(
-                        record.trigger_id.as_str(),
-                        record.envelope_operation_id.as_str(),
-                    )
-                    .map_err(storage)?;
-            }
-
-            let intake_sequence = {
-                let meta = write.open_table(META).map_err(storage)?;
-                let last_sequence = meta
-                    .get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
-                    .map_err(storage)?
-                    .map(|value| {
-                        value
-                            .value()
-                            .parse::<u64>()
-                            .map_err(|_| OrsError::IntegrityProblem {
-                                record_type: "maintenance_trigger_sequence_meta",
-                                reason: "sequence high-water marker is not an unsigned integer"
-                                    .to_owned(),
-                            })
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
-                last_sequence
-                    .checked_add(1)
-                    .ok_or(OrsError::ProjectionLimitExceeded)?
-            };
-            let sequence_key = maintenance_trigger_sequence_key(intake_sequence);
-            let sequence_key_exists = {
-                let sequence_index = write
-                    .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
-                    .map_err(storage)?;
-                sequence_index
-                    .get(sequence_key.as_str())
-                    .map_err(storage)?
-                    .is_some()
-            };
-            if sequence_key_exists {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_sequence_index",
-                    reason: "next assigned intake sequence is already present".to_owned(),
-                });
-            }
-            let retained_at_ms = current_unix_ms_u64()?;
-            let lifecycle = MaintenanceTriggerLifecycleRecord {
-                contract_version: crate::CONTRACT_VERSION,
-                intake_sequence,
-                retained_revision: 1,
-                state_revision: 1,
-                source_event_identity: record.source_event_identity.clone(),
-                trigger_id: record.trigger_id.clone(),
-                phase: MaintenanceTriggerLifecyclePhase::Pending,
-                claim: None,
-                claim_record: None,
-                decision_record: None,
-                downstream_intent_record: None,
-                acknowledgement_record: None,
-                revocation_record: None,
-                terminal_record: None,
-                retained_at_ms,
-                updated_at_ms: retained_at_ms,
-                expires_at_ms: Some(record.applicable_until_unix_ms),
-                downstream_retention: None,
-                payload_compacted_at_ms: None,
-            };
-            lifecycle.validate()?;
-            let lifecycle_payload = encode(&lifecycle)?;
-            {
-                let mut lifecycles = write
-                    .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
-                    .map_err(storage)?;
-                lifecycles
-                    .insert(record.trigger_id.as_str(), lifecycle_payload.as_str())
-                    .map_err(storage)?;
-            }
-            {
-                let mut sequence_index = write
-                    .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
-                    .map_err(storage)?;
-                sequence_index
-                    .insert(sequence_key.as_str(), record.trigger_id.as_str())
-                    .map_err(storage)?;
-            }
-            {
-                let mut meta = write.open_table(META).map_err(storage)?;
-                let high_water = intake_sequence.to_string();
-                meta.insert(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY, high_water.as_str())
-                    .map_err(storage)?;
-            }
+            persist_new_maintenance_trigger_intake(&write, record)?;
         }
-
-        // Transaction-local read-back proves that the row, direct pin, and
-        // both identity indexes agree before the write can commit.
-        let staged = {
-            let intakes = write
-                .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                .map_err(storage)?;
-            intakes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "staged row is missing on transaction read-back".to_owned(),
-                })?
-        };
-        staged.validate()?;
-        if staged != *record {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "staged row changed during transaction read-back".to_owned(),
-            });
-        }
-        let lifecycle = {
-            let lifecycles = write
-                .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
-                .map_err(storage)?;
-            lifecycles
-                .get(record.trigger_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerLifecycleRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_lifecycle",
-                    reason: "retained intake has no lifecycle row".to_owned(),
-                })?
-        };
-        lifecycle.validate()?;
-        if lifecycle.source_event_identity != record.source_event_identity
-            || lifecycle.trigger_id != record.trigger_id
-            || lifecycle.expires_at_ms != Some(record.applicable_until_unix_ms)
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_lifecycle",
-                reason: "lifecycle row does not match the retained intake identities".to_owned(),
-            });
-        }
-        let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
-        let indexed_trigger = {
-            let sequence_index = write
-                .open_table(MAINTENANCE_TRIGGER_SEQUENCE_INDEX)
-                .map_err(storage)?;
-            sequence_index
-                .get(sequence_key.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if indexed_trigger.as_deref() != Some(record.trigger_id.as_str()) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_sequence_index",
-                reason: "lifecycle sequence index is missing or mismatched".to_owned(),
-            });
-        }
-        let high_water = {
-            let meta = write.open_table(META).map_err(storage)?;
-            meta.get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
-                .map_err(storage)?
-                .map(|value| value.value().parse::<u64>())
-                .transpose()
-                .map_err(|_| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_sequence_meta",
-                    reason: "sequence high-water marker is not an unsigned integer".to_owned(),
-                })?
-                .unwrap_or(0)
-        };
-        if high_water < lifecycle.intake_sequence {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_sequence_meta",
-                reason: "sequence high-water marker precedes the retained lifecycle".to_owned(),
-            });
-        }
-        let pin_source_event = {
-            let pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            pins.get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if pin_source_event.as_deref() != Some(source_event_identity) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_pin",
-                reason: "envelope-keyed pin failed transaction read-back".to_owned(),
-            });
-        }
-        let indexed_envelope = {
-            let events = write
-                .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                .map_err(storage)?;
-            events
-                .get(source_event_identity)
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        let trigger_envelope = {
-            let trigger_ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-            trigger_ids
-                .get(record.trigger_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if indexed_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
-            || trigger_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_index",
-                reason: "source-event or trigger identity index failed transaction read-back"
-                    .to_owned(),
-            });
-        }
+        validate_maintenance_trigger_intake_transaction_readback(&write, record)?;
         write.commit().map_err(storage)?;
 
-        // A fresh committed snapshot is the only successful return path. The
-        // pin guarantees that expiry cannot delete the envelope between the
-        // atomic validation/insert transaction and this exact read-back.
         let read = self.database.begin_read().map_err(storage)?;
-        let persisted = {
-            let intakes = read
-                .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                .map_err(storage)?;
-            intakes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "committed row is missing on read-back".to_owned(),
-                })?
-        };
-        persisted.validate()?;
-        if persisted != *record {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "committed row differs from the accepted input".to_owned(),
-            });
-        }
-        let (pair_record, pair_lifecycle) =
-            read_maintenance_trigger_pair(&read, record.trigger_id.as_str())?.ok_or_else(|| {
-                OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_lifecycle",
-                    reason: "committed intake lifecycle disappeared on read-back".to_owned(),
-                }
-            })?;
-        if pair_record != persisted
-            || pair_lifecycle.source_event_identity != record.source_event_identity
-            || pair_lifecycle.trigger_id != record.trigger_id
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_lifecycle",
-                reason: "committed lifecycle identity differs from staged intake".to_owned(),
-            });
-        }
-        let pin_source_event = {
-            let pins = read.open_table(MAINTENANCE_TRIGGER_PINS).map_err(storage)?;
-            pins.get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if pin_source_event.as_deref() != Some(source_event_identity) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_pin",
-                reason: "committed envelope-keyed pin is missing or mismatched".to_owned(),
-            });
-        }
-        let indexed_envelope = {
-            let events = read
-                .open_table(MAINTENANCE_TRIGGER_EVENTS)
-                .map_err(storage)?;
-            events
-                .get(source_event_identity)
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        let trigger_envelope = {
-            let trigger_ids = read.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-            trigger_ids
-                .get(record.trigger_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if indexed_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
-            || trigger_envelope.as_deref() != Some(record.envelope_operation_id.as_str())
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_index",
-                reason: "committed source-event or trigger identity index is missing or mismatched"
-                    .to_owned(),
-            });
-        }
-        let persisted_envelope = {
-            let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
-            envelopes
-                .get(record.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake",
-                    reason: "referenced recovery envelope is missing on read-back".to_owned(),
-                })?
-        };
-        persisted_envelope.validate()?;
-        if persisted_envelope.operation_or_checkpoint_id != record.envelope_operation_id
-            || persisted_envelope.payload_sha256 != record.envelope_payload_sha256
-            || persisted_envelope.payload_length != record.envelope_payload_length
-            || persisted_envelope.state_fence.sha256 != record.source_state_fence_sha256
-            || persisted_envelope.state_fence.observed_authority_epoch
-                != record.source_observed_authority_epoch
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake",
-                reason: "referenced recovery envelope binding changed on read-back".to_owned(),
-            });
-        }
-        Ok(MaintenanceTriggerIntakeStorageProjection {
-            record: persisted,
-            replayed,
-        })
+        let persisted = readback_committed_maintenance_trigger_intake(&read, record)?;
+        Ok(MaintenanceTriggerIntakeStorageProjection { record: persisted, replayed })
     }
-
     fn load_maintenance_trigger_intake(
         &self,
         trigger_id: &str,
@@ -28633,126 +29366,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         continuation: Option<&str>,
         limit: u16,
     ) -> Result<crate::MaintenanceTriggerLifecyclePageProjection, OrsError> {
-        validate_text(request_id, "maintenance_trigger_page_request_id")?;
-        validate_text(daemon_session, "maintenance_trigger_page_daemon_session")?;
-        validate_digest(fence_sha256, "maintenance_trigger_page_fence_sha256")?;
-        if limit == 0 || limit > crate::MAX_MAINTENANCE_TRIGGER_PAGE {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-        if continuation.is_some_and(|token| {
-            validate_digest(token, "maintenance_trigger_continuation").is_err()
-        }) {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-
+        validate_maintenance_trigger_page_request(
+            request_id,
+            daemon_session,
+            fence_sha256,
+            continuation,
+            limit,
+            false,
+        )?;
         let write = self.database.begin_write().map_err(storage)?;
-        let cursor_lookup_key = continuation
-            .map(maintenance_trigger_page_continuation_key)
-            .unwrap_or_else(|| maintenance_trigger_page_owner_key(request_id));
-        let state = {
-            let cursors = write
-                .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
-                .map_err(storage)?;
-            cursors
-                .get(cursor_lookup_key.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerPageCursorState>(value.value()))
-                .transpose()?
-        };
-        let (state, replayed) = if let Some(state) = state {
-            if state.contract_version != crate::CONTRACT_VERSION
-                || state.limit != limit
-                || state.request_continuation.as_deref() != continuation
-                || state.cursor_id.is_empty()
-                || state.origin_session.is_empty()
-                || validate_digest(
-                    &state.origin_fence_sha256,
-                    "maintenance_trigger_page_origin_fence_sha256",
-                )
-                .is_err()
-            {
-                return Err(OrsError::DuplicateConflict);
-            }
-            let replayed = state.served;
-            if state.served {
-                (state, replayed)
-            } else {
-                let mut served_state = state.clone();
-                served_state.served = true;
-                let payload = encode(&served_state)?;
-                let mut cursors = write
-                    .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
-                    .map_err(storage)?;
-                cursors
-                    .insert(cursor_lookup_key.as_str(), payload.as_str())
-                    .map_err(storage)?;
-                (served_state, false)
-            }
-        } else {
-            if continuation.is_some() {
-                return Err(OrsError::DuplicateConflict);
-            }
-            let high_water_sequence = {
-                let meta = write.open_table(META).map_err(storage)?;
-                meta.get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
-                    .map_err(storage)?
-                    .map(|value| value.value().parse::<u64>())
-                    .transpose()
-                    .map_err(|_| OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_sequence_meta",
-                        reason: "sequence high-water marker is not an unsigned integer".to_owned(),
-                    })?
-                    .unwrap_or(0)
-            };
-            let owner_key = maintenance_trigger_page_owner_key(request_id);
-            let cursor_id = crate::model::sha256_hex(
-                format!(
-                    "eliot.ors.maintenance-trigger-cursor.v1\0{owner_key}\0{high_water_sequence}\0{limit}"
-                )
-                .as_bytes(),
-            );
-            let state = build_maintenance_trigger_page_cursor(
-                MaintenanceTriggerPageCursorState {
-                    contract_version: crate::CONTRACT_VERSION,
-                    cursor_id,
-                    origin_session: daemon_session.to_owned(),
-                    origin_fence_sha256: fence_sha256.to_owned(),
-                    high_water_sequence,
-                    limit,
-                    active_only: false,
-                    active_member_count: 0,
-                    active_member_start: 0,
-                    active_member_end: 0,
-                    request_continuation: None,
-                    window_start_exclusive: 0,
-                    window_end_inclusive: high_water_sequence,
-                    next_continuation: None,
-                    has_more: false,
-                    served: true,
-                },
-            )?;
-            persist_maintenance_trigger_page_cursor(&write, &owner_key, &state)?;
-            (state, false)
-        };
-
-        if let Some(next) = state.next_continuation.as_deref() {
-            let next_key = maintenance_trigger_page_continuation_key(next);
-            let next_state = next_maintenance_trigger_page_cursor(&state)?;
-            persist_maintenance_trigger_page_cursor(&write, &next_key, &next_state)?;
-        }
-
-        let (lifecycles, gaps) = maintenance_trigger_page_rows(&write, &state)?;
-        write.commit().map_err(storage)?;
-        Ok(crate::MaintenanceTriggerLifecyclePageProjection {
-            lifecycles,
-            gaps,
-            high_water_sequence: state.high_water_sequence,
-            continuation: state.next_continuation,
-            has_more: state.has_more,
-            replayed,
-        })
+        let (state, replayed) = resolve_maintenance_trigger_page_cursor(
+            &write,
+            request_id,
+            daemon_session,
+            fence_sha256,
+            continuation,
+            limit,
+        )?;
+        persist_maintenance_trigger_following_page_cursor(&write, &state)?;
+        finish_maintenance_trigger_page(write, state, replayed)
     }
-
     fn page_maintenance_trigger_recovery(
         &self,
         request_id: &str,
@@ -28761,160 +29394,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         continuation: Option<&str>,
         limit: u16,
     ) -> Result<crate::MaintenanceTriggerLifecyclePageProjection, OrsError> {
-        validate_text(request_id, "maintenance_trigger_recovery_request_id")?;
-        validate_text(
+        validate_maintenance_trigger_page_request(
+            request_id,
             daemon_session,
-            "maintenance_trigger_recovery_daemon_session",
+            fence_sha256,
+            continuation,
+            limit,
+            true,
         )?;
-        validate_digest(fence_sha256, "maintenance_trigger_recovery_fence_sha256")?;
-        if limit == 0 || limit > crate::MAX_MAINTENANCE_TRIGGER_PAGE {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-        if continuation.is_some_and(|token| {
-            validate_digest(token, "maintenance_trigger_continuation").is_err()
-        }) {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-
         let write = self.database.begin_write().map_err(storage)?;
-        let cursor_lookup_key = continuation
-            .map(maintenance_trigger_recovery_continuation_key)
-            .unwrap_or_else(|| maintenance_trigger_recovery_request_key(request_id));
-        let state = {
-            let cursors = write
-                .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
-                .map_err(storage)?;
-            cursors
-                .get(cursor_lookup_key.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerPageCursorState>(value.value()))
-                .transpose()?
-        };
-        let (state, replayed) = if let Some(state) = state {
-            if !state.active_only
-                || state.contract_version != crate::CONTRACT_VERSION
-                || state.limit != limit
-                || state.request_continuation.as_deref() != continuation
-                || state.cursor_id.is_empty()
-                || state.origin_session.is_empty()
-                || validate_digest(
-                    &state.origin_fence_sha256,
-                    "maintenance_trigger_page_origin_fence_sha256",
-                )
-                .is_err()
-            {
-                return Err(OrsError::DuplicateConflict);
-            }
-            persist_maintenance_trigger_page_cursor(&write, cursor_lookup_key.as_str(), &state)?;
-            let replayed = state.served;
-            if state.served {
-                (state, replayed)
-            } else {
-                let mut served_state = state.clone();
-                served_state.served = true;
-                let payload = encode(&served_state)?;
-                let mut cursors = write
-                    .open_table(MAINTENANCE_TRIGGER_PAGE_CURSORS)
-                    .map_err(storage)?;
-                cursors
-                    .insert(cursor_lookup_key.as_str(), payload.as_str())
-                    .map_err(storage)?;
-                (served_state, false)
-            }
-        } else {
-            if continuation.is_some() {
-                return Err(OrsError::DuplicateConflict);
-            }
-            let high_water_sequence = {
-                let meta = write.open_table(META).map_err(storage)?;
-                meta.get(MAINTENANCE_TRIGGER_SEQUENCE_META_KEY)
-                    .map_err(storage)?
-                    .map(|value| value.value().parse::<u64>())
-                    .transpose()
-                    .map_err(|_| OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_sequence_meta",
-                        reason: "sequence high-water marker is not an unsigned integer".to_owned(),
-                    })?
-                    .unwrap_or(0)
-            };
-            let active_sequences =
-                snapshot_active_maintenance_trigger_members(&write, high_water_sequence)?;
-            let active_member_count = u64::try_from(active_sequences.len())
-                .map_err(|_| OrsError::ProjectionLimitExceeded)?;
-            let owner_key = maintenance_trigger_recovery_request_key(request_id);
-            let cursor_id = crate::model::sha256_hex(
-                format!(
-                    "eliot.ors.maintenance-trigger-recovery-cursor.v1\0{owner_key}\0{high_water_sequence}\0{limit}"
-                )
-                .as_bytes(),
-            );
-            let state = build_maintenance_trigger_page_cursor(
-                MaintenanceTriggerPageCursorState {
-                    contract_version: crate::CONTRACT_VERSION,
-                    cursor_id: cursor_id.clone(),
-                    origin_session: daemon_session.to_owned(),
-                    origin_fence_sha256: fence_sha256.to_owned(),
-                    high_water_sequence,
-                    limit,
-                    active_only: true,
-                    active_member_count,
-                    active_member_start: 0,
-                    active_member_end: 0,
-                    request_continuation: None,
-                    window_start_exclusive: 0,
-                    window_end_inclusive: high_water_sequence,
-                    next_continuation: None,
-                    has_more: false,
-                    served: true,
-                },
-            )?;
-            {
-                let mut members = write
-                    .open_table(MAINTENANCE_TRIGGER_RECOVERY_PAGE_MEMBERS)
-                    .map_err(storage)?;
-                let prefix = format!("{cursor_id}:");
-                for entry in members.iter().map_err(storage)? {
-                    let (key, _) = entry.map_err(storage)?;
-                    if key.value().starts_with(prefix.as_str()) {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "maintenance_trigger_recovery_page_member",
-                            reason: "orphaned member rows exist without their frozen cursor"
-                                .to_owned(),
-                        });
-                    }
-                }
-                for (offset, sequence) in active_sequences.iter().enumerate() {
-                    let offset =
-                        u64::try_from(offset).map_err(|_| OrsError::ProjectionLimitExceeded)?;
-                    let member_key = format!("{cursor_id}:{offset:020}");
-                    let sequence = sequence.to_string();
-                    members
-                        .insert(member_key.as_str(), sequence.as_str())
-                        .map_err(storage)?;
-                }
-            }
-            persist_maintenance_trigger_page_cursor(&write, &owner_key, &state)?;
-            (state, false)
-        };
-
-        if let Some(next) = state.next_continuation.as_deref() {
-            let next_key = maintenance_trigger_recovery_continuation_key(next);
-            let next_state = next_maintenance_trigger_page_cursor(&state)?;
-            persist_maintenance_trigger_page_cursor(&write, &next_key, &next_state)?;
-        }
-
-        let (lifecycles, gaps) = maintenance_trigger_page_rows(&write, &state)?;
-        write.commit().map_err(storage)?;
-        Ok(crate::MaintenanceTriggerLifecyclePageProjection {
-            lifecycles,
-            gaps,
-            high_water_sequence: state.high_water_sequence,
-            continuation: state.next_continuation,
-            has_more: state.has_more,
-            replayed,
-        })
+        let (state, replayed) = resolve_maintenance_trigger_recovery_cursor(
+            &write,
+            request_id,
+            daemon_session,
+            fence_sha256,
+            continuation,
+            limit,
+        )?;
+        persist_maintenance_trigger_following_page_cursor(&write, &state)?;
+        finish_maintenance_trigger_page(write, state, replayed)
     }
-
     fn claim_maintenance_trigger(
         &self,
         trigger_id: &str,
@@ -29264,26 +29763,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     ) -> Result<MaintenanceTriggerGapStorageRecord, OrsError> {
         gap.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let existing = {
-            let gaps = write
-                .open_table(MAINTENANCE_TRIGGER_GAPS)
-                .map_err(storage)?;
-            gaps.get(gap.gap_identity.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
-                .transpose()?
-        };
+        let existing = load_maintenance_trigger_gap_for_update(&write, gap.gap_identity.as_str())?;
         let sequence_key =
             maintenance_trigger_gap_sequence_key(gap.first_sequence, &gap.gap_identity);
-        let indexed = {
-            let index = write
-                .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
-                .map_err(storage)?;
-            index
-                .get(sequence_key.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
+        let indexed = load_maintenance_trigger_gap_index(&write, sequence_key.as_str())?;
         if let Some(existing) = existing {
             existing.validate()?;
             if existing != gap || indexed.as_deref() != Some(gap.gap_identity.as_str()) {
@@ -29291,24 +29774,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             }
             write.commit().map_err(storage)?;
             let read = self.database.begin_read().map_err(storage)?;
-            let persisted = read
-                .open_table(MAINTENANCE_TRIGGER_GAPS)
-                .map_err(storage)?
-                .get(gap.gap_identity.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_gap",
-                    reason: "gap disappeared on exact replay read-back".to_owned(),
-                })?;
-            if persisted != gap {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_gap",
-                    reason: "exact replay gap changed on read-back".to_owned(),
-                });
-            }
-            return Ok(persisted);
+            return readback_maintenance_trigger_gap(&read, &gap, true);
         }
         if indexed.is_some() {
             return Err(OrsError::IntegrityProblem {
@@ -29316,74 +29782,16 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 reason: "gap sequence index exists without its primary row".to_owned(),
             });
         }
-        let payload = encode(&gap)?;
-        {
-            let mut gaps = write
-                .open_table(MAINTENANCE_TRIGGER_GAPS)
-                .map_err(storage)?;
-            gaps.insert(gap.gap_identity.as_str(), payload.as_str())
-                .map_err(storage)?;
-        }
-        {
-            let mut index = write
-                .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
-                .map_err(storage)?;
-            index
-                .insert(sequence_key.as_str(), gap.gap_identity.as_str())
-                .map_err(storage)?;
-        }
-        let local = {
-            let gaps = write
-                .open_table(MAINTENANCE_TRIGGER_GAPS)
-                .map_err(storage)?;
-            gaps.get(gap.gap_identity.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_gap",
-                    reason: "gap is missing on transaction read-back".to_owned(),
-                })?
-        };
-        let local_index = {
-            let index = write
-                .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
-                .map_err(storage)?;
-            index
-                .get(sequence_key.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        local.validate()?;
-        if local != gap || local_index.as_deref() != Some(gap.gap_identity.as_str()) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_gap_index",
-                reason: "gap or its sequence index changed on transaction read-back".to_owned(),
-            });
-        }
+        persist_maintenance_trigger_gap(&write, &gap, sequence_key.as_str())?;
+        validate_maintenance_trigger_gap_write_readback(
+            &write,
+            &gap,
+            sequence_key.as_str(),
+        )?;
         write.commit().map_err(storage)?;
         let read = self.database.begin_read().map_err(storage)?;
-        let persisted = read
-            .open_table(MAINTENANCE_TRIGGER_GAPS)
-            .map_err(storage)?
-            .get(gap.gap_identity.as_str())
-            .map_err(storage)?
-            .map(|value| decode::<MaintenanceTriggerGapStorageRecord>(value.value()))
-            .transpose()?
-            .ok_or_else(|| OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_gap",
-                reason: "committed gap is missing on read-back".to_owned(),
-            })?;
-        persisted.validate()?;
-        if persisted != gap {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_gap",
-                reason: "committed gap differs from accepted input".to_owned(),
-            });
-        }
-        Ok(persisted)
+        readback_maintenance_trigger_gap(&read, &gap, false)
     }
-
     fn list_maintenance_trigger_gaps(
         &self,
         after_identity: Option<&str>,
@@ -29481,126 +29889,16 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if now_ms < retention.retained_until_ms {
             return Err(OrsError::InvalidTransition);
         }
-        let (intake, envelope) = {
-            let ids = write.open_table(MAINTENANCE_TRIGGER_IDS).map_err(storage)?;
-            let envelope_id = ids
-                .get(trigger_id)
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_intake_index",
-                    reason: "lifecycle has no retained trigger index".to_owned(),
-                })?;
-            let intake = {
-                let intakes = write
-                    .open_table(MAINTENANCE_TRIGGER_INTAKES)
-                    .map_err(storage)?;
-                intakes
-                    .get(envelope_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode::<MaintenanceTriggerIntakeStorageRecord>(value.value()))
-                    .transpose()?
-                    .ok_or_else(|| OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_intake",
-                        reason: "trigger index points to a missing intake row".to_owned(),
-                    })?
-            };
-            let envelope = {
-                let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-                envelopes
-                    .get(envelope_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
-                    .transpose()?
-                    .ok_or_else(|| OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_payload_compaction",
-                        reason: "uncompacted pinned envelope is missing".to_owned(),
-                    })?
-            };
-            (intake, envelope)
-        };
-        intake.validate()?;
-        envelope.validate()?;
-        if intake.trigger_id != trigger_id
-            || intake.source_event_identity != lifecycle.source_event_identity
-            || envelope.operation_or_checkpoint_id != intake.envelope_operation_id
-            || envelope.payload_sha256 != intake.envelope_payload_sha256
-            || envelope.payload_length != intake.envelope_payload_length
-            || envelope.state_fence.sha256 != intake.source_state_fence_sha256
-            || envelope.state_fence.observed_authority_epoch
-                != intake.source_observed_authority_epoch
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_payload_compaction",
-                reason: "payload identity changed before compaction".to_owned(),
-            });
-        }
-        if envelope
-            .expires_at_ms
-            .is_some_and(|deadline| i64::try_from(now_ms).unwrap_or(i64::MAX) < deadline)
-        {
-            return Err(OrsError::InvalidTransition);
-        }
-        if let Some(raw_reservation) = {
-            let reservations = write.open_table(RESERVATIONS).map_err(storage)?;
-            reservations
-                .get(intake.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        } {
-            let reservation: ReservationRecord = decode(&raw_reservation)?;
-            if reservation.token.operation_id != intake.envelope_operation_id
-                || !reservation.state.is_terminal()
-            {
-                return Err(OrsError::UnsafeExpiry);
-            }
-        }
-        if let Some(problem) = {
-            let problems = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
-            problems
-                .get(intake.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<RecoveryProblem>(value.value()))
-                .transpose()?
-        } {
-            problem.validate()?;
-            if !problem.is_resolved() {
-                return Err(OrsError::UnsafeExpiry);
-            }
-        }
-        let pin = {
-            let pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            pins.get(intake.envelope_operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned())
-        };
-        if pin.as_deref() != Some(intake.source_event_identity.as_str()) {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "maintenance_trigger_intake_pin",
-                reason: "payload compaction pin is missing or mismatched".to_owned(),
-            });
-        }
-        {
-            let mut pins = write
-                .open_table(MAINTENANCE_TRIGGER_PINS)
-                .map_err(storage)?;
-            pins.remove(intake.envelope_operation_id.as_str())
-                .map_err(storage)?;
-        }
-        {
-            let mut envelopes = write.open_table(ENVELOPES).map_err(storage)?;
-            envelopes
-                .remove(intake.envelope_operation_id.as_str())
-                .map_err(storage)?;
-        }
+        let (intake, envelope) =
+            load_maintenance_trigger_compaction_payloads(&write, trigger_id)?;
+        validate_maintenance_trigger_compaction_binding(trigger_id, &lifecycle, &intake, &envelope)?;
+        validate_maintenance_trigger_compaction_safety(&write, &intake, &envelope, now_ms)?;
+        remove_maintenance_trigger_payload(&write, &intake)?;
         lifecycle.payload_compacted_at_ms = Some(now_ms);
         advance_maintenance_trigger_lifecycle(&mut lifecycle, now_ms)?;
         persist_maintenance_trigger_lifecycle(&write, &lifecycle)?;
         commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
-    }
-    /// Retains one visible durable Recovery Problem for a staged
+    }    /// Retains one visible durable Recovery Problem for a staged
     /// `PreparedTransition` that this build refuses to execute (issue #1927,
     /// I05-06).
     ///
