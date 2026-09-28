@@ -10,7 +10,11 @@
 //! are left unmodified and no installed success is ever claimed. The Governor integration-record shape is
 //! consumed as-is (read-only projection into the preview); this module mints
 //! no Governor authority and mutates nothing outside the caller-selected
-//! rollback directory plus a single install receipt written there.
+//! rollback directory plus a single install receipt written there. The receipt
+//! carries `preview_digest` (`sha256_hex(canonical_json_bytes(preview))`) so
+//! post-installation verification consumes the same preview bytes the
+//! installation was previewed with, instead of a hand-transcribed expectation
+//! that may have drifted.
 //!
 //! Required preview fields (I3.7): files to modify, exact config block,
 //! installed hooks, registered MCP server, tool/skill count, rollback copy,
@@ -19,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
 /// Expected integration coverage consumed as-is from the Governor-side
@@ -310,6 +315,20 @@ pub fn ensure_rollback_artifact(
     Ok(artifact_path)
 }
 
+/// Binds an install receipt to the exact preview record it was minted from:
+/// `sha256_hex(canonical_json_bytes(preview))` over the embedded `preview`
+/// object. Post-installation verification (`eliot doctor integration
+/// <profile>`) recomputes this digest over the receipt's embedded preview and
+/// refuses a drifted record instead of verifying against bytes the preview
+/// never minted. Canonical bytes sort object keys recursively, so receipt
+/// pretty-printing and JSON parse order never affect the binding.
+#[must_use]
+pub fn preview_record_digest(preview: &serde_json::Value) -> Option<String> {
+    canonical_json_bytes(preview)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes))
+}
+
 /// Why the install mutation is refused: the exact missing port and the owner
 /// that must admit it. Mirrors the admitted `eliot-cli` catalogue, where the
 /// install/verify family is `PLAN_GAP` pending A-06 provider injection.
@@ -318,6 +337,12 @@ const INSTALL_GAP_DETAIL: &str = "no admitted plugin target-mutation port in thi
 /// Attempts the governed install: renders the preview, preserves the
 /// rollback artifact first, then records an honest receipt scoped to the
 /// rollback directory. Never modifies the target files themselves.
+///
+/// The receipt embeds the full preview record plus `preview_digest`
+/// ([`preview_record_digest`]): post-installation verification consumes this
+/// same receipt as its expectation and refuses a drifted record, so preview
+/// and verification share one digest-bound record instead of two
+/// independently transcribed documents.
 ///
 /// No admitted target-mutation port exists in this front door, so the
 /// mutation is refused after rollback preservation: this function records an
@@ -333,6 +358,10 @@ pub fn install_with_rollback(
     let preview = render_preview(manifest, rollback_dir);
     let rollback_artifact = ensure_rollback_artifact(manifest, &preview, rollback_dir)?;
     let receipt_path = rollback_dir.join(format!("{}.installed.json", manifest.plugin_id));
+    let preview_value = preview_json(&preview);
+    let preview_digest = preview_record_digest(&preview_value).ok_or_else(|| {
+        PluginPreviewError::Receipt("preview record is not digestible".to_owned())
+    })?;
     let receipt = serde_json::json!({
         "contract": "eliot.plugin.install",
         "contract_version": "1.0.0",
@@ -342,7 +371,8 @@ pub fn install_with_rollback(
         "code": "PLAN_GAP",
         "completed": false,
         "rollback_copy": preview.rollback_copy,
-        "preview": preview_json(&preview),
+        "preview": preview_value,
+        "preview_digest": preview_digest,
         "detail": INSTALL_GAP_DETAIL,
         "note": "targets unmodified; rollback preserved; no installation occurred",
     });
