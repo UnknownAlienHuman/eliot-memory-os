@@ -403,8 +403,9 @@ impl MaintenanceTriggerIntakeFailure {
     #[must_use]
     pub const fn commit_outcome(&self) -> MaintenanceTriggerCommitOutcome {
         match self {
-            Self::Ors { commit_outcome, .. } => *commit_outcome,
-            Self::Protocol { commit_outcome, .. } => *commit_outcome,
+            Self::Ors { commit_outcome, .. } | Self::Protocol { commit_outcome, .. } => {
+                *commit_outcome
+            }
             _ => MaintenanceTriggerCommitOutcome::NotAttempted,
         }
     }
@@ -826,14 +827,14 @@ fn mark_maintenance_trigger_reconciling_checked(
     trigger_id: &str,
     lifecycle: &MaintenanceTriggerLifecycleRecord,
     claim: &MaintenanceTriggerClaimBinding,
-    intent: MaintenanceTriggerCanonicalRecord,
+    intent: &MaintenanceTriggerCanonicalRecord,
     now_ms: u64,
 ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
     let stored = ors.mark_maintenance_trigger_reconciling(
         trigger_id,
         lifecycle.state_revision,
         claim,
-        intent.clone(),
+        (*intent).clone(),
         now_ms,
     )?;
     stored.validate()?;
@@ -843,7 +844,7 @@ fn mark_maintenance_trigger_reconciling_checked(
             MaintenanceTriggerLifecyclePhase::Reconciling
                 | MaintenanceTriggerLifecyclePhase::DecisionRecorded
         )
-        || stored.downstream_intent_record.as_ref() != Some(&intent)
+        || stored.downstream_intent_record.as_ref() != Some(intent)
         || stored.claim.as_ref() != Some(claim)
     {
         return Err(OrsError::IntegrityProblem {
@@ -865,9 +866,9 @@ fn maintenance_trigger_receipt_contains_intents(
         .applied_command_ids
         .iter()
         .map(String::as_str)
-        .chain(receipt.emitted_event_ids.iter().map(|id| id.as_str()))
-        .chain(receipt.projection_refs.iter().map(|id| id.as_str()))
-        .chain(receipt.outbox_refs.iter().map(|id| id.as_str()))
+        .chain(receipt.emitted_event_ids.iter().map(String::as_str))
+        .chain(receipt.projection_refs.iter().map(String::as_str))
+        .chain(receipt.outbox_refs.iter().map(String::as_str))
         .collect::<std::collections::BTreeSet<_>>();
     [
         &decision.job_ref,
@@ -956,12 +957,10 @@ impl MaintenanceTriggerLifecycleFailure {
             | Self::Store { commit_outcome, .. } => *commit_outcome,
             Self::DecisionReceiptUnavailable
             | Self::DownstreamIntentNotBound
-            | Self::PreparedTransitionBindingUnavailable => {
-                MaintenanceTriggerCommitOutcome::Unknown
-            }
+            | Self::PreparedTransitionBindingUnavailable
+            | Self::CanonicalReceiptBindingMismatch
+            | Self::ReconciliationPersistFailed { .. } => MaintenanceTriggerCommitOutcome::Unknown,
             Self::CanonicalReceiptNotCommitted => MaintenanceTriggerCommitOutcome::NotCommitted,
-            Self::CanonicalReceiptBindingMismatch => MaintenanceTriggerCommitOutcome::Unknown,
-            Self::ReconciliationPersistFailed { .. } => MaintenanceTriggerCommitOutcome::Unknown,
             _ => MaintenanceTriggerCommitOutcome::NotAttempted,
         }
     }
@@ -1404,6 +1403,518 @@ impl Drop for GatewayFlightGuard<'_> {
             }
         }
     }
+}
+
+#[cfg(windows)]
+struct MaintenanceTriggerIntakeContext {
+    envelope_operation_id: OrsOperationIdentity,
+    expected_state_fence: StateFenceSnapshot,
+    canonical_trigger_bytes: Vec<u8>,
+    canonical_trigger_sha256: String,
+    source_event_identity: String,
+}
+
+#[cfg(windows)]
+enum MaintenanceTriggerIntakeReplay {
+    Missing,
+    Retained(MaintenanceTriggerIntakeStorageRecord),
+    Compacted(MaintenanceTriggerIntakeStorageRecord),
+}
+
+#[cfg(windows)]
+fn maintenance_trigger_intake_context(
+    record: &MaintenanceTriggerRecord,
+) -> Result<MaintenanceTriggerIntakeContext, MaintenanceTriggerIntakeFailure> {
+    let envelope_operation_id =
+        OrsOperationIdentity::new(record.payload.envelope_reference.clone()).map_err(|error| {
+            MaintenanceTriggerIntakeFailure::Ors {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+            }
+        })?;
+    let observed_authority_epoch = record.source_state_fence.authority_epoch.sequence.get();
+    let expected_state_fence =
+        StateFenceSnapshot::capture(&record.source_state_fence, observed_authority_epoch).map_err(
+            |error| MaintenanceTriggerIntakeFailure::Ors {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+            },
+        )?;
+    expected_state_fence
+        .validate_against_epoch(&record.source_state_fence.authority_epoch)
+        .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+        })?;
+    let canonical_trigger_bytes = canonical_json_bytes(record)
+        .map_err(MaintenanceTriggerIntakeFailure::CanonicalSerialization)?;
+    let canonical_trigger_sha256 = sha256_hex(&canonical_trigger_bytes);
+    let source_event_identity = record.source_event_identity().canonical_hex();
+    Ok(MaintenanceTriggerIntakeContext {
+        envelope_operation_id,
+        expected_state_fence,
+        canonical_trigger_bytes,
+        canonical_trigger_sha256,
+        source_event_identity,
+    })
+}
+
+#[cfg(windows)]
+fn load_maintenance_trigger_intake_replay(
+    ors: &dyn OperationalRecoveryStore,
+    record: &MaintenanceTriggerRecord,
+    context: &MaintenanceTriggerIntakeContext,
+) -> Result<MaintenanceTriggerIntakeReplay, MaintenanceTriggerIntakeFailure> {
+    let Some(retained) = ors
+        .load_maintenance_trigger_intake(&record.trigger_id)
+        .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?
+    else {
+        return Ok(MaintenanceTriggerIntakeReplay::Missing);
+    };
+    retained
+        .validate()
+        .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+        })?;
+    if retained.source_event_identity != context.source_event_identity
+        || retained.trigger_id != record.trigger_id
+        || retained.operation_hash != record.operation_hash
+        || retained.envelope_operation_id != context.envelope_operation_id
+        || retained.envelope_payload_sha256 != record.payload.payload_hash
+        || retained.applicable_until_unix_ms != record.applicable_until_unix_ms
+        || retained.source_state_fence_sha256 != context.expected_state_fence.sha256
+        || retained.source_observed_authority_epoch
+            != context.expected_state_fence.observed_authority_epoch
+        || retained.canonical_trigger_bytes != context.canonical_trigger_bytes
+        || retained.canonical_trigger_sha256 != context.canonical_trigger_sha256
+    {
+        return Err(MaintenanceTriggerIntakeFailure::Ors {
+            error: OrsError::DuplicateConflict,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotCommitted,
+        });
+    }
+    let lifecycle = ors
+        .load_maintenance_trigger_lifecycle(&record.trigger_id)
+        .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?
+        .ok_or_else(|| MaintenanceTriggerIntakeFailure::Ors {
+            error: OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: format!(
+                    "{}: retained intake has no lifecycle row",
+                    record.trigger_id
+                ),
+            },
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+        })?;
+    lifecycle
+        .validate()
+        .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+        })?;
+    if lifecycle.trigger_id != record.trigger_id
+        || lifecycle.source_event_identity != context.source_event_identity
+    {
+        return Err(MaintenanceTriggerIntakeFailure::Ors {
+            error: OrsError::DuplicateConflict,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotCommitted,
+        });
+    }
+    let compacted_after_terminal = lifecycle.payload_compacted_at_ms.is_some()
+        && lifecycle.downstream_retention.is_some()
+        && matches!(
+            lifecycle.phase,
+            MaintenanceTriggerLifecyclePhase::Acknowledged
+                | MaintenanceTriggerLifecyclePhase::Expired
+                | MaintenanceTriggerLifecyclePhase::Superseded
+        );
+    if compacted_after_terminal {
+        Ok(MaintenanceTriggerIntakeReplay::Compacted(retained))
+    } else {
+        Ok(MaintenanceTriggerIntakeReplay::Retained(retained))
+    }
+}
+
+#[cfg(windows)]
+fn stage_validated_maintenance_trigger_intake(
+    ors: &dyn OperationalRecoveryStore,
+    record: &MaintenanceTriggerRecord,
+    context: &MaintenanceTriggerIntakeContext,
+    retained_intake: Option<MaintenanceTriggerIntakeStorageRecord>,
+) -> Result<MaintenanceTriggerIntakeStorageProjection, MaintenanceTriggerIntakeFailure> {
+    let observed_authority_epoch = record.source_state_fence.authority_epoch.sequence.get();
+    let envelope = ors
+        .get_envelope(&context.envelope_operation_id)
+        .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?
+        .ok_or(MaintenanceTriggerIntakeFailure::EnvelopeNotRetained)?;
+    envelope
+        .validate()
+        .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+        })?;
+    if envelope.operation_or_checkpoint_id != context.envelope_operation_id {
+        return Err(MaintenanceTriggerIntakeFailure::EnvelopeIdentityMismatch);
+    }
+    if envelope.payload_sha256 != record.payload.payload_hash {
+        return Err(MaintenanceTriggerIntakeFailure::PayloadHashMismatch);
+    }
+    if envelope.state_fence != context.expected_state_fence
+        || envelope.authority_epoch.current.lineage_id.as_str()
+            != record
+                .source_state_fence
+                .authority_epoch
+                .lineage_id
+                .as_str()
+        || envelope.authority_epoch.current.epoch != observed_authority_epoch
+    {
+        return Err(MaintenanceTriggerIntakeFailure::EnvelopeFenceMismatch);
+    }
+    if retained_intake
+        .as_ref()
+        .is_some_and(|retained| retained.envelope_payload_length != envelope.payload_length)
+    {
+        return Err(MaintenanceTriggerIntakeFailure::EnvelopeIdentityMismatch);
+    }
+    let storage_record = retained_intake.unwrap_or(MaintenanceTriggerIntakeStorageRecord {
+        source_event_identity: context.source_event_identity.clone(),
+        trigger_id: record.trigger_id.clone(),
+        operation_hash: record.operation_hash.clone(),
+        envelope_operation_id: context.envelope_operation_id.clone(),
+        envelope_payload_sha256: envelope.payload_sha256,
+        envelope_payload_length: envelope.payload_length,
+        applicable_until_unix_ms: record.applicable_until_unix_ms,
+        source_state_fence_sha256: context.expected_state_fence.sha256.clone(),
+        source_observed_authority_epoch: context.expected_state_fence.observed_authority_epoch,
+        canonical_trigger_sha256: context.canonical_trigger_sha256.clone(),
+        canonical_trigger_bytes: context.canonical_trigger_bytes.clone(),
+    });
+    ors.stage_maintenance_trigger_intake(&storage_record)
+        .map_err(MaintenanceTriggerIntakeFailure::from_stage_error)
+}
+
+#[cfg(windows)]
+struct MaintenanceTriggerClaimContext<'a> {
+    intake: &'a MaintenanceTriggerIntakeStorageRecord,
+    trigger: &'a MaintenanceTriggerRecord,
+    lifecycle: &'a MaintenanceTriggerLifecycleRecord,
+    authenticated_session: &'a str,
+    active_state_fence: &'a StateFence,
+    now_ms: u64,
+}
+
+#[cfg(windows)]
+fn retry_retained_maintenance_trigger_claim(
+    context: &MaintenanceTriggerClaimContext<'_>,
+    claim: &MaintenanceTriggerClaim,
+) -> Result<Option<MaintenanceTriggerClaim>, MaintenanceTriggerLifecycleFailure> {
+    let lifecycle = context.lifecycle;
+    if let (Some(retained_binding), Some(retained_record)) =
+        (lifecycle.claim.as_ref(), lifecycle.claim_record.as_ref())
+        && retained_binding.retained_revision == claim.revision
+        && retained_binding.delivery_id == claim.delivery_id
+        && retained_binding.daemon_session == context.authenticated_session
+        && retained_binding.state_fence_sha256
+            == maintenance_trigger_fence_snapshot(context.active_state_fence)?.sha256
+        && matches!(
+            lifecycle.phase,
+            MaintenanceTriggerLifecyclePhase::Claimed
+                | MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                | MaintenanceTriggerLifecyclePhase::Reconciling
+        )
+    {
+        let retained_claim: MaintenanceTriggerClaim =
+            maintenance_trigger_parse_canonical(retained_record)?;
+        if retained_record.record_identity
+            != maintenance_trigger_claim_record_identity(&retained_claim)?
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        let exact_retained_binding = maintenance_trigger_claim_binding(
+            &retained_claim,
+            context.authenticated_session,
+            context.active_state_fence,
+        )?;
+        if !claim.is_exact_retry_of(&retained_claim) || retained_binding != &exact_retained_binding
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
+        }
+        retained_claim
+            .authorize_for(context.trigger, context.active_state_fence, context.now_ms)
+            .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+        return Ok(Some(retained_claim));
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn persist_maintenance_trigger_claim(
+    ors: &dyn OperationalRecoveryStore,
+    context: &MaintenanceTriggerClaimContext<'_>,
+    claim: &MaintenanceTriggerClaim,
+) -> Result<MaintenanceTriggerClaim, MaintenanceTriggerLifecycleFailure> {
+    let maximum_deadline = context
+        .now_ms
+        .saturating_add(MAINTENANCE_TRIGGER_MAX_CLAIM_LEASE_MS)
+        .min(context.trigger.applicable_until_unix_ms);
+    if claim.revision != context.lifecycle.retained_revision
+        || claim.claim_deadline_unix_ms > maximum_deadline
+        || claim.claim_deadline_unix_ms > context.intake.applicable_until_unix_ms
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
+    }
+    validate_maintenance_trigger_envelope(ors, context.intake, context.trigger)?;
+    let fence = maintenance_trigger_fence_snapshot(context.active_state_fence)?;
+    let binding = MaintenanceTriggerClaimBinding {
+        retained_revision: claim.revision,
+        delivery_id: claim.delivery_id.clone(),
+        daemon_session: context.authenticated_session.to_owned(),
+        state_fence_sha256: fence.sha256.clone(),
+        authority_epoch: fence.observed_authority_epoch,
+        resource_generation: context.active_state_fence.resource_generation.value(),
+        claim_deadline_ms: claim.claim_deadline_unix_ms,
+    };
+    binding
+        .validate()
+        .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
+    let claim_record = maintenance_trigger_canonical_record(
+        maintenance_trigger_claim_record_identity(claim)?,
+        claim,
+    )?;
+    let stored = ors
+        .claim_maintenance_trigger(
+            &context.trigger.trigger_id,
+            context.lifecycle.state_revision,
+            binding.clone(),
+            claim_record.clone(),
+            context.now_ms,
+        )
+        .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+    stored
+        .validate()
+        .map_err(|error| MaintenanceTriggerLifecycleFailure::Ors {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
+        })?;
+    let returned_claim = stored
+        .claim_record
+        .as_ref()
+        .map(maintenance_trigger_parse_canonical::<MaintenanceTriggerClaim>)
+        .transpose()?;
+    let returned_binding = returned_claim
+        .as_ref()
+        .map(|stored_claim| {
+            maintenance_trigger_claim_binding(
+                stored_claim,
+                context.authenticated_session,
+                context.active_state_fence,
+            )
+        })
+        .transpose()?;
+    let returned_record_identity = returned_claim
+        .as_ref()
+        .map(maintenance_trigger_claim_record_identity)
+        .transpose()?;
+    if stored.trigger_id != context.trigger.trigger_id
+        || stored.retained_revision != claim.revision
+        || !returned_claim
+            .as_ref()
+            .is_some_and(|stored_claim| claim.is_exact_retry_of(stored_claim))
+        || stored.claim.as_ref() != returned_binding.as_ref()
+        || stored
+            .claim_record
+            .as_ref()
+            .map(|record| record.record_identity.as_str())
+            != returned_record_identity.as_deref()
+        || !matches!(
+            stored.phase,
+            MaintenanceTriggerLifecyclePhase::Claimed
+                | MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                | MaintenanceTriggerLifecyclePhase::Reconciling
+        )
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::Ors {
+            error: OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: format!(
+                    "{}: claim read-back does not match the authenticated delivery request",
+                    context.trigger.trigger_id
+                ),
+            },
+            commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
+        });
+    }
+    returned_claim.ok_or(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent)
+}
+#[cfg(windows)]
+struct MaintenanceTriggerDecisionContext {
+    trigger: MaintenanceTriggerRecord,
+    lifecycle: MaintenanceTriggerLifecycleRecord,
+    binding: MaintenanceTriggerClaimBinding,
+    record: MaintenanceTriggerCanonicalRecord,
+}
+
+#[cfg(windows)]
+fn load_maintenance_trigger_decision_context(
+    ors: &dyn OperationalRecoveryStore,
+    active_state_fence: &StateFence,
+    authenticated_session: &str,
+    decision: &MaintenanceTriggerDecisionReceipt,
+) -> Result<MaintenanceTriggerDecisionContext, MaintenanceTriggerLifecycleFailure> {
+    let (_, trigger, lifecycle) = load_maintenance_trigger_context(ors, &decision.trigger_id)?;
+    if trigger.routing_class != MaintenanceTriggerRoutingClass::Ordinary
+        || trigger.route_grant.is_some()
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::ProtectedRoutingUnsupported);
+    }
+    decision
+        .matches_trigger(&trigger)
+        .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+    if decision.revision != lifecycle.retained_revision {
+        return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+    }
+    let claim = maintenance_trigger_retained_claim(&lifecycle)?;
+    let binding =
+        maintenance_trigger_claim_binding(&claim, authenticated_session, active_state_fence)?;
+    if lifecycle.claim.as_ref() != Some(&binding)
+        || !matches!(
+            lifecycle.phase,
+            MaintenanceTriggerLifecyclePhase::Claimed
+                | MaintenanceTriggerLifecyclePhase::Reconciling
+                | MaintenanceTriggerLifecyclePhase::DecisionRecorded
+        )
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
+    }
+    let record = maintenance_trigger_decision_record(decision)?;
+    if lifecycle
+        .decision_record
+        .as_ref()
+        .is_some_and(|retained| retained != &record)
+        || lifecycle
+            .downstream_intent_record
+            .as_ref()
+            .is_some_and(|retained| retained != &record)
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+    }
+    Ok(MaintenanceTriggerDecisionContext {
+        trigger,
+        lifecycle,
+        binding,
+        record,
+    })
+}
+
+#[cfg(windows)]
+struct MaintenanceTriggerRecoveryContext<'a> {
+    authenticated_session: &'a str,
+    authenticated_owner: &'a str,
+    active_state_fence: &'a StateFence,
+    fence: &'a StateFenceSnapshot,
+    now_ms: u64,
+}
+
+#[cfg(windows)]
+fn revoke_stale_maintenance_trigger_claim(
+    ors: &dyn OperationalRecoveryStore,
+    snapshot: &MaintenanceTriggerLifecycleRecord,
+    current: &MaintenanceTriggerLifecycleRecord,
+    context: &MaintenanceTriggerRecoveryContext<'_>,
+) -> Result<bool, MaintenanceTriggerLifecycleFailure> {
+    if let (Some(snapshot_claim), Some(revocation_record)) =
+        (snapshot.claim.as_ref(), current.revocation_record.as_ref())
+    {
+        let stale_protocol_claim = maintenance_trigger_retained_claim(snapshot)?;
+        let revocation: MaintenanceTriggerRevocation =
+            maintenance_trigger_parse_canonical(revocation_record)?;
+        let expected_prefix = format!(
+            "maintenance-trigger-revocation:{}:{}:",
+            snapshot.trigger_id, snapshot_claim.delivery_id
+        );
+        if revocation.daemon_session == snapshot_claim.daemon_session
+            && revocation.daemon_fence == stale_protocol_claim.daemon_fence
+            && revocation_record
+                .record_identity
+                .starts_with(&expected_prefix)
+        {
+            return Ok(true);
+        }
+    }
+    if !matches!(
+        current.phase,
+        MaintenanceTriggerLifecyclePhase::Claimed
+            | MaintenanceTriggerLifecyclePhase::DecisionRecorded
+            | MaintenanceTriggerLifecyclePhase::Reconciling
+    ) {
+        return Ok(false);
+    }
+    let stale_claim = current
+        .claim
+        .as_ref()
+        .ok_or(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent)?;
+    let is_stale = stale_claim.daemon_session != context.authenticated_session
+        || stale_claim.state_fence_sha256 != context.fence.sha256
+        || stale_claim.authority_epoch != context.fence.observed_authority_epoch
+        || stale_claim.resource_generation
+            != context.active_state_fence.resource_generation.value()
+        || stale_claim.claim_deadline_ms <= context.now_ms;
+    if !is_stale {
+        return Ok(false);
+    }
+    if let Some(existing) = current.revocation_record.as_ref() {
+        let revocation: MaintenanceTriggerRevocation =
+            maintenance_trigger_parse_canonical(existing)?;
+        if revocation.daemon_session == stale_claim.daemon_session
+            && revocation.daemon_fence == maintenance_trigger_retained_claim(current)?.daemon_fence
+            && matches!(
+                current.phase,
+                MaintenanceTriggerLifecyclePhase::Pending
+                    | MaintenanceTriggerLifecyclePhase::Reconciling
+            )
+        {
+            return Ok(false);
+        }
+    }
+    let stale_protocol_claim = maintenance_trigger_retained_claim(current)?;
+    let revocation = MaintenanceTriggerRevocation {
+        wire_id: eliot_protocol::MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
+        daemon_fence: stale_protocol_claim.daemon_fence.clone(),
+        daemon_session: stale_claim.daemon_session.clone(),
+        revoking_owner: context.authenticated_owner.to_owned(),
+        reason: "replacement-session-stale-claim".to_owned(),
+        revoked_at_unix_ms: context.now_ms,
+    };
+    revocation
+        .validate()
+        .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+    let revocation_record = maintenance_trigger_canonical_record(
+        format!(
+            "maintenance-trigger-revocation:{}:{}:{}",
+            current.trigger_id,
+            stale_claim.delivery_id,
+            sha256_hex(
+                &canonical_json_bytes(&revocation)
+                    .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization,)?
+            )
+        ),
+        &revocation,
+    )?;
+    ors.revoke_maintenance_trigger_claim(
+        &current.trigger_id,
+        current.state_revision,
+        stale_claim,
+        context.authenticated_session,
+        &context.fence.sha256,
+        context.fence.observed_authority_epoch,
+        context.active_state_fence.resource_generation.value(),
+        revocation_record,
+        context.now_ms,
+    )
+    .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+    Ok(true)
 }
 
 /// Concrete non-generic gateway retained by one Kernel composition.
@@ -2328,7 +2839,6 @@ impl KernelStoreGateway {
             .map_err(|_| MaintenanceTriggerIntakeFailure::ShadowMutationRefused)?;
         self.validate_active_route(active_state_fence)
             .map_err(|_| MaintenanceTriggerIntakeFailure::ActiveRouteMismatch)?;
-
         record
             .validate()
             .map_err(|error| MaintenanceTriggerIntakeFailure::Protocol {
@@ -2343,168 +2853,34 @@ impl KernelStoreGateway {
         let ors = self
             .commit_ors
             .as_deref()
-            .ok_or_else(|| MaintenanceTriggerIntakeFailure::OrsUnavailable)?;
-        let envelope_operation_id = OrsOperationIdentity::new(
-            record.payload.envelope_reference.clone(),
-        )
-        .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-            error,
-            commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-        })?;
-        let observed_authority_epoch = record.source_state_fence.authority_epoch.sequence.get();
-        let expected_state_fence =
-            StateFenceSnapshot::capture(&record.source_state_fence, observed_authority_epoch)
-                .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-                    error,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-                })?;
-        expected_state_fence
-            .validate_against_epoch(&record.source_state_fence.authority_epoch)
-            .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-                error,
-                commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-            })?;
-        let canonical_trigger_bytes = canonical_json_bytes(record)
-            .map_err(MaintenanceTriggerIntakeFailure::CanonicalSerialization)?;
-        let canonical_trigger_sha256 = sha256_hex(&canonical_trigger_bytes);
-        let source_event_identity = record.source_event_identity().canonical_hex();
-        let expected_applicability = record.applicable_until_unix_ms;
-
-        // Intake replay remains exact after W7 payload compaction. Read the
-        // durable owner rows before resolving the envelope, which may have
-        // been correctly pruned after acknowledgement/terminal retention.
-        let retained_intake = ors
-            .load_maintenance_trigger_intake(&record.trigger_id)
-            .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?;
-        if let Some(retained) = &retained_intake {
-            retained
-                .validate()
-                .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-                    error,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-                })?;
-            if retained.source_event_identity != source_event_identity
-                || retained.trigger_id != record.trigger_id
-                || retained.operation_hash != record.operation_hash
-                || retained.envelope_operation_id != envelope_operation_id
-                || retained.envelope_payload_sha256 != record.payload.payload_hash
-                || retained.applicable_until_unix_ms != expected_applicability
-                || retained.source_state_fence_sha256 != expected_state_fence.sha256
-                || retained.source_observed_authority_epoch
-                    != expected_state_fence.observed_authority_epoch
-                || retained.canonical_trigger_bytes != canonical_trigger_bytes
-                || retained.canonical_trigger_sha256 != canonical_trigger_sha256
-            {
-                return Err(MaintenanceTriggerIntakeFailure::Ors {
-                    error: OrsError::DuplicateConflict,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotCommitted,
-                });
-            }
-            let lifecycle = ors
-                .load_maintenance_trigger_lifecycle(&record.trigger_id)
-                .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?
-                .ok_or_else(|| MaintenanceTriggerIntakeFailure::Ors {
-                    error: OrsError::IntegrityProblem {
-                        record_type: "maintenance_trigger_lifecycle",
-                        reason: format!(
-                            "{}: retained intake has no lifecycle row",
-                            record.trigger_id
-                        ),
-                    },
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-                })?;
-            lifecycle
-                .validate()
-                .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-                    error,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-                })?;
-            if lifecycle.trigger_id != record.trigger_id
-                || lifecycle.source_event_identity != source_event_identity
-            {
-                return Err(MaintenanceTriggerIntakeFailure::Ors {
-                    error: OrsError::DuplicateConflict,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotCommitted,
-                });
-            }
-            let compacted_after_terminal = lifecycle.payload_compacted_at_ms.is_some()
-                && lifecycle.downstream_retention.is_some()
-                && matches!(
-                    lifecycle.phase,
-                    MaintenanceTriggerLifecyclePhase::Acknowledged
-                        | MaintenanceTriggerLifecyclePhase::Expired
-                        | MaintenanceTriggerLifecyclePhase::Superseded
-                );
-            if compacted_after_terminal {
+            .ok_or(MaintenanceTriggerIntakeFailure::OrsUnavailable)?;
+        let context = maintenance_trigger_intake_context(record)?;
+        let retained_intake = match load_maintenance_trigger_intake_replay(ors, record, &context)? {
+            MaintenanceTriggerIntakeReplay::Compacted(retained) => {
                 return ors
-                    .stage_maintenance_trigger_intake(retained)
+                    .stage_maintenance_trigger_intake(&retained)
                     .map_err(MaintenanceTriggerIntakeFailure::from_stage_error);
             }
-        } else {
-            // New intake must be current and eligible. Exact retained replay
-            // above may carry the State Fence and applicability deadline it
-            // was admitted under, even after replacement or expiry.
-            let now_ms = maintenance_trigger_now_ms()
-                .map_err(|_| MaintenanceTriggerIntakeFailure::ClockUnavailable)?;
-            record.validate_at(now_ms).map_err(|error| {
-                MaintenanceTriggerIntakeFailure::Protocol {
-                    error,
-                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+            MaintenanceTriggerIntakeReplay::Retained(retained) => Some(retained),
+            MaintenanceTriggerIntakeReplay::Missing => {
+                // New intake must be current and eligible. Exact retained replay
+                // above may carry the State Fence and applicability deadline it
+                // was admitted under, even after replacement or expiry.
+                let now_ms = maintenance_trigger_now_ms()
+                    .map_err(|_| MaintenanceTriggerIntakeFailure::ClockUnavailable)?;
+                record.validate_at(now_ms).map_err(|error| {
+                    MaintenanceTriggerIntakeFailure::Protocol {
+                        error,
+                        commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                    }
+                })?;
+                if &record.source_state_fence != active_state_fence {
+                    return Err(MaintenanceTriggerIntakeFailure::SourceFenceMismatch);
                 }
-            })?;
-            if &record.source_state_fence != active_state_fence {
-                return Err(MaintenanceTriggerIntakeFailure::SourceFenceMismatch);
+                None
             }
-        }
-
-        let envelope = ors
-            .get_envelope(&envelope_operation_id)
-            .map_err(MaintenanceTriggerIntakeFailure::from_envelope_read_error)?
-            .ok_or(MaintenanceTriggerIntakeFailure::EnvelopeNotRetained)?;
-        envelope
-            .validate()
-            .map_err(|error| MaintenanceTriggerIntakeFailure::Ors {
-                error,
-                commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
-            })?;
-        if envelope.operation_or_checkpoint_id != envelope_operation_id {
-            return Err(MaintenanceTriggerIntakeFailure::EnvelopeIdentityMismatch);
-        }
-        if envelope.payload_sha256 != record.payload.payload_hash {
-            return Err(MaintenanceTriggerIntakeFailure::PayloadHashMismatch);
-        }
-        if envelope.state_fence != expected_state_fence
-            || envelope.authority_epoch.current.lineage_id.as_str()
-                != record
-                    .source_state_fence
-                    .authority_epoch
-                    .lineage_id
-                    .as_str()
-            || envelope.authority_epoch.current.epoch != observed_authority_epoch
-        {
-            return Err(MaintenanceTriggerIntakeFailure::EnvelopeFenceMismatch);
-        }
-        if retained_intake
-            .as_ref()
-            .is_some_and(|retained| retained.envelope_payload_length != envelope.payload_length)
-        {
-            return Err(MaintenanceTriggerIntakeFailure::EnvelopeIdentityMismatch);
-        }
-        let storage_record = retained_intake.unwrap_or(MaintenanceTriggerIntakeStorageRecord {
-            source_event_identity,
-            trigger_id: record.trigger_id.clone(),
-            operation_hash: record.operation_hash.clone(),
-            envelope_operation_id,
-            envelope_payload_sha256: envelope.payload_sha256,
-            envelope_payload_length: envelope.payload_length,
-            applicable_until_unix_ms: record.applicable_until_unix_ms,
-            source_state_fence_sha256: expected_state_fence.sha256,
-            source_observed_authority_epoch: expected_state_fence.observed_authority_epoch,
-            canonical_trigger_sha256,
-            canonical_trigger_bytes,
-        });
-        ors.stage_maintenance_trigger_intake(&storage_record)
-            .map_err(MaintenanceTriggerIntakeFailure::from_stage_error)
+        };
+        stage_validated_maintenance_trigger_intake(ors, record, &context, retained_intake)
     }
 
     /// Returns one bounded, restart-stable page of retained trigger lifecycle
@@ -2586,12 +2962,12 @@ impl KernelStoreGateway {
             .validate()
             .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
         let now_ms = maintenance_trigger_now_ms()?;
-        let (intake, trigger, lifecycle) = load_maintenance_trigger_context(
-            self.commit_ors
-                .as_deref()
-                .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?,
-            &claim.trigger_id,
-        )?;
+        let ors = self
+            .commit_ors
+            .as_deref()
+            .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
+        let (intake, trigger, lifecycle) =
+            load_maintenance_trigger_context(ors, &claim.trigger_id)?;
         if trigger.routing_class != MaintenanceTriggerRoutingClass::Ordinary
             || trigger.route_grant.is_some()
         {
@@ -2603,137 +2979,18 @@ impl KernelStoreGateway {
         claim
             .authorize_for(&trigger, active_state_fence, now_ms)
             .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
-        if let (Some(retained_binding), Some(retained_record)) =
-            (lifecycle.claim.as_ref(), lifecycle.claim_record.as_ref())
-            && retained_binding.retained_revision == claim.revision
-            && retained_binding.delivery_id == claim.delivery_id
-            && retained_binding.daemon_session == authenticated_session
-            && retained_binding.state_fence_sha256
-                == maintenance_trigger_fence_snapshot(active_state_fence)?.sha256
-            && matches!(
-                lifecycle.phase,
-                MaintenanceTriggerLifecyclePhase::Claimed
-                    | MaintenanceTriggerLifecyclePhase::DecisionRecorded
-                    | MaintenanceTriggerLifecyclePhase::Reconciling
-            )
-        {
-            let retained_claim: MaintenanceTriggerClaim =
-                maintenance_trigger_parse_canonical(retained_record)?;
-            if retained_record.record_identity
-                != maintenance_trigger_claim_record_identity(&retained_claim)?
-            {
-                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
-            }
-            let exact_retained_binding = maintenance_trigger_claim_binding(
-                &retained_claim,
-                authenticated_session,
-                active_state_fence,
-            )?;
-            if !claim.is_exact_retry_of(&retained_claim)
-                || retained_binding != &exact_retained_binding
-            {
-                return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
-            }
-            retained_claim
-                .authorize_for(&trigger, active_state_fence, now_ms)
-                .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+        let context = MaintenanceTriggerClaimContext {
+            intake: &intake,
+            trigger: &trigger,
+            lifecycle: &lifecycle,
+            authenticated_session,
+            active_state_fence,
+            now_ms,
+        };
+        if let Some(retained_claim) = retry_retained_maintenance_trigger_claim(&context, claim)? {
             return Ok(retained_claim);
         }
-        let maximum_deadline = now_ms
-            .saturating_add(MAINTENANCE_TRIGGER_MAX_CLAIM_LEASE_MS)
-            .min(trigger.applicable_until_unix_ms);
-        if claim.revision != lifecycle.retained_revision
-            || claim.claim_deadline_unix_ms > maximum_deadline
-            || claim.claim_deadline_unix_ms > intake.applicable_until_unix_ms
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
-        }
-        let ors = self
-            .commit_ors
-            .as_deref()
-            .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
-        validate_maintenance_trigger_envelope(ors, &intake, &trigger)?;
-        let fence = maintenance_trigger_fence_snapshot(active_state_fence)?;
-        let binding = MaintenanceTriggerClaimBinding {
-            retained_revision: claim.revision,
-            delivery_id: claim.delivery_id.clone(),
-            daemon_session: authenticated_session.to_owned(),
-            state_fence_sha256: fence.sha256.clone(),
-            authority_epoch: fence.observed_authority_epoch,
-            resource_generation: active_state_fence.resource_generation.value(),
-            claim_deadline_ms: claim.claim_deadline_unix_ms,
-        };
-        binding
-            .validate()
-            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
-        let claim_record = maintenance_trigger_canonical_record(
-            maintenance_trigger_claim_record_identity(claim)?,
-            claim,
-        )?;
-        let stored = ors
-            .claim_maintenance_trigger(
-                &trigger.trigger_id,
-                lifecycle.state_revision,
-                binding.clone(),
-                claim_record.clone(),
-                now_ms,
-            )
-            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
-        stored
-            .validate()
-            .map_err(|error| MaintenanceTriggerLifecycleFailure::Ors {
-                error,
-                commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
-            })?;
-        let returned_claim = stored
-            .claim_record
-            .as_ref()
-            .map(maintenance_trigger_parse_canonical::<MaintenanceTriggerClaim>)
-            .transpose()?;
-        let returned_binding = returned_claim
-            .as_ref()
-            .map(|stored_claim| {
-                maintenance_trigger_claim_binding(
-                    stored_claim,
-                    authenticated_session,
-                    active_state_fence,
-                )
-            })
-            .transpose()?;
-        let returned_record_identity = returned_claim
-            .as_ref()
-            .map(maintenance_trigger_claim_record_identity)
-            .transpose()?;
-        if stored.trigger_id != trigger.trigger_id
-            || stored.retained_revision != claim.revision
-            || !returned_claim
-                .as_ref()
-                .is_some_and(|stored_claim| claim.is_exact_retry_of(stored_claim))
-            || stored.claim.as_ref() != returned_binding.as_ref()
-            || stored
-                .claim_record
-                .as_ref()
-                .map(|record| record.record_identity.as_str())
-                != returned_record_identity.as_deref()
-            || !matches!(
-                stored.phase,
-                MaintenanceTriggerLifecyclePhase::Claimed
-                    | MaintenanceTriggerLifecyclePhase::DecisionRecorded
-                    | MaintenanceTriggerLifecyclePhase::Reconciling
-            )
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::Ors {
-                error: OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_lifecycle",
-                    reason: format!(
-                        "{}: claim read-back does not match the authenticated delivery request",
-                        trigger.trigger_id
-                    ),
-                },
-                commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
-            });
-        }
-        returned_claim.ok_or(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent)
+        persist_maintenance_trigger_claim(ors, &context, claim)
     }
 
     async fn read_maintenance_trigger_canonical_receipt(
@@ -2877,7 +3134,7 @@ impl KernelStoreGateway {
     }
 
     /// Validates and reconciles a caller-presented decision receipt. Until a
-    /// named Store operation proves its PreparedTransition and trigger-revision
+    /// named Store operation proves its `PreparedTransition` and trigger-revision
     /// binding, the exact receipt bytes are retained as downstream intent in
     /// `Reconciling` and this method reports the closed blocker.
     #[cfg(windows)]
@@ -2908,50 +3165,18 @@ impl KernelStoreGateway {
             .commit_ors
             .as_deref()
             .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
-        let (_, trigger, lifecycle) = load_maintenance_trigger_context(ors, &decision.trigger_id)?;
-        if trigger.routing_class != MaintenanceTriggerRoutingClass::Ordinary
-            || trigger.route_grant.is_some()
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::ProtectedRoutingUnsupported);
-        }
-        decision
-            .matches_trigger(&trigger)
-            .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
-        if decision.revision != lifecycle.retained_revision {
-            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
-        }
-        let claim = maintenance_trigger_retained_claim(&lifecycle)?;
-        let binding =
-            maintenance_trigger_claim_binding(&claim, authenticated_session, active_state_fence)?;
-        if lifecycle.claim.as_ref() != Some(&binding)
-            || !matches!(
-                lifecycle.phase,
-                MaintenanceTriggerLifecyclePhase::Claimed
-                    | MaintenanceTriggerLifecyclePhase::Reconciling
-                    | MaintenanceTriggerLifecyclePhase::DecisionRecorded
-            )
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
-        }
-        let record = maintenance_trigger_decision_record(decision)?;
-        if lifecycle
-            .decision_record
-            .as_ref()
-            .is_some_and(|retained| retained != &record)
-            || lifecycle
-                .downstream_intent_record
-                .as_ref()
-                .is_some_and(|retained| retained != &record)
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
-        }
-        let intent = record.clone();
-
+        let context = load_maintenance_trigger_decision_context(
+            ors,
+            active_state_fence,
+            authenticated_session,
+            decision,
+        )?;
+        let intent = context.record.clone();
         let receipt_result = self
             .read_maintenance_trigger_canonical_receipt(
                 active_state_fence,
-                &trigger,
-                &lifecycle,
+                &context.trigger,
+                &context.lifecycle,
                 decision,
             )
             .await;
@@ -2962,7 +3187,7 @@ impl KernelStoreGateway {
                 &error,
                 MaintenanceTriggerLifecycleFailure::CanonicalReceiptNotCommitted
             ) && matches!(
-                lifecycle.phase,
+                context.lifecycle.phase,
                 MaintenanceTriggerLifecyclePhase::Claimed
                     | MaintenanceTriggerLifecyclePhase::Reconciling
             ) {
@@ -2976,10 +3201,10 @@ impl KernelStoreGateway {
                 let now_ms = maintenance_trigger_now_ms()?;
                 if let Err(ors_error) = mark_maintenance_trigger_reconciling_checked(
                     ors,
-                    &trigger.trigger_id,
-                    &lifecycle,
-                    &binding,
-                    intent,
+                    &context.trigger.trigger_id,
+                    &context.lifecycle,
+                    &context.binding,
+                    &intent,
                     now_ms,
                 ) {
                     return Err(
@@ -2993,9 +3218,9 @@ impl KernelStoreGateway {
             return Err(error);
         }
 
-        if lifecycle.phase == MaintenanceTriggerLifecyclePhase::DecisionRecorded {
-            if lifecycle.decision_record.as_ref() != Some(&record)
-                || lifecycle.downstream_intent_record.as_ref() != Some(&intent)
+        if context.lifecycle.phase == MaintenanceTriggerLifecyclePhase::DecisionRecorded {
+            if context.lifecycle.decision_record.as_ref() != Some(&context.record)
+                || context.lifecycle.downstream_intent_record.as_ref() != Some(&intent)
             {
                 return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
             }
@@ -3010,10 +3235,10 @@ impl KernelStoreGateway {
             let now_ms = maintenance_trigger_now_ms()?;
             mark_maintenance_trigger_reconciling_checked(
                 ors,
-                &trigger.trigger_id,
-                &lifecycle,
-                &binding,
-                intent,
+                &context.trigger.trigger_id,
+                &context.lifecycle,
+                &context.binding,
+                &intent,
                 now_ms,
             )
             .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
@@ -3088,24 +3313,17 @@ impl KernelStoreGateway {
             ),
             acknowledgement,
         )?;
-        let exact_replay = lifecycle.phase == MaintenanceTriggerLifecyclePhase::Acknowledged
-            && lifecycle.acknowledgement_record.as_ref() == Some(&ack_record);
-        if exact_replay {
-            if lifecycle.decision_record.as_ref()
-                != Some(&maintenance_trigger_decision_record(
-                    &acknowledgement.decision_receipt,
-                )?)
-            {
-                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
-            }
-            self.read_maintenance_trigger_canonical_receipt(
+        if let Some(replayed_acknowledgement) = self
+            .replay_maintenance_trigger_acknowledgement(
                 active_state_fence,
                 &trigger,
                 &lifecycle,
-                &acknowledgement.decision_receipt,
+                acknowledgement,
+                &ack_record,
             )
-            .await?;
-            return Ok(acknowledgement.clone());
+            .await?
+        {
+            return Ok(replayed_acknowledgement);
         }
 
         acknowledgement
@@ -3147,6 +3365,37 @@ impl KernelStoreGateway {
         )
         .await?;
         Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable)
+    }
+
+    #[cfg(windows)]
+    async fn replay_maintenance_trigger_acknowledgement(
+        &self,
+        active_state_fence: &StateFence,
+        trigger: &MaintenanceTriggerRecord,
+        lifecycle: &MaintenanceTriggerLifecycleRecord,
+        acknowledgement: &MaintenanceTriggerAck,
+        ack_record: &MaintenanceTriggerCanonicalRecord,
+    ) -> Result<Option<MaintenanceTriggerAck>, MaintenanceTriggerLifecycleFailure> {
+        let exact_replay = lifecycle.phase == MaintenanceTriggerLifecyclePhase::Acknowledged
+            && lifecycle.acknowledgement_record.as_ref() == Some(ack_record);
+        if !exact_replay {
+            return Ok(None);
+        }
+        if lifecycle.decision_record.as_ref()
+            != Some(&maintenance_trigger_decision_record(
+                &acknowledgement.decision_receipt,
+            )?)
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        self.read_maintenance_trigger_canonical_receipt(
+            active_state_fence,
+            trigger,
+            lifecycle,
+            &acknowledgement.decision_receipt,
+        )
+        .await?;
+        Ok(Some(acknowledgement.clone()))
     }
 
     /// Revokes stale trigger claims from a bounded frozen active-claim scan.
@@ -3202,6 +3451,13 @@ impl KernelStoreGateway {
             return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
         }
         let now_ms = maintenance_trigger_now_ms()?;
+        let context = MaintenanceTriggerRecoveryContext {
+            authenticated_session,
+            authenticated_owner,
+            active_state_fence,
+            fence: &fence,
+            now_ms,
+        };
         let mut revoked_claims = 0u16;
         let mut previous_sequence = 0;
         for snapshot in &projection.lifecycles {
@@ -3224,100 +3480,9 @@ impl KernelStoreGateway {
             if current.state_revision < snapshot.state_revision {
                 return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
             }
-            if let (Some(snapshot_claim), Some(revocation_record)) =
-                (snapshot.claim.as_ref(), current.revocation_record.as_ref())
-            {
-                let stale_protocol_claim = maintenance_trigger_retained_claim(snapshot)?;
-                let revocation: MaintenanceTriggerRevocation =
-                    maintenance_trigger_parse_canonical(revocation_record)?;
-                let expected_prefix = format!(
-                    "maintenance-trigger-revocation:{}:{}:",
-                    snapshot.trigger_id, snapshot_claim.delivery_id
-                );
-                if revocation.daemon_session == snapshot_claim.daemon_session
-                    && revocation.daemon_fence == stale_protocol_claim.daemon_fence
-                    && revocation_record
-                        .record_identity
-                        .starts_with(&expected_prefix)
-                {
-                    revoked_claims = revoked_claims.saturating_add(1);
-                    continue;
-                }
+            if revoke_stale_maintenance_trigger_claim(ors, snapshot, &current, &context)? {
+                revoked_claims = revoked_claims.saturating_add(1);
             }
-            if !matches!(
-                current.phase,
-                MaintenanceTriggerLifecyclePhase::Claimed
-                    | MaintenanceTriggerLifecyclePhase::DecisionRecorded
-                    | MaintenanceTriggerLifecyclePhase::Reconciling
-            ) {
-                continue;
-            }
-            let stale_claim = current
-                .claim
-                .as_ref()
-                .ok_or(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent)?;
-            let is_stale = stale_claim.daemon_session != authenticated_session
-                || stale_claim.state_fence_sha256 != fence.sha256
-                || stale_claim.authority_epoch != fence.observed_authority_epoch
-                || stale_claim.resource_generation
-                    != active_state_fence.resource_generation.value()
-                || stale_claim.claim_deadline_ms <= now_ms;
-            if !is_stale {
-                continue;
-            }
-            if let Some(existing) = current.revocation_record.as_ref() {
-                let revocation: MaintenanceTriggerRevocation =
-                    maintenance_trigger_parse_canonical(existing)?;
-                if revocation.daemon_session == stale_claim.daemon_session
-                    && revocation.daemon_fence
-                        == maintenance_trigger_retained_claim(&current)?.daemon_fence
-                    && matches!(
-                        current.phase,
-                        MaintenanceTriggerLifecyclePhase::Pending
-                            | MaintenanceTriggerLifecyclePhase::Reconciling
-                    )
-                {
-                    continue;
-                }
-            }
-            let stale_protocol_claim = maintenance_trigger_retained_claim(&current)?;
-            let revocation = MaintenanceTriggerRevocation {
-                wire_id: eliot_protocol::MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID.to_owned(),
-                wire_version: eliot_protocol::MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
-                daemon_fence: stale_protocol_claim.daemon_fence.clone(),
-                daemon_session: stale_claim.daemon_session.clone(),
-                revoking_owner: authenticated_owner.to_owned(),
-                reason: "replacement-session-stale-claim".to_owned(),
-                revoked_at_unix_ms: now_ms,
-            };
-            revocation
-                .validate()
-                .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
-            let revocation_record = maintenance_trigger_canonical_record(
-                format!(
-                    "maintenance-trigger-revocation:{}:{}:{}",
-                    current.trigger_id,
-                    stale_claim.delivery_id,
-                    sha256_hex(
-                        &canonical_json_bytes(&revocation)
-                            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization,)?
-                    )
-                ),
-                &revocation,
-            )?;
-            ors.revoke_maintenance_trigger_claim(
-                &current.trigger_id,
-                current.state_revision,
-                stale_claim,
-                authenticated_session,
-                &fence.sha256,
-                fence.observed_authority_epoch,
-                active_state_fence.resource_generation.value(),
-                revocation_record,
-                now_ms,
-            )
-            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
-            revoked_claims = revoked_claims.saturating_add(1);
         }
         let gaps = projection
             .gaps
