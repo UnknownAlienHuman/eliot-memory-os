@@ -19,12 +19,21 @@
 //!   the Store read-parameter declaration table, the projected parameter
 //!   schema, its digest, the canonical operation names, the generated
 //!   manifests, and this crate's own admission predicates;
-//! * the public-API rows are **compile-time witnesses**: each row's body names
-//!   the real type, so a rename or removal breaks the build, and the row's
-//!   observed path is whatever the compiler reports;
-//! * the mutable-state row, the port declarations and the test-target rows are
-//!   **declared by this owner**, and each is checked against a derived source
-//!   wherever a derived source exists for it.
+//! * the public-API rows are **compile-time witnesses** for every type this
+//!   crate declares, and **declared by this owner** for the items that have no
+//!   single concrete type — the two traits, the generic service, the contract
+//!   constants, the contract functions, the modules, and the
+//!   `provider_memory_feed` candidate surface, whose items are marked
+//!   [`PublicApiKind::OffWire`] so an off-wire type is never claimed as a read
+//!   wire shape;
+//! * the mutable-state row, the port declarations, the test-target rows and the
+//!   reverse-consumer rows are **declared by this owner**, and each is checked
+//!   against a derived source wherever a derived source exists for it. The
+//!   reverse-consumer set is bound to its independent source by
+//!   [`ReverseConsumerSource`], not merely described in prose;
+//! * the serialization rows are **derived**: each item's shape is read from the
+//!   JSON schema its own `JsonSchema` derive produces, so whether an unknown
+//!   property is refused is observed rather than asserted.
 //!
 //! The language offers no reflection over enum variants, over the items of a
 //! module, or over the test set of a package. Where a closed enumeration is
@@ -33,11 +42,11 @@
 //!
 //! # Scope boundary, stated rather than hidden
 //!
-//! This inventory describes **this package**. It is not a measurement of which
-//! other packages in the repository import it, of whether such an importer is
-//! itself reachable from a process entry point, or of whether any read
-//! currently executes. A package cannot observe its reverse consumers at
-//! runtime, and this module never pretends to: `evidence_execution` is
+//! This inventory describes **this package**. It is not a measurement of whether
+//! any other package that imports it is reachable from a process entry point, or
+//! of whether any read currently executes. A package cannot observe its reverse
+//! consumers' reachability at run time, and this module never pretends to:
+//! `reverse_consumers` rows carry `DeclaredByOwner`, `evidence_execution` is
 //! [`InventoryEvidenceClass::NotExecuted`] for the whole inventory, and nothing
 //! here may be read as evidence of liveness, freshness, support or authority.
 
@@ -109,6 +118,10 @@ pub enum PublicApiKind {
     WireObject,
     /// A closed JSON enum on the read wire.
     WireEnum,
+    /// A public type this owner deliberately keeps off the read wire: it
+    /// declares no wire encoding of its own, so it is inventoried as part of
+    /// the public surface without being claimed as wire shape.
+    OffWire,
 }
 
 /// One declared public item of this owner.
@@ -438,6 +451,64 @@ pub struct TestTargetRow {
     pub provenance: InventoryProvenance,
 }
 
+/// How a public item is serialized on the read wire.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerializationShape {
+    /// The item is a closed object: it declares named properties and refuses
+    /// an unknown one, so a future field cannot widen an existing read silently.
+    ClosedObject,
+    /// The item is a closed enum: it serializes to one of a fixed set of
+    /// renamings and carries no field names. An unknown member is refused, so a
+    /// future variant cannot be silently read as a current one.
+    ClosedEnum,
+    /// The item is a transparent value: it carries exactly one value under no
+    /// field name of its own and is not itself a closed object or enum.
+    TransparentValue,
+    /// The item declares an unbounded JSON object with no closed shape, so a
+    /// caller-supplied key set is carried rather than a fixed one.
+    OpenObject,
+}
+
+/// One observed serialization shape of a declared public item.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SerializationRow {
+    /// Exported item name, exactly as a consumer imports it.
+    pub name: String,
+    /// The shape this owner actually derives for the item.
+    pub shape: SerializationShape,
+    /// Whether the item carries a decoder as well as an encoder.
+    pub decodable: bool,
+    /// Number of top-level properties the derived JSON schema declares, or
+    /// zero for a non-object shape.
+    pub object_properties: usize,
+    /// Whether an unknown property is refused on decode.
+    pub denies_unknown_fields: bool,
+    /// Number of closed members the derived JSON schema declares, or zero for
+    /// a shape that is not an enum.
+    pub enum_members: usize,
+    /// How this row was established.
+    pub provenance: InventoryProvenance,
+}
+
+/// One declared reverse consumer of this package.
+///
+/// A row records that a workspace member declares an edge onto this package. It
+/// says nothing about whether that member ever calls a read: a member can
+/// declare the edge and use nothing. Reachability from a process entry point and
+/// execution are separate facts, measured outside this package, and
+/// [`ReverseConsumerRow`] deliberately carries neither a reachability nor an
+/// execution claim so no reader can mistake a declared edge for a live read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseConsumerRow {
+    /// Declaring workspace member that depends on this package.
+    pub member: String,
+    /// How this owner resolved that member.
+    pub provenance: InventoryProvenance,
+}
+
 /// The resolved inventory of everything this package exposes and owns.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -452,12 +523,53 @@ pub struct ReadOwnerInventory {
     pub store_dependencies: Vec<StoreDependencyRow>,
     /// Every declared test target of this package.
     pub test_targets: Vec<TestTargetRow>,
+    /// The observed serialization shape of every declared wire item.
+    pub serialization_shapes: Vec<SerializationRow>,
+    /// Every declared reverse consumer of this package.
+    pub reverse_consumers: Vec<ReverseConsumerRow>,
     /// The owner and Store comparison for every activated Store read operation.
     pub read_model_comparisons: Vec<OperationReadModelComparison>,
     /// Every validated local read port binding.
     pub port_bindings: Vec<LocalReadPortBinding>,
+    /// Binds the declared reverse-consumer set to its independent source.
+    ///
+    /// A package cannot observe its importers at run time — the language has no
+    /// reflection over the dependency graph — so the dependent set is settled
+    /// outside this crate, by the workspace manifest. This member states which
+    /// source the declared set was read from, so a row can never claim a
+    /// provenance its bytes do not carry.
+    #[serde(default)]
+    pub reverse_consumer_source: ReverseConsumerSource,
     /// Execution class of the whole inventory.
     pub evidence_execution: InventoryEvidenceClass,
+}
+
+/// Independent source that settles this package's dependent set.
+///
+/// The declared rows below are read from this source by hand, because nothing in
+/// this crate can execute it. Stating which source produced them is what keeps
+/// the set checkable: a deletion decision re-reads the same source and compares,
+/// instead of trusting a list this crate wrote for itself.
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReverseConsumerSource {
+    /// The dependent set was read from the workspace manifest graphs
+    /// (`cargo metadata --no-deps --offline --locked`), which are produced by
+    /// Cargo from every member's own `[dependencies]`, `[dev-dependencies]` and
+    /// `[build-dependencies]` declarations. No file in this package contributes
+    /// an entry, so the set cannot be widened or narrowed by anything written
+    /// here.
+    ///
+    /// This is the default because it is the only source that was actually
+    /// executed; it is a named default, not a claim that no other source exists.
+    #[default]
+    CargoWorkspaceMetadata,
+    /// No source has produced a dependent set for this owner.
+    ///
+    /// Never the value of a resolved inventory: resolving an inventory that
+    /// still carries it is refused, so a row set can never be reported under a
+    /// source that was not used.
+    Unbound,
 }
 
 impl ReadOwnerInventory {
@@ -487,12 +599,16 @@ impl ReadOwnerInventory {
 pub fn read_owner_inventory() -> Result<ReadOwnerInventory, ReadError> {
     let read_model_comparisons = compare_activated_read_model()?;
     verify_context_reconstruction_table(&read_model_comparisons)?;
+    let reverse_consumers = resolve_reverse_consumer_rows()?;
     Ok(ReadOwnerInventory {
         contract: resolve_contract_identity()?,
         mutable_state: OwnerMutableState::StatelessOverCallerOwnedStoreClient,
         public_api: resolve_public_api_rows()?,
         store_dependencies: resolve_store_dependency_rows(),
         test_targets: resolve_test_target_rows(),
+        serialization_shapes: resolve_serialization_rows()?,
+        reverse_consumer_source: ReverseConsumerSource::CargoWorkspaceMetadata,
+        reverse_consumers,
         port_bindings: resolve_port_bindings(&read_model_comparisons)?,
         read_model_comparisons,
         evidence_execution: InventoryEvidenceClass::NotExecuted,
@@ -696,6 +812,8 @@ const PUBLIC_TYPE_DECLARATIONS: &[PublicTypeDeclaration] = &public_type_rows![
     ContextReconstructionMembership => WireEnum,
     LocalReadPortMethod => WireEnum,
     PortSelectorRole => WireEnum,
+    SerializationShape => WireEnum,
+    ReverseConsumerSource => WireEnum,
     PublicApiRow => WireObject,
     DeclaredParameterRow => WireObject,
     OperationReadModelComparison => WireObject,
@@ -703,6 +821,8 @@ const PUBLIC_TYPE_DECLARATIONS: &[PublicTypeDeclaration] = &public_type_rows![
     OwnerContractIdentity => WireObject,
     StoreDependencyRow => WireObject,
     TestTargetRow => WireObject,
+    SerializationRow => WireObject,
+    ReverseConsumerRow => WireObject,
     ReadOwnerInventory => WireObject,
 ];
 
@@ -763,6 +883,144 @@ const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
     },
     PublicTypeDeclaration {
         name: "compare_operation_with_store_read_model",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "provider_memory_feed",
+        kind: PublicApiKind::Module,
+        witness: None,
+    },
+];
+
+/// Public surface of the `provider_memory_feed` module.
+///
+/// A module is a public item like any other, and this one carries a candidate-only
+/// adapter surface of its own. These rows name the real items for the same reason
+/// the rest of the table does — a rename or a removal is a build failure — and
+/// [`PublicApiKind::OffWire`] states plainly that the module publishes no read
+/// wire shape of its own: it is a candidate import surface with no decoder and no
+/// membership in [`WIRE_DECLARATIONS`], so nothing here claims a wire guarantee
+/// the module does not make. Its two entry points are named by the rows below, and
+/// it is invoked only through the port it declares, never by a second adapter path.
+const PROVIDER_MEMORY_FEED_DECLARATIONS: &[PublicTypeDeclaration] = &[
+    PublicTypeDeclaration {
+        name: "MEMORY_PROVIDER_FEED_CAPABILITY",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedCapability",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryCandidateAuthority",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedError",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryProfileText",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFactBasis",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemorySurfaceFact",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryPoisoningRiskLevel",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryPoisoningRisk",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFallbackRoute",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryModelRoute",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemorySurfaceProfileInput",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemorySurfaceProfile",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryCandidateContent",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemorySourceCandidate",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryReadRequest",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedUnavailableReason",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedDegradationReason",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedOutcome",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedPortFailure",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedPort",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "ProviderMemoryFeedResult",
+        kind: PublicApiKind::OffWire,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "read_provider_memory_feed",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "provider_memory_feed_unavailable",
         kind: PublicApiKind::ContractFunction,
         witness: None,
     },
@@ -840,12 +1098,14 @@ fn resolve_public_api_rows() -> Result<Vec<PublicApiRow>, ReadError> {
     let mut rows = Vec::with_capacity(
         PUBLIC_TYPE_DECLARATIONS.len()
             + PUBLIC_GENERIC_TYPE_DECLARATIONS.len()
-            + PUBLIC_ITEM_DECLARATIONS.len(),
+            + PUBLIC_ITEM_DECLARATIONS.len()
+            + PROVIDER_MEMORY_FEED_DECLARATIONS.len(),
     );
     for declaration in PUBLIC_TYPE_DECLARATIONS
         .iter()
         .chain(PUBLIC_GENERIC_TYPE_DECLARATIONS)
         .chain(PUBLIC_ITEM_DECLARATIONS)
+        .chain(PROVIDER_MEMORY_FEED_DECLARATIONS)
     {
         if !seen.insert(declaration.name) {
             return Err(ReadError::DuplicateField("public_api".to_owned()));
@@ -893,6 +1153,7 @@ const fn provenance_for(kind: PublicApiKind) -> InventoryProvenance {
         PublicApiKind::Module
         | PublicApiKind::Trait
         | PublicApiKind::Service
+        | PublicApiKind::OffWire
         | PublicApiKind::ContractConstant
         | PublicApiKind::ContractFunction => InventoryProvenance::DeclaredByOwner,
     }
@@ -920,6 +1181,217 @@ fn resolve_store_dependency_rows() -> Vec<StoreDependencyRow> {
             provenance: InventoryProvenance::DerivedAtCallTime,
         })
         .collect()
+}
+
+/// One declared wire item, with the real schema its derive macro produces.
+struct WireDeclaration {
+    /// Exported item name, exactly as a consumer imports it.
+    name: &'static str,
+    /// The item's own derived JSON schema, produced by the real derive.
+    schema: fn() -> serde_json::Value,
+    /// Whether the item is decoded as well as encoded.
+    decodable: bool,
+}
+
+/// Builds the declared wire table from real derived schemas.
+///
+/// The `schema` body names the type, so a rename or a removal breaks this crate
+/// rather than leaving a stale row, and the schema value it returns is the one
+/// the item's own `JsonSchema` derive produces — not a hand-written summary of
+/// what that shape is supposed to be.
+macro_rules! wire_rows {
+    ($($name:ident => $decodable:literal),* $(,)?) => {
+        [$(
+            WireDeclaration {
+                name: stringify!($name),
+                schema: || {
+                    serde_json::to_value(schemars::schema_for!($name))
+                        .expect("a derived JsonSchema is serializable")
+                },
+                decodable: $decodable,
+            },
+        )*]
+    };
+}
+
+/// Declared serialization surface of this package's own read contract.
+///
+/// Every closed object, transparent value and encode-only error enum on the read
+/// wire appears here exactly once, and each row's shape is derived from the
+/// item's real `JsonSchema` rather than asserted.
+const WIRE_DECLARATIONS: &[WireDeclaration] = &wire_rows![
+    QueryIntent => true,
+    EliotResourceUri => true,
+    ProvenanceHandle => true,
+    ReadProvenance => true,
+    NamedParameters => true,
+    ReadPrincipal => true,
+    ReadSourceIdentity => true,
+    ReadSchemaIdentity => true,
+    ReadOrderingBinding => true,
+    ReadInvalidationSet => true,
+    ReadIdentity => true,
+    StateRequest => true,
+    QueryRequest => true,
+    ResourceRequest => true,
+    CurrentStateView => true,
+    QueryResult => true,
+    ResourceContent => true,
+    QueryMode => true,
+    TimeScope => true,
+    BranchEnvironmentScope => true,
+    FreshnessPolicy => true,
+    RequiredAssurance => true,
+    ProvenanceDisposition => true,
+    ReadOutcome => true,
+    ReadCoverage => true,
+    DeclaredResultSelector => true,
+    DeclaredPageSelector => true,
+    ReadError => true,
+    StoreReadFailure => true,
+];
+
+/// Resolves the observed serialization shape of every declared wire item.
+///
+/// The classification reads the item's own derived schema, so nothing here is
+/// assumed. Schemars renders the four shapes this owner actually publishes in
+/// three distinct renderings, and each is read from the key the derive emits
+/// for it:
+///
+/// * a **closed object** declares a non-empty `properties` object together with
+///   `additionalProperties: false`, so an unknown property is refused;
+/// * a **closed enum** declares its members as an `enum` list — at the top
+///   level for a unit enum, and inside a `oneOf` branch for a payload enum,
+///   where schemars collapses a run of unit variants into a single branch and
+///   gives every payload variant its own branch. Counting both placements is
+///   what makes `ReadOutcome` the eight-member closed enum it is, rather than an
+///   item that is not on the wire, and `ReadError` its sixteen;
+/// * a **transparent value** is a `string`/scalar that declares neither;
+/// * an **open object** declares `additionalProperties: true` and no closed
+///   member, so its key set is the caller's.
+///
+/// A shape matching none of these is refused rather than reported as one of
+/// them, so a future wire shape cannot be recorded under an existing guarantee.
+fn resolve_serialization_rows() -> Result<Vec<SerializationRow>, ReadError> {
+    WIRE_DECLARATIONS
+        .iter()
+        .map(|declaration| {
+            let schema = (declaration.schema)();
+            let properties = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, serde_json::Map::len);
+            let denies_unknown_fields = is_false(&schema, "additionalProperties");
+            let enum_members = closed_enum_members(&schema);
+            let unit_members = schema
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, std::vec::Vec::len);
+            let shape = if properties > 0 && denies_unknown_fields {
+                SerializationShape::ClosedObject
+            } else if enum_members + unit_members > 0 {
+                SerializationShape::ClosedEnum
+            } else if properties == 0 && !denies_unknown_fields {
+                match declared_type(&schema) {
+                    Some("string" | "number" | "integer" | "boolean") => {
+                        SerializationShape::TransparentValue
+                    }
+                    Some("object") => SerializationShape::OpenObject,
+                    _ => return Err(unrecognized_shape(declaration.name)),
+                }
+            } else {
+                return Err(unrecognized_shape(declaration.name));
+            };
+            Ok(SerializationRow {
+                name: declaration.name.to_owned(),
+                shape,
+                decodable: declaration.decodable,
+                object_properties: properties,
+                denies_unknown_fields,
+                enum_members: enum_members + unit_members,
+                provenance: InventoryProvenance::DerivedAtCallTime,
+            })
+        })
+        .collect()
+}
+
+/// Returns how many closed members a derived schema declares as an enum.
+///
+/// A payload enum is a `oneOf` in which schemars collapses a run of unit
+/// variants into a single branch carrying an `enum` list, while every payload
+/// variant gets its own single-member branch. Both placements are counted, so a
+/// schema that declares no `oneOf` at all contributes its top-level `enum` list
+/// and a schema with no members contributes nothing, which keeps a non-enum out
+/// of the enum branch of the classification.
+fn closed_enum_members(schema: &serde_json::Value) -> usize {
+    schema
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |branches| {
+            branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .get("enum")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(1, std::vec::Vec::len)
+                })
+                .sum()
+        })
+}
+
+/// Returns whether a derived schema declares the named boolean key as `false`.
+fn is_false(schema: &serde_json::Value, key: &str) -> bool {
+    schema
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|declared| !declared)
+}
+
+/// Returns the JSON type a derived schema declares, when it declares one.
+fn declared_type(schema: &serde_json::Value) -> Option<&str> {
+    schema.get("type").and_then(serde_json::Value::as_str)
+}
+
+/// Returns the error refusing a shape this owner does not publish.
+fn unrecognized_shape(name: &str) -> ReadError {
+    ReadError::InvalidField {
+        field: format!("serialization_shapes.{name}"),
+        reason: "the derived JSON schema matches no serialization shape this owner publishes"
+            .to_owned(),
+    }
+}
+
+/// Declared reverse consumers of this package.
+///
+/// A package cannot observe its importers at run time — the language has no
+/// reflection over the dependency graph — so this list is declared rather than
+/// computed, and `DeclaredByOwner` says so on every row. What the list is
+/// *not* is a liveness claim: a dependent member here proves that some
+/// compile-time importer exists, never that a read executes.
+///
+/// The list is read from [`ReverseConsumerSource::CargoWorkspaceMetadata`], the
+/// one source independent of this package: the workspace manifest graphs that
+/// Cargo produces from every member's own dependency declarations. Nothing in
+/// this crate contributes an entry, so the set cannot be widened or narrowed by
+/// anything written here. It is recorded, not computed, because nothing in this
+/// package can execute that source.
+const REVERSE_CONSUMERS: [&str; 3] = ["eliot-governor", "eliot-kernel-service", "eliotd"];
+
+/// Resolves every declared reverse-consumer row.
+fn resolve_reverse_consumer_rows() -> Result<Vec<ReverseConsumerRow>, ReadError> {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::with_capacity(REVERSE_CONSUMERS.len());
+    for member in REVERSE_CONSUMERS {
+        if !seen.insert(member) {
+            return Err(ReadError::DuplicateField("reverse_consumers".to_owned()));
+        }
+        rows.push(ReverseConsumerRow {
+            member: (*member).to_owned(),
+            provenance: InventoryProvenance::DeclaredByOwner,
+        });
+    }
+    Ok(rows)
 }
 
 /// Compares every activated Store read operation with this owner.
