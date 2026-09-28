@@ -11,7 +11,7 @@ use eliot_user_broker::{
     request_names_notify_image,
 };
 use eliot_user_broker_core::{
-    CutoverReceipt, LaunchRequest, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
+    CutoverReceipt, LaunchRequest, OperatorEndpoint, OperatorHandoffRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,14 +63,14 @@ enum Request {
     OperatorHandoff {
         request: OperatorHandoffRequest,
     },
-    /// Redemption of one issued handoff, exactly once, against the
-    /// OS-observed redeeming client binding. A consumed nonce, a stale
-    /// endpoint generation, an expired window, a stale Kernel session token,
-    /// a foreign SID/session, or a foreign client process image is refused
-    /// with its own stable code.
+    /// Redemption is refused on stdin because this transport has no connected
+    /// broker pipe from which to observe the OS client process. Redemption
+    /// requires connected broker-pipe peer evidence before composition.
     RedeemOperatorHandoff {
-        endpoint: OperatorEndpoint,
-        client: OperatorClientBinding,
+        #[serde(rename = "endpoint")]
+        _endpoint: OperatorEndpoint,
+        #[serde(rename = "client")]
+        _client: OperatorClientBinding,
     },
     /// Publication of the registration/cutover receipt for the broker
     /// generation transition this lineage performed (I14.17).
@@ -110,10 +110,6 @@ enum Message {
     /// One owner-issued, generation-bound, expiring, single-use handoff.
     OperatorHandoff {
         endpoint: Value,
-    },
-    /// The installation-approved artifact one redeemed handoff authenticated.
-    OperatorHandoffRedeemed {
-        artifact: Value,
     },
     Stopped,
     Error {
@@ -395,16 +391,14 @@ fn dispatch(
                 ),
             }
         }
-        Request::OperatorHandoff { request } => dispatch_admitted_handoff(
-            composition
-                .admit_operator_handoff(&request)
-                .map(HandoffOutcome::Issued),
-        ),
-        Request::RedeemOperatorHandoff { endpoint, client } => dispatch_admitted_handoff(
-            composition
-                .redeem_operator_handoff(&endpoint, &client)
-                .map(HandoffOutcome::Redeemed),
-        ),
+        Request::OperatorHandoff { request } => {
+            dispatch_admitted_handoff(composition.admit_operator_handoff(&request))
+        }
+        Request::RedeemOperatorHandoff { .. } => Message::Error {
+            code: eliot_user_broker::BrokerAdmissionRefusal::OperatorClientProcessForeign.code(),
+            detail: "stdin has no OS-observed peer process; redemption requires authenticated broker-pipe peer evidence"
+                .to_owned(),
+        },
         Request::Cutover { authority } => {
             dispatch_cutover(composition.publish_cutover_receipt(authority.as_ref()))
         }
@@ -497,12 +491,6 @@ fn dispatch_cutover(
     }
 }
 
-/// The two admitted outcomes of the one-shot Operator handoff boundary.
-enum HandoffOutcome {
-    Issued(OperatorEndpoint),
-    Redeemed(OperatorArtifact),
-}
-
 /// Validates one handoff value against its owner contract and encodes it.
 fn encode_handoff<T: Serialize>(
     validated: Result<(), eliot_user_broker_core::BrokerError>,
@@ -518,30 +506,21 @@ fn encode_handoff<T: Serialize>(
     })
 }
 
-/// Projects one admitted handoff outcome onto the wire.
+/// Projects one admitted handoff issuance onto the wire.
 ///
 /// An issued endpoint carries no bearer credential and no filesystem auth
-/// reference, and a redeemed artifact carries only image identity, so both are
-/// validated by their owner contract before they leave the broker. A refusal
-/// keeps its own stable code; it is never folded into the generic composition
-/// code.
+/// reference. It is validated by its owner contract before it leaves the
+/// broker. A refusal keeps its own stable code; it is never folded into the
+/// generic composition code.
 fn dispatch_admitted_handoff(
-    outcome: Result<HandoffOutcome, eliot_user_broker::CompositionError>,
+    outcome: Result<OperatorEndpoint, eliot_user_broker::CompositionError>,
 ) -> Message {
     match outcome {
         Err(error) => composition_rejection(&error),
-        Ok(HandoffOutcome::Issued(endpoint)) => {
-            match encode_handoff(endpoint.validate(), endpoint) {
-                Ok(endpoint) => Message::OperatorHandoff { endpoint },
-                Err(message) => message,
-            }
-        }
-        Ok(HandoffOutcome::Redeemed(artifact)) => {
-            match encode_handoff(artifact.validate(), artifact) {
-                Ok(artifact) => Message::OperatorHandoffRedeemed { artifact },
-                Err(message) => message,
-            }
-        }
+        Ok(endpoint) => match encode_handoff(endpoint.validate(), endpoint) {
+            Ok(endpoint) => Message::OperatorHandoff { endpoint },
+            Err(message) => message,
+        },
     }
 }
 
