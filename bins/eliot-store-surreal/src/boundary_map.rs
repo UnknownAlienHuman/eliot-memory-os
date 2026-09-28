@@ -114,6 +114,11 @@ pub struct CredentialReferenceBoundary {
     pub role: StoreCredentialRole,
     /// Reserving namespace of the Credential Manager target.
     pub target_namespace: &'static str,
+    /// The literal prefix a live reference of this role must carry. Kept
+    /// separate from the human-readable `target_namespace` so the launch
+    /// admission compares a real string prefix rather than re-parsing a
+    /// display form that also carries a shape description.
+    pub reserved_prefix: &'static str,
     /// Admission owner of the exact reference value.
     pub validator: &'static str,
     /// Runtime caller that resolves the value.
@@ -249,6 +254,7 @@ const CREDENTIAL_REFERENCES: &[CredentialReferenceBoundary] = &[
     CredentialReferenceBoundary {
         role: StoreCredentialRole::NormalClient,
         target_namespace: "eliot/store/v1/<32 hex>",
+        reserved_prefix: "eliot/store/v1/",
         validator: "eliot_installation::validate_store_credential_target",
         resolved_by:
             "adapter_materialization::resolve_credential, called by StoreComposition::new",
@@ -260,6 +266,7 @@ const CREDENTIAL_REFERENCES: &[CredentialReferenceBoundary] = &[
     CredentialReferenceBoundary {
         role: StoreCredentialRole::ProviderBootstrapAdmin,
         target_namespace: "eliot/provider/v1/<32 hex>",
+        reserved_prefix: "eliot/provider/v1/",
         validator: "eliot_installation::validate_provider_bootstrap_credential_target",
         resolved_by:
             "adapter_materialization::resolve_provider_bootstrap_credential, called by \
@@ -406,6 +413,33 @@ impl StoreBoundaryMap {
     /// The launch must then bind its two references to two different contours:
     /// one reference for both roles would put one secret in both contours.
     pub(crate) fn validate_against(&self, config: &StoreLaunchConfig) -> Result<(), String> {
+        // The map's own roster must be closed and single-valued before the
+        // launch is judged against it: each credential role is held by exactly
+        // one contour, the provider endpoint has exactly one owner, and each
+        // credential reference is delivered to exactly one contour. These are
+        // checked against the map's OWN rows, not against a second copy of them.
+        for role in [StoreCredentialRole::NormalClient, StoreCredentialRole::ProviderBootstrapAdmin] {
+            let holders = self.contours_holding(role);
+            if holders.len() != 1 {
+                return Err(format!(
+                    "boundary map must name exactly one holder of the {role:?} credential, found {}",
+                    holders.len()
+                ));
+            }
+        }
+        let endpoint_owners = self.contours_owning_provider_endpoint();
+        if endpoint_owners != [StoreBoundaryContour::ProviderChild] {
+            return Err(
+                "boundary map must name exactly the provider child as the provider endpoint owner"
+                    .to_owned(),
+            );
+        }
+        let delivered = self.contours_receiving_a_credential();
+        if delivered.len() != self.credential_references().len() {
+            return Err(
+                "every credential reference must be delivered to exactly one contour".to_owned(),
+            );
+        }
         if NAMED_PIPE_CALLER.contour == MAINTENANCE_CALLER.contour {
             return Err(
                 "the named-pipe caller and the maintenance/break-glass caller must be distinct \
@@ -432,6 +466,27 @@ impl StoreBoundaryMap {
                     .to_owned(),
             );
         }
+        // Each reference this launch actually carries must sit in the reserved
+        // namespace the map declares for its role, and must be the reference
+        // delivered to the contour the map names. Comparing the live strings
+        // against the declared namespace is what stops a launch from binding
+        // one reference to both roles or to a third contour.
+        for reference in self.credential_references() {
+            let live = match reference.role {
+                StoreCredentialRole::NormalClient => config.credential_ref.as_str(),
+                StoreCredentialRole::ProviderBootstrapAdmin => {
+                    config.provider_bootstrap_credential_ref.as_str()
+                }
+            };
+            let namespace = reference.reserved_prefix;
+            if !live.starts_with(namespace) {
+                return Err(format!(
+                    "the {:?} credential reference must be in the reserved {namespace} namespace \
+                     the boundary map declares",
+                    reference.role
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -440,5 +495,40 @@ impl StoreBoundaryMap {
         self.rows
             .iter()
             .any(|row| row.contour == contour && row.credential_role.is_some())
+    }
+
+    /// The contours the map admits to `role`, in map order.
+    fn contours_holding(&self, role: StoreCredentialRole) -> Vec<StoreBoundaryContour> {
+        self.rows
+            .iter()
+            .filter(|row| row.credential_role == Some(role))
+            .map(|row| row.contour)
+            .collect()
+    }
+
+    /// The contours the map names as owner of the provider endpoint.
+    fn contours_owning_provider_endpoint(&self) -> Vec<StoreBoundaryContour> {
+        self.rows
+            .iter()
+            .filter(|row| row.owns_provider_endpoint)
+            .map(|row| row.contour)
+            .collect()
+    }
+
+    /// The contours that receive a credential value, across the reference rows.
+    ///
+    /// A duplicate contour here would put one launch's secret into two
+    /// processes, and an unlisted reference would leave a secret-bearing edge
+    /// with no declared delivery contour; both are refused rather than
+    /// tolerated.
+    fn contours_receiving_a_credential(&self) -> Vec<StoreBoundaryContour> {
+        let mut delivered: Vec<StoreBoundaryContour> = self
+            .credential_references()
+            .iter()
+            .map(|reference| reference.delivered_to)
+            .collect();
+        delivered.sort_by_key(|contour| format!("{contour:?}"));
+        delivered.dedup();
+        delivered
     }
 }
