@@ -38,6 +38,22 @@ pub enum KernelError {
     #[error("operational recovery state: {0}")]
     RecoveryState(#[from] eliot_ors::OrsError),
 
+    /// Owner-supplied control-reserve capacity evidence cannot be joined into
+    /// one profile.
+    ///
+    /// The frozen owner map binds exactly one runtime owner to exactly one
+    /// dimension, so two records claiming the same dimension, or a claimed
+    /// record naming an owner the map does not bind to that dimension, cannot
+    /// be reconciled. The compiler fails instead of choosing a winner, and it
+    /// never substitutes another owner's numbers.
+    #[error("control reserve owner evidence for {bottleneck} is contradictory: {reason}")]
+    ControlReserveEvidenceContradiction {
+        /// Exact frozen contract identifier of the dimension.
+        bottleneck: &'static str,
+        /// Stable reason code.
+        reason: &'static str,
+    },
+
     /// A required textual field is blank or malformed.
     #[error("{field} is invalid: {reason}")]
     InvalidField {
