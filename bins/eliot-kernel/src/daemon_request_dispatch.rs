@@ -8579,7 +8579,9 @@ fn store_recovery_response(
 /// integrity bindings the owner already validated. The reservation digest is
 /// the owner's own scan digest, and `readiness` is the same verdict that gates
 /// I1.11 step 6, so an operator reads the gate's actual state rather than a
-/// derived claim about it.
+/// derived claim about it. The `control_*` fields restate the ORS control
+/// projection coverage that same digest binds, so a partial obligation scan is
+/// visible rather than reported as no obligations.
 fn staged_write_recovery_view(
     staged: &eliot_kernel_service::StagedWriteRecovery,
 ) -> serde_json::Value {
@@ -8650,6 +8652,14 @@ fn staged_write_recovery_view(
         "last_reservation_order": reservations.last_reservation_order,
         "next_after_order": reservations.next_after_order,
         "truncated": reservations.truncated,
+        "control_scan_source": reservations.control_scan_source,
+        "control_scanned": reservations.control_scanned,
+        "control_cursor_start_after_order": reservations.control_cursor_start_after_order,
+        "control_next_after_order": reservations.control_next_after_order,
+        "control_truncated": reservations.control_truncated,
+        "job_checkpoint_refs": reservations.job_checkpoint_refs,
+        "delivery_cursor_refs": reservations.delivery_cursor_refs,
+        "recovery_inbox_refs": reservations.recovery_inbox_refs,
         "pending": reservations.pending.iter().map(startup_pending_view).collect::<Vec<_>>(),
         "unknown": reservations.unknown.iter().map(startup_unknown_view).collect::<Vec<_>>(),
         "envelopes": envelopes,

@@ -18810,7 +18810,10 @@ impl RedbRecoveryStore {
     /// staged envelope and reservation rows are left untouched so the
     /// operation remains available for reconciliation or explicit disposition.
     /// An identical retained problem is returned unchanged; a conflicting
-    /// binding under the same identity fails without overwriting.
+    /// binding under the same identity fails without overwriting. A failure of
+    /// this write itself is never propagated on its own: its callers route it
+    /// through [`Self::staging_problem_record_failed`] so the original staging
+    /// failure survives next to it.
     fn retain_staging_problem(
         &self,
         token: &WriterReservationToken,
@@ -18874,6 +18877,40 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(problem)
+    }
+
+    /// Second chance for the durable Recovery Problem write itself (issue #1713,
+    /// I5.2, I5.6).
+    ///
+    /// `I5.2`: "Decryption failure, missing key or hash mismatch creates a
+    /// Recovery Problem; plaintext fallback and silent deletion are forbidden",
+    /// and `I5.6` step 13/14: "stage the complete immutable operation in
+    /// ORS/redb; return `ACCEPTED_PENDING` for `accept_after_stage`". Once the
+    /// staging transaction committed, the operation may already have been
+    /// observed as accepted, so the original staging failure and that possible
+    /// acceptance are the evidence a caller needs. Propagating the recorder's
+    /// own error instead would replace both texts with a bare storage failure
+    /// and read as "no problem, no possible acceptance", which is exactly what
+    /// this state is not.
+    ///
+    /// The returned error claims only what is true - the problem record could
+    /// not be written - and carries both texts verbatim. Nothing is deleted, no
+    /// envelope is removed, and the reservation keeps the state it already had.
+    fn staging_problem_record_failed(
+        token: &WriterReservationToken,
+        original: &OrsError,
+        recorder: &OrsError,
+    ) -> OrsError {
+        OrsError::IntegrityProblem {
+            record_type: "recovery_problem_record",
+            reason: format!(
+                "durable Recovery Problem for staged operation {} under reservation {} could \
+                 not be retained: {recorder}; that operation may already be accepted, nothing was \
+                 deleted or released, and the original staging failure was: {original}",
+                token.operation_id.as_str(),
+                token.reservation_id.as_str()
+            ),
+        }
     }
 
     fn existing_token(
@@ -23355,7 +23392,11 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         .map_err(storage)?
                         .map(|value| raw_fingerprint(value.value()))
                 };
-                let retained = self.retain_staging_problem(&token, &error, fingerprint)?;
+                let retained = self
+                    .retain_staging_problem(&token, &error, fingerprint)
+                    .map_err(|recorder| {
+                        Self::staging_problem_record_failed(&token, &error, &recorder)
+                    })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
@@ -23382,14 +23423,16 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             Ok(envelope) => {
                 if envelope.operation_or_checkpoint_id != *operation_id {
                     let context = self.staging_context(operation_id)?;
-                    let retained = self.retain_staging_problem(
-                        &context,
-                        &OrsError::IntegrityProblem {
-                            record_type: "recovery_envelope",
-                            reason: "envelope identity does not match its operation key".to_owned(),
-                        },
-                        Some(raw_fingerprint(&raw)),
-                    )?;
+                    let original = OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "envelope identity does not match its operation key".to_owned(),
+                    };
+                    let fingerprint = Some(raw_fingerprint(&raw));
+                    let retained = self
+                        .retain_staging_problem(&context, &original, fingerprint)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&context, &original, &recorder)
+                        })?;
                     return Err(OrsError::RecoveryProblemRetained {
                         operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                     });
@@ -23399,7 +23442,11 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             Err(error) => {
                 let fingerprint = Some(raw_fingerprint(&raw));
                 let context = self.staging_context(operation_id)?;
-                let retained = self.retain_staging_problem(&context, &error, fingerprint)?;
+                let retained = self
+                    .retain_staging_problem(&context, &error, fingerprint)
+                    .map_err(|recorder| {
+                        Self::staging_problem_record_failed(&context, &error, &recorder)
+                    })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
