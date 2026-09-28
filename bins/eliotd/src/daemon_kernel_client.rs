@@ -44,6 +44,8 @@ use eliot_platform_windows::{KernelFrontDoorAclMode, KernelFrontDoorServerExpect
 mod handshake;
 
 #[cfg(windows)]
+pub use handshake::admitted_daemon_module_contract;
+#[cfg(windows)]
 use handshake::client_hello;
 use handshake::expected_snapshot;
 pub(super) use handshake::{KernelClientError, WireOutcome, kernel_port_error, operation_payload};

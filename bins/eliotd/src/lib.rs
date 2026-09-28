@@ -150,7 +150,9 @@ pub use controlboard_adapters::{
     controlboard_notification_refresh_refusal_body, controlboard_result_body,
     is_controlboard_read_tool, serve_controlboard_view,
 };
-pub use daemon_config::DaemonConfig;
+pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
+#[cfg(windows)]
+pub use daemon_kernel_client::admitted_daemon_module_contract;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
