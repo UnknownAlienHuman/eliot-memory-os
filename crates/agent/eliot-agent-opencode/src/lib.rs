@@ -7,6 +7,8 @@ mod endpoint;
 mod gate;
 mod http;
 mod ingress;
+mod pilot;
+mod route_admission;
 mod sse;
 mod types;
 
@@ -55,6 +57,14 @@ pub use ingress::{
     UnconfiguredActionGate, authority_epoch_text, classify_decision_replay, effect_request_hash,
     encode_host_event_response, handle_host_event, parse_http_head, response_commitment,
     response_commitment_message, verify_response_commitment,
+};
+pub use pilot::opencode_pilot_observation;
+pub use route_admission::{
+    OPENCODE_MANDATED_PROBES, OPENCODE_ROUTE_ADMISSION_SCHEMA_VERSION, OpenCodePilotObservation,
+    OpenCodeProbeOutcome, OpenCodeProbeReading, OpenCodeRouteAdmission,
+    OpenCodeRouteAdmissionState, OpenCodeRouteProbeEvidence, OpenCodeRouteProfile,
+    OpenCodeRouteRole, OpenCodeRouteSelectionError, RGF_AGENT_ROUTES,
+    opencode_pilot_probe_evidence, opencode_route_role_permitted, select_opencode_route,
 };
 pub use sse::{ReconnectCursor, SseDecodeError, SseDecoder, SseEvent, SseLimits};
 pub use types::*;
