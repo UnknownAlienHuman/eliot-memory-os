@@ -424,6 +424,15 @@ pub enum LearningClosureError {
     /// does not reference a receipt this closure holds.
     #[error("the referenced owner receipt is not stored on this closure: {reference}")]
     UnreferencedOwnerReceipt { reference: String },
+    /// The disposition a completion asserts is not the one the exact canonical
+    /// records support (I12.24:283-284). Silence is not a disposition, and a
+    /// disposition the records contradict is worse than silence: an episode
+    /// whose every delta is an evidence-backed no-change, stamped as retained
+    /// local learning, claims reusable learning that was never produced.
+    /// [`supported_episode_disposition`] is the only reader of the records that
+    /// can settle this.
+    #[error("canonical records support disposition {supported}, not the asserted {asserted}")]
+    DispositionUnsupported { asserted: String, supported: String },
 }
 
 /// Assemble one evidence-bound closure candidate.
@@ -1710,6 +1719,40 @@ pub fn trigger_closure_due(event: ClosureLifecycleEvent, policy: &ClosurePolicy)
             checkpoint: false,
             delayed_window: true,
         },
+    }
+}
+
+/// The one disposition the exact attempt and delta records support.
+///
+/// Read from the records themselves, so the answer cannot be asserted by the
+/// caller that asks for the closure. A [`DeltaKind::Changed`] delta is a
+/// verified state change somebody else may reuse, so an episode that produced
+/// at least one closes with its learning kept where it was learned:
+/// [`ClosureDisposition::LocalLearningRetained`]. An episode whose every delta
+/// is the evidence-backed [`DeltaKind::NoChange`] changed nothing reusable, and
+/// I12.24:291 is explicit that saying so is a disposition rather than silence,
+/// so it closes as [`ClosureDisposition::NoReusableDelta`] and never as
+/// retained learning it did not earn.
+///
+/// A `SCOPED_UPDATE_PROMOTED` claim is deliberately outside this function: no
+/// attempt, delta, overlay, outcome or economics record can establish that a
+/// promotion happened, so only the separate authorized owner receipt can, and
+/// that reference is checked where the record is minted.
+///
+/// Total by construction: every attempt denominator reaches it, and it always
+/// names one member of [`ClosureDisposition::allowed`], so a closed episode
+/// can never carry an absent or default disposition.
+pub fn supported_episode_disposition(attempts: &AttemptOutcomesAndDeltas) -> ClosureDisposition {
+    let reusable_delta_present = attempts.attempts.iter().any(|attempt| {
+        attempt
+            .delta
+            .as_ref()
+            .is_some_and(|delta| matches!(&delta.kind, DeltaKind::Changed { .. }))
+    });
+    if reusable_delta_present {
+        ClosureDisposition::LocalLearningRetained
+    } else {
+        ClosureDisposition::NoReusableDelta
     }
 }
 
