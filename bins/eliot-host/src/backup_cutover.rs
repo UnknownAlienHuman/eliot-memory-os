@@ -998,14 +998,23 @@ pub enum CutoverError {
 // never emits success, ambiguity stays unknown, and retirement-pending never
 // implies erasure.
 //
-// Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
-// only, with no dedup cache. The single terminal record per failed operation
-// belongs to the outer caller boundary, which owns the one
-// `observe_terminal_error` call. Handoff (caller-owned, not applied here):
-// `backup_dispatch_cutover` / `backup_dispatch_cutover_disposition` /
-// `backup_dispatch_cutover_retire` arm one terminal guard each with a frozen
-// `host-backup-cutover-failed` code; operation failure stays distinct from
-// any process shutdown failure.
+// Terminal ownership (W4, applied): the leaf emits nonterminal phase/refusal
+// evidence only, with no dedup cache and no terminal record of its own, and
+// hands the error back UNCHANGED so no leaf frame can become the terminal
+// emitter. The single terminal record per failed cutover operation is owned by
+// the outer caller boundary through the crate's own `HostTerminalGuard` in
+// lib.rs: `HostComposition::backup_dispatch_cutover`,
+// `HostComposition::backup_dispatch_cutover_disposition` and
+// `HostComposition::backup_dispatch_cutover_retire` each arm one guard, armed
+// on entry and disarmed on every success return, so an `Err` reaching any arm
+// emits exactly one terminal record for that operation and a success emits
+// none. The three frozen codes are
+// `host-backup-cutover-failed` / `host-backup-cutover-disposition-failed` /
+// `host-backup-cutover-retire-failed`, so the three operations stay
+// distinguishable from each other and each stays distinct from a separate
+// process shutdown failure (`host-stop-failed`, `host-open-failed`). Nothing
+// here is deduplicated away: there is no global dedup cache, so a second
+// failed operation still reports its own terminal.
 //
 // Production disposition call sites (#983): `cutover_disposition_token` has TWO
 // production callers. The first is `reconcile_cutover_outcome` below, which

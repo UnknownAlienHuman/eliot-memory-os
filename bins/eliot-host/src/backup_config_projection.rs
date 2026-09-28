@@ -120,10 +120,14 @@ pub enum ProjectionError {
 // Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
 // only, with no dedup cache. The single terminal record per failed operation
 // belongs to the outer caller boundary, which owns the one
-// `observe_terminal_error` call. Handoff (caller-owned, not applied here):
-// when HostComposition delegation lands, its dispatch wrapper arms one
-// terminal guard with a frozen `host-backup-config-failed` code; these leaf
-// records correlate beneath it by emission order.
+// `observe_terminal_error` call. Handoff (caller-owned, STILL NOT APPLIED, and
+// this is a measured fact rather than an omission): this leaf has no
+// production caller anywhere in the repository - `project_backup_config` is
+// reached only from this crate's own `tests/backup_preparation.rs` - so there
+// is no HostComposition dispatch wrapper to arm. When that delegation lands,
+// its wrapper must arm one terminal guard with a frozen
+// `host-backup-config-failed` code; these leaf records correlate beneath it by
+// emission order. No wrapper was invented to close that gap.
 //
 // Explicit no-event list: `describe_audit_fence` (pure renderer, not an
 // observation point; its forensic text must never be logged),
