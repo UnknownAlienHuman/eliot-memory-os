@@ -196,9 +196,11 @@ impl OtlpBridge {
         stream
             .write_all(self.request(&body).as_bytes())
             .map_err(|_| OtlpBridgeError::RequestNotSent)?;
-        match read_status_line(&mut stream)? {
-            status if matches!(status, 200..=299) => Ok(()),
-            status => Err(OtlpBridgeError::CollectorRejected { status }),
+        let status = read_status_line(&mut stream)?;
+        if (200..=299).contains(&status) {
+            Ok(())
+        } else {
+            Err(OtlpBridgeError::CollectorRejected { status })
         }
     }
 
