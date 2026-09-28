@@ -4170,10 +4170,11 @@ pub struct UnsupportedPrecisionItem {
 /// coarse enough to admit a fine anchor.
 ///
 /// This is the single rank table in this crate, shared by
-/// [`PrecisionKind::Coordinate`] and [`PrecisionKind::Line`]. It is derived from
-/// `AnchorPrecision`, not owned by it, so a rung may be added here only when
-/// `AnchorPrecision` carries the same spelling. The `symbol` rung I21.7 names is
-/// carried by both, which is what lets [`PrecisionKind::Symbol`] rank it.
+/// [`PrecisionKind::Coordinate`], [`PrecisionKind::Line`] and
+/// [`PrecisionKind::Symbol`]. It is derived from `AnchorPrecision`, not owned by
+/// it, so a rung may be added here only when `AnchorPrecision` carries the same
+/// spelling. The `symbol` rung I21.7 names is carried by both, which is what lets
+/// [`PrecisionKind::Symbol`] rank it.
 fn coordinate_rank(name: &str) -> Option<u8> {
     match name {
         "source" => Some(0),
