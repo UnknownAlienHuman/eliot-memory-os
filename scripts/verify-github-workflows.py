@@ -37,8 +37,10 @@ Enforces that:
    workflow that builds Eliot.Operator executes the Eliot.Operator.Tests
    harness through an explicit dotnet run/exec invocation (issue #1225
    N_step5: a restore line, a step name, quoted prose, or a run-summary
-   claim alone is not execution, and an invocation GitHub may skip or
-   discard is not executed evidence).
+   claim alone is not execution; an invocation GitHub may skip or
+   discard is not executed evidence; and an invocation whose shell-level
+   result cannot reach the step's exit status is not terminal evidence
+   either).
 8. Workflow names indicate manual invocation and state bounded proof ceilings.
 9. Referenced local scripts exist on disk.
 10. Workflow pip installs consume only the hash-locked
@@ -138,6 +140,21 @@ HARNESS_COMMAND_PREFIX_RE = re.compile(
 # with anything on its own: it satisfies the coverage rule only together with
 # an execution invocation above, and it fails the rule without one.
 OPERATOR_EXECUTION_CLAIM = "Operator tests: executed"
+# Shell-level failure suppression (issue #1225 N_step5). A harness whose exit
+# status cannot reach the step's exit status never produces terminal evidence,
+# so an invocation carrying one of these operators is not executed evidence even
+# though `dotnet` still stands at command position: `|| <cmd>` replaces a
+# failure with the right-hand side's status, `| <cmd>` replaces it with the
+# pipeline's last status, and a trailing `&` detaches the harness from the step,
+# so its result arrives after the step has already reported. The `&` of a `2>&1`
+# redirection is excluded and `||` is matched by the same `|`, so only a real
+# suppression operator refuses.
+HARNESS_FAILURE_SUPPRESSION_RE = re.compile(r"\|(?!\|)|(?<!>)&(?!&)")
+# A bare `exit 0` as the statement immediately after the invocation replaces a
+# harness failure with success before anything can observe the exit code. A
+# guarded block is a different shape: the statement that reaches the exit has
+# already converted the failure, so only the adjacent one is this defect.
+HARNESS_EXIT_OVERRIDE_RE = re.compile(r"^exit\s+0$", re.IGNORECASE)
 
 # Execution conditions (issue #1225 N_step5). An invocation line is executed
 # evidence only when the step that carries it can actually execute and its
@@ -341,6 +358,22 @@ def _enclosing_step_scope(lines: list[str], index: int) -> int | None:
     return item
 
 
+def _overrides_harness_status(lines: list[str], index: int) -> bool:
+    """True when the next statement in the block discards the harness status.
+
+    Only the statement immediately after the invocation can be reached before
+    anything has observed the harness's exit code, so a bare `exit 0` there
+    replaces a failure with success. A block that guards the exit first
+    (`if ... { throw }`) has already converted the failure and is left alone.
+    """
+    for follow in range(index + 1, len(lines)):
+        code = workflow_code_line(lines[follow]).strip()
+        if not code:
+            continue
+        return HARNESS_EXIT_OVERRIDE_RE.match(code) is not None
+    return False
+
+
 def _harness_invocations(lines: list[str]) -> list[tuple[int, int]]:
     """(owning sequence entry, invocation line) for every real invocation."""
     invocations: list[tuple[int, int]] = []
@@ -353,6 +386,10 @@ def _harness_invocations(lines: list[str]) -> list[tuple[int, int]]:
         if NON_EXECUTION_COMMAND_RE.search(before):
             continue
         if not HARNESS_COMMAND_PREFIX_RE.match(before):
+            continue
+        if HARNESS_FAILURE_SUPPRESSION_RE.search(code[match.end() :]):
+            continue
+        if _overrides_harness_status(lines, index):
             continue
         scope = _enclosing_step_scope(lines, index)
         if scope is None:
@@ -427,7 +464,11 @@ def operator_harness_executed(content: str) -> bool:
     timeout discards the harness result, so the run-summary claim
     `Operator tests: executed ...` is compared against a nonzero executed
     denominator: an invocable line whose step never executes satisfies that
-    claim for nothing.
+    claim for nothing. The shell must also pass the harness result on: a
+    `||`/`|` suppression or a detached `&` after the invocation, and a bare
+    `exit 0` as the statement right after it, all replace a harness failure
+    with success before anything can observe it, so they are not terminal
+    evidence either.
     """
     lines = content.splitlines()
     invocations = _harness_invocations(lines)
@@ -1455,6 +1496,21 @@ def run_self_tests() -> int:
             "jobs:\n  t:\n    uses: " + ref + "\n"
         )
 
+    def operator_case(tail: str) -> str:
+        """A manual workflow that builds the Operator, invokes the harness with
+        `tail` appended, and then keeps the terminal execution claim. `tail` is
+        the only variable, so a verdict can only come from the harness-result
+        rule under test."""
+        return (
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\n"
+            "jobs:\n  t:\n    runs-on: windows-latest\n    steps:\n"
+            "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n"
+            "      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore\n"
+            "      - name: Execute Eliot.Operator test harness\n"
+            "        run: dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release" + tail + "\n"
+            "      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n"
+        )
+
     test_cases = [
         ("trigger_push", "test.yml", "on:\n  push:\n    branches: [main]\n", "GWF-001"),
         ("trigger_pr", "test.yml", "on:\n  pull_request:\n", "GWF-001"),
@@ -1483,7 +1539,18 @@ def run_self_tests() -> int:
         # The true shape passes: build plus an explicit dotnet run of the
         # harness project plus the terminal execution claim.
         ("operator_execution_accepted", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore\n      - run: dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n", None),
-        ("ci_exception_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None),
+        # --- Shell-level failure suppression (issue #1225 N_step5) ---
+        # Each shape below keeps `dotnet` at command position and keeps the
+        # terminal execution claim, yet replaces a harness failure with
+        # success, so the run can report a passing run over a harness that
+        # never reached its own result. A `2>&1` redirection is not one of
+        # them and stays accepted.
+        ("operator_failure_suppression_or_rejected", "test.yml", operator_case(" --no-restore || exit 0"), "GWF-006"),
+        ("operator_failure_suppression_pipe_rejected", "test.yml", operator_case(" --no-restore | Out-Null"), "GWF-006"),
+        ("operator_failure_suppression_background_rejected", "test.yml", operator_case(" --no-restore &"), "GWF-006"),
+        ("operator_adjacent_exit_zero_rejected", "test.yml", operator_case(" --no-restore\n        exit 0"), "GWF-006"),
+        ("operator_redirect_accepted", "test.yml", operator_case(" --no-restore 2>&1"), None),
+        ("operator_guarded_exit_zero_accepted", "test.yml", operator_case(" --no-restore\n        if [ $? -ne 0 ]; then exit 1; fi"), None),        ("ci_exception_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None),
         ("ci_pr_target_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request_target:\n    branches: [main]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("ci_unscoped_push_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n  push:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("other_workflow_push_rejected", "policy.yml", "name: Manual Policy Gate\non:\n  workflow_dispatch:\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo never\n", "GWF-001"),

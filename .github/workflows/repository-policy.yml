@@ -326,6 +326,17 @@ jobs:
           # workflow report an execution claim it does not make. The same
           # reason the two keys below are split.
           operator_execution_claim = 'Operator tests: ' + 'executed'
+          # Shell-level failure suppression (issue #1225 N_step5), mirrored from
+          # scripts/verify-github-workflows.py: an invocation whose result cannot
+          # reach the step's exit status is not terminal evidence. `||`/`|`
+          # replace a failure with another status and a trailing `&` detaches the
+          # harness, so the run can report success over a harness that never
+          # reached its result; a bare `exit 0` as the statement right after the
+          # invocation does the same before anything observes the exit code. The
+          # `&` of a `2>&1` redirection is excluded, and a guarded block is not
+          # this shape.
+          harness_failure_suppression_re = re.compile(r'\|(?!\|)|(?<!>)&(?!&)')
+          harness_exit_override_re = re.compile(r'^exit\s+0$', re.IGNORECASE)
           # Execution conditions (issue #1225 N_step5), mirrored verbatim from
           # scripts/verify-github-workflows.py: an invocation line is executed
           # evidence only when the step that carries it can actually execute and
@@ -482,10 +493,26 @@ jobs:
                   return None
               return item
 
+          def _overrides_harness_status(lines, index):
+              # True when the statement immediately after the invocation
+              # discards the harness status. Only that statement can be reached
+              # before anything has observed the exit code, so a bare `exit 0`
+              # there replaces a failure with success; a block that guards the
+              # exit first has already converted the failure and is left alone.
+              for follow in range(index + 1, len(lines)):
+                  code = re.sub(r'"[^"]*"', '', lines[follow])
+                  code = re.sub(r"'[^']*'", '', code)
+                  code = code.split('#', 1)[0].strip()
+                  if not code:
+                      continue
+                  return harness_exit_override_re.match(code) is not None
+              return False
+
           def _harness_invocations(lines):
               # (owning sequence entry, invocation line) for every real
               # invocation: `dotnet` at command position, not a print-builtin
-              # argument, with quoted prose and comments stripped.
+              # argument, with quoted prose and comments stripped, and with a
+              # result that can still reach the step's exit status.
               invocations = []
               for index, line in enumerate(lines):
                   code = re.sub(r'"[^"]*"', '', line)
@@ -498,6 +525,10 @@ jobs:
                   if non_execution_command_re.search(before):
                       continue
                   if not harness_command_prefix_re.match(before):
+                      continue
+                  if harness_failure_suppression_re.search(code[match.end():]):
+                      continue
+                  if _overrides_harness_status(lines, index):
                       continue
                   scope = _enclosing_step_scope(lines, index)
                   if scope is None:
@@ -560,7 +591,11 @@ jobs:
               # timeout discards the harness result, so the run-summary claim
               # is compared against a nonzero executed denominator: an
               # invocable line whose step never executes satisfies that claim
-              # for nothing.
+              # for nothing. The shell must pass the harness result on too: a
+              # `||`/`|` suppression or a detached `&` after the invocation,
+              # and a bare `exit 0` as the statement right after it, all
+              # replace a harness failure with success before anything can
+              # observe it, so they are not terminal evidence either.
               lines = text.splitlines()
               invocations = _harness_invocations(lines)
               if not invocations:
