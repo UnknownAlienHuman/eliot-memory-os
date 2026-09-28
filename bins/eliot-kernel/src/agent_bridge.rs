@@ -15,8 +15,8 @@ use super::{
 };
 use eliot_contracts::EpochId;
 use eliot_ipc::{
-    ApplicationSession, PeerIdentity, ServerFirstConnection, Session, TransportError,
-    TransportKind, agent_bridge_admission_receipt_frame,
+    ApplicationSession, PeerIdentity, ServerFirstConnection, ServerHandshakePolicy, Session,
+    TransportError, TransportKind, agent_bridge_admission_receipt_frame,
 };
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_platform_windows::{
@@ -394,6 +394,39 @@ impl KernelComposition {
         result
     }
 
+    /// Builds the peer challenge for one bridge handshake from the admitted
+    /// profile and the live kernel policy snapshot.
+    #[cfg(windows)]
+    fn agent_bridge_peer_challenge(
+        admission: &AgentBridgeAdmissionDescriptor,
+        kernel_policy: ServerHandshakePolicy,
+        kernel_artifact_sha256: String,
+        kernel_config_snapshot_sha256: String,
+        nonce: String,
+    ) -> Result<AgentBridgePeerChallenge, TransportError> {
+        AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: admission.profile_id.as_str().to_owned(),
+            descriptor_sha256: admission.descriptor_sha256.clone(),
+            client_declaration_sha256: admission.client_declaration_sha256.clone(),
+            bridge_generation: admission.generation,
+            state_fence: admission.state_fence.clone(),
+            kernel_principal_binding: kernel_policy.session_principal_binding,
+            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
+            kernel_generation: kernel_policy.module_generation.generation,
+            kernel_artifact_sha256,
+            kernel_config_snapshot_sha256,
+            activation_deadline_unix_ms: unix_ms()
+                .saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
+            challenge_nonce: nonce,
+            challenge_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)
+    }
+
     #[cfg(windows)]
     fn begin_agent_bridge_inner(
         &self,
@@ -451,27 +484,13 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .to_string();
         let connection_id = format!("agent-bridge:{connection_nonce}");
-        let challenge = AgentBridgePeerChallenge {
-            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
-            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
-            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
-            profile_id: admission.profile_id.as_str().to_owned(),
-            descriptor_sha256: admission.descriptor_sha256.clone(),
-            client_declaration_sha256: admission.client_declaration_sha256.clone(),
-            bridge_generation: admission.generation,
-            state_fence: admission.state_fence.clone(),
-            kernel_principal_binding: kernel_policy.session_principal_binding,
-            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
-            kernel_generation: kernel_policy.module_generation.generation,
+        let challenge = Self::agent_bridge_peer_challenge(
+            admission,
+            kernel_policy,
             kernel_artifact_sha256,
             kernel_config_snapshot_sha256,
-            activation_deadline_unix_ms: unix_ms()
-                .saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
-            challenge_nonce: nonce,
-            challenge_sha256: String::new(),
-        }
-        .with_computed_digest()
-        .map_err(|_| TransportError::SessionFenced)?;
+            nonce,
+        )?;
         let exchange = ServerFirstConnection::new(&connection_id, challenge.clone(), &declaration)?;
         let challenge_frame = exchange.challenge_frame()?;
         let current_profile = self
@@ -1669,6 +1688,28 @@ impl KernelComposition {
     /// invents semantic identity here, it only projects the exact validated
     /// binding into a transport Session.
     #[cfg(windows)]
+    /// Retains the exact Resolved task/scope binding for later dispatch
+    /// continuity (issue #1746). The revision must be the canonical
+    /// decimal `TaskRevision`; anything else fails closed here, before any
+    /// retained state is mutated.
+    fn activated_application_binding(
+        binding: &AgentActivationResolvedBinding,
+    ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        let task_revision = binding
+            .task_revision
+            .parse::<u64>()
+            .ok()
+            .filter(|revision| revision.to_string() == binding.task_revision)
+            .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
+            .ok_or(TransportError::SessionFenced)?;
+        Ok(super::ActivatedApplicationBinding {
+            session_id: binding.session_id.clone(),
+            task_id: binding.task_id.clone(),
+            work_scope_id: binding.work_scope_id.clone(),
+            task_revision,
+        })
+    }
+
     fn resolved_result_response_frame(
         &self,
         connection_id: &str,
@@ -1758,16 +1799,9 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         // Retain the exact Resolved task/scope binding for later dispatch
-        // continuity (issue #1746). The revision must be the canonical
-        // decimal `TaskRevision`; anything else fails closed here, before any
-        // retained state is mutated.
-        let activated_task_revision = binding
-            .task_revision
-            .parse::<u64>()
-            .ok()
-            .filter(|revision| revision.to_string() == binding.task_revision)
-            .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
-            .ok_or(TransportError::SessionFenced)?;
+        // continuity (issue #1746); fails closed here, before any retained
+        // state is mutated.
+        let activated_binding = Self::activated_application_binding(binding)?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.
@@ -1778,12 +1812,7 @@ impl KernelComposition {
             session.session_epoch,
         )?;
         state.session = Some(session);
-        state.activated_binding = Some(super::ActivatedApplicationBinding {
-            session_id: binding.session_id.clone(),
-            task_id: binding.task_id.clone(),
-            work_scope_id: binding.work_scope_id.clone(),
-            task_revision: activated_task_revision,
-        });
+        state.activated_binding = Some(activated_binding);
         state.activation_completed = true;
         Ok(reply)
     }
