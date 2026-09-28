@@ -12,10 +12,25 @@ pub use protocol_v1::*;
 
 mod maintenance_trigger;
 pub use maintenance_trigger::{
+    MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
+    MAINTENANCE_TRIGGER_CLAIM_WIRE_ID, MAINTENANCE_TRIGGER_CLAIM_WIRE_VERSION,
     MAINTENANCE_TRIGGER_CONTRACT_NAME, MAINTENANCE_TRIGGER_CONTRACT_VERSION,
-    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerContentRef,
-    MaintenanceTriggerPayloadRef, MaintenanceTriggerPosition, MaintenanceTriggerRecord,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_ID,
+    MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_VERSION, MAINTENANCE_TRIGGER_PAGE_WIRE_ID,
+    MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION, MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID,
+    MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION, MAINTENANCE_TRIGGER_ROUTE_GRANT_WIRE_ID,
+    MAINTENANCE_TRIGGER_ROUTE_GRANT_WIRE_VERSION, MAINTENANCE_TRIGGER_TERMINAL_DISPOSITION_WIRE_ID,
+    MAINTENANCE_TRIGGER_TERMINAL_DISPOSITION_WIRE_VERSION, MAINTENANCE_TRIGGER_WIRE_ID,
+    MAINTENANCE_TRIGGER_WIRE_VERSION, MAX_MAINTENANCE_TRIGGER_PAGE_GAPS,
+    MAX_MAINTENANCE_TRIGGER_PAGE_MEMBERS, MaintenanceTriggerAck, MaintenanceTriggerClaim,
+    MaintenanceTriggerContentRef, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDisposition,
+    MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerIntakeOutcome,
+    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage, MaintenanceTriggerPayloadRef,
+    MaintenanceTriggerPendingSummary, MaintenanceTriggerPosition, MaintenanceTriggerRecord,
+    MaintenanceTriggerRevocation, MaintenanceTriggerRoute, MaintenanceTriggerRouteGrant,
     MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent,
+    MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind,
     maintenance_trigger_contract_identity,
 };
 
