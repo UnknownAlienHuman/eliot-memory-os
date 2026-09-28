@@ -85,7 +85,7 @@ cue_kind_migration_rows = [
 ]
 donor_map_rows = [
   "crates/smart/cognitive-donor-map.toml:31 [[donor]] crates/smart/eliot-cues",
-  "crates/smart/cognitive-donor-map.toml:122 [[topology_donor]] crates/smart/eliot-cues",
+  "crates/smart/cognitive-donor-map.toml:127 [[topology_donor]] crates/smart/eliot-cues",
 ]
 owner_donor_anchors = [
   "crates/smart/eliot-cue-contracts/module.toml:40",
