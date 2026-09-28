@@ -1128,10 +1128,16 @@ impl DaemonKernelClient {
     /// [`ActivationSubmitError::NotAttempted`] because no frame was written; a
     /// definitive non-acceptance is [`ActivationSubmitError::Rejected`]; and
     /// every failure observed at or after the exchange — a transport error, an
-    /// undecodable response, a missing acknowledgement or an ack that does not
-    /// bind the submitted result — is
+    /// undecodable response, a missing acknowledgement, an ack that does not
+    /// validate, or an ack that does not bind the submitted result — is
     /// [`ActivationSubmitError::PossiblySubmitted`], because Kernel may already
     /// hold this exact result. The transport itself is unchanged.
+    ///
+    /// #1115: a well-formed acknowledgement is returned with its own
+    /// `AgentActivationResultAckOutcome` intact, including `Unknown`, so the
+    /// caller classifies the outcome Kernel actually reported instead of an
+    /// accepted-payload mismatch. This leg is symmetric with
+    /// [`Self::reconcile_agent_activation_result`].
     #[cfg(windows)]
     pub async fn submit_agent_activation_result(
         &self,
@@ -1184,11 +1190,24 @@ impl DaemonKernelClient {
             .ok_or_else(|| ActivationSubmitError::PossiblySubmitted {
                 detail: "Kernel submit response omitted acknowledgement".to_owned(),
             })?;
-        ack.validate_against_result(result).map_err(|error| {
-            ActivationSubmitError::PossiblySubmitted {
-                detail: format!("Kernel activation result ack payload mismatch: {error}"),
-            }
-        })?;
+        // #1115: this leg validates the recorded acknowledgement and its
+        // replay identity only, exactly as `reconcile_agent_activation_result`
+        // already does below. The accepted-payload validator
+        // (`validate_against_result`) rejects `AgentActivationResultAckOutcome::Unknown`
+        // unconditionally, so applying it here diverted a typed Unknown into a
+        // generic `PossiblySubmitted` before `classify_submit_ack` could report
+        // it. A closed Unknown keeps its ticket id, result digest and
+        // reconciliation detail and reaches the classifier; accepted-payload
+        // validation stays where an accepted payload is actually accepted.
+        ack.validate()
+            .map_err(|error| ActivationSubmitError::PossiblySubmitted {
+                detail: format!("Kernel activation result ack does not validate: {error}"),
+            })?;
+        if ack.replay_key() != (result.ticket_id.as_str(), result.result_sha256.as_str()) {
+            return Err(ActivationSubmitError::PossiblySubmitted {
+                detail: "Kernel activation result ack identity mismatch".to_owned(),
+            });
+        }
         Ok(ack)
     }
 
