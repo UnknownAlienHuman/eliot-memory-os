@@ -195,6 +195,14 @@ pub use store_gateway::KernelStoreGateway;
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
+// Issue #2764 item 6: the Dreamer route's real caller must be able to
+// distinguish a proven mutation disposition from a still-open Problem State
+// and from a bare gateway refusal, so both the carrier and the recovered
+// outcome it carries are part of the crate's public contract.
+#[cfg(windows)]
+pub use store_gateway::DreamerCommitUncertain;
+#[cfg(windows)]
+pub use store_gateway::DreamerJobGatewayError;
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,

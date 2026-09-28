@@ -36,6 +36,7 @@ use super::dispatch_launch::dreamer_dispatch_launch::{
     DREAMER_MODULE_ID, dreamer_launch_permits_lease,
 };
 use super::*;
+use eliot_kernel_service::{DreamerCommitUncertain, DreamerJobGatewayError};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation, JobRole};
 use eliot_store_api::RequestMeta;
 use serde::Deserialize;
@@ -73,6 +74,14 @@ pub(crate) struct DreamerJobEnvelope {
 /// ledger owned by the test. The trait never routes: dispatch plus execute
 /// validation always runs first, so a test double can only answer an already
 /// admitted envelope, never admit one itself.
+///
+/// The failure type is the gateway's own [`DreamerJobGatewayError`], not a
+/// `String` (issue #2764 item 6). An unknown Dreamer commit is not one
+/// condition: it is a proven mutation disposition, a preserved earlier
+/// disposition, a disposition whose pause release is incomplete, or a still
+/// open Problem State, and this caller must be able to tell them apart before
+/// it decides whether the session fences or a typed reply is projected. The
+/// one rendering happens once, in [`KernelComposition::project_dreamer_call`].
 #[allow(async_fn_in_trait)]
 pub(crate) trait DreamerJobStore {
     /// Applies one admitted Dreamer ledger operation exactly once.
@@ -80,7 +89,7 @@ pub(crate) trait DreamerJobStore {
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String>;
+    ) -> Result<DurableJobResponse, DreamerJobGatewayError>;
 }
 
 #[cfg(windows)]
@@ -89,8 +98,11 @@ impl DreamerJobStore for KernelStoreGateway {
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String> {
-        KernelStoreGateway::dreamer_job(self, context, request).await
+    ) -> Result<DurableJobResponse, DreamerJobGatewayError> {
+        // Boxed like the gateway's own recovery sends: the admitted transition
+        // this future carries is large, and this forwarding arm is the first of
+        // the few pollers that would otherwise each carry it unboxed.
+        Box::pin(KernelStoreGateway::dreamer_job(self, context, request)).await
     }
 }
 
@@ -144,21 +156,32 @@ fn dreamer_envelope_from_payload(
     Ok(envelope)
 }
 
-/// Fail-closed classifier over stringified gateway/store errors.
+/// Fail-closed classifier over the gateway's typed Dreamer failure.
 ///
-/// Fence and unknown markers fence the session: claiming a typed refusal
-/// when the store outcome is unknown (or when the gateway route itself is
-/// fenced) would be a false proof. Every other (deterministic, typed) store
-/// refusal projects as a typed reply so the requester can reconcile under
-/// the same mutation identity. In particular, `UnknownOperation` ("unknown
-/// named operation") is a deterministic refusal — the operation is not
-/// admitted for this caller — and stays a typed reply, while any
-/// outcome-unknown marker fences. The fence marker is the full word
-/// "fenced" (a fenced gateway, generation, or session): a bare "fence"
-/// also appears in the deterministic `FenceMismatch` refusal, which stays
-/// a typed reply.
-fn dreamer_store_error_fences(error: &str) -> bool {
-    let folded = error.to_lowercase();
+/// This is the ONE place the carrier is rendered to text, and it is reached
+/// only after the typed distinction has already been used: a recovery answer
+/// that proves a mutation disposition while leaving the ledger answer unread
+/// is a typed reply naming that obligation, never a fence, because fencing on
+/// a *proven* commit would discard a fact the caller has to keep. Fence and
+/// unknown markers still fence the session — claiming a typed refusal when the
+/// store outcome is unknown (or when the gateway route itself is fenced) would
+/// be a false proof — and every other (deterministic, typed) store refusal
+/// projects as a typed reply so the requester can reconcile under the same
+/// mutation identity. In particular, `UnknownOperation` ("unknown named
+/// operation") is a deterministic refusal — the operation is not admitted for
+/// this caller — and stays a typed reply, while any outcome-unknown marker
+/// fences. The fence marker is the full word "fenced" (a fenced gateway,
+/// generation, or session): a bare "fence" also appears in the deterministic
+/// `FenceMismatch` refusal, which stays a typed reply.
+fn dreamer_store_error_fences(error: &DreamerJobGatewayError) -> bool {
+    if let Some(recovered) = error.uncertain() {
+        // A recovered Dreamer commit is a proven fact, not an unknown: the
+        // remaining ledger read is the reported obligation, never a reason to
+        // fence. Only a still-open Problem State is an unknown outcome, and it
+        // fences.
+        return matches!(recovered, DreamerCommitUncertain::UnknownCommitOpen { .. });
+    }
+    let folded = error.to_string().to_lowercase();
     folded.contains("fenced")
         || folded.contains("outcome is unknown")
         || folded.contains("unknown_outcome")
@@ -487,6 +510,12 @@ impl KernelComposition {
                 if dreamer_store_error_fences(&error) {
                     return Err(TransportError::SessionFenced);
                 }
+                // The single rendering of the typed carrier, at the true
+                // transport edge. The reply keeps the recovered outcome's own
+                // sentence — operation/key, exact outcome, evidence digest, and
+                // the remaining `Status`/`Reconcile` obligation — so a requester
+                // reading this reply still learns what was proven. Nothing
+                // above this line has collapsed the typed answer.
                 let mut reply = status_frame(
                     session,
                     FrameKind::Response,
@@ -494,7 +523,7 @@ impl KernelComposition {
                     serde_json::json!({
                         "status": "error",
                         "operation": DREAMER_JOB_WIRE_ID,
-                        "error": error,
+                        "error": error.to_string(),
                     }),
                 )?;
                 reply.request_id = Some(request_id);

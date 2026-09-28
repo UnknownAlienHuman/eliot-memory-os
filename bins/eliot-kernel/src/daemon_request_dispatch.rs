@@ -5634,6 +5634,31 @@ impl KernelComposition {
                 "value": { "outcome": "unknown_outcome" },
                 "recovery": { "kind": "unknown_outcome", "reason": reason },
             }),
+            // The mutation's disposition is proven by exact receipt evidence
+            // and only the ledger answer is unread (issue #2764 item 6). It is
+            // deliberately NOT folded into `unknown_outcome`, which means the
+            // owner cannot tell whether the mutation committed at all:
+            // reporting a proven commit under that value would make the two
+            // indistinguishable and would keep an already-settled operation
+            // reconciling forever.
+            //
+            // It is also deliberately NOT shaped like `rejected`/`not_retained`.
+            // Those carry `accepted: false`, which is accurate for a refusal
+            // and for a proven absence, but would be a false statement here:
+            // something provably DID happen, and a client keying on
+            // `accepted == false` would read a proven commit as a refusal. The
+            // operation was accepted — its commit is proven — so the accepted
+            // flag stays true and the remaining ledger read is reported as the
+            // structured `recovery` obligation it is, not as English prose.
+            UserAutomationRuntimeError::OutcomeSettled(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": true,
+                    "outcome": "outcome_settled",
+                    "reason": reason,
+                },
+                "recovery": { "kind": "ledger_read_owed", "reason": reason },
+            }),
             UserAutomationRuntimeError::Rejected(reason) => serde_json::json!({
                 "status": "known",
                 "value": {
