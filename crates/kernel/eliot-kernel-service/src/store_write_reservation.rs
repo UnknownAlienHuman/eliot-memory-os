@@ -2087,24 +2087,31 @@ impl StartupRecoverySourceCoverageBuilder {
     }
 
     fn finish(self) -> Result<StartupRecoverySourceCoverage, ReservationWriteError> {
-        if self.page_count == 0
-            || !self.complete
-            || self.expected_cursor_sha256.is_some()
-            || self.start_cursor_sha256.is_none()
-            || self.terminal_cursor_sha256.is_none()
-        {
+        if self.page_count == 0 || !self.complete || self.expected_cursor_sha256.is_some() {
             return Err(startup_scan_integrity_error(
                 "startup_recovery_inventory_coverage",
                 format!("{} did not reach explicit exhaustion", self.source),
             ));
         }
+        let start_cursor_sha256 = self.start_cursor_sha256.ok_or_else(|| {
+            startup_scan_integrity_error(
+                "startup_recovery_inventory_coverage",
+                format!("{} has no initial cursor", self.source),
+            )
+        })?;
+        let terminal_cursor_sha256 = self.terminal_cursor_sha256.ok_or_else(|| {
+            startup_scan_integrity_error(
+                "startup_recovery_inventory_coverage",
+                format!("{} has no terminal cursor", self.source),
+            )
+        })?;
         Ok(StartupRecoverySourceCoverage {
             source: self.source,
             source_revision: self.source_revision,
             page_count: self.page_count,
             record_count: self.record_count,
-            start_cursor_sha256: self.start_cursor_sha256.expect("checked above"),
-            terminal_cursor_sha256: self.terminal_cursor_sha256.expect("checked above"),
+            start_cursor_sha256,
+            terminal_cursor_sha256,
             coverage_sha256: self.chain_sha256,
             complete: self.complete,
         })
