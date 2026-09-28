@@ -6564,19 +6564,20 @@ impl KernelComposition {
         // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
         //    `RedbRecoveryStore::stage_and_reserve`, whose
         //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:27025`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2659`, whose
-        //    `verify_ordering_heads` returns `OrsError::CanonicalEvidence` at
-        //    `:2662`). This composition opens its production ORS with
-        //    `RedbRecoveryStore::open`
+        //    (`crates/kernel/eliot-ors/src/store.rs:28006`) fails closed while the
+        //    bound provider is `RejectUnboundEvidence` (`store.rs:2777`, whose
+        //    `verify_ordering_heads` at `store.rs:2780` returns
+        //    `OrsError::CanonicalEvidence` at `store.rs:2784`). This composition
+        //    opens its production ORS with `RedbRecoveryStore::open`
         //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), which binds that rejecting provider at `store.rs:20827`;
-        //    the only `open_with_evidence` (`store.rs:20837`) call site is the
-        //    `new_with_adapters` path at `composition_bootstrap.rs:1000`/`:1007`,
-        //    which production composition never takes. So even a correct seed
-        //    would be refused by ORS before it could reserve. No production
-        //    `CanonicalEvidenceProvider` implementation exists: the only ones are
-        //    `eliot_ors` test support and test files.
+        //    `:355`), whose production default binds that rejecting provider at
+        //    `store.rs:21803`; the only `open_with_evidence` (`store.rs:21813`)
+        //    call site is the `new_with_adapters` path at
+        //    `composition_bootstrap.rs:997`/`:1007`, which production composition
+        //    never takes. So even a correct seed would be refused by ORS before it
+        //    could reserve. No production `CanonicalEvidenceProvider`
+        //    implementation exists: the only ones are `eliot_ors` test support
+        //    and test files.
         //
         // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
         // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
