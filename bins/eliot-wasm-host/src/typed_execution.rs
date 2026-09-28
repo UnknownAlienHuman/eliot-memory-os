@@ -1243,27 +1243,39 @@ fn describe_dreamer_cycle(
 pub enum TypedDomainRequest {
     /// `context-admission` `admit` request.
     Admission(
-        crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRequest,
+        Box<
+            crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRequest,
+        >,
     ),
     /// `context-assembly` `assemble` request.
     Assembly(
-        crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyRequest,
+        Box<
+            crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyRequest,
+        >,
     ),
     /// `cue-activation` `activate` request.
     CueActivation(
-        crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationRequest,
+        Box<
+            crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationRequest,
+        >,
     ),
     /// `dreamer-handler` `handle` request.
     DreamerHandler(
-        crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ValidatedCandidate,
+        Box<
+            crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ValidatedCandidate,
+        >,
     ),
     /// `memory-curation-screen` `screen` request.
     MemoryCurationScreen(
-        crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenRequest,
+        Box<
+            crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenRequest,
+        >,
     ),
     /// `dreamer-cycle` `step` request.
     DreamerCycle(
-        crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleStepInput,
+        Box<
+            crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleStepInput,
+        >,
     ),
 }
 
@@ -1286,27 +1298,39 @@ impl TypedDomainRequest {
 pub enum TypedDomainOutcome {
     /// `admit` returned a typed `admission-result`.
     Admission(
-        crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionResult,
+        Box<
+            crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionResult,
+        >,
     ),
     /// `assemble` returned a typed `assembly-result`.
     Assembly(
-        crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyResult,
+        Box<
+            crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyResult,
+        >,
     ),
     /// `activate` returned a typed `activation-outcome`.
     CueActivation(
-        crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationOutcome,
+        Box<
+            crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationOutcome,
+        >,
     ),
     /// `handle` returned a typed `handler-outcome`.
     DreamerHandler(
-        crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerOutcome,
+        Box<
+            crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerOutcome,
+        >,
     ),
     /// `screen` returned a typed `screen-outcome`.
     MemoryCurationScreen(
-        crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenOutcome,
+        Box<
+            crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenOutcome,
+        >,
     ),
     /// `step` returned a typed `cycle-outcome`.
     DreamerCycle(
-        crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleOutcome,
+        Box<
+            crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleOutcome,
+        >,
     ),
 }
 
@@ -1316,27 +1340,39 @@ pub enum TypedDomainOutcome {
 pub enum TypedDomainError {
     /// `admit` returned a typed `admission-error`.
     Admission(
-        crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionError,
+        Box<
+            crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionError,
+        >,
     ),
     /// `assemble` returned a typed `assembly-error`.
     Assembly(
-        crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyError,
+        Box<
+            crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyError,
+        >,
     ),
     /// `activate` returned a typed `activation-error`.
     CueActivation(
-        crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationError,
+        Box<
+            crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationError,
+        >,
     ),
     /// `handle` returned a typed `handler-error`.
     DreamerHandler(
-        crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerError,
+        Box<
+            crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerError,
+        >,
     ),
     /// `screen` returned a typed `screen-error`.
     MemoryCurationScreen(
-        crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenError,
+        Box<
+            crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenError,
+        >,
     ),
     /// `step` returned a typed `cycle-error`.
     DreamerCycle(
-        crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleError,
+        Box<
+            crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleError,
+        >,
     ),
 }
 
@@ -1344,9 +1380,9 @@ pub enum TypedDomainError {
 /// typed error kept as-is.
 pub enum TypedDomainResult {
     /// The guest returned a typed domain outcome.
-    Outcome(TypedDomainOutcome),
+    Outcome(Box<TypedDomainOutcome>),
     /// The guest returned its own typed error. Distinct from every trap.
-    GuestError(TypedDomainError),
+    GuestError(Box<TypedDomainError>),
 }
 
 impl TypedDomainResult {
@@ -1590,7 +1626,7 @@ fn bound_request(
 }
 
 const fn ceiling_admission(
-    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ProofCeiling,
+    value: crate::typed_bindings::context_admission::exports::eliot::current::admission::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::context_admission::exports::eliot::current::admission::ProofCeiling as V;
     match value {
@@ -1606,7 +1642,7 @@ const fn ceiling_admission(
 }
 
 const fn ceiling_assembly(
-    value: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::ProofCeiling,
+    value: crate::typed_bindings::context_assembly::exports::eliot::current::assembly::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::context_assembly::exports::eliot::current::assembly::ProofCeiling as V;
     match value {
@@ -1622,7 +1658,7 @@ const fn ceiling_assembly(
 }
 
 const fn ceiling_activation(
-    value: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::ProofCeiling,
+    value: crate::typed_bindings::cue_activation::exports::eliot::current::activation::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::cue_activation::exports::eliot::current::activation::ProofCeiling as V;
     match value {
@@ -1638,7 +1674,7 @@ const fn ceiling_activation(
 }
 
 const fn ceiling_handler(
-    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ProofCeiling,
+    value: crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ProofCeiling as V;
     match value {
@@ -1654,7 +1690,7 @@ const fn ceiling_handler(
 }
 
 const fn ceiling_screen(
-    value: &crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ProofCeiling,
+    value: crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ProofCeiling as V;
     match value {
@@ -1670,7 +1706,7 @@ const fn ceiling_screen(
 }
 
 const fn ceiling_cycle(
-    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::ProofCeiling,
+    value: crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::ProofCeiling,
 ) -> u8 {
     use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::ProofCeiling as V;
     match value {
@@ -1694,172 +1730,218 @@ fn check_result(
     admitted: &TypedDomainAdmission,
     bound: &mut TypedBound,
 ) -> Result<(), TypedExecutionError> {
-    use crate::typed_bindings::context_admission::exports::eliot::current::admission;
-    use crate::typed_bindings::context_assembly::exports::eliot::current::assembly;
-    use crate::typed_bindings::cue_activation::exports::eliot::current::activation;
-    use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle;
-    use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler;
-    use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen;
     match result {
-        TypedDomainResult::Outcome(TypedDomainOutcome::Admission(value)) => {
-            match value {
-                admission::AdmissionResult::Admitted(set) => {
-                    check_echo(&set.operation_id, &admitted.operation_id, "operation-id")?;
-                    check_echo(&set.task_id, &admitted.task_id, "task-id")?;
-                    check_echo(&set.scope_id, &admitted.scope_id, "scope-id")?;
-                    check_echo(&set.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-                    check_ceiling(
-                        ceiling_admission(&set.proof_ceiling),
-                        admitted.proof_ceiling,
-                        "proof-ceiling",
-                    )?;
-                    bound.text(&set.operation_id)?;
-                    bound.text(&set.task_id)?;
-                    bound.text(&set.attempt_id)?;
-                    bound.text(&set.scope_id)?;
-                    bound.text(&set.fence_epoch)?;
-                    bound.text(&set.recipe_digest)?;
-                    bound.text(&set.recipe_revision)?;
-                    bound.text(&set.canonical_digest)?;
-                    bound.list(&set.members)?;
-                    bound.list(&set.dispositions)?;
-                    bound.list(&set.omissions)?;
-                    bound.list(&set.frontier)?;
-                }
-                admission::AdmissionResult::Incomplete(incomplete) => {
-                    check_ceiling(
-                        ceiling_admission(&incomplete.proof_ceiling),
-                        admitted.proof_ceiling,
-                        "proof-ceiling",
-                    )?;
-                    bound.text(&incomplete.failed_floor_rule)?;
-                    bound.list(&incomplete.missing)?;
-                    bound.list(&incomplete.stale)?;
-                    bound.list(&incomplete.blocked)?;
-                    bound.list(&incomplete.unavailable)?;
-                    bound.list(&incomplete.omitted)?;
-                    bound.list(&incomplete.exhausted)?;
-                    bound.list(&incomplete.unknown)?;
-                    bound.list(&incomplete.known_empty)?;
-                    bound.list(&incomplete.partial)?;
-                    bound.list(&incomplete.provider_gaps)?;
-                    bound.list(&incomplete.oversized)?;
-                    bound.list(&incomplete.measurements)?;
-                    bound.list(&incomplete.reopening_requirements)?;
-                }
+        TypedDomainResult::Outcome(outcome) => match outcome.as_ref() {
+            TypedDomainOutcome::Admission(value) => check_admission_result(value, admitted, bound),
+            TypedDomainOutcome::Assembly(value) => check_assembly_result(value, admitted, bound),
+            TypedDomainOutcome::CueActivation(value) => {
+                check_activation_result(value, admitted, bound)
             }
-            Ok(())
-        }
-        TypedDomainResult::Outcome(TypedDomainOutcome::Assembly(value)) => {
-            let assembly::AssemblyResult::Assembled(view) = value;
-            check_echo(&view.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&view.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&view.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&view.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            check_ceiling(
-                ceiling_assembly(&view.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.text(&view.operation_id)?;
-            bound.text(&view.task_id)?;
-            bound.text(&view.scope_id)?;
-            bound.text(&view.fence_epoch)?;
-            bound.text(&view.admitted_digest)?;
-            bound.text(&view.canonical_digest)?;
-            bound.text(&view.measurement.serializer)?;
-            bound.text(&view.measurement.schema_revision)?;
-            bound.text(&view.measurement.input_digest)?;
-            bound.text(&view.measurement.output_digest)?;
-            check_ceiling(
-                ceiling_assembly(&view.measurement.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.list(&view.members)?;
-            bound.list(&view.quality.results)?;
-            bound.list(&view.omission_evidence)?;
-            bound.list(&view.frontier)?;
-            Ok(())
-        }
-        TypedDomainResult::Outcome(TypedDomainOutcome::CueActivation(value)) => {
-            let activation::ActivationOutcome::Activated(body) = value;
-            check_echo(&body.request_id, &admitted.operation_id, "operation-id")?;
-            check_ceiling(
-                ceiling_activation(&body.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.text(&body.request_id)?;
-            bound.text(&body.snapshot_id)?;
-            bound.text(&body.result_digest)?;
-            bound.list(&body.direct)?;
-            bound.list(&body.derived)?;
-            bound.list(&body.trace.steps)?;
-            bound.list(&body.frontier)?;
-            Ok(())
-        }
-        TypedDomainResult::Outcome(TypedDomainOutcome::DreamerHandler(value)) => {
-            let handler::HandlerOutcome::Handled(body) = value;
-            check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
-            check_ceiling(
-                ceiling_handler(&body.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.text(&body.operation_id)?;
-            bound.text(&body.output_digest)?;
-            bound.list(&body.frontier)?;
-            bound.list(&body.preservation.verdicts)?;
-            Ok(())
-        }
-        TypedDomainResult::Outcome(TypedDomainOutcome::MemoryCurationScreen(value)) => {
-            let screen::ScreenOutcome::Screened(body) = value;
-            check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&body.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&body.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&body.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            check_ceiling(
-                ceiling_screen(&body.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.text(&body.operation_id)?;
-            bound.text(&body.task_id)?;
-            bound.text(&body.scope_id)?;
-            bound.text(&body.fence_epoch)?;
-            bound.text(&body.result_digest)?;
-            bound.list(&body.protection)?;
-            bound.list(&body.findings)?;
-            Ok(())
-        }
-        TypedDomainResult::Outcome(TypedDomainOutcome::DreamerCycle(value)) => {
-            let cycle::CycleOutcome::Stepped(body) = value;
-            check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(
-                &body.state.fence_epoch,
-                &admitted.fence_epoch,
-                "fence-epoch",
-            )?;
-            check_ceiling(
-                ceiling_cycle(&body.proof_ceiling),
-                admitted.proof_ceiling,
-                "proof-ceiling",
-            )?;
-            bound.text(&body.operation_id)?;
-            bound.text(&body.state.state_digest)?;
-            bound.text(&body.state.fence_epoch)?;
-            bound.text(&body.result_digest)?;
-            bound.list(&body.state.pending)?;
-            bound.list(&body.state.observed)?;
-            bound.list(&body.emitted)?;
-            bound.list(&body.frontier)?;
-            Ok(())
-        }
+            TypedDomainOutcome::DreamerHandler(value) => {
+                check_handler_result(value, admitted, bound)
+            }
+            TypedDomainOutcome::MemoryCurationScreen(value) => {
+                check_screen_result(value, admitted, bound)
+            }
+            TypedDomainOutcome::DreamerCycle(value) => check_cycle_result(value, admitted, bound),
+        },
         // A guest's own typed error carries no outcome identity and no proof
         // ceiling to compare; it is retained verbatim as the terminal result.
         TypedDomainResult::GuestError(_) => Ok(()),
     }
+}
+
+fn check_admission_result(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionResult,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionResult as R;
+    match value {
+        R::Admitted(set) => {
+            check_echo(&set.operation_id, &admitted.operation_id, "operation-id")?;
+            check_echo(&set.task_id, &admitted.task_id, "task-id")?;
+            check_echo(&set.scope_id, &admitted.scope_id, "scope-id")?;
+            check_echo(&set.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+            check_ceiling(
+                ceiling_admission(set.proof_ceiling),
+                admitted.proof_ceiling,
+                "proof-ceiling",
+            )?;
+            bound.text(&set.operation_id)?;
+            bound.text(&set.task_id)?;
+            bound.text(&set.attempt_id)?;
+            bound.text(&set.scope_id)?;
+            bound.text(&set.fence_epoch)?;
+            bound.text(&set.recipe_digest)?;
+            bound.text(&set.recipe_revision)?;
+            bound.text(&set.canonical_digest)?;
+            bound.list(&set.members)?;
+            bound.list(&set.dispositions)?;
+            bound.list(&set.omissions)?;
+            bound.list(&set.frontier)?;
+        }
+        R::Incomplete(incomplete) => {
+            check_ceiling(
+                ceiling_admission(incomplete.proof_ceiling),
+                admitted.proof_ceiling,
+                "proof-ceiling",
+            )?;
+            bound.text(&incomplete.failed_floor_rule)?;
+            bound.list(&incomplete.missing)?;
+            bound.list(&incomplete.stale)?;
+            bound.list(&incomplete.blocked)?;
+            bound.list(&incomplete.unavailable)?;
+            bound.list(&incomplete.omitted)?;
+            bound.list(&incomplete.exhausted)?;
+            bound.list(&incomplete.unknown)?;
+            bound.list(&incomplete.known_empty)?;
+            bound.list(&incomplete.partial)?;
+            bound.list(&incomplete.provider_gaps)?;
+            bound.list(&incomplete.oversized)?;
+            bound.list(&incomplete.measurements)?;
+            bound.list(&incomplete.reopening_requirements)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_assembly_result(
+    value: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyResult,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyResult as R;
+    let R::Assembled(view) = value;
+    check_echo(&view.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&view.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&view.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&view.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    check_ceiling(
+        ceiling_assembly(view.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    check_ceiling(
+        ceiling_assembly(view.measurement.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    bound.text(&view.operation_id)?;
+    bound.text(&view.task_id)?;
+    bound.text(&view.scope_id)?;
+    bound.text(&view.fence_epoch)?;
+    bound.text(&view.admitted_digest)?;
+    bound.text(&view.canonical_digest)?;
+    bound.text(&view.measurement.serializer)?;
+    bound.text(&view.measurement.schema_revision)?;
+    bound.text(&view.measurement.input_digest)?;
+    bound.text(&view.measurement.output_digest)?;
+    bound.list(&view.members)?;
+    bound.list(&view.quality.results)?;
+    bound.list(&view.omission_evidence)?;
+    bound.list(&view.frontier)?;
+    Ok(())
+}
+
+fn check_activation_result(
+    value: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationOutcome,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationOutcome as R;
+    // The activation world carries no task/scope field; its echoed operation
+    // identity is the WIT `request-id`.
+    let R::Activated(body) = value;
+    check_echo(&body.request_id, &admitted.operation_id, "operation-id")?;
+    check_ceiling(
+        ceiling_activation(body.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    bound.text(&body.request_id)?;
+    bound.text(&body.snapshot_id)?;
+    bound.text(&body.result_digest)?;
+    bound.list(&body.direct)?;
+    bound.list(&body.derived)?;
+    bound.list(&body.trace.steps)?;
+    bound.list(&body.frontier)?;
+    Ok(())
+}
+
+fn check_handler_result(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerOutcome,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerOutcome as R;
+    let R::Handled(body) = value;
+    check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
+    check_ceiling(
+        ceiling_handler(body.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    bound.text(&body.operation_id)?;
+    bound.text(&body.output_digest)?;
+    bound.list(&body.frontier)?;
+    bound.list(&body.preservation.verdicts)?;
+    Ok(())
+}
+
+fn check_screen_result(
+    value: &crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenOutcome,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenOutcome as R;
+    let R::Screened(body) = value;
+    check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&body.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&body.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&body.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    check_ceiling(
+        ceiling_screen(body.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    bound.text(&body.operation_id)?;
+    bound.text(&body.task_id)?;
+    bound.text(&body.scope_id)?;
+    bound.text(&body.fence_epoch)?;
+    bound.text(&body.result_digest)?;
+    bound.list(&body.protection)?;
+    bound.list(&body.findings)?;
+    Ok(())
+}
+
+fn check_cycle_result(
+    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleOutcome,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleOutcome as R;
+    let R::Stepped(body) = value;
+    check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(
+        &body.state.fence_epoch,
+        &admitted.fence_epoch,
+        "fence-epoch",
+    )?;
+    check_ceiling(
+        ceiling_cycle(body.proof_ceiling),
+        admitted.proof_ceiling,
+        "proof-ceiling",
+    )?;
+    bound.text(&body.operation_id)?;
+    bound.text(&body.state.state_digest)?;
+    bound.text(&body.state.fence_epoch)?;
+    bound.text(&body.result_digest)?;
+    bound.list(&body.state.pending)?;
+    bound.list(&body.state.observed)?;
+    bound.list(&body.emitted)?;
+    bound.list(&body.frontier)?;
+    Ok(())
 }
 
 fn dispatch_domain(
@@ -1871,22 +1953,32 @@ fn dispatch_domain(
 ) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
     match (world, request) {
         (TypedWorld::ContextAdmission, TypedDomainRequest::Admission(value)) => {
-            call_admission(engine, component, limits, value)
+            let ((descriptor, result), usage) = call_admission(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         (TypedWorld::ContextAssembly, TypedDomainRequest::Assembly(value)) => {
-            call_assembly(engine, component, limits, value)
+            let ((descriptor, result), usage) = call_assembly(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         (TypedWorld::CueActivation, TypedDomainRequest::CueActivation(value)) => {
-            call_cue_activation(engine, component, limits, value)
+            let ((descriptor, result), usage) =
+                call_cue_activation(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         (TypedWorld::DreamerHandler, TypedDomainRequest::DreamerHandler(value)) => {
-            call_dreamer_handler(engine, component, limits, value)
+            let ((descriptor, result), usage) =
+                call_dreamer_handler(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         (TypedWorld::MemoryCurationScreen, TypedDomainRequest::MemoryCurationScreen(value)) => {
-            call_memory_curation_screen(engine, component, limits, value)
+            let ((descriptor, result), usage) =
+                call_memory_curation_screen(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         (TypedWorld::DreamerCycle, TypedDomainRequest::DreamerCycle(value)) => {
-            call_dreamer_cycle(engine, component, limits, value)
+            let ((descriptor, result), usage) =
+                call_dreamer_cycle(engine, component, limits, value)?;
+            Ok((descriptor, result, usage))
         }
         _ => Err(TypedExecutionError::WorldSelection {
             reason: "request-world".to_owned(),
@@ -1899,7 +1991,7 @@ fn call_admission(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRequest,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -1934,8 +2026,12 @@ fn call_admission(
                 )
             })?;
         let domain = match called {
-            Ok(value) => TypedDomainResult::Outcome(TypedDomainOutcome::Admission(value)),
-            Err(error) => TypedDomainResult::GuestError(TypedDomainError::Admission(error)),
+            Ok(value) => {
+                TypedDomainResult::Outcome(Box::new(TypedDomainOutcome::Admission(Box::new(value))))
+            }
+            Err(error) => TypedDomainResult::GuestError(Box::new(TypedDomainError::Admission(
+                Box::new(error),
+            ))),
         };
         Ok((descriptor, domain))
     })
@@ -1946,7 +2042,7 @@ fn call_assembly(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyRequest,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -1981,8 +2077,12 @@ fn call_assembly(
                 )
             })?;
         let domain = match called {
-            Ok(value) => TypedDomainResult::Outcome(TypedDomainOutcome::Assembly(value)),
-            Err(error) => TypedDomainResult::GuestError(TypedDomainError::Assembly(error)),
+            Ok(value) => {
+                TypedDomainResult::Outcome(Box::new(TypedDomainOutcome::Assembly(Box::new(value))))
+            }
+            Err(error) => {
+                TypedDomainResult::GuestError(Box::new(TypedDomainError::Assembly(Box::new(error))))
+            }
         };
         Ok((descriptor, domain))
     })
@@ -1993,7 +2093,7 @@ fn call_cue_activation(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationRequest,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -2028,8 +2128,12 @@ fn call_cue_activation(
                 )
             })?;
         let domain = match called {
-            Ok(value) => TypedDomainResult::Outcome(TypedDomainOutcome::CueActivation(value)),
-            Err(error) => TypedDomainResult::GuestError(TypedDomainError::CueActivation(error)),
+            Ok(value) => TypedDomainResult::Outcome(Box::new(TypedDomainOutcome::CueActivation(
+                Box::new(value),
+            ))),
+            Err(error) => TypedDomainResult::GuestError(Box::new(TypedDomainError::CueActivation(
+                Box::new(error),
+            ))),
         };
         Ok((descriptor, domain))
     })
@@ -2040,7 +2144,7 @@ fn call_dreamer_handler(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ValidatedCandidate,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -2075,8 +2179,12 @@ fn call_dreamer_handler(
                 )
             })?;
         let domain = match called {
-            Ok(value) => TypedDomainResult::Outcome(TypedDomainOutcome::DreamerHandler(value)),
-            Err(error) => TypedDomainResult::GuestError(TypedDomainError::DreamerHandler(error)),
+            Ok(value) => TypedDomainResult::Outcome(Box::new(TypedDomainOutcome::DreamerHandler(
+                Box::new(value),
+            ))),
+            Err(error) => TypedDomainResult::GuestError(Box::new(
+                TypedDomainError::DreamerHandler(Box::new(error)),
+            )),
         };
         Ok((descriptor, domain))
     })
@@ -2087,7 +2195,7 @@ fn call_memory_curation_screen(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenRequest,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -2123,12 +2231,12 @@ fn call_memory_curation_screen(
                 )
             })?;
         let domain = match called {
-            Ok(value) => {
-                TypedDomainResult::Outcome(TypedDomainOutcome::MemoryCurationScreen(value))
-            }
-            Err(error) => {
-                TypedDomainResult::GuestError(TypedDomainError::MemoryCurationScreen(error))
-            }
+            Ok(value) => TypedDomainResult::Outcome(Box::new(
+                TypedDomainOutcome::MemoryCurationScreen(Box::new(value)),
+            )),
+            Err(error) => TypedDomainResult::GuestError(Box::new(
+                TypedDomainError::MemoryCurationScreen(Box::new(error)),
+            )),
         };
         Ok((descriptor, domain))
     })
@@ -2139,7 +2247,7 @@ fn call_dreamer_cycle(
     component: &wasmtime::component::Component,
     limits: &InvocationLimits,
     request: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleStepInput,
-) -> Result<(TypedDescriptor, TypedDomainResult, ObservedUsage), TypedExecutionError> {
+) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
@@ -2172,8 +2280,12 @@ fn call_dreamer_cycle(
             )
         })?;
         let domain = match called {
-            Ok(value) => TypedDomainResult::Outcome(TypedDomainOutcome::DreamerCycle(value)),
-            Err(error) => TypedDomainResult::GuestError(TypedDomainError::DreamerCycle(error)),
+            Ok(value) => TypedDomainResult::Outcome(Box::new(TypedDomainOutcome::DreamerCycle(
+                Box::new(value),
+            ))),
+            Err(error) => TypedDomainResult::GuestError(Box::new(TypedDomainError::DreamerCycle(
+                Box::new(error),
+            ))),
         };
         Ok((descriptor, domain))
     })
