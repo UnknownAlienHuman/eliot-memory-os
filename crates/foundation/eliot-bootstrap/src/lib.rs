@@ -21,9 +21,8 @@ pub use eliot_conformance_contracts::{
     SupportObservationState,
 };
 use eliot_conformance_contracts::{
-    ConformanceContractError, canonicalize_domain_coverage, canonicalize_support_claim_set,
-    validate_capability_support_row, validate_capability_support_row_against_coverage,
-    validate_domain_coverage, validate_support_claim_set,
+    ConformanceContractError, ConformanceContractSet, canonicalize_contract_set,
+    validate_conformance_contract_set,
 };
 use eliot_contracts::{
     ContractIdentity, ContractVersion, Revision, canonical_json_bytes, sha256_hex,
@@ -45,6 +44,20 @@ pub mod normative;
 pub const CONTRACT_NAME: &str = "eliot.foundation.bootstrap";
 /// Wire revision of the C0-09 compiler surface.
 pub const CONTRACT_VERSION: u16 = 1;
+/// Wire identity of the snapshot emitted by
+/// [`CurrentSystemEvidenceCompiler::compile`].
+///
+/// Compatibility decision (issue #216, external audit `5870225846`): the single
+/// declared evaluation boundary became a required serialized field, so the wire
+/// shape changed and its identity moved from `…-v2` to `…-v3`. A `…-v2` artifact
+/// therefore no longer deserializes as a current snapshot; it remains a
+/// historical byte artifact under its own recorded digest and is never
+/// reinterpreted as a boundary-bearing one. There is deliberately no default,
+/// no clock fallback, and no inference from the other timestamps: re-emitting an
+/// old artifact under this shape requires its evidence owner to supply the
+/// boundary again.
+pub const CURRENT_SYSTEM_EVIDENCE_SNAPSHOT_SCHEMA: &str =
+    "eliot-current-system-evidence-snapshot-v3";
 /// Frozen cell plan identity supplied by the Runtime bundle.
 pub const PLAN_ID: &str = "C0-09:plan-v2";
 
@@ -343,6 +356,18 @@ pub enum EvidenceEvaluation {
 pub struct CurrentSystemEvidenceSource {
     /// Normative pair bound to this observation.
     pub normative_pair: NormativePair,
+    /// The one evaluation boundary this owner declares for the complete
+    /// validation unit.
+    ///
+    /// This is the owner-supplied `ConformanceContractSet::evaluated_at_ms` of
+    /// this crate's single I0.5 validation unit, not a second time model: it is
+    /// the instant at which this owner asserts that the coverage and support
+    /// rows below are evaluated together. The compiler never derives it from a
+    /// row, a maximum, a minimum, or the ambient clock, and mixed row
+    /// boundaries are rejected rather than normalized. Observation times may
+    /// still differ per row; only their dependencies must be current at this
+    /// one boundary.
+    pub evaluated_at_ms: u64,
     /// Selected repository root identity, never discovered by this crate.
     pub selected_repository_root: String,
     /// Selected source head identity.
@@ -383,6 +408,13 @@ pub struct CurrentSystemEvidenceSource {
 pub struct CurrentSystemEvidenceSnapshot {
     /// Artifact schema identity.
     pub schema_version: String,
+    /// The one evaluation boundary the owner declared for this validation unit.
+    ///
+    /// It travels with the coverage and support rows inside the snapshot
+    /// content address, so two otherwise identical snapshots evaluated at
+    /// different boundaries are different identities. Independent validation
+    /// rejects a snapshot whose support rows carry a different boundary.
+    pub evaluated_at_ms: u64,
     /// Normative pair used for compilation.
     pub normative_pair: NormativePair,
     /// Source projection identity.
@@ -468,15 +500,8 @@ impl CurrentSystemEvidenceSnapshot {
         validate_records(&self.records, "snapshot")?;
         validate_product_identity_coverage(&self.records, "snapshot")?;
         exact_strings(&self.unavailable_domains, "snapshot", "unavailable_domains")?;
-        validate_conformance_coverage(&self.domain_coverage, "snapshot")?;
-        validate_support_claim_set(&self.support_rows)
+        validate_conformance_contract_set(&self.validation_unit())
             .map_err(|error| conformance_error("snapshot", &error))?;
-        for row in &self.support_rows {
-            validate_capability_support_row(row)
-                .map_err(|error| conformance_error("snapshot", &error))?;
-            validate_capability_support_row_against_coverage(row, &self.domain_coverage)
-                .map_err(|error| conformance_error("snapshot", &error))?;
-        }
         enforce_support_ceiling(&self.support_rows, &self.domain_coverage, "snapshot")?;
         digest(
             &self.snapshot_sha256,
@@ -486,6 +511,21 @@ impl CurrentSystemEvidenceSnapshot {
         validate_content_digest(self, "snapshot", &self.snapshot_sha256, |value| {
             value.snapshot_sha256.clear();
         })
+    }
+
+    /// Projects the snapshot's coverage and support rows onto the one
+    /// owner-neutral validation unit that owns the single evaluation boundary.
+    ///
+    /// Both borrowed vectors are copied because the owner-neutral validator
+    /// accepts one owned `ConformanceContractSet`. This is a pure allocation
+    /// inside a stateless compiler; it invents no value and reads no clock.
+    fn validation_unit(&self) -> ConformanceContractSet {
+        ConformanceContractSet {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            evaluated_at_ms: self.evaluated_at_ms,
+            domain_coverage: self.domain_coverage.clone(),
+            support_rows: self.support_rows.clone(),
+        }
     }
 }
 
@@ -546,13 +586,6 @@ fn conformance_error(source: &str, error: &ConformanceContractError) -> Bootstra
         provider: "eliot-conformance-contracts",
         detail: format!("{source}: {error}"),
     }
-}
-
-fn validate_conformance_coverage(
-    coverage: &[DomainCoverage],
-    source: &str,
-) -> Result<(), BootstrapCompileError> {
-    validate_domain_coverage(coverage).map_err(|error| conformance_error(source, &error))
 }
 
 /// Bootstrap-owned ceiling over the owner-neutral validators.
@@ -660,17 +693,29 @@ impl CurrentSystemEvidenceCompiler {
         let mut records = input.records;
         ensure_product_identity_coverage(&mut records, &format!("{source_id}@{revision}"));
         validate_records(&records, &source_id)?;
-        let domain_coverage = canonicalize_domain_coverage(input.domain_coverage)
-            .map_err(|error| conformance_error(&source_id, &error))?;
-        let support_rows = canonicalize_support_claim_set(input.support_rows, &domain_coverage)
-            .map_err(|error| conformance_error(&source_id, &error))?;
+        // Compile the owner-declared validation unit through the single
+        // owner-neutral contract-set canonicalizer. It rejects a support row
+        // evaluated at any boundary other than the declared one, so mixed
+        // boundaries cannot reach a published snapshot. The compiler does not
+        // rewrite, average, or re-label a row timestamp to make an input pass:
+        // re-evaluation belongs to the evidence owner.
+        let contract_set = canonicalize_contract_set(ConformanceContractSet {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            evaluated_at_ms: input.evaluated_at_ms,
+            domain_coverage: input.domain_coverage,
+            support_rows: input.support_rows,
+        })
+        .map_err(|error| conformance_error(&source_id, &error))?;
+        let domain_coverage = contract_set.domain_coverage;
+        let support_rows = contract_set.support_rows;
         enforce_support_ceiling(&support_rows, &domain_coverage, &source_id)?;
 
         records.sort_by(|left, right| left.key.cmp(&right.key));
         let mut unavailable_domains = input.unavailable_domains;
         unavailable_domains.sort();
         let mut snapshot = CurrentSystemEvidenceSnapshot {
-            schema_version: "eliot-current-system-evidence-snapshot-v2".to_owned(),
+            schema_version: CURRENT_SYSTEM_EVIDENCE_SNAPSHOT_SCHEMA.to_owned(),
+            evaluated_at_ms: input.evaluated_at_ms,
             normative_pair: input.normative_pair,
             source_projection_ref: format!("{source_id}@{revision}"),
             selected_repository_root: input.selected_repository_root,
@@ -699,15 +744,22 @@ impl CurrentSystemEvidenceCompiler {
 
     /// Explicit legacy import of a flat v1 evidence source.
     ///
-    /// Old flat bytes carry no domain coverage and no support rows. This
-    /// disposition names that gap instead of reinterpreting it: every one of
-    /// the five domains becomes `UNKNOWN` with the legacy import attributed in
-    /// its handles, and no support row is minted, so the ceiling is vacuous and
-    /// no stronger than the exact evidence. A legacy `VerifierBacked` record
-    /// label is preserved byte-identically on its record; it is never mapped
-    /// into `EXECUTED` or `CURRENT_VERIFIED`.
+    /// Old flat bytes carry no domain coverage, no support rows, and no
+    /// evaluation boundary, so the importing owner declares the boundary at the
+    /// import call. This disposition names that gap instead of reinterpreting
+    /// it: every one of the five domains becomes `UNKNOWN` with the legacy
+    /// import attributed in its handles, and no support row is minted, so the
+    /// ceiling is vacuous and no stronger than the exact evidence. A legacy
+    /// `VerifierBacked` record label is preserved byte-identically on its
+    /// record; it is never mapped into `EXECUTED` or `CURRENT_VERIFIED`.
+    ///
+    /// The supplied boundary labels the imported validation unit. It cannot
+    /// promote it: the import has no `OBSERVED` coverage and no support row, so
+    /// no current verified support exists in the result at any boundary. The
+    /// historical flat bytes and their recorded identity are never rewritten.
     pub fn compile_legacy_flat_partial(
         source: SourceProjection<LegacyFlatEvidenceSource>,
+        evaluated_at_ms: u64,
     ) -> Result<CurrentSystemEvidenceSnapshot, BootstrapCompileError> {
         let (source_id, revision, input) = require(source)?;
         let domain_coverage = EvidenceDomain::ALL
@@ -729,6 +781,7 @@ impl CurrentSystemEvidenceCompiler {
             status: SourceStatus::Complete,
             value: Some(CurrentSystemEvidenceSource {
                 normative_pair: input.normative_pair,
+                evaluated_at_ms,
                 selected_repository_root: input.selected_repository_root,
                 selected_source_head: input.selected_source_head,
                 dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
@@ -2133,6 +2186,7 @@ mod tests {
             "revision-1",
             CurrentSystemEvidenceSource {
                 normative_pair: pair(),
+                evaluated_at_ms: 2,
                 selected_repository_root: "repo-root".to_owned(),
                 selected_source_head: "head-1".to_owned(),
                 dirty_delta_artifact_ref: None,
@@ -2746,7 +2800,7 @@ mod tests {
                 unavailable_domains: vec!["runtime".to_owned()],
             },
         );
-        let snapshot = CurrentSystemEvidenceCompiler::compile_legacy_flat_partial(legacy)?;
+        let snapshot = CurrentSystemEvidenceCompiler::compile_legacy_flat_partial(legacy, 2)?;
         snapshot.validate()?;
         assert_eq!(snapshot.domain_coverage.len(), EvidenceDomain::ALL.len());
         assert!(
