@@ -8977,9 +8977,10 @@ fn store_recovery_response(
 /// integrity bindings the owner already validated. The reservation digest is
 /// the owner's own scan digest, and `readiness` is the same verdict that gates
 /// I1.11 step 6, so an operator reads the gate's actual state rather than a
-/// derived claim about it. The `control_*` fields restate the ORS control
-/// projection coverage that same digest binds, so a partial obligation scan is
-/// visible rather than reported as no obligations.
+/// derived claim about it. The inventory fields report full five-source
+/// coverage, exact obligation counts, and bounded samples. Preflight coverage,
+/// partial reservation lookup, and final coverage remain distinct so a partial
+/// lookup cannot be mistaken for an exhaustive startup scan.
 fn staged_write_recovery_view(
     staged: &eliot_kernel_service::StagedWriteRecovery,
 ) -> serde_json::Value {
