@@ -17,7 +17,8 @@ use super::{
     ProfileGovernedRoots, ProfileSelectionResolution, RuntimeStateRoots,
     SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
     StoreCredentialProgress, candidate_manifest_digest, handle, handles,
-    ownership_secret_absence_evidence, phase_b_scm_digest, prove_unprivileged_selection,
+    ownership_secret_absence_evidence, phase_b_scm_digest,
+    prove_no_service_profile_authority_dependency,
     sha256_handle, sha256_hex, validate_installer_effects, validate_package_binding,
     validate_phase_b_effect_bindings, validate_staging_receipt_for_observation,
     validate_staging_receipt_for_plan,
@@ -431,11 +432,11 @@ pub struct InstallationTransaction {
     pub profile: InstallationProfile,
     /// Versioned I3.1 four-root binding resolved for `profile`.
     ///
-    /// `Some` only when the transaction was planned through the
-    /// profile-governed selector; legacy ungoverned plans carry `None` and are
-    /// never defaulted into a binding. The registry store persists this exact
-    /// binding with the transaction, and restart rehydration revalidates it in
-    /// [`InstallationTransaction::validate`].
+    /// `None` is permitted only while a fresh in-memory planner constructor is
+    /// assembling the transaction. Every executable, persisted, decoded, or
+    /// reopened current-wire transaction must carry the exact selected roots;
+    /// validation rehydrates this original binding and never resolves a new
+    /// layout from ambient paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_governed_roots: Option<InstallationRoots>,
     /// Governing request identity.
@@ -537,10 +538,9 @@ impl InstallationTransaction {
             }
         })?;
         binding.validate(self.profile)?;
-        if binding.runtime_state_roots != self.candidate_manifest.runtime_launch.runtime_state_roots
-        {
+        if binding != &self.candidate_manifest.runtime_launch.profile_governed_roots {
             return Err(InstallationError::ProfileViolation(
-                "recorded profile-governed roots disagree with the recorded candidate runtime roots"
+                "recorded profile-governed roots disagree with the candidate launch binding"
                     .to_owned(),
             ));
         }
@@ -551,12 +551,22 @@ impl InstallationTransaction {
             user_config: binding.user_config.clone(),
             user_cache: binding.user_cache.clone(),
         };
-        let unprivileged_proof =
-            prove_unprivileged_selection(&governed, &binding.runtime_state_roots)?;
+        let launch = &self.candidate_manifest.runtime_launch;
+        let no_service_authority_proof = if self.profile.requires_admin() {
+            None
+        } else {
+            Some(prove_no_service_profile_authority_dependency(
+                &governed,
+                &binding.runtime_state_roots,
+                launch.profile_component.as_str(),
+                launch.profile_version.as_str(),
+                Some(launch.generation.as_str()),
+            )?)
+        };
         Ok(ProfileSelectionResolution {
             roots: binding.clone(),
             governance: governed.governance_report(),
-            unprivileged_proof,
+            no_service_authority_proof,
         })
     }
 
@@ -744,12 +754,21 @@ impl InstallationTransaction {
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
+        // Unit tests historically use constructor-produced synthetic plans.
+        // Give those fixtures the exact root binding already present in the
+        // validated launch descriptor; production constructors leave the
+        // field unset until the published-selection planner binds it below.
+        let profile_governed_roots = if cfg!(test) {
+            Some(candidate_manifest.runtime_launch.profile_governed_roots.clone())
+        } else {
+            None
+        };
         Ok(Self {
             transaction_wire_version: INSTALLATION_TRANSACTION_WIRE_VERSION,
             transaction_id,
             installation_epoch,
             profile,
-            profile_governed_roots: None,
+            profile_governed_roots,
             request,
             current_active_manifest,
             candidate_manifest,
@@ -1353,17 +1372,12 @@ impl InstallationTransaction {
                 "transaction profile must equal the candidate runtime launch profile".to_owned(),
             ));
         }
-        if let Some(binding) = &self.profile_governed_roots {
-            if binding.runtime_state_roots
-                != self.candidate_manifest.runtime_launch.runtime_state_roots
-            {
-                return Err(InstallationError::ProfileViolation(
-                    "profile-governed root binding must agree with the candidate runtime roots"
-                        .to_owned(),
-                ));
-            }
-            binding.validate(self.profile)?;
-        }
+        // Reopen and every later state-machine operation revalidate the exact
+        // original root binding, including its agreement with the candidate
+        // launch descriptor. This does not select replacement roots from the
+        // current environment. `None` is never valid at this boundary; only
+        // the crate-private planner constructor may hold it before binding.
+        self.rehydrate_profile_binding()?;
         if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
             return Err(InstallationError::InvalidField {
                 field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
@@ -2132,6 +2146,7 @@ impl InstallationTransaction {
             self.planner_construction_proof,
             PlannerConstructionProof::Bound
         ) && self.transaction_wire_version == INSTALLATION_TRANSACTION_WIRE_VERSION
+            && self.profile_governed_roots.is_some()
             && self.stage == InstallationStage::Planned
             && self.revision == 1
             && self.completed_stage_refs.is_empty()
@@ -2491,8 +2506,10 @@ struct InstallationTransactionWire {
     transaction_id: PlatformHandle,
     installation_epoch: InstallationEpoch,
     profile: InstallationProfile,
-    #[serde(default)]
-    profile_governed_roots: Option<InstallationRoots>,
+    // Current durable wire records are never in the constructor-only
+    // unbound state. A non-optional wire field rejects both an omitted member
+    // and an explicit JSON null before the in-memory transaction is rebuilt.
+    profile_governed_roots: InstallationRoots,
     request: ManagedEnvironmentChangeRequest,
     current_active_manifest: Option<CandidateManifest>,
     candidate_manifest: CandidateManifest,
@@ -2523,7 +2540,7 @@ impl InstallationTransactionWire {
             transaction_id: self.transaction_id,
             installation_epoch: self.installation_epoch,
             profile: self.profile,
-            profile_governed_roots: self.profile_governed_roots,
+            profile_governed_roots: Some(self.profile_governed_roots),
             request: self.request,
             current_active_manifest: self.current_active_manifest,
             candidate_manifest: self.candidate_manifest,
@@ -2551,7 +2568,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v24 records are
+/// transaction authority object to another crate. Pre-v25 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -2662,7 +2679,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v24 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v25 is required"
                         ),
                     });
                 }
@@ -2701,7 +2718,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v24 discriminator".to_owned(),
+            reason: "installation transaction predates the required v25 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {

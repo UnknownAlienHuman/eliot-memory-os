@@ -234,8 +234,8 @@ use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
 pub use profile_supervision::{
-    ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision, UnprivilegedSelectionProof,
-    prove_unprivileged_selection,
+    NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
+    prove_no_service_profile_authority_dependency,
 };
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
@@ -337,9 +337,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// adds the optional, digest-bound agent-bridge source materialization plan.
 /// Version 24 binds the SCM grant OWNER|GROUP proof from the same live handle
 /// into the durable registration receipt and its canonical marker digest.
-/// Older wires cannot be interpreted as this effect set.
-/// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(24, 0, 0);
+/// Version 25 requires the retained I3.1 profile-root binding on every current
+/// executable transaction and carries the corresponding launch descriptor
+/// shape. Older wires require explicit migration and are never synthesized.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(25, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -347,9 +348,10 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
 /// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
-/// service-control grant receipt.
+/// service-control grant receipt. Version 17 carries launch descriptors with
+/// their mandatory retained I3.1 profile-root binding.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -1109,6 +1111,20 @@ impl SupervisionAuthorityBinding {
 pub struct RuntimeLaunchDescriptor {
     /// Installation profile selected for this generation.
     pub profile: InstallationProfile,
+    /// Versioned immutable-root component identity selected by I3.1.
+    pub profile_component: PlatformHandle,
+    /// Versioned immutable-root component release selected by I3.1.
+    pub profile_version: PlatformHandle,
+    /// Lowercase installation identity for SystemService/UserMode; absent for
+    /// PortableDev, whose root identity is the retained repository root.
+    pub profile_installation_key: Option<PlatformHandle>,
+    /// Complete I3.1 four-root binding retained on the launch wire.
+    ///
+    /// This includes the profile-governed `user_config` and `user_cache` roles
+    /// (shared for `system_service`, distinct for `user_mode` and `portable_dev`)
+    /// and the typed runtime topology. `runtime_state_roots` below is the
+    /// existing compatibility projection and must exactly match this member.
+    pub profile_governed_roots: InstallationRoots,
     /// Canonical repository root for `portable_dev`, when applicable.
     pub portable_root: Option<PlatformHandle>,
     /// Installation lineage that approved this launch contour.
@@ -1671,6 +1687,10 @@ impl RuntimeLaunchDescriptor {
         #[derive(Serialize)]
         struct Unsigned<'a> {
             profile: InstallationProfile,
+            profile_component: &'a PlatformHandle,
+            profile_version: &'a PlatformHandle,
+            profile_installation_key: &'a Option<PlatformHandle>,
+            profile_governed_roots: &'a InstallationRoots,
             portable_root: &'a Option<PlatformHandle>,
             installation_epoch: &'a InstallationEpoch,
             generation: &'a PlatformHandle,
@@ -1716,6 +1736,10 @@ impl RuntimeLaunchDescriptor {
         }
         serde_json::to_vec(&Unsigned {
             profile: self.profile,
+            profile_component: &self.profile_component,
+            profile_version: &self.profile_version,
+            profile_installation_key: &self.profile_installation_key,
+            profile_governed_roots: &self.profile_governed_roots,
             portable_root: &self.portable_root,
             installation_epoch: &self.installation_epoch,
             generation: &self.generation,
@@ -1829,6 +1853,73 @@ impl RuntimeLaunchDescriptor {
             return Err(InstallationError::ProfileViolation(
                 "runtime launch profile must equal RuntimeStateRoots.profile".to_owned(),
             ));
+        }
+        handle(
+            &self.profile_component,
+            "runtime_launch.profile_component",
+        )?;
+        handle(&self.profile_version, "runtime_launch.profile_version")?;
+        self.profile_governed_roots.validate(self.profile)?;
+        if self.profile_governed_roots.runtime_state_roots != self.runtime_state_roots {
+            return Err(InstallationError::ProfileViolation(
+                "runtime launch I3.1 binding must retain the exact RuntimeStateRoots value"
+                    .to_owned(),
+            ));
+        }
+        let immutable_root = WindowsPathIdentity::parse_root(
+            &self.profile_governed_roots.immutable_binaries,
+            "runtime_launch.profile_governed_roots.immutable_binaries",
+        )?;
+        match (self.profile, self.profile_installation_key.as_ref()) {
+            (InstallationProfile::PortableDev, None) => {}
+            (InstallationProfile::PortableDev, Some(_)) => {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev does not carry a profiled installation key".to_owned(),
+                ));
+            }
+            (InstallationProfile::SystemService | InstallationProfile::UserMode, Some(key)) => {
+                handle(key, "runtime_launch.profile_installation_key")?;
+                if key.as_str() != key.as_str().to_ascii_lowercase() {
+                    return Err(InstallationError::ProfileViolation(
+                        "profile installation key must use its canonical lowercase identity"
+                            .to_owned(),
+                    ));
+                }
+                if immutable_root.components.len() < 2
+                    || !immutable_root.components[immutable_root.components.len() - 2]
+                        .eq_ignore_ascii_case(self.profile_component.as_str())
+                    || !immutable_root
+                        .components
+                        .last()
+                        .is_some_and(|version| {
+                            version.eq_ignore_ascii_case(self.profile_version.as_str())
+                        })
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "profiled immutable root must end in the selected component and version"
+                            .to_owned(),
+                    ));
+                }
+                let installation = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.installation_root.as_str(),
+                    "runtime_launch.runtime_state_roots.installation_root",
+                )?;
+                if !installation
+                    .components
+                    .last()
+                    .is_some_and(|component| component.eq_ignore_ascii_case(key.as_str()))
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "runtime launch installation key must equal the runtime root identity"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (InstallationProfile::SystemService | InstallationProfile::UserMode, None) => {
+                return Err(InstallationError::ProfileViolation(
+                    "profiled Windows launch requires its installation key".to_owned(),
+                ));
+            }
         }
         handle(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
         approved_path(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
@@ -2056,6 +2147,22 @@ impl RuntimeLaunchDescriptor {
                 )? {
                     return Err(InstallationError::ProfileViolation(
                         "portable root must equal RuntimeStateRoots.installation_root".to_owned(),
+                    ));
+                }
+                let expected_immutable = joined_windows_path(
+                    &joined_windows_path(
+                        &joined_windows_path(root.as_str(), "target"),
+                        "eliot-dev",
+                    ),
+                    self.generation.as_str(),
+                );
+                if !same_windows_root(
+                    &expected_immutable,
+                    &self.profile_governed_roots.immutable_binaries,
+                )? {
+                    return Err(InstallationError::ProfileViolation(
+                        r"portable immutable root must equal repository\target\eliot-dev\generation"
+                            .to_owned(),
                     ));
                 }
             }
