@@ -213,18 +213,32 @@ impl ScreenedValue {
 
 /// Screens one daemon field through the shared `OperationalLog` scrubber.
 ///
-/// The screened, judged and emitted strings are one and the same canonical
-/// value: the input trimmed exactly as the compatibility sanitizers trim it
+/// The shared scrubber ([`scrub_labels_for_emit`]), the local marker check
+/// ([`local_redaction_reason`]) and the fail-closed verdict
+/// ([`ScrubbedLabels::is_clean`]) all judge one and the same canonical value:
+/// the input trimmed exactly as the compatibility sanitizers trim it
 /// ([`sanitize_identity`] and [`sanitize_detail`] both judge the trimmed
-/// string). The shared scrubber ([`scrub_labels_for_emit`]), the local marker
-/// check ([`local_redaction_reason`]), the compatibility sanitizer, the
-/// fail-closed handle-shape check ([`ScrubbedLabels::is_clean`]) and the
-/// emitted string all observe this canonical value, so a whitespace-only
-/// difference can never screen one string and emit another (issue #1842,
-/// AUDIT-1): a recognisable secret with surrounding whitespace is recognised
-/// by the scrubber too, so it is minted a handle with a redaction status
-/// instead of the bare [`REDACTED`] literal; a handle-shaped value with no
-/// recorded handle fails closed through the existing `is_clean` arm.
+/// string), so a whitespace-only difference can never screen one string and
+/// judge another. A recognisable secret with surrounding whitespace is
+/// therefore recognised by the scrubber too and is minted a handle with a
+/// redaction status instead of the bare [`REDACTED`] literal.
+///
+/// The compatibility sanitizer may still *transform* the canonical value
+/// ([`sanitize_detail`] maps control characters and `'` to `?` and
+/// [`sanitize_identity`] truncates to [`MAX_IDENTITY_CHARS`]), so the string
+/// this function emits is not always the string the policy judged. The
+/// fail-closed arm is therefore driven by the policy verdict alone: whenever
+/// [`ScrubbedLabels::is_clean`] denies the screened value, the field is
+/// emitted as an immutable handle over the canonical value with a redaction
+/// status and the recorded evidence disposition, whatever the sanitizer
+/// would have done to it. Sanitizer output is only ever emitted when the
+/// shared policy judges the screened value clean (issue #1842, AUDIT-1):
+/// gating that arm on the sanitizer leaving the value unchanged let a
+/// sanitizer-transformed `evh:`-shaped value — an apostrophe in a detail, an
+/// identity past the truncation bound — be emitted with no evidence handle,
+/// no redaction status and no evidence disposition, which is an accounting
+/// loss of exactly the kind `field_policy::claims_handle_shape` exists to
+/// reject.
 fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> ScreenedValue {
     let canonical = value.trim().to_owned();
     let mut candidate = BTreeMap::new();
@@ -261,7 +275,7 @@ fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> Screene
     if sanitized == UNAVAILABLE {
         return ScreenedValue::unavailable();
     }
-    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) && sanitized == canonical {
+    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) {
         return screened_handle(key, &canonical, RedactionReason::HandleOnly);
     }
     ScreenedValue {
