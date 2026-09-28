@@ -25,6 +25,15 @@
 //! [`ModalityPropertyStatus::Degraded`] claim on a modality that needs a
 //! modality-competent evaluator is refused without one, so a description is
 //! never the thing that raises an absent property to a partial measurement.
+//!
+//! The same rule holds per property, not only per observation. A
+//! [`RepresentationGap`] is the per-property record of a property the workflow
+//! position does not resolve, so its `property_status` is never optional and
+//! never defaulted: the gap gate keeps it typed, refuses `Measured` outright,
+//! and refuses a `Degraded` claim whose only named evidence is a
+//! model-generated description or an unestablished modality. Absent modality
+//! evidence therefore has one spelling on both records — explicitly `Unknown`,
+//! carrying its loss warning — and no path that reports it as a measurement.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -681,6 +690,16 @@ pub fn assess_modality_property(
 /// keep the refusal of an `Unknown` or `TextDerived` source: prose and an
 /// unestablished modality measure nothing, so they cannot claim either
 /// measurement strength.
+///
+/// The three cases are exhaustive and none of them can report an absent
+/// property as satisfied, which is what I12.35's absent-modality rule asks of
+/// this gate. `Unknown` returns `Ok` because the record already states the
+/// absence rather than claiming a measurement, and
+/// [`check_loss_warnings`] makes that statement non-silent. `Degraded` and
+/// `Measured` are both measurement claims, so both fall through to the two
+/// refusals above and neither reaches `Ok` without a competent evaluator. A
+/// property with no evidence therefore has exactly one honest spelling here and
+/// no other: it cannot be omitted, defaulted to present, or folded into a pass.
 fn check_modality_status(observation: &ContinuityObservation) -> Result<(), ContinuityError> {
     if matches!(observation.property_status, ModalityPropertyStatus::Unknown) {
         return Ok(());
@@ -887,7 +906,12 @@ impl ArtifactLineageEntry {
 ///
 /// A gap is a property the record does not settle, so it carries the admitted
 /// status of that property while the gap stands together with the loss warning
-/// the gap itself is.
+/// the gap itself is. The status is the *per-property* record I12.35 asks for
+/// when modality evidence is absent, so it is never optional and never
+/// defaulted: `property_status` has no "unspecified" spelling, and the absence
+/// of competent evidence can only be stated as [`ModalityPropertyStatus::Unknown`]
+/// or earned as [`ModalityPropertyStatus::Degraded`] behind a genuinely
+/// modality-competent [`EvaluatorRef`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepresentationGap {
@@ -1015,6 +1039,24 @@ fn check_lineage_provenance(entry: &ArtifactLineageEntry) -> Result<(), Continui
 /// evaluator measured partially, so it must name an evaluator competent in the
 /// gap's own modality; without one the honest status is `Unknown`, which
 /// [`assess_modality_property`] already draws.
+///
+/// Equality of the two modality labels was not enough, and it failed open in
+/// exactly the direction I12.35 forbids. Both labels are producer-controlled,
+/// so a gap whose modality is never established ([`SourceModality::Unknown`])
+/// or is model-generated prose ([`SourceModality::TextDerived`]) paired with an
+/// [`EvaluatorRef`] of that same modality satisfied `evaluator.modality ==
+/// gap.modality` and was admitted as a partial measurement. A textual
+/// description is a derived candidate, not an evaluator, so that record
+/// reported a measurement where no modality evidence existed at all instead of
+/// leaving the property `Unknown`. This now refuses the pair outright, mirroring
+/// what [`check_modality_status`] already does for an observation whose source
+/// is `Unknown` or `TextDerived`, and it does so on the gap's own modality
+/// rather than on a label the producer restates in the evaluator.
+///
+/// The three states stay distinct and typed: a gap that names no competent
+/// evidence is refused here and must be recorded as `Unknown` with its
+/// `loss_warning`; it is never downgraded into a measurement, and never merged
+/// into a pass for a different property.
 fn check_gap_status(gap: &RepresentationGap) -> Result<(), ContinuityError> {
     if matches!(gap.property_status, ModalityPropertyStatus::Measured) {
         return Err(ContinuityError::UnsupportedGapStatus {
@@ -1022,6 +1064,14 @@ fn check_gap_status(gap: &RepresentationGap) -> Result<(), ContinuityError> {
         });
     }
     if matches!(gap.property_status, ModalityPropertyStatus::Degraded) {
+        if matches!(
+            gap.modality,
+            SourceModality::Unknown | SourceModality::TextDerived
+        ) {
+            return Err(ContinuityError::UnsupportedGapStatus {
+                subject: gap.subject_ref.clone(),
+            });
+        }
         let competent =
             matches!(gap.evaluator.as_ref(), Some(evaluator) if evaluator.modality == gap.modality);
         if !competent {
