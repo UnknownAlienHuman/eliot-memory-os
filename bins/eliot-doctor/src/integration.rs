@@ -468,13 +468,14 @@ pub fn verify_profile(
     if profile.trim().is_empty() {
         return Err(IntegrationError::EmptyProfile);
     }
-    let expected = load_expectation(expectation_path)?;
-    if expected.profile != profile {
+    let loaded = load_expectation(expectation_path)?;
+    if loaded.expectation.profile != profile {
         return Err(IntegrationError::ProfileMismatch {
             requested: profile.to_owned(),
-            carried: expected.profile,
+            carried: loaded.expectation.profile,
         });
     }
+    let expected = &loaded.expectation;
     // Loaded for shape validation only; none of its claims are authority.
     let _supplied = load_observation(observation_path)?;
     // Real readback. Non-absolute targets cannot be observed without
@@ -496,7 +497,11 @@ pub fn verify_profile(
         observed_hook_events: Vec::new(),
         handshake_ok: false,
     };
-    let mut report = evaluate(profile, &expected, &capped);
+    let mut report = evaluate(profile, expected, &capped);
+    // The record's own installation status is reported beside the evidence,
+    // never in place of it, and it gates `installed` on its own.
+    report.installation = loaded.install_status.clone();
+    let install_completed = loaded.install_status.as_ref().is_some_and(|status| status.completed);
     // Authority cap, scoped to the axes this front door cannot observe.
     // File hashes come from real readback above. Registrations and hook
     // events have no observation port, so any expectation naming them stays
