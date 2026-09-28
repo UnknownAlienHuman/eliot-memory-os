@@ -73,6 +73,13 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated Governor publish operation carrying one live-derivation
+/// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
+/// publishes its exact revision, exact active fingerprint, and exact
+/// authorization axes; Kernel maps the axes to its existing three-axis
+/// profile and records the projection, so Material/Critical gates admit
+/// only under current owner-issued authority.
+pub(crate) const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
 /// Authenticated daemon route that drives the typed Host `UserAutomation`
 /// transport.  The daemon session supplies the outer authority; the Host
 /// open handshake supplies the channel evidence and the Host owner supplies
@@ -507,6 +514,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
         "initialize_owner_revision" => "initialize_owner_revision",
+        PUBLISH_GOVERNOR_AUTHORITY_OPERATION => PUBLISH_GOVERNOR_AUTHORITY_OPERATION,
         "activate_grant" => "activate_grant",
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
@@ -610,6 +618,28 @@ struct OwnerPublishOperation {
     operation: String,
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Closed Governor-derived authority publish operation (`#1935` AUD1).
+///
+/// Carries the live Governor-owned derivation's exact revision, exact active
+/// fingerprint, and exact authorization axes (`verified`,
+/// `authorizes_enforcement`, `authorizes_complete_coverage_ops`): the owner
+/// `GovernanceProfile::authorizes` vocabulary, not a third profile. The
+/// dispatcher maps the axes to the existing three-axis profile and records
+/// the projection under the strictly-advancing revision rule, so a replayed
+/// or older revision fails closed and revoked authority can never be
+/// resurrected by re-presenting superseded bytes. Unknown or absent fields
+/// fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorAuthorityPublishOperation {
+    operation: String,
+    revision: u64,
+    fingerprint: String,
+    verified: bool,
+    authorizes_enforcement: bool,
+    authorizes_complete_coverage_ops: bool,
 }
 
 /// Closed owner-lineage revision initialization operation (`#2100`).
@@ -2211,8 +2241,7 @@ impl KernelComposition {
                     // Main's material-authority admission still runs first, so a
                     // claimant without fresh material authority never reaches
                     // the claim step at all.
-                    self.admit_material_authority_for_fence(
-                        GovernanceProfile::full(),
+                    self.admit_material_authority_for_governor_issued_fence(
                         &session.module_generation.state_fence,
                     )
                     .map_err(|_| TransportError::SessionFenced)?;
@@ -2878,8 +2907,7 @@ impl KernelComposition {
                 if !owner_bundle_agrees_with_session(&operation.bundle, session) {
                     return Err(TransportError::SessionFenced);
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -2907,6 +2935,38 @@ impl KernelComposition {
                     Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
                     Err(_) => Err(TransportError::SessionFenced),
                 }
+            }
+            PUBLISH_GOVERNOR_AUTHORITY_OPERATION => {
+                let operation: GovernorAuthorityPublishOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.operation != PUBLISH_GOVERNOR_AUTHORITY_OPERATION {
+                    return Err(TransportError::SessionFenced);
+                }
+                // Issue #1935 AUD1: the live Governor-owned derivation
+                // projects its exact revision, exact active fingerprint, and
+                // exact authorization axes across this authenticated boundary.
+                // The axes map to the existing three-axis profile and record
+                // under the strictly-advancing revision rule, so a newer
+                // degraded projection revokes everything issued under the old
+                // one. Until the first publish records, every
+                // Material/Critical gate refuses closed.
+                self.record_governor_issued_coverage_projection(
+                    operation.revision,
+                    operation.fingerprint,
+                    operation.verified,
+                    operation.authorizes_enforcement,
+                    operation.authorizes_complete_coverage_ops,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": {
+                        "kind": "governor_authority_receipt",
+                        "value": { "revision": operation.revision, "status": "recorded" },
+                    },
+                    "recovery": null,
+                }))
             }
             "query_owner_bundle" => {
                 let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
@@ -2978,8 +3038,7 @@ impl KernelComposition {
                         &refusal,
                     );
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3075,8 +3134,7 @@ impl KernelComposition {
                         &refusal,
                     );
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3168,8 +3226,7 @@ impl KernelComposition {
                 // session BEFORE the retained owner is touched, so a stale or
                 // cross-session crossing never reaches the port.
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3766,8 +3823,7 @@ impl KernelComposition {
 
         match request {
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -7291,8 +7347,7 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -7801,8 +7856,7 @@ impl KernelComposition {
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -8055,15 +8109,16 @@ impl KernelComposition {
 
     /// Store apply is the production Material/Critical admission boundary.
     /// It keeps the existing helper seam used by the package-local gate proof,
-    /// but now requires the owner-backed current Watchdog observation before
-    /// the retained Store gateway can be entered.
+    /// but now requires the recorded Governor-issued projection plus the
+    /// owner-backed current Watchdog observation before the retained Store
+    /// gateway can be entered.
     ///
     /// The answer uses the daemon's `error` wire variant. A refusal must be
     /// decodable by the client: an unrecognised `status` would be surfaced as an
     /// unknown transport outcome, which is exactly the ambiguity this
     /// fail-closed path exists to avoid.
     fn material_write_admission_response(&self, target: &StateFence) -> Option<serde_json::Value> {
-        self.admit_material_authority_for_fence(GovernanceProfile::full(), target)
+        self.admit_material_authority_for_governor_issued_fence(target)
             .err()
             .map(|_| {
                 serde_json::json!({
