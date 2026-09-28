@@ -565,6 +565,16 @@ pub(super) fn run() -> Result<(), String> {
         winning_value = canonical.winning_value(),
         contributing_layers = ?canonical.contributions(),
     );
+    // I3.9 (#1966 W4): publish the generated schema for the supported
+    // TOML/JSON layer files on the same diagnostics surface. The text is
+    // generated at runtime from the single typed shape the decoders enforce,
+    // so it cannot rot relative to them. Diagnostics only: it gates nothing
+    // and grants nothing.
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.canonical_layer_schema_published",
+        schema = eliotd::canonical_layer_json_schema_pretty(),
+    );
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
     let mut composition = DaemonComposition::start(
