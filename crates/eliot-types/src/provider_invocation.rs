@@ -111,6 +111,34 @@ pub struct ProviderInvocationTransition {
     pub evidence_refs: Vec<String>,
 }
 
+/// Decoder: derived and closed. The eleven optional outcome fields below
+/// (`provider_route_policy` through `stderr_truncated`) now follow the same
+/// explicit presence rule this record's other `Option` fields already use —
+/// `Option` without `#[serde(default)]`, so an absent key is a typed
+/// missing-field failure rather than a silent `None`.
+///
+/// Those eleven fields carry timeout/cancel/truncation, byte-count and
+/// route-policy meaning for a governed external process. Defaulting them let a
+/// record that never recorded a timeout, a reap receipt, a cancellation, a
+/// truncation or its route-policy binding read as if it had recorded
+/// `false`/`0`/absent — an absent observation presented as a measured one, which
+/// is exactly the silent absence this record must not carry.
+/// `provider_route_policy` matters most here: it is the binding between an
+/// attempt and the governed route policy it was dispatched under.
+///
+/// Compatibility: this record is durably journaled to disk by
+/// `ProviderInvocationJournal::{create, persist}`
+/// (`eliot-engine/src/provider_invocation.rs`), one file per attempt, and read
+/// back on reconciliation and timeout repair. Every current producer sets all
+/// eleven explicitly, including `None`:
+/// `eliot-engine/src/antigravity.rs:5109`,
+/// `eliot-app/src/host_runtime/external_agent.rs:2567` and
+/// `eliot-app/src/delegation_runtime.rs:844` all construct the full literal.
+/// `Serialize` is untouched, so accepted and emitted bytes are unchanged and
+/// this is a compatible requiredness correction. No named/versioned legacy
+/// decoder exists for this record and none may be invented (W4), so a record
+/// written by an older build now fails loudly instead of decoding as an
+/// attempt that measured nothing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInvocationAttempt {
@@ -129,7 +157,6 @@ pub struct ProviderInvocationAttempt {
     pub cwd: Option<String>,
     pub environment_fingerprint: Option<String>,
     pub timeout_profile_id: String,
-    #[serde(default)]
     pub provider_route_policy: Option<ProviderRoutePolicyBinding>,
     pub state_transitions: Vec<ProviderInvocationTransition>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -151,23 +178,14 @@ pub struct ProviderInvocationAttempt {
     pub structured_output_blob_or_hash: Option<BlobRef>,
     pub exit_code_or_signal: Option<String>,
     pub process_or_job_identity: Option<String>,
-    #[serde(default)]
     pub timeout_class: Option<ProviderTimeoutClass>,
-    #[serde(default)]
     pub process_reap_receipt: Option<ProcessReapReceipt>,
-    #[serde(default)]
     pub process_timed_out: Option<bool>,
-    #[serde(default)]
     pub process_cancelled: Option<bool>,
-    #[serde(default)]
     pub process_worker_error: Option<String>,
-    #[serde(default)]
     pub stdout_total_bytes: Option<u64>,
-    #[serde(default)]
     pub stderr_total_bytes: Option<u64>,
-    #[serde(default)]
     pub stdout_truncated: Option<bool>,
-    #[serde(default)]
     pub stderr_truncated: Option<bool>,
     pub quota_or_cost_if_known: Option<String>,
     pub original_closeout_ref: Option<String>,
@@ -575,6 +593,21 @@ pub struct ProviderFailureIncident {
     pub resolved_when: Vec<String>,
 }
 
+/// Decoder: derived and closed. The nine readiness observations below
+/// (`installed` through `console_headless_ready`) and
+/// `last_successful_smoke_ref` now follow the same explicit presence rule this
+/// gate's other fields already use: `bool` and `Option<String>` with no
+/// `#[serde(default)]`.
+///
+/// Defaulting them conflated "the gate observed this is false / no smoke has
+/// ever succeeded" with "the gate never observed it at all". Both readings fed
+/// the same `verdict`, so a partial or truncated gate record could present a
+/// fail-closed `false` as a measured negative. The default direction *is*
+/// fail-closed, so this was not an authority-escalation defect — but absent and
+/// measured are still different facts, and `ProviderRouteReadinessService::evaluate`
+/// (`eliot-engine/src/provider_invocation.rs:657`) is the only producer and
+/// sets all ten explicitly, so current payloads are unchanged and this is a
+/// compatible requiredness correction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 #[serde(deny_unknown_fields)]
@@ -585,25 +618,15 @@ pub struct ProviderRouteReadinessGate {
     pub local_adapter_health: bool,
     pub executable_available: bool,
     pub auth_or_configuration_present: bool,
-    #[serde(default)]
     pub installed: bool,
-    #[serde(default)]
     pub provider_authenticated: bool,
-    #[serde(default)]
     pub exact_model_selectable: bool,
-    #[serde(default)]
     pub mcp_config_valid: bool,
-    #[serde(default)]
     pub mcp_process_started: bool,
-    #[serde(default)]
     pub mcp_initialized: bool,
-    #[serde(default)]
     pub required_tools_visible: bool,
-    #[serde(default)]
     pub structured_output_ready: bool,
-    #[serde(default)]
     pub console_headless_ready: bool,
-    #[serde(default)]
     pub last_successful_smoke_ref: Option<String>,
     pub provider_gate_current: bool,
     pub last_incident_class: ProviderInvocationOutcomeClass,

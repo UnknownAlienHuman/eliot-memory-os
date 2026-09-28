@@ -753,6 +753,7 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-user-broker-core",
+ "eliot-workscope",
  "secrecy",
  "serde",
  "serde_json",
@@ -2354,7 +2355,6 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
- "eliot-memory-curation",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2515,8 +2515,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-contracts",
- "eliot-epistemic",
- "eliot-evidence",
  "eliot-memory-curation-contracts",
  "eliot-memory-curation-screen",
  "schemars",
@@ -3045,6 +3043,7 @@ dependencies = [
 name = "eliot-runtime-status"
 version = "0.1.0"
 dependencies = [
+ "eliot-conformance-contracts",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-evaluation-contracts",
@@ -3565,6 +3564,7 @@ dependencies = [
  "eliot-governor",
  "eliot-improvement",
  "eliot-instrument-api",
+ "eliot-integration-coverage",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",

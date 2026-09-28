@@ -387,6 +387,7 @@ fn submit_chain_curation_success_with_injected_carrier() {
         job_id,
         candidates,
         provenance,
+        pulse,
     }) = result
     else {
         panic!("injected-carrier chain must route curation, got {result:?}");
@@ -419,6 +420,22 @@ fn submit_chain_curation_success_with_injected_carrier() {
             );
         }
     }
+    assert_eq!(
+        pulse.disposition,
+        crate::CurationPulseDisposition::Complete,
+        "the chain receipt must record the real route disposition"
+    );
+    assert_eq!(
+        usize::try_from(pulse.expected_total).ok(),
+        Some(pulse.denominator_members.len()),
+        "the pulse denominator total must match the declared members"
+    );
+    assert_eq!(
+        pulse.screened_targets.len(),
+        pulse.denominator_members.len(),
+        "the screened set and the admitted denominator must be cross-checked, \
+         not restated from one list"
+    );
     let view = project_result_view(
         &job_id,
         JobState::Completed,
@@ -426,6 +443,7 @@ fn submit_chain_curation_success_with_injected_carrier() {
             job_id: job_id.clone(),
             candidates: candidates.clone(),
             provenance: provenance.clone(),
+            pulse,
         }),
     );
     let line = render_jsonl(&view).expect("chain receipt must render");

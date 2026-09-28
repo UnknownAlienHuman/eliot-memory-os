@@ -605,6 +605,31 @@ impl PersistedValue for ReservationRecord {
             &self.token.prepared_transition_sha256,
             "prepared_transition_sha256",
         )?;
+        if let Some(binding) = &self.token.write_binding {
+            binding.validate()?;
+            let token_scopes = self
+                .token
+                .scopes
+                .iter()
+                .map(|scope| scope.scope.clone())
+                .collect::<BTreeSet<_>>();
+            let binding_scopes = binding
+                .ordering_scopes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if binding.operation_id != self.token.operation_id
+                || binding.prepared_transition_sha256 != self.token.prepared_transition_sha256
+                || binding.authority_epoch != self.token.writer_epoch
+                || binding.state_fence != self.token.state_fence
+                || binding_scopes != token_scopes
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: Self::RECORD_TYPE,
+                    reason: "write binding differs from its retained reservation token".to_owned(),
+                });
+            }
+        }
         let mut scopes = BTreeSet::new();
         for scope in &self.token.scopes {
             scope.expected_head.validate()?;

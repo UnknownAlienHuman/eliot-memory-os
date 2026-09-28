@@ -29,7 +29,7 @@ use thiserror::Error;
 use crate::BridgeError;
 use crate::SubmissionRecord;
 use crate::admission::ProviderAdmission;
-use crate::evidence::{CancellationEvidence, RawProviderEvidence, sha256_hex};
+use crate::evidence::{CancellationEvidence, RawProviderEvidence, exit_code_of, sha256_hex};
 use crate::protocol::{
     RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
 };
@@ -310,9 +310,10 @@ impl ProviderBridge {
 
     /// Waits for the terminal lifecycle of one started operation, preserving
     /// the request binding on every observation. A deadline overrun attempts
-    /// cancellation, retains the cancellation receipt on the typed timeout, and
-    /// stays explicit: the outcome is unconfirmed and reconciliation by
-    /// operation identity is required before any retry.
+    /// cancellation, retains the cancellation receipt, reads the executor's
+    /// captured streams back so the provider's real stdout/stderr survive as
+    /// evidence, and stays explicit: the outcome is unconfirmed and
+    /// reconciliation by operation identity is required before any retry.
     fn await_terminal(
         &self,
         bound: &BoundOperation,
@@ -337,10 +338,50 @@ impl ProviderBridge {
                 let cancellation = block_on(self.executor.cancel(bound.operation.clone()))
                     .map(|receipt| Box::new(CancellationEvidence::from_receipt(&receipt)))
                     .map_err(BridgeError::Process)?;
-                return Err(BridgeError::TimedOut { cancellation });
+                return Err(BridgeError::TimedOut {
+                    cancellation,
+                    evidence: Some(Box::new(self.timeout_evidence(bound, &view)?)),
+                });
             }
             std::thread::sleep(BOUND_RUN_POLL);
         }
+    }
+
+    /// Materializes the evidence a deadline overrun retains.
+    ///
+    /// The timeout arm never reaches `finish_terminal`, which is where the
+    /// crate's only stream readback lives, so the executor's captured streams
+    /// are read back here too. The provider's real stdout/stderr therefore
+    /// survive a timeout instead of being replaced by
+    /// `RawProviderEvidence::absent`, which reports the digest of zero bytes
+    /// and misstates the omission as `NoHandle` even though the executor held a
+    /// live drain. `stderr` is never discarded on the failure path.
+    ///
+    /// The exit and descendant fields are read from the last bounded
+    /// observation this wait actually made and are never recomputed or
+    /// invented: a wait that reached the deadline arm saw no terminal
+    /// lifecycle, so those stay empty and explicit while the streams are the
+    /// provider's own recorded bytes.
+    fn timeout_evidence(
+        &self,
+        bound: &BoundOperation,
+        view: &eliot_process::ProcessExecutionView,
+    ) -> Result<RawProviderEvidence, BridgeError> {
+        let (stdout, stderr) = self
+            .executor
+            .captured_output(&bound.operation)
+            .map_err(BridgeError::Process)?;
+        let descendants_complete = view
+            .descendants()
+            .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
+        Ok(RawProviderEvidence::materialize_optional(
+            bound.operation.as_str(),
+            &bound.digest,
+            view.exit(),
+            &stdout,
+            &stderr,
+            descendants_complete,
+        ))
     }
 
     /// Materializes immutable evidence from one terminal observation and
@@ -592,8 +633,8 @@ fn carries_submit_binding(request: &ProcessRequest, submit_binding_sha256: &str)
 
 /// Classifies one terminal observation into a provider-local outcome.
 /// Anything that is not a clean completed exit with proven tree closure stays
-/// explicit: crash-class dispositions, missing descendant proof, and unknown
-/// lifecycles never decode as success.
+/// explicit: crash-class dispositions, a non-zero exit code, missing descendant
+/// proof, and unknown lifecycles never decode as success.
 fn classify_terminal(
     lifecycle: ProcessLifecycle,
     exit: &eliot_process::ExitStatus,
@@ -604,6 +645,16 @@ fn classify_terminal(
     }
     match exit.disposition() {
         ExitDisposition::Completed => {
+            // A `Completed` disposition is a physical observation, not a
+            // success verdict. The provider that asked for a clean exit and
+            // returned a non-zero code crashed, so the numeric code is read
+            // here and the outcome stays `Crashed` exactly as
+            // `ProviderOutcome::Crashed` documents. The code is recovered from
+            // the serialized exit observation because the typed contract
+            // exposes only the coarse disposition.
+            if exit_code_of(exit) != Some(0) {
+                return ProviderOutcome::Crashed;
+            }
             if descendants_complete {
                 ProviderOutcome::Completed
             } else {

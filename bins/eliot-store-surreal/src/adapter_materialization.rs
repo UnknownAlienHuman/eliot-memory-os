@@ -24,6 +24,7 @@ use crate::StoreLaunchConfig;
 pub fn materialize_adapter_config(
     config: &StoreLaunchConfig,
     password: SecretString,
+    provider_bootstrap_password: SecretString,
 ) -> Result<SurrealAdapterConfig, String> {
     config.validate()?;
     let schema_generation = SchemaGeneration::new(config.schema_generation.as_str())
@@ -37,6 +38,8 @@ pub fn materialize_adapter_config(
         database: config.database.clone(),
         username: config.username.clone(),
         password,
+        provider_bootstrap_username: config.provider_bootstrap_username.clone(),
+        provider_bootstrap_password,
         installation_id: launch.installation_epoch.installation.as_str().to_owned(),
         installation_profile: match launch.profile {
             InstallationProfile::SystemService => "system_service",
@@ -68,12 +71,38 @@ pub(crate) fn resolve_credential(
     platform: &WindowsPlatform,
     credential_ref: &str,
 ) -> Result<SecretString, String> {
+    resolve_credential_from(platform, credential_ref, "configured credential")
+}
+
+/// Resolves the provider child's own bootstrap/admin credential from its
+/// separate reserved reference.
+///
+/// A failed read is terminal. There is no fallback to the ordinary client
+/// credential, to a value already held in this process, or to a default
+/// administrator identity: I15.4 requires the Store bridge to "fail startup
+/// explicitly rather than launch an unauthenticated/default-admin server".
+pub(crate) fn resolve_provider_bootstrap_credential(
+    platform: &WindowsPlatform,
+    provider_bootstrap_credential_ref: &str,
+) -> Result<SecretString, String> {
+    resolve_credential_from(
+        platform,
+        provider_bootstrap_credential_ref,
+        "provider bootstrap credential",
+    )
+}
+
+fn resolve_credential_from(
+    platform: &WindowsPlatform,
+    credential_ref: &str,
+    source: &str,
+) -> Result<SecretString, String> {
     let credential = platform
         .read_credential(credential_ref)
-        .map_err(|error| format!("read configured credential reference: {error}"))?;
+        .map_err(|error| format!("read {source} reference: {error}"))?;
     let password = String::from_utf8(credential.expose().to_vec())
-        .map_err(|_| "configured credential is not UTF-8".to_owned())?;
-    non_empty_secret(&password, "configured credential")
+        .map_err(|_| format!("{source} is not UTF-8"))?;
+    non_empty_secret(&password, source)
 }
 
 fn non_empty_secret(value: &str, source: &str) -> Result<SecretString, String> {

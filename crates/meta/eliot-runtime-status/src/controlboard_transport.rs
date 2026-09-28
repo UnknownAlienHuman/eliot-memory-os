@@ -55,7 +55,7 @@ use thiserror::Error;
 use super::controlboard_consumer::{CONTROLBOARD_CONSUMER_CONTRACT, RenderedControlBoard};
 
 /// Stable contract identity for the transported board message.
-pub const CONTROLBOARD_TRANSPORT_CONTRACT: &str = "eliot.runtime-status.controlboard-transport/v1";
+pub const CONTROLBOARD_TRANSPORT_CONTRACT: &str = "eliot.runtime-status.controlboard-transport/v2";
 
 /// Operation selector the surface owner sends to request one board. It fits
 /// the CLI `transact_async` operation bound and names no authority.
@@ -65,7 +65,10 @@ pub const CONTROLBOARD_STATUS_OPERATION: &str = "controlboard.status";
 const MAX_CONNECTION_CHARS: usize = 1024;
 
 /// One board message as carried by the `Json` payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally absent: the board carries the owner evidence records,
+/// which are `PartialEq` only, and the transport refuses to narrow them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlBoardTransportMessage {
     /// Always [`CONTROLBOARD_TRANSPORT_CONTRACT`].
@@ -300,6 +303,7 @@ pub fn decode_controlboard_response(
 mod tests {
     use std::num::NonZeroU64;
 
+    use eliot_conformance_contracts::{EvidenceExecutionStatus, SupportObservationState};
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
     use eliot_controlboard::{NotificationInbox, NotificationMetrics};
     use eliot_ipc::TransportLimits;
@@ -311,6 +315,7 @@ mod tests {
         ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
         ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
     };
+    use super::super::controlboard_projection::owner_records;
     use super::*;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -403,6 +408,11 @@ mod tests {
             observed_count: 7,
             missing_count: 1,
             unexpected_observed: vec!["extra-entry".to_owned()],
+            transport: SupportObservationState::Unknown,
+            evidence_execution: EvidenceExecutionStatus::NotExecuted,
+            evaluated_at_ms: owner_records::EVALUATED_AT_MS,
+            domain_coverage: owner_records::unobserved_coverage(),
+            support_rows: vec![owner_records::target_source_support_row()],
             expiry: "re-read required after fence or generation change".to_owned(),
             invalidation: "revision/fence change, generation rotation, owner rebind".to_owned(),
         }

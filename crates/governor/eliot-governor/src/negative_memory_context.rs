@@ -58,8 +58,8 @@
 use std::collections::BTreeMap;
 
 use eliot_context_contracts::{
-    ContextBinding, QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult,
-    QualityDimensionState, QualityScorecard,
+    ContextBinding, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION, QualityDimension,
+    QualityDimensionResult, QualityDimensionState, QualityScorecard,
 };
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_failure::{
@@ -1019,8 +1019,18 @@ fn negative_memory_coverage_result(
     };
 
     let result = QualityDimensionResult {
+        schema_version: QUALITY_RESULT_SCHEMA_VERSION,
         dimension: QualityDimension::NegativeMemoryInvariantCoverage,
         state,
+        rule_revision: ArtifactId::new(std::format!(
+            "negative-memory-rule-set:{}",
+            projection.evidence.rule_set_revision
+        ))
+        .map_err(|_| NegativeMemoryExposureError::InvalidField("quality.rule_revision"))?,
+        // The required member set is exactly the governing rules this
+        // projection exposes; the result is a pass only because every one of
+        // them was observed above.
+        required_evidence: evidence.clone(),
         evidence,
         measurements: Vec::new(),
         failed_invariant: None,
@@ -1038,6 +1048,7 @@ fn negative_memory_coverage_result(
     // or degraded axis to name its failed invariant or unknown evidence.
     let mut probe = QualityScorecard {
         binding: binding.clone(),
+        applicability: scorecard.applicability.clone(),
         results: scorecard.results.clone(),
     };
     if let Some(axis) = probe

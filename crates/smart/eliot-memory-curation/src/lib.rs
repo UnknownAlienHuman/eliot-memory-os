@@ -4,24 +4,21 @@
 //! accepts an already materialized, revision-fenced canonical snapshot and
 //! emits deterministic, reversible proposals.  It never changes a record,
 //! promotes epistemic status, or treats writer-supplied utility as authority.
+//!
+//! Issue #40 migration target for this donor: "neutral screen contracts plus
+//! read-only screening/protection; **no lifecycle/action ownership**." The
+//! typed lifecycle/action admission vocabulary and its admissibility rules
+//! (`CurationMutationOperation`, `CurationAdmission`, `check_operation_shape`,
+//! `verify_admission_chain` and the candidate-admission drivers) were removed
+//! from this crate and now live in the Kernel-local owner
+//! `eliot-kernel-service::lifecycle_admission`, which is the only production
+//! consumer. What remains here is the frozen read-only preview DTO surface,
+//! the neutral contract re-exports, and the one-call screen adapter.
 
 #![forbid(unsafe_code)]
-// Frozen #40 facade: internal cross-uses of deprecated compat items stay
+// Frozen #40 facade: internal uses of the deprecated compat item stay
 // warning-free here; downstream uses still warn. See `facade`.
 #![allow(deprecated)]
-
-/// Frozen #40/#1905 compatibility: typed lifecycle admission linkage retained
-/// for the kernel persist seam. See [`facade::FACADE_DISPOSITIONS`].
-#[deprecated(
-    note = "#40 frozen compat; migrate lifecycle_persist to neutral owners; see facade::FACADE_DISPOSITIONS"
-)]
-pub mod admission;
-/// Frozen #40/#1905 compatibility: admission drivers retained for the kernel
-/// proof tests. See [`facade::FACADE_DISPOSITIONS`].
-#[deprecated(
-    note = "#40 frozen compat; migrate lifecycle_persist tests to neutral owners; see facade::FACADE_DISPOSITIONS"
-)]
-pub mod candidate_admission;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -288,12 +285,14 @@ impl PreviewRequest {
 #[serde(deny_unknown_fields)]
 pub struct MemoryCurationOwner;
 
+#[allow(deprecated)]
 impl Default for MemoryCurationOwner {
     fn default() -> Self {
         Self
     }
 }
 
+#[allow(deprecated)]
 impl MemoryCurationOwner {
     pub const fn new() -> Self {
         Self

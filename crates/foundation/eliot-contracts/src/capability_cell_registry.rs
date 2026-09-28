@@ -686,15 +686,20 @@ pub enum CellClassificationError {
         /// Cell that the registry does not declare.
         cell: String,
     },
-    /// The cell is registered but carries no Module Catalog record, so its five
-    /// `I2.10` classifications and selection rationale cannot be reported.
-    UnclassifiedCell {
-        /// Registered cell with no catalog record.
-        cell: String,
-    },
     /// The Module Catalog failed validation, so its records cannot be reported
     /// as a complete classification.
     InvalidCatalog(ModuleCatalogError),
+    /// The Module Catalog carries no record for a functional cell this registry
+    /// declares, so querying any functional cell could not yield all five
+    /// classifications.
+    ///
+    /// Completeness is measured against the registry's own declared cells, so a
+    /// catalog is never accepted as complete by dropping a declared cell from
+    /// it, and the comparison cannot be satisfied by a caller-supplied list.
+    IncompleteCatalog {
+        /// Declared functional cell that no catalog record classifies.
+        cell: String,
+    },
 }
 
 impl fmt::Display for CellClassificationError {
@@ -706,11 +711,11 @@ impl fmt::Display for CellClassificationError {
                     "capability cell registry declares no cell '{cell}'"
                 )
             }
-            Self::UnclassifiedCell { cell } => write!(
-                formatter,
-                "registered cell '{cell}' has no Module Catalog classification record"
-            ),
             Self::InvalidCatalog(error) => write!(formatter, "invalid Module Catalog: {error}"),
+            Self::IncompleteCatalog { cell } => write!(
+                formatter,
+                "Module Catalog carries no classification record for declared functional cell '{cell}'"
+            ),
         }
     }
 }
@@ -781,12 +786,15 @@ impl CapabilityCellRegistry {
     /// iteration lane) together with the recorded selection rationale: the
     /// least-privilege reason, the rejected alternatives, and the applicable
     /// promotion path. Classification completeness is part of support
-    /// classification: an unregistered cell is refused with
-    /// [`CellClassificationError::UnknownCell`], a registered cell with no
-    /// record is refused with [`CellClassificationError::UnclassifiedCell`],
-    /// and an invalid catalog is refused with
-    /// [`CellClassificationError::InvalidCatalog`]. No value is derived from a
-    /// crate, bundle, source-layer, or runtime-layer name.
+    /// classification, and the completeness check compares the catalog against
+    /// this registry's own declared cells rather than against the catalog's
+    /// records: an unregistered cell is refused with
+    /// [`CellClassificationError::UnknownCell`], an invalid catalog is refused
+    /// with [`CellClassificationError::InvalidCatalog`], and a declared
+    /// functional cell the catalog does not classify is refused with
+    /// [`CellClassificationError::IncompleteCatalog`] no matter which cell was
+    /// queried. No value is derived from a crate, bundle, source-layer, or
+    /// runtime-layer name.
     pub fn cell_classification<'a>(
         &self,
         catalog: &'a ModuleCatalog,
@@ -800,12 +808,16 @@ impl CapabilityCellRegistry {
         catalog
             .validate()
             .map_err(CellClassificationError::InvalidCatalog)?;
-        catalog.record(cell).map_err(|error| match error {
-            ModuleCatalogError::UnknownCapability { cell } => {
-                CellClassificationError::UnclassifiedCell { cell }
+        for record in &self.cells {
+            if catalog.record(&record.cell).is_err() {
+                return Err(CellClassificationError::IncompleteCatalog {
+                    cell: record.cell.as_str().to_owned(),
+                });
             }
-            error => CellClassificationError::InvalidCatalog(error),
-        })
+        }
+        catalog
+            .record(cell)
+            .map_err(CellClassificationError::InvalidCatalog)
     }
 }
 

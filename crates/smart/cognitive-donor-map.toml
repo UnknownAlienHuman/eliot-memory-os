@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "29715ec120863e1b0148846fc4ed6e1d1d1a195f"
+current_main_commit = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -72,9 +72,9 @@ extraction_proof = "Module/package proof scope only: crates/governor/eliot-obser
 
 [[donor]]
 path = "crates/smart/eliot-system-experience"
-disposition = "RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS"
+disposition = "RETIRED_UNCONSUMED_SYSTEM_EXPERIENCE_PROJECTION"
 targets = []
-rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records. Status under #39: retained-stateless v2 confirmed, owner-neutral edge deferred; source untouched by the eliot-memory retirement."
+rationale = "Corrected against the current owner decision, which had moved after this row was written. Issue #1199 (workstreams/memory/assignments/1199-system-experience-disposition.toml, [disposition].decision = \"retired-zero-consumer\", zero_consumer_proof at base 87c38c81) proved the stateless projection had zero Cargo, source and runtime consumers and removed the package, its exact root workspace member line and its Cargo.lock stanza in 01070e29, an ancestor of the current base recorded above. That record named this stanza as its own out-of-scope residue and required a follow-up owner to reconcile it; measured on the current base the path is absent from the tree and no owner claims it, so the previous RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS deferred reuse of a source that no longer exists. The canonical self-scope experience bank and SystemObservationJournal keep their Governor/Memory OS owners, so the rejected second-owner boundary is unchanged and nothing here is a reuse target."
 rejected_overgeneralization = "A second self-memory owner, relation store or lifecycle transition path."
 
 [[donor]]
@@ -94,12 +94,17 @@ rejected_overgeneralization = "Effective indexes, old READY labels or empty crat
 # Issue #816 makes the legacy split explicit without changing or deleting any
 # donor.  `observed_disposition` describes the current map; it is not runtime
 # completion evidence and does not turn a donor into an implementation owner.
+# `current_main_commit` above is the ONE current base on which both the
+# `[[donor]]` dispositions and the `[topology_donor_authority]` rows below were
+# re-read against current source; `dispositions_base` restates that same base
+# for the authority table, and a map whose two bases disagree is refused.
 [topology_donor_authority]
 issue = 816
 schema_version = 1
 authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
 proof_ceiling = "DONOR_AND_OWNER_RECONCILIATION_ONLY"
 runtime_completion = false
+dispositions_base = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
 
 [[topology_donor]]
 path = "crates/smart/eliot-context"

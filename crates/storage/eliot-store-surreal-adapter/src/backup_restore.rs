@@ -13,14 +13,27 @@
 //!
 //! Durable state: a private namespace inside the admitted recovery registry
 //! table (the same physical table the Dreamer ledger uses, under the private
-//! `client::backup_restore` seam). Four keyed row families carry it: the
+//! `client::backup_restore` seam). Five keyed row families carry it: the
 //! destination fence row, the per-operation record row (members, per-phase
 //! receipts and the exact restored/rejected/suppressed/unresolved denominator),
-//! the archive-placement exclusivity row, and the current purge-ledger rows. No
-//! new table, DDL, schema generation or second client exists; the unique
+//! the archive-placement exclusivity row, the archive-member carrier rows the
+//! archive/artifact owner publishes, and the current purge-ledger rows. No new
+//! table, DDL, schema generation or second client exists; the unique
 //! `(namespace, key)` index supplies insert-if-absent exclusion, exact replay
 //! and changed-content conflict, and the destination fence compare-and-set
 //! serializes concurrent restores of one destination.
+//!
+//! Where the canonical bytes come from: a batch's [`SnapshotMember`] list
+//! supplies identities, digests and residency metadata, and is never a payload
+//! source. Each importable member's canonical logical payload is resolved
+//! through the archive/artifact owner's own carrier row, keyed by that batch's
+//! archive member digest and the member's domain-qualified logical identity, and
+//! every field of the carrier is compared against the batch's own member before
+//! the payload is used — including the owner's attested payload digest, which is
+//! validated against the bytes the carrier actually holds. An absent carrier is
+//! an unresolved member, never a member with empty content. The resolved
+//! payloads stay private to this execution path and are re-read out of the
+//! destination before any receipt reports a member restored.
 //!
 //! Evidence discipline: the current purge policy, the destination admission, the
 //! isolation fence, the build/schema identity and the source binding are read
@@ -35,6 +48,17 @@
 //! is never executed as queries, old session/lease/grant/epoch state is never
 //! imported, and invariant checks are never disabled. Nothing here activates an
 //! installation, unblocks effects, or retires a source.
+//!
+//! Bounded execution: one batch is bounded on all four axes the contract names.
+//! *Batches* by the member ceiling `MAX_RESTORE_MEMBERS`; *bytes* by the
+//! cumulative `MAX_RESTORE_BYTES` accounting that now covers the canonical
+//! payload bytes an apply imports, not only its bookkeeping document; *duration*
+//! by `MAX_RESTORE_DURATION_MS`, measured from the destination's preparation and,
+//! on a resume, from the operation's own first durable write; and *work* by the
+//! shape of the single composed transaction, whose indexed clause families are
+//! exactly the batch's head counts, its two purge obligations and its resolved
+//! members. No unbounded retry, fan-out or background loop exists, so the work a
+//! single apply can perform is the work its bounded shape already names.
 //!
 //! Local attempt ownership: an apply is owned by a private, non-cloneable
 //! [`RestoreAttemptGuard`] acquired before the first suspension that needs
@@ -55,9 +79,10 @@ use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
     IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS, OperationId, OperationIdentity,
-    ReconciliationOutcome, RecoveryRecord, RequestMeta, RestoreValidationReceipt,
-    SnapshotCompleteness, SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreError,
-    StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation, sha256_hex,
+    OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord, RequestMeta,
+    RestoreValidationReceipt, RevisionHeadExpectation, SnapshotCompleteness, SnapshotMember,
+    SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreError, StoreMutationDisposition,
+    canonical_json_bytes, reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,20 +133,27 @@ const MAX_RESTORE_TRACKED_ATTEMPTS: usize = MAX_RESTORE_BATCH_MEMBERS;
 
 /// Closed per-member disposition of one canonical restore batch.
 ///
-/// The frozen [`CanonicalRestoreBatch`] contract carries exactly one archive
-/// member digest per batch, so a purge obligation is necessarily observed at
-/// member-set granularity: an obligation names the archive member digest or the
-/// source scope and therefore covers the whole member set of that batch. A
-/// per-member split the contract cannot observe would be manufactured
-/// accounting, so every member of the set carries the same observed
-/// disposition while the exact per-member identities and counts are preserved.
+/// A purge obligation is observed at archive-member-scope granularity, so it
+/// opens or closes the whole member set; everything after that is decided per
+/// member. One member's payload may resolve while its neighbour's does not, a
+/// reference edge is never a row the import can write, and a member the
+/// destination does not serve back is unresolved while its neighbours are
+/// restored. Every member keeps its own identity and its own disposition, and a
+/// split the contract cannot observe is never manufactured: the exact
+/// per-member identities and counts are preserved either way.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum MemberDisposition {
-    /// Bound into the isolated destination under its fresh identity.
+    /// Bound into the isolated destination under its fresh identity, with the
+    /// canonical import read back out of the destination.
     Restored,
     /// Suppressed by the current purge ledger; never made servable.
     Suppressed,
+    /// A reference edge: it names a canonical object rather than carrying one,
+    /// so the record import has no row of its own to write and mints none. It
+    /// stays in the denominator under its own identity, and its closure is
+    /// proved by [`validate_reference_closure_against`].
+    Rejected,
     /// No durable outcome: the member keeps its original identity and the
     /// missing denominator stays visible.
     Unresolved,
@@ -149,6 +181,195 @@ struct RestoreMemberRecord {
     retention_domain: String,
     /// Purge policy revision the disposition was decided against.
     purge_policy_revision: u64,
+    /// Destination record address the canonical import wrote, present only for a
+    /// member whose payload was actually resolved and imported.
+    imported_record_id: Option<String>,
+    /// Class token of the imported record, present exactly with
+    /// [`Self::imported_record_id`].
+    imported_class: Option<String>,
+    /// Content digest this operation bound for this member's canonical import:
+    /// the digest of the resolved payload validated against the archive owner's
+    /// attested value. It is present exactly with [`Self::imported_record_id`],
+    /// and the post-commit readback must reproduce it from the destination's own
+    /// canonical read path before the member is reported `Restored`. A member
+    /// without a `Restored` disposition never carries one, so it cannot claim an
+    /// import it has no expectation for.
+    imported_digest: Option<String>,
+}
+
+/// The canonical class one resolved archive member restores into.
+///
+/// Closed set, adapter-owned: each token names one physical class table through
+/// the single owner in [`crate::schema`], and a token outside this set has no
+/// destination, so a caller-selected class cannot exist.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RestoreRecordClass {
+    /// A durable write receipt of the captured commit.
+    WriteReceipt,
+    /// A revision head of the captured scope state.
+    RevisionHead,
+    /// An ordering head of the captured conflict-serialization scope.
+    OrderingHead,
+    /// A canonical semantic event.
+    CanonicalEvent,
+    /// A materialized projection publication.
+    ProjectionRecord,
+    /// A typed relation edge.
+    RelationRecord,
+    /// An outbox intent.
+    OutboxEvent,
+}
+
+impl RestoreRecordClass {
+    /// Every admitted class, in canonical order.
+    const ALL: &'static [Self] = &[
+        Self::WriteReceipt,
+        Self::RevisionHead,
+        Self::OrderingHead,
+        Self::CanonicalEvent,
+        Self::ProjectionRecord,
+        Self::RelationRecord,
+        Self::OutboxEvent,
+    ];
+
+    /// Parses one closed class token.
+    fn parse(token: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|class| class.token() == token)
+    }
+
+    /// The durable token of this class.
+    const fn token(self) -> &'static str {
+        match self {
+            Self::WriteReceipt => "write-receipt",
+            Self::RevisionHead => "revision-head",
+            Self::OrderingHead => "ordering-head",
+            Self::CanonicalEvent => "canonical-event",
+            Self::ProjectionRecord => "projection-record",
+            Self::RelationRecord => "relation-record",
+            Self::OutboxEvent => "outbox-event",
+        }
+    }
+
+    /// The physical class table, named only by the single owner in
+    /// [`crate::schema`].
+    const fn table(self) -> &'static str {
+        match self {
+            Self::WriteReceipt => crate::schema::table::WRITE_RECEIPT,
+            Self::RevisionHead => crate::schema::table::REVISION_HEAD,
+            Self::OrderingHead => crate::schema::table::ORDERING_HEAD,
+            Self::CanonicalEvent => crate::schema::table::CANONICAL_EVENT,
+            Self::ProjectionRecord => crate::schema::table::PROJECTION_RECORD,
+            Self::RelationRecord => crate::schema::table::RELATION_RECORD,
+            Self::OutboxEvent => crate::schema::table::OUTBOX_EVENT,
+        }
+    }
+}
+
+/// One archive/artifact owner carrier row for a single canonical member.
+///
+/// The batch's [`SnapshotMember`] supplies identities, digests and residency
+/// metadata only; it is not a payload source. These rows are the owner-side
+/// carrier the resolution step reads back, and every field named here is
+/// compared against the batch's own member before the payload is used.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveMemberCarrier {
+    /// Store id of the source snapshot this payload was captured from.
+    source_store_id: String,
+    /// Installation id of the source snapshot this payload was captured from.
+    source_installation_id: String,
+    /// Schema generation of the source snapshot.
+    source_schema_generation: String,
+    /// Archive commitment the payload belongs to.
+    archive_member_digest: String,
+    /// Member identity the payload answers for.
+    member_id: String,
+    /// Member type the payload answers for.
+    member_type: SnapshotMemberType,
+    /// Residency domain the payload was captured under.
+    residency_domain: String,
+    /// Content digest of the archive member this payload answers for.
+    ///
+    /// This is the *archive* commitment the batch member names, not a checksum of
+    /// the payload: the capture contract derives a member's `content_digest` from
+    /// the observed source row, so it binds carrier to member and never replaces
+    /// the payload's own proof.
+    content_digest: String,
+    /// Owner-recorded digest of the resolved canonical payload bytes.
+    ///
+    /// This is the value the archive/artifact owner attested for the bytes it
+    /// published. Resolution validates it against the payload it actually holds,
+    /// so a carrier that claims one digest and carries other bytes is refused
+    /// rather than accepted because its claim looked plausible.
+    payload_digest: String,
+    /// Actual byte length of the resolved canonical payload.
+    byte_count: u64,
+    /// Closed class this payload restores into.
+    class: RestoreRecordClass,
+    /// Destination record address derived from the member's own logical
+    /// identity, so the same member always lands at the same address.
+    record_id: String,
+    /// The canonical logical payload itself.
+    payload: serde_json::Value,
+}
+
+impl ArchiveMemberCarrier {
+    /// Validates the carrier's own shape.
+    fn validate(&self) -> Result<(), StoreError> {
+        reject_blank_text(&self.source_store_id, "restore.carrier_source_store_id")?;
+        reject_blank_text(
+            &self.source_installation_id,
+            "restore.carrier_source_installation_id",
+        )?;
+        reject_blank_text(
+            &self.source_schema_generation,
+            "restore.carrier_source_schema_generation",
+        )?;
+        reject_blank_text(
+            &self.archive_member_digest,
+            "restore.carrier_archive_member_digest",
+        )?;
+        reject_blank_text(&self.member_id, "restore.carrier_member_id")?;
+        reject_blank_text(&self.residency_domain, "restore.carrier_residency_domain")?;
+        reject_blank_text(&self.content_digest, "restore.carrier_content_digest")?;
+        reject_blank_text(&self.payload_digest, "restore.carrier_payload_digest")?;
+        reject_blank_text(&self.record_id, "restore.carrier_record_id")?;
+        if self.byte_count == 0 {
+            return Err(StoreError::InvalidField {
+                field: "restore.carrier_byte_count",
+                reason: "resolved payload must carry a non-zero byte length",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One resolved canonical member ready to be imported into the destination.
+///
+/// Private to the adapter execution path: the resolved bytes are consumed by the
+/// fixed apply transaction and then re-read through the destination's own
+/// canonical read path. Nothing here is caller-visible, and a structural batch
+/// validation cannot produce one.
+struct ResolvedArchiveMember {
+    /// Index of this member inside the admitted member list.
+    member_index: u64,
+    /// The batch member this payload answers for.
+    member: SnapshotMember,
+    /// Destination class the payload restores into.
+    class: RestoreRecordClass,
+    /// Destination record address derived from the member's own identity.
+    record_id: String,
+    /// The canonical logical payload bytes.
+    payload: serde_json::Value,
+    /// Digest of exactly those payload bytes, validated against the archive
+    /// owner's own attested value at resolution. It is the content the
+    /// post-commit readback must reproduce before the member may be reported
+    /// `Restored`.
+    payload_digest: String,
 }
 
 /// Closed lifecycle state of one current purge-ledger obligation.
@@ -398,6 +619,17 @@ struct RestoreRecordDocument {
     destination_id: String,
     /// Fresh destination operational identity the members were bound under.
     destination_identity: String,
+    /// Real store identity of the admitted process that performed the canonical
+    /// import, read back from this adapter's own admitted configuration.
+    ///
+    /// A document whose label says `ISOLATED` does not select an isolated
+    /// provider, so the receipt binds the actual destination process it was
+    /// written by. A receipt whose bound store differs from the process
+    /// re-deriving it is a record for another destination, never evidence for
+    /// this one.
+    destination_store_id: String,
+    /// Real installation identity of the same admitted process.
+    destination_installation_id: String,
     /// Source identity digest the members were captured from.
     source_identity_digest: String,
     /// Archive member digest this record applies to.
@@ -1328,16 +1560,16 @@ pub fn validate_restore_batch(
     Ok(())
 }
 
-/// Validates the canonical reference/ordering closure of one restore batch.
+/// Validates the structural canonical reference/ordering closure of a batch.
 ///
-/// Requires a non-empty, duplicate-free revision-head set with every head
-/// validated, a duplicate-free validated ordering-head set, a bounded non-zero
-/// member count whose length matches the batch's real canonical member list, and
-/// — the restore analogue of
-/// `crate::backup_snapshot::validate_reference_closure` — that every
-/// `SnapshotMemberType::Reference` member names the exact `content_digest` of
-/// another member in the same batch. Unverified derived data can never grant
-/// completion: closure failure refuses the batch outright.
+/// Structural only: it proves the batch's own head sets, its member ceiling and
+/// the reference-digest coupling, and that a reference edge is not a self-edge.
+/// It deliberately does **not** decide whether a reference *resolves*. A
+/// `BTreeSet<content_digest>` membership test over the batch's own declarations
+/// drops residency and type identity, so equal bytes in another obligation
+/// domain would satisfy it and a member that never resolved would pass it.
+/// Resolution is a separate typed step over the owner-resolved canonical
+/// payloads — see [`validate_reference_closure_against`].
 pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), StoreError> {
     batch.operation.validate()?;
     if batch.expected_revision_heads.is_empty() {
@@ -1382,14 +1614,9 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
             reason: "must equal the admitted canonical member list",
         });
     }
-    // Independent re-proof over the batch's own member set: a member that lost
-    // its target inside this batch still fails closed, whatever the caller
-    // claimed for the archive it came from.
-    let present: BTreeSet<&str> = batch
-        .members
-        .iter()
-        .map(|member| member.content_digest.as_str())
-        .collect();
+    // The reference coupling is re-proved here; whether the edge *resolves* is
+    // decided by the typed step over the resolved canonical payloads, never over
+    // this batch's own declarations.
     for member in &batch.members {
         if member.member_type != SnapshotMemberType::Reference {
             continue;
@@ -1400,7 +1627,73 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
                 reason: "reference member requires a reference digest",
             });
         };
-        if !present.contains(reference) || reference == member.content_digest {
+        if reference == member.content_digest {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
+/// Resolves every reference edge this batch claims to have closed, against the
+/// member set that is actually *present*.
+///
+/// `dispositions[i]` is the disposition of `batch.members[i]` at this exact
+/// point: the planned set before an apply commit, the observed set at receipt
+/// time. This is the typed half of the closure, and it is deliberately not a
+/// digest-membership test over the batch's own declarations. A reference edge
+/// resolves only against a member that
+///
+/// 1. carries the referenced content digest **under the same residency domain**
+///    as the referring member. Equal bytes under a different obligation domain
+///    are a different logical object (I5.13), so they are not the referenced
+///    object; and
+/// 2. is itself importable — a `Record` or `Blob` member rather than another
+///    reference edge — so a reference chain is refused instead of followed.
+///
+/// Only an edge the batch actually claims to have closed — a `Rejected` edge,
+/// which is what an importable batch records for a reference — carries that
+/// obligation. A purge-suppressed or still-unresolved member set makes nothing
+/// servable, so its edges are accounted as suppressed or unresolved rather than
+/// demanded to resolve: a suppressed archive cannot fail to be closed.
+///
+/// A member that is not present is not a target, so a batch cannot close a graph
+/// it never imported. A cross-batch target, an object an authorized earlier
+/// batch of the same restore plan already imported, is **not** resolvable here:
+/// the #950 batch contract carries no record address for a member outside the
+/// batch and this port never mints one. Such an edge fails closed rather than
+/// being assumed present, and a reference member never gains a canonical row of
+/// its own.
+fn validate_reference_closure_against(
+    batch: &CanonicalRestoreBatch,
+    dispositions: &[MemberDisposition],
+) -> Result<(), StoreError> {
+    if dispositions.len() != batch.members.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    for (member, disposition) in batch.members.iter().zip(dispositions) {
+        if member.member_type != SnapshotMemberType::Reference
+            || *disposition != MemberDisposition::Rejected
+        {
+            continue;
+        }
+        let reference = member
+            .reference_digest
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "restore.reference_digest",
+                reason: "reference member requires a reference digest",
+            })?;
+        let resolved_target =
+            batch
+                .members
+                .iter()
+                .zip(dispositions)
+                .any(|(target, target_disposition)| {
+                    *target_disposition == MemberDisposition::Restored
+                        && target.content_digest == reference
+                        && target.residency.domain == member.residency.domain
+                });
+        if !resolved_target {
             return Err(StoreError::IdentityConflict);
         }
     }
@@ -1629,6 +1922,26 @@ fn purge_scope_key(source_installation_id: &str) -> String {
     )
 }
 
+/// Derives the archive-member carrier row key for one batch member.
+///
+/// The key binds the admitted archive member digest and the member's own
+/// domain-qualified logical identity, so the carrier row a batch resolves is
+/// the one the archive/artifact owner published for exactly that member under
+/// exactly that archive. A caller cannot name another member's carrier row.
+fn archive_member_key(
+    archive_member_digest: &str,
+    member: &eliot_store_api::SnapshotMember,
+) -> String {
+    registry_key(
+        crate::client::RESTORE_KEY_ARCHIVE_MEMBER_PREFIX,
+        &format!(
+            "{archive_member_digest}:{}:{}",
+            member.member_id,
+            member.logical_identity()
+        ),
+    )
+}
+
 /// Builds one durable registry row from an encoded document.
 fn registry_row(
     key: &str,
@@ -1724,6 +2037,30 @@ async fn execute_restore_read(
 /// is the fail-closed answer for anything unclassified; it differs per lane
 /// because a read mutated nothing while a write leaves its commit ambiguous.
 fn classify_restore_errors(errors: &[String], fallback: StoreError) -> StoreError {
+    // The current-purge precondition is checked first: an obligation recorded
+    // between preflight and commit must be re-evaluated, never reported as the
+    // weaker conflict class it happens to share a transaction with.
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_purge_ledger_changed(error))
+    {
+        return StoreError::InvalidField {
+            field: "restore.purge_policy_revision",
+            reason: "current purge obligations changed before this restore committed",
+        };
+    }
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_revision_head_changed(error))
+    {
+        return StoreError::RevisionConflict;
+    }
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_ordering_head_changed(error))
+    {
+        return StoreError::OrderingConflict;
+    }
     if errors
         .iter()
         .any(|error| crate::client::is_restore_duplicate(error))
@@ -1763,23 +2100,35 @@ fn classify_restore_errors(errors: &[String], fallback: StoreError) -> StoreErro
 async fn execute_restore_write(
     transport: &RpcTransport,
     operation: &'static str,
+    statement: String,
     bindings: serde_json::Map<String, serde_json::Value>,
     exposure: Option<&mut RestoreEffectExposure>,
 ) -> Result<(), StoreError> {
     check_registry_capability()?;
     crate::client::validate_restore_operation(operation).map_err(AdapterError::into_store_error)?;
-    let statement = crate::client::fixed_restore_statement(operation)
+    // The closed registry is still consulted for every write: the apply
+    // transaction is the pinned bookkeeping half with its bounded per-batch
+    // preconditions and canonical imports rendered from the same templates, and
+    // refusing here means a caller-selected statement can never be composed
+    // around the admitted registry.
+    let pinned = crate::client::fixed_restore_statement(operation)
         .map_err(AdapterError::into_store_error)?;
+    if !statement.starts_with(pinned) {
+        return Err(AdapterError::NamedOperationUnavailable {
+            operation: crate::client::RESTORE_ERROR_OPERATION.to_owned(),
+        }
+        .into_store_error());
+    }
     let mut response = match exposure {
         Some(exposure) => {
             exposure.note_write_may_be_submitted();
-            let response = transport.query_write(operation, statement, bindings).await;
+            let response = transport.query_write(operation, &statement, bindings).await;
             if response.is_ok() {
                 exposure.note_response_observed();
             }
             response
         }
-        None => transport.query_write(operation, statement, bindings).await,
+        None => transport.query_write(operation, &statement, bindings).await,
     }
     .map_err(AdapterError::into_store_error)?;
     let errors = response.take_errors();
@@ -1883,6 +2232,25 @@ fn decode_document<T: for<'de> Deserialize<'de>>(row: &RecoveryRecord) -> Result
         .map_err(|error| AdapterError::Serialization(error.to_string()).into_store_error())
 }
 
+/// One current purge obligation exactly as the destination's privacy owner
+/// recorded it.
+///
+/// The decoded entry decides the disposition; the registry row's own durable
+/// revision is the value the commit transaction re-reads and compares. The two
+/// are independent facts — the entry's `purge_policy_revision` is policy
+/// provenance, not the row revision — so both travel separately and neither is
+/// ever substituted for the other.
+struct PurgeObservation {
+    /// Registry row key this obligation is read under.
+    key: String,
+    /// Decoded obligation, absent only on a positive absent-row observation.
+    entry: Option<PurgeLedgerEntry>,
+    /// Durable registry revision the row was read at; `0` when the row is
+    /// absent, so "no obligation recorded" and "an obligation moved" stay
+    /// distinguishable at the commit precondition.
+    row_revision: u64,
+}
+
 /// Reads the current purge ledger for one batch scope: the member obligation
 /// and the source-scope obligation, in one dispatch.
 async fn read_purge_ledger(
@@ -1890,7 +2258,7 @@ async fn read_purge_ledger(
     config: &SurrealAdapterConfig,
     archive_member_digest: &str,
     source_installation_id: &str,
-) -> Result<(Option<PurgeLedgerEntry>, Option<PurgeLedgerEntry>), StoreError> {
+) -> Result<(PurgeObservation, PurgeObservation), StoreError> {
     let mut bindings = serde_json::Map::new();
     bindings.insert(
         "restore_namespace".to_owned(),
@@ -1916,9 +2284,292 @@ async fn read_purge_ledger(
     let scope_rows: Vec<RecoveryRecord> =
         response.take(1).map_err(AdapterError::into_store_error)?;
     Ok((
-        decode_purge_entry(member_rows.into_iter().next())?,
-        decode_purge_entry(scope_rows.into_iter().next())?,
+        purge_observation(purge_member_key(archive_member_digest), member_rows)?,
+        purge_observation(purge_scope_key(source_installation_id), scope_rows)?,
     ))
+}
+
+/// Folds one purge-ledger row family into its observation.
+///
+/// A family that returns more than one row cannot be ordered, so it is refused
+/// rather than resolved to whichever row happened to arrive first.
+fn purge_observation(
+    key: String,
+    rows: Vec<RecoveryRecord>,
+) -> Result<PurgeObservation, StoreError> {
+    if rows.len() > 1 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(PurgeObservation {
+            key,
+            entry: None,
+            row_revision: 0,
+        });
+    };
+    let row_revision = row.revision;
+    Ok(PurgeObservation {
+        entry: decode_purge_entry(Some(row))?,
+        row_revision,
+        key,
+    })
+}
+
+/// Reads one archive/artifact owner carrier row for one batch member.
+///
+/// The key is derived from the batch's archive member digest and the member's
+/// own logical identity, so a carrier row for a different member, a different
+/// archive, or a different residency domain is simply not found: nothing the
+/// caller supplies selects a row.
+async fn read_archive_member(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    batch: &CanonicalRestoreBatch,
+    member: &eliot_store_api::SnapshotMember,
+) -> Result<Option<ArchiveMemberCarrier>, StoreError> {
+    let key = archive_member_key(&batch.archive_member_digest, member);
+    let Some(row) = read_registry_row(
+        transport,
+        config,
+        crate::client::RESTORE_OPERATION_ARCHIVE_MEMBERS,
+        &key,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if row.schema != crate::client::RESTORE_SCHEMA_ARCHIVE_MEMBER {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let carrier: ArchiveMemberCarrier = decode_document(&row)?;
+    carrier.validate()?;
+    if !carrier_answers_for(&carrier, batch, member) {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(Some(carrier))
+}
+
+/// Reports whether one carrier row actually answers for one batch member.
+///
+/// Eight independent facts must agree before the payload is used: the source
+/// store, the source installation, the source schema generation, the archive
+/// commitment, the member identity, the member type, the residency domain, the
+/// archive content digest and the declared byte count. The byte count is
+/// compared against the *batch member's own* declared residency length — an
+/// independent expected value, not a second copy of the carrier's — and the
+/// payload's own digest is then validated separately in
+/// [`resolve_archive_members`]. Any divergence is an identity conflict, never a
+/// payload that is silently accepted because it looked plausible.
+fn carrier_answers_for(
+    carrier: &ArchiveMemberCarrier,
+    batch: &CanonicalRestoreBatch,
+    member: &eliot_store_api::SnapshotMember,
+) -> bool {
+    carrier.source_store_id == batch.source.store_id
+        && carrier.source_installation_id == batch.source.installation_id
+        && carrier.source_schema_generation == batch.source.schema
+        && carrier.archive_member_digest == batch.archive_member_digest
+        && carrier.member_id == member.member_id
+        && carrier.member_type == member.member_type
+        && carrier.residency_domain == residency_label(member.residency.domain)
+        && carrier.content_digest == member.content_digest
+        && carrier.byte_count == member.residency.byte_count
+}
+
+/// Resolves every member of one batch into its canonical logical payload.
+///
+/// A member whose carrier row is absent resolves to `None`: it is an unresolved
+/// member, not a member with empty content. A carrier whose own attested digest
+/// or declared length disagrees with the payload it actually holds is refused
+/// outright — the recorded value is validated, never replaced by a fresh
+/// checksum over whatever happened to arrive. The resolved payloads are private
+/// to this execution path and never become part of a caller-visible receipt.
+async fn resolve_archive_members(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    batch: &CanonicalRestoreBatch,
+) -> Result<Vec<Option<ResolvedArchiveMember>>, StoreError> {
+    let mut resolved = Vec::with_capacity(batch.members.len());
+    for (index, member) in batch.members.iter().enumerate() {
+        // A reference edge names a canonical object; it is not one. Resolving it
+        // to a payload of its own would let the import mint a destination record
+        // for an edge, so no carrier row is read for it.
+        if member.member_type == SnapshotMemberType::Reference {
+            resolved.push(None);
+            continue;
+        }
+        let Some(carrier) = read_archive_member(transport, config, batch, member).await? else {
+            resolved.push(None);
+            continue;
+        };
+        // The owner's own attested digest is checked against the bytes it
+        // published, and the actual byte length against both the owner's record
+        // and the batch member's own declaration. A carrier that fails either is
+        // not a payload source.
+        let payload_bytes = canonical_digest_bytes(&carrier.payload)?;
+        let payload_digest = sha256_hex(&payload_bytes);
+        if payload_bytes.is_empty() || payload_digest != carrier.payload_digest {
+            return Err(StoreError::InvalidField {
+                field: "restore.carrier_payload_digest",
+                reason: "resolved payload does not match the owner-attested digest",
+            });
+        }
+        if u64::try_from(payload_bytes.len()).ok() != Some(carrier.byte_count) {
+            return Err(StoreError::InvalidField {
+                field: "restore.carrier_byte_count",
+                reason: "resolved payload length does not match the owner-recorded length",
+            });
+        }
+        resolved.push(Some(ResolvedArchiveMember {
+            member_index: u64::try_from(index).unwrap_or(u64::MAX),
+            member: member.clone(),
+            class: carrier.class,
+            record_id: carrier.record_id,
+            payload: carrier.payload,
+            payload_digest,
+        }));
+    }
+    Ok(resolved)
+}
+
+/// Reads one canonical row of the destination through its own read path.
+///
+/// The class table and the record id are bound parameters of one pinned read, so
+/// nothing a caller supplies names a table. The result is the row's `body` — the
+/// admitted logical document the canonical owner writes under it — or `None`
+/// when the destination serves no such row. A `None` is an absent row, never a
+/// row with empty content.
+async fn read_canonical_body(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    class: RestoreRecordClass,
+    record_id: &str,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let mut bindings = serde_json::Map::new();
+    bindings.insert(
+        "restore_canonical_table".to_owned(),
+        serde_json::Value::String(class.table().to_owned()),
+    );
+    bindings.insert(
+        "restore_canonical_row_id".to_owned(),
+        serde_json::Value::String(record_id.to_owned()),
+    );
+    let mut response = execute_restore_read(
+        transport,
+        config,
+        crate::client::RESTORE_OPERATION_CANONICAL_READ,
+        bindings,
+    )
+    .await?;
+    let rows: Vec<serde_json::Value> = response.take(0).map_err(AdapterError::into_store_error)?;
+    match rows.into_iter().next() {
+        Some(row) if row.is_null() => Ok(None),
+        Some(row) => Ok(Some(row)),
+        None => Ok(None),
+    }
+}
+
+/// The head field one canonical class publishes for compare-and-set purposes.
+///
+/// The destination's own head value is read through the record address the
+/// canonical owner itself uses (`type::record(revision_head, revision_key)` and
+/// `type::record(ordering_head, ordering_scope)`, per `schema::TX_UPSERT_REVISION`
+/// and `schema::READ_REVISION_HEADS_BY_KEYS`), and the field is the one the owner
+/// writes under `body` for that class. No caller chooses either the address or
+/// the field.
+const fn head_value_field(class: RestoreRecordClass) -> &'static str {
+    match class {
+        RestoreRecordClass::RevisionHead => "revision",
+        _ => "sequence",
+    }
+}
+
+/// Reads the destination's own head values for one batch's expected heads.
+///
+/// One bounded canonical read per head, in the batch's own order, so
+/// `observed[index]` is the value the destination actually publishes for
+/// `keys[index]` and `None` is a positive observation that it publishes no head
+/// there. This is the *observed* half of the expected-state check: the batch's
+/// heads are the input, these are the values they are compared against.
+async fn read_destination_heads(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    class: RestoreRecordClass,
+    keys: &[String],
+) -> Result<Vec<Option<u64>>, StoreError> {
+    let field = head_value_field(class);
+    let mut observed = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(body) = read_canonical_body(transport, config, class, key).await? else {
+            observed.push(None);
+            continue;
+        };
+        // A head the destination DOES publish must carry its value; a present
+        // record whose value field is missing or not a `u64` is a malformed
+        // receipt, not an absent head, so it refuses instead of being reported
+        // as `None`. `None` above is reserved for the one case it means: the
+        // destination publishes no head at this key.
+        observed.push(Some(
+            body.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(StoreError::InvalidReceipt)?,
+        ));
+    }
+    Ok(observed)
+}
+
+/// Compares the batch's expected head values with the destination's own.
+///
+/// The same rule the commit transaction applies, applied before the write so a
+/// batch whose expectation has already moved is refused rather than submitted.
+/// A head the destination publishes must carry exactly the revision or sequence
+/// this operation was admitted against. A head it does not publish yet is the
+/// create-from-floor case the canonical owner itself distinguishes
+/// (`schema::TX_UPSERT_REVISION` compare-and-sets a present head,
+/// `schema::TX_CREATE_REVISION` establishes an absent one), so absence is not a
+/// contradiction here either — and this preflight must not be stricter than the
+/// transaction guard it precedes. `mismatch` is the lane's typed conflict, so a
+/// revision move never reads as an ordering move or the other way round.
+fn check_observed_heads(
+    expected: &[u64],
+    observed: &[Option<u64>],
+    mismatch: StoreError,
+) -> Result<(), StoreError> {
+    if expected.len() != observed.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    for (expected, observed) in expected.iter().zip(observed) {
+        if !observed.is_none_or(|observed| observed == *expected) {
+            return Err(mismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Re-reads one imported canonical record out of the destination and reports
+/// whether it serves exactly the bytes this operation committed.
+///
+/// A `Restored` member is only `Restored` when the destination serves its row
+/// back, in the closed class, at the address this operation recorded, **with the
+/// content this operation bound into its own transaction**. The returned digest
+/// is that readback: a member whose row is absent yields `None`, and so does a
+/// row whose bytes digest to anything other than `expected_digest` — a row that
+/// exists at the right address with the wrong content is not this member's
+/// import. This is what separates a registered placement, a staged archive
+/// handle and a completed canonical import — three different facts — and what
+/// stops a metadata-only batch from reporting a complete import.
+async fn read_imported_member(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    class: RestoreRecordClass,
+    record_id: &str,
+    expected_digest: &str,
+) -> Result<Option<String>, StoreError> {
+    let Some(body) = read_canonical_body(transport, config, class, record_id).await? else {
+        return Ok(None);
+    };
+    let digest = sha256_hex(&canonical_digest_bytes(&body)?);
+    Ok((digest == expected_digest).then_some(digest))
 }
 
 /// Decodes one purge-ledger row, refusing a foreign namespace or schema.
@@ -2054,6 +2705,19 @@ fn check_cancellation(
 
 /// Verifies the expected-state identity: every expected head must carry the
 /// request's state fence, so a batch cannot bind heads from another fence.
+///
+/// This is the *shape* half of the expected-state check. The *value* half — that
+/// the destination's own revision/ordering heads actually carry the expected
+/// revision and sequence — is made twice, and never by storing the expectation:
+///
+/// 1. before the write, by [`check_observed_heads`] over the values read back
+///    from the destination through its own canonical read path; and
+/// 2. inside the commit transaction itself, by
+///    [`crate::client::restore_apply_statement`]'s indexed head guards, which
+///    re-read each head and abort the whole commit on any divergence. The
+///    preflight read narrows the failure; only the in-transaction guard is the
+///    commit precondition, because a preflight observation can go stale before
+///    the write lands.
 fn check_expected_state(
     batch: &CanonicalRestoreBatch,
     ctx: &RequestMeta,
@@ -2072,18 +2736,30 @@ fn check_expected_state(
 }
 
 /// Digests the expected revision/ordering heads of one batch.
-fn expected_head_digests(batch: &CanonicalRestoreBatch) -> (Vec<String>, Vec<String>) {
+///
+/// The digest exists only to bind *this* batch's expectation into its durable
+/// record, so a head that cannot be canonically encoded is a refusal rather than
+/// a digest of empty bytes: a fallback would let two different head lists hash
+/// to the same stored expectation. This stores the expectation; the destination's
+/// actual head values are compared inside the commit transaction by
+/// [`check_observed_heads`].
+fn expected_head_digests(
+    batch: &CanonicalRestoreBatch,
+) -> Result<(Vec<String>, Vec<String>), StoreError> {
+    fn digest<T: Serialize>(head: &T) -> Result<String, StoreError> {
+        Ok(sha256_hex(&canonical_digest_bytes(head)?))
+    }
     let revision_digests = batch
         .expected_revision_heads
         .iter()
-        .map(|head| sha256_hex(&canonical_json_bytes(head).unwrap_or_default()))
-        .collect();
+        .map(digest::<RevisionHeadExpectation>)
+        .collect::<Result<Vec<_>, _>>()?;
     let ordering_digests = batch
         .expected_ordering_heads
         .iter()
-        .map(|head| sha256_hex(&canonical_json_bytes(head).unwrap_or_default()))
-        .collect();
-    (revision_digests, ordering_digests)
+        .map(digest::<OrderingHeadExpectation>)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((revision_digests, ordering_digests))
 }
 
 /// Verifies that a durable record belongs to exactly this batch: same
@@ -2098,6 +2774,8 @@ fn check_record_binding(
     expected_state_fence: &StateFence,
     revision_digests: &[String],
     ordering_digests: &[String],
+    destination_store_id: &str,
+    destination_installation_id: &str,
 ) -> Result<(), StoreError> {
     if document.operation.operation_id != batch.operation.operation_id
         || document.operation.canonical_request_hash != batch.operation.canonical_request_hash
@@ -2110,6 +2788,11 @@ fn check_record_binding(
         || document.expected_revision_head_digests != revision_digests
         || document.expected_ordering_head_digests != ordering_digests
         || document.denominator.total != batch.member_count
+        // The record is evidence for the destination process that wrote it. A
+        // record admitted under another store's identity answers for that
+        // store, so it can never certify this one's canonical import.
+        || document.destination_store_id != destination_store_id
+        || document.destination_installation_id != destination_installation_id
     {
         return Err(StoreError::IdentityConflict);
     }
@@ -2119,60 +2802,87 @@ fn check_record_binding(
 /// Re-derives completeness and disposition from the per-member durable records a
 /// document actually carries.
 ///
-/// The stored scalars are never trusted as the source of the verdict. A
-/// member-set obligation resolves one disposition for the whole set, so an
-/// honest document carries exactly one observed per-member disposition, and the
-/// per-member tally must be exactly the durable denominator. A document whose
-/// members disagree with each other, with the denominator, or that claims
-/// `Complete` beside unresolved members is rejected rather than reported ready.
+/// The stored scalars are never trusted as the source of the verdict. Members
+/// may legitimately hold different dispositions — a purge obligation covers one
+/// archive member and not its neighbour, and a member whose payload did not
+/// resolve is unresolved while the rest imported — so the tally is what decides,
+/// not agreement across the set. The per-member tally must equal the durable
+/// denominator, and a document whose members disagree with it is rejected rather
+/// than reported ready.
+///
+/// Every `Restored` member must additionally carry the import evidence its own
+/// readback produced. Without that, a metadata-only batch could still present a
+/// complete committed receipt, which is exactly the failure this re-derivation
+/// exists to prevent.
 fn observed_outcome(
     document: &RestoreRecordDocument,
     denominator: &RestoreDenominator,
 ) -> Result<(SnapshotCompleteness, StoreMutationDisposition), StoreError> {
-    let mut observed: Option<MemberDisposition> = None;
     let mut restored = 0_u64;
+    let mut rejected = 0_u64;
     let mut suppressed = 0_u64;
     let mut unresolved = 0_u64;
     for member in &document.members {
         match member.disposition {
-            MemberDisposition::Restored => restored = restored.saturating_add(1),
-            MemberDisposition::Suppressed => suppressed = suppressed.saturating_add(1),
-            MemberDisposition::Unresolved => unresolved = unresolved.saturating_add(1),
-        }
-        if let Some(first) = observed {
-            if first != member.disposition {
-                return Err(StoreError::InvalidReceipt);
+            MemberDisposition::Restored => {
+                restored = restored.saturating_add(1);
+                if member.imported_record_id.is_none()
+                    || member.imported_class.is_none()
+                    || member.imported_digest.is_none()
+                {
+                    return Err(StoreError::InvalidReceipt);
+                }
             }
-        } else {
-            observed = Some(member.disposition);
+            MemberDisposition::Rejected => {
+                rejected = rejected.saturating_add(1);
+                if member.imported_record_id.is_some() {
+                    return Err(StoreError::InvalidReceipt);
+                }
+            }
+            MemberDisposition::Suppressed => {
+                suppressed = suppressed.saturating_add(1);
+                if member.imported_record_id.is_some() {
+                    return Err(StoreError::InvalidReceipt);
+                }
+            }
+            MemberDisposition::Unresolved => {
+                unresolved = unresolved.saturating_add(1);
+                if member.imported_record_id.is_some() {
+                    return Err(StoreError::InvalidReceipt);
+                }
+            }
         }
     }
     // The per-member tally is the observation; the denominator only agrees with
     // it when the record is honest.
     if restored != denominator.restored
+        || rejected != denominator.rejected
         || suppressed != denominator.suppressed
         || unresolved != denominator.unresolved
     {
         return Err(StoreError::InvalidReceipt);
     }
-    match observed {
-        Some(MemberDisposition::Restored) => Ok((
-            SnapshotCompleteness::Complete,
-            StoreMutationDisposition::Committed,
-        )),
-        Some(MemberDisposition::Suppressed) => Ok((
-            SnapshotCompleteness::Complete,
-            StoreMutationDisposition::ProvenNotApplied,
-        )),
-        Some(MemberDisposition::Unresolved) => Ok((
+    if denominator.total == 0 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    if unresolved > 0 {
+        return Ok((
             SnapshotCompleteness::Partial,
             StoreMutationDisposition::Partial,
-        )),
-        // A member set is non-empty by admission and its length was already
-        // matched against the denominator, so an empty observation is
-        // manufactured accounting rather than an empty restore.
-        None => Err(StoreError::InvalidReceipt),
+        ));
     }
+    if restored > 0 {
+        return Ok((
+            SnapshotCompleteness::Complete,
+            StoreMutationDisposition::Committed,
+        ));
+    }
+    // Nothing was restored and nothing is unresolved: every member is
+    // proven-not-applicable under the current purge ledger.
+    Ok((
+        SnapshotCompleteness::Complete,
+        StoreMutationDisposition::ProvenNotApplied,
+    ))
 }
 
 /// Projects the store-neutral receipt from the exact durable record.
@@ -2261,26 +2971,71 @@ fn check_destination_fence(
 /// later readback re-observes keeps the identity it was first given. The list
 /// length is the declared denominator, cross-checked by
 /// `validate_reference_closure` before this runs.
+///
+/// The disposition is decided per member, not per member *set*: a member whose
+/// payload could not be resolved, or whose import was not read back out of the
+/// destination, is `Unresolved` even while its neighbours are `Restored`, and a
+/// purge-suppressed member is `Suppressed` even while the rest imported. The
+/// import evidence fields are populated only from a member's own readback, so a
+/// `Restored` row can never exist without the canonical import it claims.
 fn member_records(
     batch: &CanonicalRestoreBatch,
     domains: &RestoreDomains,
-    disposition: MemberDisposition,
+    dispositions: &[MemberDisposition],
+    imports: &[Option<ImportedMemberEvidence>],
     purge_revision: u64,
-) -> Vec<RestoreMemberRecord> {
+) -> Result<Vec<RestoreMemberRecord>, StoreError> {
+    if dispositions.len() != batch.members.len() || imports.len() != batch.members.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
     batch
         .members
         .iter()
         .enumerate()
-        .map(|(index, member)| RestoreMemberRecord {
-            member_ref: member_reference(&batch.archive_member_digest, &member.logical_identity()),
-            member_index: u64::try_from(index).unwrap_or(u64::MAX),
-            disposition,
-            residency_domain: domains.residency.clone(),
-            privacy_domain: domains.privacy.clone(),
-            retention_domain: domains.retention.clone(),
-            purge_policy_revision: purge_revision,
+        .map(|(index, member)| {
+            let disposition = dispositions[index];
+            let evidence = imports[index].as_ref();
+            // Import evidence is exactly the readback of a committed canonical
+            // write: it is present for a `Restored` member and absent otherwise,
+            // so a suppressed or unresolved member can never carry one.
+            if (disposition == MemberDisposition::Restored) != evidence.is_some() {
+                return Err(StoreError::InvalidReceipt);
+            }
+            Ok(RestoreMemberRecord {
+                member_ref: member_reference(
+                    &batch.archive_member_digest,
+                    &member.logical_identity(),
+                ),
+                member_index: u64::try_from(index).unwrap_or(u64::MAX),
+                disposition,
+                residency_domain: domains.residency.clone(),
+                privacy_domain: domains.privacy.clone(),
+                retention_domain: domains.retention.clone(),
+                purge_policy_revision: purge_revision,
+                imported_record_id: evidence.map(|evidence| evidence.record_id.clone()),
+                imported_class: evidence.map(|evidence| evidence.class_token.to_owned()),
+                imported_digest: evidence.map(|evidence| evidence.digest.clone()),
+            })
         })
         .collect()
+}
+
+/// One member's canonical import: the address the commit wrote, the closed class
+/// it was written into, and the digest of exactly the bytes that were written.
+///
+/// The digest is fixed *before* the commit — it is the digest of the resolved
+/// payload this operation bound into its own transaction, validated at
+/// resolution against the archive owner's attested value. The readback then has
+/// to reproduce it, so the receipt answers "the destination serves these exact
+/// bytes at this exact address", not merely "some row exists there".
+struct ImportedMemberEvidence {
+    /// Destination record address the import wrote.
+    record_id: String,
+    /// Closed class the record was imported into.
+    class_token: &'static str,
+    /// Digest of the bytes this operation bound for this member. A readback
+    /// that does not reproduce it is not this member's import.
+    digest: String,
 }
 
 /// Builds one per-phase receipt entry for the destination fence document.
@@ -2421,6 +3176,9 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
         match execute_restore_write(
             transport,
             crate::client::RESTORE_OPERATION_PREPARE,
+            crate::client::fixed_restore_statement(crate::client::RESTORE_OPERATION_PREPARE)
+                .map_err(AdapterError::into_store_error)?
+                .to_owned(),
             bindings,
             // Destination preparation owns no admitted restore batch, so it owns
             // no attempt incarnation: there is no local bookkeeping obligation to
@@ -2533,7 +3291,15 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
                 reason: "the destination purge policy advanced after this restore",
             });
         }
-        let receipt = receipt_from_document(&record, &batch)?;
+        // Readiness requires the real canonical import evidence: every member the
+        // record claims is re-read out of the destination's own canonical read
+        // path, and a member the destination does not serve makes this batch's
+        // result partial. This certifies the batch, not the whole destination —
+        // the destination is only canonical-restore-ready once every admitted
+        // batch of its restore plan has produced such a receipt.
+        let receipt = self
+            .receipt_from_observed_imports(transport, &record, &batch)
+            .await?;
         project_verified_receipt(&batch, &receipt)?;
         Ok(receipt)
     }
@@ -2674,6 +3440,20 @@ impl SurrealStoreAdapter {
     ) -> Result<DestinationFence, StoreError> {
         validate_isolated_destination(&batch.destination, active_store, active_installation)
             .map_err(redact_store_error)?;
+        // The canonical import is written through this adapter's single admitted
+        // provider — the one the destination fence names. A document whose label
+        // says ISOLATED does not select an isolated provider, so the real
+        // binding is checked here: the batch's declared source must not be the
+        // admitted process that performs the write, or the import would land in
+        // the source's or the active store's canonical tables.
+        if batch.source.store_id == active_store
+            || batch.source.installation_id == active_installation
+        {
+            return Err(StoreError::InvalidField {
+                field: "restore.source_store_id",
+                reason: "restore must not write the source or active store",
+            });
+        }
         check_admission_freshness(&batch.destination.evidence, current_unix_ms())?;
         let fence =
             read_destination_fence(transport, &self.config, &batch.destination.destination_id)
@@ -2740,7 +3520,7 @@ impl SurrealStoreAdapter {
         source_digest: &str,
         expected_state_fence: &StateFence,
     ) -> Result<Option<RestoreRecordDocument>, StoreError> {
-        let (revision_digests, ordering_digests) = expected_head_digests(batch);
+        let (revision_digests, ordering_digests) = expected_head_digests(batch)?;
         let document = read_record_document(
             transport,
             &self.config,
@@ -2758,6 +3538,8 @@ impl SurrealStoreAdapter {
             expected_state_fence,
             &revision_digests,
             &ordering_digests,
+            &active_store_identity(&self.config).0,
+            &active_store_identity(&self.config).1,
         )?;
         Ok(Some(document))
     }
@@ -2818,9 +3600,14 @@ impl SurrealStoreAdapter {
         {
             // A resume of an interrupted operation stays inside the duration
             // bound measured from its first durable write, and keeps the
-            // original member identities and missing denominator.
+            // original member identities and missing denominator. The receipt is
+            // re-derived from the destination's own canonical readback, so an
+            // exact repeat never re-applies and never re-asserts an import it
+            // has not just observed.
             check_duration(existing.started_at_unix_ms, now)?;
-            let receipt = receipt_from_document(&existing, batch)?;
+            let receipt = self
+                .receipt_from_observed_imports(transport, &existing, batch)
+                .await?;
             exposure.note_durable_result_verified();
             project_verified_receipt(batch, &receipt)?;
             return Ok(receipt);
@@ -2835,54 +3622,168 @@ impl SurrealStoreAdapter {
         if exposure.requires_reconciliation() {
             return Err(unknown_outcome(batch.operation.operation_id.as_str()));
         }
-        let (member_entry, scope_entry) = read_purge_ledger(
+        // Current purge obligations, read before the write. The same rows are
+        // re-read inside the commit transaction, so an obligation recorded
+        // between this observation and the commit refuses the batch instead of
+        // leaving a stale `Restored` result behind.
+        let (member_observation, scope_observation) = read_purge_ledger(
             transport,
             &self.config,
             &batch.archive_member_digest,
             &batch.source.installation_id,
         )
         .await?;
-        let member_disposition = match decide_purge(member_entry.as_ref(), scope_entry.as_ref()) {
+        let purge_observed = purge_commit_preconditions(&member_observation, &scope_observation);
+        // The destination's own head values decide whether the batch's expected
+        // state still holds. The batch's heads are an input; these are the
+        // observed values the comparison is made against.
+        let revision_expected: Vec<u64> = batch
+            .expected_revision_heads
+            .iter()
+            .map(|head| head.expected_revision)
+            .collect();
+        let ordering_expected: Vec<u64> = batch
+            .expected_ordering_heads
+            .iter()
+            .map(|head| head.expected_sequence)
+            .collect();
+        let revision_keys: Vec<String> = batch
+            .expected_revision_heads
+            .iter()
+            .map(|head| head.key.as_str().to_owned())
+            .collect();
+        let ordering_keys: Vec<String> = batch
+            .expected_ordering_heads
+            .iter()
+            .map(|head| head.scope.as_str().to_owned())
+            .collect();
+        check_observed_heads(
+            &revision_expected,
+            &read_destination_heads(
+                transport,
+                &self.config,
+                RestoreRecordClass::RevisionHead,
+                &revision_keys,
+            )
+            .await?,
+            StoreError::RevisionConflict,
+        )?;
+        check_observed_heads(
+            &ordering_expected,
+            &read_destination_heads(
+                transport,
+                &self.config,
+                RestoreRecordClass::OrderingHead,
+                &ordering_keys,
+            )
+            .await?,
+            StoreError::OrderingConflict,
+        )?;
+        // Source resolution: every member's canonical logical payload is
+        // obtained from the archive/artifact owner's carrier rows, before any
+        // member is given a disposition. A member whose payload cannot be
+        // resolved is unresolved, never restored.
+        let resolved = resolve_archive_members(transport, &self.config, batch).await?;
+        // A purge obligation applies to the archive member scope, and the
+        // residency, privacy and retention domains stay separate: an obligation
+        // in one domain never silently widens into another.
+        let scope_disposition = match decide_purge(
+            member_observation.entry.as_ref(),
+            scope_observation.entry.as_ref(),
+        ) {
             PurgeDecision::Clear => MemberDisposition::Restored,
             PurgeDecision::Suppressed => MemberDisposition::Suppressed,
             PurgeDecision::Unresolved => MemberDisposition::Unresolved,
         };
-        let member_count = batch.member_count;
-        let denominator = match member_disposition {
-            MemberDisposition::Restored => RestoreDenominator::new(member_count, 0, 0, 0),
-            MemberDisposition::Suppressed => RestoreDenominator::new(0, 0, member_count, 0),
-            MemberDisposition::Unresolved => RestoreDenominator::new(0, 0, 0, member_count),
-        };
-        denominator.validate()?;
-        let (completeness, mutation) = if denominator.unresolved == 0 {
-            if member_disposition == MemberDisposition::Restored {
-                (
-                    SnapshotCompleteness::Complete,
-                    StoreMutationDisposition::Committed,
-                )
-            } else {
-                (
-                    SnapshotCompleteness::Complete,
-                    StoreMutationDisposition::ProvenNotApplied,
-                )
+        let imports: Vec<&ResolvedArchiveMember> = if scope_disposition
+            == MemberDisposition::Restored
+        {
+            let imports: Vec<&ResolvedArchiveMember> = resolved
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|import| import.member.member_type != SnapshotMemberType::Reference)
+                .collect();
+            // Each resolved payload must still be the batch member it was
+            // resolved for. Resolution is positional, so this re-proves the
+            // binding rather than assuming it: a payload that is not equal to
+            // the admitted member at its own index is not this batch's
+            // payload, whatever its carrier row claimed.
+            for import in &imports {
+                let index =
+                    usize::try_from(import.member_index).map_err(|_| StoreError::InvalidField {
+                        field: "restore.member_index",
+                        reason: "resolved member index is out of range",
+                    })?;
+                let member = batch.members.get(index).ok_or(StoreError::InvalidField {
+                    field: "restore.member_index",
+                    reason: "resolved member index is out of range",
+                })?;
+                if import.member != *member {
+                    return Err(StoreError::IdentityConflict);
+                }
             }
+            imports
         } else {
-            (
-                SnapshotCompleteness::Partial,
-                StoreMutationDisposition::Partial,
-            )
+            Vec::new()
         };
+        // The canonical import, its operation receipt and the destination
+        // bookkeeping all commit in one transaction. Each member's disposition
+        // is planned here from the resolution and the current ledger, then
+        // re-decided from the destination's own readback after the commit: a
+        // member is `Restored` only when its row is actually served.
+        let dispositions: Vec<MemberDisposition> = batch
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| match scope_disposition {
+                MemberDisposition::Suppressed => MemberDisposition::Suppressed,
+                MemberDisposition::Unresolved => MemberDisposition::Unresolved,
+                // A reference edge is never a record the import can write, so it
+                // is rejected as a row, not left unresolved. Its closure is
+                // proved against this collected set below.
+                MemberDisposition::Restored => {
+                    if member.member_type == SnapshotMemberType::Reference {
+                        MemberDisposition::Rejected
+                    } else {
+                        match resolved.get(index) {
+                            Some(Some(_)) => MemberDisposition::Restored,
+                            _ => MemberDisposition::Unresolved,
+                        }
+                    }
+                }
+                MemberDisposition::Rejected => MemberDisposition::Rejected,
+            })
+            .collect();
+        // Typed closure, proved against the planned dispositions before anything
+        // is written: an edge this batch claims to have closed must land on a
+        // member this batch actually imports, in the same obligation domain.
+        // Unverified derived data cannot grant completion, so a dangling edge
+        // refuses the batch rather than being committed and reported.
+        validate_reference_closure_against(batch, &dispositions)?;
+        let denominator = denominator_of(&dispositions);
+        denominator.validate()?;
+        let (completeness, mutation) = planned_outcome(&dispositions);
+        // The durable record names the class, the address and the exact content
+        // digest this commit writes for each member. That digest is fixed here
+        // from the payload already bound into the transaction, and the
+        // post-commit readback has to reproduce it before the member can be
+        // reported restored — so a record written without a matching import is
+        // re-read as unresolved rather than certified.
+        let planned = planned_evidence(batch, &imports);
         let members = member_records(
             batch,
             &source.domains,
-            member_disposition,
+            &dispositions,
+            &planned,
             fence.document.purge_policy_revision,
-        );
-        let (revision_digests, ordering_digests) = expected_head_digests(batch);
+        )?;
+        let (revision_digests, ordering_digests) = expected_head_digests(batch)?;
         let document = RestoreRecordDocument {
             operation: batch.operation.clone(),
             destination_id: batch.destination.destination_id.clone(),
             destination_identity: fence.document.destination_identity.clone(),
+            destination_store_id: active_store.clone(),
+            destination_installation_id: active_installation.clone(),
             source_identity_digest: source.digest.clone(),
             archive_member_digest: batch.archive_member_digest.clone(),
             target_schema: batch.target_schema.clone(),
@@ -2898,8 +3799,13 @@ impl SurrealStoreAdapter {
             started_at_unix_ms: now,
         };
         let (payload, value_digest) = encode_document(&document)?;
-        let document_bytes =
-            u64::try_from(payload.len()).map_err(|_| StoreError::PayloadTooLarge)?;
+        // The byte bound covers the canonical bytes this commit writes, not only
+        // the bookkeeping document: a batch that imports a large payload inside a
+        // small record is still a large restore.
+        let document_bytes = u64::try_from(payload.len())
+            .map_err(|_| StoreError::PayloadTooLarge)?
+            .checked_add(imported_payload_bytes(&imports)?)
+            .ok_or(StoreError::PayloadTooLarge)?;
         check_cumulative_bytes(fence.document.cumulative_bytes, document_bytes)?;
         let phase = phase_receipt(batch, denominator, now)?;
         let destination = destination_after_phase(&fence.document, phase, document_bytes)?;
@@ -2941,27 +3847,32 @@ impl SurrealStoreAdapter {
             placement_payload,
             placement_digest,
         );
-        let bindings = apply_bindings(
+        let (shape, bindings) = apply_bindings(
             &destination_row,
             &record_row,
             &placement_row,
             &record_row_key,
             &placement_key_value,
             &fence,
+            &ctx.state_fence,
+            batch,
+            &purge_observed,
+            &imports,
         )?;
         match execute_restore_write(
             transport,
             crate::client::RESTORE_OPERATION_APPLY,
+            crate::client::restore_apply_statement(shape),
             bindings,
             Some(&mut *exposure),
         )
         .await
         {
             Ok(()) => {}
-            Err(StoreError::IdentityConflict) => {
-                // A concurrent winner owns this operation identity or this
-                // archive placement: reconcile by exact readback, never
-                // re-apply under a new identity.
+            Err(StoreError::IdentityConflict | StoreError::RevisionConflict) => {
+                // A concurrent winner owns this operation identity, this archive
+                // placement, or the destination fence: reconcile by exact
+                // readback, never re-apply under a new identity.
                 if let Some(existing) = self
                     .read_record(
                         transport,
@@ -2972,36 +3883,21 @@ impl SurrealStoreAdapter {
                     )
                     .await?
                 {
-                    let receipt = receipt_from_document(&existing, batch)?;
+                    let receipt = self
+                        .receipt_from_observed_imports(transport, &existing, batch)
+                        .await?;
                     exposure.note_durable_result_verified();
                     project_verified_receipt(batch, &receipt)?;
                     return Ok(receipt);
                 }
                 return Err(StoreError::IdentityConflict);
             }
-            Err(StoreError::RevisionConflict) => {
-                // The destination fence moved: the exact record decides.
-                if let Some(existing) = self
-                    .read_record(
-                        transport,
-                        crate::client::RESTORE_OPERATION_RECONCILE,
-                        batch,
-                        &source.digest,
-                        &ctx.state_fence,
-                    )
-                    .await?
-                {
-                    let receipt = receipt_from_document(&existing, batch)?;
-                    exposure.note_durable_result_verified();
-                    project_verified_receipt(batch, &receipt)?;
-                    return Ok(receipt);
-                }
-                return Err(StoreError::RevisionConflict);
-            }
             Err(error) => return Err(error),
         }
-        // The committed receipt is derived from exact durable readback; a lost
-        // response stays unknown and is reconciled by operation identity.
+        // The committed receipt is derived from the destination's own canonical
+        // readback of every imported member, not from the bookkeeping the commit
+        // just wrote. A lost response stays unknown and is reconciled by
+        // operation identity.
         let committed = self
             .read_record(
                 transport,
@@ -3012,11 +3908,232 @@ impl SurrealStoreAdapter {
             )
             .await?
             .ok_or(StoreError::MissingReceiptEnvelope)?;
-        let receipt = receipt_from_document(&committed, batch)?;
+        let receipt = self
+            .receipt_from_observed_imports(transport, &committed, batch)
+            .await?;
         exposure.note_durable_result_verified();
         project_verified_receipt(batch, &receipt)?;
         Ok(receipt)
     }
+
+    /// Projects the receipt only after every member's canonical import has been
+    /// re-read out of the destination.
+    ///
+    /// The durable record names what each member claimed — its closed class, its
+    /// destination address and the digest of the bytes this operation committed
+    /// for it; this observes what the destination actually serves. A member the
+    /// destination does not return, or returns with different bytes, is
+    /// `Unresolved`, so a batch whose bookkeeping committed while its import did
+    /// not become servable reports partial instead of complete. The typed
+    /// reference closure is then re-proved against what was observed, not
+    /// against what was declared.
+    async fn receipt_from_observed_imports(
+        &self,
+        transport: &RpcTransport,
+        document: &RestoreRecordDocument,
+        batch: &CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreError> {
+        let first = document.members.first().ok_or(StoreError::InvalidReceipt)?;
+        let domains = RestoreDomains {
+            residency: first.residency_domain.clone(),
+            privacy: first.privacy_domain.clone(),
+            retention: first.retention_domain.clone(),
+        };
+        if document.members.len() != batch.members.len() {
+            return Err(StoreError::InvalidReceipt);
+        }
+        let mut dispositions = Vec::with_capacity(document.members.len());
+        let mut evidence = Vec::with_capacity(document.members.len());
+        for member in &document.members {
+            // Only a claim that names a closed class, a record address *and* the
+            // content digest this operation committed can be looked up in the
+            // destination. A metadata-only record written before canonical import
+            // named none of them, so it stays bookkeeping evidence: it is re-read
+            // as `Unresolved` rather than being certified as imported data.
+            let observed = match (
+                member.disposition,
+                member.imported_class.as_deref(),
+                member.imported_record_id.as_deref(),
+                member.imported_digest.as_deref(),
+            ) {
+                (
+                    MemberDisposition::Restored,
+                    Some(class_token),
+                    Some(record_id),
+                    Some(expected_digest),
+                ) => {
+                    let class = RestoreRecordClass::parse(class_token).ok_or({
+                        StoreError::InvalidField {
+                            field: "restore.imported_class",
+                            reason: "unknown canonical class token",
+                        }
+                    })?;
+                    read_imported_member(transport, &self.config, class, record_id, expected_digest)
+                        .await?
+                        .map(|digest| ImportedMemberEvidence {
+                            record_id: record_id.to_owned(),
+                            class_token: class.token(),
+                            digest,
+                        })
+                }
+                _ => None,
+            };
+            dispositions.push(match observed {
+                Some(_) => MemberDisposition::Restored,
+                None => match member.disposition {
+                    MemberDisposition::Suppressed => MemberDisposition::Suppressed,
+                    MemberDisposition::Rejected => MemberDisposition::Rejected,
+                    MemberDisposition::Restored | MemberDisposition::Unresolved => {
+                        MemberDisposition::Unresolved
+                    }
+                },
+            });
+            evidence.push(observed);
+        }
+        validate_reference_closure_against(batch, &dispositions)?;
+        let denominator = denominator_of(&dispositions);
+        denominator.validate()?;
+        let members = member_records(
+            batch,
+            &domains,
+            &dispositions,
+            &evidence,
+            document.current_purge_revision,
+        )?;
+        let observed_document = RestoreRecordDocument {
+            denominator,
+            members,
+            completeness: SnapshotCompleteness::Partial,
+            disposition: StoreMutationDisposition::Partial,
+            ..document.clone()
+        };
+        // The observed document is what the destination actually serves; the
+        // receipt is projected from it, never from the pre-write claim.
+        let (completeness, mutation) =
+            observed_outcome(&observed_document, &observed_document.denominator)?;
+        receipt_from_document(
+            &RestoreRecordDocument {
+                completeness,
+                disposition: mutation,
+                ..observed_document
+            },
+            batch,
+        )
+    }
+}
+
+/// Tallies the canonical payload bytes one apply transaction imports.
+///
+/// The bound must cover what the destination actually receives, so the resolved
+/// payloads are measured in their canonical encoding rather than the count of
+/// members being the only thing accounted for.
+fn imported_payload_bytes(imports: &[&ResolvedArchiveMember]) -> Result<u64, StoreError> {
+    let mut total = 0_u64;
+    for member in imports {
+        let bytes = u64::try_from(canonical_digest_bytes(&member.payload)?.len())
+            .map_err(|_| StoreError::PayloadTooLarge)?;
+        total = total
+            .checked_add(bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+    }
+    Ok(total)
+}
+
+/// Tallies one per-member disposition list into the exact denominator.
+fn denominator_of(dispositions: &[MemberDisposition]) -> RestoreDenominator {
+    let count = |wanted: MemberDisposition| {
+        u64::try_from(
+            dispositions
+                .iter()
+                .filter(|disposition| **disposition == wanted)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    };
+    RestoreDenominator::new(
+        count(MemberDisposition::Restored),
+        count(MemberDisposition::Rejected),
+        count(MemberDisposition::Suppressed),
+        count(MemberDisposition::Unresolved),
+    )
+}
+
+/// Derives the pre-commit completeness and disposition of a planned batch.
+///
+/// This is the *plan*, recorded in the durable operation receipt. It is not the
+/// verdict: [`observed_outcome`] re-derives completeness from the destination's
+/// own readback, and a member whose import the destination does not serve turns
+/// this plan into a partial result.
+fn planned_outcome(
+    dispositions: &[MemberDisposition],
+) -> (SnapshotCompleteness, StoreMutationDisposition) {
+    let denominator = denominator_of(dispositions);
+    if denominator.unresolved > 0 {
+        return (
+            SnapshotCompleteness::Partial,
+            StoreMutationDisposition::Partial,
+        );
+    }
+    if denominator.restored > 0 {
+        return (
+            SnapshotCompleteness::Complete,
+            StoreMutationDisposition::Committed,
+        );
+    }
+    (
+        SnapshotCompleteness::Complete,
+        StoreMutationDisposition::ProvenNotApplied,
+    )
+}
+
+/// Binds the class, the address and the content digest of each member this
+/// commit will import.
+///
+/// The digest is the one already validated at resolution against the archive
+/// owner's attested value, and it is what the post-commit readback must
+/// reproduce. Binding it here is what makes the readback a content check rather
+/// than a row-presence check.
+fn planned_evidence(
+    batch: &CanonicalRestoreBatch,
+    imports: &[&ResolvedArchiveMember],
+) -> Vec<Option<ImportedMemberEvidence>> {
+    let mut evidence: Vec<Option<ImportedMemberEvidence>> =
+        (0..batch.members.len()).map(|_| None).collect();
+    for member in imports {
+        let index = usize::try_from(member.member_index).unwrap_or(usize::MAX);
+        let Some(slot) = evidence.get_mut(index) else {
+            continue;
+        };
+        *slot = Some(ImportedMemberEvidence {
+            record_id: member.record_id.clone(),
+            class_token: member.class.token(),
+            digest: member.payload_digest.clone(),
+        });
+    }
+    evidence
+}
+
+/// Builds the commit preconditions for the current purge obligations.
+///
+/// Both observed obligations travel into the commit transaction as their
+/// registry key and the exact durable revision the row was read at, with an
+/// absent row bound as revision `0`. The transaction re-reads the same rows and
+/// refuses unless the presence and revision are unchanged, so an obligation
+/// recorded after this observation aborts the commit instead of leaving a stale
+/// disposition behind.
+///
+/// Absence is still not proof that the authoritative privacy owner holds no
+/// obligation: it is only the absence this port's own ledger records, and it is
+/// carried as an explicit "absent" precondition rather than folded into a clear
+/// result.
+fn purge_commit_preconditions(
+    member: &PurgeObservation,
+    scope: &PurgeObservation,
+) -> Vec<(String, u64)> {
+    vec![
+        (member.key.clone(), member.row_revision),
+        (scope.key.clone(), scope.row_revision),
+    ]
 }
 
 /// Source identity binding of one batch plus the destination-owned domains its
@@ -3026,16 +4143,31 @@ struct SourceBinding {
     domains: RestoreDomains,
 }
 
-/// Builds the bound parameters of one apply transaction.
-fn apply_bindings(
+/// Binds the durable bookkeeping half of one apply transaction.
+///
+/// The registry table, the destination fence compare-and-set values, the
+/// per-operation record row and the archive-placement exclusivity row. All of
+/// them are bound values: no row content and no identifier is interpolated into
+/// statement text.
+///
+/// Two different fences are bound, and they are not interchangeable:
+/// `restore_expected_destination_fence` is the destination row's own fence, the
+/// value the fence compare-and-set must observe, while
+/// `restore_expected_state_fence` is the state fence *this request* was admitted
+/// under — the generation the batch's own expected heads were validated against
+/// by [`check_expected_state`] and the value the in-transaction head guards
+/// compare a destination head against.
+#[allow(clippy::too_many_arguments)]
+fn bookkeeping_bindings(
     destination_row: &RecoveryRecord,
     record_row: &RecoveryRecord,
     placement_row: &RecoveryRecord,
     record_row_key: &str,
     placement_row_key: &str,
     fence: &DestinationFence,
-) -> Result<serde_json::Map<String, serde_json::Value>, StoreError> {
-    let mut bindings = serde_json::Map::new();
+    expected_state_fence: &StateFence,
+    bindings: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), StoreError> {
     bindings.insert(
         "restore_table".to_owned(),
         serde_json::Value::String(crate::client::RESTORE_REGISTRY_TABLE.to_owned()),
@@ -3078,7 +4210,126 @@ fn apply_bindings(
         "restore_placement_row".to_owned(),
         row_binding(placement_row)?,
     );
-    Ok(bindings)
+    bindings.insert(
+        "restore_expected_state_fence".to_owned(),
+        serde_json::to_value(expected_state_fence)
+            .map_err(|error| AdapterError::Serialization(error.to_string()).into_store_error())?,
+    );
+    Ok(())
+}
+
+/// Binds the expected-head, purge-obligation and canonical-import half of one
+/// apply transaction.
+///
+/// Each expected head travels as its key and the exact revision or sequence the
+/// batch was admitted against, each observed purge obligation as its row address
+/// and its observed revision, and each resolved canonical record as its class
+/// table, its record address and its payload.
+fn precondition_bindings(
+    batch: &CanonicalRestoreBatch,
+    purge_observed: &[(String, u64)],
+    imports: &[&ResolvedArchiveMember],
+    bindings: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    bindings.insert(
+        "restore_revision_table".to_owned(),
+        serde_json::Value::String(RestoreRecordClass::RevisionHead.table().to_owned()),
+    );
+    bindings.insert(
+        "restore_ordering_table".to_owned(),
+        serde_json::Value::String(RestoreRecordClass::OrderingHead.table().to_owned()),
+    );
+    for (index, head) in batch.expected_revision_heads.iter().enumerate() {
+        bindings.insert(
+            format!("restore_revision_key{index}"),
+            serde_json::Value::String(head.key.as_str().to_owned()),
+        );
+        bindings.insert(
+            format!("restore_expected_revision{index}"),
+            serde_json::Value::from(head.expected_revision),
+        );
+    }
+    for (index, head) in batch.expected_ordering_heads.iter().enumerate() {
+        bindings.insert(
+            format!("restore_ordering_scope{index}"),
+            serde_json::Value::String(head.scope.as_str().to_owned()),
+        );
+        bindings.insert(
+            format!("restore_expected_sequence{index}"),
+            serde_json::Value::from(head.expected_sequence),
+        );
+    }
+    for (index, (key, revision)) in purge_observed.iter().enumerate() {
+        bindings.insert(
+            format!("restore_purge_row_id{index}"),
+            serde_json::Value::String(registry_record_id(key)?),
+        );
+        bindings.insert(
+            format!("restore_expected_purge_revision{index}"),
+            serde_json::Value::from(*revision),
+        );
+    }
+    for (index, member) in imports.iter().enumerate() {
+        bindings.insert(
+            format!("restore_class_table{index}"),
+            serde_json::Value::String(member.class.table().to_owned()),
+        );
+        bindings.insert(
+            format!("restore_class_row_id{index}"),
+            serde_json::Value::String(member.record_id.clone()),
+        );
+        bindings.insert(
+            format!("restore_class_record{index}"),
+            member.payload.clone(),
+        );
+    }
+    Ok(())
+}
+
+/// Builds the bound parameters of one apply transaction.
+///
+/// Every parameter is a bound value. The count of each indexed family is
+/// reported in the returned [`crate::client::RestoreApplyShape`] so the composed
+/// statement and the bindings are rendered from one shape and cannot drift
+/// apart.
+#[allow(clippy::too_many_arguments)]
+fn apply_bindings(
+    destination_row: &RecoveryRecord,
+    record_row: &RecoveryRecord,
+    placement_row: &RecoveryRecord,
+    record_row_key: &str,
+    placement_row_key: &str,
+    fence: &DestinationFence,
+    expected_state_fence: &StateFence,
+    batch: &CanonicalRestoreBatch,
+    purge_observed: &[(String, u64)],
+    imports: &[&ResolvedArchiveMember],
+) -> Result<
+    (
+        crate::client::RestoreApplyShape,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    StoreError,
+> {
+    let mut bindings = serde_json::Map::new();
+    bookkeeping_bindings(
+        destination_row,
+        record_row,
+        placement_row,
+        record_row_key,
+        placement_row_key,
+        fence,
+        expected_state_fence,
+        &mut bindings,
+    )?;
+    precondition_bindings(batch, purge_observed, imports, &mut bindings)?;
+    let shape = crate::client::RestoreApplyShape {
+        revision_heads: batch.expected_revision_heads.len(),
+        ordering_heads: batch.expected_ordering_heads.len(),
+        purge_obligations: purge_observed.len(),
+        imports: imports.len(),
+    };
+    Ok((shape, bindings))
 }
 
 #[cfg(test)]

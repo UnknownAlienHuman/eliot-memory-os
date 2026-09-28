@@ -33,13 +33,17 @@ pub(crate) mod session_pool;
 /// owner: no restore caller can name a table, key prefix or payload schema of
 /// its own.
 pub(crate) use backup_restore::{
-    RESTORE_KEY_DESTINATION_PREFIX, RESTORE_KEY_PLACEMENT_PREFIX, RESTORE_KEY_PURGE_MEMBER_PREFIX,
-    RESTORE_KEY_PURGE_SCOPE_PREFIX, RESTORE_KEY_RECORD_PREFIX, RESTORE_NAMESPACE,
-    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_FENCE, RESTORE_OPERATION_PREPARE,
-    RESTORE_OPERATION_PURGE_LEDGER, RESTORE_OPERATION_RECONCILE, RESTORE_OPERATION_VALIDATE,
-    RESTORE_REGISTRY_TABLE, RESTORE_SCHEMA_DESTINATION, RESTORE_SCHEMA_PLACEMENT,
-    RESTORE_SCHEMA_PURGE, RESTORE_SCHEMA_RECORD, fixed_restore_statement,
-    is_restore_destination_absent, is_restore_duplicate, is_restore_fence_race, restore_capability,
+    RESTORE_ERROR_OPERATION, RESTORE_KEY_ARCHIVE_MEMBER_PREFIX, RESTORE_KEY_DESTINATION_PREFIX,
+    RESTORE_KEY_PLACEMENT_PREFIX, RESTORE_KEY_PURGE_MEMBER_PREFIX, RESTORE_KEY_PURGE_SCOPE_PREFIX,
+    RESTORE_KEY_RECORD_PREFIX, RESTORE_NAMESPACE, RESTORE_OPERATION_APPLY,
+    RESTORE_OPERATION_ARCHIVE_MEMBERS, RESTORE_OPERATION_CANONICAL_READ, RESTORE_OPERATION_FENCE,
+    RESTORE_OPERATION_PREPARE, RESTORE_OPERATION_PURGE_LEDGER, RESTORE_OPERATION_RECONCILE,
+    RESTORE_OPERATION_VALIDATE, RESTORE_REGISTRY_TABLE, RESTORE_SCHEMA_ARCHIVE_MEMBER,
+    RESTORE_SCHEMA_DESTINATION, RESTORE_SCHEMA_PLACEMENT, RESTORE_SCHEMA_PURGE,
+    RESTORE_SCHEMA_RECORD, RestoreApplyShape, fixed_restore_statement,
+    is_restore_destination_absent, is_restore_duplicate, is_restore_fence_race,
+    is_restore_ordering_head_changed, is_restore_purge_ledger_changed,
+    is_restore_revision_head_changed, restore_apply_statement, restore_capability,
     validate_restore_operation,
 };
 /// Fixed coherent-snapshot operation registration (issue #951).
@@ -444,6 +448,10 @@ mod tests {
             database: "eliot".to_owned(),
             username: "provider-user".to_owned(),
             password: SecretString::new("provider-password".into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: "127.0.0.1:18000".to_owned(),
             installation_id: "installation-test".to_owned(),
             installation_profile: "portable_dev".to_owned(),
@@ -602,7 +610,14 @@ mod tests {
         assert_eq!(spy.arguments, config.provider_arguments);
         assert_eq!(
             spy.environment_names,
-            ["SystemRoot", "WINDIR", "TEMP", "TMP"]
+            [
+                "SystemRoot",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                provider_owner::PROVIDER_BOOTSTRAP_USER_ENV,
+                provider_owner::PROVIDER_BOOTSTRAP_PASSWORD_ENV,
+            ]
         );
     }
 
@@ -797,7 +812,17 @@ mod tests {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["SystemRoot", "WINDIR", "TEMP", "TMP"]);
+        assert_eq!(
+            names,
+            [
+                "SystemRoot",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                provider_owner::PROVIDER_BOOTSTRAP_USER_ENV,
+                provider_owner::PROVIDER_BOOTSTRAP_PASSWORD_ENV,
+            ]
+        );
         for inherited_runtime_name in ["PATH", "RUST_LOG", "SURREAL_PATH", "SURREAL_BIND"] {
             assert!(!names.iter().any(|name| name == inherited_runtime_name));
         }

@@ -588,6 +588,14 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #1773 (I3.4, W2): immediately after the complete paged drain above, apply
+    // and COMMIT the dependency change the Host admitted about this daemon's own
+    // served bytes. This is the step that makes a restriction durable: an
+    // in-process invalidation is erased by a restart, after which the evidence
+    // it limited can be re-admitted. It is placed here, before the composition is
+    // shared, because the commit is an async Kernel exchange and this is the last
+    // point at which the composition can be borrowed exclusively.
+    commit_installation_scope_restriction(&mut composition, &launch.executable_sha256);
     // #1145: report the Governor-owned improvement pipeline owner at startup
     // (diagnostics only), keeping the owner identity observable without adding
     // policy semantics to the composition root.
@@ -997,6 +1005,131 @@ fn hydrate_capability_evidence_view(
                 event = "eliotd.capability_evidence_hydration_unavailable",
                 reason = %reason,
                 "canonical capability evidence did not refresh the admission view; the view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
+    }
+}
+
+/// The daemon's OWN admitted installation scope, and the only dependency
+/// selector built from it (issue #1773, I3.4, W2).
+///
+/// `executable_sha256` is the digest the Host admitted on the launch contour:
+/// the exact 8-value descriptor binding requires the literal
+/// `--executable-sha256` flag (`parse_launch_args`), `DaemonConfig::load_protected_bound`
+/// validates it, and the same value already names this process's artifact
+/// (`eliotd-exe:<digest>`). It is therefore the one fact the daemon can attest
+/// to about its own runtime instance and its own integration implementation, and
+/// it is bound to both of exactly those two `RouteScopeFingerprint` dimensions.
+///
+/// Every other dimension stays `None`, i.e. UNKNOWN, never inferred. The
+/// requested provider/model/auth/billing route is not observable from this
+/// process, and I3.4 is explicit that an unexposed field is `unknown` and must
+/// not be back-filled from a UI selection or prompt text. The daemon asserts
+/// what it observed about itself and nothing else.
+fn observed_installation_scope(executable_sha256: &str) -> eliot_governor::RouteScopeFingerprint {
+    let artifact = format!("eliotd-exe:{executable_sha256}");
+    eliot_governor::RouteScopeFingerprint {
+        runtime_hash: Some(artifact.clone()),
+        adapter_hash: Some(artifact),
+        ..eliot_governor::RouteScopeFingerprint::default()
+    }
+}
+
+/// Applies the installation-scope dependency change to the drained admission
+/// view and commits every record it limited (issue #1773, I3.4, W2).
+///
+/// **The selector is narrow by construction, and that is the point.**
+/// `ScopeDependencySelector::all()` is exactly the trap this repository already
+/// recorded: a record is staled when it DIFFERS from `current` on a selected
+/// dimension, so selecting every dimension against a single observed scope
+/// invalidates every other route's and account's still-valid evidence, on every
+/// call, permanently. Here the selector names only `runtime_hash` and
+/// `adapter_hash` — the two dimensions the Host admitted about THIS process.
+///
+/// **The exact predicate, so the retained case is not over-claimed.** With this
+/// selector `ScopeDependencySelector::selects_difference` reduces to
+/// `record.runtime_hash != observed.runtime_hash
+/// || record.adapter_hash != observed.adapter_hash`. So a record matching the
+/// observed installation on BOTH dimensions is never staled, and no other
+/// dimension — provider/model, serializer, auth profile, tool-call ordering —
+/// can stale anything at all from this call site, which is what preserves
+/// `is_fresh_positive_for`'s exact-match retention for every unrelated route. A
+/// record that matches one dimension and differs on the other IS staled, and
+/// that is correct rather than lossy: `is_fresh_positive_for` already demands
+/// exact equality of the whole fingerprint, so such a record could never have
+/// admitted the observed route, and this is exactly I3.4's "adapter change makes
+/// dependent evidence stale".
+///
+/// A record that does differ is restricted, and the restriction is then COMMITTED
+/// through the Governor's existing `RecordCapabilityEvidenceRecord` leg, so the
+/// next restart re-derives it from the served
+/// `limitations_and_negative_evidence` rather than from memory.
+///
+/// The step is a one-shot startup write on a composition that is still
+/// exclusively owned here, so a current-thread runtime is built for exactly this
+/// step — the same shape `DaemonKernelClient::blocking` already uses for its
+/// one-shot exchanges. No thread, no transport, no `start()` contour or
+/// run-loop change.
+///
+/// Fail-closed: a refused commit is a `warn` naming the exact reason and how far
+/// it got. The in-process restriction the registry already applied REMAINS, so
+/// this process keeps refusing the affected evidence; only its durability across
+/// a restart is lost, and the diagnostic says so.
+fn commit_installation_scope_restriction(
+    composition: &mut DaemonComposition,
+    executable_sha256: &str,
+) {
+    // A drain that failed left the view as it was, so there is nothing for the
+    // change to narrow; the step then legitimately restricts nothing and the
+    // log line below reports zero rather than claiming coverage.
+    let observed = observed_installation_scope(executable_sha256);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_unavailable",
+                reason = %error,
+                "the installation-scope restriction could not be committed; it remains in process only, so a restart would forget it while this process keeps refusing the restricted evidence"
+            );
+            return;
+        }
+    };
+    let committed = runtime.block_on(composition.commit_scope_change_restriction(
+        &observed,
+        eliot_governor::ScopeDependencySelector {
+            runtime_hash: true,
+            adapter_hash: true,
+            ..eliot_governor::ScopeDependencySelector::none()
+        },
+    ));
+    match committed {
+        Ok(report) if report.restricted > 0 => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_committed",
+                restricted_records = report.restricted,
+                committed_records = report.committed,
+                change_ref = %report.blocking_evidence_ref,
+                "a runtime/adapter change staled the dependent evidence and the restriction is now an owner-issued durable fact that survives a restart"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_not_needed",
+                "every retained evidence record already matches this installation's admitted runtime and adapter hashes; nothing was staled and nothing was written"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_unavailable",
+                reason = %error,
+                "the installation-scope restriction was not committed; it remains in process only, so a restart would forget it while this process keeps refusing the restricted evidence"
             );
         }
     }
@@ -4401,13 +4534,18 @@ fn classify_submit_ack(
             ticket.ticket_id
         )));
     }
-    ack.validate_against_result(result).map_err(|error| {
-        ActivationDispatchError::Hard(format!(
-            "Kernel activation result ack payload mismatch: {error}"
-        ))
-    })?;
+    // #1115: the full accepted-payload validation belongs to the `Accepted`
+    // arm only, exactly as in reconcile classification. Running the
+    // accepted-result validator before this match rejected every closed
+    // `Unknown` acknowledgement as a payload mismatch and made the typed
+    // `Unknown` outcome below unreachable.
     match ack.outcome {
         AgentActivationResultAckOutcome::Accepted => {
+            ack.validate_against_result(result).map_err(|error| {
+                ActivationDispatchError::Hard(format!(
+                    "Kernel activation result ack payload mismatch: {error}"
+                ))
+            })?;
             // #740: ack record. Stable retained-result correlation is not
             // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
@@ -4522,962 +4660,6 @@ fn unix_ms(now: SystemTime) -> Result<u64, String> {
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
-}
-
-/// Plans one closed T11.1 `GetEvidencePack` read for the daemon query path.
-///
-/// This is the registration half of the `eliot.query` plumbing: the caller
-/// holds the already-connected [`DaemonKernelClient`] and the
-/// [`DaemonComposition`] (see `context_read_client`), and calls this pure
-/// planner with the exact admitted fence plus explicit `scope_id`/`subject`/
-/// `max_records` selectors. The returned [`NamedReadRequest`] travels the
-/// single `store_named` transport via [`KernelContextReadClient`]; free text
-/// never becomes a selector and no second consistency algorithm lives here.
-///
-/// For T11.1 the consistency is `Eventual` with no dependency revisions, so
-/// this is exactly the `ReadService` fast path (no stable re-read, no churn
-/// check); when the `eliot-read` dependency is available the caller should
-/// delegate to `ReadService::query` with a `Verification` intent instead of
-/// calling `execute_named` directly. The store catalogue remains the
-/// authority: this planner validates shape only, and the closed
-/// `subject`/`max_records` membership plus the `EVIDENCE_PACK_MAX_RECORDS`
-/// cap are enforced by the adapters.
-#[allow(
-    dead_code,
-    reason = "T11.1 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_evidence_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    subject: &str,
-    max_records: &str,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    if subject.trim().is_empty() || subject.chars().any(char::is_control) {
-        return Err(
-            "daemon evidence read subject must be non-blank with no control characters".to_owned(),
-        );
-    }
-    if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
-        return Err(
-            "daemon evidence read max_records must be a non-blank decimal bound".to_owned(),
-        );
-    }
-    let bound: u32 = max_records.trim().parse().map_err(|_| {
-        "daemon evidence read max_records must be a positive decimal bound".to_owned()
-    })?;
-    if bound == 0 {
-        return Err("daemon evidence read max_records must be a positive decimal bound".to_owned());
-    }
-    let scope = eliot_store_api::ScopeId::new(scope_id)
-        .map_err(|error| format!("daemon evidence read scope: {error}"))?;
-    let mut parameters = std::collections::BTreeMap::new();
-    parameters.insert(
-        "subject".to_owned(),
-        serde_json::Value::String(subject.trim().to_owned()),
-    );
-    parameters.insert(
-        "max_records".to_owned(),
-        serde_json::Value::String(max_records.trim().to_owned()),
-    );
-    let request = eliot_store_api::NamedReadRequest {
-        operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
-        scope_id: Some(scope),
-        consistency: eliot_store_api::ReadConsistency::Eventual,
-        state_fence: fence.clone(),
-        parameters,
-    };
-    request
-        .validate()
-        .map_err(|error| format!("daemon evidence read request: {error}"))?;
-    Ok(request)
-}
-
-/// Projects a successful evidence-pack response into the daemon query content.
-///
-/// Returns the exact record/provenance shape the `eliot.query` caller
-/// receives: the store payload crosses unchanged under `evidence_pack` with
-/// its subject/scope identity. Fails closed when the operation is not
-/// `GetEvidencePack`, the fence does not match the admitted fence, or the
-/// payload lacks the versioned `records`/`provenance` shape.
-#[allow(
-    dead_code,
-    reason = "T11.1 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_evidence_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    expected_subject: &str,
-) -> Result<serde_json::Value, String> {
-    if response.operation != eliot_store_api::NamedReadOperation::GetEvidencePack {
-        return Err("daemon evidence response operation must be GetEvidencePack".to_owned());
-    }
-    if response.state_fence != *admitted_fence {
-        return Err("daemon evidence response fence does not match the admitted fence".to_owned());
-    }
-    response
-        .validate()
-        .map_err(|error| format!("daemon evidence response: {error}"))?;
-    let subject = response
-        .payload
-        .get("subject")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "daemon evidence payload misses its subject".to_owned())?;
-    if subject != expected_subject {
-        return Err(
-            "daemon evidence payload subject does not match the requested subject".to_owned(),
-        );
-    }
-    if response
-        .payload
-        .get("records")
-        .and_then(serde_json::Value::as_array)
-        .is_none()
-    {
-        return Err("daemon evidence payload misses its records array".to_owned());
-    }
-    if response
-        .payload
-        .get("provenance")
-        .and_then(serde_json::Value::as_object)
-        .is_none()
-    {
-        return Err("daemon evidence payload misses its provenance".to_owned());
-    }
-    Ok(serde_json::json!({
-        "operation": "GetEvidencePack",
-        "subject": subject,
-        "evidence_pack": response.payload,
-    }))
-}
-
-/// Plans one closed T11.2 `GetCurrentEpistemicPosition` read for the daemon
-/// query path.
-///
-/// This is the registration half of the `eliot.query` CEP plumbing: the caller
-/// holds the already-connected [`DaemonKernelClient`] and the
-/// [`DaemonComposition`] (see `context_read_client`), and calls this pure
-/// planner with the exact admitted fence plus explicit `scope_id`/`position`
-/// selectors. The returned [`NamedReadRequest`] travels the single
-/// `store_named` transport via [`KernelContextReadClient`] with
-/// `ExactFence`; free text never becomes a selector and no second position
-/// resolver lives here. The store catalogue remains the authority: this
-/// planner validates shape only, and the closed `position` membership is
-/// enforced by the adapters.
-#[allow(
-    dead_code,
-    reason = "T11.2 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_position_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    position: &str,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    if position.trim().is_empty() || position.chars().any(char::is_control) {
-        return Err(
-            "daemon position read position must be non-blank with no control characters".to_owned(),
-        );
-    }
-    let scope = eliot_store_api::ScopeId::new(scope_id)
-        .map_err(|error| format!("daemon position read scope: {error}"))?;
-    let mut parameters = std::collections::BTreeMap::new();
-    parameters.insert(
-        "position".to_owned(),
-        serde_json::Value::String(position.trim().to_owned()),
-    );
-    let request = eliot_store_api::NamedReadRequest {
-        operation: eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition,
-        scope_id: Some(scope),
-        consistency: eliot_store_api::ReadConsistency::ExactFence,
-        state_fence: fence.clone(),
-        parameters,
-    };
-    request
-        .validate()
-        .map_err(|error| format!("daemon position read request: {error}"))?;
-    Ok(request)
-}
-
-/// Projects a successful current-epistemic-position response into the daemon
-/// query content.
-///
-/// Returns the exact admitted wire CEP shape the `eliot.query` caller
-/// receives: the store payload crosses unchanged under
-/// `current_epistemic_position` with its position identity. Fails closed when
-/// the operation is not `GetCurrentEpistemicPosition`, the fence does not
-/// match the admitted fence, or the payload lacks the versioned admitted
-/// position shape.
-#[allow(
-    dead_code,
-    reason = "T11.2 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_position_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    expected_position: &str,
-) -> Result<serde_json::Value, String> {
-    if response.operation != eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition {
-        return Err(
-            "daemon position response operation must be GetCurrentEpistemicPosition".to_owned(),
-        );
-    }
-    if response.state_fence != *admitted_fence {
-        return Err("daemon position response fence does not match the admitted fence".to_owned());
-    }
-    response
-        .validate()
-        .map_err(|error| format!("daemon position response: {error}"))?;
-    Ok(serde_json::json!({
-        "operation": "GetCurrentEpistemicPosition",
-        "position": expected_position,
-        "current_epistemic_position": response.payload,
-    }))
-}
-
-/// Closed T11.3 role denominator for one task-bound `ContextReconstruction`.
-///
-/// The seven provider-role keys follow the T11 acquisition table: task frame,
-/// critical attention, current epistemic position, cue activation,
-/// negative memory, evidence/source assurance, and affordances. The
-/// understanding-projection read carries one exact closed `selector`; the
-/// cue-activation and negative-memory roles share a single physical read only
-/// when they deliberately address the same source snapshot, and otherwise each
-/// plans its own read, so this denominator stays seven roles over six or seven
-/// physical reads. The current-epistemic-position role payload doubles as the
-/// activation evidence bound to the admitted fence. An eighth role key, a
-/// missing role, or a duplicate role is a denominator mismatch and fails
-/// closed — never silent absorption.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) const CONTEXT_RECONSTRUCTION_ROLES: [&str; 7] = [
-    "task_frame",
-    "critical_attention",
-    "current_epistemic_position",
-    "cue_activation",
-    "negative_memory",
-    "evidence",
-    "affordances",
-];
-
-/// Typed per-role readout assembled by the reconstruction dispatch.
-///
-/// `Present` carries the exact owner payload crossed unchanged;
-/// `KnownEmpty` carries an authoritative completed empty lookup (never a
-/// transport failure or a partial scan); `Stale` reports a fence/generation
-/// mismatch for that role (a previous generation is never served as
-/// current); `Unsupported` reports a missing provider or an unadmitted
-/// catalogue operation, distinctly from `KnownEmpty`.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RoleReadout {
-    Present(serde_json::Value),
-    KnownEmpty(serde_json::Value),
-    Stale { detail: String },
-    Unsupported { detail: String },
-}
-
-impl RoleReadout {
-    const fn disposition(&self) -> &'static str {
-        match self {
-            Self::Present(_) => "present",
-            Self::KnownEmpty(_) => "known_empty",
-            Self::Stale { .. } => "stale",
-            Self::Unsupported { .. } => "unsupported",
-        }
-    }
-}
-
-/// The catalogue-declared explicit bound key every owner handler parses.
-///
-/// `eliot_store_api::operation_parameters` declares `max_records` as
-/// `Subject`-shaped text, so the bound travels as its **decimal string**; this
-/// is the only place the daemon renders one.
-const DAEMON_MAX_RECORDS_KEY: &str = "max_records";
-
-/// Fills the store catalogue's declared selector map for one T11.3
-/// reconstruction role read from the caller-resolved exact values.
-///
-/// The key set, the required/optional shape and the declared text shape all
-/// come from [`eliot_store_api::declared_read_parameters`] — the single
-/// catalogue that the Governor producer builds its own `NamedParameters` from
-/// and that the Kernel capability gate validates with
-/// [`eliot_store_api::validate_typed_read_parameters`]. This seam therefore
-/// keeps no second parameter list and cannot drift from the owner: it fills
-/// exactly the declared keys, refuses a resolved value the operation does not
-/// declare, and refuses a missing required declaration.
-///
-/// The declared bound key takes the caller's explicit bound as its decimal
-/// string (the exact form every owner handler parses). Every other declared
-/// key takes the caller's exact resolved text; a blank, control-bearing or
-/// numeric value is refused here, and an OPTIONAL declared key with no
-/// resolved value is OMITTED entirely rather than sent as null — the declared
-/// "no specific problem is requested" contract option, which the
-/// `GetAttentionAndProblems` handler answers with its own exact null.
-///
-/// A bound outside `1..=EVIDENCE_PACK_MAX_RECORDS` fails closed: that numeric
-/// range is the one restriction the declaration does not carry, and the store
-/// owner enforces it on every handler.
-fn daemon_reconstruction_parameters(
-    operation: eliot_store_api::NamedReadOperation,
-    role: &'static str,
-    resolved: &[(&str, &str)],
-    max_records: u32,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
-    if max_records == 0 || max_records > eliot_store_api::EVIDENCE_PACK_MAX_RECORDS {
-        return Err(format!(
-            "daemon reconstruction {role} read max_records must be within 1..=EVIDENCE_PACK_MAX_RECORDS"
-        ));
-    }
-    let mut parameters = std::collections::BTreeMap::new();
-    for declaration in eliot_store_api::declared_read_parameters(operation) {
-        let value = if declaration.name == DAEMON_MAX_RECORDS_KEY {
-            Some(max_records.to_string())
-        } else {
-            resolved
-                .iter()
-                .find(|(name, _)| *name == declaration.name)
-                .map(|(_, value)| (*value).to_owned())
-        };
-        match value {
-            Some(text) if text.trim().is_empty() || text.chars().any(char::is_control) => {
-                return Err(format!(
-                    "daemon reconstruction {role} read {} must be non-blank text with no control characters",
-                    declaration.name
-                ));
-            }
-            Some(text) => {
-                parameters.insert(declaration.name.to_owned(), serde_json::Value::String(text));
-            }
-            None if declaration.required => {
-                return Err(format!(
-                    "daemon reconstruction {role} read requires its declared {} selector",
-                    declaration.name
-                ));
-            }
-            None => {}
-        }
-    }
-    for (name, _) in resolved {
-        if !parameters.contains_key(*name) {
-            return Err(format!(
-                "daemon reconstruction {role} read selector {name} is not declared for this operation"
-            ));
-        }
-    }
-    eliot_store_api::validate_typed_read_parameters(operation, &parameters)
-        .map_err(|error| format!("daemon reconstruction {role} read selectors: {error}"))?;
-    Ok(parameters)
-}
-
-/// Plans one closed T11.3 reconstruction role read with the catalogue's exact
-/// selectors.
-///
-/// Shared shape check for the four task-bound reads (`GetTaskState`,
-/// `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`,
-/// `GetCapabilityEvidenceState`): scope-bound, `ExactFence` against the exact
-/// admitted fence, and carrying the closed selector map the store catalogue
-/// declares for `operation` — no fabricated `all` selector, no empty default,
-/// and no second parameter list. A fence change surfaces as a mismatch, never
-/// as a previous generation served as current.
-fn plan_daemon_reconstruction_role_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    operation: eliot_store_api::NamedReadOperation,
-    role: &'static str,
-    resolved: &[(&str, &str)],
-    max_records: u32,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
-        return Err(format!(
-            "daemon reconstruction {role} read scope must be non-blank with no control characters"
-        ));
-    }
-    let scope = eliot_store_api::ScopeId::new(scope_id)
-        .map_err(|error| format!("daemon reconstruction {role} read scope: {error}"))?;
-    let parameters = daemon_reconstruction_parameters(operation, role, resolved, max_records)?;
-    let request = eliot_store_api::NamedReadRequest {
-        operation,
-        scope_id: Some(scope),
-        consistency: eliot_store_api::ReadConsistency::ExactFence,
-        state_fence: fence.clone(),
-        parameters,
-    };
-    request
-        .validate()
-        .map_err(|error| format!("daemon reconstruction {role} read request: {error}"))?;
-    Ok(request)
-}
-
-/// Projects one successful T11.3 role response into daemon content.
-///
-/// Binds the answer to the exact read it was asked for before it becomes daemon
-/// content: the planned operation, the admitted fence, the requested scope,
-/// the requested selector the owner handler echoes (`selector_key` must equal
-/// `expected_selector`, or be the handler's exact null when no specific
-/// identity was requested), the source-envelope version, a `records` array,
-/// and the authoritative `matched_total`/`returned`/`truncated` provenance.
-/// A response answering a different task, problem, source selector or skill is
-/// refused even when its operation and fence match, and a payload whose
-/// provenance does not describe its own records is never projected as
-/// present.
-///
-/// The exact counts cross unchanged beside the payload so the owning Governor
-/// reconstruction composition can derive the role disposition from them; this
-/// seam does not decide admission, capability qualification or packet
-/// readiness from a successful retrieval.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one non-rederived exact-read binding context: response, fence, scope, operation pair, role, selector pair (#838)"
-)]
-fn project_daemon_role_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    operation: eliot_store_api::NamedReadOperation,
-    operation_name: &'static str,
-    role: &'static str,
-    selector_key: &'static str,
-    expected_selector: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
-        return Err(
-            "daemon reconstruction role scope must be non-blank with no control characters"
-                .to_owned(),
-        );
-    }
-    if response.operation != operation {
-        return Err(format!(
-            "daemon reconstruction {role} response operation must be {operation_name}"
-        ));
-    }
-    if response.state_fence != *admitted_fence {
-        return Err(format!(
-            "daemon reconstruction {role} response fence does not match the admitted fence"
-        ));
-    }
-    response
-        .validate()
-        .map_err(|error| format!("daemon reconstruction {role} response: {error}"))?;
-    let payload = &response.payload;
-    if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err(format!(
-            "daemon reconstruction {role} response payload version is unsupported"
-        ));
-    }
-    if payload.get("scope_id").and_then(serde_json::Value::as_str) != Some(scope_id) {
-        return Err(format!(
-            "daemon reconstruction {role} response scope does not match the requested scope"
-        ));
-    }
-    match (payload.get(selector_key), expected_selector) {
-        (Some(serde_json::Value::String(echoed)), Some(expected)) if echoed == expected => {}
-        (Some(serde_json::Value::Null), None) => {}
-        _ => {
-            return Err(format!(
-                "daemon reconstruction {role} response {selector_key} does not match the requested selector"
-            ));
-        }
-    }
-    let Some(records) = payload.get("records").and_then(serde_json::Value::as_array) else {
-        return Err(format!(
-            "daemon reconstruction {role} response payload misses its records array"
-        ));
-    };
-    let provenance = payload
-        .get("provenance")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            format!("daemon reconstruction {role} response payload misses its provenance")
-        })?;
-    let matched_total = provenance
-        .get("matched_total")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            format!("daemon reconstruction {role} response provenance misses matched_total")
-        })?;
-    let returned = provenance
-        .get("returned")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            format!("daemon reconstruction {role} response provenance misses returned")
-        })?;
-    let truncated = provenance
-        .get("truncated")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            format!("daemon reconstruction {role} response provenance misses truncated")
-        })?;
-    if truncated != (matched_total > returned) {
-        return Err(format!(
-            "daemon reconstruction {role} response provenance truncation flag contradicts its counts"
-        ));
-    }
-    if returned != records.len() as u64 {
-        return Err(format!(
-            "daemon reconstruction {role} response provenance returned count contradicts its records"
-        ));
-    }
-    // Dynamic role key: `serde_json::json!` would freeze an identifier key as
-    // a literal, so the object is built imperatively to carry the payload
-    // under its exact role key alongside the operation/role identity and the
-    // observed counts.
-    let mut object = serde_json::Map::with_capacity(6);
-    object.insert(
-        "operation".to_owned(),
-        serde_json::Value::String(operation_name.to_owned()),
-    );
-    object.insert(
-        "role".to_owned(),
-        serde_json::Value::String(role.to_owned()),
-    );
-    object.insert(role.to_owned(), response.payload.clone());
-    object.insert("matched_total".to_owned(), matched_total.into());
-    object.insert("returned".to_owned(), returned.into());
-    object.insert("truncated".to_owned(), truncated.into());
-    Ok(serde_json::Value::Object(object))
-}
-
-/// Plans one closed T11.3 `GetTaskState` read for the daemon reconstruction
-/// path, carrying the catalogue's exact `task_id` + `max_records` selectors.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_task_state_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    task_id: &str,
-    max_records: u32,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    plan_daemon_reconstruction_role_read(
-        fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetTaskState,
-        "task frame",
-        &[("task_id", task_id)],
-        max_records,
-    )
-}
-
-/// Plans one closed T11.3 `GetAttentionAndProblems` read for the daemon
-/// reconstruction path, carrying the catalogue's `max_records` bound plus the
-/// exact `problem_id` when one is requested. `None` is the declared "no
-/// specific problem is requested" contract option: the `problem_id` key is
-/// then omitted rather than sent as a substituted identity, and the handler
-/// answers with its own exact null.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_attention_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    problem_id: Option<&str>,
-    max_records: u32,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    let resolved: &[(&str, &str)] = match problem_id {
-        Some(problem_id) => &[("problem_id", problem_id)],
-        None => &[],
-    };
-    plan_daemon_reconstruction_role_read(
-        fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetAttentionAndProblems,
-        "critical attention",
-        resolved,
-        max_records,
-    )
-}
-
-/// Plans one closed T11.3 `GetUnderstandingProjectionInputs` read for the
-/// daemon reconstruction path, carrying the catalogue's exact `selector` +
-/// `max_records` for one resolved source set. The cue-activation and
-/// negative-memory roles plan their OWN selector, so one unrelated source
-/// snapshot is never relabelled into both roles.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_understanding_inputs_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    selector: &str,
-    max_records: u32,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    plan_daemon_reconstruction_role_read(
-        fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
-        "understanding inputs",
-        &[("selector", selector)],
-        max_records,
-    )
-}
-
-/// Plans one closed T11.3 `GetCapabilityEvidenceState` read for the daemon
-/// reconstruction path (affordances role), carrying the catalogue's exact
-/// `skill_id` + `max_records` selectors instead of an empty map.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_capability_evidence_read(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    skill_id: &str,
-    max_records: u32,
-) -> Result<eliot_store_api::NamedReadRequest, String> {
-    plan_daemon_reconstruction_role_read(
-        fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetCapabilityEvidenceState,
-        "affordances",
-        &[("skill_id", skill_id)],
-        max_records,
-    )
-}
-
-/// Projects a successful task-state response into the daemon query content,
-/// bound to the exact `task_id` this read was asked for.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_task_state_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    expected_task_id: &str,
-) -> Result<serde_json::Value, String> {
-    project_daemon_role_response(
-        response,
-        admitted_fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetTaskState,
-        "GetTaskState",
-        "task_frame",
-        "task_id",
-        Some(expected_task_id),
-    )
-}
-
-/// Projects a successful attention-and-problems response into the daemon
-/// query content, bound to the requested scope and to the exact `problem_id`
-/// (or to the handler's exact null when no specific problem was requested).
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_attention_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    expected_problem_id: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    project_daemon_role_response(
-        response,
-        admitted_fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetAttentionAndProblems,
-        "GetAttentionAndProblems",
-        "critical_attention",
-        "problem_id",
-        expected_problem_id,
-    )
-}
-
-/// Projects a successful understanding-projection-inputs response into the
-/// daemon query content, bound to the exact `selector` that read requested.
-/// The cue-activation and negative-memory roles project from their OWN
-/// selector, so an answer to a different source set is never relabelled into
-/// both roles.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_understanding_inputs_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    expected_selector: &str,
-) -> Result<serde_json::Value, String> {
-    project_daemon_role_response(
-        response,
-        admitted_fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
-        "GetUnderstandingProjectionInputs",
-        "understanding_inputs",
-        "selector",
-        Some(expected_selector),
-    )
-}
-
-/// Projects a successful capability-evidence response into the daemon query
-/// content (affordances role), bound to the exact `skill_id` this read was
-/// asked for.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_capability_evidence_response(
-    response: &eliot_store_api::NamedReadResponse,
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    expected_skill_id: &str,
-) -> Result<serde_json::Value, String> {
-    project_daemon_role_response(
-        response,
-        admitted_fence,
-        scope_id,
-        eliot_store_api::NamedReadOperation::GetCapabilityEvidenceState,
-        "GetCapabilityEvidenceState",
-        "affordances",
-        "skill_id",
-        Some(expected_skill_id),
-    )
-}
-
-/// Exact owner-resolved selectors for one daemon-side T11.3 reconstruction
-/// closure.
-///
-/// One closed carrier instead of a positional argument list: every member is an
-/// exact value the store catalogue declares for one reconstruction read, and
-/// the closure cannot be planned without all of them. There is no fabricated
-/// `all` selector and no empty default anywhere in this shape — the daemon must
-/// say which task, problem, source sets and skill it means before any read is
-/// planned, exactly as the Governor producer's own request does.
-///
-/// `problem_id` is the only optional member: `None` is the declared "no
-/// specific problem is requested" contract option, and the `problem_id` key is
-/// then omitted rather than sent as a substituted identity. `max_records` is
-/// the shared explicit bound for the four task-bound reads and travels as its
-/// decimal string; the T11.1 evidence bound and the T11.2 position selector
-/// stay separate closure members, so no role silently reuses another's bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch carries it once the daemon dispatches the query route"
-)]
-pub(super) struct DaemonReconstructionSelectors<'a> {
-    /// Exact `task_id` for the task-frame read.
-    pub(super) task_id: &'a str,
-    /// Exact `problem_id` for the attention read, or `None` when no specific
-    /// problem is requested.
-    pub(super) problem_id: Option<&'a str>,
-    /// Exact `selector` for the cue-activation projection read.
-    pub(super) cue_selector: &'a str,
-    /// Exact `selector` for the negative-memory projection read.
-    pub(super) negative_memory_selector: &'a str,
-    /// Exact `skill_id` for the affordances read.
-    pub(super) skill_id: &'a str,
-    /// Explicit shared bound for the four task-bound reads.
-    pub(super) max_records: u32,
-}
-
-/// Plans the closed `ContextReconstruction` closure for the daemon.
-///
-/// Canonical role order: the four T11.3 role reads (each carrying the closed
-/// selectors the store catalogue declares for it, so the plans this produces
-/// are exactly the requests the Kernel capability gate admits and the store
-/// handlers serve), then the T11.1 evidence-pack read (explicit
-/// `subject`/`max_records` selectors) and the T11.2 position read (explicit
-/// `position` selector, doubling as the activation evidence). This mirrors the
-/// Governor read facade's `ContextReconstruction` intent gate without
-/// depending on it: `bins/eliotd` owns no `eliot-read` dependency, so the
-/// operations are listed explicitly here and must stay in parity with that
-/// gate. Free text never becomes a selector and no second consistency
-/// algorithm lives here.
-///
-/// The closure is six physical reads when the cue-activation and
-/// negative-memory slots deliberately address the SAME exact source snapshot
-/// (identical `selector`), and seven when they address different source sets:
-/// a differing selector gets its own read, so one unrelated result is never
-/// relabelled into both roles. The store catalogue remains the authority: use
-/// [`context_reconstruction_role_admission`] to check manifest admission
-/// before dispatch.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn plan_daemon_context_reconstruction(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    selectors: DaemonReconstructionSelectors<'_>,
-    subject: &str,
-    max_records: &str,
-    position: &str,
-) -> Result<Vec<eliot_store_api::NamedReadRequest>, String> {
-    let mut planned = vec![
-        plan_daemon_task_state_read(fence, scope_id, selectors.task_id, selectors.max_records)?,
-        plan_daemon_attention_read(fence, scope_id, selectors.problem_id, selectors.max_records)?,
-        plan_daemon_understanding_inputs_read(
-            fence,
-            scope_id,
-            selectors.cue_selector,
-            selectors.max_records,
-        )?,
-    ];
-    if selectors.negative_memory_selector != selectors.cue_selector {
-        planned.push(plan_daemon_understanding_inputs_read(
-            fence,
-            scope_id,
-            selectors.negative_memory_selector,
-            selectors.max_records,
-        )?);
-    }
-    planned.push(plan_daemon_capability_evidence_read(
-        fence,
-        scope_id,
-        selectors.skill_id,
-        selectors.max_records,
-    )?);
-    planned.push(plan_daemon_evidence_read(
-        fence,
-        scope_id,
-        subject,
-        max_records,
-    )?);
-    planned.push(plan_daemon_position_read(fence, scope_id, position)?);
-    Ok(planned)
-}
-
-/// Reports per-operation catalogue admission for the reconstruction closure.
-///
-/// This checks every planned reconstruction request against the real
-/// generated operation manifests: the catalogue — not this planner — decides
-/// which reads may execute. Until the Store owner activates a read, its entry
-/// reports `false` and production dispatch must not call it; an unadmitted
-/// role is reported `Unsupported` by the assembly, distinctly from an
-/// authoritative `KnownEmpty`.
-///
-/// The four T11.3 role plans are now selector-complete, so their admission
-/// result reflects the real catalogue decision for the exact requested
-/// selectors instead of a parameter-free request the catalogue can only
-/// refuse.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn context_reconstruction_role_admission(
-    fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    selectors: DaemonReconstructionSelectors<'_>,
-    subject: &str,
-    max_records: &str,
-    position: &str,
-) -> Result<Vec<(&'static str, bool)>, String> {
-    let planned = plan_daemon_context_reconstruction(
-        fence,
-        scope_id,
-        selectors,
-        subject,
-        max_records,
-        position,
-    )?;
-    let entries = eliot_store_api::generated_operation_manifests()
-        .map_err(|error| format!("daemon reconstruction admission manifests: {error}"))?;
-    let mut admission = Vec::with_capacity(planned.len());
-    for request in &planned {
-        let name: &'static str = match request.operation {
-            eliot_store_api::NamedReadOperation::GetTaskState => "GetTaskState",
-            eliot_store_api::NamedReadOperation::GetAttentionAndProblems => {
-                "GetAttentionAndProblems"
-            }
-            eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs => {
-                "GetUnderstandingProjectionInputs"
-            }
-            eliot_store_api::NamedReadOperation::GetCapabilityEvidenceState => {
-                "GetCapabilityEvidenceState"
-            }
-            eliot_store_api::NamedReadOperation::GetEvidencePack => "GetEvidencePack",
-            eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition => {
-                "GetCurrentEpistemicPosition"
-            }
-            _ => {
-                return Err(
-                    "daemon reconstruction closure planned an out-of-closure operation".to_owned(),
-                );
-            }
-        };
-        let admitted = request.validate_against_catalogue(&entries).is_ok();
-        admission.push((name, admitted));
-    }
-    Ok(admission)
-}
-
-/// Assembles the seven role dispositions plus fence identity into the daemon
-/// reconstruction content.
-///
-/// `roles` must carry exactly the [`CONTEXT_RECONSTRUCTION_ROLES`]
-/// denominator once each, in any order: a missing, duplicate, or eighth role
-/// fails closed. Each readout keeps its disposition (`present`,
-/// `known_empty`, `stale`, `unsupported`) with its exact payload or typed
-/// detail; stale and unsupported roles are reported, never replaced with a
-/// previous generation or an invented empty. The
-/// `current_epistemic_position` role payload is the activation evidence bound
-/// to the admitted fence.
-#[allow(
-    dead_code,
-    reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
-)]
-pub(super) fn project_daemon_context_reconstruction(
-    admitted_fence: &eliot_contracts::StateFence,
-    scope_id: &str,
-    roles: &[(&str, RoleReadout)],
-) -> Result<serde_json::Value, String> {
-    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
-        return Err(
-            "daemon reconstruction scope must be non-blank with no control characters".to_owned(),
-        );
-    }
-    if roles.len() != CONTEXT_RECONSTRUCTION_ROLES.len() {
-        return Err(format!(
-            "daemon reconstruction requires exactly {} roles, observed {}",
-            CONTEXT_RECONSTRUCTION_ROLES.len(),
-            roles.len()
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for (role, _) in roles {
-        if !CONTEXT_RECONSTRUCTION_ROLES.contains(role) {
-            return Err(format!(
-                "daemon reconstruction role {role:?} is outside the closed denominator"
-            ));
-        }
-        if !seen.insert(*role) {
-            return Err(format!(
-                "daemon reconstruction role {role:?} is reported twice"
-            ));
-        }
-    }
-    let projected: Vec<serde_json::Value> = roles
-        .iter()
-        .map(|(role, readout)| match readout {
-            RoleReadout::Present(payload) | RoleReadout::KnownEmpty(payload) => serde_json::json!({
-                "role": role,
-                "disposition": readout.disposition(),
-                "payload": payload,
-            }),
-            RoleReadout::Stale { detail } | RoleReadout::Unsupported { detail } => {
-                serde_json::json!({
-                    "role": role,
-                    "disposition": readout.disposition(),
-                    "detail": detail,
-                })
-            }
-        })
-        .collect();
-    Ok(serde_json::json!({
-        "operation": "ContextReconstruction",
-        "scope_id": scope_id,
-        "state_fence": admitted_fence,
-        "roles": projected,
-    }))
 }
 
 fn ready_message(status: &DaemonStatus) -> ReadyMessage {
@@ -6015,88 +5197,5 @@ mod tests {
         assert_eq!(result.result_sha256, original_sha);
         assert!(result.resolved_binding().is_none());
         result.validate_against(&ticket).expect("valid binding");
-    }
-
-    #[test]
-    #[allow(
-        clippy::expect_used,
-        clippy::unwrap_used,
-        clippy::too_many_lines,
-        reason = "T11.1 registration test: every asserted subject, bound, scope, fence, and projection value is derived from the test inputs; nothing is canned"
-    )]
-    fn daemon_evidence_read_plans_closed_request_and_projects_exact_response() {
-        use std::num::NonZeroU64;
-
-        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-
-        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
-        let epoch = EpochId::new(
-            EpochLineageId::new(LINEAGE).expect("valid lineage"),
-            NonZeroU64::new(1).expect("nonzero sequence"),
-        )
-        .expect("valid epoch");
-        let fence = StateFence::new(epoch, ResourceGeneration::genesis());
-
-        // Closed planning: exact subject + explicit bound + scope + fence.
-        let request = plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
-            .expect("closed evidence read plans");
-        assert_eq!(
-            request.operation,
-            eliot_store_api::NamedReadOperation::GetEvidencePack
-        );
-        assert_eq!(request.state_fence, fence);
-        // The planned request passes the real catalogue gate: only
-        // `subject`/`max_records` cross, so generation never reports an
-        // unknown parameter.
-        let entries =
-            eliot_store_api::generated_operation_manifests().expect("catalogue generates");
-        request
-            .validate_against_catalogue(&entries)
-            .expect("planned request is catalogue-closed");
-
-        // Free text, blank scope, and bad bounds fail closed before transport.
-        assert!(plan_daemon_evidence_read(&fence, "scope-evidence", "  ", "10").is_err());
-        assert!(plan_daemon_evidence_read(&fence, "  ", "evidence-alpha", "10").is_err());
-        for bound in ["0", "ten", "  "] {
-            assert!(
-                plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", bound)
-                    .is_err(),
-                "bound {bound:?} must fail closed"
-            );
-        }
-
-        // Projection: exact record/provenance crosses unchanged; wrong
-        // subject, wrong fence, or malformed payload fails closed.
-        let response = eliot_store_api::NamedReadResponse {
-            operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
-            state_fence: fence.clone(),
-            revision_heads: Vec::new(),
-            payload: serde_json::json!({
-                "version": 1,
-                "subject": "evidence-alpha",
-                "records": [{"capture_index": 0}],
-                "provenance": {"matched_total": 1},
-            }),
-        };
-        let projected = project_daemon_evidence_response(&response, &fence, "evidence-alpha")
-            .expect("exact response projects");
-        assert_eq!(projected["subject"], "evidence-alpha");
-        assert_eq!(projected["evidence_pack"], response.payload);
-        assert!(
-            project_daemon_evidence_response(&response, &fence, "evidence-beta").is_err(),
-            "wrong subject must fail closed"
-        );
-        let changed = StateFence::new(
-            EpochId::new(
-                EpochLineageId::new(LINEAGE).expect("valid lineage"),
-                NonZeroU64::new(2).expect("nonzero sequence"),
-            )
-            .expect("valid epoch"),
-            ResourceGeneration::genesis(),
-        );
-        assert!(
-            project_daemon_evidence_response(&response, &changed, "evidence-alpha").is_err(),
-            "changed fence must fail closed"
-        );
     }
 }

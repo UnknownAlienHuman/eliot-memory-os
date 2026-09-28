@@ -9,7 +9,8 @@ use eliot_context_contracts::{
     CoverageEvidence, CoverageFreshness, CriticalAttentionMember, DecisionSafetyFloor,
     IntegrationCoverageProfile, LossPolicy, MeasurementRef, MeasurementStatus,
     PriorDeliveryBinding, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
-    ProviderRole, ProviderRoleDenominator, QualityDimension, QualityDimensionResult,
+    ProviderRole, ProviderRoleDenominator, QUALITY_APPLICABILITY_INPUTS,
+    QUALITY_RESULT_SCHEMA_VERSION, QualityApplicability, QualityDimension, QualityDimensionResult,
     QualityDimensionState, QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
     SerializedContextMeasurement, SessionDeliverySnapshot, SnapshotCompleteness,
     SnapshotDenominator, SourceSnapshot,
@@ -110,6 +111,13 @@ fn candidate() -> ContextCandidate {
     }
 }
 
+fn resolved_applicability() -> QualityApplicability {
+    QualityApplicability {
+        resolved: QUALITY_APPLICABILITY_INPUTS.to_vec(),
+        unknown: Vec::new(),
+    }
+}
+
 fn quality(binding: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -127,11 +135,15 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: binding.clone(),
+        applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
             .map(|dimension| QualityDimensionResult {
+                schema_version: QUALITY_RESULT_SCHEMA_VERSION,
                 dimension,
                 state: QualityDimensionState::Passed,
+                rule_revision: id("rule-revision"),
+                required_evidence: vec![id("quality-evidence")],
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
                 failed_invariant: None,

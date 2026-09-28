@@ -87,13 +87,14 @@ pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
 pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime, drive_parent_runtime};
 pub use request_loop::{
-    AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopError, MAX_RESULT_FRAME_BYTES,
-    MAX_RESULT_SEQUENCE, OP_CANCEL, OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError,
+    AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopCompletion, LoopError,
+    MAX_RESULT_FRAME_BYTES, MAX_RESULT_SEQUENCE, MAX_RETAINED_RESULT_STREAM_BYTES, OP_CANCEL,
+    OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, ObservedResultRetention, OrdinaryDriveError,
     OrdinaryOutcome, RESULT_PHASE_CONTAIN, RESULT_PHASE_DENY, RESULT_PHASE_EXECUTE,
-    RESULT_PHASE_RECONCILE, WASM_HOST_REQUEST_WIRE_ID, WASM_HOST_REQUEST_WIRE_VERSION,
-    WASM_HOST_RESULT_WIRE_ID, WASM_HOST_RESULT_WIRE_VERSION, WasmHostRequest,
-    WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame, run_ordinary_request_loop,
-    run_request_loop,
+    RESULT_PHASE_RECONCILE, RequestLoopReport, ServedResultReadback, WASM_HOST_REQUEST_WIRE_ID,
+    WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WASM_HOST_RESULT_WIRE_VERSION,
+    WasmHostRequest, WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame,
+    run_ordinary_request_loop, run_request_loop,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
@@ -101,8 +102,10 @@ pub use typed_bindings::{
     export_matches_interface, typed_wit_digest,
 };
 pub use typed_execution::{
-    ExecutionMode, TypedDescriptor, TypedExecutionError, TypedReceipt, default_experimental_limits,
-    domain_handoff, execute_describe_experimental, execute_governed_refusal,
+    ExecutionMode, TypedDescriptor, TypedDomainAdmission, TypedDomainError, TypedDomainOutcome,
+    TypedDomainRequest, TypedDomainResult, TypedExecutionError, TypedReceipt, TypedStage,
+    default_experimental_limits, execute_describe_experimental, execute_domain_experimental,
+    execute_governed_refusal,
 };
 pub use wasmtime_provider::{
     WasmtimeBuildError, WasmtimeComponentEngine, provider_configuration_digest,

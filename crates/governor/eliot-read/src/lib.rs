@@ -26,6 +26,24 @@
 //! caller fence, so no cache, freshness state, or second consistency algorithm
 //! exists in this package (ARCH-MOD-03 explicit statelessness).
 //!
+//! The exhaustive, code-derived form of this inventory is
+//! [`owner_inventory::read_owner_inventory`], which resolves every row below at
+//! call time from the Store declaration tables and this crate's own predicates.
+//! It is the machine-checkable copy; the list here is its human-readable summary.
+//!
+//! Two statements in that list are bounded on purpose. `ReadApi`, `LocalReadPort`
+//! and `ReadService` are the only real construction and call sites of this
+//! package's read semantics: the two traits have exactly one blanket
+//! implementation, in [`ReadService`], and the three families
+//! (`state`/`query`/`resource` and their `bound_*` forms) are the only entry
+//! points, all reaching the one engine [`ReadService::execute`]. There is no
+//! second read path, no cache, and no second consistency algorithm.
+//! `provider_memory_feed` is a candidate-only import surface with **no importer
+//! in this repository** (see `reverse_consumers` in the machine-checkable copy);
+//! it declares no read wire shape and grants no promotion authority, so its
+//! items are inventoried as [`owner_inventory::PublicApiKind::OffWire`] rather
+//! than as read-contract members.
+//!
 //! ```text
 //! public API:        ReadApi, LocalReadPort, ReadService,
 //!                    contract_identity, CONTRACT_NAME, CONTRACT_VERSION,
@@ -39,14 +57,18 @@
 //!                    ProvenanceDisposition, ReadProvenance,
 //!                    StateRequest, QueryRequest, ResourceRequest,
 //!                    CurrentStateView, QueryResult, ResourceContent,
-//!                    ReadError, StoreReadFailure;
-//! store dependency:   CanonicalReadClient (read-only), the Store operation
-//!                    catalogue (generated_operation_manifests,
-//!                    activated_read_operations, declared_read_parameters,
-//!                    project_parameter_schema, parameter_schema_digest) and
-//!                    the Store-owned experience page coverage statement
-//!                    (ExperienceRangePage). No SurrealDB SDK, no credentials,
-//!                    no write capability, no raw query text;
+//!                    ReadError, StoreReadFailure, plus the
+//!                    `provider_memory_feed` module's candidate-only surface
+//!                    (25 further rows, `OffWire`, no wire shape claimed);
+//! store dependency:   CanonicalReadClient (read-only) and the Store operation
+//!                    catalogue, reached ONLY through
+//!                    `owner_inventory::compare_operation_with_store_read_model`
+//!                    (generated_operation_manifests, activated_read_operations,
+//!                    declared_read_parameters, project_parameter_schema,
+//!                    parameter_schema_digest) and the Store-owned experience
+//!                    page coverage statement (ExperienceRangePage). No SurrealDB
+//!                    SDK, no credentials, no write capability, no raw query
+//!                    text;
 //! serialization:      every public type is `deny_unknown_fields` JSON with
 //!                    closed enum dimensions; intents reject unknown future
 //!                    prose instead of widening the read;
@@ -54,6 +76,20 @@
 //!                    crates/governor/eliot-read/tests/context_reconstruction.rs,
 //!                    in-crate `evidence_pack_read_tests`.
 //! ```
+//!
+//! # One owner of source, schema, coverage and scope semantics (W4)
+//!
+//! Source identity, projection schema, coverage identity and the owner/Store
+//! scope comparison are resolved in exactly one place:
+//! [`owner_inventory::OperationReadModelComparison`], produced by
+//! [`owner_inventory::compare_operation_with_store_read_model`]. The package's
+//! private `resolve_source_and_schema` and `resolve_coverage` were removed
+//! because they were a second, independent answer to the same questions from the
+//! same Store rows; keeping both would have left two owners of revision,
+//! freshness and query semantics. The single read engine
+//! ([`ReadService::execute`]) now resolves all four through the one comparison,
+//! so the coverage a read publishes is the coverage that comparison admitted
+//! rather than a second resolution of it.
 //!
 //! # Comparison with the current read owner, Store read model and runtime
 //! # status consumers (W2)
@@ -80,6 +116,29 @@
 //!                            `eliot.query` pair. Both consume the resolved
 //!                            [`ReadIdentity`] instead of re-deriving freshness.
 //! ```
+//!
+//! # Declared edges versus a live read (A1)
+//!
+//! The inventory above is a *declared-edge* statement, and the difference is
+//! load-bearing for any deletion decision. `cargo metadata` reports three
+//! workspace members with an edge onto this package; searching the current
+//! source for a non-test call site gives:
+//!
+//! | member | declared edge | what that member does with it |
+//! |---|---|---|
+//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads and classifies each `ReadOutcome`; its only call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:702`), itself reached only through `DaemonComposition::reconstruction_composition` (`bins/eliotd/src/lib.rs:3296`), which **no caller in this repository invokes**; |
+//! | `eliotd` | normal | production entry points `answer_evidence_query` / `answer_projection_inputs` construct a `ReadService` and are re-exported from the library (`bins/eliotd/src/lib.rs:227`), but the `eliotd` **binary** composes none of them: `main.rs` reaches only `daemon_runtime::run`, and the run loop's local-read leg calls `forward_admitted_local_read` -> `DaemonKernelClient::local_read_async`, which asks the **Kernel** to serve the read and returns the persisted result body. The only caller of the Governor-serving path `serve_admitted_local_read` -> `KernelContextReadClient::execute_local_read` is `bins/eliotd/tests/local_read_e2e.rs`; |
+//! | `eliot-kernel-service` | **dev-dependency only** | uses `ReadService` inside `mod live_surreal_evidence_pack_e2e` in `store_gateway.rs`. Not in the production graph. |
+//!
+//! So on the exact source searched, `eliot-read` has **no read that a process
+//! entry point can reach**: every production call site is either reached only by
+//! a test or by an accessor nothing calls. `provider_memory_feed` has no
+//! importer at all. No caller was invented, no `#[allow(dead_code)]` was added,
+//! and no value is constructed and dropped to make the set look populated; the
+//! crate's proof ceiling is therefore
+//! `CURRENT_UNVERIFIED` at best, never `CURRENT_VERIFIED` (I0.5). This is
+//! stated here rather than hidden because a deletion decision and a liveness
+//! claim are different decisions, and only the first is a source fact.
 //!
 //! # Retained-read binding (W5, A3)
 //!
@@ -128,8 +187,7 @@ use eliot_contracts::{
 use eliot_store_api::{
     AutomationContinuationFailure, CanonicalReadClient, ExperienceRangePage, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, StoreError, activated_read_operations, declared_read_parameters,
-    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
+    ScopeId, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1652,8 +1710,16 @@ impl<C: CanonicalReadClient> ReadService<C> {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
-        let (source, schema) = resolve_source_and_schema(operation)?;
-        let coverage = resolve_coverage(operation, parameters)?;
+        // One owner for source, schema, coverage and scope semantics: the single
+        // Store read-model comparison. `resolve_source_and_schema` and
+        // `resolve_coverage` were removed because this comparison already answers
+        // every one of their questions from the same Store declaration rows, and
+        // two resolvers for one identity is a second semantic read owner.
+        let comparison = owner_inventory::compare_operation_with_store_read_model(operation)?;
+        comparison.refuse_scope_divergence()?;
+        let source = comparison.source.clone();
+        let schema = comparison.schema.clone();
+        let coverage = comparison.coverage(parameters)?;
         ordering.validate_against(&ctx.state_fence)?;
         if matches!(
             consistency,
@@ -1865,130 +1931,6 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
     }
 }
 
-/// Resolves the exact activated Store source and projection schema of one
-/// named read.
-///
-/// The Store operation catalogue is the single authority for which source is
-/// activated, and it is read here without re-declaring anything. An operation
-/// with no activated entry has no running source, so it is refused as
-/// [`ReadOutcome::NotRunning`] instead of being dispatched and answered by an
-/// unknown-operation error that a consumer could mistake for a refusal of the
-/// caller rather than of the source.
-///
-/// Both schema witnesses come from the Store: the catalogue entry's own schema
-/// digest and the digest over the owner-approved typed read-parameter schema the
-/// request is admitted against. Neither is read from the payload, so a payload
-/// can never restate or widen the schema it was read under.
-fn resolve_source_and_schema(
-    operation: NamedReadOperation,
-) -> Result<(ReadSourceIdentity, ReadSchemaIdentity), ReadError> {
-    let operation_name = named_read_operation_name(operation);
-    if !activated_read_operations().contains(&operation) {
-        return Err(ReadError::Outcome(ReadOutcome::NotRunning));
-    }
-    let entries = generated_manifests()?;
-    let entry = entries
-        .iter()
-        .find(|entry| entry.name == operation_name)
-        .ok_or(ReadError::Outcome(ReadOutcome::NotRunning))?;
-    let source = ReadSourceIdentity {
-        operation,
-        operation_name: operation_name.to_owned(),
-        manifest_name: entry.name.clone(),
-        manifest_digest: entry.digest.as_str().to_owned(),
-    };
-    let schema = ReadSchemaIdentity {
-        manifest_name: entry.name.clone(),
-        manifest_version: entry.version,
-        manifest_schema_digest: entry.schema_digest.clone(),
-        parameter_schema_digest: parameter_schema_digest(&project_parameter_schema(operation))?,
-    };
-    Ok((source, schema))
-}
-
-/// Returns the generated Store operation catalogue.
-///
-/// The catalogue is a pure function of the Store's own declaration table, so
-/// resolving it here introduces no second source of truth; a catalogue that
-/// cannot be generated is a store contract failure, not an empty read.
-fn generated_manifests() -> Result<Vec<eliot_store_api::NamedOperationManifest>, ReadError> {
-    eliot_store_api::generated_operation_manifests()
-        .map_err(StoreReadFailure::from)
-        .map_err(ReadError::Store)
-}
-
-/// Resolves the exact coverage identity of one named read from the Store's own
-/// declared read-parameter table plus the caller's declared selectors.
-///
-/// A result-set bound, a cursor continuation, or the absence of any coverage
-/// dimension is read from the declaration table rather than assumed, and the
-/// caller's declared bound is echoed exactly. No percentage or completeness
-/// estimate is derived here: coverage is a statement about which bound was in
-/// force, never about how much of the source a read happened to see.
-fn resolve_coverage(
-    operation: NamedReadOperation,
-    parameters: &NamedParameters,
-) -> Result<ReadCoverage, ReadError> {
-    let declarations = declared_read_parameters(operation);
-    let mut result_bound = None;
-    let mut page_bound = None;
-    let mut cursor = false;
-    for declaration in declarations {
-        match declaration.name {
-            "max_records" => result_bound = Some(DeclaredResultSelector::MaxRecords),
-            "page_limit" => page_bound = Some(DeclaredPageSelector::PageLimit),
-            "cursor" => cursor = true,
-            _ => {}
-        }
-    }
-    if let Some(selector) = result_bound {
-        return Ok(
-            match declared_bound(parameters, declaration_name(selector))? {
-                Some(declared_bound) => ReadCoverage::BoundedByDeclaredSelector {
-                    selector,
-                    declared_bound,
-                },
-                None => ReadCoverage::BoundByStore { selector },
-            },
-        );
-    }
-    if cursor {
-        return Ok(ReadCoverage::PagedByDeclaredCursor {
-            selector: page_bound,
-        });
-    }
-    Ok(ReadCoverage::NotApplicable)
-}
-
-/// Returns the exact Store selector name for one declared coverage selector.
-const fn declaration_name(selector: DeclaredResultSelector) -> &'static str {
-    match selector {
-        DeclaredResultSelector::MaxRecords => "max_records",
-    }
-}
-
-/// Reads one caller-declared positive decimal bound out of the closed selectors.
-fn declared_bound(parameters: &NamedParameters, selector: &str) -> Result<Option<u32>, ReadError> {
-    let Some(raw) = parameters.as_map().get(selector) else {
-        return Ok(None);
-    };
-    let text = raw.as_str().ok_or_else(|| ReadError::InvalidField {
-        field: format!("coverage.{selector}"),
-        reason: "declared bound must be a decimal string".to_owned(),
-    })?;
-    let bound: u32 = text.parse().map_err(|_| ReadError::InvalidField {
-        field: format!("coverage.{selector}"),
-        reason: "declared bound must be a positive decimal".to_owned(),
-    })?;
-    if bound == 0 {
-        return Err(ReadError::InvalidField {
-            field: format!("coverage.{selector}"),
-            reason: "declared bound must be a positive decimal".to_owned(),
-        });
-    }
-    Ok(Some(bound))
-}
-
 /// Refuses a successful response that does not observe its own bound identity.
 ///
 /// Two cases are refused, and neither may become a successful empty or current
@@ -2004,7 +1946,7 @@ fn declared_bound(parameters: &NamedParameters, selector: &str) -> Result<Option
 ///
 /// Every other operation keeps its payload opaque here: its own consumer owns
 /// the payload contract, and this owner states only that the read is bound to
-/// the exact [`ReadCoverage`] identity it resolved above.
+/// the exact [`ReadCoverage`] identity the one Store comparison resolved.
 fn classify_payload_coverage(
     operation: NamedReadOperation,
     payload: &Value,

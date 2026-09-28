@@ -209,7 +209,8 @@ pub use credential_provision::{
     decode_credential_control_response_frame, dispatch_credential_target_for_store_target,
     phase_b_credential_receipt_digest, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest,
-    validate_store_credential_target,
+    provider_bootstrap_credential_target_for_store_target,
+    validate_provider_bootstrap_credential_target, validate_store_credential_target,
 };
 pub use package::{PackageObservationSnapshot, PackageObservedFile};
 use package::{
@@ -4202,7 +4203,14 @@ impl WindowsInstallationEffectPort {
                     {
                         PortOutcome::Known(*receipt)
                     }
-                    Ok(_) | Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
+                        PortOutcome::Error(phase_b_unknown_port_error(request, &pending_ref))
+                    }
+                    Ok(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Err(PortError::Provider(provider)) if provider.retryable => {
+                        PortOutcome::Unknown(UnknownReason::Indeterminate)
+                    }
+                    Err(error) => PortOutcome::Error(error),
                 }
             }
             Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {

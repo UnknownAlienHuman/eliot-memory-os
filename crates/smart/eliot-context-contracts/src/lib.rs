@@ -46,9 +46,9 @@ pub use atom::{
 pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
     BoundaryDenominator, BoundaryGap, BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage,
-    BoundaryMemberReference, BoundaryMemberRole, BoundaryMetadataEnvelope, BoundaryMetadataSet,
-    BoundaryPrecision, BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits,
-    ExactSourceRange,
+    BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
+    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation,
+    BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
@@ -80,8 +80,10 @@ pub use measurement::{
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
-    QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult, QualityDimensionState,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QUALITY_APPLICABILITY_INPUTS, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION,
+    QualityApplicability, QualityApplicabilityInput, QualityDimension, QualityDimensionResult,
+    QualityDimensionState, QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QualitySuitability,
 };
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,

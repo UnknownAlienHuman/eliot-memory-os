@@ -384,6 +384,12 @@ fn observed_store_heads_unambiguous(
 /// promotion keeps the permitted safe raw observation cold via
 /// `cold_raw_retained`.
 ///
+/// The recorded disposition is a function of the observed value set, never of
+/// arrival order: the heads are normalized through [`normalize_heads`] and the
+/// pinned-scope denominator is sorted and deduplicated with the same
+/// discipline, so permuting `predicate_pinned_scopes` cannot change which of
+/// the dispositions is written down.
+///
 /// # Errors
 ///
 /// Returns [`FreshnessError`] when any identity, fence, predicate form, or
@@ -401,6 +407,18 @@ pub fn evaluate_freshness_admission(
     for scope in &candidate.predicate_pinned_scopes {
         check_identity("predicate pinned scope", scope, 256)?;
     }
+    // The pinned-scope denominator is normalized with the same mechanism the
+    // heads are, so the recorded disposition is a function of the observed
+    // VALUE SET and not of the order the caller happened to present it in.
+    // Without this the first scope that trips the loop decides the record:
+    // the same candidate presented with a permuted `predicate_pinned_scopes`
+    // yields `SELF_INVALIDATING` in one order and `INCOMPLETE` in the other.
+    // Both orders refuse promotion, so this is not a promotion bypass; it is
+    // the normalization guarantee this module already claims for `normalize_heads`
+    // extending to the one list that is not a head list.
+    let mut pinned = candidate.predicate_pinned_scopes.clone();
+    pinned.sort();
+    pinned.dedup();
     let base = normalize_heads(&candidate.base_revision_heads)?;
     let expected = normalize_heads(&candidate.expected_post_commit_revision_heads)?;
     let observed = normalize_heads(&candidate.observed_source_heads)?;
@@ -409,7 +427,7 @@ pub fn evaluate_freshness_admission(
         || candidate.task != TaskCompatibility::Compatible
     {
         FreshnessDisposition::Incomplete
-    } else if candidate.predicate_pinned_scopes.is_empty() {
+    } else if pinned.is_empty() {
         // No declared pinned dependency can prove the predicate needs none,
         // so freshness is unestablished: vacuous promotion is forbidden.
         FreshnessDisposition::Incomplete
@@ -418,7 +436,7 @@ pub fn evaluate_freshness_admission(
         let expected_map = heads_by_scope(&expected);
         let observed_map = heads_by_scope(&observed);
         let mut disposition = FreshnessDisposition::Current;
-        for scope in &candidate.predicate_pinned_scopes {
+        for scope in &pinned {
             let scope = scope.as_str();
             let (Some(base_revision), Some(expected_revision), Some(observed_revision)) = (
                 base_map.get(scope).copied(),

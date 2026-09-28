@@ -137,17 +137,31 @@ mod slice_8_result_tests {
     }
 
     fn curation(job_id: &str) -> DreamResult {
+        let candidates = vec![CurationCandidate {
+            candidate_id: format!("{job_id}-candidate-1"),
+            kind: "review_required".to_owned(),
+            source_handles: vec!["evidence-1".to_owned()],
+            proposed_transformation: "Inspect provenance; do not alter the source.".to_owned(),
+            uncertainty: "No semantic promotion from a handle-only bundle.".to_owned(),
+            rollback: "Discard the candidate.".to_owned(),
+        }];
+        let pulse = crate::curation_pulse::fixture_pulse(
+            job_id,
+            job_id,
+            job_id,
+            "scope-slice-8",
+            &fence(),
+            vec!["evidence-1".to_owned()],
+            candidates
+                .iter()
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect(),
+        );
         DreamResult::Curation {
             job_id: job_id.to_owned(),
-            candidates: vec![CurationCandidate {
-                candidate_id: format!("{job_id}-candidate-1"),
-                kind: "review_required".to_owned(),
-                source_handles: vec!["evidence-1".to_owned()],
-                proposed_transformation: "Inspect provenance; do not alter the source.".to_owned(),
-                uncertainty: "No semantic promotion from a handle-only bundle.".to_owned(),
-                rollback: "Discard the candidate.".to_owned(),
-            }],
+            candidates,
             provenance: vec!["evidence-1".to_owned()],
+            pulse,
         }
     }
 

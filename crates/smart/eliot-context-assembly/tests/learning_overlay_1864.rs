@@ -271,6 +271,13 @@ fn refresh_economy_receipt(value: &mut AdmittedContextSet) {
         eliot_context_contracts::canonical_digest(&unsigned).expect("economy receipt");
 }
 
+fn resolved_applicability() -> QualityApplicability {
+    QualityApplicability {
+        resolved: QUALITY_APPLICABILITY_INPUTS.to_vec(),
+        unknown: Vec::new(),
+    }
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -288,11 +295,15 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: context.clone(),
+        applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
             .map(|dimension| QualityDimensionResult {
+                schema_version: QUALITY_RESULT_SCHEMA_VERSION,
                 dimension,
                 state: QualityDimensionState::Passed,
+                rule_revision: id("rule-revision"),
+                required_evidence: vec![id("quality-evidence")],
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
                 failed_invariant: None,

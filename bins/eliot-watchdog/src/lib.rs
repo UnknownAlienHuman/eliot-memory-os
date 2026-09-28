@@ -150,9 +150,11 @@ pub use audit_anchor_sink::{
     WatchdogAuditAnchorSink, watchdog_anchor_dir,
 };
 pub use backup_control::{
-    AcceptedWatchdogBackupMethod, BackupControlError, BackupControlHandle, WatchdogBackupOutcome,
-    WatchdogBackupRequest, accepted_watchdog_backup_methods, register_backup_control,
-    start_backup_control, stop_backup_control,
+    AcceptedWatchdogBackupMethod, AdmittedWatchdogBackupRequest, BackupControlError,
+    BackupControlHandle, BackupControlRegistration, MAX_BACKUP_CONTROL_HANDLES,
+    MAX_RETAINED_BACKUP_OPERATIONS, WatchdogBackupAdmission, WatchdogBackupChannelOutcome,
+    accepted_watchdog_backup_methods, register_backup_control, resolve_accepted_method,
+    start_backup_control, stop_backup_control, verify_registration_is_complete,
 };
 pub use heartbeat_transport::{
     FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,

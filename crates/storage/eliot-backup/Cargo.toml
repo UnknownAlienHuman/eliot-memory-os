@@ -7,7 +7,7 @@ license.workspace = true
 description = "Governed ECXF logical backup and isolated restore contracts"
 
 [package.metadata.eliot]
-workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage plus isolated rehearsal runner; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback"
+workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage plus isolated rehearsal runner; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback. #1141 disposition: LIVE GOVERNED PORTABILITY/RECOVERY CONSUMER - the 'non-runtime' wording above predates the #960/#961 edges and is superseded by three shipped production binary dependency edges (bins/eliot, bins/eliot-host, bins/eliot-kernel); proof ceiling: eliot_backup::export_ecxf_package, the only ECXF/1 export entry, still has no EcxfSourceStore implementor and no call site, so no production process produces an ECXF/1 package yet"
 
 [dependencies]
 aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }

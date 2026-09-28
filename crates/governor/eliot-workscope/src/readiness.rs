@@ -32,7 +32,8 @@
 //! multiple plausible scope/task candidates, `GOVERNING_CONTEXT_REQUIRED` for
 //! deficient source or verifier grounding, and `READINESS_REEVALUATION_REQUIRED`
 //! when the Kernel fence changed, the scope guard detected a changed
-//! generation, or the governing source set went stale or conflicted. The
+//! generation or descriptor revision changed, or the governing source set
+//! went stale or conflicted. The
 //! missing-context directive names the exact gap in `missing_inputs`, which is
 //! the honest no-proof disposition: a declared gap, never a generic denial and
 //! never a fabricated allow.
@@ -206,11 +207,13 @@ impl GoverningCoverage {
 
 /// Caller-supplied facts for one readiness evaluation.
 ///
-/// Every field is caller-observed authority: the compiled receipt, the
-/// retained descriptor (truth-surface/verifier references, privacy boundary,
-/// authority route), the governing coverage, the current guard receipt, the
+/// Every field is caller-supplied authority: the compiled receipt, the
+/// descriptor selected for this evaluation (including its owner-sourced
+/// revision), the governing coverage, the current guard receipt, the
 /// onboarding lease, the current Kernel fence, and the evaluation tick. This
-/// crate reads no filesystem, process, store, or credential state.
+/// crate checks the descriptor revision against the receipt but does not
+/// establish whether the caller refreshed it from the owner; it reads no
+/// filesystem, process, store, or credential state.
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialReadinessInputs<'a> {
     pub receipt: &'a OnboardingReadinessReceipt,
@@ -230,8 +233,8 @@ pub struct MaterialReadinessInputs<'a> {
 /// route, task binding status, and governing-source coverage. It grants
 /// nothing by itself; [`evaluate_material_request`] decides one effect.
 ///
-/// The eight flags are independent readiness legs, not a ladder, so the
-/// struct keeps them as plain booleans by design.
+/// The readiness flags are independent legs, not a ladder, so the struct keeps
+/// them as plain booleans by design.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +245,12 @@ pub struct MaterialReadinessReport {
     pub fence_current: bool,
     pub lease_current: bool,
     pub lease_deadline: u64,
+    /// Expected revision carried from the validated onboarding candidate.
+    pub expected_descriptor_revision: u64,
+    /// Revision from the descriptor supplied to this readiness evaluation.
+    pub observed_descriptor_revision: u64,
+    /// Whether the supplied descriptor still names the candidate revision.
+    pub descriptor_revision_current: bool,
     pub guard: ScopeBindingDisposition,
     pub guard_bound: bool,
     pub instance_bound: bool,
@@ -266,6 +275,19 @@ impl MaterialReadinessReport {
     /// Returns an error when a bound reference is blank.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.receipt_ref, "report.receipt_ref")?;
+        counter(
+            self.expected_descriptor_revision,
+            "report.expected_descriptor_revision",
+        )?;
+        counter(
+            self.observed_descriptor_revision,
+            "report.observed_descriptor_revision",
+        )?;
+        if self.descriptor_revision_current
+            != (self.expected_descriptor_revision == self.observed_descriptor_revision)
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
         text(
             &self.governance_profile_ref,
             "report.governance_profile_ref",
@@ -366,10 +388,11 @@ fn descriptor_binds_receipt(
 ) -> bool {
     descriptor.scope_ref == receipt.scope.scope_ref
         && descriptor.kind == receipt.scope.kind
-        && descriptor.instances.iter().any(|instance| {
-            instance.instance_ref == receipt.scope.instance_ref
-                && instance.root_identity == receipt.scope.root_identity
-        })
+        && descriptor.lineage == receipt.lineage
+        && descriptor
+            .instances
+            .iter()
+            .any(|instance| instance == &receipt.instance)
 }
 
 fn coverage_closes(
@@ -436,6 +459,8 @@ pub fn assess_material_readiness(
     let guard_bound = guard == ScopeBindingDisposition::Matched
         && guard_agrees_with_receipt(inputs.guard_receipt, receipt);
     let instance_bound = descriptor_binds_receipt(descriptor, receipt);
+    let descriptor_revision_current =
+        receipt.scope_descriptor_revision == descriptor.descriptor_revision;
     let coverage_bound = inputs
         .coverage
         .binds_scope(&receipt.scope.scope_ref, receipt.scope.generation);
@@ -464,6 +489,9 @@ pub fn assess_material_readiness(
         fence_current,
         lease_current,
         lease_deadline: lease.deadline,
+        expected_descriptor_revision: receipt.scope_descriptor_revision,
+        observed_descriptor_revision: descriptor.descriptor_revision,
+        descriptor_revision_current,
         guard,
         guard_bound,
         instance_bound,
@@ -575,6 +603,7 @@ pub fn evaluate_material_request(
     // on unclosed coverage.
     let currency_ok = report.fence_current
         && report.lease_current
+        && report.descriptor_revision_current
         && report.instance_bound
         && report.coverage_sufficient;
     if !currency_ok {

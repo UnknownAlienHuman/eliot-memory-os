@@ -8,6 +8,7 @@ use eliot_platform_windows::{
     ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
     observe_loopback_tcp_connection_peer_owner, observe_loopback_tcp_listener_owner,
 };
+use secrecy::ExposeSecret;
 use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
@@ -399,10 +400,48 @@ pub(super) fn require_unchanged_identity(
     Ok(())
 }
 
+/// Environment name the pinned `SurrealDB` provider reads its initial root-level
+/// user from.
+///
+/// This is the fixed channel the integration provider harness already uses for
+/// this exact purpose against the pinned provider build
+/// (`scripts/integration/IntegrationHarness.Store.psm1`,
+/// `$Script:StoreCredentialUserEnv`), so the admitted channel is the one already
+/// named for this provider rather than a newly invented one.
+pub(super) const PROVIDER_BOOTSTRAP_USER_ENV: &str = "SURREAL_USER";
+
+/// Environment name the pinned `SurrealDB` provider reads its initial root-level
+/// password from. It is delivered only inside the fresh child-only block, never
+/// in argv, never serialized, and never sourced from the parent environment.
+pub(super) const PROVIDER_BOOTSTRAP_PASSWORD_ENV: &str = "SURREAL_PASS";
+
 pub(super) struct ProviderEnvironment {
     pub(super) entries: Vec<(OsString, OsString)>,
 }
 
+/// Builds the provider child's own fresh environment block from a closed
+/// allowlist. I15.4 (`docs/architecture/I15-04-secrets.md`) admits exactly this
+/// channel for the `surreal.exe` dependency: "Host materializes a fresh
+/// child-only environment block ... immediately before process creation; secret
+/// values are never placed in argv, `HostStateJournal`, Module Catalog, crash
+/// command text or reusable environment snapshots."
+///
+/// The allowlist is the literal below: the two Windows roots, the store temp
+/// root, and the provider's OWN bootstrap/admin identity under the two fixed
+/// names the pinned provider reads. Nothing else can appear, because
+/// [`configure_provider_command`] calls `clear_environment()` before
+/// `environment()`, so no parent environment and no database secret another
+/// contour may be holding is ever inherited.
+///
+/// The ordinary client credential of this launch is absent from the block
+/// because the block is closed, not because this function compares strings: it
+/// only ever reads [`SurrealAdapterConfig::provider_bootstrap_password`], the
+/// value resolved from the reserved provider bootstrap reference. The ordinary
+/// client credential is delivered to no child contour at all — it is used by
+/// this process's own `signin` only.
+///
+/// A missing bootstrap credential is terminal here, immediately before process
+/// creation: the provider would otherwise start as an unauthenticated server.
 pub(super) fn provider_environment(
     config: &SurrealAdapterConfig,
 ) -> Result<ProviderEnvironment, AdapterError> {
@@ -411,12 +450,30 @@ pub(super) fn provider_environment(
         .ok_or_else(|| {
             AdapterError::Config("required Windows SystemRoot is unavailable".to_owned())
         })?;
-    Ok(ProviderEnvironment {
-        entries: vec![
-            ("SystemRoot".into(), system_root.clone()),
-            ("WINDIR".into(), system_root),
-            ("TEMP".into(), config.store_temp_root.clone().into()),
-            ("TMP".into(), config.store_temp_root.clone().into()),
-        ],
-    })
+    if config
+        .provider_bootstrap_password
+        .expose_secret()
+        .is_empty()
+    {
+        return Err(AdapterError::Config(
+            "provider bootstrap credential is unavailable; refusing to launch an \
+             unauthenticated provider server"
+                .to_owned(),
+        ));
+    }
+    let entries = vec![
+        ("SystemRoot".into(), system_root.clone()),
+        ("WINDIR".into(), system_root),
+        ("TEMP".into(), config.store_temp_root.clone().into()),
+        ("TMP".into(), config.store_temp_root.clone().into()),
+        (
+            PROVIDER_BOOTSTRAP_USER_ENV.into(),
+            config.provider_bootstrap_username.clone().into(),
+        ),
+        (
+            PROVIDER_BOOTSTRAP_PASSWORD_ENV.into(),
+            config.provider_bootstrap_password.expose_secret().into(),
+        ),
+    ];
+    Ok(ProviderEnvironment { entries })
 }

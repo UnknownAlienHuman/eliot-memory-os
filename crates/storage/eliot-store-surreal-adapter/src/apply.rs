@@ -113,7 +113,19 @@ use schema_contract::{
 /// the declared non-executable roots — is refused with its typed reason, and
 /// the refusal is the operator-visible error text. No caller can name a
 /// different DDL body or a migration directory.
+///
+/// The legacy mapping gate runs first: the declared legacy roots may leave the
+/// tree only once every legacy table, index and field has a current owner, an
+/// explicit transform or an archive-only rationale, so an incomplete mapping
+/// closes admission rather than letting a migration proceed over an unmapped
+/// legacy schema.
 fn admit_migration(migration: &CompiledMigration) -> Result<(), AdapterError> {
+    schema_inventory::validate_legacy_table_mapping().map_err(|omission| {
+        AdapterError::Config(format!(
+            "the legacy schema mapping is incomplete at the current schema owner {}: {omission}",
+            schema_inventory::CURRENT_MIGRATION_OWNER
+        ))
+    })?;
     schema_inventory::resolve_executable_body(
         &migration.migration_id,
         &migration.statements,
@@ -237,6 +249,13 @@ fn migration_preflight(
         if record.migration_checksum_sha256 != expected.migration_checksum_sha256 {
             return Err(AdapterError::PartialOutcome);
         }
+        // The plan's own bound predecessor must be the predecessor the database
+        // actually recorded, compared rather than carried.
+        if migration.predecessor_migration_id.as_deref() != Some(expected.migration_id.as_str())
+            || migration.predecessor_generation.as_deref() != Some(expected.generation.as_str())
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
         return Ok(MigrationPreflight::V1ToV2);
     }
     Err(AdapterError::Config(
@@ -244,12 +263,27 @@ fn migration_preflight(
     ))
 }
 
-fn migration_receipt(migration: &CompiledMigration) -> MigrationReceipt {
-    MigrationReceipt {
-        migration_id: migration.migration_id.clone(),
-        checksum_sha256: migration.checksum_sha256.clone(),
-        generation_after: migration.generation_after.clone(),
-    }
+/// Builds the receipt of one applied migration and compares every bound value
+/// with the migration that was applied.
+///
+/// A receipt that cannot be re-derived from the plan, the root, the fence and
+/// the provider is a partial outcome: it is never handed out as a success.
+fn migration_receipt(
+    config: &SurrealAdapterConfig,
+    migration: &CompiledMigration,
+    state_fence: &StateFence,
+) -> Result<MigrationReceipt, AdapterError> {
+    let receipt = MigrationReceipt::applied(
+        migration,
+        &config.store_data_root,
+        state_fence,
+        config.expected_provider_major,
+        &config.provider_artifact_digest,
+    );
+    receipt.validate_against(migration).map_err(|reason| {
+        AdapterError::Config(format!("migration receipt is not provable: {reason}"))
+    })?;
+    Ok(receipt)
 }
 
 #[allow(
@@ -489,7 +523,7 @@ async fn handle_forward_migration(
             {
                 return Err(AdapterError::PartialOutcome);
             }
-            Ok(migration_receipt(migration))
+            Ok(migration_receipt(config, migration, state_fence)?)
         }
         _ => Err(AdapterError::PartialOutcome),
     }
@@ -549,7 +583,7 @@ async fn apply_migration_direct(
         if f.state_fence != *state_fence {
             return Err(AdapterError::PartialOutcome);
         }
-        return Ok(migration_receipt(migration));
+        return migration_receipt(&adapter.config, migration, state_fence);
     }
     observed_clock
         .validate()
@@ -590,7 +624,9 @@ async fn apply_migration_direct(
             )
             .await
         }
-        MigrationPreflight::ExactReplay => Ok(migration_receipt(migration)),
+        MigrationPreflight::ExactReplay => {
+            Ok(migration_receipt(&adapter.config, migration, state_fence)?)
+        }
     }
 }
 
@@ -2780,6 +2816,10 @@ mod concurrent_allocation_tests {
                     database: "alloc989".into(),
                     username: "sconc989-user".into(),
                     password: SecretString::new(format!("test-{}", uuid::Uuid::new_v4()).into()),
+                    provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+                    provider_bootstrap_password: SecretString::new(
+                        "provider-bootstrap-fixture-secret".into(),
+                    ),
                     provider_bind_address: bind,
                     installation_id: "sconc989-test".into(),
                     installation_profile: "portable_dev".into(),

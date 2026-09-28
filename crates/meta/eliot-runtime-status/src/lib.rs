@@ -86,7 +86,7 @@ mod controlboard_projection;
 pub use controlboard_projection::{
     CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
     ControlBoardProjectionBindings, ControlBoardProjectionError, ControlBoardStatusRow,
-    ControlBoardSupport, project_controlboard_contour, read_controlboard_contour,
+    project_controlboard_contour, read_controlboard_contour,
 };
 
 mod controlboard_consumer;
@@ -104,6 +104,16 @@ pub use controlboard_transport::{
     CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportError,
     ControlBoardTransportMessage, build_controlboard_frame, decode_controlboard_response,
     encode_controlboard_response, open_controlboard_frame,
+};
+
+// #1213: the ControlBoard contour carries the #216 owner records on its public
+// surface. They are re-exported, not redefined, so a consumer of this crate
+// needs no second dependency edge and cannot construct a ControlBoard-local
+// support or proof vocabulary.
+pub use eliot_conformance_contracts::{
+    CONTRACT_VERSION as CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity,
+    DomainCoverage, EvidenceDomain, EvidenceExecutionStatus, ImplementationSupport,
+    SupportObservationState,
 };
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;

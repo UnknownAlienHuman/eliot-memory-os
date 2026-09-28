@@ -4,8 +4,9 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{
-    DeliveryOutcome, NotificationComposition, NotifyStdinRequest, PROTOCOL_VERSION, SERVICE_NAME,
-    UnsatisfiedObligation, parse_notify_stdin_request,
+    DeliveryOutcome, NOTIFICATION_PROVIDER_REJECTED, NOTIFICATION_REQUEST_REJECTED,
+    NotificationComposition, NotifyStdinRequest, PROTOCOL_VERSION, SERVICE_NAME,
+    UnsatisfiedObligation, notify_error_code, parse_notify_stdin_request,
 };
 use eliot_notify_core::{
     NotificationEnvelope, NotificationStateReadRequest, NotificationStateResponse, NotifyError,
@@ -384,7 +385,46 @@ fn dispatch_user_automation(
             }
         }
         UserAutomationPreflightDecision::BlockedConfig { receipt, failure } => {
-            match composition.deliver_user_automation_failure(failure, request) {
+            // The blocked-config failure is delivered through the
+            // obligation-bearing accessor so the recorded degradation is
+            // reported, not just persisted. `deliver_user_automation_failure`
+            // performs the identical delivery and the identical
+            // `record_unsatisfied_obligation` write, but it hands back only
+            // `.delivery`, so a caller of it reports a bare rejection and the
+            // Event Log / spool obligation the composition just wrote is
+            // invisible on the wire — the operator is told the delivery failed
+            // without being told the obligation survived. This is a
+            // mis-projection of a real record, not a missing one.
+            //
+            // `PreflightBlocked` is kept for the case it actually describes: a
+            // block that reached the user. When no OS acceptance was observed
+            // the honest answer is the degradation the sibling
+            // `deliver`/`user_automation_failure` contours already return, so
+            // all three blocked-config/delivery contours project identically.
+            let DeliveryOutcome {
+                delivery,
+                obligation,
+            } = composition.deliver_user_automation_failure_with_obligation(failure, request);
+            if let Some(obligation) = obligation {
+                let (code, detail) = match &delivery {
+                    Ok(observation) => (
+                        NOTIFICATION_DELIVERY_DEGRADED,
+                        format!(
+                            "delivery confidence {:?}, delivered {:?}",
+                            observation.confidence, observation.delivered
+                        ),
+                    ),
+                    Err(error) => (notify_error_code(error), error.to_string()),
+                };
+                return Response::Degraded {
+                    service: SERVICE_NAME,
+                    protocol: PROTOCOL_VERSION,
+                    code,
+                    detail,
+                    obligation: Box::new(obligation),
+                };
+            }
+            match delivery {
                 Ok(observation) => Response::PreflightBlocked {
                     service: SERVICE_NAME,
                     protocol: PROTOCOL_VERSION,
@@ -480,7 +520,7 @@ const NOTIFICATION_DELIVERY_DEGRADED: &str = "NOTIFICATION_DELIVERY_DEGRADED";
 fn is_provider_rejection(response: &Response) -> bool {
     match response {
         Response::Error { code, .. } | Response::Degraded { code, .. } => {
-            *code == "NOTIFICATION_PROVIDER_REJECTED"
+            *code == NOTIFICATION_PROVIDER_REJECTED
         }
         _ => false,
     }
@@ -527,7 +567,7 @@ fn canonical_state_response(state: NotificationStateResponse) -> Response {
 
 fn composition_error(detail: String) -> Response {
     Response::Error {
-        code: "NOTIFICATION_PROVIDER_REJECTED",
+        code: NOTIFICATION_PROVIDER_REJECTED,
         detail,
     }
 }
@@ -544,7 +584,7 @@ fn fallback_startup_degraded(detail: String) -> Response {
     let persisted =
         eliot_notify::no_session_persist::record_no_session("fallback:adapter-unavailable");
     Response::Error {
-        code: "NOTIFICATION_PROVIDER_REJECTED",
+        code: NOTIFICATION_PROVIDER_REJECTED,
         detail: format!(
             "{detail}; degradation persisted event_logged={} spool_persisted={} reason={}",
             persisted.event_logged, persisted.spool_persisted, persisted.reason_code
@@ -554,7 +594,7 @@ fn fallback_startup_degraded(detail: String) -> Response {
 
 fn preflight_error(detail: String) -> Response {
     Response::Error {
-        code: "NOTIFICATION_REQUEST_REJECTED",
+        code: NOTIFICATION_REQUEST_REJECTED,
         detail,
     }
 }
@@ -566,17 +606,12 @@ fn notify_error(error: &NotifyError) -> Response {
     }
 }
 
-/// Classifies one core failure onto its stable wire code. A plan gap is a
-/// provider rejection (non-zero exit); every other core failure is a rejected
-/// request. The same classification is reused by the degradation projection so
-/// an adapter loss never changes the process's exit semantics.
-fn notify_error_code(error: &NotifyError) -> &'static str {
-    if matches!(error, NotifyError::PlanGap { .. }) {
-        "NOTIFICATION_PROVIDER_REJECTED"
-    } else {
-        "NOTIFICATION_REQUEST_REJECTED"
-    }
-}
+// The wire-code classifier itself is owned by `eliot_notify::notify_error_code`
+// and imported above. It is a single owner on purpose: the terminal error
+// projection, the degradation projection, and the canonical read-back inside
+// `record_unsatisfied_obligation` all classify the same failure the same way,
+// so recording a delivery obligation can never change the exit semantics the
+// caller observes.
 
 fn write_response(response: &Response) -> bool {
     let stdout = io::stdout();

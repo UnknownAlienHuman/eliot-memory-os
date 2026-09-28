@@ -19,6 +19,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 
+use super::lifecycle_admission::{
+    EmittedAuditLink, ForwardRevisionParams, LifecycleAdmission, LifecycleMutationOperation,
+    ObservationGenesisParams, admit_forward_revision, admit_observation_genesis,
+    bind_emitted_audit_events,
+};
 use super::lifecycle_persist::{
     AuthenticatedLifecycleSession, HopMutation, HopMutationInput, LifecyclePersistError,
     LifecyclePersistRequest, build_persist_transitions, handle_lifecycle_persist_request,
@@ -37,11 +42,6 @@ use eliot_epistemic::lifecycle::{
     ActorIdentity, ActorKind, AdmissionOutcome, LifecycleRole, SourceAnchor,
 };
 use eliot_evidence::EpistemicStatus;
-use eliot_memory_curation::admission::CurationAdmission;
-use eliot_memory_curation::candidate_admission::{
-    EmittedAuditLink, ForwardRevisionParams, ObservationGenesisParams, admit_forward_revision,
-    admit_observation_genesis, bind_emitted_audit_events,
-};
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
@@ -248,8 +248,9 @@ fn context() -> RequestMeta {
 
 /// Builds a verified two-hop chain with preset audit events, mirroring
 /// the B4 acceptance flow: the route appoints audit identities first,
-/// curation admits with them preset, the seam persists and binds.
-fn verified_chain() -> Vec<CurationAdmission> {
+/// the kernel-local admission owner admits with them preset, the seam
+/// persists and binds.
+fn verified_chain() -> Vec<LifecycleAdmission> {
     let genesis = admit_observation_genesis(ObservationGenesisParams {
         receipt_id: id("receipt:capture"),
         raw_handle: id("obs:raw-1"),
@@ -1115,8 +1116,8 @@ fn revision_policy_request() -> (LifecyclePersistRequest, Vec<EpistemicRevisionP
         },
     )
     .expect("policy receipt");
-    let policy = eliot_memory_curation::admission::CurationAdmission::new(
-        eliot_memory_curation::admission::CurationMutationOperation::ApplyLifecyclePolicy,
+    let policy = LifecycleAdmission::new(
+        LifecycleMutationOperation::ApplyLifecyclePolicy,
         policy_receipt
             .link_audit(id("op-1905-rp-audit-3"))
             .expect("audit linkage"),
@@ -1295,9 +1296,8 @@ async fn revision_and_policy_hops_persist_typed_payloads_with_owner_reload() {
 
 #[tokio::test]
 async fn mutation_mismatch_and_paraphrase_refusal_fail_before_dispatch() {
+    use super::lifecycle_admission::LifecycleAdmissionError;
     use eliot_epistemic::lifecycle::LifecycleError;
-    use eliot_memory_curation::admission::AdmissionError;
-
     let service = ready_service();
     let session = session(&service);
     let fake = FakeStore::new();

@@ -2327,12 +2327,54 @@ impl GrantGraph {
         Some(binding.clone())
     }
 
+    /// Whether one recorded cross-scope omission is a genuine cross-root
+    /// omission for this restored graph.
+    ///
+    /// The dedicated cross-scope influence relation is declared for every
+    /// retained quarantined edge, and partition-time migration admits a
+    /// descendant of a quarantined grant without re-testing the crossing
+    /// (`restore_quarantine_record` does test it, `migrate_to_quarantine`
+    /// only tests narrowing). A dependent this graph records under the SAME
+    /// authority root as the omission's source is therefore reachable
+    /// inside one root and is not a cross-scope omission at all:
+    /// discharging it would drop an in-root dependent out of the closure
+    /// denominator, so a revoked origin's own root could keep a live
+    /// descendant. Revocation cannot narrow the declared root either.
+    ///
+    /// The crossing question is decided by the crate's one existing owner,
+    /// [`crosses_authority_root`], over the lineage
+    /// [`quarantine_parent_grant`](Self::quarantine_parent_grant) resolves
+    /// for both sides, so this check cannot hold a different meaning of
+    /// "different root" than edge declaration, the verdict walk, and the
+    /// restore partition. An omission whose source or dependent this graph
+    /// does not record keeps the pre-existing treatment: a lookup miss
+    /// proves nothing about a crossing, so the omission still needs its own
+    /// CURRENT binding to discharge.
+    fn omission_crosses_authority_root(&self, omission: &RevocationOmission) -> bool {
+        let (Ok(source), Ok(dependent)) = (
+            GrantId::new(omission.edge_source.as_str()),
+            GrantId::new(omission.edge_dependent.as_str()),
+        ) else {
+            return true;
+        };
+        let (Some(source_root), Some(dependent_root)) = (
+            self.quarantine_parent_grant(&source)
+                .map(|grant| grant.authority_root_ref.as_str()),
+            self.quarantine_parent_grant(&dependent)
+                .map(|grant| grant.authority_root_ref.as_str()),
+        ) else {
+            return true;
+        };
+        crosses_authority_root(source_root, dependent_root)
+    }
+
     /// Reconciles one bounded engine outcome against the structural walk
     /// (#2875 item 6): the engine's affected set must match the reached set
-    /// exactly, and every cross-scope omission must bind to a CURRENT
-    /// verified quarantine binding. Returns the frontier refs, the bound
-    /// omission bindings in relation-id order, the forensic relation labels,
-    /// and whether the verdict is partial/unknown.
+    /// exactly, and every cross-scope omission must cross an authority root
+    /// AND bind to a CURRENT verified quarantine binding. Returns the
+    /// frontier refs, the bound omission bindings in relation-id order, the
+    /// forensic relation labels, and whether the verdict is
+    /// partial/unknown.
     ///
     /// An absent, stale, revoked, or mismatched binding preserves the exact
     /// frontier/omission and makes the verdict partial/unknown. A matching
@@ -2381,6 +2423,19 @@ impl GrantGraph {
                     partial = true;
                 }
                 OmissionCause::CrossScope => {
+                    // A cross-scope omission is legitimate only when the
+                    // omitted dependent really leaves the omission source's
+                    // authority root. A dependent under the same root is
+                    // inside the declared scope, so it is never a legitimate
+                    // omission: no binding discharges it, its exact
+                    // reference is retained in the frontier, and the verdict
+                    // stays partial/unknown. The check can only refuse a
+                    // discharge, never grant one.
+                    if !self.omission_crosses_authority_root(omission) {
+                        frontier_refs.insert(omission.edge_dependent.clone());
+                        partial = true;
+                        continue;
+                    }
                     if let (Ok(source), Ok(dependent)) = (
                         GrantId::new(omission.edge_source.as_str()),
                         GrantId::new(omission.edge_dependent.as_str()),
@@ -2436,12 +2491,13 @@ impl GrantGraph {
     /// quarantined dependents encountered with their CURRENT verified
     /// bindings. The bounded engine outcome is reconciled against that
     /// walk: completeness requires the engine's affected set to match the
-    /// reached set exactly and every cross-scope omission to bind to a
-    /// CURRENT verified quarantine binding. Anything less — an unfinished
-    /// traversal, a nonempty frontier, an unbound omission, or a
-    /// denominator mismatch — is an explicit partial/unknown state with
-    /// the exact frontier and omissions, never an omission-labelled
-    /// success.
+    /// reached set exactly, every cross-scope omission to leave the
+    /// omission source's authority root, and every such omission to bind to
+    /// a CURRENT verified quarantine binding. Anything less — an unfinished
+    /// traversal, a nonempty frontier, a same-root dependent recorded as
+    /// cross-scope, an unbound omission, or a denominator mismatch — is an
+    /// explicit partial/unknown state with the exact frontier and
+    /// omissions, never an omission-labelled success.
     ///
     /// The graph consumes already-qualified evidence only: it looks
     /// bindings up by exact relation id and rechecks the edge, but it

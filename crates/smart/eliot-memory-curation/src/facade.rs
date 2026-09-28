@@ -7,26 +7,26 @@
 //! errors pass through untouched with no fallback.
 //!
 //! The legacy crate-root surface (`MemoryCurationOwner::preview` and its DTOs)
-//! keeps byte-identical behavior and must not be extended; `admission` and
-//! `candidate_admission` are frozen #1905 compatibility retained for the
-//! kernel persist seam and its proof tests. New callers use the re-exported
-//! neutral vocabulary plus the adapter. This facade owns no lifecycle,
-//! action, writer-utility, or semantic-kind authority.
+//! keeps byte-identical behavior and must not be extended. New callers use the
+//! re-exported neutral vocabulary plus the adapter. This crate owns no
+//! lifecycle, action, writer-utility, or semantic-kind authority.
 //!
 //! ## Facade disposition table (exact; every public item has one row)
 //!
 //! Dispositions form a closed set: `LegacyFrozen`, `ReexportOwner`,
-//! `AdapterEntry`, `FacadeSurface`.
+//! `AdapterEntry`, `FacadeSurface`, `MigratedOwner`.
 //!
 //! ## Bounded removal plan (#40 A4)
 //!
 //! 1. Legacy rows are frozen: no behavior change, no extension, no new callers.
 //! 2. Delete the preview rows after the #929 inventory is regenerated and the
 //!    A2 equivalence battery runs against the screen cell.
-//! 3. Delete `admission`/`candidate_admission` after the #1905 kernel proof
-//!    tests and `lifecycle_persist.rs` migrate to the neutral owners
-//!    (`eliot-epistemic` receipts plus the kernel-local persist seam); the
-//!    `lifecycle_persist.rs` import is the last live product edge.
+//! 3. The lifecycle/action admission rows are already migrated (#40 W5): the
+//!    vocabulary and its rules moved to the Kernel-local owner
+//!    `eliot-kernel-service::lifecycle_admission`, and the Kernel
+//!    `lifecycle_persist` seam plus its #1905 proof tests consume that owner
+//!    directly. The donor no longer ships an `admission` or
+//!    `candidate_admission` module at all.
 //! 4. Delete this crate after every consumer migrates, per issue #40 A4.
 
 use thiserror::Error;
@@ -126,68 +126,68 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 38] = [
     ),
     (
         "CurationMutationOperation",
-        "LegacyFrozen",
-        "DEPRECATED module; linkage moves to the kernel-local seam",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::LifecycleMutationOperation (#40 W5)",
     ),
     (
         "AdmissionError",
-        "LegacyFrozen",
-        "DEPRECATED module; linkage moves to the kernel-local seam",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::LifecycleAdmissionError (#40 W5)",
     ),
     (
         "CurationAdmission",
-        "LegacyFrozen",
-        "DEPRECATED module; receipts stay owned by eliot-epistemic",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::LifecycleAdmission (#40 W5)",
     ),
     (
         "AdmissionChainView",
-        "LegacyFrozen",
-        "DEPRECATED module; linkage moves to the kernel-local seam",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::LifecycleAdmissionChainView (#40 W5)",
     ),
     (
         "verify_admission_chain",
-        "LegacyFrozen",
-        "DEPRECATED module; receipt chain owner is eliot-epistemic",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::verify_lifecycle_admission_chain (#40 W5)",
     ),
     (
         "ObservationGenesisParams",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::ObservationGenesisParams (#40 W5)",
     ),
     (
         "ForwardRevisionParams",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::ForwardRevisionParams (#40 W5)",
     ),
     (
         "admit_observation_genesis",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::admit_observation_genesis (#40 W5)",
     ),
     (
         "admit_forward_revision",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::admit_forward_revision (#40 W5)",
     ),
     (
         "bind_emitted_audit_events",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::bind_emitted_audit_events (#40 W5)",
     ),
     (
         "EmittedAuditLink",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::EmittedAuditLink (#40 W5)",
     ),
     (
         "StoreProjection",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::StoreProjection (#40 W5)",
     ),
     (
         "project_for_store",
-        "LegacyFrozen",
-        "DEPRECATED module; drivers move with the #1905 tests",
+        "MigratedOwner",
+        "eliot-kernel-service::lifecycle_admission::project_for_store (#40 W5)",
     ),
     (
         "CurationScreenRequest",

@@ -19,7 +19,9 @@ use eliot_installation::{
 };
 #[cfg(test)]
 use eliot_installation::{PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor};
-use eliot_ipc::{BoundIdentity, ReplayDisposition, ReplayLedger, TransportError, TransportLimits};
+use eliot_ipc::{
+    BoundIdentity, PeerIdentity, ReplayDisposition, ReplayLedger, TransportError, TransportLimits,
+};
 use eliot_kernel_service::{
     HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
 };
@@ -62,7 +64,13 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+pub mod boundary_map;
 mod launch_config;
+pub use boundary_map::{
+    BoundaryEvidence, ContourBoundary, CredentialIssuer, CredentialReferenceBoundary,
+    MaintenanceCallerBoundary, NamedPipeCallerBoundary, StoreBoundaryContour, StoreBoundaryMap,
+    StoreCredentialRole, StoreRootBoundary, WatchdogSensorBoundary,
+};
 #[cfg(test)]
 pub(crate) use launch_config::{LEGACY_PHASE_B_ZERO_DIGEST, parse_config_bytes};
 pub use launch_config::{
@@ -119,7 +127,7 @@ pub use connection_manager::{
 };
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
-use adapter_materialization::resolve_credential;
+use adapter_materialization::{resolve_credential, resolve_provider_bootstrap_credential};
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -319,6 +327,14 @@ impl StoreComposition {
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
+        // The provider child's bootstrap/admin credential is a separate
+        // reference resolved here, once, for this launch. A missing or
+        // unreadable second reference stops composition instead of leaving the
+        // provider to start without one.
+        let provider_bootstrap_password = resolve_provider_bootstrap_credential(
+            &platform,
+            &config.provider_bootstrap_credential_ref,
+        )?;
         let roots = &config.runtime_launch.runtime_state_roots;
         let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
             .map_err(|error| format!("validate runtime-root provider: {error}"))?;
@@ -347,7 +363,7 @@ impl StoreComposition {
             .validate()
             .map_err(|error| format!("invalid Store state fence: {error}"))?;
         let store = SurrealStoreAdapter::new(
-            materialize_adapter_config(config, password)?,
+            materialize_adapter_config(config, password, provider_bootstrap_password)?,
             provider_process_lease,
         )
         .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
@@ -1367,7 +1383,18 @@ pub struct StoreEbpSession {
     module_generation: eliot_protocol::ProtocolModuleGeneration,
     max_frame_bytes: usize,
     capabilities: BTreeSet<String>,
+    authenticated_peer: Option<AuthenticatedStorePeer>,
+    session_principal_binding: String,
     replay: ReplayLedger,
+}
+
+/// Verified caller identity retained separately from the server identity
+/// advertised by `ServerHello`.
+struct AuthenticatedStorePeer {
+    identity: PeerIdentity,
+    expected_sid: String,
+    expected_session_id: u32,
+    principal_binding: String,
 }
 
 impl StoreEbpSession {
@@ -1387,13 +1414,57 @@ impl StoreEbpSession {
     }
 }
 
-/// Admits the only supported S-03 `ClientHello` and binds the complete
-/// generation/fence/epoch lineage to the resulting session.
+/// Admits the only supported S-03 `ClientHello` over an authenticated pipe
+/// peer and binds the peer and complete generation/fence/epoch lineage to the
+/// resulting session.
+pub fn admit_authenticated_handshake(
+    frame: Frame,
+    limits: TransportLimits,
+    config: &StoreLaunchConfig,
+    identity: &StoreHandshakeIdentity,
+    authenticated_peer: &PeerIdentity,
+) -> Result<(StoreEbpSession, ServerHello), String> {
+    config.validate()?;
+    let authenticated_peer = AuthenticatedStorePeer::admit(authenticated_peer, config)?;
+    let session_principal_binding = store_server_principal_binding()?;
+    admit_handshake_inner(
+        frame,
+        limits,
+        config,
+        identity,
+        Some(authenticated_peer),
+        session_principal_binding,
+    )
+}
+
+/// Compatibility constructor for legacy handshake fixtures.
+///
+/// This admits no caller identity, so request validation rejects the returned
+/// session in production. The production binary enters only through
+/// [`admit_authenticated_handshake`].
 pub fn admit_handshake(
     frame: Frame,
     limits: TransportLimits,
     config: &StoreLaunchConfig,
     identity: &StoreHandshakeIdentity,
+) -> Result<(StoreEbpSession, ServerHello), String> {
+    admit_handshake_inner(
+        frame,
+        limits,
+        config,
+        identity,
+        None,
+        store_server_principal_binding()?,
+    )
+}
+
+fn admit_handshake_inner(
+    frame: Frame,
+    limits: TransportLimits,
+    config: &StoreLaunchConfig,
+    identity: &StoreHandshakeIdentity,
+    authenticated_peer: Option<AuthenticatedStorePeer>,
+    session_principal_binding: String,
 ) -> Result<(StoreEbpSession, ServerHello), String> {
     config.validate()?;
     frame
@@ -1456,7 +1527,7 @@ pub fn admit_handshake(
     let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
     let server_hello = ServerHello {
         selected_protocol: protocol_version,
-        session_principal_binding: format!("{SERVICE_NAME}:{}", std::process::id()),
+        session_principal_binding,
         allowed_capabilities: capabilities.clone(),
         allowed_effects: effects,
         config_snapshot: serde_json::json!({
@@ -1472,22 +1543,137 @@ pub fn admit_handshake(
         rejection_reason: None,
         authority_epoch: hello.authority_epoch,
     };
+    let session = StoreEbpSession {
+        connection_id: frame.connection_id,
+        protocol_version,
+        state_fence: state_fence.clone(),
+        module_generation: hello.module_generation.clone(),
+        max_frame_bytes: usize::try_from(hello.max_frame)
+            .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
+        capabilities: capabilities.into_iter().collect(),
+        authenticated_peer,
+        session_principal_binding: server_hello.session_principal_binding.clone(),
+        replay: ReplayLedger::default(),
+    };
+    validate_server_hello_peer_binding(&session, &server_hello)?;
     server_hello
         .validate()
         .map_err(|error| format!("validate ServerHello: {error}"))?;
-    Ok((
-        StoreEbpSession {
-            connection_id: frame.connection_id,
-            protocol_version,
-            state_fence: state_fence.clone(),
-            module_generation: hello.module_generation.clone(),
-            max_frame_bytes: usize::try_from(hello.max_frame)
-                .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
-            capabilities: capabilities.into_iter().collect(),
-            replay: ReplayLedger::default(),
-        },
-        server_hello,
+    Ok((session, server_hello))
+}
+
+fn authenticated_peer_principal_binding(peer: &PeerIdentity) -> Result<String, String> {
+    peer.validate()
+        .map_err(|error| format!("authenticated pipe peer proof is invalid: {error}"))?;
+    let PeerIdentity::Authenticated {
+        process_id,
+        user_identity,
+        session_identity,
+        ..
+    } = peer
+    else {
+        return Err("authenticated pipe peer proof is unavailable".to_owned());
+    };
+    let process = peer
+        .process_binding()
+        .ok_or_else(|| "authenticated pipe process binding is unavailable".to_owned())?;
+    Ok(format!(
+        "{SERVICE_NAME}:peer:{user_identity}:logon-session:{session_identity}:process:{process_id}:started:{}",
+        process.start_time_100ns()
     ))
+}
+
+impl AuthenticatedStorePeer {
+    fn admit(peer: &PeerIdentity, config: &StoreLaunchConfig) -> Result<Self, String> {
+        peer.validate()
+            .map_err(|error| format!("authenticated pipe peer proof is invalid: {error}"))?;
+        let PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } = peer
+        else {
+            return Err("authenticated pipe peer proof is unavailable".to_owned());
+        };
+        if user_identity != &config.expected_client_sid
+            || session_identity != &config.expected_client_session_id.to_string()
+        {
+            return Err(
+                "authenticated pipe peer is outside the Host-approved SID/session".to_owned(),
+            );
+        }
+        Ok(Self {
+            identity: peer.clone(),
+            expected_sid: config.expected_client_sid.clone(),
+            expected_session_id: config.expected_client_session_id,
+            principal_binding: authenticated_peer_principal_binding(peer)?,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.identity
+            .validate()
+            .map_err(|error| format!("authenticated pipe peer proof is invalid: {error}"))?;
+        let PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } = &self.identity
+        else {
+            return Err("authenticated pipe peer proof is unavailable".to_owned());
+        };
+        if user_identity != &self.expected_sid
+            || session_identity != &self.expected_session_id.to_string()
+        {
+            return Err(
+                "authenticated pipe peer no longer matches the admitted SID/session".to_owned(),
+            );
+        }
+        if authenticated_peer_principal_binding(&self.identity)? != self.principal_binding {
+            return Err("authenticated pipe peer principal binding changed".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn store_server_principal_binding() -> Result<String, String> {
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .map_err(|error| format!("observe Store server SID/session: {error}"))?;
+    Ok(format!(
+        "sid={};session={}",
+        expectation.expected_sid(),
+        expectation.expected_session_id()
+    ))
+}
+
+fn validate_server_hello_peer_binding(
+    session: &StoreEbpSession,
+    server_hello: &ServerHello,
+) -> Result<(), String> {
+    let expected = store_server_principal_binding()?;
+    if session.session_principal_binding != expected
+        || server_hello.session_principal_binding != expected
+    {
+        return Err(
+            "ServerHello principal binding does not match the Store server SID/session".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_peer_binding(session: &StoreEbpSession) -> Result<(), String> {
+    if let Some(peer) = session.authenticated_peer.as_ref() {
+        peer.validate()?;
+    }
+    #[cfg(not(test))]
+    if session.authenticated_peer.is_none() {
+        return Err("Store EBP session has no authenticated pipe peer".to_owned());
+    }
+    let expected_server = store_server_principal_binding()?;
+    if session.session_principal_binding != expected_server {
+        return Err("Store EBP session server SID/session binding changed".to_owned());
+    }
+    Ok(())
 }
 
 /// Validates one request against the admitted session and replay ledger.
@@ -1562,6 +1748,16 @@ pub fn validate_request_frame_with_log(
             None,
         );
         return Err("request frame is outside the negotiated EBP session".to_owned());
+    }
+    if let Err(error) = validate_session_peer_binding(session) {
+        emit_validation_rejected(
+            events,
+            BridgeBoundary::SessionValidation,
+            "frame",
+            &frame_identity,
+            None,
+        );
+        return Err(error);
     }
     let (request_id, identity, request, _) = match decode_request_frame_with_authority(frame) {
         Ok(decoded) => decoded,
@@ -2056,6 +2252,9 @@ mod tests {
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),
             credential_ref: "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
+            provider_bootstrap_credential_ref: "eliot/provider/v1/fedcba9876543210fedcba9876543210"
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
             runtime_launch: runtime_launch(),
         };
         config.approved_config_hash = launch_config_digest(&config).expect("config digest");
@@ -2115,11 +2314,13 @@ mod tests {
         binding
             .validate_command(&command, &migration)
             .expect("exact SystemService command");
-        let provider_receipt = MigrationReceipt {
-            migration_id: migration.migration_id().to_owned(),
-            checksum_sha256: migration.checksum_sha256().to_owned(),
-            generation_after: migration.generation_after().clone(),
-        };
+        let provider_receipt = MigrationReceipt::applied(
+            &migration,
+            "test-store-data-root",
+            &config.runtime_launch.authority_state_fence,
+            eliot_store_surreal_adapter::PINNED_SURREALDB_MAJOR,
+            "test-provider-artifact-digest",
+        );
         let receipt = binding
             .receipt(&provider_receipt)
             .expect("typed authoritative receipt");

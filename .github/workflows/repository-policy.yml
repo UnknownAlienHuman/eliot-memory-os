@@ -423,12 +423,13 @@ jobs:
 
           def _enclosing_job_block(lines, index, indent):
               # Line indexes of the job body that owns a step at `indent`.
-              # `steps:` sits between the job header and its steps, so the owning
-              # job's body is every mapping line at the job-body indentation, from
-              # the `steps:` container up to (but not including) the shallower job
-              # header. Every governing `if:`/soft-failure/timeout key in that
-              # body is returned, so a skipped or soft-failure job is seen no
-              # matter which key carries it.
+              # A YAML mapping is unordered, so the owning job's body is every
+              # mapping line at the job-body indentation: above the `steps:`
+              # container up to the shallower job header, and below the steps
+              # block down to the next shallower mapping line. Every governing
+              # `if:`/soft-failure/timeout key in that body is returned, so a
+              # skipped or soft-failure job is seen no matter which key carries
+              # it or where in the job body the key is written.
               governing = []
               body_indent = None
               for previous in range(index, -1, -1):
@@ -448,7 +449,26 @@ jobs:
                   governing.append(previous)
                   if key == 'steps':
                       body_indent = leading
-              return governing
+              if body_indent is not None:
+                  # A job-level key may also be written after the `steps:` block
+                  # (the mapping is unordered and GitHub still reads it as a job
+                  # condition), so collect the job-body keys below the step too.
+                  # Deeper lines are step content; the first shallower mapping
+                  # line ends the job body.
+                  for following in range(index + 1, len(lines)):
+                      line = lines[following]
+                      if _is_yaml_comment(line):
+                          continue
+                      key = _yaml_key(line)
+                      if key is None:
+                          continue
+                      leading = len(line) - len(line.lstrip(' '))
+                      if leading > body_indent:
+                          continue
+                      if leading < body_indent:
+                          break
+                      governing.append(following)
+                  return governing
 
           def _nearest_list_item(lines, index):
               # The index of the nearest block-sequence entry at or above `index`.

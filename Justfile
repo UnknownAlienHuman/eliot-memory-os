@@ -44,6 +44,13 @@ work-unit crate:
 standalone-crates:
     python scripts/verify-standalone-crates.py --root .
 
+# Fail-closed gate for crates/smart/cognitive-donor-map.toml: every donor
+# disposition against current source, one current base for the donor
+# dispositions and the topology donor authority, and the authority ceiling
+# that keeps a donor from becoming a runtime owner. Metadata evidence only.
+cognitive-donor-dispositions:
+    python scripts/verify-cognitive-donor-dispositions-816.py --root .
+
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
 
@@ -137,7 +144,7 @@ sync-skills:
 # directly with no governed profile receipt. Thin-invoker migration to the same named
 # profile awaits W4 stage-execution provisions; until then no governed claim rests on
 # these gates.
-quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
+quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates cognitive-donor-dispositions core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 # Complete locked Review profile, sole definition in scripts/verify.ps1.
 verify:

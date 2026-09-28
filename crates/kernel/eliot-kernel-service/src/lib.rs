@@ -31,6 +31,7 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod lifecycle_admission;
 mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
@@ -98,6 +99,12 @@ pub use eliot_protocol::{
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use lifecycle_admission::{
+    EmittedAuditLink, ForwardRevisionParams, LifecycleAdmission, LifecycleAdmissionChainView,
+    LifecycleAdmissionError, LifecycleMutationOperation, ObservationGenesisParams, StoreProjection,
+    admit_forward_revision, admit_observation_genesis, bind_emitted_audit_events,
+    project_for_store, verify_lifecycle_admission_chain,
 };
 pub use lifecycle_persist::{
     AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
@@ -183,7 +190,8 @@ pub use storage_replacement::{
     CANONICAL_STORE_CAPABILITY, CANONICAL_STORE_EFFECT_DOMAIN, CANONICAL_STORE_MODULE_ID,
     CANONICAL_STORE_WORK_SCOPE, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
     StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
-    StorageReplacementTransfer, StorageRollbackDisposition, canonical_store_route_scope,
+    StorageReplacementTransfer, StorageRollbackDisposition, active_canonical_store_generation,
+    canonical_store_route_scope,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,

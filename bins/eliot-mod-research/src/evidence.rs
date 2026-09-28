@@ -138,6 +138,47 @@ impl RawProviderEvidence {
         }
     }
 
+    /// Materializes the evidence record from a real stream readback whose
+    /// terminal exit was never observed.
+    ///
+    /// The streams here are the provider's own bytes, so both records are
+    /// ordinary captures and a stream that did reach EOF with no bytes is
+    /// honestly complete-with-zero-bytes rather than an absence handle. No
+    /// exit is invented: the disposition stays `Unknown` and no numeric code is
+    /// fabricated for an observation that never produced one.
+    #[must_use]
+    pub fn materialize_optional(
+        operation_id: &str,
+        invocation_digest: &str,
+        exit: Option<&ExitStatus>,
+        stdout: &CapturedStream,
+        stderr: &CapturedStream,
+        descendants_complete: bool,
+    ) -> Self {
+        let (exit_disposition, exit_code) = match exit {
+            Some(exit) => (
+                exit.disposition(),
+                match exit.disposition() {
+                    ExitDisposition::Completed => exit_code_of(exit),
+                    ExitDisposition::Signalled
+                    | ExitDisposition::ResourceLimit
+                    | ExitDisposition::Cancelled
+                    | ExitDisposition::Unknown => None,
+                },
+            ),
+            None => (ExitDisposition::Unknown, None),
+        };
+        Self {
+            operation_id: operation_id.to_owned(),
+            invocation_digest: invocation_digest.to_owned(),
+            stdout: StreamRecord::capture(stdout),
+            stderr: StreamRecord::capture(stderr),
+            exit_disposition,
+            exit_code,
+            descendants_complete,
+        }
+    }
+
     /// Builds the explicit absence record for an attempt that never reached
     /// stream readback.
     ///
@@ -146,6 +187,11 @@ impl RawProviderEvidence {
     /// `Unknown`, and no numeric code is invented. The receipt therefore
     /// reports "no stream evidence was obtained" instead of "the provider
     /// produced nothing".
+    ///
+    /// This record is correct only when no readback was ever attempted. A
+    /// deadline overrun holds a live executor drain, so it retains the
+    /// provider's real streams through [`RawProviderEvidence::materialize_optional`]
+    /// instead of claiming here that no handle existed.
     #[must_use]
     pub fn absent(operation_id: &str, invocation_digest: &str) -> Self {
         Self {
@@ -164,7 +210,7 @@ impl RawProviderEvidence {
 /// serialized exit observation, following the established
 /// `eliot-instrument-runner` precedent: the typed contract exposes only the
 /// coarse disposition, so the code is read from the serialized form.
-fn exit_code_of(exit: &ExitStatus) -> Option<i32> {
+pub(crate) fn exit_code_of(exit: &ExitStatus) -> Option<i32> {
     serde_json::to_value(exit)
         .ok()
         .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
@@ -408,11 +454,8 @@ impl std::fmt::Display for ProviderExecutionReceipt {
                 .is_some_and(|receipt| receipt.no_effect_proven),
             self.reconciliation.attempts.len(),
             self.reconciliation.owner_confirmed(),
-            self.reconciliation.leaves_cancellation_unconfirmed(
-                self.cancellation
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.no_effect_proven),
-            ),
+            self.reconciliation
+                .leaves_cancellation_unconfirmed(self.cancellation.as_ref()),
             self.reconciliation.summary(),
             self.evidence_records.len(),
             self.provider_job_ref.as_deref().unwrap_or("none"),
@@ -542,15 +585,28 @@ impl ReconciliationEvidence {
             .and_then(|attempt| attempt.disposition)
     }
 
-    /// Whether a cancellation was issued whose no-effect could not be proven
+    /// Whether a cancellation WAS ISSUED whose no-effect could not be proven
     /// and whose owner confirmation is absent.
+    ///
+    /// `cancellation_issued` is the retained cancellation receipt of this run.
+    /// A run that never cancelled anything has no cancellation to confirm, so
+    /// requiring it here is what keeps this predicate equal to its own
+    /// definition: a plain unknown outcome, a crash, a protocol violation, or a
+    /// refusal that never reached the executor is not a cancellation-unconfirmed
+    /// state and must keep its own reason code.
     ///
     /// This is the only condition under which the research-provider vocabulary's
     /// own `CANCELLATION_UNCONFIRMED` reason code is correct. Using it for a
     /// plain unknown outcome would collapse two different states into one code.
     #[must_use]
-    pub fn leaves_cancellation_unconfirmed(&self, no_effect_proven: bool) -> bool {
-        !no_effect_proven
+    pub fn leaves_cancellation_unconfirmed(
+        &self,
+        cancellation_issued: Option<&CancellationEvidence>,
+    ) -> bool {
+        let Some(cancellation) = cancellation_issued else {
+            return false;
+        };
+        !cancellation.no_effect_proven
             && !self
                 .disposition_of(eliot_kernel_service::RESEARCH_PROVIDER_CANCEL_OPERATION)
                 .is_some_and(eliot_kernel_service::ResearchProviderDisposition::admits)

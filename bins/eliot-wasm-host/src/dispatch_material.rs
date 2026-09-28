@@ -76,9 +76,11 @@ pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "eliot-wasm-host.inflight.json";
 /// serve: no accumulation is possible, and a stale record (naming a replaced
 /// set) never matches the staged identity.
 pub const WASM_HOST_SERVED_RESULT_FILE_NAME: &str = "eliot-wasm-host.served-result.json";
-/// Served-result record allocation guard: the retained terminal frame already
-/// fits the governed result budget, and the identity wrapper adds a few
-/// hundred bytes; anything larger is refused before parsing, never truncated.
+/// Served-result record allocation guard: it is also the retained-owner byte
+/// budget for one operation's whole bounded result-event sequence, so the
+/// aggregate is refused before it is built rather than after it is written.
+/// The identity wrapper and commitment add a few hundred bytes on top of the
+/// stored events; anything larger is refused before parsing, never truncated.
 pub const SERVED_RESULT_MAX_BYTES: usize = 128 * 1024;
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
@@ -2190,11 +2192,62 @@ pub fn clear_inflight_marker(
     }
 }
 
-/// Durable terminal-result record: the exact terminal frame this drive served,
-/// bound to its served identity. Decisions match on identity only (see
-/// [`names`](ServedResultRecord::names)); `retained_at_unix_ms` is
-/// informational (wall-clock at write, never a derivation input). The frame
-/// stays an opaque JSON value here: typed interpretation belongs to the
+/// The exact bounded result-event sequence one drive retained for its served
+/// identity (#2787 audit defect 2). It lives inside #2786's existing durable
+/// result record — there is no second result database — and it replaces that
+/// record's terminal-only payload, which could not describe a
+/// `sequence=1, observation_predecessors=[0]` terminal whose predecessor was
+/// never retained.
+///
+/// Events stay opaque JSON values here: typed interpretation, per-frame
+/// validation, and stream-shape validation belong to the request-loop driver
+/// that owns the result contract, so this module never depends on driver
+/// types. What this module owns is the record's own integrity: exactly one
+/// payload variant, a well-formed identity, and a well-formed commitment to
+/// the exact stored event bytes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedResultStream {
+    /// The exact retained result events, in observation order. Only ever
+    /// appended to by the writer; a prefix is never dropped to fit a bound.
+    pub events: Vec<serde_json::Value>,
+    /// Sequence number of the event that closed the stream, or `None` while
+    /// the retained sequence is still an open prefix. `None` is an explicit
+    /// incomplete state, never a synthesized terminal.
+    pub terminal_sequence: Option<u64>,
+    /// Commitment to the exact stored event bytes. The reader recomputes it
+    /// from the ORIGINAL recorded values and compares, so a record whose
+    /// stored bytes differ from what its writer committed fails closed.
+    pub stream_digest: String,
+}
+
+/// The one result content a served-result record retains.
+///
+/// Exactly one variant is stored. This is the type a writer names and the
+/// type a reader classifies, so the two can never disagree about what a
+/// stored record is: a `Stream` is what current code writes, and a
+/// `TerminalFrame` is the #2786 v1 shape that earlier code wrote and that
+/// readback therefore still has to be able to see. `TerminalFrame` remains
+/// readable as an explicitly incomplete prefix: its predecessors are never
+/// synthesized on readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServedResultPayload {
+    /// #2786 v1: only the terminal frame was retained. No current writer
+    /// emits this; it exists so the readback of a record written before the
+    /// stream shape existed is a shape the classifier actually receives.
+    TerminalFrame {
+        /// Exact retained terminal frame JSON.
+        frame: serde_json::Value,
+    },
+    /// #2787 v2: the exact bounded retained result-event sequence.
+    Stream(RetainedResultStream),
+}
+
+/// Durable result record: the exact bounded result content this drive
+/// retained, bound to its served identity. Decisions match on identity only
+/// (see [`names`](ServedResultRecord::names)); `retained_at_unix_ms` is
+/// informational (wall-clock at write, never a derivation input). Both
+/// payloads are opaque JSON here; typed interpretation belongs to the
 /// request-loop driver that owns the frame contract, so this module never
 /// depends on driver types.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2210,25 +2263,36 @@ pub struct ServedResultRecord {
     pub grant_digest: String,
     /// Wall-clock milliseconds when the record was written.
     pub retained_at_unix_ms: u64,
-    /// Exact retained terminal frame JSON.
-    pub frame: serde_json::Value,
+    /// #2786 v1 payload: the terminal frame alone. An explicitly incomplete
+    /// prefix, retained so an older record stays readable as what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<serde_json::Value>,
+    /// #2787 v2 payload: the exact bounded retained result-event sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<RetainedResultStream>,
 }
 
 impl ServedResultRecord {
-    /// Captures the served-result record for one claimed identity and frame.
+    /// Captures the served-result record for one claimed identity and the one
+    /// exact result content that identity retained.
     #[must_use]
     pub fn from_identity(
         identity: &StagedDeliveryIdentity,
-        frame: &serde_json::Value,
+        payload: ServedResultPayload,
         retained_at_unix_ms: u64,
     ) -> Self {
+        let (frame, stream) = match payload {
+            ServedResultPayload::TerminalFrame { frame } => (Some(frame), None),
+            ServedResultPayload::Stream(stream) => (None, Some(stream)),
+        };
         Self {
             operation_id: identity.operation_id.clone(),
             generation: identity.generation,
             claim_id: identity.claim_id.clone(),
             grant_digest: identity.grant_digest.clone(),
             retained_at_unix_ms,
-            frame: frame.clone(),
+            frame,
+            stream,
         }
     }
 
@@ -2243,9 +2307,12 @@ impl ServedResultRecord {
 }
 
 /// Reads the durable served-result record, if any. Only an absent record
-/// answers `Ok(None)`; read failures, oversize files, and malformed records
-/// fail closed so callers cannot treat uncertain retained state as a fresh
-/// delivery or as another identity's result.
+/// answers `Ok(None)`; read failures, oversize files, malformed records, and
+/// records carrying zero or both result payloads fail closed so callers
+/// cannot treat uncertain retained state as a fresh delivery or as another
+/// identity's result. The retained content is returned opaquely: the driver
+/// that owns the result contract performs the real per-frame and stream-shape
+/// validation against the recorded values.
 pub fn read_served_result(
     install_dir: &std::path::Path,
 ) -> Result<Option<ServedResultRecord>, MaterialError> {
@@ -2286,21 +2353,45 @@ pub fn read_served_result(
         return Err(MaterialError::Malformed);
     }
     hex_digest(&record.grant_digest, "served-result-grant-digest")?;
+    // Exactly one payload: a record carrying both a terminal-only frame and a
+    // retained stream, or neither, is malformed and never answered as one of
+    // the two shapes. The content itself is validated by the driver that owns
+    // the result contract; this reader only refuses what it can prove is
+    // unreadable here.
+    match (&record.frame, &record.stream) {
+        (Some(_), None) | (None, Some(_)) => {}
+        _ => return Err(MaterialError::Malformed),
+    }
+    if let Some(stream) = record.stream.as_ref() {
+        if stream.events.is_empty() {
+            return Err(MaterialError::Malformed);
+        }
+        hex_digest(&stream.stream_digest, "served-result-stream-digest")?;
+        if let Some(terminal) = stream.terminal_sequence {
+            // A recorded terminal that names an event the record never
+            // stored is malformed here, not a stream whose shape the driver
+            // gets to decide.
+            let index = usize::try_from(terminal).map_err(|_| MaterialError::Malformed)?;
+            if stream.events.get(index).is_none() {
+                return Err(MaterialError::Malformed);
+            }
+        }
+    }
     Ok(Some(record))
 }
 
 /// Writes the served-result record atomically (process-scoped partial,
 /// flushed, then renamed): the reader never observes partial JSON. The
-/// record must fit [`SERVED_RESULT_MAX_BYTES`]; an oversize frame fails here
-/// rather than truncating. Callers must propagate a write failure and retain
-/// the claimed set for recovery.
+/// record must fit [`SERVED_RESULT_MAX_BYTES`]; an oversize retained stream
+/// fails here rather than truncating, and a caller must propagate a write
+/// failure and retain the claimed set for recovery.
 pub fn write_served_result(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
-    frame: &serde_json::Value,
+    payload: ServedResultPayload,
     retained_at_unix_ms: u64,
 ) -> std::io::Result<()> {
-    let record = ServedResultRecord::from_identity(identity, frame, retained_at_unix_ms);
+    let record = ServedResultRecord::from_identity(identity, payload, retained_at_unix_ms);
     let bytes =
         serde_json::to_vec(&record).map_err(|error| std::io::Error::other(error.to_string()))?;
     if bytes.len() > SERVED_RESULT_MAX_BYTES {

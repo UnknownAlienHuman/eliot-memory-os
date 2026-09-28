@@ -55,6 +55,10 @@ pub enum BridgeTransportBackpressureDimension {
     TransportQueueItemsOrBytes,
     #[serde(rename = "bridge-host-request-dispatch")]
     BridgeHostRequestDispatch,
+    #[serde(rename = "bridge-recovery-windows")]
+    BridgeRecoveryWindows,
+    #[serde(rename = "bridge-recovery-cuts")]
+    BridgeRecoveryCuts,
 }
 
 /// Closed recovery actions allowed for front-door transport backpressure.
@@ -82,6 +86,14 @@ pub enum BridgeTransportBackpressureRecoveryAction {
         rename = "retain the admitted session; run gap/reconcile recovery, then resubmit duplicate-safe"
     )]
     RetainSessionRecoverThenResubmitDuplicateSafe,
+    #[serde(
+        rename = "reuse an exact live matching recovery window, or wait for expiry then reissue the authenticated open"
+    )]
+    ReuseExactLiveRecoveryWindowOrWaitForExpiry,
+    #[serde(
+        rename = "after expired-window cleanup, retry the exact selector while its window is live; if expired, reopen authenticated recovery and use the new window"
+    )]
+    AfterExpiredWindowCleanupRetryLiveSelectorOrReopenAuthenticatedRecovery,
 }
 
 /// Closed descriptions of work shed or deferred by the front door.
@@ -103,6 +115,14 @@ pub enum BridgeTransportBackpressureShedWork {
         rename = "this frame shed; its commit fate is unknown, never denied; the session is retained"
     )]
     UnknownCommitFateSessionRetained,
+    #[serde(
+        rename = "only the new recovery-window open shed and deferred; existing live windows and recovery retained"
+    )]
+    DeferredNewRecoveryWindowOpenExistingRecoveryRetained,
+    #[serde(
+        rename = "only the requested new recovery cut deferred; all existing recovery windows and cuts retained"
+    )]
+    DeferredNewRecoveryCutExistingRecoveryRetained,
 }
 
 /// The only generic transport outcome currently emitted by the front door.
@@ -160,6 +180,14 @@ impl BridgeTransportBackpressure {
                     BridgeTransportBackpressureDimension::BridgeHostRequestDispatch,
                     BridgeTransportBackpressureRecoveryAction::RetainSessionRecoverThenResubmitDuplicateSafe,
                     BridgeTransportBackpressureShedWork::UnknownCommitFateSessionRetained,
+                ) | (
+                    BridgeTransportBackpressureDimension::BridgeRecoveryWindows,
+                    BridgeTransportBackpressureRecoveryAction::ReuseExactLiveRecoveryWindowOrWaitForExpiry,
+                    BridgeTransportBackpressureShedWork::DeferredNewRecoveryWindowOpenExistingRecoveryRetained,
+                ) | (
+                    BridgeTransportBackpressureDimension::BridgeRecoveryCuts,
+                    BridgeTransportBackpressureRecoveryAction::AfterExpiredWindowCleanupRetryLiveSelectorOrReopenAuthenticatedRecovery,
+                    BridgeTransportBackpressureShedWork::DeferredNewRecoveryCutExistingRecoveryRetained,
                 )
             )
     }

@@ -15,10 +15,29 @@
 //! - [`submit_host_event`] journals one host event through `forward_hook`;
 //! - [`submit_derived_fault`] files one derived transport edge;
 //! - [`read_host_coverage`] projects the owner's coverage denominator;
-//! - [`reconcile_terminal_event`] verifies a nominated host event verbatim in
-//!   the live journal and assesses it against an emission observation;
+//! - [`reconcile_terminal_event`] joins a nominated host event onto the live
+//!   journal by exact identity, position, content, and generation, checks it
+//!   against the evidence this correlation already accepted, and only then
+//!   assesses it against an emission observation;
 //! - [`reconcile_deadline_sweep`] assesses the stuck/pending boundary from the
 //!   live journal without a terminal event.
+//!
+//! No expected set is ever taken from the joining caller. Event identity,
+//! position, and content are compared against the retained owner journal;
+//! generation is compared against the owner's live attach binding; and a later
+//! event is compared against the evidence the correlation itself already
+//! accepted. Comparing two values the caller supplied could only prove that the
+//! caller agrees with itself.
+//!
+//! Everything this seam retains is bounded and owned elsewhere. The expected
+//! sets are the owner's journal, capped by the owner's
+//! `TERMINAL_JOURNAL_CAPACITY` with an explicit eviction policy (the oldest
+//! entry rotates out and the owner raises its incomplete-coverage flag, which
+//! makes [`read_host_coverage`] report indeterminacy rather than a clean
+//! interval), and the per-invocation `AssessmentLog` in `super::correlation`,
+//! capped by `MAX_ASSESSMENT_REVISIONS` and dropped with its invocation. There
+//! is no facade-side table: nothing in this module is a second store, and no
+//! terminal host fact is produced without an owner journal entry behind it.
 
 use eliot_agent_bridge_core::{
     AgentBridgeCore, HostEventEnvelope, TransportEdge, TransportEdgeKind,
@@ -26,11 +45,11 @@ use eliot_agent_bridge_core::{
 
 use super::correlation::{
     Assessment, AssessmentInputs, AssessmentRevision, CanonicalDisposition, CoverageIndeterminacy,
-    CoverageProof, EliotEmissionObservation, HostTerminalObservation, ObservationWindow,
-    OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
+    CoverageProof, EliotEmissionObservation, HostObservationEvidence, HostTerminalObservation,
+    ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
 };
 use super::host_observation::{
-    HostEventJoinKeys, HostObservationReject, normalize_terminal_observation,
+    HostEventJoinKeys, HostObservationReject, check_event_replay, normalize_terminal_observation,
 };
 
 /// Submits one host event through the existing admitted event route.
@@ -118,6 +137,16 @@ pub(crate) struct BridgeHostCoverage {
 /// cursor gap; rotation proves indeterminacy; an unattached owner proves
 /// nothing. Coverage comes only from this owner projection, never from
 /// facade-local guessing.
+///
+/// The journal is the denominator and it is bounded by the owner, not by this
+/// module: the owner caps it at its `TERMINAL_JOURNAL_CAPACITY`, evicts the
+/// oldest entry when full, and raises its own incomplete-coverage flag on that
+/// eviction, which surfaces here as
+/// [`CoverageProof::Indeterminate`] rather than as a silently shorter
+/// interval. Rejection is therefore explicit: a rotated or absent journal
+/// yields `Indeterminate`, and a gap yields
+/// [`CoverageProof::CursorGap`], so no assessment downstream can read a bounded
+/// but incomplete interval as complete coverage.
 pub(crate) fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage {
     let Some(inputs) = bridge.terminal_reduction_inputs() else {
         return BridgeHostCoverage {
@@ -181,8 +210,23 @@ pub(crate) enum ReconcileError {
         /// Nominated event identity.
         event_id: String,
     },
+    /// The nominated event identity is not bound to exactly the position the
+    /// owner declared for it, so a late or reordered observation closes
+    /// nothing.
+    OutOfDeclaredOrder {
+        /// Conflicting event identity.
+        event_id: String,
+        /// Position the candidate claimed in the owner's observation order.
+        sequence: u64,
+    },
     /// The journal holds different content under the nominated event identity.
     JournalContentConflict {
+        /// Conflicting event identity.
+        event_id: String,
+    },
+    /// The same event identity was already accepted for this correlation with
+    /// different content, generation, route, or cursor.
+    PriorEvidenceConflict {
         /// Conflicting event identity.
         event_id: String,
     },
@@ -199,9 +243,18 @@ impl std::fmt::Display for ReconcileError {
                 formatter,
                 "nominated host event {event_id} is absent from the owner journal"
             ),
+            Self::OutOfDeclaredOrder { event_id, sequence } => write!(
+                formatter,
+                "host event {event_id} is not at its declared journal position {sequence}"
+            ),
             Self::JournalContentConflict { event_id } => write!(
                 formatter,
                 "owner journal holds different content for host event {event_id}"
+            ),
+            Self::PriorEvidenceConflict { event_id } => write!(
+                formatter,
+                "host event {event_id} was already accepted for this correlation with \
+                 different content"
             ),
             Self::HostRejected(reason) => {
                 write!(formatter, "host event rejected for correlation: {reason}")
@@ -216,7 +269,9 @@ impl std::error::Error for ReconcileError {
             Self::HostRejected(reason) => Some(reason),
             Self::OwnerUnattached
             | Self::NominatedEventNotJournaled { .. }
-            | Self::JournalContentConflict { .. } => None,
+            | Self::OutOfDeclaredOrder { .. }
+            | Self::JournalContentConflict { .. }
+            | Self::PriorEvidenceConflict { .. } => None,
         }
     }
 }
@@ -229,6 +284,13 @@ pub(crate) struct TerminalReconcileRequest<'a> {
     pub(crate) candidate: &'a HostEventEnvelope,
     /// Exact join keys the owner attests for the candidate.
     pub(crate) keys: &'a HostEventJoinKeys,
+    /// Host observation already accepted for this same correlation, taken
+    /// from the correlation's own retained revision chain.
+    ///
+    /// This is the independent expected set for a later event: the join
+    /// compares a new candidate against the recorded evidence rather than
+    /// against a fresh recomputation of the same inputs.
+    pub(crate) prior_host_evidence: Option<&'a HostObservationEvidence>,
     /// Owner-validated operation binding, when a tool owner minted one.
     pub(crate) operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
@@ -241,11 +303,26 @@ pub(crate) struct TerminalReconcileRequest<'a> {
 
 /// Reconciles one nominated terminal host event against an emission.
 ///
-/// Verifies the candidate verbatim in the live owner journal (absent events
-/// and changed same-identity content fail closed), normalizes it through the
-/// host-event adapter, and assesses it against the emission observation with
-/// the owner's live coverage denominator. Stale, foreign, duplicated, or
-/// reordered host events cannot close a current correlation.
+/// The candidate is joined on exact identity first, then exact generation, then
+/// exact content, then against the evidence this correlation already accepted:
+///
+/// 1. **exact identity** — the event identity must be present in the live
+///    owner journal, and that identity must be bound to exactly the sequence
+///    and cursor the candidate claims. An event that is absent, or that sits at
+///    a different position than it claims, closes nothing;
+/// 2. **exact content** — every journaled entry under that identity must equal
+///    the candidate field for field. One differing entry is a same-identity
+///    content conflict and is refused, never overwritten; byte-equal repeats
+///    are an exact replay and stay idempotent;
+/// 3. **exact generation** — the candidate's own owner-validated lineage must
+///    name the owner's live current session, so a restart or session rotation
+///    cannot relabel an old observation as current;
+/// 4. **prior accepted evidence** — the same event identity may not reappear
+///    for this correlation with any changed content.
+///
+/// Only then is the event assessed, with the owner's live coverage
+/// denominator. Stale, foreign, duplicated, reordered, and out-of-order host
+/// events each close nothing current.
 pub(crate) fn reconcile_terminal_event(
     bridge: &AgentBridgeCore,
     request: &TerminalReconcileRequest<'_>,
@@ -253,23 +330,27 @@ pub(crate) fn reconcile_terminal_event(
     let Some(inputs) = bridge.terminal_reduction_inputs() else {
         return Err(ReconcileError::OwnerUnattached);
     };
-    let candidate_id = request.candidate.event_id.as_str();
-    let Some(journaled) = inputs
-        .history()
-        .iter()
-        .find(|event| event.event_id.as_str() == candidate_id)
-    else {
-        return Err(ReconcileError::NominatedEventNotJournaled {
-            event_id: candidate_id.to_owned(),
-        });
-    };
-    if journaled != request.candidate {
-        return Err(ReconcileError::JournalContentConflict {
-            event_id: candidate_id.to_owned(),
+    let journaled = journal_binding(inputs.history(), request.candidate)?;
+    let current_session = bridge
+        .attach_view()
+        .map(|view| view.binding().session_id().as_str().to_owned())
+        .ok_or(ReconcileError::OwnerUnattached)?;
+    let host = normalize_terminal_observation(journaled, request.keys, &current_session)
+        .map_err(ReconcileError::HostRejected)?;
+    // An exact replay is idempotent: identical evidence re-derives the
+    // identical assessment, so the correlation still closes exactly once, and a
+    // different event identity is a new observation of the same correlation.
+    // Neither rewrites a prior revision by itself. Only the same identity with
+    // changed content — a different generation, route, cursor, or digest — is
+    // refused.
+    if let (Some(prior), HostTerminalObservation::Observed { evidence, .. }) =
+        (request.prior_host_evidence, &host)
+        && check_event_replay(prior, evidence.as_ref()).is_err()
+    {
+        return Err(ReconcileError::PriorEvidenceConflict {
+            event_id: journaled.event_id.as_str().to_owned(),
         });
     }
-    let host = normalize_terminal_observation(request.candidate, request.keys)
-        .map_err(ReconcileError::HostRejected)?;
     let coverage = read_host_coverage(bridge);
     let window = ObservationWindow {
         deadline_unix_ms: request.keys.deadline_unix_ms,
@@ -279,7 +360,7 @@ pub(crate) fn reconcile_terminal_event(
     let transport_edge = inputs
         .edges()
         .iter()
-        .find(|edge| edge.event_ref() == candidate_id)
+        .find(|edge| edge.event_ref() == journaled.event_id.as_str())
         .map(TransportEdge::kind);
     let assessment_inputs = AssessmentInputs {
         emission: request.emission,
@@ -291,6 +372,55 @@ pub(crate) fn reconcile_terminal_event(
         ui_confirmed_stale: request.ui_confirmed_stale,
     };
     Ok(assess_correlation(&assessment_inputs))
+}
+
+/// Joins one nominated candidate onto the owner's declared observation order.
+///
+/// Exact identity, never a prefix match. The event identity must be present in
+/// the retained journal, and that identity must be bound to exactly the
+/// sequence and cursor the candidate claims, and the journal position holding
+/// that sequence must hold that identity: an absent, foreign, reordered, or
+/// late observation therefore closes nothing. Every entry filed under the same
+/// identity must also be byte-equal to the candidate, so one differing entry is
+/// a same-identity content conflict while byte-equal repeats stay an idempotent
+/// replay. The owner journal is the only expected set consulted; the facade
+/// keeps no table of its own.
+fn journal_binding<'a>(
+    history: &'a [HostEventEnvelope],
+    candidate: &HostEventEnvelope,
+) -> Result<&'a HostEventEnvelope, ReconcileError> {
+    let event_id = candidate.event_id.as_str().to_owned();
+    let bound = history
+        .iter()
+        .filter(|event| event.event_id.as_str() == event_id)
+        .collect::<Vec<_>>();
+    let Some(first) = bound.first() else {
+        return Err(ReconcileError::NominatedEventNotJournaled { event_id });
+    };
+    if bound
+        .iter()
+        .any(|event| event.sequence != candidate.sequence || event.cursor != candidate.cursor)
+    {
+        return Err(ReconcileError::OutOfDeclaredOrder {
+            event_id,
+            sequence: candidate.sequence,
+        });
+    }
+    if bound.iter().any(|event| *event != candidate) {
+        return Err(ReconcileError::JournalContentConflict {
+            event_id: event_id.clone(),
+        });
+    }
+    let at_declared = history
+        .iter()
+        .find(|event| event.sequence == candidate.sequence);
+    if at_declared.is_none_or(|event| event.event_id.as_str() != event_id) {
+        return Err(ReconcileError::OutOfDeclaredOrder {
+            event_id,
+            sequence: candidate.sequence,
+        });
+    }
+    Ok(*first)
 }
 
 /// Owner request to assess the stuck/pending boundary without a terminal event.

@@ -102,6 +102,13 @@ pub enum BridgeError {
         /// Boxed so the typed error stays small enough to return by value from
         /// every call site without an allocation on the success path.
         cancellation: Box<CancellationEvidence>,
+        /// Immutable raw evidence read back from the executor's captured
+        /// streams after the deadline overrun, so a provider's real
+        /// stdout/stderr survive a timeout instead of being replaced by an
+        /// absence record. Preserved for the same reason as
+        /// [`BridgeError::UnknownOutcome`]: the bytes are the only custody of
+        /// what the provider actually wrote.
+        evidence: Option<Box<RawProviderEvidence>>,
     },
     #[error(
         "research provider outcome is unknown: reconcile by operation identity before any retry"
@@ -178,17 +185,23 @@ impl BridgeError {
     #[must_use]
     pub const fn cancellation(&self) -> Option<&CancellationEvidence> {
         match self {
-            Self::TimedOut { cancellation } => Some(cancellation),
+            Self::TimedOut { cancellation, .. } => Some(cancellation),
             _ => None,
         }
     }
 
     /// Returns the immutable raw evidence, when it was materialized before the
     /// failure was classified.
+    ///
+    /// A deadline overrun reads the executor's captured streams back before it
+    /// classifies, so a timed-out provider's real stdout/stderr/exit/lineage are
+    /// retained on exactly the same footing as an unclassifiable terminal state.
     #[must_use]
     pub fn evidence(&self) -> Option<&RawProviderEvidence> {
         match self {
-            Self::UnknownOutcome { evidence } => evidence.as_deref(),
+            Self::UnknownOutcome { evidence } | Self::TimedOut { evidence, .. } => {
+                evidence.as_deref()
+            }
             _ => None,
         }
     }
@@ -403,6 +416,47 @@ impl TerminalFailure {
             cancellation: error.cancellation().cloned(),
         }
     }
+
+    /// Builds the terminal record of a classified terminal outcome that left no
+    /// `BridgeError` behind.
+    ///
+    /// `ProviderBridge::execute` returns `Ok` for every terminal state it could
+    /// classify, so a crashed, cancelled, timed-out or unknown provider reaches
+    /// this path with no error to project. The reason code and coverage gap come
+    /// from the crate's own `BridgeError` vocabulary through the same
+    /// `reason_code`/`coverage_gap_kind` pair, so an outcome is never reported
+    /// under a second, privately chosen classification.
+    #[must_use]
+    pub fn outcome_degradation(
+        outcome: ProviderOutcome,
+        cancellation: Option<&CancellationEvidence>,
+    ) -> Self {
+        let reason_code = match outcome {
+            // Both a clean terminal classification and a crash-class
+            // classification are a runtime failure of the provider process, so
+            // they share the one runtime-failure code the vocabulary defines.
+            ProviderOutcome::Completed | ProviderOutcome::Crashed => {
+                eliot_kernel_service::REASON_RUNTIME_FAILED
+            }
+            ProviderOutcome::TimedOut => eliot_kernel_service::REASON_DEADLINE_EXCEEDED,
+            ProviderOutcome::Cancelled => eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED,
+            ProviderOutcome::Unknown => eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+        };
+        let coverage_gap = match outcome {
+            ProviderOutcome::TimedOut => CoverageGapKind::Timeout,
+            ProviderOutcome::Crashed
+            | ProviderOutcome::Cancelled
+            | ProviderOutcome::Unknown
+            | ProviderOutcome::Completed => CoverageGapKind::Unknown,
+        };
+        Self {
+            reason_code,
+            coverage_gap,
+            outcome,
+            evidence: None,
+            cancellation: cancellation.cloned(),
+        }
+    }
 }
 
 /// The exact typed acquisition-coverage degradation one failed provider attempt
@@ -544,13 +598,26 @@ pub struct SubmissionRecord {
 }
 
 /// Terminal record of one submitted attempt.
+///
+/// This is the bridge's own retained classification of what the provider run
+/// did. A crashed, cancelled, timed-out or unclassifiable attempt reaches a
+/// terminal state that is not a completion, and the terminal receipt has to
+/// carry that exact state rather than a locally chosen success label.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SubmittedOutcome {
+pub enum SubmittedOutcome {
+    /// A clean completed exit with a zero code and proven tree closure.
     Completed,
+    /// A non-zero exit or a crash-class disposition.
     Crashed,
+    /// The terminal wait exceeded the deadline.
     TimedOut,
+    /// Cancellation stopped the tree.
     Cancelled,
+    /// The terminal state could not be classified from local evidence.
     Unknown,
+    /// The attempt failed at or after the executor and keeps no finer
+    /// classification; it is still crash-class acquisition evidence, never a
+    /// clean stop and never a fabricated completion.
     Refused,
 }
 
@@ -560,6 +627,25 @@ impl SubmittedOutcome {
     /// the `reconcile` path.
     const fn requires_reconciliation(self) -> bool {
         matches!(self, Self::TimedOut | Self::Unknown)
+    }
+
+    /// Returns the provider-local outcome this retained classification carries.
+    ///
+    /// `Refused` is crash-class acquisition evidence: the attempt reached the
+    /// executor or its contour, so it is never reported as a completion.
+    #[must_use]
+    pub const fn provider_outcome(self) -> ProviderOutcome {
+        match self {
+            Self::Completed => ProviderOutcome::Completed,
+            Self::Crashed
+            // An unclassifiable terminal state and a refusal that reached the
+            // executor are both crash-class acquisition evidence: neither is a
+            // completion, and neither stays a locally invented label.
+            | Self::Unknown
+            | Self::Refused => ProviderOutcome::Crashed,
+            Self::TimedOut => ProviderOutcome::TimedOut,
+            Self::Cancelled => ProviderOutcome::Cancelled,
+        }
     }
 }
 
@@ -625,6 +711,18 @@ impl AdmittedResearchBridge {
     pub fn last_cancellation(&self) -> Option<&CancellationEvidence> {
         self.submitted()
             .and_then(|state| state.cancellation.as_ref())
+    }
+
+    /// Returns the retained terminal classification of this attempt.
+    ///
+    /// The terminal receipt carries this value verbatim. A submit that reached
+    /// a terminal executor state is not a completion by virtue of succeeding
+    /// as a Rust call, so the caller reads what the run actually did here
+    /// instead of choosing a label of its own. `None` only before the executor
+    /// has been contacted, where no terminal state exists.
+    #[must_use]
+    pub fn last_outcome(&self) -> Option<SubmittedOutcome> {
+        self.submitted().map(|state| state.outcome)
     }
 
     /// Returns the exact submit reconciliation record, when one was sealed.
@@ -1486,6 +1584,7 @@ mod tests {
                     no_effect_proven: false,
                     descendants_complete: false,
                 }),
+                evidence: None,
             }
             .coverage_gap_kind(),
             CoverageGapKind::Timeout

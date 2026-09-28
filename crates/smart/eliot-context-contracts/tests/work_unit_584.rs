@@ -2297,14 +2297,24 @@ fn all_quality_dimensions() -> Vec<QualityDimension> {
     ]
 }
 
+fn resolved_applicability() -> QualityApplicability {
+    QualityApplicability {
+        resolved: QUALITY_APPLICABILITY_INPUTS.to_vec(),
+        unknown: Vec::new(),
+    }
+}
+
 fn passing_dimension_result(
     context: &ContextBinding,
     dimension: QualityDimension,
     evidence: &str,
 ) -> QualityDimensionResult {
     QualityDimensionResult {
+        schema_version: QUALITY_RESULT_SCHEMA_VERSION,
         dimension,
         state: QualityDimensionState::Passed,
+        rule_revision: id("rule-revision"),
+        required_evidence: vec![id(evidence)],
         evidence: vec![id(evidence)],
         measurements: Vec::new(),
         failed_invariant: None,
@@ -2326,6 +2336,7 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
         .collect();
     QualityScorecard {
         binding: context.clone(),
+        applicability: resolved_applicability(),
         results,
     }
 }
@@ -2581,8 +2592,9 @@ fn no_scalar_weighted_or_average_quality_compensation_path() {
     // The closed wire surface carries no aggregate scalar to compensate with.
     let value = serde_json::to_value(&baseline).expect("scorecard value");
     let object = value.as_object().expect("scorecard object");
-    assert_eq!(object.len(), 2);
+    assert_eq!(object.len(), 3);
     assert!(object.contains_key("binding"));
+    assert!(object.contains_key("applicability"));
     assert!(object.contains_key("results"));
     for rejected in ["score", "average", "weighted", "total"] {
         let mut injected = value.clone();

@@ -224,6 +224,29 @@ const DELIVER_QUIET_HOURS_SUPPRESSED: &str = "deliver:quiet-hours-suppressed";
 /// and the request defect must not read as a delivered notification.
 const DELIVER_QUIET_HOURS_REJECTED: &str = "deliver:quiet-hours-rejected";
 
+/// Stable wire code for a failure the owning providers could not serve.
+///
+/// A plan gap means a required owner was absent, so the process answers its
+/// caller with the provider-rejection code and a non-zero exit.
+pub const NOTIFICATION_PROVIDER_REJECTED: &str = "NOTIFICATION_PROVIDER_REJECTED";
+/// Stable wire code for a failure the request itself caused.
+pub const NOTIFICATION_REQUEST_REJECTED: &str = "NOTIFICATION_REQUEST_REJECTED";
+
+/// Classifies one core failure onto its stable wire code.
+///
+/// This is the single classifier for the process: the terminal response
+/// projection and the recorded-degradation projection both read it, so
+/// recording a delivery obligation can never change the exit semantics the
+/// caller observes for the same failure.
+#[must_use]
+pub const fn notify_error_code(error: &eliot_notify_core::NotifyError) -> &'static str {
+    if matches!(error, eliot_notify_core::NotifyError::PlanGap { .. }) {
+        NOTIFICATION_PROVIDER_REJECTED
+    } else {
+        NOTIFICATION_REQUEST_REJECTED
+    }
+}
+
 /// Which delivery contour recorded the unsatisfied obligation.
 ///
 /// The contour selects the condition code only; it never changes what is
@@ -285,10 +308,45 @@ pub struct UnsatisfiedObligation {
     /// Whether a durable no-session marker is still readable from the spool.
     /// Read back from the owning store, never assumed from the write.
     pub spool_obligation_available: bool,
-    /// The canonical obligation read back from the canonical owner, when this
-    /// notification has a canonical scope to read. The owner's own unresolved
-    /// flag is reported as observed; delivery loss never writes a resolution.
-    pub canonical: Option<CanonicalObligation>,
+    /// The canonical obligation read back from the canonical owner. The three
+    /// states are reported verbatim: the owner's own unresolved flag is never
+    /// inferred here, an owner that could not be read is never reported as an
+    /// absent record, and delivery loss never writes a resolution.
+    pub canonical: CanonicalObligationRead,
+}
+
+/// The canonical-obligation leg of one recorded delivery degradation.
+///
+/// The three states are kept apart because a *read that could not be answered*
+/// is not a *record that is absent*, and the difference is the whole of what
+/// the operator is told. I11.6:19 makes the canonical notification state
+/// durable in its owning store; I11.7:8 requires a failed delivery to remain
+/// visible. Collapsing an unreadable owner into "no canonical item" would
+/// report the canonical state as missing at the exact moment delivery degraded,
+/// which is the mis-projection this typed leg removes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum CanonicalObligationRead {
+    /// This contour has no canonical record to read: the signed Watchdog
+    /// fallback envelope carries none by design (I11.6:9-11), and a request
+    /// refused before its upsert never wrote one. The Event Log / spool above
+    /// is the whole obligation on those contours.
+    NotApplicable,
+    /// The canonical owner answered with the record and its own unresolved
+    /// flag, observed rather than inferred.
+    Observed {
+        /// The record exactly as its owning store returned it.
+        obligation: CanonicalObligation,
+    },
+    /// The canonical owner could not be read on this contour. Nothing was
+    /// resolved, acknowledged or removed by that failure — the delivery
+    /// degradation recorded beside it is the durable record, and the code says
+    /// which class of failure the read hit.
+    Unavailable {
+        /// Stable classification from [`notify_error_code`]; no payload, path,
+        /// identity or secret.
+        code: &'static str,
+    },
 }
 
 /// One delivery contour's complete result: the adapter's verdict and the
@@ -804,6 +862,12 @@ impl NotificationComposition {
     /// quiet-hours policy rejection also yields no canonical record — the
     /// delivery was refused before the upsert — so its read back reports no
     /// canonical item rather than failing.
+    ///
+    /// A read that the owner *fails* is not a record that is absent. The typed
+    /// failure is kept and reported as [`CanonicalObligationRead::Unavailable`];
+    /// it is never dropped, because "the canonical owner could not be reached"
+    /// and "the canonical state is not there" are opposite claims about the
+    /// store I11.6:19 requires to keep the item durable.
     fn record_unsatisfied_obligation(
         &mut self,
         notification_id: &PlatformHandle,
@@ -814,11 +878,20 @@ impl NotificationComposition {
     ) -> UnsatisfiedObligation {
         let condition = cause.condition_code(contour);
         let persisted = no_session_persist::record_no_session(condition);
-        let canonical = affected_scope.and_then(|scope| {
-            self.core
-                .canonical_obligation(notification_id, scope, request)
-                .ok()
-        });
+        let canonical = match affected_scope {
+            None => CanonicalObligationRead::NotApplicable,
+            Some(scope) => {
+                match self
+                    .core
+                    .canonical_obligation(notification_id, scope, request)
+                {
+                    Ok(obligation) => CanonicalObligationRead::Observed { obligation },
+                    Err(error) => CanonicalObligationRead::Unavailable {
+                        code: notify_error_code(&error),
+                    },
+                }
+            }
+        };
         UnsatisfiedObligation {
             claimed_toast: false,
             reason_code: persisted.reason_code,
@@ -1163,47 +1236,19 @@ where
                 retryable: false,
             }));
         }
-        let issued = match self.issuer.lock() {
-            Ok(mut issuer) => match operation {
-                operation_identity::NotifyOperation::G08Verify => {
-                    issuer.issue_g08(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::A08Admit => {
-                    issuer.issue_a08(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::WatchdogVerify => {
-                    issuer.issue_watchdog(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::DeliveryVerify => {
-                    issuer.issue_delivery(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::LedgerReserve => {
-                    issuer.issue_reserve(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::LedgerCommit => {
-                    issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::NotificationState => {
-                    issuer.issue_notification_state(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::NotificationStateRead => {
-                    issuer.issue_notification_state_read(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::QuietHoursProjectionRead => {
-                    issuer.issue_quiet_hours_projection_read(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::UserAutomationPreflightRead => {
-                    issuer.issue_user_automation_preflight_read(parent, &payload, now)
-                }
-            },
-            Err(_) => {
-                return PortOutcome::Error(PortError::Provider(ProviderError {
-                    code: ProviderErrorCode::Failed,
-                    retryable: false,
-                }));
-            }
-        };
-        let issued = match issued {
+        // A reconstruction replays a RETAINED ORIGINAL identity; it never
+        // re-derives one. This composition root holds no retained per-step
+        // record — see the #78 STITCH note on `issue_step` — so the recovery
+        // material is explicitly absent and this step is a FIRST issuance.
+        let issued = match issue_step(
+            &self.issuer,
+            parent,
+            operation,
+            &payload,
+            prior_receipt_digest,
+            None,
+            now,
+        ) {
             Ok(issued) => issued,
             Err(operation_identity::OperationIdentityError::IdentityConflict(detail)) => {
                 return identity_conflict_outcome(detail.as_str());
@@ -1271,6 +1316,84 @@ where
                 "Kernel verification exchange mutex is poisoned".to_owned(),
             )),
         }
+    }
+}
+
+/// Resolves the exact child identity for one Kernel step.
+///
+/// A reconstruction is only ever a replay of a RETAINED ORIGINAL identity:
+/// [`operation_identity::NotifyIdentityIssuer::restore_issued`] reinstalls the
+/// complete `RequestIdentity` a step was first issued with and compares it
+/// field by field against the live parent, operation, canonical payload, prior
+/// receipt and the other retained fields. The recovery clock may validate
+/// freshness and report expiry; it never re-anchors that identity. A step
+/// without such retained material is a FIRST issuance and the issuer mints its
+/// own anchored identity under the derived transport strings.
+///
+/// #78 STITCH: the `retained` seam is the only place reconstruction can enter,
+/// and the durable owner of that per-step record does not exist yet. Every
+/// in-scope caller (the stdin request schema, the one-shot composition root,
+/// the protected fallback ledger and its schema-compatible snapshot, and the
+/// Kernel/state owners) carries no retained child identity, so this root never
+/// supplies one and the branch below is not yet taken in production. Until that
+/// owner exists this stays an honest STITCH: a freshly started issuer re-mints
+/// a new anchor under the same transport strings, and that is a first issuance,
+/// never a replay of a lost step. Nothing is fabricated to close the gap.
+fn issue_step(
+    issuer: &operation_identity::IssuerHandle,
+    parent: &NotificationRequest,
+    operation: operation_identity::NotifyOperation,
+    payload: &Value,
+    prior_receipt_digest: Option<&str>,
+    retained: Option<&operation_identity::ChildLineageEntry>,
+    now: u64,
+) -> Result<operation_identity::IssuedIdentity, operation_identity::OperationIdentityError> {
+    let mut issuer = issuer.lock().map_err(|_| {
+        operation_identity::OperationIdentityError::InvalidIdentity(
+            "operation identity issuer mutex is poisoned".to_owned(),
+        )
+    })?;
+    match retained {
+        Some(retained) => issuer.restore_issued(
+            parent,
+            operation,
+            payload,
+            prior_receipt_digest,
+            retained,
+            now,
+        ),
+        None => match operation {
+            operation_identity::NotifyOperation::G08Verify => {
+                issuer.issue_g08(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::A08Admit => {
+                issuer.issue_a08(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::WatchdogVerify => {
+                issuer.issue_watchdog(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::DeliveryVerify => {
+                issuer.issue_delivery(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::LedgerReserve => {
+                issuer.issue_reserve(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::LedgerCommit => {
+                issuer.issue_commit(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::NotificationState => {
+                issuer.issue_notification_state(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::NotificationStateRead => {
+                issuer.issue_notification_state_read(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::QuietHoursProjectionRead => {
+                issuer.issue_quiet_hours_projection_read(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::UserAutomationPreflightRead => {
+                issuer.issue_user_automation_preflight_read(parent, payload, now)
+            }
+        },
     }
 }
 
