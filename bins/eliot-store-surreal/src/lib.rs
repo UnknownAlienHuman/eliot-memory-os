@@ -9,7 +9,7 @@
 //! claim identity; it is not a second store or semantic write path.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
@@ -74,8 +74,9 @@ pub use compatibility::{
     ADMITTED_TRANSPORT, COMPATIBILITY_FILE_NAME, CompatibilityFile, CompatibilityVerdict,
     EVIDENCE_SNAPSHOT_FILE_NAME, EvidenceSnapshotVerification, SurrealCompatibility,
     compatibility_path_for_config, evaluate_compatibility, load_compatibility_for_config,
-    load_evidence_snapshot_verification, parse_compatibility_bytes,
-    require_compatibility_for_writer, require_observed_identity_match,
+    load_evidence_snapshot_verification, observed_identity_verdict, parse_compatibility_bytes,
+    require_compatibility_for_writer, require_installation_writer, require_observed_identity_match,
+    resolve_compatibility_verdict,
 };
 mod schema_bootstrap_contract;
 use schema_bootstrap_contract::{
@@ -279,6 +280,11 @@ pub struct StoreComposition {
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
     connections: StoreConnectionManager,
     health_admission: HealthAdminAdmission,
+    /// Exact materialization path of the selected Store launch config. It is
+    /// the binding that locates the installation-visible I5.9 compatibility
+    /// decision and its I0.5 evidence snapshot as siblings of THIS config; it
+    /// carries no decision of its own.
+    store_config_path: PathBuf,
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
@@ -291,6 +297,7 @@ impl std::fmt::Debug for StoreComposition {
             .field("state_fence", &self.state_fence)
             .field("connections", &self.connections)
             .field("health_admission", &self.health_admission)
+            .field("store_config_path", &self.store_config_path)
             .finish_non_exhaustive()
     }
 }
@@ -368,8 +375,48 @@ impl StoreComposition {
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
             connections,
             health_admission: HealthAdminAdmission::bridge_default(),
+            store_config_path: PathBuf::from(config.runtime_launch.store_config_path.as_str()),
             _runtime_root_leases: runtime_root_leases,
         })
+    }
+
+    /// Resolves the installation-visible I5.9 compatibility decision for this
+    /// composition's exact Store config (issue #1932).
+    ///
+    /// The installation-visible record is the only authority: every call
+    /// re-reads `compatibility.toml` and the I0.5 evidence snapshot installed
+    /// beside the selected config and re-evaluates them against the
+    /// installation-approved provider artifact digest and this bridge's
+    /// configured schema generation. No process-local copy of the decision is
+    /// kept, so a record that is rotated, revoked or removed while the process
+    /// runs is visible on the next observation.
+    #[must_use]
+    pub fn compatibility_verdict(&self) -> CompatibilityVerdict {
+        let adapter = self.store.config();
+        resolve_compatibility_verdict(
+            &self.store_config_path,
+            adapter.provider_artifact_digest.as_str(),
+            adapter.expected_schema_generation.as_str(),
+        )
+    }
+
+    /// Enforces canonical-writer admission for one write (issue #1932).
+    ///
+    /// Returns the exact compatibility report when the installation-visible
+    /// decision admits a canonical writer, and the same report as an explicit
+    /// refusal otherwise. It re-reads the installation-visible record instead
+    /// of trusting a verdict resolved earlier, so the offline
+    /// maintenance-authority write path (schema initialization) and any future
+    /// in-crate writer are gated by the same installation decision as the
+    /// authenticated pipe.
+    pub fn require_canonical_writer(&self) -> Result<(), String> {
+        let adapter = self.store.config();
+        require_installation_writer(
+            &self.store_config_path,
+            adapter.provider_artifact_digest.as_str(),
+            adapter.expected_schema_generation.as_str(),
+        )
+        .map(|_report| ())
     }
 
     /// Rejects attempts to add a second process/root owner after composition.
@@ -494,6 +541,19 @@ impl StoreComposition {
         if self.schema_bootstrap_binding.profile != InstallationProfile::PortableDev {
             return Err(StoreCompositionError::Store(StoreError::Unavailable));
         }
+        // I5.9 (issue #1932): a schema migration is a provider write, so the
+        // offline maintenance-authority path passes the same
+        // installation-visible compatibility gate as the authenticated pipe.
+        // The pipe gate lives in `dispatch_request`; this path never reaches
+        // it, so the admission is enforced here as well. The exact report is
+        // already reported by the launch gate that admits this mode; the
+        // refusal here carries the static contract reason.
+        self.require_canonical_writer().map_err(|_report| {
+            StoreCompositionError::Store(StoreError::InvalidField {
+                field: "store.compatibility",
+                reason: "canonical writes are not admitted by the active compatibility decision",
+            })
+        })?;
         let generation = self.store.config().expected_schema_generation.clone();
         let migration = SurrealStoreAdapter::initial_schema_migration(generation);
         self.store

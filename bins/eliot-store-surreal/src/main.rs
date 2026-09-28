@@ -16,10 +16,11 @@ use eliot_store_surreal::diagnostics::{
     emit_received, emit_validation_rejected, install_startup_subscriber, report_events,
 };
 use eliot_store_surreal::{
-    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch_with_log,
-    load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
-    require_compatibility_for_writer, require_observed_identity_match,
-    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame_with_log,
+    CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake,
+    dispatch_with_log, load_compatibility_for_config, load_config,
+    load_evidence_snapshot_verification, observed_identity_verdict,
+    require_semantic_ready_for_pipe, resolve_compatibility_verdict, store_bootstrap_descriptor,
+    validate_request_frame_with_log,
 };
 
 mod launch_mode;
@@ -227,47 +228,62 @@ fn frame_rejection_defect(
 /// I5.9 compatibility gate (issue #1932).
 ///
 /// Reports the exact active `SurrealDB` version and compatibility decision from
-/// the installation-visible `compatibility.toml` sibling of the Store config,
-/// then admits the canonical writer only on a recorded qualified decision. An
-/// unrecorded or unqualified server binary keeps the installation in visible
-/// maintenance instead of silently accepting writes.
+/// the installation-visible `compatibility.toml` sibling of the Store config.
+///
+/// The report is emitted for BOTH verdicts and the stage diagnostic is recorded
+/// BEFORE the verdict is interpreted by the caller. The previous ordering put
+/// the writer-admission `?` in front of the report, so a maintenance verdict
+/// aborted startup with the decision never printed: an unqualified or
+/// unrecorded binary produced no visible decision at all. A maintenance verdict
+/// is now a RUNNING state — the bridge continues to composition, connect,
+/// readiness and the authenticated pipe, answers health/readiness as a non-writer
+/// and refuses every canonical mutation (see
+/// `StoreComposition::require_canonical_writer`).
 #[cfg(windows)]
 #[allow(clippy::print_stderr)]
 fn enforce_store_compatibility(
     config: &eliot_store_surreal::StoreLaunchConfig,
-) -> Result<(), String> {
-    let outcome = enforce_store_compatibility_inner(config);
+) -> CompatibilityVerdict {
+    let verdict = enforce_store_compatibility_inner(config);
+    eprintln!("{SERVICE_NAME}: {}", verdict.report());
     report_stage_outcome(
         BridgeBoundary::CompatibilityGate,
         "compatibility_gate",
         &BridgeIdentity::new(),
-        outcome.is_ok(),
+        verdict.is_writer_admitted(),
     );
-    outcome
+    verdict
 }
 
 #[cfg(windows)]
-#[allow(clippy::print_stderr)]
 fn enforce_store_compatibility_inner(
     config: &eliot_store_surreal::StoreLaunchConfig,
-) -> Result<(), String> {
-    let config_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
-    let file = load_compatibility_for_config(config_path)?;
-    // The I0.5 evidence qualification is an observed property of the
-    // installed snapshot document, never state of the record: resolve it
-    // here and pass it explicitly to the admission gate.
-    let evidence_verification = load_evidence_snapshot_verification(config_path, &file.surrealdb);
-    let report = require_compatibility_for_writer(
-        &file.surrealdb,
+) -> CompatibilityVerdict {
+    resolve_compatibility_verdict(
+        Path::new(config.runtime_launch.store_config_path.as_str()),
         config
             .runtime_launch
             .canonical_store_artifact_digest
             .as_str(),
-        &config.schema_generation,
-        &evidence_verification,
-    )?;
-    eprintln!("{SERVICE_NAME}: {report}");
-    Ok(())
+        config.schema_generation.as_str(),
+    )
+}
+
+/// Requires an admitted canonical-writer decision for one write-capable launch
+/// mode (issue #1932).
+///
+/// The portable-dev schema-initialization mode is a provider write, so it passes
+/// the same installation-visible gate as the long-running writer: the exact
+/// report is emitted and recorded, and a maintenance verdict refuses the mode
+/// with that report instead of migrating an unqualified generation.
+#[cfg(windows)]
+fn require_writer_admission(config: &eliot_store_surreal::StoreLaunchConfig) -> Result<(), String> {
+    let verdict = enforce_store_compatibility(config);
+    if verdict.is_writer_admitted() {
+        Ok(())
+    } else {
+        Err(verdict.report().to_owned())
+    }
 }
 
 #[cfg(windows)]
@@ -316,13 +332,13 @@ fn emit_bootstrap_descriptor_inner(mode: &LaunchMode) -> Result<bool, String> {
 fn bind_observed_identity(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
-) -> Result<(), String> {
+) -> Result<CompatibilityVerdict, String> {
     let outcome = bind_observed_identity_inner(composition, config);
     report_stage_outcome(
         BridgeBoundary::ObservedIdentityBinding,
         "observed_identity_binding",
         &BridgeIdentity::new(),
-        outcome.is_ok(),
+        matches!(&outcome, Ok(verdict) if verdict.is_writer_admitted()),
     );
     outcome
 }
@@ -332,7 +348,7 @@ fn bind_observed_identity(
 fn bind_observed_identity_inner(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
-) -> Result<(), String> {
+) -> Result<CompatibilityVerdict, String> {
     let observed = composition
         .observed_provider_identity()
         .ok_or_else(|| "provider identity was not proved by connect".to_owned())?;
@@ -340,15 +356,37 @@ fn bind_observed_identity_inner(
         "{}.{}.{}",
         observed.version_major, observed.version_minor, observed.version_patch
     );
-    let compat_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
-    let compat_file = load_compatibility_for_config(compat_path)?;
-    let bound_report = require_observed_identity_match(
-        &compat_file.surrealdb,
-        &observed_version,
-        &observed.artifact_digest,
-    )?;
-    eprintln!("{SERVICE_NAME}: {bound_report}");
-    Ok(())
+    let config_path = Path::new(config.runtime_launch.store_config_path.as_str());
+    // A record swapped, revoked or rotated across the provider-startup window
+    // is an explicit maintenance verdict naming the drift, not a startup abort:
+    // the installation stays running and queryable as a non-writer, and the
+    // mutation path refuses every canonical write.
+    let verdict = match load_compatibility_for_config(config_path) {
+        Ok(file) => {
+            let evidence_verification =
+                load_evidence_snapshot_verification(config_path, &file.surrealdb);
+            observed_identity_verdict(
+                &file.surrealdb,
+                &observed_version,
+                &observed.artifact_digest,
+                &evidence_verification,
+            )
+        }
+        Err(_) => {
+            // No readable record at all: the unrecorded maintenance verdict
+            // names the exact load refusal in its report.
+            resolve_compatibility_verdict(
+                config_path,
+                config
+                    .runtime_launch
+                    .canonical_store_artifact_digest
+                    .as_str(),
+                config.schema_generation.as_str(),
+            )
+        }
+    };
+    eprintln!("{SERVICE_NAME}: {}", verdict.report());
+    Ok(verdict)
 }
 
 #[cfg(windows)]
@@ -599,6 +637,10 @@ async fn serve_handshake_loop(
 
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
+// This standalone service has no initialized telemetry sink before startup;
+// stderr is the only fail-closed launch diagnostic available to its supervisor,
+// and the visible non-writer readiness state must be reported there.
+#[allow(clippy::print_stderr)]
 async fn run() -> Result<(), String> {
     let mode = match parse_launch_mode(std::env::args_os().skip(1)) {
         Ok(mode) => {
@@ -639,7 +681,11 @@ async fn run() -> Result<(), String> {
     // observability runtime is installed before the provider is composed,
     // connected, or the authenticated pipe is served.
     install_observability(&config)?;
-    enforce_store_compatibility(&config)?;
+    // I5.9 compatibility gate (issue #1932). The verdict is reported and
+    // recorded at every stage, and a maintenance verdict does not abort
+    // startup: the installation comes up as a running, queryable non-writer
+    // whose canonical mutations are refused on the mutation path itself.
+    let mut compatibility = enforce_store_compatibility(&config);
     let composed = StoreComposition::new(&config);
     report_stage_outcome(
         BridgeBoundary::Startup,
@@ -658,17 +704,29 @@ async fn run() -> Result<(), String> {
     connected?;
     // Post-connect re-verification (issue #1932): the adapter has now proved
     // spawned-artifact identity, listener ownership and server major over its
-    // ownership-verified channel. Reload the decision record and require the
-    // same admission before serving: a record swapped, revoked or drifted
-    // across the provider-startup window must fail closed here, never at the
-    // first canonical write.
-    enforce_store_compatibility(&config)?;
+    // ownership-verified channel. Re-resolve the installation-visible decision
+    // before serving: a record swapped, revoked or drifted across the
+    // provider-startup window keeps the installation non-writer here, never at
+    // the first canonical write. `combine` is fail-closed, so an admitted
+    // earlier stage can never re-admit a maintenance verdict.
+    compatibility = compatibility.combine(enforce_store_compatibility(&config));
     // Observed-identity binding (issue #1932, backend handoff §3): the
     // adapter proved the live version and spawn-validated digest over its
     // ownership-verified channel during connect. Bind the record echo to
-    // that observation before serving: a rotated binary or drifted record
-    // fails closed here, never at the first canonical write.
-    bind_observed_identity(&composition, &config)?;
+    // that observation before serving: a rotated binary or drifted record is
+    // visible maintenance here, never an accepted write.
+    compatibility = compatibility.combine(bind_observed_identity(&composition, &config)?);
+    if !compatibility.is_writer_admitted() {
+        // Visible non-writer readiness: the store is up and answers
+        // health/readiness, and every canonical mutation is refused. The
+        // refusal is enforced on the mutation path, not by refusing to serve.
+        eprintln!(
+            "{SERVICE_NAME}: serving non-writer readiness: {}",
+            compatibility
+                .maintenance_reason()
+                .unwrap_or("unqualified decision")
+        );
+    }
     let readiness = match composition.readiness().await {
         Ok(receipt) => receipt,
         Err(error) => {
