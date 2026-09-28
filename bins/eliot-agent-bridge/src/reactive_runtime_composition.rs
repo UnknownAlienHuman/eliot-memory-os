@@ -99,8 +99,12 @@ fn live_state_fence(binding: &AttachBinding) -> Result<StateFence, BridgeError> 
 /// `restore_reactive_ledger`, each served snapshot into
 /// `publish_canonical_resource` (canonical grammar + digest binding enforced
 /// there). `uris` is the bounded caller-nominated snapshot set; attach
-/// passes an empty set (ledger-only restore — snapshot handles have no
-/// session-keyed listing, so no URI is invented here).
+/// passes an empty set. The live session's own canonical attention and
+/// mailbox addresses (`eliot://session/<live-session>/attention|mailbox`,
+/// derived from the authenticated binding, never caller text) are always
+/// requested alongside the caller set so owner-held session snapshots flow
+/// through the existing publish path when served; absence stays an explicit
+/// `Unserved` report, never an invented snapshot.
 ///
 /// Fence or session mismatch with the live binding refuses before any wire
 /// traffic. A refused reply echo discards the bytes. Store errors leave the
@@ -113,7 +117,28 @@ pub fn restore_reactive_runtime(
     let view = runner.attach_view().ok_or(BridgeError::NotAttached)?;
     let live_session = view.binding().session_id().as_str().to_owned();
     let live_fence = live_state_fence(view.binding())?;
-    if uris.len() > MAX_RESTORE_URIS {
+    // Live-session self addresses: the bridge requests only its own session's
+    // canonical attention/mailbox URIs (authenticated binding, validated
+    // against the I7.18 grammar here). Foreign families still arrive only via
+    // the caller-nominated set; served bytes still flow through
+    // `publish_canonical_resource` with digest binding, unserved stays
+    // `Unserved`. No content is invented: the URIs are requests, the bytes
+    // come from the owner or not at all.
+    let mut requested: Vec<String> = Vec::with_capacity(uris.len().saturating_add(2));
+    for candidate in [
+        format!("eliot://session/{live_session}/attention"),
+        format!("eliot://session/{live_session}/mailbox"),
+    ] {
+        if ResourceUri::parse(candidate.clone()).is_ok() && !requested.contains(&candidate) {
+            requested.push(candidate);
+        }
+    }
+    for nominated in uris {
+        if !requested.contains(nominated) {
+            requested.push(nominated.clone());
+        }
+    }
+    if requested.len() > MAX_RESTORE_URIS {
         return Err(BridgeError::InvalidContract {
             field: "restore.uris",
             reason: "exceeds the bounded URI fan-out",
@@ -122,7 +147,7 @@ pub fn restore_reactive_runtime(
     let query = ReactiveRestoreQuery {
         session_id: live_session.clone(),
         state_fence: live_fence.clone(),
-        uris: uris.to_vec(),
+        uris: requested,
     };
     query
         .validate()

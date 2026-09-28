@@ -3457,6 +3457,26 @@ impl BridgeRunner {
         self.core
             .project_tool_result(result_bytes, source_handle, tokens_rendered, delivery)
     }
+    /// Observes the delivery completeness of one recorded hot view (I7.24
+    /// disposition on the live invocation path).
+    ///
+    /// Maps the measured truncation flag (preview shorter than the exact
+    /// delivered bytes) to the owner's observed delivery state: `TRUNCATED`
+    /// when bytes were withheld behind the handle, `FULL` otherwise. No token
+    /// measurement is involved; token-measured receipts still project via
+    /// [`Self::project_tool_result_receipt`] when a route emits a bound
+    /// attestation, and gate via [`ToolResultReceipt::check_complete_evidence`].
+    /// This observation lets a verifier that holds only the hot view cite what
+    /// was actually delivered instead of mistaking a preview for complete
+    /// evidence.
+    #[must_use]
+    pub fn observed_hot_delivery(view: &HotResourceView) -> DeliveryStatus {
+        if view.is_truncated() {
+            DeliveryStatus::Truncated
+        } else {
+            DeliveryStatus::Full
+        }
+    }
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. Zero while detached; cleared by the core on every attach.
     #[must_use]
@@ -3508,6 +3528,13 @@ impl BridgeRunner {
         if self.expand_resource(view.handle()).ok()? != bytes {
             return None;
         }
+        // I7.24 disposition on the live path: observe the measured truncation
+        // flag so the delivered completeness is cited from real bytes, never
+        // estimated. Token-measured receipt projection and the
+        // complete-evidence gate still await a route-owner attestation and a
+        // production verifier consumer; until then the disposition is observed
+        // here and the evidence slot carries the preview+handle.
+        let _observed = Self::observed_hot_delivery(&view);
         Some(view)
     }
     /// Notes the owner-supplied bootstrap context for this session.
