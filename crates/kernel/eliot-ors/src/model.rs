@@ -2495,7 +2495,17 @@ macro_rules! operational_receipt {
 
 operational_receipt!(StageReceipt);
 operational_receipt!(DeliveryCursorReceipt);
-operational_receipt!(AdmissionReservationReceipt);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct AdmissionReservationReceipt(OperationalMutationReceipt);
+
+impl AdmissionReservationReceipt {
+    pub fn receipt(&self) -> &OperationalMutationReceipt {
+        &self.0
+    }
+}
+
 operational_receipt!(GenerationTransitionReceipt);
 operational_receipt!(GenerationCutoverReceipt);
 operational_receipt!(SessionBindingReceipt);
