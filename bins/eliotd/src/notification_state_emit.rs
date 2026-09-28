@@ -461,6 +461,24 @@ pub async fn notification_already_recorded(
 /// decision whose record is already stored is I11.12's repeat rather than a
 /// new occurrence; both return `Ok(None)` without touching the store.
 ///
+/// The `off`-mode guard refuses a *proactive* decision only. A `Block` or
+/// `Defer` decision is the durable record of a refusal, and I14.22:94 requires
+/// exactly that to be preserved: "If automation is disabled, the required route
+/// is unavailable or budget is exhausted, ELIOT preserves one actionable
+/// recommendation with reason, evidence, expected benefit, cost, expiry and safe
+/// deferral consequence. It does not repeatedly notify or pretend maintenance
+/// occurred." See [`records_a_refusal`] for the exact split.
+///
+/// Stated rather than implied: the second guard below,
+/// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
+/// today. `MaintenanceRoute::admits_start` is
+/// `DURABLE_JOB_ADMISSION_BLOCKERS.is_empty()` over a shared four-element
+/// non-empty list, so it is `false` for all fifteen families and the arm is
+/// currently unreachable. It is left exactly as it is: it is the correct
+/// condition, and it becomes live when that shared list empties, which is a
+/// change to the list rather than to this function. Do not read it as a gate
+/// that is currently refusing anything.
+///
 /// # Errors
 ///
 /// Returns [`NotificationEmitError`] when the store contract refuses the
@@ -473,7 +491,31 @@ pub async fn emit_blocked_automation_notification(
     decision: &AutomationTriggerDecision,
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
     let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
-    if family_entry.mode == eliot_maintenance::MaintenanceAutomationMode::Off {
+    // #1692 kept, #1693 narrowed. #1692 (#3641) added this guard so that an
+    // unresolved Human policy cannot publish a proactive maintenance
+    // recommendation, and that intent is preserved exactly: I14.22:37 defines
+    // `off` as "no automatic job or proactive recommendation, except mandatory
+    // safety/recovery obligations", so a `Start` or a `Suggest` is still
+    // refused while the selected mode is `Off`.
+    //
+    // What is NOT preserved is the unconditional early return the same commit
+    // added for every decision. `eliot_maintenance::MaintenanceController::evaluate_trigger`
+    // itself answers mode `Off` with `(Block, AutomationOff)`, so the
+    // unconditional form returned `Ok(None)` for all fifteen families before any
+    // durable I/O, and the caller in `daemon_runtime.rs` discarded it: a
+    // triggered family was silently ignored, which is the one outcome A1
+    // forbids. A `Block`/`Defer` decision states that work was NOT started, so
+    // recording it cannot be a proactive recommendation and `off` does not
+    // forbid it.
+    //
+    // Ownership is not part of the predicate, and deliberately so: a family
+    // with a real execution owner and a family with none at all both owe the
+    // operator the same refusal record. What `MaintenanceExecutionOwner::is_owned`
+    // selects is only WHICH exact absence that record names, through
+    // `MaintenanceFamilyEntry::recommendation`.
+    if family_entry.mode == eliot_maintenance::MaintenanceAutomationMode::Off
+        && !records_a_refusal(decision.decision)
+    {
         return Ok(None);
     }
     let family_decision = family_entry.decide(decision);
@@ -552,6 +594,38 @@ pub async fn emit_blocked_automation_notification(
         notification_id: key.notification_id,
         operation_id: receipt.operation_id.to_string(),
     }))
+}
+
+/// Whether one Governor decision is the durable record of a REFUSAL rather
+/// than a proactive act.
+///
+/// I14.22:56 fixes the closed decision vocabulary this emitter receives, and
+/// only two of its six members are refusals:
+///
+/// * [`eliot_maintenance::AutomationDecision::Block`] — "Policy, route,
+///   budget or session requirements deny execution";
+/// * [`eliot_maintenance::AutomationDecision::Defer`] — "Preserve the trigger
+///   for a later eligible window".
+///
+/// Both state that the family did NOT run, so writing them is not "a
+/// proactive recommendation" and I14.22:37's `off` does not forbid it. The
+/// other members are refused while `off` holds: `Start` and `Suggest` are the
+/// two proactive acts `off` names outright; `Escalate` hands work to a Human
+/// or recovery owner rather than stating this family's disposition;
+/// `SuppressDuplicate` is I11.12's repeat, already coalesced onto the one
+/// stored record by the identical key.
+///
+/// Stated rather than implied: `eliot_maintenance::MaintenanceController::evaluate_trigger`
+/// has no `Escalate` arm and this daemon holds `active_job_id` at `None`
+/// (`crate::maintenance_trigger_evaluator::UNRESOLVED_AUTHORITIES`), so the
+/// two arms this predicate excludes beyond `Start`/`Suggest` cannot currently
+/// reach it. The exclusion is written from I14.22's own definitions, not from
+/// today's reachability.
+fn records_a_refusal(decision: eliot_maintenance::AutomationDecision) -> bool {
+    matches!(
+        decision,
+        eliot_maintenance::AutomationDecision::Block | eliot_maintenance::AutomationDecision::Defer
+    )
 }
 
 /// The exact four-field flat apply contract the admitted Kernel route decodes.
