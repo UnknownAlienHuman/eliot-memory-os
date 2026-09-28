@@ -5018,6 +5018,54 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(snapshot)
     }
 
+    /// Retains one scope-identity mismatch in the bounded in-process
+    /// diagnostic projection (issue #1787, W6 partial projection).
+    ///
+    /// Builds the [`QuarantinedScopeRecord`] for `report` through its
+    /// existing constructor and validator, then appends it instead of
+    /// overwriting: an exact repeat of the latest record adds no new
+    /// evidence, anything else appends with oldest-first eviction at
+    /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`]. The retained binding,
+    /// task state, and project memory stay untouched. Construction
+    /// failure is never silent: it fails closed here so the conflicting
+    /// evidence cannot disappear while the write is withheld. This
+    /// projection is not durable, rehydrated, or an authority for
+    /// rebind; durable quarantine still belongs to the `WorkScope`
+    /// owner path.
+    fn push_scope_quarantine_record(
+        &mut self,
+        expected: &ScopeBinding,
+        observed: &ScopeBinding,
+        report: &TriggerReport,
+        fence_generation: u64,
+    ) -> Result<(), CompositionError> {
+        let record = QuarantinedScopeRecord::for_report(
+            expected,
+            observed,
+            report,
+            fence_generation,
+        )
+        .map_err(|error| {
+            CompositionError::Recovery(format!(
+                "scope guard withheld at trigger {:?} after scope mismatch, but its process-local diagnostic could not be retained: {error}",
+                report.trigger
+            ))
+        })?;
+        // Preserve every unresolved conflict instead of overwriting one
+        // slot: an exact repeat of the latest record adds no new
+        // evidence, anything else appends with oldest-first eviction at
+        // the bound. The retained binding, task state, and project
+        // memory stay untouched; durable quarantine still belongs to
+        // the WorkScope owner path.
+        if self.scope_quarantine.last() != Some(&record) {
+            if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
+                self.scope_quarantine.remove(0);
+            }
+            self.scope_quarantine.push(record);
+        }
+        Ok(())
+    }
+
     /// Checks the canonical write against the caller-supplied, actual observed
     /// `WorkScope` at the current Kernel fence (issue #1787, W5). The write's
     /// claimed scope must match that observation, and it proceeds only when
@@ -5055,29 +5103,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let claimed_scope_matches_observation = scope_id == observed.scope.scope_ref.as_str();
         if !claimed_scope_matches_observation || !report.is_matched() {
             if report.identity != IdentityLegOutcome::IdentityClear {
-                let record = QuarantinedScopeRecord::for_report(
+                self.push_scope_quarantine_record(
                     &snapshot.binding,
                     observed,
                     &report,
                     fence.resource_generation.value(),
-                )
-                .map_err(|error| {
-                    CompositionError::Recovery(format!(
-                        "canonical write withheld after scope mismatch, but its process-local diagnostic could not be retained: {error}"
-                    ))
-                })?;
-                // Preserve every unresolved conflict instead of overwriting one
-                // slot: an exact repeat of the latest record adds no new
-                // evidence, anything else appends with oldest-first eviction at
-                // the bound. The retained binding, task state, and project
-                // memory stay untouched; durable quarantine still belongs to
-                // the WorkScope owner path.
-                if self.scope_quarantine.last() != Some(&record) {
-                    if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
-                        self.scope_quarantine.remove(0);
-                    }
-                    self.scope_quarantine.push(record);
-                }
+                )?;
             }
             return Err(CompositionError::ScopeGuardWithheld {
                 claimed_scope: scope_id.to_owned(),
@@ -5514,9 +5545,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// either scope input, preserving safe read-only and cold-capture behavior.
     /// The presented receipt must name exactly the live `WorkScope` binding
     /// read at that fence. A readiness denial preserves its typed directive; a
-    /// scope-guard failure preserves the structured guard report.
+    /// scope-guard failure preserves the structured guard report and retains
+    /// conflicting identity evidence in the bounded process-local diagnostic
+    /// projection (fail-closed retention; never durable, never an authority
+    /// for rebind).
     pub fn check_material_readiness_for_effect(
-        &self,
+        &mut self,
         effect: RequestedEffect,
         readiness: &MaterialReadinessInputs<'_>,
         observed: Option<&ScopeBinding>,
@@ -5575,6 +5609,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     trigger,
                 );
                 if !report.is_matched() {
+                    if report.identity != IdentityLegOutcome::IdentityClear {
+                        self.push_scope_quarantine_record(
+                            &snapshot.binding,
+                            observed,
+                            &report,
+                            live_fence.resource_generation.value(),
+                        )?;
+                    }
                     return Err(CompositionError::ScopeGuardWithheld {
                         claimed_scope: readiness.receipt.scope.scope_ref.clone(),
                         observed_scope: observed.scope.scope_ref.clone(),
@@ -5608,9 +5650,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// bundle fails as [`CompositionError::Recovery`]. A typed denial is
     /// returned as [`CompositionError::MaterialReadinessDenied`] with its
     /// receipt, requested effect, directive, and exact missing inputs; nothing
-    /// is committed on any failure.
+    /// is committed on any failure. A scope-guard mismatch retains the
+    /// conflicting evidence in the bounded process-local diagnostic
+    /// projection before withholding.
     pub fn check_material_readiness_for_write(
-        &self,
+        &mut self,
         readiness: &MaterialReadinessInputs<'_>,
         observed: &ScopeBinding,
         sources: &GoverningSourceSet,
@@ -5637,8 +5681,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// canonical-write edge calls this method instead of `commit_canonical`
     /// directly; safe-capture experience commits keep using `commit_canonical`
     /// because the contract permits safe capture before `READY_MATERIAL`.
+    /// A scope-guard mismatch retains the conflicting evidence in the
+    /// bounded process-local diagnostic projection before withholding.
     pub async fn commit_canonical_with_readiness(
-        &self,
+        &mut self,
         identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
         readiness: &MaterialReadinessInputs<'_>,
@@ -9567,7 +9613,7 @@ mod tests {
 
     #[test]
     fn canonical_write_without_task_is_denied_before_commit() {
-        let (kernel, composition) = readiness_composition();
+        let (kernel, mut composition) = readiness_composition();
         let fence = composition.kernel_snapshot().state_fence().clone();
         let identity = commit_identity(&fence);
         let envelope = commit_envelope(
@@ -9602,7 +9648,7 @@ mod tests {
 
     #[test]
     fn canonical_write_with_full_grounding_commits() {
-        let (kernel, composition) = readiness_composition();
+        let (kernel, mut composition) = readiness_composition();
         let fence = composition.kernel_snapshot().state_fence().clone();
         let identity = commit_identity(&fence);
         let envelope = commit_envelope(
