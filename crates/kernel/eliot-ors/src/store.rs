@@ -2553,6 +2553,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// Lists retained Recovery Problems in operation-identity order, bounded
     /// by [`crate::MAX_RECOVERY_PAGE`].
     fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError>;
+    /// Retains a visible durable Recovery Problem for one staged
+    /// `PreparedTransition` that this build refuses to execute because its
+    /// recorded contract/operation manifest is outside admissible support
+    /// (issue #1927, I05-06).
+    ///
+    /// I05-06: such a plan "stays staged and enters visible recovery instead of
+    /// being reinterpreted by newer code". Bindings (epoch, state fence,
+    /// recovery owner, reservation identity) are read back from the staged
+    /// operation itself rather than from caller values, the record carries no
+    /// payload bytes, and an exact replay returns the durable record unchanged.
+    fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError>;
     /// Closes one retained Recovery Problem only from an explicit terminal
     /// receipt under the exact recovery owner (issue #1925).
     ///
@@ -23733,6 +23748,48 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
     }
 
+    /// Retains one visible durable Recovery Problem for a staged
+    /// `PreparedTransition` that this build refuses to execute (issue #1927,
+    /// I05-06).
+    ///
+    /// The caller has already proved the refusal is determinate: the plan's
+    /// recorded contract or operation manifest lies outside current admissible
+    /// support, so no effect occurred and the reserved order stays safely
+    /// disposable. The staged plan itself must not simply disappear, because
+    /// I05-06 requires such a plan to stay staged and enter visible recovery
+    /// instead of being reinterpreted by newer code. Without this record the
+    /// refusal is only a returned error string, and once the reservation is
+    /// released nothing durable marks the operation for an operator.
+    ///
+    /// Every binding (epoch, state fence, recovery owner, reservation
+    /// identity) is read back from the staged operation itself rather than
+    /// from caller values, so the retained problem cannot disagree with what
+    /// was actually staged. No payload bytes are recorded, and the refused plan
+    /// is never translated, widened or re-derived.
+    fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError> {
+        let token = self.staging_context(operation_id)?;
+        let problem = RecoveryProblem::new(
+            token.operation_id.clone(),
+            Some(token.reservation_id.clone()),
+            RecoveryProblemKind::UnsupportedPreparedTransition,
+            OpaqueLabel::new(detail.to_owned()).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "recovery_problem_detail",
+                reason: error.to_string(),
+            })?,
+            None,
+            None,
+            token.writer_epoch.clone(),
+            token.state_fence.clone(),
+            token.recovery_owner.clone(),
+            current_unix_ms()?,
+        )?;
+        self.report_recovery_problem(problem)
+    }
+
     fn report_recovery_problem(
         &self,
         problem: RecoveryProblem,
@@ -23740,11 +23797,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         problem.validate()?;
         if !matches!(
             problem.kind,
-            RecoveryProblemKind::MissingKey | RecoveryProblemKind::DecryptionFailure
+            RecoveryProblemKind::MissingKey
+                | RecoveryProblemKind::DecryptionFailure
+                | RecoveryProblemKind::UnsupportedPreparedTransition
         ) {
             return Err(OrsError::InvalidField {
                 field: "recovery_problem_kind",
-                reason: "external reports are limited to missing-key and decryption-failure causes",
+                reason: "external reports are limited to missing-key, decryption-failure and \
+                         unsupported-prepared-transition causes",
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
@@ -24486,6 +24546,26 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     /// Lists retained Recovery Problems in operation-identity order.
     pub fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError> {
         self.store.list_recovery_problems(limit)
+    }
+
+    /// Retains a visible durable Recovery Problem for one staged
+    /// `PreparedTransition` that the current build refuses to execute because
+    /// its recorded contract/operation manifest is outside admissible support
+    /// (issue #1927, I05-06).
+    ///
+    /// I05-06: such a plan "stays staged and enters visible recovery instead of
+    /// being reinterpreted by newer code". This is that entry into visible
+    /// recovery. The problem is keyed by the staged operation identity, carries
+    /// no payload bytes, and blocks normal writer readiness until an explicit
+    /// canonical receipt or owner disposition resolves it. Bindings are read
+    /// back from the staged operation, never from caller values.
+    pub fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError> {
+        self.store
+            .retain_unsupported_prepared_transition(operation_id, detail)
     }
 
     /// Closes one retained Recovery Problem from an explicit terminal receipt

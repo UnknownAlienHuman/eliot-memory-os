@@ -1068,6 +1068,32 @@ pub fn cancel_before_send(
     Ok(owner.ors.release(token, owner.writer_identity())?)
 }
 
+/// Records one staged `PreparedTransition` this build refuses to execute as a
+/// visible durable Recovery Problem (issue #1927, I05-06).
+///
+/// Called when the single send resolved to a determinate refusal because the
+/// plan's recorded contract or operation manifest lies outside current
+/// admissible support. No external effect occurred, so the reserved order is
+/// still safely disposable and the caller releases it as usual - but I05-06
+/// requires the plan itself to stay staged and enter visible recovery instead
+/// of being reinterpreted by newer code, so the refusal is recorded durably
+/// first, keyed by the staged operation identity.
+///
+/// Recording before the release matters: the retention reads the staged
+/// operation's own epoch, fence, recovery owner and reservation identity, so
+/// the problem cannot disagree with what was actually staged. It carries no
+/// payload bytes, and an unresolved problem blocks normal writer readiness
+/// until an explicit canonical receipt or owner disposition resolves it.
+pub fn retain_unsupported_prepared_plan(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+    detail: &str,
+) -> Result<eliot_ors::RecoveryProblem, ReservationWriteError> {
+    Ok(owner
+        .ors
+        .retain_unsupported_prepared_transition(&token.operation_id, detail)?)
+}
+
 /// Marks an ambiguous effect non-replayable until canonical reconciliation.
 ///
 /// Called when the single send resolves to a still-unknown outcome after

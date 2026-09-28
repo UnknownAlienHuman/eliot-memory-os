@@ -8691,6 +8691,9 @@ fn recovery_problem_kind_label(kind: eliot_ors::RecoveryProblemKind) -> &'static
         eliot_ors::RecoveryProblemKind::EnvelopeIntegrity => "envelope-integrity",
         eliot_ors::RecoveryProblemKind::MissingKey => "missing-key",
         eliot_ors::RecoveryProblemKind::DecryptionFailure => "decryption-failure",
+        eliot_ors::RecoveryProblemKind::UnsupportedPreparedTransition => {
+            "unsupported-prepared-transition"
+        }
     }
 }
 
