@@ -46,9 +46,9 @@ pub use atom::{
 pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
     BoundaryDenominator, BoundaryGap, BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage,
-    BoundaryMemberReference, BoundaryMemberRole, BoundaryMetadataEnvelope, BoundaryMetadataSet,
-    BoundaryPrecision, BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits,
-    ExactSourceRange,
+    BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
+    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation,
+    BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
