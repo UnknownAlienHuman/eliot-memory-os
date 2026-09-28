@@ -875,6 +875,18 @@ fn bind_declared_startup_capabilities(
     let agent_fabric = attach_agent_fabric(composition);
     // #1882: the two declared Skill-path capabilities, in declaration order.
     let (skill_tool_source, skill_tool_basis) = bind_skill_path_capabilities(composition);
+    // #1773 (I3.4): rebuild the daemon-held Governor capability admission view
+    // from the durable capability-evidence records, at the same attach site that
+    // already holds the concrete client and the mutable composition, and before
+    // `publish_daemon_startup_evidence` evaluates the retained capability model
+    // below. This is the production seam that makes a qualifying record survive
+    // a daemon restart: without it the view stays empty and every production
+    // route is refused for lack of evidence.
+    //
+    // The drain is complete and fail-closed, so a partial read is never
+    // reported as coverage; a refusal keeps the view as it was, which means
+    // any route it cannot evidence stays refused.
+    hydrate_capability_evidence_view(composition, kernel);
     // The retained ledger is the only readiness input for the declared
     // capabilities: it cannot be constructed without a disposition for each of
     // the seven, and the whole record (bound identity or unbound reason) is
@@ -888,6 +900,75 @@ fn bind_declared_startup_capabilities(
         skill_tool_source,
         skill_tool_basis,
     )
+}
+
+/// Drains the durable capability-evidence records into the daemon-held Governor
+/// admission view at startup (issue #1773, I3.4).
+///
+/// This is the durable-hydration production seam. The view is otherwise
+/// constructed empty, so before this drain every production route is refused
+/// for lack of evidence and no record survives a restart. It runs at the
+/// existing startup attach site that already holds the concrete Kernel client
+/// and the mutable composition — no new thread, no new transport, no new
+/// `start()` contour, and no run-loop change; the read travels the one
+/// authenticated Kernel named-read route.
+///
+/// Fail-closed: the drain either covers every page the store serves at this
+/// fence or returns an error, and an error is a `warn` diagnostic naming the
+/// exact reason. The view then keeps its previous contents, so any production
+/// route the view cannot evidence stays refused rather than being treated as
+/// "nothing to check".
+fn hydrate_capability_evidence_view(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+) {
+    let fence = composition.kernel_snapshot().state_fence();
+    let scope = match eliot_store_api::ScopeId::new(eliot_governor::GOVERNOR_SCOPE_ID) {
+        Ok(scope) => scope,
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydration_unavailable",
+                reason = %error,
+                "canonical capability evidence could not be addressed; the admission view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+            return;
+        }
+    };
+    let drained = composition
+        .capability_admission_mut()
+        .map_err(|error| error.to_string())
+        .and_then(|view| {
+            eliotd::drain_capability_evidence_records(
+                view,
+                kernel,
+                &scope,
+                &fence,
+                eliot_store_api::MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+            )
+            .map_err(|error| error.to_string())
+        });
+    match drained {
+        Ok(report) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydrated",
+                pages = report.pages,
+                observed_records = report.observed_records,
+                minted_records = report.minted_records,
+                retained_records = report.retained,
+                "durable capability evidence rebuilt the Governor admission view through the complete paged read"
+            );
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydration_unavailable",
+                reason = %reason,
+                "canonical capability evidence did not refresh the admission view; the view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
+    }
 }
 
 /// Binds the two declared Skill-path capabilities (#1882), in declaration

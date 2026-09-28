@@ -101,8 +101,9 @@ use eliot_governor::{
     OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
 };
 use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    ReadConsistency, ScopeId,
+    EVIDENCE_PACK_MAX_RECORDS, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+    MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, ReadConsistency, ScopeId,
 };
 use thiserror::Error;
 
@@ -312,6 +313,150 @@ impl GovernorCapabilityAdmission {
         })
     }
 
+    /// Plans one page of the closed canonical capability-evidence RECORD read.
+    ///
+    /// `GetCapabilityEvidenceRecordRange` is the only read that can rebuild
+    /// this view: it serves the real durable evidence rows with their
+    /// owner-issued `record_digest` and the store-issued `revision` the fenced
+    /// compare-and-set assigned, so a hydration can mint real
+    /// [`CapabilityEvidenceRecord`]s with real owner-issued revisions.
+    /// `GetCapabilityEvidenceState` cannot: it answers committed lifecycle
+    /// governance rows carrying no status, source, scope fingerprint, or
+    /// revision.
+    ///
+    /// `skill_id` is the optional exact filter over one skill; `None` selects
+    /// every skill in scope, which is what a complete registry rebuild needs.
+    /// `cursor` is the opaque continuation token the previous page issued;
+    /// `None` reads from the start of the eligible set, and the store fails
+    /// closed on a cursor that does not decode against the current fence and
+    /// revision heads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceBridgeError`] when the skill identity or page bound is
+    /// not closed, or the built request is structurally invalid.
+    pub fn plan_evidence_record_read(
+        skill_id: Option<&str>,
+        max_records: u16,
+        cursor: Option<String>,
+        scope: ScopeId,
+        fence: eliot_contracts::StateFence,
+    ) -> Result<NamedReadRequest, EvidenceBridgeError> {
+        if let Some(skill) = skill_id
+            && (!eliot_store_api::valid_skill_id(skill)
+                || skill.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES)
+        {
+            return Err(EvidenceBridgeError::BlankSkill);
+        }
+        if max_records == 0 || max_records > MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS {
+            return Err(EvidenceBridgeError::BadBound);
+        }
+        let request = eliot_store_api::capability_evidence_read_request(
+            scope,
+            skill_id.map(str::to_owned),
+            max_records,
+            cursor,
+            fence,
+        );
+        request
+            .validate()
+            .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
+        Ok(request)
+    }
+
+    /// Applies one capability-evidence RECORD page to the held view, minting
+    /// real records under the store-issued owner revision.
+    ///
+    /// Each projected row is re-proved at this read edge before it can become
+    /// registry state: the row's presented `record_digest` must equal the
+    /// digest over the exact record bytes, and the record's own
+    /// `(skill_id, scope_fingerprint)` must be the key the row was addressed
+    /// by. A row that fails either check is refused whole, so a substituted
+    /// document can never displace a retained record or clear an invalidation.
+    ///
+    /// This is the mutating sibling the audit required: `ingest_evidence_response`
+    /// is `&self` and mints nothing, so it cannot be the path that rebuilds
+    /// this view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceBridgeError`] when the response does not answer the
+    /// planned read, the payload is not the versioned record shape, a row fails
+    /// its digest/key re-proof, or the bounded registry refused a new key.
+    pub fn hydrate_from_evidence_record_page(
+        &mut self,
+        request: &NamedReadRequest,
+        response: &NamedReadResponse,
+    ) -> Result<EvidenceRecordPage, EvidenceBridgeError> {
+        if response.operation != NamedReadOperation::GetCapabilityEvidenceRecordRange
+            || response.operation != request.operation
+        {
+            return Err(EvidenceBridgeError::ResponseMismatch("operation"));
+        }
+        if response.state_fence != request.state_fence {
+            return Err(EvidenceBridgeError::ResponseMismatch("fence"));
+        }
+        response
+            .validate()
+            .map_err(|_| EvidenceBridgeError::ResponseMismatch("shape"))?;
+        let payload = &response.payload;
+        if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err(EvidenceBridgeError::Payload("version"));
+        }
+        let planned_scope = request
+            .scope_id
+            .clone()
+            .ok_or(EvidenceBridgeError::Payload("scope"))?;
+        let planned_scope_value = serde_json::to_value(&planned_scope)
+            .map_err(|_| EvidenceBridgeError::Payload("scope"))?;
+        if payload.get("scope_id") != Some(&planned_scope_value) {
+            return Err(EvidenceBridgeError::Payload("scope"));
+        }
+        let truncated = payload
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(EvidenceBridgeError::Payload("truncated"))?;
+        let next_cursor = match payload.get("next_cursor") {
+            Some(serde_json::Value::Null) | None => None,
+            Some(serde_json::Value::String(cursor)) => Some(cursor.clone()),
+            Some(_) => return Err(EvidenceBridgeError::Payload("next_cursor")),
+        };
+        // A page that reports truncation without a usable continuation token is
+        // not a prefix a caller can drain; it is a coverage claim the store did
+        // not back, and it is refused rather than reported as hydrated.
+        if truncated && next_cursor.is_none() {
+            return Err(EvidenceBridgeError::Payload("next_cursor"));
+        }
+        let rows = payload
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(EvidenceBridgeError::Payload("records"))?;
+        let mut minted = 0_usize;
+        for row in rows {
+            let (record, revision) = decode_evidence_record_row(row)?;
+            // A new key refused because the bounded registry is full means the
+            // requested coverage was NOT retained, so hydration reports the
+            // refusal instead of claiming coverage. An equal/older replay
+            // converges silently: it displaces nothing.
+            let already_retained = self
+                .registry
+                .retained_revision(&record.skill_id, &record.scope_fingerprint)
+                .is_some();
+            if self.registry.insert(record, revision) {
+                minted = minted.saturating_add(1);
+            } else if !already_retained {
+                return Err(EvidenceBridgeError::CapacityExceeded);
+            }
+        }
+        Ok(EvidenceRecordPage {
+            records_in_page: rows.len(),
+            minted,
+            truncated,
+            next_cursor,
+            retained: self.len(),
+        })
+    }
+
     /// Plans the closed canonical evidence read for one skill.
     ///
     /// The request carries the exact `skill_id` + `max_records` selectors
@@ -455,6 +600,140 @@ pub struct ObservedLifecycleSummary {
     pub truncated: bool,
 }
 
+/// Decodes one projected capability-evidence row into a real record plus the
+/// store-issued owner revision that orders its key.
+///
+/// Re-proves the row at the Governor read edge, which is where the owner
+/// authority is established: the presented `record_digest` must equal the digest
+/// over the exact record bytes, and the record's own `(skill_id,
+/// scope_fingerprint)` must reproduce the row's `scope_key` address. A row that
+/// fails either check is refused whole, so no substituted document can become
+/// registry state under a reference the canonical store never issued for it.
+fn decode_evidence_record_row(
+    row: &serde_json::Value,
+) -> Result<(CapabilityEvidenceRecord, OwnerEvidenceRevision), EvidenceBridgeError> {
+    let text = |field: &'static str| -> Result<String, EvidenceBridgeError> {
+        row.get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(EvidenceBridgeError::Payload(field))
+    };
+    let record_json = text("record_json")?;
+    let record_digest = text("record_digest")?;
+    if eliot_store_api::sha256_hex(record_json.as_bytes()) != record_digest {
+        return Err(EvidenceBridgeError::Payload("record_digest"));
+    }
+    let scope_key = text("scope_key")?;
+    let row_skill_id = text("skill_id")?;
+    let owner_revision = row
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(EvidenceBridgeError::Payload("revision"))?;
+    let record: CapabilityEvidenceRecord =
+        serde_json::from_str(&record_json).map_err(|_| EvidenceBridgeError::Payload("record"))?;
+    if record.skill_id != row_skill_id {
+        return Err(EvidenceBridgeError::Payload("skill_id"));
+    }
+    if record.scope_fingerprint.reference_digest() != scope_key {
+        return Err(EvidenceBridgeError::Payload("scope_key"));
+    }
+    let revision = OwnerEvidenceRevision::issued(owner_revision, &record_digest)
+        .map_err(|_| EvidenceBridgeError::Payload("revision"))?;
+    Ok((record, revision))
+}
+
+/// Drains the complete capability-evidence record read into the held view.
+///
+/// The loop is the "complete paged hydration" the audit required: it plans one
+/// page, executes it through the authenticated Kernel route, applies it, and
+/// continues with the exact continuation token the store issued until a page
+/// reports no further eligible row. It is fail-closed in both directions:
+///
+/// * a page that reports truncation without a usable cursor is refused, so a
+///   bounded prefix is never reported as complete coverage;
+/// * a store that returns a cursor it already issued is refused, so the loop
+///   cannot spin forever re-reading the same page.
+///
+/// A returned report therefore always describes a **complete** drain: the view
+/// either holds every durable evidence record the store serves at this fence, or
+/// the call is an error and the view keeps its previous contents. The view
+/// never believes it is fully hydrated after a partial read.
+pub fn drain_capability_evidence_records(
+    admission: &mut GovernorCapabilityAdmission,
+    kernel: &super::daemon_kernel_client::DaemonKernelClient,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+    page_records: u16,
+) -> Result<CapabilityHydrationReport, EvidenceBridgeError> {
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_u32;
+    let mut minted = 0_usize;
+    let mut observed = 0_u64;
+    let mut issued: Vec<String> = Vec::new();
+    loop {
+        let request = GovernorCapabilityAdmission::plan_evidence_record_read(
+            None,
+            page_records,
+            cursor,
+            scope.clone(),
+            fence.clone(),
+        )?;
+        let response = kernel
+            .store_named_blocking(request.clone())
+            .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
+        let page = admission.hydrate_from_evidence_record_page(&request, &response)?;
+        pages = pages.saturating_add(1);
+        observed = observed.saturating_add(u64::try_from(page.records_in_page).unwrap_or(u64::MAX));
+        minted = minted.saturating_add(page.minted);
+        if !page.truncated {
+            return Ok(CapabilityHydrationReport {
+                pages,
+                observed_records: observed,
+                minted_records: minted,
+                retained: admission.len(),
+            });
+        }
+        let Some(next) = page.next_cursor else {
+            return Err(EvidenceBridgeError::Payload("next_cursor"));
+        };
+        if issued.iter().any(|seen| seen == &next) {
+            return Err(EvidenceBridgeError::Request(
+                "capability evidence hydration cursor did not advance".to_owned(),
+            ));
+        }
+        issued.push(next.clone());
+        cursor = Some(next);
+    }
+}
+
+/// One applied page of the capability-evidence record read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRecordPage {
+    /// Rows the served page carried.
+    pub records_in_page: usize,
+    /// Records this page newly retained (replays converge and are not counted).
+    pub minted: usize,
+    /// Whether the store observed a further eligible row beyond this page.
+    pub truncated: bool,
+    /// The exact continuation token to present next, when truncated.
+    pub next_cursor: Option<String>,
+    /// Records the held view retains after this page.
+    pub retained: usize,
+}
+
+/// Coverage report of one complete capability-evidence drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityHydrationReport {
+    /// Pages drained to exhaustion.
+    pub pages: u32,
+    /// Durable evidence rows observed across every page.
+    pub observed_records: u64,
+    /// Records the drain newly retained; a replayed record is not re-counted.
+    pub minted_records: usize,
+    /// Records the held view retains after the drain.
+    pub retained: usize,
+}
+
 /// Result of hydrating the held view from one canonical evidence read.
 ///
 /// `declared_records` is the count of `declared` / `imported_legacy`
@@ -524,6 +803,15 @@ mod tests {
         ScopeId::new("governor").expect("scope")
     }
 
+    /// Deterministic stand-in for a store-issued evidence revision.
+    fn test_owner_revision(owner_revision: u64) -> OwnerEvidenceRevision {
+        OwnerEvidenceRevision::issued(
+            owner_revision,
+            &eliot_store_api::sha256_hex(&owner_revision.to_be_bytes()),
+        )
+        .expect("fixture revision is well formed")
+    }
+
     #[test]
     fn admission_is_held_and_consulted_with_real_time() {
         let mut admission = GovernorCapabilityAdmission::new();
@@ -537,12 +825,15 @@ mod tests {
         assert_eq!(admission.len(), 1);
         // Declared/imported evidence never admits, even with no other data.
         assert!(!admission.admit_production_route("skill-demo", &scope(), 10));
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert!(admission.admit_production_route("skill-demo", &scope(), 10));
         // Positive evidence goes stale in the running daemon: expiry ends
         // admission without any other write.
         let mut expiring = GovernorCapabilityAdmission::new();
-        expiring.insert(probe("skill-demo", 1).expires_at(10));
+        expiring.insert(
+            probe("skill-demo", 1).expires_at(10),
+            test_owner_revision(1),
+        );
         assert!(expiring.admit_production_route("skill-demo", &scope(), 9));
         assert!(!expiring.admit_production_route("skill-demo", &scope(), 10));
     }
@@ -550,7 +841,7 @@ mod tests {
     #[test]
     fn scope_change_stales_through_the_held_view() {
         let mut admission = GovernorCapabilityAdmission::new();
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert!(admission.admit_production_route("skill-demo", &scope(), 10));
         let mut changed = scope();
         changed.adapter_hash = Some("adapter-hash-2".into());
@@ -558,7 +849,12 @@ mod tests {
             adapter_hash: true,
             ..ScopeDependencySelector::none()
         };
-        assert_eq!(admission.apply_scope_change(&changed, selector), 1);
+        assert_eq!(
+            admission
+                .apply_scope_change(&changed, selector, &test_owner_revision(1).evidence_ref)
+                .expect("fixture change reference is owner-referenced"),
+            1
+        );
         assert!(!admission.admit_production_route("skill-demo", &changed, 10));
     }
 
@@ -566,7 +862,7 @@ mod tests {
     fn required_set_and_standing_read_through_the_held_view() {
         let mut admission = GovernorCapabilityAdmission::new();
         assert!(admission.required_set().is_empty());
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert_eq!(admission.required_set(), vec!["skill-demo".to_owned()]);
         assert_eq!(
             admission.skill_standing("skill-demo", 10),

@@ -139,7 +139,8 @@ pub use capability_admission::{
     canonical_required_set, evaluate_production_admission,
 };
 pub use capability_evidence_wiring::{
-    EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
+    CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, drain_capability_evidence_records,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,

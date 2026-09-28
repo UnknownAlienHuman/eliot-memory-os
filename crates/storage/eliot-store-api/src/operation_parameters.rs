@@ -79,6 +79,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::capability_evidence_store::{
+    CAPABILITY_EVIDENCE_PARAM_CURSOR, CAPABILITY_EVIDENCE_PARAM_EXPECTED_REVISION,
+    CAPABILITY_EVIDENCE_PARAM_IDEMPOTENCY_KEY, CAPABILITY_EVIDENCE_PARAM_MAX_RECORDS,
+    CAPABILITY_EVIDENCE_PARAM_RECORD_DIGEST, CAPABILITY_EVIDENCE_PARAM_RECORD_JSON,
+    CAPABILITY_EVIDENCE_PARAM_SCOPE_KEY, CAPABILITY_EVIDENCE_PARAM_SKILL_ID,
+};
 use crate::learning_store::{
     LEARNING_PARAM_CURSOR, LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE,
     LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST,
@@ -435,7 +441,18 @@ static GET_UNDERSTANDING_PROJECTION_INPUTS_PARAMETERS: [ParameterDeclaration; 2]
         required: true,
     },
 ];
-static GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
+/// Closed selectors for `GetCapabilityEvidenceState` (T11.3): the required
+/// exact `skill_id` plus the required `max_records` bound, plus the optional
+/// opaque `cursor` keyset-continuation selector (issue #1773).
+///
+/// The cursor is what makes the page honest. Without it the handler had to
+/// serve a bare prefix and report `truncated` with no way to continue, so a
+/// caller draining the read would re-read the first `limit` rows forever and
+/// could never reach exhaustion. An absent cursor still reads from the start, so
+/// every existing caller is unaffected; a caller that receives `truncated`
+/// presents the issued cursor, and a cursor that does not decode against the
+/// current fence and revision heads fails closed.
+static GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS: [ParameterDeclaration; 3] = [
     ParameterDeclaration {
         name: "skill_id",
         shape: ParameterShape::Subject,
@@ -445,6 +462,11 @@ static GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
         name: "max_records",
         shape: ParameterShape::Subject,
         required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_CURSOR,
+        shape: ParameterShape::Subject,
+        required: false,
     },
 ];
 
@@ -951,6 +973,72 @@ static GET_LEARNING_RANGE_PARAMETERS: [ParameterDeclaration; 3] = [
     },
 ];
 
+/// Closed capability-evidence commit fields (issue #1773, I3.4): the exact
+/// `skill_id` of the evidence key, the owner-issued `scope_key` digest of the
+/// exact route-scope fingerprint, the verbatim `record_json` evidence
+/// document, the presented `record_digest` of those bytes, the asserted
+/// `expected_canonical_revision` CAS predecessor as its decimal string, and the
+/// deterministic `idempotency_key`. The store issues
+/// `expected + 1` as the owner-issued revision of the evidence row; the
+/// document stays opaque and its semantics stay Governor-owned.
+static COMMIT_CAPABILITY_EVIDENCE_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_SKILL_ID,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_SCOPE_KEY,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_RECORD_JSON,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_RECORD_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_EXPECTED_REVISION,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_IDEMPOTENCY_KEY,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
+/// Closed selector for the paged capability-evidence record read (issue
+/// #1773, I3.4): the required `max_records` page bound as its decimal string,
+/// the optional exact `skill_id` filter, plus the optional opaque `cursor`
+/// keyset-continuation selector. Scope arrives through the typed `scope_id`
+/// request field, mirroring `GetEvidencePack`; an absent cursor reads from the
+/// start and a malformed cursor fails closed at the cursor decoder, so a
+/// complete hydration cannot silently stop at the first page.
+static GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_MAX_RECORDS,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_SKILL_ID,
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: CAPABILITY_EVIDENCE_PARAM_CURSOR,
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -1070,6 +1158,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetAuditRange => "GetAuditRange",
         NamedReadOperation::ResolveWriteReceipt => "ResolveWriteReceipt",
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
+        NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
     }
 }
 
@@ -1107,6 +1196,9 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
         b"GetBlackboardItem" => Some(NamedReadOperation::GetBlackboardItem),
         b"GetLearningRecordRange" => Some(NamedReadOperation::GetLearningRecordRange),
+        b"GetCapabilityEvidenceRecordRange" => {
+            Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
+        }
         _ => None,
     }
 }
@@ -1135,6 +1227,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
+        NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
     }
 }
 
@@ -1164,6 +1257,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
+        b"RecordCapabilityEvidenceRecord" => {
+            Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
+        }
         _ => None,
     }
 }
@@ -1234,6 +1330,9 @@ pub const fn declared_read_parameters(
         }
         NamedReadOperation::GetBlackboardItem => &BLACKBOARD_ITEM_LOOKUP_PARAMETERS,
         NamedReadOperation::GetLearningRecordRange => &GET_LEARNING_RANGE_PARAMETERS,
+        NamedReadOperation::GetCapabilityEvidenceRecordRange => {
+            &GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS
+        }
         NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
@@ -1328,6 +1427,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::CommitExperienceBank
         | NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
         NamedMutationOperation::RecordLearningRecord => &COMMIT_LEARNING_PARAMETERS,
+        NamedMutationOperation::RecordCapabilityEvidenceRecord => {
+            &COMMIT_CAPABILITY_EVIDENCE_PARAMETERS
+        }
     }
 }
 

@@ -2195,6 +2195,11 @@ mod tests {
             )
             .map_err(|error| format!("probe evidence: {error}"))?
             .expires_at(2_000),
+            eliot_governor::OwnerEvidenceRevision::issued(
+                1,
+                &eliot_store_api::sha256_hex(b"test.dreamer.probe-evidence"),
+            )
+            .map_err(|error| format!("owner revision: {error}"))?,
         );
         Ok(registry)
     }

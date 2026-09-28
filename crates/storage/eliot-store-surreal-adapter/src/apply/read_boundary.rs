@@ -46,6 +46,9 @@ const TASK_STATE_PAYLOAD_VERSION: u32 = 1;
 const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
 const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
 const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetCapabilityEvidenceRecordRange` payload shape (issue
+/// #1773, I3.4).
+const CAPABILITY_EVIDENCE_RECORD_PAYLOAD_VERSION: u32 = 1;
 
 /// One receipt row of the closed evidence SELECT (see
 /// [`schema::READ_EVIDENCE_RECORDS`](crate::schema::READ_EVIDENCE_RECORDS)).
@@ -366,7 +369,13 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetCapabilityEvidenceState => {
             let rows = read_authority_records(db, &adapter.config).await?;
-            capability_evidence_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+            let heads: Vec<(String, u64)> = read_all_revision_heads(db, &adapter.config)
+                .await?
+                .iter()
+                .map(|head| (head.key.as_str().to_owned(), head.revision))
+                .collect();
+            capability_evidence_payload(query, state_fence, &rows, &heads)
+                .map_err(AdapterError::Store)
         }
         NamedReadOperation::GetNotificationState => {
             notification_state_payload(db, &adapter.config, query, state_fence).await
@@ -391,6 +400,9 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetLearningRecordRange => {
             learning_record_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetCapabilityEvidenceRecordRange => {
+            capability_evidence_record_range_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
@@ -1612,10 +1624,19 @@ fn understanding_inputs_payload(
 }
 
 /// Builds the versioned `GetCapabilityEvidenceState` payload (T11.3, Surreal).
+///
+/// The page is served by genuine keyset continuation, not a bare prefix slice
+/// (issue #1773). A bare `.take(limit)` with no continuation token would
+/// re-read the first `limit` rows on every further request, so a caller draining
+/// this read could never reach exhaustion and would mistake a bounded prefix
+/// for the whole set. The cursor is fence- and heads-bound and fails closed in
+/// [`eliot_store_api::audit_cursor_parse`] when it does not decode, so a partial
+/// drain is always visible as `truncated` plus a usable `next_cursor`.
 fn capability_evidence_payload(
     query: &NamedReadRequest,
     state_fence: &StateFence,
     rows: &[AuthorityReceiptRow],
+    heads: &[(String, u64)],
 ) -> Result<Value, StoreError> {
     let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
         field: "scope_id",
@@ -1639,6 +1660,14 @@ fn capability_evidence_payload(
     if query.state_fence != *state_fence {
         return Err(StoreError::FenceMismatch);
     }
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(eliot_store_api::audit_cursor_parse(
+            cursor,
+            state_fence,
+            heads,
+        )?),
+    };
     let indexed = indexed_authorities(rows)?;
     let matched: Vec<&IndexedAuthority> = indexed
         .iter()
@@ -1649,18 +1678,36 @@ fn capability_evidence_payload(
         })
         .collect();
     let matched_total = matched.len();
-    let records: Vec<Value> = matched
-        .into_iter()
-        .take(limit)
-        .map(|record| {
-            json!({
-                "capture_index": record.capture_index,
-                "operation": named_mutation_operation_name(record.operation),
-                "parameters": record.parameters,
-            })
-        })
-        .collect();
+    let mut records: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for record in matched {
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() >= limit {
+            truncated = true;
+            break;
+        }
+        records.push(json!({
+            "capture_index": record.capture_index,
+            "operation": named_mutation_operation_name(record.operation),
+            "parameters": record.parameters,
+        }));
+    }
     let returned = records.len();
+    let next_cursor = if truncated {
+        Some(eliot_store_api::audit_cursor_issue(
+            state_fence,
+            heads,
+            start
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX)),
+        )?)
+    } else {
+        None
+    };
     Ok(json!({
         "version": CAPABILITY_EVIDENCE_PAYLOAD_VERSION,
         "skill_id": skill_id,
@@ -1671,8 +1718,116 @@ fn capability_evidence_payload(
             "matched_total": matched_total,
             "returned": returned,
             "max_records": max_records,
-            "truncated": matched_total > returned,
+            "truncated": truncated,
         },
+        "next_cursor": next_cursor,
+    }))
+}
+
+/// Builds the versioned `GetCapabilityEvidenceRecordRange` payload (issue
+/// #1773, I3.4, Surreal).
+///
+/// Projects the real durable evidence rows — the verbatim document, the
+/// owner-issued `record_digest` of those bytes, and the store-issued `revision`
+/// the fenced compare-and-set assigned — so the Governor can re-mint real
+/// `CapabilityEvidenceRecord`s with their owner-issued revisions after a
+/// restart. `GetCapabilityEvidenceState` cannot do this: it answers committed
+/// lifecycle-governance rows, which carry no status, source, scope fingerprint,
+/// or revision.
+///
+/// One bounded page with genuine keyset continuation: the next cursor is issued
+/// only when a further eligible row was actually observed, and it fails closed
+/// against the current fence and revision heads, so a complete hydration
+/// terminates and a partial one is never reported as complete coverage.
+async fn capability_evidence_record_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_capability_evidence_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded =
+        eliot_store_api::decode_capability_evidence_read(query.operation, &query.parameters)
+            .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "capability evidence record range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records);
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query
+        .parameters
+        .get(eliot_store_api::CAPABILITY_EVIDENCE_PARAM_CURSOR)
+        .and_then(Value::as_str)
+    {
+        None => None,
+        Some(cursor) => Some(eliot_store_api::audit_cursor_parse(
+            cursor,
+            state_fence,
+            &heads,
+        )?),
+    };
+    // The eligible set is the complete scope/skill/fence predicate: it is
+    // applied in the query before the page bound, and the skip window is served
+    // by bounded keyset continuation from the last row actually returned, so a
+    // second page never re-materializes the consumed prefix. `truncated` is true
+    // only when a further eligible row was actually observed, and the page is
+    // empty only when the eligible set was traversed to its end.
+    let page = super::surreal_capability_evidence::read_capability_evidence_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        decoded.skill_id.as_deref(),
+        state_fence,
+        start.unwrap_or(0),
+        limit,
+    )
+    .await?;
+    let returned = page.records.len();
+    let records: Vec<Value> = page
+        .records
+        .into_iter()
+        .map(|row| {
+            json!({
+                "skill_id": row.skill_id,
+                "scope_key": row.scope_key,
+                "record_digest": row.record_digest,
+                "record_json": row.record_json,
+                "revision": row.revision,
+            })
+        })
+        .collect();
+    let truncated = page.more;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "version": CAPABILITY_EVIDENCE_RECORD_PAYLOAD_VERSION,
+        "scope_id": scope_id,
+        "records": records,
+        "matched_total": returned,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": state_fence,
     }))
 }
 
@@ -4365,7 +4520,7 @@ mod admitted_read_tests {
             validate_named_against_active_catalogue(&query).is_ok(),
             "activated capability read passes the gate"
         );
-        let payload = capability_evidence_payload(&query, &fence, &rows).expect("pack builds");
+        let payload = capability_evidence_payload(&query, &fence, &rows, &[]).expect("pack builds");
         assert_eq!(
             payload.get("version").and_then(Value::as_u64),
             Some(u64::from(CAPABILITY_EVIDENCE_PAYLOAD_VERSION))
@@ -4420,7 +4575,7 @@ mod admitted_read_tests {
             BTreeMap::from([("max_records".to_owned(), json!("10"))]),
         );
         assert!(matches!(
-            capability_evidence_payload(&query, &fence, &rows),
+            capability_evidence_payload(&query, &fence, &rows, &[]),
             Err(StoreError::InvalidField { .. })
         ));
         // Zero and non-decimal bounds fail the bound shape.

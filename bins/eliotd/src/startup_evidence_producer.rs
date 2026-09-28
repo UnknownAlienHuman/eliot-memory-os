@@ -1118,6 +1118,16 @@ mod tests {
         }
     }
 
+    /// Deterministic stand-in for a store-issued evidence revision.
+    fn summary_owner_revision(owner_revision: u64) -> eliot_governor::OwnerEvidenceRevision {
+        eliot_governor::OwnerEvidenceRevision::issued(
+            owner_revision,
+            &eliot_store_api::sha256_hex(&owner_revision.to_be_bytes()),
+        )
+        .map_err(|error| contract(format!("owner revision: {error}")))
+        .expect("fixture revision is well formed")
+    }
+
     fn summary_probe(
         skill: &str,
         observed_at: u64,
@@ -1145,7 +1155,10 @@ mod tests {
         // Retained model: one holding probe, one fresh restriction, one
         // declared-only legacy import.
         let mut view = GovernorCapabilityAdmission::new();
-        view.insert(summary_probe("skill-holding", 1_000).map_err(contract)?);
+        view.insert(
+            summary_probe("skill-holding", 1_000).map_err(contract)?,
+            summary_owner_revision(1),
+        );
         view.insert(
             eliot_governor::CapabilityEvidenceRecord::verified(
                 "skill-restricted",
@@ -1155,6 +1168,7 @@ mod tests {
                 1_200,
             )
             .map_err(|error| contract(format!("failure evidence: {error}")))?,
+            summary_owner_revision(2),
         );
         view.import_legacy(&LegacyCapabilityDeclaration {
             skill_id: "skill-declared".to_owned(),

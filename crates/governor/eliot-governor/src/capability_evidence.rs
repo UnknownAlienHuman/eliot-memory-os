@@ -128,7 +128,9 @@ pub enum EvidenceRevisionError {
 ///
 /// This pair is the only supersession authority in the registry. It is never
 /// derived from a locally observed instant.
-#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerEvidenceRevision {
     /// Store-issued monotonic revision for this evidence key.
@@ -147,10 +149,7 @@ impl OwnerEvidenceRevision {
     /// is minted by [`OwnerEvidenceRevision::legacy_declared`]) and
     /// [`EvidenceRevisionError::MalformedEvidenceRef`] for a reference that is
     /// not one hex SHA-256 digest.
-    pub fn issued(
-        owner_revision: u64,
-        evidence_ref: &str,
-    ) -> Result<Self, EvidenceRevisionError> {
+    pub fn issued(owner_revision: u64, evidence_ref: &str) -> Result<Self, EvidenceRevisionError> {
         if owner_revision < 1 {
             return Err(EvidenceRevisionError::RevisionBelowFloor);
         }
@@ -820,7 +819,8 @@ impl CapabilityRegistry {
             self.restriction_capacity_exhausted |= record.is_restrictive_evidence();
             return false;
         }
-        self.records.push(RetainedCapabilityEvidence { record, revision });
+        self.records
+            .push(RetainedCapabilityEvidence { record, revision });
         true
     }
 
@@ -845,7 +845,8 @@ impl CapabilityRegistry {
             .requalification
             .as_deref()
             .is_some_and(|named| named == cause.blocking_evidence_ref);
-        if !names_blocking_reference || revision.owner_revision <= cause.blocking_revision.owner_revision
+        if !names_blocking_reference
+            || revision.owner_revision <= cause.blocking_revision.owner_revision
         {
             return;
         }
@@ -953,10 +954,7 @@ impl CapabilityRegistry {
     /// Returns the retained invalidation cause for one scope, when it is
     /// currently invalidated.
     #[must_use]
-    pub fn invalidation_cause(
-        &self,
-        scope: &RouteScopeFingerprint,
-    ) -> Option<&InvalidationCause> {
+    pub fn invalidation_cause(&self, scope: &RouteScopeFingerprint) -> Option<&InvalidationCause> {
         self.invalidated_scopes.get(scope)
     }
 
@@ -983,12 +981,9 @@ impl CapabilityRegistry {
             return false;
         }
         if self.records.iter().any(|retained| {
-            retained.record.is_fresh_restriction_for(
-                skill_id,
-                scope,
-                now,
-                &self.invalidated_scopes,
-            )
+            retained
+                .record
+                .is_fresh_restriction_for(skill_id, scope, now, &self.invalidated_scopes)
         }) {
             return false;
         }
@@ -1188,7 +1183,12 @@ mod tests {
             adapter_hash: true,
             ..ScopeDependencySelector::none()
         };
-        assert!(rotated.apply_scope_change(&changed, adapter_only, &change_ref()).unwrap() >= 1);
+        assert!(
+            rotated
+                .apply_scope_change(&changed, adapter_only, &change_ref())
+                .unwrap()
+                >= 1
+        );
         assert!(!rotated.admit_production_route("route.execute", &changed, 10));
         let mut changed_serializer = scope();
         changed_serializer.feature_flags_and_serializer = Some("serializer-v2".into());
@@ -1200,7 +1200,9 @@ mod tests {
             ..ScopeDependencySelector::none()
         };
         assert!(
-            rotated_serializer.apply_scope_change(&changed_serializer, serializer_only, &change_ref())
+            rotated_serializer
+                .apply_scope_change(&changed_serializer, serializer_only, &change_ref())
+                .unwrap()
                 >= 1
         );
         assert!(!rotated_serializer.admit_production_route(
@@ -1350,7 +1352,12 @@ mod tests {
         };
         // skill-b shares the stale adapter hash, so it stales; a selector
         // naming only the provider route would leave both untouched.
-        assert_eq!(registry.apply_scope_change(&changed, adapter_only, &change_ref()).unwrap(), 2);
+        assert_eq!(
+            registry
+                .apply_scope_change(&changed, adapter_only, &change_ref())
+                .unwrap(),
+            2
+        );
         assert!(registry.is_scope_invalidated(&scope()));
         assert!(registry.is_scope_invalidated(&other));
         let fresh = CapabilityRegistry::new();
@@ -1361,7 +1368,9 @@ mod tests {
             ..ScopeDependencySelector::none()
         };
         assert_eq!(
-            fresh_registry.apply_scope_change(&changed, provider_only, &change_ref()).unwrap(),
+            fresh_registry
+                .apply_scope_change(&changed, provider_only, &change_ref())
+                .unwrap(),
             0
         );
         assert!(fresh_registry.admit_production_route("skill-a", &scope(), 10));
@@ -1397,7 +1406,10 @@ mod tests {
         let mut changed = scope();
         changed.adapter_hash = Some("adapter-hash-2".into());
         assert!(
-            registry.apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref()).unwrap() >= 1
+            registry
+                .apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref())
+                .unwrap()
+                >= 1
         );
         assert!(!registry.admit_production_route("skill-a", &scope(), 10));
         registry.insert(probe("skill-a", scope(), 3), rev(3));
@@ -1487,7 +1499,10 @@ mod tests {
         let mut changed = scope();
         changed.adapter_hash = Some("adapter-hash-2".into());
         assert!(
-            holding.apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref()).unwrap() >= 1
+            holding
+                .apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref())
+                .unwrap()
+                >= 1
         );
         assert_eq!(
             holding.skill_standing("skill-a", 10),

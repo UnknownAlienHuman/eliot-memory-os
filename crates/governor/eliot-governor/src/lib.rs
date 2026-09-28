@@ -37,6 +37,7 @@ mod campaign_source_publishers;
 mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
+mod capability_evidence_commit;
 mod composition;
 mod context_inputs;
 mod cue_composition;
@@ -55,7 +56,8 @@ pub use cue_composition::{
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{
-    FinishAttemptError, GovernorFinishAttempt, PreparedFinishDecision, PreparedKernelExchange,
+    FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
+    PreparedKernelExchange,
 };
 mod controlboard_projection;
 mod learning_admission;
@@ -102,6 +104,9 @@ pub use capability_evidence::{
     LEGACY_DECLARED_OWNER_REVISION, MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision,
     RetainedCapabilityEvidence, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
     is_evidence_ref,
+};
+pub use capability_evidence_commit::{
+    capability_evidence_mutation_request_for_record, commit_capability_evidence_record,
 };
 pub use composition::*;
 pub use controlboard_projection::{
