@@ -109,13 +109,14 @@ const MAX_RESTORE_TRACKED_ATTEMPTS: usize = MAX_RESTORE_BATCH_MEMBERS;
 
 /// Closed per-member disposition of one canonical restore batch.
 ///
-/// The frozen [`CanonicalRestoreBatch`] contract carries exactly one archive
-/// member digest per batch, so a purge obligation is necessarily observed at
-/// member-set granularity: an obligation names the archive member digest or the
-/// source scope and therefore covers the whole member set of that batch. A
-/// per-member split the contract cannot observe would be manufactured
-/// accounting, so every member of the set carries the same observed
-/// disposition while the exact per-member identities and counts are preserved.
+/// A purge obligation is observed at archive-member-scope granularity, so it
+/// opens or closes the whole member set; everything after that is decided per
+/// member. One member's payload may resolve while its neighbour's does not, a
+/// reference edge is never a row the import can write, and a member the
+/// destination does not serve back is unresolved while its neighbours are
+/// restored. Every member keeps its own identity and its own disposition, and a
+/// split the contract cannot observe is never manufactured: the exact
+/// per-member identities and counts are preserved either way.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum MemberDisposition {
@@ -127,7 +128,7 @@ enum MemberDisposition {
     /// A reference edge: it names a canonical object rather than carrying one,
     /// so the record import has no row of its own to write and mints none. It
     /// stays in the denominator under its own identity, and its closure is
-    /// proved by [`validate_typed_reference_closure`].
+    /// proved by [`validate_reference_closure_against`].
     Rejected,
     /// No durable outcome: the member keeps its original identity and the
     /// missing denominator stays visible.
@@ -1539,7 +1540,7 @@ pub fn validate_restore_batch(
 /// drops residency and type identity, so equal bytes in another obligation
 /// domain would satisfy it and a member that never resolved would pass it.
 /// Resolution is a separate typed step over the owner-resolved canonical
-/// payloads — see [`validate_typed_reference_closure`].
+/// payloads — see [`validate_reference_closure_against`].
 pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), StoreError> {
     batch.operation.validate()?;
     if batch.expected_revision_heads.is_empty() {
@@ -1604,47 +1605,61 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
     Ok(())
 }
 
-/// Resolves every reference edge of one batch through the canonical payloads
-/// the archive/artifact owner actually supplied.
+/// Resolves every reference edge this batch claims to have closed, against the
+/// member set that is actually *present*.
 ///
-/// This is the typed half of the closure. A reference resolves only against a
-/// member that
+/// `dispositions[i]` is the disposition of `batch.members[i]` at this exact
+/// point: the planned set before an apply commit, the observed set at receipt
+/// time. This is the typed half of the closure, and it is deliberately not a
+/// digest-membership test over the batch's own declarations. A reference edge
+/// resolves only against a member that
 ///
-/// 1. resolved to a real canonical payload through the owner's carrier row. A
-///    declared member that never resolved is not a target, so a batch cannot
-///    close a graph it never imported;
-/// 2. carries the referenced content digest **under the same residency domain**
+/// 1. carries the referenced content digest **under the same residency domain**
 ///    as the referring member. Equal bytes under a different obligation domain
 ///    are a different logical object (I5.13), so they are not the referenced
 ///    object; and
-/// 3. is itself importable — a `Record` or `Blob` member rather than another
+/// 2. is itself importable — a `Record` or `Blob` member rather than another
 ///    reference edge — so a reference chain is refused instead of followed.
 ///
-/// A cross-batch target, an object an authorized earlier batch of the same
-/// restore plan already imported, is **not** resolvable here: the #950 batch
-/// contract carries no record address for a member outside the batch and this
-/// port never mints one. Such an edge fails closed rather than being assumed
-/// present, and a reference member never gains a canonical row of its own.
-fn validate_typed_reference_closure(
+/// Only an edge the batch actually claims to have closed — a `Rejected` edge,
+/// which is what an importable batch records for a reference — carries that
+/// obligation. A purge-suppressed or still-unresolved member set makes nothing
+/// servable, so its edges are accounted as suppressed or unresolved rather than
+/// demanded to resolve: a suppressed archive cannot fail to be closed.
+///
+/// A member that is not present is not a target, so a batch cannot close a graph
+/// it never imported. A cross-batch target, an object an authorized earlier
+/// batch of the same restore plan already imported, is **not** resolvable here:
+/// the #950 batch contract carries no record address for a member outside the
+/// batch and this port never mints one. Such an edge fails closed rather than
+/// being assumed present, and a reference member never gains a canonical row of
+/// its own.
+fn validate_reference_closure_against(
     batch: &CanonicalRestoreBatch,
-    resolved: &[Option<ResolvedArchiveMember>],
+    dispositions: &[MemberDisposition],
 ) -> Result<(), StoreError> {
-    if resolved.len() != batch.members.len() {
+    if dispositions.len() != batch.members.len() {
         return Err(StoreError::InvalidReceipt);
     }
-    for member in &batch.members {
-        if member.member_type != SnapshotMemberType::Reference {
+    for (member, disposition) in batch.members.iter().zip(dispositions) {
+        if member.member_type != SnapshotMemberType::Reference
+            || *disposition != MemberDisposition::Rejected
+        {
             continue;
         }
         let reference = member.reference_digest.as_deref().ok_or(StoreError::InvalidField {
             field: "restore.reference_digest",
             reason: "reference member requires a reference digest",
         })?;
-        let resolved_target = resolved.iter().flatten().any(|target| {
-            target.member.content_digest == reference
-                && target.member.residency.domain == member.residency.domain
-                && target.member.member_type != SnapshotMemberType::Reference
-        });
+        let resolved_target = batch
+            .members
+            .iter()
+            .zip(dispositions)
+            .any(|(target, target_disposition)| {
+                *target_disposition == MemberDisposition::Restored
+                    && target.content_digest == reference
+                    && target.residency.domain == member.residency.domain
+            });
         if !resolved_target {
             return Err(StoreError::IdentityConflict);
         }
@@ -2465,12 +2480,12 @@ async fn read_destination_heads(
 /// Compares the batch's expected head values with the destination's own.
 ///
 /// The same rule the commit transaction applies, applied before the write so a
-/// batch whose expectation has already moved is refused rather than submitted:
-/// a head the destination publishes must carry exactly the revision or sequence
-/// this operation was admitted against, and a head the destination does not
-/// publish yet is the absent case the create-only import establishes. `mismatch`
-/// is the lane's typed conflict, so a revision move never reads as an ordering
-/// move or the other way round.
+/// batch whose expectation has already moved is refused rather than submitted.
+/// The admitted expectation is non-zero by contract, so a destination that
+/// publishes no head at that key has moved just as surely as one that publishes
+/// a different value: absence is a conflict, not a pass. `mismatch` is the
+/// lane's typed conflict, so a revision move never reads as an ordering move or
+/// the other way round.
 fn check_observed_heads(
     expected: &[u64],
     observed: &[Option<u64>],
@@ -2480,33 +2495,37 @@ fn check_observed_heads(
         return Err(StoreError::InvalidReceipt);
     }
     for (expected, observed) in expected.iter().zip(observed) {
-        if !observed.is_none_or(|observed| observed == *expected) {
+        if observed.is_none_or(|observed| observed == *expected) {
             return Err(mismatch);
         }
     }
     Ok(())
 }
 
-/// Re-reads one imported canonical record out of the destination and digests
-/// exactly the bytes it serves.
+/// Re-reads one imported canonical record out of the destination and reports
+/// whether it serves exactly the bytes this operation committed.
 ///
 /// A `Restored` member is only `Restored` when the destination serves its row
-/// back, in the closed class and at the address this operation recorded. The
-/// returned digest is that readback: a member whose row is absent yields `None`
-/// and the caller reads it as `Unresolved` rather than as a restored one. This
-/// is what separates a registered placement, a staged archive handle and a
-/// completed canonical import — three different facts — and what stops a
-/// metadata-only batch from reporting a complete import.
+/// back, in the closed class, at the address this operation recorded, **with the
+/// content this operation bound into its own transaction**. The returned digest
+/// is that readback: a member whose row is absent yields `None`, and so does a
+/// row whose bytes digest to anything other than `expected_digest` — a row that
+/// exists at the right address with the wrong content is not this member's
+/// import. This is what separates a registered placement, a staged archive
+/// handle and a completed canonical import — three different facts — and what
+/// stops a metadata-only batch from reporting a complete import.
 async fn read_imported_member(
     transport: &RpcTransport,
     config: &SurrealAdapterConfig,
     class: RestoreRecordClass,
     record_id: &str,
+    expected_digest: &str,
 ) -> Result<Option<String>, StoreError> {
     let Some(body) = read_canonical_body(transport, config, class, record_id).await? else {
         return Ok(None);
     };
-    Ok(Some(sha256_hex(&canonical_digest_bytes(&body)?)))
+    let digest = sha256_hex(&canonical_digest_bytes(&body)?);
+    Ok((digest == expected_digest).then_some(digest))
 }
 
 /// Decodes one purge-ledger row, refusing a foreign namespace or schema.
@@ -3603,11 +3622,6 @@ impl SurrealStoreAdapter {
         // member is given a disposition. A member whose payload cannot be
         // resolved is unresolved, never restored.
         let resolved = resolve_archive_members(transport, &self.config, batch).await?;
-        // Typed closure: a reference edge resolves only against a payload the
-        // owner actually supplied for the same obligation domain. Unverified
-        // derived data cannot grant completion, so a dangling edge refuses the
-        // batch before any write.
-        validate_typed_reference_closure(batch, &resolved)?;
         // A purge obligation applies to the archive member scope, and the
         // residency, privacy and retention domains stay separate: an obligation
         // in one domain never silently widens into another.
@@ -3678,6 +3692,12 @@ impl SurrealStoreAdapter {
                 MemberDisposition::Rejected => MemberDisposition::Rejected,
             })
             .collect();
+        // Typed closure, proved against the planned dispositions before anything
+        // is written: an edge this batch claims to have closed must land on a
+        // member this batch actually imports, in the same obligation domain.
+        // Unverified derived data cannot grant completion, so a dangling edge
+        // refuses the batch rather than being committed and reported.
+        validate_reference_closure_against(batch, &dispositions)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let (completeness, mutation) = planned_outcome(&dispositions);
@@ -3834,10 +3854,14 @@ impl SurrealStoreAdapter {
     /// Projects the receipt only after every member's canonical import has been
     /// re-read out of the destination.
     ///
-    /// The durable record names what each member claimed; this observes what the
-    /// destination actually serves. A member the destination does not return is
+    /// The durable record names what each member claimed — its closed class, its
+    /// destination address and the digest of the bytes this operation committed
+    /// for it; this observes what the destination actually serves. A member the
+    /// destination does not return, or returns with different bytes, is
     /// `Unresolved`, so a batch whose bookkeeping committed while its import did
-    /// not become servable reports partial instead of complete.
+    /// not become servable reports partial instead of complete. The typed
+    /// reference closure is then re-proved against what was observed, not
+    /// against what was declared.
     async fn receipt_from_observed_imports(
         &self,
         transport: &RpcTransport,
@@ -3850,33 +3874,48 @@ impl SurrealStoreAdapter {
             privacy: first.privacy_domain.clone(),
             retention: first.retention_domain.clone(),
         };
+        if document.members.len() != batch.members.len() {
+            return Err(StoreError::InvalidReceipt);
+        }
         let mut dispositions = Vec::with_capacity(document.members.len());
         let mut evidence = Vec::with_capacity(document.members.len());
         for member in &document.members {
-            // Only a claim that names a closed class *and* a record address can
-            // be looked up in the destination. A metadata-only record written
-            // before canonical import named neither, so it stays bookkeeping
-            // evidence: it is re-read as `Unresolved` rather than being
-            // certified as imported data.
+            // Only a claim that names a closed class, a record address *and* the
+            // content digest this operation committed can be looked up in the
+            // destination. A metadata-only record written before canonical import
+            // named none of them, so it stays bookkeeping evidence: it is re-read
+            // as `Unresolved` rather than being certified as imported data.
             let observed = match (
                 member.disposition,
                 member.imported_class.as_deref(),
                 member.imported_record_id.as_deref(),
+                member.imported_digest.as_deref(),
             ) {
-                (MemberDisposition::Restored, Some(class_token), Some(record_id)) => {
+                (
+                    MemberDisposition::Restored,
+                    Some(class_token),
+                    Some(record_id),
+                    Some(expected_digest),
+                ) => {
                     let class = RestoreRecordClass::parse(class_token).ok_or({
                         StoreError::InvalidField {
                             field: "restore.imported_class",
                             reason: "unknown canonical class token",
                         }
                     })?;
-                    read_imported_member(transport, &self.config, class, record_id)
-                        .await?
-                        .map(|digest| ImportedMemberEvidence {
-                            record_id: record_id.to_owned(),
-                            class_token: class.token(),
-                            digest: Some(digest),
-                        })
+                    read_imported_member(
+                        transport,
+                        &self.config,
+                        class,
+                        record_id,
+                        expected_digest,
+                    )
+                    .await?
+                    .map(|digest| ImportedMemberEvidence {
+                        record_id: record_id.to_owned(),
+                        class_token: class.token(),
+                        digest,
+                    })
                 }
                 _ => None,
             };
@@ -3892,6 +3931,7 @@ impl SurrealStoreAdapter {
             });
             evidence.push(observed);
         }
+        validate_reference_closure_against(batch, &dispositions)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let members = member_records(
@@ -3985,11 +4025,13 @@ fn planned_outcome(
     )
 }
 
-/// Binds the planned class and address of each member this commit will import.
+/// Binds the class, the address and the content digest of each member this
+/// commit will import.
 ///
-/// No digest is bound. The import digest can only come from the destination's
-/// readback after the commit, so the pre-write record names what the transaction
-/// will write and can never claim an import it has not observed.
+/// The digest is the one already validated at resolution against the archive
+/// owner's attested value, and it is what the post-commit readback must
+/// reproduce. Binding it here is what makes the readback a content check rather
+/// than a row-presence check.
 fn planned_evidence(
     batch: &CanonicalRestoreBatch,
     imports: &[&ResolvedArchiveMember],
@@ -4004,7 +4046,7 @@ fn planned_evidence(
         *slot = Some(ImportedMemberEvidence {
             record_id: member.record_id.clone(),
             class_token: member.class.token(),
-            digest: None,
+            digest: member.payload_digest.clone(),
         });
     }
     evidence
