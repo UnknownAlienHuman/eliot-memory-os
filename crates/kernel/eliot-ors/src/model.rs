@@ -3640,6 +3640,8 @@ pub struct ActivationRecoverySnapshot {
 pub enum OrsError {
     #[error("bridge event capacity exhausted: {0:?}")]
     BridgeEventCapacityExceeded(BridgeEventCapacityPressure),
+    #[error("bridge recovery window capacity exhausted")]
+    BridgeRecoveryWindowCapacityExceeded,
     #[error("{field} is invalid: {reason}")]
     InvalidField {
         field: &'static str,
