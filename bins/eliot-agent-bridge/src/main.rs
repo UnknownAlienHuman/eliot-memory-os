@@ -4,11 +4,11 @@ mod request_input;
 
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
-    CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile, TransportAdmissionError,
-    TransportProfile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
-    loopback_http_route, parse_args, reactive_runtime_composition, validate_credential,
-    validate_host, validate_origin,
+    CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
+    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile,
+    TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
+    kernel_ports_with_declaration, loopback_http_route, parse_args, reactive_runtime_composition,
+    validate_credential, validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -1299,6 +1299,15 @@ fn invocation_wire_result(
         return Ok(wire);
     }
     let preview_len = content.len().min(eliot_agent_bridge::MAX_PREVIEW_BYTES);
+    // I7.24 delivery disposition for this frame: the retained view's measured
+    // flag when present, else TRUNCATED — this branch withholds bytes behind
+    // a bounded preview by construction, so the frame never claims a full
+    // delivery. Token-measured receipts still project only from a route
+    // attestation (`project_produced_tool_result`), never here.
+    let delivery = evidence.map_or(
+        DeliveryStatus::Truncated,
+        BridgeRunner::observed_hot_delivery,
+    );
     let response = wire
         .get_mut("outcome")
         .and_then(|outcome| outcome.get_mut("response"))
@@ -1310,6 +1319,7 @@ fn invocation_wire_result(
             "preview_bytes": &content[..preview_len],
             "total_bytes": content.len(),
             "truncated": true,
+            "delivery": delivery,
         }),
     );
     let resource = evidence
@@ -3558,12 +3568,16 @@ fn record_mcp_delivery(
         binding,
     );
     let preview = std::str::from_utf8(view.preview()).ok()?;
+    // I7.24 delivery disposition for this frame, observed from the recorded
+    // view's measured flag (never estimated; token-measured receipts still
+    // project only from a route attestation).
     Some(serde_json::json!({
         "uri": view.handle().uri().as_str(),
         "digest": view.handle().digest(),
         "preview": preview,
         "total_bytes": view.total_bytes(),
         "truncated": view.is_truncated(),
+        "delivery": BridgeRunner::observed_hot_delivery(&view),
     }))
 }
 

@@ -22,10 +22,10 @@
 //!               refuses before any wire traffic.
 //! ```
 //!
-//! Absence is explicit: no durable ledger means an empty restore (current
-//! behavior, not an error); an unserved URI is reported, not published.
-//! Store errors fail the whole call with the runner untouched: no partial
-//! restore ever lands.
+//! Absence publishes nothing: no durable ledger means an empty restore (current
+//! behavior, not an error); a URI the owner does not serve yields no report
+//! entry and publishes nothing. Store errors fail the whole call with the
+//! runner untouched: no partial restore ever lands.
 
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
 use eliot_contracts::{ResourceGeneration, StateFence};
@@ -103,8 +103,9 @@ fn live_state_fence(binding: &AttachBinding) -> Result<StateFence, BridgeError> 
 /// mailbox addresses (`eliot://session/<live-session>/attention|mailbox`,
 /// derived from the authenticated binding, never caller text) are always
 /// requested alongside the caller set so owner-held session snapshots flow
-/// through the existing publish path when served; absence stays an explicit
-/// `Unserved` report, never an invented snapshot.
+/// through the existing publish path when served; a URI the owner does not
+/// serve yields no report entry and publishes nothing — never an invented
+/// snapshot.
 ///
 /// Fence or session mismatch with the live binding refuses before any wire
 /// traffic. A refused reply echo discards the bytes. Store errors leave the
@@ -121,9 +122,10 @@ pub fn restore_reactive_runtime(
     // canonical attention/mailbox URIs (authenticated binding, validated
     // against the I7.18 grammar here). Foreign families still arrive only via
     // the caller-nominated set; served bytes still flow through
-    // `publish_canonical_resource` with digest binding, unserved stays
-    // `Unserved`. No content is invented: the URIs are requests, the bytes
-    // come from the owner or not at all.
+    // `publish_canonical_resource` with digest binding, while a URI the owner
+    // does not serve yields no report entry and publishes nothing. No content
+    // is invented: the URIs are requests, the bytes come from the owner or
+    // not at all.
     let mut requested: Vec<String> = Vec::with_capacity(uris.len().saturating_add(2));
     for candidate in [
         format!("eliot://session/{live_session}/attention"),
