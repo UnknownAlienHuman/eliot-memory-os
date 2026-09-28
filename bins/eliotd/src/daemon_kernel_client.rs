@@ -27,8 +27,7 @@ use eliot_protocol::{
     AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
-    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    MaintenanceTriggerPendingSummary, MessageType, ProtocolPayload, ProtocolVersion,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
@@ -2014,6 +2013,88 @@ impl DaemonKernelClient {
                 .transact_async_with_identity(operation, payload, identity)
                 .await
         })
+    }
+
+    /// Creates a fresh identity for one bounded trigger-page request.
+    ///
+    /// The caller retains this exact value while retrying the same page
+    /// request. A new continuation page receives a new identity because its
+    /// request payload differs.
+    #[cfg(windows)]
+    pub(super) fn new_maintenance_trigger_page_request_identity(
+        &self,
+    ) -> Result<RequestIdentity, KernelPortError> {
+        self.next_identity("maintenance_trigger_page")
+            .map_err(kernel_port_error)
+    }
+
+    /// Derives the same request identity for exact retries of one current
+    /// trigger revision in this authenticated daemon session.
+    ///
+    /// The Kernel uses the request ID as the delivery identity. Binding the
+    /// stable identity to this connection, fence, trigger, revision, and
+    /// applicability bound prevents an uncertain claim retry from creating a
+    /// competing delivery. A replacement daemon session gets a different
+    /// identity and must pass the Kernel's normal claim/revocation checks.
+    #[cfg(windows)]
+    pub(super) fn maintenance_trigger_claim_request_identity(
+        &self,
+        member: &MaintenanceTriggerPendingSummary,
+    ) -> Result<RequestIdentity, KernelPortError> {
+        member
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if member.applicable_until_unix_ms <= unix_ms() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger is no longer applicable for a claim".to_owned(),
+            ));
+        }
+
+        let state_fence = self.snapshot.state_fence();
+        let identity_material = serde_json::json!({
+            "operation": "maintenance_trigger_claim",
+            "connection_id": self.connection_id,
+            "state_fence": state_fence,
+            "trigger_id": member.trigger_id,
+            "revision": member.revision,
+            "applicable_until_unix_ms": member.applicable_until_unix_ms,
+        });
+        let canonical = canonical_json_bytes(&identity_material)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let digest = sha256_hex(&canonical);
+        let request_id =
+            RequestId::new(format!("{SERVICE_NAME}:maintenance_trigger_claim:{digest}"))
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let idempotency_key = format!("{SERVICE_NAME}:maintenance_trigger_claim:{digest}");
+        let metadata = RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new(SERVICE_NAME)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+            source_id: SourceId::new(SERVICE_NAME)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+            state_fence: state_fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: None,
+                known_time_ms: None,
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+        };
+        let identity = RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence,
+            },
+            idempotency_key,
+            deadline_unix_ms: member.applicable_until_unix_ms,
+            cancellation_id: format!("{SERVICE_NAME}:maintenance_trigger_claim:{digest}:cancel"),
+        };
+        identity
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(identity)
     }
 
     /// Executes one closed named read through the authenticated Kernel route.
