@@ -472,8 +472,11 @@ pub async fn emit_blocked_automation_notification(
     state_fence: StateFence,
     decision: &AutomationTriggerDecision,
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
-    let family_decision =
-        super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
+    let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
+    if family_entry.mode == eliot_maintenance::MaintenanceAutomationMode::Off {
+        return Ok(None);
+    }
+    let family_decision = family_entry.decide(decision);
     if decision.admits_job && family_decision.admits_start {
         return Ok(None);
     }
