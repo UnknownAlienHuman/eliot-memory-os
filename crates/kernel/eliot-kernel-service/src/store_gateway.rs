@@ -35,8 +35,9 @@ use eliot_store_api::{
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteSubmission,
+    WriteSubmissionState, admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    generated_operation_manifests, verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::{
@@ -700,12 +701,19 @@ impl KernelStoreGateway {
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err("transition caller is not the active daemon".to_owned());
         }
-        admit_prepared_transition(
+        let admission = admit_prepared_transition(
             context,
             &transition,
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
+        // I5.19: the unreserved `apply` route executes only a `staged` decision.
+        // The state is re-checked here rather than trusted, so an admission that
+        // later resolves an existing receipt refuses the write instead of
+        // creating a second canonical transition for one identity.
+        if admission.state != WriteSubmissionState::Staged {
+            return Err(admission.to_string());
+        }
 
         let lease = {
             let service = self
@@ -5490,39 +5498,66 @@ fn refuse_determinate_reserved_write(
 /// staged transition therefore survives daemon replacement only when the
 /// replacement Kernel explicitly supports its recorded contract digest and
 /// operation manifest.
+///
+/// The gate ORDER is load-bearing and unchanged: every gate below runs before
+/// any store send, and this is the *unreserved* admission point, so a refusal
+/// here has reserved no Ordering Scope sequence and issued no external effect.
+/// That is what lets the refusal be a typed I5.19 `not_accepted`
+/// `WriteSubmission` instead of an erased string: the decision is taken at the
+/// I5.6 steps 1-12 boundary, strictly before I5.6 step 13 stages anything in
+/// ORS. The reserved-write path is a different owner with a different act and
+/// deliberately does not come through here.
+///
+/// The accepted arm returns the `staged` decision, and this function has no
+/// existing-receipt lookup in front of it, so it can only ever return `staged`
+/// or refuse. [`KernelStoreGateway::apply`] still checks the state before
+/// executing, so a future admission that resolves an existing receipt refuses
+/// the write instead of creating a second canonical transition.
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<(), String> {
-    context.validate().map_err(|error| error.to_string())?;
-    transition.validate().map_err(|error| error.to_string())?;
-    if transition.state_fence != context.state_fence {
-        return Err("transition state fence does not match request metadata".to_owned());
+) -> Result<WriteSubmission, String> {
+    let gate: Result<(), StoreError> = (|| {
+        context.validate().map_err(StoreError::Foundation)?;
+        transition.validate()?;
+        if transition.state_fence != context.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        // RECHECK-63 slice B: recompute the canonical request hash from the
+        // exact values about to be executed (context + transition + expected
+        // heads) and reject divergence before any store work. The view is
+        // built from these references — not re-forwarded copies — so a
+        // mutation after admission fails here with the typed mismatch.
+        let view = CanonicalRequestView::from_apply(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        let entries = generated_operation_manifests()?;
+        transition.validate_against_catalogue(&entries)
+    })();
+    // The gate's own typed refusal is kept so the operational response can name
+    // both the typed `not_accepted` decision and the specific cause under it.
+    let gate_cause = gate.as_ref().err().map(ToString::to_string);
+    let submission = match admit_write_submission(transition, gate, None) {
+        Ok(submission) => submission,
+        // A request whose own identity is unnameable has no submission to
+        // report under, so the gate's own typed refusal is reported instead.
+        Err(unnameable) => {
+            return Err(gate_cause.unwrap_or_else(|| unnameable.to_string()));
+        }
+    };
+    if submission.state != WriteSubmissionState::Staged {
+        return Err(match gate_cause {
+            Some(cause) => format!("{submission}; cause: {cause}"),
+            None => submission.to_string(),
+        });
     }
-    // RECHECK-63 slice B: recompute the canonical request hash from the
-    // exact values about to be executed (context + transition + expected
-    // heads) and reject divergence before any store work. The view is
-    // built from these references — not re-forwarded copies — so a
-    // mutation after admission fails here with the typed mismatch.
-    let view = CanonicalRequestView::from_apply(
-        context,
-        transition,
-        expected_revision_heads,
-        expected_ordering_heads,
-    );
-    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
-        .map_err(|error| error.to_string())?;
-    let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
-    transition
-        .validate_against_catalogue(&entries)
-        .map_err(|error| {
-            format!(
-                "unsupported prepared transition; preserve as recovery, do not reinterpret: {error}"
-            )
-        })?;
-    Ok(())
+    Ok(submission)
 }
 
 /// Reserved-write admission gates shared by the gateway entry point.
@@ -5767,7 +5802,7 @@ mod tests {
         .unwrap_or_else(|_| unreachable!());
         let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
             Err(error) => error,
-            Ok(()) => unreachable!("unsupported manifest must fail"),
+            Ok(_) => unreachable!("unsupported manifest must fail"),
         };
         assert!(
             error.contains("recovery"),
