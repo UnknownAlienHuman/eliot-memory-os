@@ -302,6 +302,17 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             StoreRecoveryAction::RefreshStateFence,
             ctx,
         ),
+        // An observation of several workspace instances never reaches the guard
+        // comparison, so there is no guard report to carry: it is a
+        // deterministic rejection of an unauthenticated scope, never a retry and
+        // never a selection among the candidates.
+        CompositionError::ScopeObservationAmbiguous { .. } => map_composition_store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "SCOPE_OBSERVATION_AMBIGUOUS",
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        ),
         CompositionError::ScopeGuardWithheld {
             claimed_scope,
             observed_scope,

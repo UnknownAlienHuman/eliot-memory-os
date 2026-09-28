@@ -23,9 +23,8 @@ use crate::{
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, ToolRequest, ToolSchema,
     TypedRejection, bind_act_owner_inputs, bind_list_surface_budget, canonical_tool_schemas,
-    classify_tool_request, decode_protected_request_bytes, is_act_request,
-    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
-    validate_tool_request_owner,
+    classify_tool_request, decode_protected_request_bytes, published_mcp_tool_surface,
+    reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1132,9 +1131,11 @@ fn validate_application_request(
     request.tool.validate().map_err(contract_violation)?;
     let semantic_profile = validate_tool_semantic_owner(&request.tool)?;
     // I7.24 dispatch: join the live generated descriptor against the owner
-    // and carry the Kernel-verified task revisions into admission. Dispatch
-    // re-resolves live owners by method name on every call; no advertised
-    // disposition is trusted here, so hidden-by-name calls face the
+    // and carry only the canonical operation requirement into admission.
+    // Task identity/revision are structurally joined only for exact-task
+    // requirements; they do not prove current Governor selection.
+    // Dispatch re-resolves live owners by method name on every call; no
+    // advertised disposition is trusted here, so hidden-by-name calls face the
     // identical check. No grant owner is joined at this seam.
     let live_descriptor = canonical_tool_schemas()
         .map_err(|_| {
@@ -1212,65 +1213,104 @@ fn validate_tool_semantic_owner(
     })
 }
 
-/// Binds the Kernel-verified task identity and fence revision carried into
-/// dispatch admission. Pre-task discovery requests carry no task and bind
-/// `None` rather than an invented reference.
+/// Projects the canonical requirement into dispatch admission. Exact-task
+/// operations need both the request task identifier and its fence revision; the
+/// resulting reference is structural input, not proof of current Governor
+/// selection. The trusted Kernel port still receives the typed request and is
+/// responsible for resolving that owner.
 ///
-/// Issue #1742: an `eliot.act` request is not dispatched from its caller
-/// contributions alone. It takes the explicit
-/// [`bind_act_owner_inputs`](crate::bind_act_owner_inputs) path, which resolves
-/// the effect class from the single registered semantic owner, refuses a
-/// read-only downgrade of a material effect, and refuses an effectful action
-/// request whose retained fence carries no task/acceptance revision - the
-/// revision the applicable Decision Safety Floor and the phase-aware decision
-/// lineage must be bound to. The caller fields travel as non-evidence
-/// contributions, and every owner input still owed is named rather than
-/// fabricated here; the semantic owner resolves them downstream.
+/// Action requests also bind their owner inputs through the registered semantic
+/// profile. This preserves the refusal of read-only downgrades and missing
+/// acceptance revisions without treating caller contributions as owner
+/// evidence.
 fn dispatch_task_binding(
     request: &ApplicationRequest,
     semantic_profile: &crate::ToolSemanticProfile,
 ) -> Result<Option<String>, BridgeError> {
-    let fence = request.identity.request.state_fence.clone();
-    let task_id = request
-        .identity
-        .request
-        .metadata
-        .task_id
-        .as_ref()
-        .map(|id| id.as_str().to_owned());
-    if !is_act_request(&request.tool) {
-        return Ok(task_ref(&fence, task_id.as_deref()));
-    }
-    let ToolRequest::Act(input) = &request.tool else {
-        return Err(BridgeError::invalid(
-            "tool.name",
-            "only an eliot.act request carries an action input",
-        ));
-    };
     let requirement = classify_tool_request(&request.tool).map_err(|_| {
         BridgeError::invalid(
             "tool.name",
-            "eliot.act has no canonical operation requirement",
+            "request has no canonical operation requirement",
         )
     })?;
-    let binding = bind_act_owner_inputs(
-        input,
-        &requirement,
-        semantic_profile,
-        &fence,
-        task_id.as_deref(),
-    )?;
-    Ok(binding.owner_task_ref)
+    match (requirement.access_class, requirement.binding_evidence) {
+        (
+            crate::OperationAccessClass::TaskRelativeEffectful,
+            crate::RequiredBindingEvidence::ExactApplicableTask,
+        ) => {
+            let task_id = request
+                .identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(eliot_contracts::TaskId::as_str)
+                .ok_or_else(|| {
+                    BridgeError::invalid(
+                        "identity.request.metadata.task_id",
+                        "is required for an exact-task operation",
+                    )
+                })?;
+            let fence = &request.identity.request.state_fence;
+            if let ToolRequest::Act(input) = &request.tool {
+                let binding = bind_act_owner_inputs(
+                    input,
+                    &requirement,
+                    semantic_profile,
+                    fence,
+                    Some(task_id),
+                )?;
+                let task_ref = exact_task_ref(fence, Some(task_id))?;
+                if binding.owner_task_ref.as_deref() != Some(task_ref.as_str()) {
+                    return Err(BridgeError::invalid(
+                        "act.owner_task_ref",
+                        "must match the exact request task ID and State Fence revision",
+                    ));
+                }
+                Ok(binding.owner_task_ref)
+            } else {
+                Ok(Some(exact_task_ref(fence, Some(task_id))?))
+            }
+        }
+        (
+            crate::OperationAccessClass::AuthenticatedDiscoveryReadOnly,
+            crate::RequiredBindingEvidence::AuthenticatedSession
+            | crate::RequiredBindingEvidence::ExactAuthorizedJob,
+        )
+        | (
+            crate::OperationAccessClass::SafeRawCapture,
+            crate::RequiredBindingEvidence::CaptureIdentityPrivacyAndStaging,
+        ) => {
+            // Exact job references remain in their typed request for the
+            // trusted Kernel owner; they are not task references.
+            Ok(None)
+        }
+        _ => Err(BridgeError::invalid(
+            "tool.name",
+            "canonical operation has an unsupported access/evidence pairing",
+        )),
+    }
 }
 
-/// The exact task reference the dispatch gate is given for a non-action request.
-fn task_ref(fence: &eliot_contracts::StateFence, task_id: Option<&str>) -> Option<String> {
-    match (task_id, fence.task_revision) {
-        (Some(task), Some(revision)) => Some(format!("{task}@{}", revision.value())),
-        (Some(task), None) => Some(task.to_owned()),
-        (None, Some(revision)) => Some(format!("task-revision:{}", revision.value())),
-        (None, None) => None,
-    }
+/// Requires the only valid dispatch task-reference shape: exact task ID plus
+/// its exact fence revision. Partial and revision-only references are refused.
+fn exact_task_ref(
+    fence: &eliot_contracts::StateFence,
+    task_id: Option<&str>,
+) -> Result<String, BridgeError> {
+    let task_id = task_id.ok_or_else(|| {
+        BridgeError::invalid(
+            "identity.request.metadata.task_id",
+            "is required for an exact-task operation",
+        )
+    })?;
+    let revision = fence.task_revision.ok_or_else(|| {
+        BridgeError::invalid(
+            "identity.request.state_fence.task_revision",
+            "is required for an exact-task operation",
+        )
+    })?;
+    Ok(format!("{task_id}@{}", revision.value()))
 }
 
 fn validate_active_session_binding(
