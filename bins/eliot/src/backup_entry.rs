@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use eliot_backup::{
     BackupBundle, BackupCreateArgs, RestoreContext, RestoreEpochSpec, WrappedKeyManifest,
-    issue_backup, preview_backup_create, preview_restore, run_restore, verify_key_coverage,
+    issue_backup, preview_backup_create, preview_restore, run_restore,
+    verify_portable_key_material,
 };
 use eliot_cli::{CommandId, CommandRequest};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -373,7 +374,7 @@ fn run_key_coverage(bundle_json: &Path, key_manifest_json: &Path) -> Result<i32>
     manifest
         .validate()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    match verify_key_coverage(&bundle.blobs, &manifest) {
+    match verify_portable_key_material(&bundle, &manifest) {
         Ok(()) => {
             println!(
                 "{}",

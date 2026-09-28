@@ -29,7 +29,8 @@ use super::{
     RestoreAppliedEffect, RestoreContext, RestoreEffectReceipt, RestoreEvidence,
     RestoreHistoricalAuthority, RestoreIntent, RestoreJournalPort, RestoreJournalRecord,
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReconciliation, RestoreTarget,
-    WrappedKeyManifest, plan_isolated_restore, suspended_recovery_entries, verify_key_coverage,
+    WrappedKeyManifest, plan_isolated_restore, suspended_recovery_entries,
+    verify_portable_key_material,
 };
 
 /// Temp-file-backed restore journal (rehearsal grade).
@@ -739,11 +740,21 @@ pub struct RunnerOutcome {
 /// Executes one isolated restore with real bytes into `root`.
 ///
 /// Binds the portable key manifest when supplied (blob-carrying archives
-/// without coverage fail before any effect), plans the isolated restore
+/// without coverage fail before any effect, and a manifest minted for a
+/// different archive fails as a fence mismatch), plans the isolated restore
 /// (validating bundle, lineage advance, purge-first order, fresh lineage),
 /// then drives the governed journaled executor with a file-backed journal
 /// and a file-backed target. Re-running against the same root resumes from
 /// the durable journal instead of re-applying.
+///
+/// Sealed blob bytes cross into the isolated root byte-for-byte unchanged:
+/// `FileRestoreTarget::apply_phase` writes `blob.sealed_bytes` itself after
+/// re-deriving `blob.sealed_sha256` over those exact bytes, and nothing on
+/// this path unwraps a data key, decrypts an envelope, or re-encrypts under
+/// destination key ownership. Destination unwrap/re-seal is the
+/// BlobStore/secret-provider owner's step, driven by the per-blob restoration
+/// receipts, precisely because this runner proves key *material exists for
+/// this archive* rather than that the destination already owns the key.
 pub fn execute_isolated_restore(
     bundle: &BackupBundle,
     target: RestoreContext,
@@ -753,7 +764,7 @@ pub fn execute_isolated_restore(
     keys: Option<&WrappedKeyManifest>,
 ) -> Result<RunnerOutcome, BackupError> {
     match keys {
-        Some(manifest) => verify_key_coverage(&bundle.blobs, manifest)?,
+        Some(manifest) => verify_portable_key_material(bundle, manifest)?,
         None if !bundle.blobs.is_empty() => {
             return Err(BackupError::MissingRecoveryComponent("blob_key_material"));
         }
