@@ -462,11 +462,25 @@ function Invoke-RuntimeAllocate {
         [void](Resolve-RuntimeOwnedPath -RunRoot $runRoot -Path $full -ExpectedRunId $runId)
         $roots[$leaf] = $full
     }
-    $pipeNamespace = ($Script:RuntimePipePrefix + $runId.Substring(0, 8))
+    # Every MUTABLE identity below is derived from the FULL 128-bit run identity.
+    # The previous first-8-hex form mapped distinct run identities onto one pipe
+    # namespace, one job object and one session, which is the cross-run mutable
+    # sharing this operation exists to prevent. No hash, seed or counter replaces
+    # the discarded bits. The canonical prefixes are 12 and 10 characters, so a
+    # 32-hex run identity yields 44 and 42 characters and both 64-character shape
+    # guards below still hold without a second truncation.
+    #
+    # $nonce is deliberately NOT used for any of the three: it stays the path
+    # suffix and the allocation seed, where the full $runId already present in the
+    # same leaf keeps distinct runs distinct, and where a caller-supplied -Entropy
+    # value of up to 64 hex characters would otherwise push 'sess-' past the
+    # 64-character principal shape and fail as RUNTIME-INVALID-PRINCIPAL rather
+    # than the RUNTIME-INVALID-ENTROPY the bad entropy actually is.
+    $pipeNamespace = ($Script:RuntimePipePrefix + $runId)
     if ($pipeNamespace -cnotmatch '^[A-Za-z0-9_.-]{1,64}$') { throw [System.InvalidOperationException]::new('RUNTIME-ALLOCATION-MISMATCH: derived pipe namespace has an invalid shape.') }
-    $jobObjectName = ($Script:RuntimeJobObjectPrefix + $runId.Substring(0, 8))
+    $jobObjectName = ($Script:RuntimeJobObjectPrefix + $runId)
     if ($jobObjectName -cnotmatch '^[A-Za-z0-9_.-]{1,64}$') { throw [System.InvalidOperationException]::new('RUNTIME-ALLOCATION-MISMATCH: derived job-object identity has an invalid shape.') }
-    $sessionId = ('sess-' + $nonce)
+    $sessionId = ('sess-' + $runId)
     $principal = @{ principal = [string]$Binding['owner']; sessionId = $sessionId; scope = $Script:RuntimePrincipalScope }
     [void](Test-RuntimePrincipalShape -Principal $principal)
     $principalLane = 'shape-only'
