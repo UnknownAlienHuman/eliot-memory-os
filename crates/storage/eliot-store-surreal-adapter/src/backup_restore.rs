@@ -72,7 +72,7 @@
 //! obligation. Releasing the guard is never provider cancellation and never
 //! durable settlement.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
