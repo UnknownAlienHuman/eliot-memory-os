@@ -3764,7 +3764,7 @@ impl TestdStore {
             target_roots,
             None,
             priority,
-            JobSubmissionMetadata::verification(),
+            metadata,
             at_ms,
             None,
         )
