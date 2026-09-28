@@ -44,6 +44,18 @@
 //! projection of that record, never a second decision ledger (I06-11:7): no
 //! lineage is stamped without the verified link, and the link is believed
 //! only against the retained refusals.
+//!
+//! That holds across a restart because the journal is treated as untrusted
+//! input on the way back in, and because it is only treated as saved on the
+//! way out. [`PreStageIdentityCache::restore`] re-validates every restored
+//! refusal against the values actually recorded, through the same
+//! [`PreStageRejection::validate`] the live path uses, before any of it
+//! reaches the cache; a decoded snapshot is not validated state.
+//! [`PreStageIdentityCache::take_journal_snapshot`] hands the record to the
+//! daemon without clearing the obligation, and only
+//! [`PreStageIdentityCache::acknowledge_journal_save`] for the revision still
+//! pending discharges it, so a write that did not land leaves the retained
+//! refusal owed and visible rather than silently forgotten.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -263,15 +275,6 @@ pub struct VerifiedCorrectionLink {
     pub correction_rejection_id: String,
 }
 
-/// One refusal this gate kept, bound to the operation identity it refused.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct IssuedCorrection {
-    /// Operation identity this gate refused.
-    rejected_operation_id: String,
-    /// Stable rejection identity returned for it.
-    rejection_id: String,
-}
-
 /// In-memory pre-stage identity cache.
 ///
 /// Preserves exact same-hash retry identity and `IDENTITY_CONFLICT` without
@@ -292,16 +295,23 @@ struct IssuedCorrection {
 /// a [`PreStageIdentitySnapshot`] the daemon persists write-ahead of the
 /// commit a retained refusal authorizes, and merges it back with
 /// [`PreStageIdentityCache::restore`] after a restart, so a committed
-/// correction still replays its lineage. Merging is a union over
-/// deterministic records, so a concurrent retain can never be lost by a
-/// restore. The transport response stays a projection of this record, never
-/// a second decision ledger (I06-11:7).
+/// correction still replays its lineage. A snapshot is validated before it
+/// touches the cache, and merging is a conflict-preserving union, so a
+/// restore can neither manufacture a correction link nor drop a refusal a
+/// concurrent retain produced. The transport response stays a projection of
+/// this record, never a second decision ledger (I06-11:7).
 #[derive(Clone, Debug, Default)]
 pub struct PreStageIdentityCache {
     entries: BTreeMap<String, (String, PreStageRejection)>,
     refused_operations: BTreeSet<String>,
-    issued_corrections: BTreeMap<String, IssuedCorrection>,
-    journal_dirty: bool,
+    // The complete refusal, not just the two identity strings it derives: a
+    // restored correction link is only provable when the refusal behind it is
+    // still on record and re-validates through `PreStageRejection::validate`.
+    issued_corrections: BTreeMap<String, PreStageRejection>,
+    /// The newest complete record whose exact save is not yet acknowledged.
+    pending_journal: Option<PreStageIdentitySnapshot>,
+    /// Monotonic revision; every retain advances it by one.
+    journal_revision: u64,
 }
 
 /// Durable snapshot of the pre-stage identity cache (issue #1796, I6.8).
@@ -309,15 +319,21 @@ pub struct PreStageIdentityCache {
 /// The Kernel-owned durable pre-stage journal: the daemon persists this
 /// write-ahead of the commit a retained refusal authorizes and restores it
 /// after a restart, so correction lineage survives the process without a
-/// store-protocol or receipt-format change. Every record in it is a pure
-/// function of the refusal it was retained for, so merging a snapshot is
-/// idempotent.
+/// store-protocol or receipt-format change. Every refusal in it is a pure
+/// function of the request it refused, so merging the same snapshot twice is
+/// idempotent, and `revision` names which publication of the record this is.
+///
+/// `Deserialize` decodes a wire copy; it does not make the decoded copy
+/// validated state. The only way into a live cache is
+/// [`PreStageIdentityCache::restore`], which re-checks every recorded refusal
+/// against the original values before any of it is used.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreStageIdentitySnapshot {
+    revision: u64,
     entries: BTreeMap<String, (String, PreStageRejection)>,
     refused_operations: BTreeSet<String>,
-    issued_corrections: BTreeMap<String, IssuedCorrection>,
+    issued_corrections: BTreeMap<String, PreStageRejection>,
 }
 
 impl PreStageIdentityCache {
@@ -333,41 +349,164 @@ impl PreStageIdentityCache {
             && self.issued_corrections.is_empty()
     }
 
-    /// Exports the durable journal snapshot of every retained refusal.
+    /// Exports the complete durable journal record this cache holds, stamped
+    /// with the revision that record was retained at.
     #[must_use]
     pub fn snapshot(&self) -> PreStageIdentitySnapshot {
         PreStageIdentitySnapshot {
+            revision: self.journal_revision,
             entries: self.entries.clone(),
             refused_operations: self.refused_operations.clone(),
             issued_corrections: self.issued_corrections.clone(),
         }
     }
 
-    /// Merges one durable journal snapshot into this cache.
+    /// Validates one durable journal snapshot and merges it into this cache.
     ///
-    /// Union over deterministic records: re-merging the same snapshot is
-    /// idempotent, and a retain that landed after the snapshot was read is
-    /// never lost. Merging never marks the journal dirty, so a bare restore
-    /// schedules no write-back.
-    pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) {
-        self.entries.extend(snapshot.entries);
-        self.refused_operations.extend(snapshot.refused_operations);
-        self.issued_corrections.extend(snapshot.issued_corrections);
+    /// A deserialized snapshot is untrusted input, so every refusal it carries
+    /// is re-checked here against the ORIGINAL RECORDED VALUES through the
+    /// same [`PreStageRejection::validate`] the live path uses, together with
+    /// the cross-record invariants that validator cannot see: a retained entry
+    /// must be keyed and hashed by the refusal it holds, and every retained
+    /// refusal and issued correction must name an operation identity this gate
+    /// refused. Nothing in the snapshot is used or converted before the whole
+    /// of it passes, so an inconsistent snapshot is rejected without a partial
+    /// mutation and can never produce a [`VerifiedCorrectionLink`] that no
+    /// retained refusal supports: `validate` binds each refusal's
+    /// `corrected_operation_id` to `derive_corrected_operation_id`, and the
+    /// map key must be exactly that identity.
+    ///
+    /// The merge is a conflict-preserving union, not an overwrite: a
+    /// contradictory record for a key this cache already holds rejects the
+    /// whole snapshot, while an identical replay is idempotent and a
+    /// disjoint one is added. Merging never schedules a write-back, and the
+    /// durable state it just read discharges no local obligation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreStageGateError`] when a recorded refusal fails validation,
+    /// when a cross-record invariant does not hold, or when a key this cache
+    /// already holds would be replaced by a different record.
+    pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
+        Self::validate_snapshot(&snapshot)?;
+        for (key, record) in &snapshot.entries {
+            if let Some(held) = self.entries.get(key) && held != record {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.entries",
+                    reason: "a retained idempotency key already holds a different rejection",
+                });
+            }
+        }
+        for (key, record) in &snapshot.issued_corrections {
+            if let Some(held) = self.issued_corrections.get(key) && held != record {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.issued_corrections",
+                    reason: "a retained corrected identity already holds a different refusal",
+                });
+            }
+        }
+        let restored_revision = snapshot.revision;
+        for (key, record) in snapshot.entries {
+            self.entries.entry(key).or_insert(record);
+        }
+        for key in snapshot.refused_operations {
+            self.refused_operations.insert(key);
+        }
+        for (key, record) in snapshot.issued_corrections {
+            self.issued_corrections.entry(key).or_insert(record);
+        }
+        // A restored record keeps publishing under a revision above the one it
+        // was read at, so a save that is still in flight can never be mistaken
+        // for the newest publication after a restart.
+        self.journal_revision = self.journal_revision.max(restored_revision);
+        Ok(())
     }
 
-    /// Takes the durable journal snapshot when a retain landed since the
-    /// last take, and clears the mark.
+    /// Re-checks a whole snapshot against the original recorded values before
+    /// any of it reaches the cache.
+    fn validate_snapshot(snapshot: &PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
+        for (key, (stored_hash, rejection)) in &snapshot.entries {
+            rejection.validate()?;
+            if key != &rejection.idempotency_key || stored_hash != &rejection.canonical_request_hash {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.entries",
+                    reason: "a retained entry must be keyed and hashed by the recorded rejection",
+                });
+            }
+            if !snapshot
+                .refused_operations
+                .contains(&rejection.proposed_operation_id)
+            {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.refused_operations",
+                    reason: "a retained rejection must name an operation identity this gate refused",
+                });
+            }
+        }
+        for (corrected_operation_id, rejection) in &snapshot.issued_corrections {
+            rejection.validate()?;
+            if corrected_operation_id != &rejection.corrected_operation_id {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.issued_corrections",
+                    reason: "a retained correction must be keyed by the identity that refusal issued",
+                });
+            }
+            if !snapshot
+                .refused_operations
+                .contains(&rejection.proposed_operation_id)
+            {
+                return Err(PreStageGateError::InvalidField {
+                    field: "snapshot.refused_operations",
+                    reason: "an issued correction must name an operation identity this gate refused",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the durable journal snapshot whose exact save is still owed.
     ///
-    /// The daemon persists the returned snapshot write-ahead of the commit
-    /// the retain authorizes; `None` means nothing changed and no write is
-    /// owed.
+    /// The daemon persists the returned snapshot write-ahead of the commit the
+    /// retain authorizes and reports the outcome through
+    /// [`PreStageIdentityCache::acknowledge_journal_save`]. Taking a snapshot
+    /// is not a persistence acknowledgement and does not clear the
+    /// obligation: an unacknowledged save stays pending and is offered again,
+    /// so a retained refusal can never be forgotten because a file write did
+    /// not land, and an exact retry of a cached rejection republishes it
+    /// instead of returning before anything is owed. `None` means nothing was
+    /// ever retained, so no write is owed. The hand-off takes `&mut self` so
+    /// publication is serialized against concurrent retains under the
+    /// caller's own lock.
     #[must_use]
     pub fn take_journal_snapshot(&mut self) -> Option<PreStageIdentitySnapshot> {
-        if self.journal_dirty {
-            self.journal_dirty = false;
-            Some(self.snapshot())
-        } else {
-            None
+        self.pending_journal.clone()
+    }
+
+    /// Acknowledges the exact durable save of `revision`.
+    ///
+    /// A failed save is never acknowledged, so the retained refusal stays
+    /// owed and visible. Only the save whose revision is still pending
+    /// discharges the obligation: an acknowledgement for an older revision
+    /// cannot retire a newer record a retain produced after that save began.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreStageGateError`] when nothing is pending, or when
+    /// `revision` is not the revision that is still pending.
+    pub fn acknowledge_journal_save(&mut self, revision: u64) -> Result<(), PreStageGateError> {
+        match &self.pending_journal {
+            None => Err(PreStageGateError::InvalidField {
+                field: "cache.pending_journal",
+                reason: "no durable journal save is pending",
+            }),
+            Some(pending) if pending.revision == revision => {
+                self.pending_journal = None;
+                Ok(())
+            }
+            Some(_) => Err(PreStageGateError::InvalidField {
+                field: "cache.pending_journal",
+                reason: "an acknowledgement must name the revision that is still pending",
+            }),
         }
     }
 }
@@ -409,6 +548,12 @@ impl PreStageIdentityCache {
     /// obeying that rejection's own `next_allowed_action` would commit with no
     /// lineage. I6.8 requires that `corrected_from_operation_id` preserves
     /// lineage, and it states no first-refusal-only exception.
+    ///
+    /// The whole refusal is retained, not only the identities it derives, so
+    /// a restored snapshot can re-validate the link through
+    /// [`PreStageRejection::validate`] instead of recomputing one over a copy
+    /// of itself. A changed-bytes conflict refusal is retained here too, and
+    /// it is the only record of that conflict's corrected identity.
     fn retain_refused_operation(
         &mut self,
         proposed_operation_id: &str,
@@ -418,33 +563,37 @@ impl PreStageIdentityCache {
             .insert(proposed_operation_id.to_owned());
         self.issued_corrections.insert(
             rejection.corrected_operation_id.clone(),
-            IssuedCorrection {
-                rejected_operation_id: proposed_operation_id.to_owned(),
-                rejection_id: rejection.rejection_id.clone(),
-            },
+            rejection.clone(),
         );
-        // Every retain lands in the durable journal: the daemon persists the
-        // snapshot write-ahead of the commit this refusal authorizes, so the
-        // lineage survives a restart (issue #1796 F1).
-        self.journal_dirty = true;
+        // Every retain is owed to the durable journal until its exact save is
+        // acknowledged: the daemon persists the snapshot write-ahead of the
+        // commit this refusal authorizes, so the lineage survives a restart
+        // (issue #1796 F1). A retain that lands after a snapshot was handed
+        // out replaces the pending one with a strictly newer revision, so
+        // that older save can no longer discharge the newer obligation.
+        self.journal_revision += 1;
+        self.pending_journal = Some(self.snapshot());
     }
 
     /// Verifies a presented operation identity against this cache's own record.
     ///
     /// Returns the verified link only when the presented identity is exactly
-    /// a corrected identity a retained refusal issued. A fresh unrelated
-    /// operation yields `None`: it is an ordinary new write, and stamping it
-    /// with lineage would stamp unproven lineage.
+    /// a corrected identity a retained refusal issued. Both halves of the link
+    /// are read off that one refusal, whose own `validate` bound its
+    /// `corrected_operation_id` to the shared derivation, and which
+    /// [`PreStageIdentityCache::restore`] re-validated before admitting it. A
+    /// fresh unrelated operation yields `None`: it is an ordinary new write,
+    /// and stamping it with lineage would stamp unproven lineage.
     fn verified_correction_for(
         &self,
         presented_operation_id: &str,
     ) -> Option<VerifiedCorrectionLink> {
         self.issued_corrections
             .get(presented_operation_id)
-            .map(|issued| VerifiedCorrectionLink {
+            .map(|rejection| VerifiedCorrectionLink {
                 corrected_operation_id: presented_operation_id.to_owned(),
-                corrected_from_operation_id: issued.rejected_operation_id.clone(),
-                correction_rejection_id: issued.rejection_id.clone(),
+                corrected_from_operation_id: rejection.proposed_operation_id.clone(),
+                correction_rejection_id: rejection.rejection_id.clone(),
             })
     }
 }
