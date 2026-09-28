@@ -363,12 +363,18 @@ impl AuditEventKind {
     pub const QUEUE_LOCAL_READ_ENQUEUED: &'static str = "queue.local_read_enqueued";
     /// One invoke-read routed to its daemon-claimable lane.
     pub const ROUTE_INVOKE_READ_ROUTED: &'static str = "route.invoke_read_routed";
+    /// A requested route diverged from the actual serving lane and the work
+    /// was rejected without queueing or binding (issue #1839).
+    pub const ROUTE_MISMATCH: &'static str = "route.mismatch";
     /// First governed claim minted a fencing lease for one pair.
     pub const LEASE_CLAIM_CREATED: &'static str = "lease.claim_created";
     /// Same-owner re-claim returned the identical current capability.
     pub const LEASE_CLAIM_RECONFIRMED: &'static str = "lease.claim_reconfirmed";
     /// A new owner reassigned the fencing lease (generation bump).
     pub const LEASE_CLAIM_REASSIGNED: &'static str = "lease.claim_reassigned";
+    /// A claimed pair's absolute deadline passed before completion; the dead
+    /// pair was retired instead of lingering as a stranded claim (issue #1839).
+    pub const LEASE_CLAIM_EXPIRED: &'static str = "lease.claim_expired";
     /// A supervision lease was established for the daemon contour.
     pub const LEASE_SUPERVISION_ESTABLISHED: &'static str = "lease.supervision_established";
     /// A supervision lease was renewed for the daemon contour.
@@ -396,12 +402,18 @@ impl AuditEventKind {
     pub const TRACE_MANIFEST_SEALED: &'static str = "trace.manifest_sealed";
     /// A stale submission was quarantined without binding.
     pub const RESULT_STALE_QUARANTINED: &'static str = "result.stale_quarantined";
+    /// A claimed observe pair deferred to `DeferredNoEffect` and retired its
+    /// queue pair (issue #1839).
+    pub const DEFER_CLAIM_DEFERRED: &'static str = "defer.claim_deferred";
     /// A canonical admission receipt was issued.
     pub const RECEIPT_ADMISSION_ISSUED: &'static str = "receipt.admission_issued";
     /// The durable eliotd live receipt was published.
     pub const RECEIPT_LIVE_PUBLISHED: &'static str = "receipt.live_published";
     /// A typed cancellation was requested for its exact parent.
     pub const CANCEL_REQUESTED: &'static str = "cancel.requested";
+    /// A cancellation reached its exact parent: cancelled, fenced to
+    /// `Unknown` past the cancellable window, or already terminal (issue #1839).
+    pub const CANCEL_CONFIRMED: &'static str = "cancel.confirmed";
     /// A queued pair was retired (orphan cleanup).
     pub const ORPHAN_QUEUE_RETIRED: &'static str = "orphan.queue_retired";
     /// A lost connection's operations were fenced (orphan cleanup).
@@ -431,9 +443,11 @@ impl AuditEventKind {
         Self::QUEUE_ENVELOPE_ADMITTED,
         Self::QUEUE_LOCAL_READ_ENQUEUED,
         Self::ROUTE_INVOKE_READ_ROUTED,
+        Self::ROUTE_MISMATCH,
         Self::LEASE_CLAIM_CREATED,
         Self::LEASE_CLAIM_RECONFIRMED,
         Self::LEASE_CLAIM_REASSIGNED,
+        Self::LEASE_CLAIM_EXPIRED,
         Self::LEASE_SUPERVISION_ESTABLISHED,
         Self::LEASE_SUPERVISION_RENEWED,
         Self::LEASE_SUPERVISION_REVOKED,
@@ -447,9 +461,11 @@ impl AuditEventKind {
         Self::RESULT_KERNEL_BOUND,
         Self::TRACE_MANIFEST_SEALED,
         Self::RESULT_STALE_QUARANTINED,
+        Self::DEFER_CLAIM_DEFERRED,
         Self::RECEIPT_ADMISSION_ISSUED,
         Self::RECEIPT_LIVE_PUBLISHED,
         Self::CANCEL_REQUESTED,
+        Self::CANCEL_CONFIRMED,
         Self::ORPHAN_QUEUE_RETIRED,
         Self::ORPHAN_CONNECTION_FENCED,
         Self::PROCESS_LAUNCH_COMMITTED,
@@ -485,6 +501,7 @@ impl AuditEventKind {
             | Self::TRACE_MANIFEST_SEALED
             | Self::RECEIPT_LIVE_PUBLISHED
             | Self::CANCEL_REQUESTED
+            | Self::CANCEL_CONFIRMED
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
             | Self::SHUTDOWN_DRAIN_REQUESTED
@@ -959,6 +976,55 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns the route-mismatch draft for one invoke-read that matched no
+    /// daemon-claimable lane (issue #1839).
+    ///
+    /// The requested capability is preserved in lineage
+    /// (`route_receipt_requested`) and body; no actual lane exists because the
+    /// work was rejected before queueing.
+    #[must_use]
+    pub fn route_mismatch_routing(envelope: &HostRequestEnvelope, reason: &'static str) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::ROUTE_MISMATCH,
+            lineage,
+            body: serde_json::json!({
+                "requested_route": envelope.identity.capability,
+                "actual_lane": serde_json::Value::Null,
+                "disposition": "rejected_not_queued",
+                "reason": reason,
+            }),
+        }
+    }
+
+    /// Returns the route-mismatch draft for one submit refused because the
+    /// stored capability diverged from the serving lane (issue #1839).
+    ///
+    /// Observation only: the refusal itself is unchanged
+    /// ([`TransportError::SessionFenced`](eliot_ipc::TransportError::SessionFenced));
+    /// the record names the requested versus actual route so the rejection is
+    /// diagnosable instead of silent.
+    #[must_use]
+    pub fn route_mismatch_submit(
+        session: &Session,
+        stored: &HostRequestRecord,
+        lane: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(stored);
+        lineage.fill_daemon_leg(session);
+        Self {
+            kind: AuditEventKind::ROUTE_MISMATCH,
+            lineage,
+            body: serde_json::json!({
+                "requested_route": stored.capability_ref.as_str(),
+                "actual_lane": lane,
+                "disposition": "rejected_submit_refused",
+            }),
+        }
+    }
+
     /// Returns the fencing-lease claim draft, classified by claim history.
     #[must_use]
     pub fn lease_claim(
@@ -990,6 +1056,54 @@ impl AuditEventDraft {
                 "owner_session_epoch": session.session_epoch,
                 "expires_at_unix_ms": attempt.expires_at_unix_ms,
                 "use_budget": attempt.use_budget,
+            }),
+        }
+    }
+
+    /// Returns the claimed-lease-expiry draft for one deadline-passed pair
+    /// (issue #1839).
+    ///
+    /// `phase` names the route leg that detected the expiry (`admission`,
+    /// `submit`, or `defer`); `queue_retired` reports whether the dead pair
+    /// was actually removed, so the expiry record stays joined to its
+    /// observable cleanup instead of implying removal that never happened.
+    /// The presented attempt identity is carried when the leg presented one;
+    /// admission-time staging presents none.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the expiry observation joins session, record, lane, phase, presented attempt, and cleanup outcome in one audited call"
+    )]
+    pub fn lease_claim_expired(
+        session: Option<&Session>,
+        stored: &HostRequestRecord,
+        lane: &'static str,
+        phase: &'static str,
+        presented_attempt_id: Option<&str>,
+        presented_generation: Option<u64>,
+        queue_retired: bool,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(stored);
+        if let Some(session) = session {
+            lineage.fill_daemon_leg(session);
+        }
+        if let Some(attempt_id) = presented_attempt_id {
+            lineage.attempt_id = Some(attempt_id.to_owned());
+            lineage.environment_lease = Some(attempt_id.to_owned());
+        }
+        Self {
+            kind: AuditEventKind::LEASE_CLAIM_EXPIRED,
+            lineage,
+            body: serde_json::json!({
+                "lane": lane,
+                "phase": phase,
+                "request_digest": stored.request_digest,
+                "deadline_unix_ms": stored.deadline_unix_ms,
+                "presented_attempt_id": presented_attempt_id,
+                "presented_generation": presented_generation,
+                "queue_retired": queue_retired,
+                "durable_state": format!("{:?}", stored.state),
             }),
         }
     }
@@ -1171,6 +1285,35 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns the claim-deferred draft for one observe deferral (issue #1839).
+    ///
+    /// The durable `DeferredNoEffect` persist precedes the observation; the
+    /// queue pair retires on the same leg, so `queue_retired` is always true
+    /// here and pairs the deferral with its cleanup.
+    #[must_use]
+    pub fn observe_claim_deferred(
+        session: &Session,
+        attempt: &LocalReadAttempt,
+        routed: &HostRequestRecord,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(routed);
+        lineage.fill_daemon_leg(session);
+        lineage.fill_attempt(attempt);
+        Self {
+            kind: AuditEventKind::DEFER_CLAIM_DEFERRED,
+            lineage,
+            body: serde_json::json!({
+                "lane": "observe",
+                "attempt_id": attempt.attempt_id,
+                "fencing_generation": attempt.fencing_generation,
+                "attempt_phase": "deferred_no_effect",
+                "queue_retired": true,
+                "durable_state": format!("{:?}", routed.state),
+            }),
+        }
+    }
+
     /// Returns the cancellation-requested draft for one exact parent.
     #[must_use]
     pub fn cancel_requested(envelope: &HostRequestEnvelope, admitted: &HostRequestRecord) -> Self {
@@ -1183,6 +1326,35 @@ impl AuditEventDraft {
                 "parent_operation_id": envelope.identity.parent_operation_id,
                 "cancellation_id": envelope.identity.cancellation_id,
                 "durable_state": format!("{:?}", admitted.state),
+            }),
+        }
+    }
+
+    /// Returns the cancellation-confirmed draft for one exact parent
+    /// (issue #1839).
+    ///
+    /// `outcome` is `cancelled` when the parent transitioned, `fenced_unknown`
+    /// when the parent had passed the cancellable window, or
+    /// `already_terminal` when no transition was needed. The durable ORS
+    /// transition precedes the observation; the record never claims a
+    /// cancellation the store refused.
+    #[must_use]
+    pub fn cancel_confirmed(
+        envelope: &HostRequestEnvelope,
+        parent_operation_id: &str,
+        parent_digest: &str,
+        outcome: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::CANCEL_CONFIRMED,
+            lineage,
+            body: serde_json::json!({
+                "parent_operation_id": parent_operation_id,
+                "parent_digest": parent_digest,
+                "cancellation_id": envelope.identity.cancellation_id,
+                "outcome": outcome,
             }),
         }
     }
