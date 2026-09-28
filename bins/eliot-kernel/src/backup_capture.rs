@@ -652,7 +652,6 @@ impl KernelBackupCapture {
             archive_sha256: identities.archive_sha256.clone(),
             operation_id: operation_id.clone(),
             idempotency_key,
-            durability_note: "owner-durable".to_owned(),
         };
         if receipt.operation_id != archive.operation_id
             || receipt.archive_sha256 != archive.archive_sha256
@@ -1811,6 +1810,18 @@ fn check_budgets(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
 /// class, source, and schema come from the frozen plan, and every evidence
 /// section crosses byte-identical. The purge revision binds the carried
 /// ledger: zero with an empty ledger, the entry count otherwise.
+///
+/// ASSUMPTION (purge-ledger revision). I5.13:44 requires the manifest to bind
+/// the "purge-ledger revision", and `eliot-backup` leaves that value to the
+/// producer: it only refuses a nonzero revision with no ledger and a zero
+/// revision with a non-empty one (`BackupBundle::validate`, "the purge revision
+/// binds the purge ledger carried here"). No accepted owner-neutral purge API
+/// reachable from this owner publishes a ledger-wide revision — the closest
+/// thing, Host's `BackupConfigProjection::purge_ledger_revision`, lives in
+/// `bins/eliot-host`, which this composition root may not depend on. The
+/// carried entry count is therefore used as the binding over the ledger this
+/// owner actually validated, and it is stated here rather than presented as the
+/// purge owner's own declared revision.
 fn assemble_input(request: &CaptureRequest) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),

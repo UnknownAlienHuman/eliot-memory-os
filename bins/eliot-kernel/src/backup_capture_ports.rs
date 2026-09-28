@@ -609,7 +609,13 @@ pub fn owner_fence_dispositions(
 }
 
 /// One immutable verified archive bound to its single publication operation:
-/// archive digest, operation identity, idempotency key, and durability note.
+/// archive digest, operation identity, and idempotency key.
+///
+/// There is deliberately no durability field here. Durability is evidence the
+/// OWNER issues — it is [`PublicationReceipt::durable`] — and a note this owner
+/// wrote about its own publication would be a self-attested flag, not proof.
+/// The coordinator compares the owner's receipt against these three identities
+/// and nothing else.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedArchive {
     /// Archive backup identity bound at build.
@@ -620,8 +626,6 @@ pub struct PublishedArchive {
     pub operation_id: String,
     /// Idempotency key binding backup identity and archive digest.
     pub idempotency_key: String,
-    /// Owner durability note accompanying the receipt.
-    pub durability_note: String,
 }
 
 /// Durable receipt for one publication operation.
