@@ -945,7 +945,7 @@ fn join_scanned_delivery(
         match parsed {
             Some(ack) if validate_control_ack(&ack, delivery).is_ok() => {
                 let (advanced, advanced_reason) =
-                    advance_disposition(disposition, reason, &ack, sidecar_valid);
+                    advance_disposition(disposition, reason.clone(), &ack, sidecar_valid);
                 if advanced != disposition || advanced_reason != reason {
                     disposition = advanced;
                     reason = advanced_reason;
