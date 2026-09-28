@@ -1105,6 +1105,7 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
             | StoreError::InvalidOutbox
             | StoreError::InvalidReceipt
             | StoreError::TransitionDigestMismatch { .. }
+            | StoreError::StaleDisposition { .. }
             | StoreError::ReceiptNotFound
             | StoreError::AutomationContinuation(_)
             | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
