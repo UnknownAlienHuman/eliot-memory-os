@@ -75,8 +75,9 @@ use eliot_process_executor::{
     },
 };
 use eliot_verifier::{
-    AxisVerdicts, CanaryRecord, ComparisonAxis, EvidenceDigest, GenerationReceipt,
-    OracleResolution, OuterGuardianRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
+    AxisVerdicts, CanaryRecord, ComparisonAxis, DocumentationEvidenceRecord, EvidenceDigest,
+    FrozenOuterPin, FrozenOuterScript, GenerationReceipt, OracleResolution, OuterGuardianRecord,
+    PackageDocument, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
     ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence, VerificationDecision,
     verdict_with_bootstrap,
 };
@@ -90,6 +91,11 @@ const EXIT_CUTOVER: i32 = 0;
 const EXIT_REFUSED: i32 = 1;
 /// Exit code for a committed launch whose terminal state needs reconciliation.
 const EXIT_RECONCILE_REQUIRED: i32 = 4;
+
+/// The exit code the frozen outer `DocumentationEvidenceCheck` uses for an
+/// accepted package, read from `scripts/documentation_evidence_check.py`
+/// `_cmd_verify` (`0 if report.accepted else 1`).
+const DOC_EVIDENCE_ACCEPT_EXIT_CODE: i32 = 0;
 
 /// Validation revision pinned into every stored dispatch validation context.
 ///
@@ -154,6 +160,13 @@ struct BootstrapEvidence {
     /// `ExecutorOuterGuardian` arm below requires it, so an executor-surface
     /// change can never reach cutover without a real scenario run.
     outer_guardian_scenario: Option<GuardianScenarioRecord>,
+    /// The frozen outer script/generation this entry re-reads from the machine
+    /// before a documentation/audit-tooling change is admitted. The typed
+    /// `DocumentationEvidence` arm below requires it, so a
+    /// documentation-surface change can never reach cutover on a
+    /// bundle-supplied script identity: the pin and the script bytes are read
+    /// from this machine and the recorded digests are re-derived from them.
+    documentation_freeze: Option<DocumentationFreezeRecord>,
     /// The unchanged external discriminator, run for real on this machine by
     /// the last-known-good pass and the canary.
     discriminator: DiscriminatorCommand,
@@ -202,6 +215,28 @@ struct GuardianScenarioRecord {
     evidence: String,
     /// The expected evidence digest the recomputed value must equal.
     expected_evidence: EvidenceDigest,
+}
+
+/// The frozen outer script/generation a documentation/audit-tooling change is
+/// checked from.
+///
+/// The pin file and the script are both absolute paths read from this machine.
+/// Nothing about the freeze is taken from the bundle beyond the pointer: the
+/// generation and the script digest come out of the pin file this process
+/// reads, and the script bytes come out of the script file this process reads,
+/// so `DocumentationEvidenceRecord` is built over machine-observed bytes.
+struct DocumentationFreezeRecord {
+    /// Absolute path of the frozen pin file recording generation and digest.
+    pin: PathBuf,
+    /// Absolute path of the frozen outer script the pin names.
+    script: PathBuf,
+    /// Absolute path of the interpreter the frozen outer script runs under.
+    interpreter: PathBuf,
+    /// Absolute workspace root the packaged documents are compared against,
+    /// or `None` when the run checks the package alone.
+    workspace: Option<PathBuf>,
+    /// Absolute path of the evidence package whose bytes were packaged.
+    package: PathBuf,
 }
 
 /// One real child process the bootstrap genuinely runs on this machine.
@@ -385,7 +420,7 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
     // `ProcessExecutor` change really runs the outer Host/OS guardian scenario
     // and every other case really runs its own mechanic. The typed
     // `SpecialCaseEvidence` shape makes a fabricated variant unrepresentable.
-    if let Some((case, digest)) = dispatch_special_case(&evidence)? {
+    if let Some((case, digest)) = dispatch_special_case(&evidence, &admission)? {
         bootstrap.record_special_case(case, digest)?;
     }
 
@@ -828,6 +863,7 @@ fn streams(pass: &DiscriminatorPass) -> impl Iterator<Item = &ProcessStreamEvide
 /// evidence variant can only be admitted for the case that guards it.
 fn dispatch_special_case(
     evidence: &BootstrapEvidence,
+    admission: &HarnessAdmission,
 ) -> Result<Option<(SpecialCase, EvidenceDigest)>, CliError> {
     match (
         evidence.surface.special_case(),
@@ -837,12 +873,19 @@ fn dispatch_special_case(
             // The `ProcessExecutor` arm additionally re-runs the machine-side
             // outer guardian scenario here, so the cleanup fact the typed
             // `OuterGuardianRecord` carries is one this process observed from
-            // the machine rather than a claim read back from the bundle.
+            // the machine rather than a claim read back from the bundle. The
+            // documentation/audit-tooling arm does the same for the frozen
+            // outer script: it launches the frozen check for real and rebuilds
+            // the typed record over bytes read from this machine.
             let record = match (case, &record) {
                 (
                     SpecialCase::ExecutorOuterGuardian,
                     SpecialCaseEvidence::ExecutorOuterGuardian(record),
                 ) => observe_outer_guardian(evidence, record)?,
+                (
+                    SpecialCase::DocumentationEvidence,
+                    SpecialCaseEvidence::DocumentationEvidence(record),
+                ) => observe_documentation_evidence(evidence, record, admission)?,
                 (_, record) => record.clone(),
             };
             case.verify(&record)?;
@@ -904,6 +947,182 @@ fn observe_outer_guardian(
     ))
 }
 
+/// Reads the frozen outer pin and the frozen outer script from this machine.
+///
+/// The pin is the recorded generation plus the recorded digest of the frozen
+/// script; the script is the exact bytes the outer `DocumentationEvidenceCheck`
+/// executes from. Both are read from disk here, so the freeze is an observation
+/// and not a bundle string: a bundle that names a different script, or a pin
+/// whose generation or digest does not match the script it names, fails closed
+/// below before the typed record is even built.
+fn read_frozen_outer(
+    freeze: &DocumentationFreezeRecord,
+) -> Result<(FrozenOuterPin, Vec<u8>), CliError> {
+    let pin_bytes = std::fs::read(&freeze.pin).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen pin {} is unavailable: {error}",
+            freeze.pin.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&pin_bytes).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen pin {} is not canonical: {error}",
+            freeze.pin.display()
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::Contract(format!(
+            "frozen pin {} is not a JSON object",
+            freeze.pin.display()
+        ))
+    })?;
+    let pin = FrozenOuterPin {
+        generation: text(object, "generation")?,
+        script: text(object, "script")?,
+        script_sha256: field(object, "script_sha256")?,
+    };
+    let script_bytes = std::fs::read(&freeze.script).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen outer script {} is unavailable: {error}",
+            freeze.script.display()
+        ))
+    })?;
+    if sha256_hex(&script_bytes) != pin.script_sha256.as_str() {
+        return Err(CliError::Contract(format!(
+            "frozen outer script {} does not match the digest the pin records for generation {}",
+            freeze.script.display(),
+            pin.generation
+        )));
+    }
+    Ok((pin, script_bytes))
+}
+
+/// Re-reads the documentation evidence package from this machine.
+///
+/// The package and every live workspace file are read from disk here, so both
+/// byte sides of the re-extraction comparison are machine-observed rather than
+/// asserted by the bundle. The re-extracted package bytes are the archive
+/// members the frozen package really holds.
+fn read_package_documents(
+    freeze: &DocumentationFreezeRecord,
+    recorded: &[PackageDocument],
+) -> Result<Vec<PackageDocument>, CliError> {
+    let bytes = std::fs::read(&freeze.package).map_err(|error| {
+        CliError::Contract(format!(
+            "evidence package {} is unavailable: {error}",
+            freeze.package.display()
+        ))
+    })?;
+    if bytes.len() < 4 || &bytes[..2] != b"PK" {
+        return Err(CliError::Contract(format!(
+            "evidence package {} is not a re-extractable ZIP",
+            freeze.package.display()
+        )));
+    }
+    recorded
+        .iter()
+        .map(|document| {
+            let workspace_bytes = freeze.workspace.as_ref().map(|root| {
+                std::fs::read(root.join(&document.path)).map_err(|error| {
+                    CliError::Contract(format!(
+                        "workspace file {} is unavailable: {error}",
+                        root.join(&document.path).display()
+                    ))
+                })
+            });
+            Ok(PackageDocument {
+                path: document.path.clone(),
+                source_bytes: document.source_bytes.clone(),
+                packaged_bytes: document.packaged_bytes.clone(),
+                workspace_bytes: workspace_bytes.transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Runs the frozen outer check for real, then re-derives its verdict.
+///
+/// I18.31:56 says the candidate documentation generator cannot certify itself
+/// by emitting a green report, so the green report is never the verdict: the
+/// frozen script is launched as a real child through the sole
+/// `WindowsProcessExecutor`, its own exit code must be the accept code, and
+/// the typed check below then recomputes every rule from the bytes on this
+/// machine. Both must accept, so neither side can stand in for the other.
+fn run_frozen_outer_check(
+    freeze: &DocumentationFreezeRecord,
+    admission: &HarnessAdmission,
+) -> Result<(), CliError> {
+    let command = DiscriminatorCommand {
+        executable: freeze.interpreter.clone(),
+        argv: vec![
+            freeze.script.to_string_lossy().into_owned(),
+            "verify".to_owned(),
+            "--package".to_owned(),
+            freeze.package.to_string_lossy().into_owned(),
+        ],
+        working_directory: freeze
+            .script
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    };
+    let child = run_child(&command, admission)?;
+    let Some(status) = child.exit_status else {
+        return Err(CliError::Contract(
+            "frozen outer documentation evidence check published no terminal exit status"
+                .to_owned(),
+        ));
+    };
+    let outcome = exit_outcome(&status).map_err(CliError::Contract)?;
+    if outcome.code != Some(DOC_EVIDENCE_ACCEPT_EXIT_CODE) {
+        return Err(CliError::Contract(format!(
+            "frozen outer documentation evidence check exited {:?}, want {}",
+            outcome.code, DOC_EVIDENCE_ACCEPT_EXIT_CODE
+        )));
+    }
+    Ok(())
+}
+
+/// Runs the documentation evidence check from the frozen outer script.
+///
+/// The typed record is rebuilt over machine-observed bytes: the pin and the
+/// outer script are read from disk and re-hashed, and each packaged document
+/// carries the live workspace bytes next to the bytes the package re-extracted.
+/// The verdict is never read from the bundle — there is no verdict field on
+/// `SpecialCaseEvidence` to read — so a candidate documentation generator
+/// cannot certify itself by emitting a green report: every rule is recomputed
+/// from the bytes below.
+fn observe_documentation_evidence(
+    evidence: &BootstrapEvidence,
+    record: &DocumentationEvidenceRecord,
+    admission: &HarnessAdmission,
+) -> Result<SpecialCaseEvidence, CliError> {
+    let Some(freeze) = &evidence.documentation_freeze else {
+        return Err(CliError::Contract(
+            "the documentation evidence special case requires a frozen outer script".to_owned(),
+        ));
+    };
+    run_frozen_outer_check(freeze, admission)?;
+    let (pin, script_bytes) = read_frozen_outer(freeze)?;
+    if record.script.pin != pin {
+        return Err(CliError::Contract(
+            "recorded documentation freeze differs from the pin on this machine".to_owned(),
+        ));
+    }
+    let script = FrozenOuterScript::new(pin, script_bytes)?;
+    let documents = read_package_documents(freeze, &record.documents)?;
+    let rebuilt = DocumentationEvidenceRecord::new(
+        script,
+        documents,
+        record.manifest.clone(),
+        record.ledger.clone(),
+        record.dispositions.clone(),
+    )?;
+    Ok(SpecialCaseEvidence::DocumentationEvidence(Box::new(
+        rebuilt,
+    )))
+}
+
 /// Reads and shape-validates the recorded evidence bundle.
 ///
 /// The bundle is read field by field from its JSON value, so a missing,
@@ -932,6 +1151,13 @@ fn read_bundle(bundle: &Path) -> Result<BootstrapEvidence, CliError> {
             "outer_guardian_scenario",
         )? {
             Some(scenario) => Some(guardian_scenario(&scenario)?),
+            None => None,
+        },
+        documentation_freeze: match optional_field::<serde_json::Value>(
+            object,
+            "documentation_freeze",
+        )? {
+            Some(freeze) => Some(documentation_freeze(&freeze)?),
             None => None,
         },
         discriminator: discriminator(object, "discriminator")?,
@@ -1025,6 +1251,36 @@ fn guardian_scenario(value: &serde_json::Value) -> Result<GuardianScenarioRecord
         worktree_root: absolute_path(object, "outer_guardian_scenario", "worktree_root")?,
         evidence: text(object, "evidence")?,
         expected_evidence: field(object, "expected_evidence")?,
+    })
+}
+
+/// Decodes the recorded frozen outer script/generation pointers.
+///
+/// Every path is required and absolute, and the workspace root is optional
+/// because I0.14:59 scopes a successful check to artifact integrity: a run with
+/// no live workspace compares the packaged bytes against themselves and the
+/// manifest, which is the package-only form the frozen script itself supports.
+fn documentation_freeze(value: &serde_json::Value) -> Result<DocumentationFreezeRecord, CliError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError::Bundle("'documentation_freeze' is not an object".to_owned()))?;
+    Ok(DocumentationFreezeRecord {
+        pin: absolute_path(object, "documentation_freeze", "pin")?,
+        script: absolute_path(object, "documentation_freeze", "script")?,
+        interpreter: absolute_path(object, "documentation_freeze", "interpreter")?,
+        workspace: match optional_field::<String>(object, "workspace")? {
+            Some(workspace) => {
+                let workspace = PathBuf::from(workspace);
+                if !workspace.is_absolute() {
+                    return Err(CliError::Bundle(
+                        "'documentation_freeze.workspace' must be an absolute path".to_owned(),
+                    ));
+                }
+                Some(workspace)
+            }
+            None => None,
+        },
+        package: absolute_path(object, "documentation_freeze", "package")?,
     })
 }
 

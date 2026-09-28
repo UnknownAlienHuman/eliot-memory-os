@@ -25,11 +25,14 @@ pub mod self_change;
 
 pub use self_change::{
     AdversarialCase, AdversarialProof, AdversarialSuiteRecord, AxisVerdicts, BootstrapPhase,
-    CanaryRecord, ComparisonAxis, ComparisonOutcome, ConflictArbiter, EvidenceDigest,
-    FrontDoorVerdict, GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord,
-    ParserOutput, ParserReplayRecord, ResolvedOracleConflict, SelectionOutcome,
-    SelectionSentinelRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface, SentinelCase,
-    ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence, verdict_with_bootstrap,
+    CanaryRecord, ComparisonAxis, ComparisonOutcome, ConflictArbiter, DocumentationEvidenceRecord,
+    ENVELOPE_OWNED_RECEIPT_FIELDS, EvidenceDigest, FrontDoorVerdict, FrozenOuterPin,
+    FrozenOuterScript, GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord,
+    PackageDispositions, PackageDocument, PackageLedger, PackageManifest, ParserOutput,
+    ParserReplayRecord, ResolvedOracleConflict, STABLE_AGENT_RESPONSE_DISPOSITIONS,
+    SelectionOutcome, SelectionSentinelRecord, SelfChangeBootstrap, SelfChangeError,
+    SelfChangeSurface, SentinelCase, ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence,
+    VersionedCopy, verdict_with_bootstrap, verify_documentation_evidence,
     verify_finish_adversarial, verify_outer_guardian_record, verify_parser_replay,
     verify_selection_sentinel,
 };
