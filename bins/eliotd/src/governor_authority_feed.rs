@@ -75,10 +75,12 @@ pub async fn maintain_governor_authority_feed(
     watchdog: &WatchdogEvidence,
     trace: TraceFreshness,
 ) -> Result<u64, CompositionError> {
-    let authority = composition.governor_authority_mut().map_err(|error| match error {
-        DaemonError::Composition(error) => error,
-        error => CompositionError::Recovery(error.to_string()),
-    })?;
+    let authority = composition
+        .governor_authority_mut()
+        .map_err(|error| match error {
+            DaemonError::Composition(error) => error,
+            error => CompositionError::Recovery(error.to_string()),
+        })?;
     let projection = authority
         .refresh(coverage, watchdog, trace)
         .map_err(|error| CompositionError::Owner(error.to_string()))?;
@@ -104,10 +106,12 @@ pub async fn maintain_governor_authority_route_mismatch(
     expected_fingerprint: &str,
     observed_fingerprint: &str,
 ) -> Result<(u64, Vec<String>), CompositionError> {
-    let authority = composition.governor_authority_mut().map_err(|error| match error {
-        DaemonError::Composition(error) => error,
-        error => CompositionError::Recovery(error.to_string()),
-    })?;
+    let authority = composition
+        .governor_authority_mut()
+        .map_err(|error| match error {
+            DaemonError::Composition(error) => error,
+            error => CompositionError::Recovery(error.to_string()),
+        })?;
     let (projection, revoked) = authority
         .report_route_mismatch(expected_fingerprint, observed_fingerprint)
         .map_err(|error| CompositionError::Owner(error.to_string()))?;
@@ -137,12 +141,11 @@ async fn publish_projection(
     let value = kind_value(&value, GOVERNOR_AUTHORITY_RECEIPT_KIND).map_err(|error| {
         CompositionError::Owner(format!("governor authority receipt kind: {error}"))
     })?;
-    let receipt: GovernorAuthorityReceiptWire =
-        serde_json::from_value(value).map_err(|error| {
-            CompositionError::Owner(format!(
-                "governor authority receipt does not decode: {error}"
-            ))
-        })?;
+    let receipt: GovernorAuthorityReceiptWire = serde_json::from_value(value).map_err(|error| {
+        CompositionError::Owner(format!(
+            "governor authority receipt does not decode: {error}"
+        ))
+    })?;
     if receipt.status != GOVERNOR_AUTHORITY_RECORDED_STATUS
         || receipt.revision != projection.revision()
     {

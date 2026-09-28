@@ -225,6 +225,9 @@ pub use freshness_admission::{
     TaskCompatibility, evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
     observed_publication, publication_serves_candidate,
 };
+pub use governor_authority_feed::{
+    maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
+};
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
@@ -247,9 +250,6 @@ pub use notification_state_emit::{
     AutomationFailureKey, NotificationStateEmit, automation_failure_key,
     emit_blocked_automation_notification, notification_already_recorded,
     read_notification_ordering_head,
-};
-pub use governor_authority_feed::{
-    maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
 };
 pub use owner_feed::{
     KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
