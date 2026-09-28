@@ -425,7 +425,11 @@ impl InstrumentRun {
                 reason: "launched; terminal observation is owned by the supervising lane"
                     .to_owned(),
             },
-            executable_digest: None,
+            executable_digest: if grant.content_digest.is_empty() {
+                None
+            } else {
+                Some(grant.content_digest.clone())
+            },
             grant_digest: Some(grant.grant_digest.clone()),
             candidate_identity: None,
             target_layout,
