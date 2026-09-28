@@ -1,11 +1,13 @@
 //! Daemon swarm composition proof for issue #1126 (W1/W4/W5, A1/A4/A5/A7,
 //! A10-negative, A11-locality).
 //!
-//! Non-test composition proof: the test drives the real non-test
-//! composition in `bins/eliotd/src/swarm_composition.rs` (included below by
-//! path because the `lib.rs` one-line activation,
-//! `pub mod swarm_composition;`, is the integrator's follow-up outside this
-//! work unit's file grant) against the REAL Governor owner
+//! This drives the one production composition in
+//! `bins/eliotd/src/swarm_composition.rs` through `eliotd::swarm_composition`.
+//! The module is reached by its real public path, not through a `#[path]`
+//! include: a path include would compile a SECOND, independent copy of the
+//! module, so any product change to the composition could pass here without
+//! ever being type-checked against the code the daemon actually links. The
+//! composition is driven against the REAL Governor owner
 //! ([`SwarmAttachmentComposition`] over [`SwarmPlanAttachmentService`] and
 //! the canonical [`CanonicalSwarmPlanAttachmentStore`]) plus deterministic
 //! fake ledger/runner owners behind the composition's port traits.
@@ -23,15 +25,12 @@
 //! [`SwarmPlanAttachmentService`]: eliot_governor::SwarmPlanAttachmentService
 //! [`CanonicalSwarmPlanAttachmentStore`]: eliot_governor::CanonicalSwarmPlanAttachmentStore
 
-#[path = "../src/swarm_composition.rs"]
-mod swarm_composition;
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use eliot_governor::{SwarmAttachmentComposition, SwarmPlanAttachmentService};
 
-use swarm_composition::{
+use eliotd::swarm_composition::{
     AttachedPlan, ChildExit, ChildLaunchIntent, ChildRunner, ChildState, LaunchIntentLedger,
     RegistryRouteStatus, SwarmComposition, SwarmCompositionError, plan_drain,
 };

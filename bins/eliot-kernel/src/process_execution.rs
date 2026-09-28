@@ -103,10 +103,18 @@ struct OrsProcessEvidenceSink {
 }
 
 impl ProcessEvidenceSink for OrsProcessEvidenceSink {
+    /// Records the byte-free ORS observation of one physical result.
+    ///
+    /// Issue #269, A1: the accepted `ProcessEvidence` is read at this boundary
+    /// to take the digest over the ORIGINAL observed bytes, and the bounded
+    /// inline preview bytes are then dropped with the borrowed value. They never
+    /// reach ORS, so an execution with no stdout/stderr still records its
+    /// observation, and an execution with streams records their identity,
+    /// locator, exact digests and typed state without their payload.
     fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
         let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
         let record =
-            ProcessEvidenceRecord::from_evidence(evidence, self.owner.clone(), observed_at_ms)
+            ProcessEvidenceRecord::from_evidence(&evidence, self.owner.clone(), observed_at_ms)
                 .map_err(|error| eliot_process::EvidenceSinkError {
                     message: error.to_string(),
                 })?;
@@ -700,6 +708,23 @@ pub(crate) trait ProcessStartPorts {
         digest: &str,
         owner: &ProcessOwnerBinding,
     ) -> Result<ProcessExecutionReplayBegin, ProcessExecutionError>;
+    /// Authorizes one REPLAY of an already-reserved operation on its exact
+    /// unexpired effect operation lease (issue #1885; I1.9, W2/W5).
+    ///
+    /// Called only from the `Existing(replay)` arm, never from the `Acquired`
+    /// arm: a first process start is a new operation authorized by admission,
+    /// while a replay of an effect-capable operation may resume only under the
+    /// unexpired lease that already authorized its effect. The owner binding
+    /// supplies the authenticated module identity, generation and live
+    /// Authority Epoch; the effect receipt, route scope, manifest digest and
+    /// admitting Catalog/Policy revisions are read from the durable ORS rows,
+    /// and a denial is persisted as a durable reconciliation intent before this
+    /// returns, so a refused replay is never discarded.
+    fn require_effect_replay_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<(), ProcessExecutionError>;
     async fn completed_receipt(
         &self,
         record: ProcessExecutionReplayRecord,
@@ -1054,6 +1079,71 @@ impl ProcessExecutionGateway {
                 receipt: None,
             },
         );
+    }
+
+    /// Gates one effect-capable process-start REPLAY on its exact unexpired
+    /// effect operation lease (issue #1885; I1.9, W2/W5).
+    ///
+    /// A first process start is a new operation and is authorized by admission
+    /// (I1.9: "new effect admission requires a current Module Catalog/Policy
+    /// view"). A process start that resumes an already-reserved operation is a
+    /// **replay**, and only a replay needs this lease: I1.9 says an
+    /// effect-capable generation "may resume only exact already-authorized
+    /// operations covered by an unexpired operation lease". This method is
+    /// therefore called from the `Existing(replay)` arm of the process-start
+    /// pipeline, never from the acquire arm, so a new operation is never gated
+    /// on a lease that by definition does not exist yet.
+    ///
+    /// The observation is the replayed record's own authenticated owner binding
+    /// (module identity, generation and the live Authority Epoch it was admitted
+    /// under) and the Kernel's clock. The effect receipt, route scope, manifest
+    /// digest and admitting Catalog/Policy revisions are read from the durable
+    /// rows by
+    /// [`eliot_ors::RedbRecoveryStore::authorize_effect_replay_for_operation`],
+    /// which also persists the durable reconciliation intent for a denied,
+    /// expired or unknown replay, so a refused attempt is never discarded (W5).
+    /// Nothing is invented here.
+    ///
+    /// An authorization state that is absent, invalid, expired, revoked,
+    /// gap-affected, epoch-mismatched or Catalog/Policy stale leaves
+    /// `authorized_lease()` empty: the replay is refused before the effect is
+    /// executed, the shadow/no-effect authority can expose diagnostics but
+    /// carries no effect and no canonical write admission. A read that itself
+    /// fails is refused too — an unreadable authorization state is the
+    /// "unavailable" case I1.9 routes to shadow diagnostics.
+    pub(crate) fn require_effect_replay_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<(), ProcessExecutionError> {
+        let lease_id = eliot_ors::OperationIdentity::new(operation_id.as_str())
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let current_authority_epoch =
+            eliot_contracts::AuthorityEpoch::new(owner.authority_epoch().sequence.get())
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let decision = self
+            .evidence_store
+            .authorize_effect_replay_for_operation(
+                &lease_id,
+                owner.module_id(),
+                owner.generation().get(),
+                current_authority_epoch,
+                i64::try_from(super::unix_ms()).map_err(|error| {
+                    ProcessExecutionError::Unavailable(format!(
+                        "effect replay observation clock: {error}"
+                    ))
+                })?,
+            )
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if decision.authority.authorized_lease().is_some() {
+            return Ok(());
+        }
+        observe_process("kernel.process.effect_replay_denied", "shadow_only");
+        // The denial's reconciliation kind is already persisted durably by the
+        // store query above; it is not logged as a payload here.
+        Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::DispatchBindingMismatch,
+        ))
     }
 
     pub(crate) async fn start(
@@ -1446,6 +1536,19 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
                     eliot_process::ContractError::DispatchBindingMismatch,
                 ));
             }
+            // #1885 (I1.9, W2): this is a REPLAY of an already-reserved
+            // operation, so an effect-capable one may resume only under an exact
+            // unexpired effect operation lease. The gate runs before the
+            // recorded receipt is replayed and before any effect is executed;
+            // a denial refuses the resume and the store has already persisted
+            // the durable reconciliation intent (W5). A first process start
+            // takes the `Acquired` arm and is authorized by admission instead,
+            // so a new operation is never gated on a lease that cannot exist
+            // yet.
+            ports.require_effect_replay_authority(
+                owner,
+                &admission.intent().operation_id().clone(),
+            )?;
             return match record.state {
                 ProcessExecutionReplayState::Completed => ports
                     .completed_receipt(record)
@@ -1645,6 +1748,14 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         self.replay_store
             .begin_process_start(operation_id, digest, owner)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+    }
+
+    fn require_effect_replay_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<(), ProcessExecutionError> {
+        ProcessExecutionGateway::require_effect_replay_authority(self, owner, operation_id)
     }
 
     async fn completed_receipt(

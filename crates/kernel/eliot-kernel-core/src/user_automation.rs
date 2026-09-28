@@ -1354,7 +1354,12 @@ impl ProviderFingerprintPolicy {
         Ok(())
     }
 
-    fn admits(&self, observed: Option<&ProviderFingerprint>) -> bool {
+    /// Reports whether the policy admits the observed provider fingerprint.
+    ///
+    /// An exact allowed set admits only a contained observation; the
+    /// deterministic-only policy admits only the absence of any observation.
+    /// The predicate is pure: it issues no observation and grants no access.
+    pub fn admits(&self, observed: Option<&ProviderFingerprint>) -> bool {
         match self {
             Self::Allowed { fingerprints } => {
                 observed.is_some_and(|value| fingerprints.contains(value))
@@ -2439,6 +2444,70 @@ pub struct UserAutomationPreflightContext {
     pub request_metadata: RequestMetadata,
 }
 
+/// Owner-attested live evidence joined into one complete preflight projection.
+///
+/// Every member is attested by an existing owner: the immutable revision carries
+/// the skill package revisions, the route/cost ceiling and the provider
+/// admission set; the observed provider fingerprint, the exact tool definition
+/// revisions, the delivery capability and the blocked failure are observed by
+/// their owner routes and passed here unchanged. Assembly compares each member
+/// with the revision and the authenticated request instead of trusting it, so a
+/// substituted member fails here before the deterministic preflight ever runs.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationPreflightEvidence {
+    /// Provider identity observed by the owner route, if model access applies.
+    pub observed_provider_fingerprint: Option<ProviderFingerprint>,
+    /// Exact trusted Tool Definition revisions observed by the owner route.
+    pub trusted_tool_definition_refs: Vec<String>,
+    /// Whether the declared delivery target is currently capable.
+    pub delivery_available: bool,
+    /// Optional owner-issued blocked failure.
+    pub failure: Option<UserAutomationFailureProjection>,
+}
+
+impl UserAutomationPreflightEvidence {
+    /// Validates evidence shape without issuing any admission.
+    pub fn validate(&self) -> Result<(), UserAutomationError> {
+        if let Some(observed) = &self.observed_provider_fingerprint {
+            observed.validate()?;
+        }
+        list_text(
+            &self.trusted_tool_definition_refs,
+            "trusted_tool_definition_refs",
+        )?;
+        if let Some(failure) = &self.failure {
+            failure.reason.validate()?;
+            text(&failure.failure_fingerprint, "failure.failure_fingerprint")?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete owner inputs joined into one preflight projection.
+///
+/// The struct carries references so the joining owner performs no copy before
+/// validation; the assembled projection owns every member it keeps.
+#[derive(Clone, Debug)]
+pub struct UserAutomationPreflightAssembly<'a> {
+    /// Immutable revision read back from the canonical owner.
+    pub revision: &'a UserAutomationRevision,
+    /// Live configuration state from the current owner pointer.
+    pub configuration_state: UserAutomationConfigurationState,
+    /// Existing B-owned complete config snapshot.
+    pub config_snapshot: &'a ConfigPolicySnapshot,
+    /// Existing owner-issued source verification receipt.
+    pub source_receipt: &'a ReceiptEnvelope,
+    /// Existing Durable Job/history projection over the complete denominator.
+    pub execution: &'a UserAutomationExecutionProjection,
+    /// Authenticated occurrence the projection is assembled for.
+    pub invocation: &'a UserAutomationInvocation,
+    /// Authenticated parent request metadata the receipt and snapshot bind to.
+    pub request_metadata: &'a RequestMetadata,
+    /// Owner-attested live evidence for this occurrence.
+    pub evidence: &'a UserAutomationPreflightEvidence,
+}
+
 /// Owner-issued complete projection consumed by Kernel/Host and notify.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2483,6 +2552,194 @@ pub struct UserAutomationPreflightProjection {
 }
 
 impl UserAutomationPreflightProjection {
+    /// Assembles the complete owner-issued projection from its owner members.
+    ///
+    /// The caller supplies every member from the owner that attests it: the
+    /// immutable revision from the canonical owner readback, the live
+    /// configuration state from the current owner pointer, the complete
+    /// config snapshot from the B-owned policy owner, the source verification
+    /// receipt from the committed operation, the execution projection from the
+    /// Durable Job/history owner over the complete denominator, and the live
+    /// evidence from the provider/tool/delivery/failure owner routes. Nothing
+    /// is defaulted and nothing is re-derived by spelling: the trusted skill
+    /// revisions are repeated verbatim from the revision that attests them, so
+    /// the deterministic preflight keeps the exact equality check.
+    ///
+    /// Evidence completeness follows the configuration state the owner reports.
+    /// A paused or retired revision defers without consulting provider, tool or
+    /// delivery evidence, so vacuous evidence assembles there; a blocked
+    /// revision carries its owner-issued failure instead. An active revision
+    /// requires the complete evidence set the deterministic preflight checks:
+    /// an admitted provider observation, a non-empty exact tool set, a capable
+    /// delivery target, and — for deterministic mode — no provider observation
+    /// at all with a deterministic-only policy, a clean capability profile and
+    /// a non-model work class. An active occurrence with unresolved prior
+    /// effects is refused here: its I14.21 disposition belongs to the
+    /// reconciliation owner, not to a preflight retry.
+    pub fn assemble(
+        assembly: &UserAutomationPreflightAssembly<'_>,
+    ) -> Result<Self, UserAutomationError> {
+        let occurrence_id = Self::check_assembly_bindings(assembly)?;
+        Self::check_assembly_evidence(assembly)?;
+        Ok(Self {
+            automation_id: assembly.invocation.automation_id.clone(),
+            automation_revision: assembly.invocation.automation_revision.clone(),
+            mode: assembly.invocation.mode,
+            occurrence_id,
+            revision: assembly.revision.clone(),
+            configuration_state: assembly.configuration_state,
+            config_snapshot: assembly.config_snapshot.clone(),
+            source_receipt: assembly.source_receipt.clone(),
+            execution: assembly.execution.clone(),
+            observed_provider_fingerprint: assembly.evidence.observed_provider_fingerprint.clone(),
+            trusted_skill_package_revision_refs: assembly
+                .revision
+                .portable_skill_package_revision_refs
+                .clone(),
+            trusted_tool_definition_refs: assembly.evidence.trusted_tool_definition_refs.clone(),
+            delivery_available: assembly.evidence.delivery_available,
+            trigger_origin: assembly.invocation.trigger_origin,
+            child_depth: assembly.invocation.child_depth,
+            failure: assembly.evidence.failure.clone(),
+        })
+    }
+
+    /// Compares every assembled member with the revision and the authenticated
+    /// request, returning the stable occurrence identity they agree on.
+    fn check_assembly_bindings(
+        assembly: &UserAutomationPreflightAssembly<'_>,
+    ) -> Result<String, UserAutomationError> {
+        assembly.revision.validate()?;
+        assembly.invocation.validate()?;
+        assembly.execution.validate()?;
+        assembly.evidence.validate()?;
+        assembly
+            .config_snapshot
+            .validate()
+            .map_err(|error| UserAutomationError::Config(error.to_string()))?;
+        assembly
+            .source_receipt
+            .validate()
+            .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
+        if assembly.execution.history_query_ref != assembly.revision.execution_history_query_ref {
+            return Err(UserAutomationError::Invalid("execution.history_query_ref"));
+        }
+        let revision_refs = assembly
+            .revision
+            .current_execution_refs
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let execution_refs = assembly
+            .execution
+            .current_execution_refs
+            .iter()
+            .map(|reference| reference.durable_job_ref.as_str())
+            .collect::<BTreeSet<_>>();
+        if revision_refs != execution_refs {
+            return Err(UserAutomationError::Invalid(
+                "execution.current_execution_refs",
+            ));
+        }
+        let occurrence_id = assembly.invocation.occurrence_identity()?;
+        if assembly.revision.automation_id != assembly.invocation.automation_id
+            || assembly.invocation.mode != assembly.revision.mode
+            || assembly.invocation.principal_ref != assembly.revision.owner_principal
+            || assembly.invocation.work_scope_ref != assembly.revision.work_scope.scope_id
+            || assembly.invocation.workdir_ref != assembly.revision.workdir_ref
+        {
+            return Err(UserAutomationError::RevisionMismatch);
+        }
+        if assembly.config_snapshot.state_fence != assembly.request_metadata.state_fence
+            || assembly.config_snapshot.state_fence.policy_revision
+                != Some(assembly.config_snapshot.revision)
+        {
+            return Err(UserAutomationError::Invalid("config_snapshot.state_fence"));
+        }
+        if assembly.source_receipt.core.request.metadata != *assembly.request_metadata
+            || assembly.source_receipt.core.request.state_fence
+                != assembly.request_metadata.state_fence
+            || assembly.source_receipt.core.work_scope.state_fence
+                != assembly.request_metadata.state_fence
+            || assembly.source_receipt.core.work_scope.product_id
+                != assembly.request_metadata.product_id
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+        Ok(occurrence_id)
+    }
+
+    /// Requires the evidence completeness the reported configuration state
+    /// admits, including the deterministic closed world for active revisions.
+    fn check_assembly_evidence(
+        assembly: &UserAutomationPreflightAssembly<'_>,
+    ) -> Result<(), UserAutomationError> {
+        match assembly.configuration_state {
+            UserAutomationConfigurationState::Paused
+            | UserAutomationConfigurationState::Retired => {
+                if assembly.evidence.failure.is_some() {
+                    return Err(UserAutomationError::Invalid(
+                        "unexpected_failure_projection",
+                    ));
+                }
+            }
+            UserAutomationConfigurationState::BlockedConfig => {
+                let failure = assembly
+                    .evidence
+                    .failure
+                    .as_ref()
+                    .ok_or(UserAutomationError::FailureProjectionMissing)?;
+                failure.validate(assembly.revision, &assembly.request_metadata.state_fence)?;
+            }
+            UserAutomationConfigurationState::Active => {
+                if assembly.evidence.failure.is_some() {
+                    return Err(UserAutomationError::Invalid(
+                        "unexpected_failure_projection",
+                    ));
+                }
+                if assembly.execution.requires_reconciliation() {
+                    return Err(UserAutomationError::Invalid(
+                        "execution.unresolved_reconciliation_refs",
+                    ));
+                }
+                if assembly.evidence.trusted_tool_definition_refs.is_empty() {
+                    return Err(UserAutomationError::Invalid("trusted_tool_definition_refs"));
+                }
+                if !assembly.evidence.delivery_available {
+                    return Err(UserAutomationError::Invalid("delivery_available"));
+                }
+                if !assembly
+                    .revision
+                    .provider_policy
+                    .admits(assembly.evidence.observed_provider_fingerprint.as_ref())
+                {
+                    return Err(UserAutomationError::Invalid("provider_policy.admits"));
+                }
+                let deterministic_broken = assembly.revision.mode
+                    == UserAutomationExecutionMode::DeterministicProcess
+                    && (assembly.evidence.observed_provider_fingerprint.is_some()
+                        || !matches!(
+                            assembly.revision.provider_policy,
+                            ProviderFingerprintPolicy::DeterministicOnly
+                        )
+                        || assembly.revision.task.capability_profile.model_access
+                        || assembly.revision.task.capability_profile.provider_access
+                        || assembly
+                            .revision
+                            .task
+                            .capability_profile
+                            .automation_scheduling
+                        || assembly.revision.work_class == AutomationWorkClass::ModelJobs);
+                if deterministic_broken {
+                    return Err(UserAutomationError::Invalid(
+                        "deterministic_process.excludes_model_provider_access",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Runs deterministic preflight against the authenticated parent metadata.
     pub fn preflight(
         &self,

@@ -29,7 +29,6 @@ pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
 pub mod verification_profile;
-pub mod work_envelope;
 
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
@@ -51,6 +50,10 @@ pub use dev_fast::{
     check_zero_execution, dev_fast_caller_plan, dev_fast_disposition, dev_fast_registry,
     dev_fast_stage_dispatch,
 };
+pub use eliot_build_test_graph::{
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity, GovernedWorkEnvelope,
+    LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
+};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
     KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
@@ -66,9 +69,9 @@ pub use profile::{
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, ProviderDispatch, StageEvidence, StageIdentity, StageLauncher,
-    StageOrchestrator, StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,
-    compose_provider_dispatch,
+    ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
+    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
+    TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
@@ -92,11 +95,6 @@ pub use verification_profile::{
     VerificationProfileError, VerificationProfileReceipt, build_verification_profile_receipt,
     check_declared_environment_dependencies, issue_receipt_envelope, parity_summary,
     require_provenance, verify_profile_parity,
-};
-pub use work_envelope::{
-    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity,
-    EnvelopedInstrumentResult, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
-    WorkEnvelopeError,
 };
 
 /// Stable identity of the shared instrument runner contract.
@@ -503,6 +501,41 @@ impl GovernedInstrumentResult {
             )));
         }
         Ok(())
+    }
+}
+
+/// A governed result with the lane identity that produced it attached.
+#[derive(Clone, Debug)]
+pub struct EnvelopedInstrumentResult {
+    /// The runner's governed result: invocation, executable identity, argv,
+    /// raw output, and execution axis.
+    pub result: GovernedInstrumentResult,
+    /// Which candidate, fingerprint, and contract revision produced it.
+    pub identity: CandidateIdentity,
+}
+
+impl EnvelopedInstrumentResult {
+    /// Attaches a work item's lane identity to one emitted governed result.
+    ///
+    /// The identity is read from the one [`GovernedWorkEnvelope`] the work
+    /// item was allocated in, so the attached candidate and contract revision
+    /// can never disagree with the lane. The envelope type lives in
+    /// `eliot-build-test-graph` so the test daemon reads the same identity
+    /// onto its verification receipt; this constructor is the runner-side
+    /// counterpart of that attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError::InvalidFingerprint`] when the fingerprint
+    /// is not a valid fingerprint.
+    pub fn attach(
+        envelope: &GovernedWorkEnvelope,
+        result: GovernedInstrumentResult,
+    ) -> Result<Self, WorkEnvelopeError> {
+        Ok(Self {
+            result,
+            identity: envelope.candidate_identity()?,
+        })
     }
 }
 

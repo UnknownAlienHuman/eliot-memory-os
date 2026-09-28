@@ -1211,6 +1211,10 @@ fn allowed_ipc_profile(profile: &str) -> bool {
     )
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "presence vector of the 6 handshake scope facets from one is_some call site; contract is the 2 accepted shapes (#838)"
+)]
 fn valid_normal_scope_shape(
     has_session: bool,
     has_project: bool,

@@ -71,6 +71,46 @@
 //! over its ownership-verified channel at connect time, and only the startup
 //! order (gate → connect → re-verify → serve) plus the backend handoff carry
 //! that proof to the writer decision.
+//!
+//! PRODUCER CONTRACT (issue #1932, audit 5856162900 defect 1). This cell is
+//! the READER and the pure decision; it deliberately does not write the
+//! installation-visible documents, because the party that qualifies a
+//! generation must not be the party that consumes the qualification (I0.5:
+//! "report wording, test count, trait presence or manual status edit cannot
+//! promote support"). The producer belongs to the existing installation /
+//! release owner, and the seam it must use is exactly:
+//!
+//! ```text
+//! 1. decide the record      — owner-approved; `active_version` is the exact
+//!                             `major.minor.patch` from the release lock
+//!                             `docs/release/SURREALDB_WINDOWS_X64.lock.json`,
+//!                             and `qualified_fallback_*` names the artifact
+//!                             that actually qualified;
+//! 2. obtain the evidence    — the I0.5 `CurrentSystemEvidenceSnapshot` bytes
+//!                             from `eliot-bootstrap`
+//!                             (`CurrentSystemEvidenceCompiler::compile`), and
+//!                             its `snapshot_sha256` verbatim;
+//! 3. render                 — `toml::to_string_pretty(&CompatibilityFile { .. })`;
+//!                             `Serialize` is derived from the same struct the
+//!                             parser reads, so the emitted shape cannot drift;
+//! 4. verify before install  — re-parse the rendered bytes with
+//!                             `parse_compatibility_bytes` and require
+//!                             `PartialEq` equality, and require the snapshot
+//!                             bytes to state exactly the record's
+//!                             `evidence_snapshot_sha256`;
+//! 5. install atomically     — write each document to a same-directory
+//!                             temporary file and rename it into place beside
+//!                             the selected Store config, the evidence snapshot
+//!                             FIRST, so an interruption leaves the pair
+//!                             refusing rather than admitting.
+//! ```
+//!
+//! Steps 3-5 have no production caller in this crate today: `mod
+//! compatibility` is private and the re-export seam is `lib.rs`, so an
+//! uncalled producer here would be dead code. The record is consequently
+//! never written, and a normally installed Store resolves to
+//! [`CompatibilityVerdict::Maintenance`] — visible, queryable, and refusing
+//! every mutation, which is the fail-closed outcome, but not a writer.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -104,7 +144,13 @@ const MAX_EVIDENCE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const LEGACY_ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Installation-visible compatibility file.
-#[derive(Clone, Debug, serde::Deserialize)]
+///
+/// `Serialize` is the producer half of the SAME shape [`Self`] parses. The
+/// emitting and the parsing view are one struct, so a field name or a type can
+/// never drift between the document the installation/release owner writes and
+/// the document this gate reads. `PartialEq` is what lets that agreement be
+/// proved by a round trip rather than asserted.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatibilityFile {
     /// Active `SurrealDB` store decision.
@@ -140,7 +186,10 @@ pub enum EvidenceSnapshotVerification {
 }
 
 /// Active `SurrealDB` store decision record.
-#[derive(Clone, Debug, serde::Deserialize)]
+///
+/// `Serialize` is derived from this same struct [`parse_compatibility_bytes`]
+/// deserializes, for the reason given on [`CompatibilityFile`].
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrealCompatibility {
     /// Exact `SurrealDB` version admitted for canonical writes (e.g. `3.1.4`).

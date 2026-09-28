@@ -5,16 +5,20 @@
 //! daemon composition root's handle on that view. The single
 //! [`GovernorCapabilityAdmission`] is constructed empty at
 //! [`DaemonComposition::start`](super::DaemonComposition::start) and is
-//! mutated in production at exactly two sites, both non-test:
+//! mutated in production at exactly two sites, both non-test, and both reading
+//! DURABLE capability-evidence rows:
 //!
-//! 1. [`GovernorCapabilityAdmission::hydrate_from_evidence_response`], reached
-//!    from the daemon's live Skill-intake commit step
-//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)), which
-//!    applies the canonical `GetCapabilityEvidenceState` response that same
-//!    intake already read;
-//! 2. [`GovernorCapabilityAdmission::apply_scope_change`], reached from
-//!    [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//!    with the route scope the caller observed.
+//! 1. [`drain_capability_evidence_records`], reached from the startup attach
+//!    (`daemon_runtime::hydrate_capability_evidence_view`), which drains the
+//!    complete `GetCapabilityEvidenceRecordRange` read to exhaustion;
+//! 2. [`GovernorCapabilityAdmission::hydrate_from_evidence_record_page`],
+//!    reached from the daemon's live Skill-intake commit step
+//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)) for the
+//!    intake's own Skill, so a record committed while the daemon runs is
+//!    observed without waiting for a restart. The one-shot apply installs only
+//!    a COMPLETE page: a page that reports further eligible rows is refused
+//!    whole before any row is minted, so partial coverage can never present
+//!    itself as the view and admit past an unread restriction.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -31,15 +35,11 @@
 //! constructed in production by `daemon_runtime::attach_dreamer_model`
 //! through [`DaemonComposition::dreamer_model`](super::DaemonComposition::dreamer_model).
 //!
-//! The daemon route gate
-//! ([`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route))
+//! Residual STITCH, measured and not papered over:
+//! [`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route)
 //! is a second, distinct consumer of the same predicate, reached through
 //! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
 //! from [`DaemonComposition::drive_verified_agent_fabric`](super::DaemonComposition::drive_verified_agent_fabric).
-//! Its refusal is the typed [`FabricError::NoRoute`](super::agent_fabric::FabricError::NoRoute)
-//! residual; it never falls back to a local route.
-//!
-//! Residual STITCH, measured and not papered over:
 //! `drive_verified_agent_fabric` itself has no in-crate caller, and the
 //! production B-MOD model-registry port (`ProductionModelRegistryPort`) reports
 //! `PortBindingState::Missing`, so a production route resolution cannot succeed
@@ -47,49 +47,73 @@
 //! per-operation executor binds that driver; the driver seam lives outside
 //! `bins/eliotd`, and no composition method here invents a caller for it.
 //!
-//! Evidence bridge: `GetCapabilityEvidenceState` is the existing canonical
-//! read for capability evidence (selected by exact `skill_id` +
-//! `max_records`; see `operation_catalogue` and the `Affordances` role in
-//! `GovernorContextInputs`). [`GovernorCapabilityAdmission::plan_evidence_read`]
-//! builds that closed request for one skill, and
-//! [`GovernorCapabilityAdmission::ingest_evidence_response`] decodes the
-//! versioned store payload.
+//! **Trap recorded for the next writer: do NOT reintroduce an
+//! `apply_scope_change` call here.** `CapabilityRegistry::apply_scope_change`
+//! stales a record when its fingerprint DIFFERS from the scope supplied as
+//! `current` on a selected dimension, and a scope once invalidated is not
+//! revived by a later matching record. A call that passes an OBSERVED route as
+//! `current` with `ScopeDependencySelector::all()` therefore inserts every
+//! other account's and route's still-valid record into the growing invalidation
+//! set, on every call, and permanently. I3.4 requires capability to be
+//! route/account-specific, so that call erases exactly the dimension the
+//! document protects. The over-broad call has been REMOVED from
+//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route),
+//! so no production path invokes it any more; staleness is instead DERIVED at the
+//! gate (below). [`apply_scope_change`](Self::apply_scope_change) is left in
+//! place, unreferenced from production: it is pre-existing public surface whose
+//! correct direction is a narrower selector than any current observation site
+//! can supply, and an existing test exercises it, so removing the method itself
+//! would exceed this issue.
 //!
-//! What the read actually carries, measured on current store source: the
-//! store answers with committed `ApplyLifecyclePolicy` authority-receipt rows,
-//! each carrying exactly the six declared lifecycle parameters (`action`,
-//! `base_view_digest`, `candidate_digest`, `candidate_package_digest`,
-//! `skill_id`, `verifier_ref`) plus its commit-order `capture_index`. A row
-//! carries no probe status, no evidence source, and no route-scope
-//! fingerprint, so `ingest_evidence_response` mints no verified record from it
-//! and reports observation currency only.
+//! Evidence bridges, and why there are two. Both are canonical reads, and they
+//! carry different things — measured on current store source:
 //!
-//! Hydration therefore admits exactly one shape, and it is deliberately
-//! non-admitting: [`GovernorCapabilityAdmission::hydrate_from_evidence_response`]
-//! imports the read's skill through the legacy importer
-//! ([`GovernorCapabilityAdmission::import_legacy`]), the only construction path
-//! the adopted `CapabilityEvidenceRecord` relation allows for `declared`, and
-//! leaves every scope-fingerprint field `None` (unknown, never inferred)
-//! because the read exposes none. Such a record places the skill in
-//! [`GovernorCapabilityAdmission::required_set`] and evaluates as
-//! [`SkillStanding::Unevaluated`]. It can never satisfy
-//! [`GovernorCapabilityAdmission::admit_production_route`], which requires
-//! `probe_passed` or `observed` evidence from an admissible source on a
-//! matching scope. Absence of canonical evidence therefore REFUSES a
-//! production route; it is never treated as a pass, and never as "nothing to
-//! check".
+//! * `GetCapabilityEvidenceState` answers committed `ApplyLifecyclePolicy`
+//!   authority-receipt rows, each carrying exactly the six declared lifecycle
+//!   parameters (`action`, `base_view_digest`, `candidate_digest`,
+//!   `candidate_package_digest`, `skill_id`, `verifier_ref`) plus its
+//!   commit-order `capture_index`. A row carries no probe status, no evidence
+//!   source, and no route-scope fingerprint, so
+//!   [`ingest_evidence_response`](Self::ingest_evidence_response) mints no
+//!   verified record from it and reports observation currency only.
+//!   [`hydrate_from_evidence_response`](Self::hydrate_from_evidence_response)
+//!   therefore imports exactly one shape, and it is deliberately non-admitting:
+//!   it runs the read's skill through the legacy importer
+//!   ([`import_legacy`](Self::import_legacy)) and leaves every
+//!   scope-fingerprint field `None`, because the read exposes none of the six
+//!   dimensions it could carry. Such a record places the skill in
+//!   [`required_set`](Self::required_set) and evaluates as
+//!   [`SkillStanding::Unevaluated`]; it can never satisfy
+//!   [`admit_production_route`](Self::admit_production_route). Marking the
+//!   unavailable dimensions unknown is I3.4's rule; inferring them from the
+//!   requested route is not.
+//! * `GetCapabilityEvidenceRecordRange` answers the durable evidence rows
+//!   themselves — the verbatim `CapabilityEvidenceRecord` document, the
+//!   owner-issued `record_digest` of those bytes, and the store-issued
+//!   `revision` the fenced compare-and-set assigned. This is the only leg that
+//!   can mint a real `probe_passed`, `observed`, or `broken` record, and so the
+//!   only leg on which a positive admits, a negative restricts, or a
+//!   fingerprint change stales anything. Absence of canonical evidence REFUSES a
+//!   production route; it is never treated as a pass, and never as "nothing to
+//!   check".
 //!
-//! Staleness is derived, never persisted, and it is applied on the observed
-//! route. A changed runtime hash, adapter hash, provider/model/auth route,
-//! serializer, or feature-flag scope stops admitting on two independent
-//! grounds: [`admit_production_route`](Self::admit_production_route) compares
-//! the observed scope against each record's fingerprint by exact value, so a
-//! record that no longer matches cannot authorize the changed route; and
-//! [`apply_scope_change`](Self::apply_scope_change), called by
-//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//! with the caller-observed scope, moves every record that differs from that
-//! observation into the registry's invalidation set. Either way the exact route
-//! must be re-probed before it authorizes production work again.
+//! Staleness (I3.4: "runtime/adapter/provider/serializer change makes dependent
+//! evidence stale") is therefore enforced against real durable records on two
+//! independent grounds, both derived rather than remembered:
+//! [`admit_production_route`](Self::admit_production_route) compares the
+//! observed scope against each retained record's fingerprint by EXACT value, so
+//! a record whose adapter hash, serializer fingerprint, or any other dimension
+//! no longer matches cannot authorize the changed route; and
+//! [`hydrate_from_evidence_record_page`](Self::hydrate_from_evidence_record_page)
+//! re-derives the per-`(skill_id, scope_fingerprint)` invalidation index from
+//! each served record's own persisted `limitations_and_negative_evidence`, so a
+//! committed restriction survives a restart. Either way the exact route must be
+//! re-probed before it authorizes production work again.
+//!
+//! [`drain_capability_evidence_records`] is the production rebuild path and it
+//! is atomic: pages are staged and the held view is replaced only after the
+//! last page, so a drain that stops early leaves the view exactly as it was
+//! rather than partially hydrated.
 
 use std::collections::BTreeMap;
 
@@ -98,11 +122,12 @@ use eliot_config::legacy_capability_import::{
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, MAX_CAPABILITY_EVIDENCE_RECORDS,
-    RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
+    OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
 };
 use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    ReadConsistency, ScopeId,
+    EVIDENCE_PACK_MAX_RECORDS, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+    MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, ReadConsistency, ScopeId,
 };
 use thiserror::Error;
 
@@ -129,6 +154,11 @@ pub enum EvidenceBridgeError {
     /// evidence coverage was not retained.
     #[error("capability evidence registry is full; new capability coverage was refused")]
     CapacityExceeded,
+    /// A one-shot page hydration cannot claim complete coverage: the store
+    /// reports further eligible rows past this page and the caller supplied no
+    /// continuation to drain. Nothing from the page is installed.
+    #[error("capability evidence page is truncated; complete coverage requires the paged drain")]
+    CoverageIncomplete,
 }
 
 /// Daemon-held Governor capability admission view.
@@ -156,6 +186,18 @@ impl GovernorCapabilityAdmission {
         &self.registry
     }
 
+    /// Replaces the held registry with a completely drained one.
+    ///
+    /// Only [`drain_capability_evidence_records`] calls this, and only after it
+    /// has drained the canonical read to exhaustion. Taking the whole registry
+    /// rather than merging into it is what makes a partial drain harmless: a
+    /// drain that stops early never reaches this method, so the held view keeps
+    /// exactly the records — and exactly the derived invalidation state — it
+    /// had before.
+    fn replace_drained_registry(&mut self, drained: Self) {
+        self.registry = drained.registry;
+    }
+
     /// Returns the number of retained evidence records.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -168,9 +210,17 @@ impl GovernorCapabilityAdmission {
         self.registry.is_empty()
     }
 
-    /// Inserts one canonical evidence record (probe/observation path).
-    pub fn insert(&mut self, record: CapabilityEvidenceRecord) -> bool {
-        self.registry.insert(record)
+    /// Inserts one canonical evidence record under the immutable owner-issued
+    /// revision the canonical store issued for it (probe/observation path).
+    ///
+    /// The revision is the only supersession authority the registry accepts;
+    /// no semantic rule lives here.
+    pub fn insert(
+        &mut self,
+        record: CapabilityEvidenceRecord,
+        revision: OwnerEvidenceRevision,
+    ) -> bool {
+        self.registry.insert(record, revision)
     }
 
     /// Imports one legacy declaration as `declared/imported_legacy`.
@@ -187,11 +237,16 @@ impl GovernorCapabilityAdmission {
         let imported =
             import_legacy_declaration(declaration).map_err(|_| EvidenceBridgeError::BlankSkill)?;
         let record = CapabilityEvidenceRecord::from(&imported);
-        let already_retained = self.registry.records().iter().any(|retained| {
-            retained.skill_id == record.skill_id
-                && retained.scope_fingerprint == record.scope_fingerprint
+        // A legacy declaration is not evidence and no store arbitrates a
+        // revision for it, so it is retained at the reserved floor: it can
+        // never displace, reorder, or requalify verified evidence.
+        let already_retained = self.registry.retained().iter().any(|retained| {
+            retained.record.skill_id == record.skill_id
+                && retained.record.scope_fingerprint == record.scope_fingerprint
         });
-        let inserted = self.registry.insert(record);
+        let inserted = self
+            .registry
+            .insert(record, OwnerEvidenceRevision::legacy_declared());
         if !inserted && !already_retained && self.registry.len() >= MAX_CAPABILITY_EVIDENCE_RECORDS
         {
             return Err(EvidenceBridgeError::CapacityExceeded);
@@ -230,14 +285,34 @@ impl GovernorCapabilityAdmission {
         self.registry.admit_production_route(skill_id, scope, now)
     }
 
-    /// Stales dependent evidence after a narrowed dependency change.
-    /// Returns the count of newly staled records.
+    /// Stales dependent evidence after a narrowed dependency change, retaining
+    /// the owner-issued cause each invalidated key must be requalified
+    /// against. Returns the owner-issued change reference, how many
+    /// `(skill_id, scope_fingerprint)` keys it newly limited, and the mutated
+    /// records carrying the change reference in their own persisted
+    /// `limitations_and_negative_evidence`.
+    ///
+    /// Those mutated records are the durable form of the restriction. Committing
+    /// them through the named `RecordCapabilityEvidenceRecord` leg is what makes
+    /// the restriction survive a restart; until they are committed the
+    /// restriction holds in this process only, which is the fail-closed
+    /// direction. The limitation is also what a later hydration re-derives the
+    /// invalidation from, so a committed restriction is never forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceRevisionError`](eliot_governor::EvidenceRevisionError)
+    /// when the applied-change reference is not one hex SHA-256 digest;
+    /// nothing is staled in that case.
     pub fn apply_scope_change(
         &mut self,
         current: &RouteScopeFingerprint,
         changed: ScopeDependencySelector,
-    ) -> usize {
-        self.registry.apply_scope_change(current, changed)
+        blocking_evidence_ref: &str,
+    ) -> Result<eliot_governor::InvalidatedCapabilityEvidence, eliot_governor::EvidenceRevisionError>
+    {
+        self.registry
+            .apply_scope_change(current, changed, blocking_evidence_ref)
     }
 
     /// Hydrates the held view from one canonical evidence-read response.
@@ -286,6 +361,178 @@ impl GovernorCapabilityAdmission {
         Ok(CapabilityHydration {
             summary,
             declared_records,
+            retained: self.len(),
+        })
+    }
+
+    /// Plans one page of the closed canonical capability-evidence RECORD read.
+    ///
+    /// `GetCapabilityEvidenceRecordRange` is the only read that can rebuild
+    /// this view: it serves the real durable evidence rows with their
+    /// owner-issued `record_digest` and the store-issued `revision` the fenced
+    /// compare-and-set assigned, so a hydration can mint real
+    /// [`CapabilityEvidenceRecord`]s with real owner-issued revisions.
+    /// `GetCapabilityEvidenceState` cannot: it answers committed lifecycle
+    /// governance rows carrying no status, source, scope fingerprint, or
+    /// revision.
+    ///
+    /// `skill_id` is the optional exact filter over one skill; `None` selects
+    /// every skill in scope, which is what a complete registry rebuild needs.
+    /// `cursor` is the opaque continuation token the previous page issued;
+    /// `None` reads from the start of the eligible set, and the store fails
+    /// closed on a cursor that does not decode against the current fence and
+    /// revision heads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceBridgeError`] when the skill identity or page bound is
+    /// not closed, or the built request is structurally invalid.
+    pub fn plan_evidence_record_read(
+        skill_id: Option<&str>,
+        max_records: u16,
+        cursor: Option<String>,
+        scope: ScopeId,
+        fence: eliot_contracts::StateFence,
+    ) -> Result<NamedReadRequest, EvidenceBridgeError> {
+        if let Some(skill) = skill_id
+            && (!eliot_store_api::valid_skill_id(skill)
+                || skill.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES)
+        {
+            return Err(EvidenceBridgeError::BlankSkill);
+        }
+        if max_records == 0 || max_records > MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS {
+            return Err(EvidenceBridgeError::BadBound);
+        }
+        let request = eliot_store_api::capability_evidence_read_request(
+            scope,
+            skill_id.map(str::to_owned),
+            max_records,
+            cursor,
+            fence,
+        );
+        request
+            .validate()
+            .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
+        Ok(request)
+    }
+
+    /// Applies one COMPLETE capability-evidence RECORD page to the held view,
+    /// minting real records under the store-issued owner revision.
+    ///
+    /// Each projected row is re-proved at this read edge before it can become
+    /// registry state: the row's presented `record_digest` must equal the
+    /// digest over the exact record bytes, and the record's own
+    /// `(skill_id, scope_fingerprint)` must be the key the row was addressed
+    /// by. A row that fails either check is refused whole, so a substituted
+    /// document can never displace a retained record or clear an invalidation.
+    ///
+    /// This is the mutating sibling the audit required: `ingest_evidence_response`
+    /// is `&self` and mints nothing, so it cannot be the path that rebuilds
+    /// this view.
+    ///
+    /// A page that reports further eligible rows (`truncated`) is refused whole
+    /// with [`EvidenceBridgeError::CoverageIncomplete`] before any row is
+    /// minted. A one-shot apply has no continuation to drain, so installing its
+    /// prefix would present partial coverage as the view: a restriction, or a
+    /// newer revision, sitting past the cursor would stay invisible while the
+    /// installed prefix admits. The complete paged drain
+    /// ([`drain_capability_evidence_records`]) remains the only multi-page path;
+    /// it follows every continuation to exhaustion instead.
+    ///
+    /// The apply is atomic: envelope and row re-proofs, the truncation refusal,
+    /// and the capacity fit check all run before the first insert, so an error
+    /// leaves the held view exactly as it was. A refusal therefore keeps every
+    /// retained restriction and admits nothing new, which is the fail-closed
+    /// direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceBridgeError`] when the response does not answer the
+    /// planned read, the payload is not the versioned record shape, a row fails
+    /// its digest/key re-proof, the page reports further eligible rows, or the
+    /// page carries more new keys than the bounded registry can retain.
+    pub fn hydrate_from_evidence_record_page(
+        &mut self,
+        request: &NamedReadRequest,
+        response: &NamedReadResponse,
+    ) -> Result<EvidenceRecordPage, EvidenceBridgeError> {
+        let decoded = decode_evidence_record_page(request, response)?;
+        if decoded.truncated {
+            return Err(EvidenceBridgeError::CoverageIncomplete);
+        }
+        // Atomic fit check before the first insert: the distinct new keys the
+        // page carries must fit the bound alongside what is already retained,
+        // so a page that cannot be installed whole is refused whole instead of
+        // leaving a minted prefix behind.
+        {
+            let mut unseen_new: Vec<(&str, &RouteScopeFingerprint)> = Vec::new();
+            for (record, _) in &decoded.rows {
+                if self
+                    .registry
+                    .retained_revision(&record.skill_id, &record.scope_fingerprint)
+                    .is_some()
+                {
+                    continue;
+                }
+                if unseen_new.iter().any(|(skill, scope)| {
+                    *skill == record.skill_id.as_str() && *scope == &record.scope_fingerprint
+                }) {
+                    continue;
+                }
+                unseen_new.push((record.skill_id.as_str(), &record.scope_fingerprint));
+            }
+            if self.registry.len() + unseen_new.len() > MAX_CAPABILITY_EVIDENCE_RECORDS {
+                return Err(EvidenceBridgeError::CapacityExceeded);
+            }
+        }
+        let mut minted = 0_usize;
+        for (record, revision) in decoded.rows {
+            // The fit check above guarantees a new key is never refused here.
+            // An equal/older replay converges silently: it displaces nothing.
+            if self.registry.insert(record, revision) {
+                minted = minted.saturating_add(1);
+            }
+        }
+        Ok(EvidenceRecordPage {
+            minted,
+            truncated: false,
+            next_cursor: decoded.next_cursor,
+            retained: self.len(),
+        })
+    }
+
+    /// Applies one RECORD page to the held view while tolerating truncation.
+    ///
+    /// Only [`drain_capability_evidence_records`] calls this, and only with the
+    /// continuation the page issued: the drain follows every page to exhaustion
+    /// and replaces the held view solely after the last one, so a truncated
+    /// page here is a drain in progress, never installed partial coverage.
+    fn apply_evidence_record_page(
+        &mut self,
+        request: &NamedReadRequest,
+        response: &NamedReadResponse,
+    ) -> Result<EvidenceRecordPage, EvidenceBridgeError> {
+        let decoded = decode_evidence_record_page(request, response)?;
+        let mut minted = 0_usize;
+        for (record, revision) in decoded.rows {
+            // A new key refused because the bounded registry is full means the
+            // requested coverage was NOT retained, so hydration reports the
+            // refusal instead of claiming coverage. An equal/older replay
+            // converges silently: it displaces nothing.
+            let already_retained = self
+                .registry
+                .retained_revision(&record.skill_id, &record.scope_fingerprint)
+                .is_some();
+            if self.registry.insert(record, revision) {
+                minted = minted.saturating_add(1);
+            } else if !already_retained {
+                return Err(EvidenceBridgeError::CapacityExceeded);
+            }
+        }
+        Ok(EvidenceRecordPage {
+            minted,
+            truncated: decoded.truncated,
+            next_cursor: decoded.next_cursor,
             retained: self.len(),
         })
     }
@@ -433,6 +680,279 @@ pub struct ObservedLifecycleSummary {
     pub truncated: bool,
 }
 
+/// One decoded capability-evidence RECORD page: envelope validated, every row
+/// re-proved, nothing yet applied to any registry.
+struct DecodedEvidenceRecordPage {
+    rows: Vec<(CapabilityEvidenceRecord, OwnerEvidenceRevision)>,
+    truncated: bool,
+    next_cursor: Option<String>,
+}
+
+/// Validates one RECORD-page envelope and re-proves every row it carries.
+///
+/// Operation, fence, scope, version, truncation-token, and per-row
+/// digest/key checks are exactly the ones the page apply used to inline, so a
+/// page accepted here carries the same owner authority wherever it is applied.
+/// Rows are decoded and re-proved but NOTHING is inserted: the caller decides
+/// whether this page may become registry state (complete pages only for a
+/// one-shot apply; continued pages only inside the drain).
+fn decode_evidence_record_page(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+) -> Result<DecodedEvidenceRecordPage, EvidenceBridgeError> {
+    if response.operation != NamedReadOperation::GetCapabilityEvidenceRecordRange
+        || response.operation != request.operation
+    {
+        return Err(EvidenceBridgeError::ResponseMismatch("operation"));
+    }
+    if response.state_fence != request.state_fence {
+        return Err(EvidenceBridgeError::ResponseMismatch("fence"));
+    }
+    response
+        .validate()
+        .map_err(|_| EvidenceBridgeError::ResponseMismatch("shape"))?;
+    let payload = &response.payload;
+    if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(EvidenceBridgeError::Payload("version"));
+    }
+    let planned_scope = request
+        .scope_id
+        .clone()
+        .ok_or(EvidenceBridgeError::Payload("scope"))?;
+    let planned_scope_value =
+        serde_json::to_value(&planned_scope).map_err(|_| EvidenceBridgeError::Payload("scope"))?;
+    if payload.get("scope_id") != Some(&planned_scope_value) {
+        return Err(EvidenceBridgeError::Payload("scope"));
+    }
+    let truncated = payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(EvidenceBridgeError::Payload("truncated"))?;
+    let next_cursor = match payload.get("next_cursor") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(serde_json::Value::String(cursor)) => Some(cursor.clone()),
+        Some(_) => return Err(EvidenceBridgeError::Payload("next_cursor")),
+    };
+    // A page that reports truncation without a usable continuation token is
+    // not a prefix a caller can drain; it is a coverage claim the store did
+    // not back, and it is refused rather than reported as hydrated.
+    if truncated && next_cursor.is_none() {
+        return Err(EvidenceBridgeError::Payload("next_cursor"));
+    }
+    let rows = payload
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(EvidenceBridgeError::Payload("records"))?;
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        decoded.push(decode_evidence_record_row(row)?);
+    }
+    Ok(DecodedEvidenceRecordPage {
+        rows: decoded,
+        truncated,
+        next_cursor,
+    })
+}
+
+/// Decodes one projected capability-evidence row into a real record plus the
+/// store-issued owner revision that orders its key.
+///
+/// Re-proves the row at the Governor read edge, which is where the owner
+/// authority is established: the presented `record_digest` must equal the digest
+/// over the exact record bytes, and the record's own `(skill_id,
+/// scope_fingerprint)` must reproduce the row's `scope_key` address. A row that
+/// fails either check is refused whole, so no substituted document can become
+/// registry state under a reference the canonical store never issued for it.
+///
+/// Those two checks together already bind the whole record, so no third
+/// field-completeness check is added here. Measured: the only producer of a
+/// record document is `canonical_json_bytes(record)` in the Governor's commit
+/// owner, and [`RouteScopeFingerprint`] has no `skip_serializing_if`, so every
+/// field is always present as an explicit key or an explicit `null` — I3.4's
+/// "unknown rather than inferred" marker. A document that dropped a field would
+/// change its `reference_digest()` and therefore fail the `scope_key`
+/// re-proof, and any substituted bytes change the `record_digest`. A check that
+/// cannot fire is not a check.
+fn decode_evidence_record_row(
+    row: &serde_json::Value,
+) -> Result<(CapabilityEvidenceRecord, OwnerEvidenceRevision), EvidenceBridgeError> {
+    let text = |field: &'static str| -> Result<String, EvidenceBridgeError> {
+        row.get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(EvidenceBridgeError::Payload(field))
+    };
+    let record_json = text("record_json")?;
+    let record_digest = text("record_digest")?;
+    if eliot_store_api::sha256_hex(record_json.as_bytes()) != record_digest {
+        return Err(EvidenceBridgeError::Payload("record_digest"));
+    }
+    let scope_key = text("scope_key")?;
+    let row_skill_id = text("skill_id")?;
+    let owner_revision = row
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(EvidenceBridgeError::Payload("revision"))?;
+    // Read the ORIGINAL recorded bytes, not a re-derivation over what we hold:
+    // the record is taken from the document the store committed under the digest
+    // it echoed, and the two re-proofs below bind those exact bytes.
+    let record: CapabilityEvidenceRecord =
+        serde_json::from_str(&record_json).map_err(|_| EvidenceBridgeError::Payload("record"))?;
+    if record.skill_id != row_skill_id {
+        return Err(EvidenceBridgeError::Payload("skill_id"));
+    }
+    if record.scope_fingerprint.reference_digest() != scope_key {
+        return Err(EvidenceBridgeError::Payload("scope_key"));
+    }
+    let revision = OwnerEvidenceRevision::issued(owner_revision, &record_digest)
+        .map_err(|_| EvidenceBridgeError::Payload("revision"))?;
+    Ok((record, revision))
+}
+
+/// Drains the complete capability-evidence record read into the held view.
+///
+/// The loop is the "complete paged hydration" the audit required: it plans one
+/// page, executes it through the authenticated Kernel route, applies it, and
+/// continues with the exact continuation token the store issued until a page
+/// reports no further eligible row. It is fail-closed in both directions:
+///
+/// * a page that reports truncation without a usable cursor is refused, so a
+///   bounded prefix is never reported as complete coverage;
+/// * a page that reports truncation must carry a continuation, and that
+///   continuation must **strictly advance** past the previous one. This is the
+///   house paging rule in `notification_board_attach.rs`: a short truncated page
+///   would mean the store knows of more eligible rows but cannot say where they
+///   resume, and continuing from a non-advancing cursor would either spin or
+///   silently under-read. Both are refused rather than accepted and hoped over,
+///   so a future provider cannot quietly break the coverage claim.
+///
+/// **Atomicity.** Pages are applied to a *staging* view and the held view is
+/// replaced only after the last page. A drain that stops early — a capacity
+/// refusal, a transport error, an invalid cursor — therefore leaves the held
+/// view byte-identical to what it was, instead of leaving a partially hydrated
+/// view that could admit the subset it happened to read. This is the difference
+/// between "no coverage" and "wrong coverage", and only the second one is a
+/// safety failure.
+///
+/// A returned report therefore always describes a **complete** drain: the view
+/// either holds every durable evidence record the store serves at this fence, or
+/// the call is an error and the view keeps its previous contents. The view
+/// never believes it is fully hydrated after a partial read.
+pub fn drain_capability_evidence_records(
+    admission: &mut GovernorCapabilityAdmission,
+    kernel: &super::daemon_kernel_client::DaemonKernelClient,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+    page_records: u16,
+) -> Result<CapabilityHydrationReport, EvidenceBridgeError> {
+    let mut staging = GovernorCapabilityAdmission::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_u32;
+    let mut minted = 0_usize;
+    let mut issued: Vec<String> = Vec::new();
+    let drained = loop {
+        let request = GovernorCapabilityAdmission::plan_evidence_record_read(
+            None,
+            page_records,
+            cursor,
+            scope.clone(),
+            fence.clone(),
+        )?;
+        let response = kernel
+            .store_named_blocking(request.clone())
+            .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
+        let page = staging.apply_evidence_record_page(&request, &response)?;
+        pages = pages.saturating_add(1);
+        minted = minted.saturating_add(page.minted);
+        if !page.truncated {
+            // Coverage is the staging view's own retained key count, read AFTER
+            // the final page is applied. Both endpoints of that number are named
+            // here so it does not have to be re-derived:
+            //
+            // WRITE SIDE  `CapabilityRegistry::insert`
+            //             (eliot-governor/capability_evidence.rs) locates an
+            //             existing key by `skill_id` + `scope_fingerprint`, and
+            //             `CapabilityRegistry::len` is that key vector's length.
+            // READ SIDE   `staging.len()` -> `GovernorCapabilityAdmission::len`
+            //             -> `self.registry.len()`, where `self.registry` is the
+            //             registry `apply_evidence_record_page` inserts
+            //             into above.
+            //
+            // It therefore counts DISTINCT keys, so a store that re-serves a
+            // page under a fresh cursor cannot inflate it. The `minted` sum is
+            // reported separately and is likewise duplicate-safe, because a
+            // replayed key contributes nothing to `minted`.
+            break (pages, staging.len(), minted);
+        }
+        // House paging rule (see `notification_board_attach.rs`): a page that
+        // reports truncation MUST carry a usable continuation, and that
+        // continuation must strictly advance. Both providers currently set
+        // `truncated` only after observing a further eligible row, so a short
+        // truncated page is not reachable today — but accepting one would let a
+        // future provider silently under-read the eligible set, which is the
+        // wrong direction for a coverage claim. Refuse instead.
+        let Some(next) = page.next_cursor else {
+            return Err(EvidenceBridgeError::Payload("next_cursor"));
+        };
+        if issued
+            .last()
+            .is_some_and(|previous| next.as_str() <= previous.as_str())
+        {
+            return Err(EvidenceBridgeError::Request(
+                "capability evidence hydration cursor did not advance".to_owned(),
+            ));
+        }
+        issued.push(next.clone());
+        cursor = Some(next);
+    };
+    admission.replace_drained_registry(staging);
+    let (pages, observed_records, minted_records) = drained;
+    let observed_records = u64::try_from(observed_records).unwrap_or(u64::MAX);
+    Ok(CapabilityHydrationReport {
+        pages,
+        observed_records,
+        minted_records,
+        retained: usize::try_from(observed_records).unwrap_or(usize::MAX),
+    })
+}
+
+/// One applied page of the capability-evidence record read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRecordPage {
+    /// Records this page newly retained (replays converge and are not counted).
+    ///
+    /// This is the count a coverage claim may use, because it counts DISTINCT
+    /// keys: a page that re-serves an already-retained key adds nothing. There is
+    /// deliberately no per-page row count alongside it. A served-row count
+    /// double-counts whenever a provider re-serves a page under a fresh cursor,
+    /// which would make a drain report more coverage than it actually read, and
+    /// that is the specific failure a coverage figure exists to exclude.
+    pub minted: usize,
+    /// Whether the store observed a further eligible row beyond this page.
+    pub truncated: bool,
+    /// The exact continuation token to present next, when truncated.
+    pub next_cursor: Option<String>,
+    /// Records the held view retains after this page.
+    pub retained: usize,
+}
+
+/// Coverage report of one complete capability-evidence drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityHydrationReport {
+    /// Pages drained to exhaustion.
+    pub pages: u32,
+    /// Durable evidence rows observed across every page.
+    /// Distinct `(skill_id, scope_fingerprint)` evidence keys the drained view
+    /// holds. This is the honest coverage figure: it is the registry's own
+    /// retained count, so a store that re-served a page under a fresh cursor
+    /// cannot inflate it. Never a sum of per-page row counts.
+    pub observed_records: u64,
+    /// Records the drain newly retained; a replayed record is not re-counted.
+    pub minted_records: usize,
+    /// Records the held view retains after the drain.
+    pub retained: usize,
+}
+
 /// Result of hydrating the held view from one canonical evidence read.
 ///
 /// `declared_records` is the count of `declared` / `imported_legacy`
@@ -502,6 +1022,15 @@ mod tests {
         ScopeId::new("governor").expect("scope")
     }
 
+    /// Deterministic stand-in for a store-issued evidence revision.
+    fn test_owner_revision(owner_revision: u64) -> OwnerEvidenceRevision {
+        OwnerEvidenceRevision::issued(
+            owner_revision,
+            &eliot_store_api::sha256_hex(&owner_revision.to_be_bytes()),
+        )
+        .expect("fixture revision is well formed")
+    }
+
     #[test]
     fn admission_is_held_and_consulted_with_real_time() {
         let mut admission = GovernorCapabilityAdmission::new();
@@ -515,12 +1044,15 @@ mod tests {
         assert_eq!(admission.len(), 1);
         // Declared/imported evidence never admits, even with no other data.
         assert!(!admission.admit_production_route("skill-demo", &scope(), 10));
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert!(admission.admit_production_route("skill-demo", &scope(), 10));
         // Positive evidence goes stale in the running daemon: expiry ends
         // admission without any other write.
         let mut expiring = GovernorCapabilityAdmission::new();
-        expiring.insert(probe("skill-demo", 1).expires_at(10));
+        expiring.insert(
+            probe("skill-demo", 1).expires_at(10),
+            test_owner_revision(1),
+        );
         assert!(expiring.admit_production_route("skill-demo", &scope(), 9));
         assert!(!expiring.admit_production_route("skill-demo", &scope(), 10));
     }
@@ -528,7 +1060,7 @@ mod tests {
     #[test]
     fn scope_change_stales_through_the_held_view() {
         let mut admission = GovernorCapabilityAdmission::new();
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert!(admission.admit_production_route("skill-demo", &scope(), 10));
         let mut changed = scope();
         changed.adapter_hash = Some("adapter-hash-2".into());
@@ -536,7 +1068,13 @@ mod tests {
             adapter_hash: true,
             ..ScopeDependencySelector::none()
         };
-        assert_eq!(admission.apply_scope_change(&changed, selector), 1);
+        assert_eq!(
+            admission
+                .apply_scope_change(&changed, selector, &test_owner_revision(1).evidence_ref)
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled,
+            1
+        );
         assert!(!admission.admit_production_route("skill-demo", &changed, 10));
     }
 
@@ -544,7 +1082,7 @@ mod tests {
     fn required_set_and_standing_read_through_the_held_view() {
         let mut admission = GovernorCapabilityAdmission::new();
         assert!(admission.required_set().is_empty());
-        admission.insert(probe("skill-demo", 1));
+        admission.insert(probe("skill-demo", 1), test_owner_revision(1));
         assert_eq!(admission.required_set(), vec!["skill-demo".to_owned()]);
         assert_eq!(
             admission.skill_standing("skill-demo", 10),

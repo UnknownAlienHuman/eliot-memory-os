@@ -1248,6 +1248,16 @@ pub enum AnchorPrecision {
     Section,
     Paragraph,
     Line,
+    /// The finest named position inside a source: a named symbol such as a
+    /// function, type or field path.
+    ///
+    /// I21.7 names a `symbol` beside a `line` among the things a file-level or
+    /// document-level support does not automatically support, so the ladder has
+    /// to be able to say "this source supports the line, not the symbol". The
+    /// rung sits between [`Self::Line`] and [`Self::ByteRange`] and the
+    /// declaration order is load-bearing: [`Self::permits`] compares with
+    /// `>=`, so moving a variant would silently change which admissions hold.
+    Symbol,
     ByteRange,
 }
 
@@ -1596,6 +1606,61 @@ fn admit_locator(
     }
 }
 
+/// Applies the I21.7 reference gate of one delivered `ExactCitation::anchor`.
+///
+/// A citation is the pair I21.7 names - a source identity *and* a pointer a
+/// reader follows - and only the identity half was gated: the `source_handle`
+/// was checked against [`AllowedReferenceManifest::allows`] and the anchor was
+/// read with [`text`], which is a blank/control predicate and not a reference
+/// check. A syntactically valid URL the manifest does not list therefore became
+/// a genuinely supported citation, the sentence A1 forbids.
+///
+/// The verdict is [`admit_locator`]'s, delegated rather than repeated: this
+/// crate exports one closed classifier and both reference surfaces of a bundle
+/// must read it, since a boundary deciding "is this a URL?" on its own terms is
+/// how `https://attacker.example/x` became citable. So an
+/// [`LocatorClass::ExternalUri`] anchor must be admitted by
+/// [`AllowedReferenceManifest::admits_url`], and a spelling the classifier
+/// cannot read is refused by name.
+///
+/// [`LocatorClass::InternalUri`] and [`LocatorClass::OpaqueHandle`] stay
+/// allowed, and that is safe because neither carries authority: they are
+/// coordinates into the source whose identity the `source_handle` gate admitted
+/// immediately before this call. This arm is also what keeps human anchors
+/// working - `section-2`, `Introduction`, `3.1` and `Ch. 4: Overview` all
+/// classify opaque (`Ch. 4` is not an RFC 3986 scheme token, the space fails).
+/// Refusing them would make the gate stricter than A1, which gates references,
+/// not prose.
+///
+/// A1's line-range spelling needs no separate rule: `README.md` is a valid
+/// scheme token, so `README.md:12-40` reads as an external URI and is refused
+/// here. Re-typing it as a line range first, the way the Researcher does for a
+/// *candidate handle*, would move the refusal off the URL allowlist onto the
+/// handle allowlist for a string this surface already refuses - the two
+/// surfaces differ because a candidate handle has no admitted source behind it
+/// while this anchor does. The precision half needs no rule at all:
+/// `allowed_anchor_precision.permits` already refuses a line claim against a
+/// coarser ceiling independently of the anchor text.
+///
+/// The caller runs [`text`] first, so a blank anchor is still
+/// [`ResearchContractError::InvalidText`] rather than a classification verdict -
+/// mirroring the blank-locator guard at `sources[].locator`.
+///
+/// # Errors
+///
+/// [`ResearchContractError::UrlNotAdmitted`] for an authority-bearing anchor
+/// outside `url_handles`, or [`ResearchContractError::LocatorNotClassifiable`]
+/// for an unreadable spelling. Neither is introduced here: `UrlNotAdmitted`
+/// says "delivered locator URL" because it was written for the locator surface,
+/// and one rule answering both surfaces is the point rather than a reason to
+/// fork the error.
+fn admit_citation_anchor(
+    anchor: &str,
+    manifest: &AllowedReferenceManifest,
+) -> Result<(), ResearchContractError> {
+    admit_locator(anchor, manifest)
+}
+
 impl ResearchEvidenceBundle {
     pub fn validate_against(
         &self,
@@ -1734,7 +1799,16 @@ impl ResearchEvidenceBundle {
                 {
                     return Err(ResearchContractError::CitationNotAllowed);
                 }
+                // A1: a citation is a source identity *and* a pointer, and only
+                // the identity half was gated. The anchor is the pointer a
+                // reader follows, so it is a reference in its own right and is
+                // gated here on the same terms as the source locator above. This
+                // runs after the `source_handle` gate on purpose, for the reason
+                // `admit_citation_anchor` states: that gate is what makes a
+                // non-authority anchor a coordinate into an admitted source
+                // rather than a reference in its own right.
                 text(&citation.anchor, "citation.anchor")?;
+                admit_citation_anchor(&citation.anchor, &request.allowed_references)?;
             }
         }
         Ok(())

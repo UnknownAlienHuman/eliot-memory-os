@@ -6,9 +6,16 @@
 
 #![forbid(unsafe_code)]
 
+mod revocation_digest;
 mod surface_types;
 mod validation;
 
+pub use revocation_digest::{
+    REVOCATION_DISPOSITION_COMPLETE, REVOCATION_DISPOSITION_PARTIAL,
+    REVOCATION_DISPOSITION_UNKNOWN, REVOCATION_HISTORY_EVIDENCE_VERSION,
+    RevocationClosureDigestBounds, RevocationClosureDigestInput, revocation_affected_members,
+    revocation_affected_members_digest, revocation_closure_canonical_digest,
+};
 pub use surface_types::*;
 pub use validation::{
     SecurityContractError, import_legacy_selection_receipt_v1, selection_member_digest,

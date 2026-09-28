@@ -82,8 +82,9 @@ use crate::learning_closure::{
     AdmissionState, AttemptOutcomesAndDeltas, CampaignAndTarget, ClosureAssembly,
     ClosureCompletion, ClosureDisposition, ClosureDue, ClosureLifecycleEvent, ClosurePolicy,
     ClosureRecordAssembly, LearningClosureError, OutcomeHarmAndEconomicsEvidence,
-    OverlayAndActivationAssessments, PriorClosureHistory, assemble_campaign_learning_closure,
-    assemble_campaign_learning_closure_with_evidence, trigger_closure_due,
+    OverlayAndActivationAssessments, PriorClosureHistory, allowed_disposition,
+    assemble_campaign_learning_closure, assemble_campaign_learning_closure_with_evidence,
+    supported_episode_disposition, trigger_closure_due,
 };
 use crate::{CandidateState, ImprovementCandidate, ImprovementSurface};
 
@@ -2257,16 +2258,23 @@ pub fn governed_assemble_campaign_learning_closure(
 /// major checkpoint opens it only when the policy admits checkpoints, else
 /// [`BoundsError::InvalidPolicy`] is returned and nothing is assembled.
 ///
-/// The record carries exactly one [`ClosureDisposition::allowed`] disposition
-/// and the stored canonical evidence from `completion`, so a consequential
-/// episode assembled here is learning-closed with an explicit disposition
-/// (I12.24: "A consequential episode is not learning-closed until it has a
-/// disposition") rather than as a disposition-less candidate. When the
-/// decision core yields a bounded further-evidence disposition instead of a
-/// candidate, that disposition is returned untouched and `completion` is
-/// unused. Returns the record assembly together with the trigger assessment
-/// so the caller (finish job / checkpoint owner) can record debt when
-/// closure stays open.
+/// The per-episode disposition is READ FROM the exact canonical attempt and
+/// delta records through [`supported_episode_disposition`], never taken on
+/// the caller's word: a completion that asserts anything other than that
+/// disposition, or the owner-receipt-backed `SCOPED_UPDATE_PROMOTED`, is
+/// refused with
+/// [`LearningClosureError::DispositionUnsupported`]. So the closed record and
+/// the bounded further-evidence outcome both restate their answer in the
+/// allowed vocabulary, and a consequential episode assembled here is
+/// learning-closed with an explicit disposition (I12.24: "A consequential
+/// episode is not learning-closed until it has a disposition") rather than as
+/// a disposition-less candidate. A decision-core name outside
+/// [`ClosureDisposition::allowed`] is passed through unchanged, because
+/// restating it is the only honest answer this cell can give.
+///
+/// Returns the record assembly together with the trigger assessment so the
+/// caller (finish job / checkpoint owner) can record debt when closure stays
+/// open.
 #[allow(clippy::too_many_arguments)]
 pub fn governed_assemble_at_lifecycle_event(
     event: ClosureLifecycleEvent,
@@ -2285,6 +2293,7 @@ pub fn governed_assemble_at_lifecycle_event(
             "checkpoint closure not admitted by closure policy",
         )));
     }
+    let supported = supported_episode_disposition(&exact_attempt_outcomes_and_deltas);
     let assembly = governed_assemble_campaign_learning_closure(
         exact_campaign_and_target.clone(),
         exact_attempt_outcomes_and_deltas.clone(),
@@ -2296,17 +2305,40 @@ pub fn governed_assemble_at_lifecycle_event(
     )?;
     let record = match assembly {
         ClosureAssembly::Disposition(disposition) => {
+            let named = ClosureDisposition::parse(&disposition.disposition);
+            let disposition = match named {
+                Some(name) => allowed_disposition(
+                    name,
+                    disposition.missing_evidence,
+                    disposition.missing_owner,
+                    disposition.open_debt,
+                    Some(disposition.retain_ref),
+                ),
+                None => disposition,
+            };
             ClosureRecordAssembly::Disposition(disposition)
         }
-        ClosureAssembly::Candidate(_) => assemble_campaign_learning_closure_with_evidence(
-            exact_campaign_and_target,
-            exact_attempt_outcomes_and_deltas,
-            exact_overlay_and_activation_assessments,
-            exact_outcome_harm_and_economics_evidence,
-            prior_closure_history,
-            closure_policy,
-            completion,
-        )?,
+        ClosureAssembly::Candidate(_) => {
+            if completion.disposition != ClosureDisposition::ScopedUpdatePromoted
+                && completion.disposition != supported
+            {
+                return Err(GovernedClosureError::Closure(
+                    LearningClosureError::DispositionUnsupported {
+                        asserted: completion.disposition.as_str().to_string(),
+                        supported: supported.as_str().to_string(),
+                    },
+                ));
+            }
+            assemble_campaign_learning_closure_with_evidence(
+                exact_campaign_and_target,
+                exact_attempt_outcomes_and_deltas,
+                exact_overlay_and_activation_assessments,
+                exact_outcome_harm_and_economics_evidence,
+                prior_closure_history,
+                closure_policy,
+                completion,
+            )?
+        }
     };
     Ok((record, due))
 }

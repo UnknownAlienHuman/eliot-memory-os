@@ -87,7 +87,7 @@ use eliot_ors::{
     test_support::{KernelRouteEvidence, KernelRouteStoreFixture},
 };
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CanonicalStoreClient, CommitId, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, Resubmission,
@@ -3814,6 +3814,33 @@ struct StartupRoute {
     client: EbpCanonicalStoreClient<eliot_ipc::NamedPipeTransport>,
     server_task: tokio::task::JoinHandle<()>,
     dir: std::path::PathBuf,
+}
+
+/// Test-only route for the startup scan's named-gateway port (issue #1713).
+///
+/// The production route is `KernelStoreGateway`, whose impl lives in
+/// `store_gateway.rs` behind the `#[cfg(windows)]` gate; this module is not
+/// that crate root's cfg, so the scan needs a test route over the same
+/// connected client. It exists ONLY to keep the existing startup-scan cases
+/// compiling after the scan's receipt parameter changed, and it deliberately
+/// reads the raw trait method rather than copying the gateway's checks — the
+/// scan's accounting is what these cases exercise, and the named gateway's
+/// own refusals are exercised through the real gateway in the production
+/// route.
+impl crate::store_write_reservation::StartupReceiptRoute
+    for EbpCanonicalStoreClient<eliot_ipc::NamedPipeTransport>
+{
+    fn observe_receipt<'a>(
+        &'a self,
+        _state_fence: &'a StateFence,
+        operation_id: OperationId,
+    ) -> crate::store_write_reservation::StartupReceiptObservation<'a> {
+        Box::pin(async move {
+            CanonicalStoreClient::receipt(self, operation_id)
+                .await
+                .map_err(crate::store_write_reservation::ReservationWriteError::Store)
+        })
+    }
 }
 
 /// Connects the producer's store port over a real named-pipe EBP

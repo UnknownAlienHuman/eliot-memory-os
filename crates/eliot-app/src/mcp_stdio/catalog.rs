@@ -1045,6 +1045,10 @@ pub(super) fn metrics_tool_definitions() -> Vec<Value> {
     ]
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "tool catalog is one declarative literal: splitting across fns hides catalog completeness (#838)"
+)]
 pub(super) fn task_tool_definitions() -> Vec<Value> {
     vec![
         tool(

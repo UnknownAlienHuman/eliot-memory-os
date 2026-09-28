@@ -40,11 +40,12 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
-    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
-    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
-    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
-    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+    BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeEventCapacityDimension, BridgeEventCapacityPressure,
+    BridgeEventLocalPhase, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
+    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, BridgeTransportBackpressure,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -600,6 +601,31 @@ fn parse_owner_disposition(text: &str) -> Option<EventDisposition> {
     }
 }
 
+// Keep consumed-receipt eligibility aligned with the policy installed in
+// `AgentBridgeCore` below. `CursorPolicy::required_for` is private to the
+// core crate, so these shared values are the composition-root declaration
+// used by both sides of the edge.
+const DURABLE_CONTROL_CURSOR_PHASE: AckPhase = AckPhase::Durable;
+const DURABLE_OBSERVATION_CURSOR_PHASE: AckPhase = AckPhase::Normalized;
+
+fn owner_phase_satisfies_cursor_policy(class: DeliveryClass, observed: AckPhase) -> bool {
+    let required = match class {
+        DeliveryClass::DurableControl => DURABLE_CONTROL_CURSOR_PHASE,
+        DeliveryClass::DurableObservation => DURABLE_OBSERVATION_CURSOR_PHASE,
+        DeliveryClass::BestEffortTelemetry => return false,
+    };
+    match required {
+        AckPhase::Durable => matches!(
+            observed,
+            AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
+        ),
+        AckPhase::Normalized => matches!(observed, AckPhase::Normalized | AckPhase::Applied),
+        AckPhase::Applied => observed == AckPhase::Applied,
+        AckPhase::Rejected => observed == AckPhase::Rejected,
+        AckPhase::Received | AckPhase::Unknown => false,
+    }
+}
+
 /// Decodes one event-route forward reply into the port outcome (Implements
 /// #2561 item 2).
 ///
@@ -611,8 +637,9 @@ fn parse_owner_disposition(text: &str) -> Option<EventDisposition> {
 /// guessed. Best-effort answers with `BestEffortForwarded` or the typed
 /// `BestEffortDropped` gap reason. Class confusion (a durable phase on a
 /// best-effort event or vice versa) refuses. The bridge-owned delivered
-/// frontier advances only on digest-verified durable holdings — never on a
-/// conflict — so reconciliation acks exactly what the owner durably holds.
+/// frontier advances only on digest-verified holdings at the configured
+/// cursor phase — never on an earlier phase or a conflict — so reconciliation
+/// offers only what the owner justified for this delivery class.
 fn decode_event_port_outcome(
     event: &EventEnvelope,
     value: &serde_json::Value,
@@ -739,7 +766,11 @@ fn decode_durable_outcome(
         ));
     }
     let outcome = acknowledge_owner_phase(event, phase, disposition)?;
-    if disposition == EventDisposition::Accepted || disposition == EventDisposition::Duplicate {
+    if matches!(
+        disposition,
+        EventDisposition::Accepted | EventDisposition::Duplicate
+    ) && owner_phase_satisfies_cursor_policy(event.delivery_class, phase)
+    {
         port.note_delivered(&event.stream_id, event.sequence);
     }
     Ok(outcome)
@@ -1015,6 +1046,18 @@ fn decode_recovery_reply_coverage(
         unscoped_gaps_complete,
         unscoped_gaps_continuation,
     })
+}
+
+fn decode_recovery_window_expiry(
+    reconciliation: &serde_json::Value,
+) -> Result<u64, ProviderFailure> {
+    let expires_at_ms = recovery_cursor(reconciliation, "expires_at_ms")?;
+    if expires_at_ms == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner window expiry must be nonzero",
+        ));
+    }
+    Ok(expires_at_ms)
 }
 
 /// Decodes one owner stream page whole: identities, records, cursors, and
@@ -1309,7 +1352,15 @@ fn check_reconciliation_identity(
     }
     if let Some(request) = expected {
         let window_key = recovery_digest(reconciliation, "window_key")?;
-        if request.window_key() != window_key.as_str() {
+        if request.window_key().is_none() && !request.is_resume() {
+            return Err(event_shape_failure(
+                "recovery continuation refused: non-resume token lacks its owner window identity",
+            ));
+        }
+        if request
+            .window_key()
+            .is_some_and(|expected| expected != window_key.as_str())
+        {
             return Err(event_shape_failure(
                 "recovery continuation refused: owner window identity changed",
             ));
@@ -1350,43 +1401,14 @@ fn decode_reconciliation_outcome(
     }
     let live_generation = check_reconciliation_identity(binding, reconciliation, expected)?;
     let window_key = recovery_digest(reconciliation, "window_key")?;
-    let window_status = match reconciliation
-        .get("window_status")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("active") => RecoveryWindowStatus::Active,
-        Some("moved") => RecoveryWindowStatus::Moved,
-        Some("expired") => RecoveryWindowStatus::Expired,
-        _ => {
-            return Err(event_shape_failure(
-                "reconciliation refused: unsupported owner window status",
-            ));
-        }
-    };
+    let expires_at_ms = decode_recovery_window_expiry(reconciliation)?;
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
     // The typed disposition, the explicit unresolved frontier, and the page
     // commitment are all resolved BEFORE any fact below is decoded, let alone
     // applied: a page whose commitment cannot be recomputed from the answer's
     // own legs is refused whole, so no known fact and no unresolved frontier
     // is ever applied half-verified.
-    let disposition = decode_recovery_window_disposition(reconciliation)?;
-    // The typed disposition and the legacy status leg must agree, so an
-    // answer cannot present a refresh-required walk as an active one (or the
-    // reverse) and be read through whichever leg the consumer happens to use.
-    let expected_status = match disposition {
-        BridgeRecoveryWindowDisposition::Active => "active",
-        BridgeRecoveryWindowDisposition::Moved => "moved",
-        BridgeRecoveryWindowDisposition::Expired => "expired",
-    };
-    if reconciliation
-        .get("window_status")
-        .and_then(serde_json::Value::as_str)
-        != Some(expected_status)
-    {
-        return Err(event_shape_failure(
-            "reconciliation refused: window status disagrees with its typed disposition",
-        ));
-    }
+    let (disposition, window_status) = decode_recovery_window_state(reconciliation)?;
     let unresolved = decode_recovery_unresolved_frontier(reconciliation)?;
     verify_recovery_page_commitment(reconciliation, &window_key, disposition, &unresolved)?;
     let stream_facts = decode_reconciliation_streams(reconciliation, live_generation, &mut budget)?;
@@ -1418,6 +1440,7 @@ fn decode_reconciliation_outcome(
         binding,
         receipt_ref,
         window_key,
+        expires_at_ms,
         window_status,
         live,
         presenting_connection,
@@ -1549,12 +1572,20 @@ fn decode_unscoped_gaps(
 fn recovery_scope_value(
     request: &RecoveryReadRequest,
 ) -> Result<BridgeRecoverySelector, ProviderFailure> {
+    if request.is_resume() {
+        return Ok(BridgeRecoverySelector::Resume {
+            version: BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+        });
+    }
+    let window_key = request.window_key().ok_or_else(|| {
+        event_shape_failure("recovery continuation has no owner-issued window key")
+    })?;
     if let Some((stream_id, after_sequence, cut, event_limit, gap_offset, gap_limit)) =
         request.stream_scope()
     {
         Ok(BridgeRecoverySelector::Stream {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
-            window_key: request.window_key().to_owned(),
+            window_key: window_key.to_owned(),
             stream_id: stream_id.to_owned(),
             owner_incarnation: cut.owner_incarnation(),
             owner_revision: cut.owner_revision(),
@@ -1569,14 +1600,14 @@ fn recovery_scope_value(
     } else if let Some((after_stream, stream_limit)) = request.stream_list_scope() {
         Ok(BridgeRecoverySelector::Streams {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
-            window_key: request.window_key().to_owned(),
+            window_key: window_key.to_owned(),
             after_stream: after_stream.to_owned(),
             stream_limit,
         })
     } else if let Some((after_gap_scope, gap_offset, gap_limit)) = request.unscoped_gap_scope() {
         Ok(BridgeRecoverySelector::UnscopedGaps {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
-            window_key: request.window_key().to_owned(),
+            window_key: window_key.to_owned(),
             after_gap_scope: after_gap_scope.to_owned(),
             gap_offset,
             gap_limit,
@@ -1689,6 +1720,41 @@ fn decode_recovery_window_disposition(
     Ok(disposition)
 }
 
+fn decode_recovery_window_state(
+    reconciliation: &serde_json::Value,
+) -> Result<(BridgeRecoveryWindowDisposition, RecoveryWindowStatus), ProviderFailure> {
+    let status = match reconciliation
+        .get("window_status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("active") => RecoveryWindowStatus::Active,
+        Some("moved") => RecoveryWindowStatus::Moved,
+        Some("expired") => RecoveryWindowStatus::Expired,
+        _ => {
+            return Err(event_shape_failure(
+                "reconciliation refused: unsupported owner window status",
+            ));
+        }
+    };
+    let disposition = decode_recovery_window_disposition(reconciliation)?;
+    // The typed disposition and legacy status leg must agree.
+    let expected_status = match disposition {
+        BridgeRecoveryWindowDisposition::Active => "active",
+        BridgeRecoveryWindowDisposition::Moved => "moved",
+        BridgeRecoveryWindowDisposition::Expired => "expired",
+    };
+    if reconciliation
+        .get("window_status")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_status)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: window status disagrees with its typed disposition",
+        ));
+    }
+    Ok((disposition, status))
+}
+
 /// A complete finite event page must account for its declared upper bound.
 /// A truncated response with a null continuation cannot turn the missing
 /// suffix into completed inventory. The requested predecessor permits a
@@ -1753,7 +1819,7 @@ fn check_recovery_page_ordinals(
         }
         last_position = position;
     }
-    if expected.is_none_or(|request| request.stream_list_scope().is_some())
+    if expected.is_none_or(|request| request.is_resume() || request.stream_list_scope().is_some())
         && let Some(cursor) = reconciliation
             .get("stream_list_continuation")
             .and_then(serde_json::Value::as_str)
@@ -1847,6 +1913,12 @@ fn check_expected_continuation(
         .and_then(serde_json::Value::as_str)
         != Some("active")
     {
+        return Ok(());
+    }
+    if request.is_resume() {
+        for page in stream_facts {
+            check_finite_page_end(page, page.acked_cursor())?;
+        }
         return Ok(());
     }
     if let Some((stream_id, after_sequence, cut, _, gap_offset, _)) = request.stream_scope() {
@@ -2527,7 +2599,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// rights, including after a reconnect, and possession of the token
     /// alone authorizes nothing. The reply decodes through the same
     /// validating path as the full read, additionally requiring the
-    /// selected scope, predecessor, and next continuation to match.
+    /// selected scope, predecessor, and next continuation to match. A Resume
+    /// selector carries no window identity: ORS resolves the unique persisted
+    /// owner-scoped window and its returned key is accepted only through the
+    /// page commitment and reconciliation-key checks.
     fn reconcile_continue(
         &mut self,
         binding: &AttachBinding,
@@ -3066,8 +3141,11 @@ impl BridgeRunner {
         // reads event ownership and cursors through the admitted Kernel
         // observation route (#2561). The policy still declares the honest
         // requirement the owner answers must satisfy.
-        let cursor_policy = CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)
-            .map_err(RuntimeBuildError::BridgeContract)?;
+        let cursor_policy = CursorPolicy::new(
+            DURABLE_CONTROL_CURSOR_PHASE,
+            DURABLE_OBSERVATION_CURSOR_PHASE,
+        )
+        .map_err(RuntimeBuildError::BridgeContract)?;
         Ok(Self {
             profile,
             runtime,
@@ -3379,6 +3457,26 @@ impl BridgeRunner {
         self.core
             .project_tool_result(result_bytes, source_handle, tokens_rendered, delivery)
     }
+    /// Observes the delivery completeness of one recorded hot view (I7.24
+    /// disposition on the live invocation path).
+    ///
+    /// Maps the measured truncation flag (preview shorter than the exact
+    /// delivered bytes) to the owner's observed delivery state: `TRUNCATED`
+    /// when bytes were withheld behind the handle, `FULL` otherwise. No token
+    /// measurement is involved; token-measured receipts still project via
+    /// [`Self::project_tool_result_receipt`] when a route emits a bound
+    /// attestation, and gate via [`ToolResultReceipt::check_complete_evidence`].
+    /// This observation lets a verifier that holds only the hot view cite what
+    /// was actually delivered instead of mistaking a preview for complete
+    /// evidence.
+    #[must_use]
+    pub fn observed_hot_delivery(view: &HotResourceView) -> DeliveryStatus {
+        if view.is_truncated() {
+            DeliveryStatus::Truncated
+        } else {
+            DeliveryStatus::Full
+        }
+    }
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. Zero while detached; cleared by the core on every attach.
     #[must_use]
@@ -3430,6 +3528,13 @@ impl BridgeRunner {
         if self.expand_resource(view.handle()).ok()? != bytes {
             return None;
         }
+        // I7.24 disposition on the live path: observe the measured truncation
+        // flag so the delivered completeness is cited from real bytes, never
+        // estimated. Token-measured receipt projection and the
+        // complete-evidence gate still await a route-owner attestation and a
+        // production verifier consumer; until then the disposition is observed
+        // here and the evidence slot carries the preview+handle.
+        let _observed = Self::observed_hot_delivery(&view);
         Some(view)
     }
     /// Notes the owner-supplied bootstrap context for this session.

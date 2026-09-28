@@ -121,7 +121,9 @@ use crate::dispatch_material::{
     stage_control_bytes,
 };
 use crate::parent_authority::edge_now_ms;
-use crate::parent_runtime::{AdmittedRuntime, build_admitted_runtime};
+use crate::parent_runtime::{
+    AdmittedRuntime, ProcessTermination, ProcessTerminationObservation, build_admitted_runtime,
+};
 
 /// Request-frame wire identity, matched exactly by the loop's parser.
 pub const WASM_HOST_REQUEST_WIRE_ID: &str = "eliot.wasm.host-request";
@@ -224,8 +226,16 @@ enum WorkerState {
 
 /// Accepted-command lifecycle of one command handed to the worker. Distinct
 /// from the drain phase: this is the per-command accounting, and it is how
-/// "requested", "accepted by the command channel" and "outcome observed"
-/// stay separate facts (issue #2785 I1).
+/// "requested" and "accepted by the command channel" stay separate facts
+/// (issue #2785 I1).
+///
+/// This is the bound-1 channel's capacity slot, so it carries at most one
+/// command and is never used as a history record: an observed outcome
+/// retires the accepted slot before the observation runs, so the follow-up
+/// that observation requests can take it. The outcome-observed fact itself
+/// is retained as history by the result-event sequence
+/// ([`BoundedRequestLoop::retained`]), not here (issue #2785 audit,
+/// defect 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandDelivery {
     /// Admission produced the command; it has not been handed to the
@@ -235,9 +245,6 @@ enum CommandDelivery {
     /// `try_send` succeeded: the worker received the command and exactly
     /// this correlated reply is owed.
     Accepted { command: WorkerCommand, token: u64 },
-    /// The worker replied for the accepted command; the reply is being
-    /// observed now.
-    OutcomeObserved(WorkerCommand),
 }
 
 /// Fail-closed loop errors. Stable codes plus one stable field name; no
@@ -2395,6 +2402,7 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
             admitted,
             live: _,
             engine_binding: _,
+            termination: _,
         } = runtime;
         let mut runner: WasmHostRunner = runner;
         let mut attempt: Option<InvocationRequest> = None;
@@ -2564,10 +2572,11 @@ pub struct BoundedRequestLoop {
     delivery: Option<CommandDelivery>,
     /// This loop's own termination protocol.
     worker: WorkerState,
-    /// Whether the outer process-containment owner reported the admitted
-    /// P-03 guest child as exited. `Some(true)` is the only observation
-    /// that may be called a clean stop; `None` and `Some(false)` both stay
-    /// unresolved for that owner, whatever this loop did.
+    /// The operation-bound process-termination disposition read back from
+    /// the P-03 owner's own evidence for the exact admitted child.
+    /// `Some(true)` is the only observation that may be called a clean
+    /// stop; `None` and `Some(false)` both stay unresolved for the outer
+    /// process-containment owner, whatever this loop did.
     guest_child_exited: Option<bool>,
     /// Drain bound: the admitted grant wall deadline plus the control-poll
     /// cadence the drain itself waits on. Execution already ran under that
@@ -3130,6 +3139,11 @@ pub fn run_request_loop(
         drain_bound(material),
     );
     state = install_interrupt_handle(state, &runtime.runner);
+    // The operation-bound process-termination projection is read on this
+    // control thread, not inside the worker: it is a read-only handle onto
+    // the P-03 owner's own evidence sink and outlives the worker's own move
+    // of the runtime (issue #2785 audit, defect 2).
+    let termination = runtime.termination.clone();
     let worker = spawn_worker(runtime, state.max_in_flight);
     let drive = drive_loop(
         &mut state,
@@ -3138,7 +3152,7 @@ pub fn run_request_loop(
         &worker.outcomes,
         &worker.handle,
     );
-    drain_and_shutdown_request_worker(&mut state, &mut channel, worker, drive)
+    drain_and_shutdown_request_worker(&mut state, &mut channel, &termination, worker, drive)
 }
 
 /// Drains accepted work, shuts down and joins the worker, then returns the
@@ -3146,6 +3160,7 @@ pub fn run_request_loop(
 fn drain_and_shutdown_request_worker(
     state: &mut BoundedRequestLoop,
     channel: &mut DeliverySetChannel,
+    termination: &ProcessTermination,
     worker: EngineWorker,
     drive: Result<(), LoopError>,
 ) -> Result<WasmHostResultFrame, LoopError> {
@@ -3269,11 +3284,20 @@ fn drain_and_shutdown_request_worker(
     if let Some(error) = confirm_error {
         return Err(error);
     }
-    // Containment evidence, kept separate from cleanup evidence (issue #2785
-    // I6): "the worker stopped" is not "the effect is resolved". The
-    // operation's disposition belongs to the outer process-containment
-    // owner, and this process can only attest what it observed itself.
-    state.guest_child_exited = Some(operation_containment_observed(state));
+    // Child termination, kept separate from cleanup evidence and from the
+    // result delivery (issue #2785 I6, audit defect 2): "the worker stopped"
+    // is not "the effect is resolved", and neither is "the frame was
+    // published". The disposition is read from the P-03 owner's own process
+    // evidence for the exact admitted child — an actual exit/reap or an
+    // owner-confirmed containment. The seated engine name, this loop's own
+    // join, an interrupt request, and the published frame are all other
+    // facts and supply none of it. A readback that is missing, failed, or
+    // poisoned stays unknown, and an unknown disposition fails the loop
+    // rather than reclaiming anything.
+    state.guest_child_exited = match termination.observed() {
+        ProcessTerminationObservation::Proven => Some(true),
+        ProcessTerminationObservation::Unknown => Some(false),
+    };
     if state.guest_child_exited != Some(true) {
         return Err(LoopError::OperationContainmentUnresolved {
             operation_id: UNATTESTED_OPERATION,
@@ -3353,34 +3377,6 @@ fn admit_external_control(
     }
 }
 
-/// The operation-level containment disposition this process actually
-/// observed for its own effect (issue #2785 I6).
-///
-/// The P-03 guest child is what this operation really ran, and the loop
-/// observed that child through this process's own already-closed runtime
-/// ports: an observation of the seated engine for this admitted operation
-/// is a report about the operation itself, and it is present exactly when
-/// the execution phase produced an engine observation. Anything else — a
-/// refusal before execution, a lost reply, a publication that never
-/// reached the owner, or a nonterminating worker this process contained —
-/// means the operation's effect is unresolved for the outer
-/// process-containment owner, which owns both the outer process and the
-/// P-03 child's terminal reap. This function never upgrades an unresolved
-/// effect and never claims a cancellation this process did not perform.
-fn operation_containment_observed(state: &BoundedRequestLoop) -> bool {
-    // A worker this process contained is running: its effect cannot be
-    // called resolved here under any observation the loop holds.
-    if state.worker == WorkerState::Contained {
-        return false;
-    }
-    // The terminal execution evidence is this operation's effect, and a
-    // settled operation always carries the engine observation that ran it.
-    state
-        .published()
-        .is_some_and(|frame| frame.engine_implementation_id.is_some())
-        && state.guest_child_exited.is_none()
-}
-
 /// The loop's own terminal residual on a path that ends without a joinable
 /// worker (issue #2785 A6/I6). The retained execution evidence, the
 /// retained cleanup evidence, and the retained operation record are handed
@@ -3394,11 +3390,9 @@ fn contained_failure(
 ) -> LoopError {
     state.worker = WorkerState::Contained;
     let executing = match state.delivery {
-        Some(
-            CommandDelivery::Requested(command)
-            | CommandDelivery::Accepted { command, .. }
-            | CommandDelivery::OutcomeObserved(command),
-        ) => command_name(command),
+        Some(CommandDelivery::Requested(command) | CommandDelivery::Accepted { command, .. }) => {
+            command_name(command)
+        }
         None => EXECUTE_COMMAND,
     };
     let _cleanup = channel.cleanup_output_helper();
@@ -3699,11 +3693,19 @@ fn consume_worker_outcome(
         return Err(denied("uncorrelated-outcome"));
     }
     let command = outcome.command;
-    state.delivery = Some(CommandDelivery::OutcomeObserved(command));
-    let frame = state.on_outcome(outcome);
-    // The command slot is free again as soon as the reply is observed, so
-    // the follow-up the observation requested can take the single slot.
+    // The accepted command's own reply settled, so that accepted slot is
+    // retired BEFORE the outcome is observed (issue #2785 audit, defect 1).
+    // `on_outcome` may run `settle_uncertain -> request_follow_up`, and that
+    // follow-up can only be requested while `command_slot_free()` holds;
+    // leaving the old slot occupied would suppress the follow-up the
+    // uncertain observation is supposed to send, and clearing the slot
+    // afterwards would erase the successor it just selected.
+    //
+    // The preceding equality check must remain before this mutation.
     state.delivery = None;
+    let frame = state.on_outcome(outcome);
+    // Preserve any Requested(Cancel/Reconcile) created by on_outcome: the
+    // slot now holds that successor, never the command just settled.
     if let Some(frame) = frame.as_ref() {
         // The exact outcome is observed here: complete the accepted
         // control before publishing, so the ack is durable ahead of
@@ -3839,9 +3841,9 @@ fn supervise_to_worker_exit(
     // drain verdict.
     if let Some(delivery) = state.delivery {
         let command = match delivery {
-            CommandDelivery::Requested(command)
-            | CommandDelivery::Accepted { command, .. }
-            | CommandDelivery::OutcomeObserved(command) => command,
+            CommandDelivery::Requested(command) | CommandDelivery::Accepted { command, .. } => {
+                command
+            }
         };
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: command_name(command),
@@ -3852,10 +3854,17 @@ fn supervise_to_worker_exit(
     true
 }
 
-/// Consumes one late outcome that arrived while the worker was terminating.
-/// A reply with no accepted command to settle is an uncorrelated outcome,
-/// and a failed delivery is a delivery residual — neither is allowed to
-/// change the termination verdict.
+/// Consumes one late outcome that arrived while the worker was terminating,
+/// under the same slot accounting as [`consume_worker_outcome`] (issue #2785
+/// audit, defect 1): the accepted slot is retired before the observation
+/// runs, so the observation settles against a free capacity slot.
+///
+/// The shutdown supervisor holds no command sender, so a follow-up this
+/// observation requests is terminalized as unresolved instead of becoming a
+/// successor nobody can deliver — the drain is not restarted for it. A reply
+/// with no accepted command to settle is an uncorrelated outcome, and a
+/// failed delivery is a delivery residual — neither is allowed to change the
+/// termination verdict.
 fn observe_residual_outcome(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
@@ -3865,8 +3874,20 @@ fn observe_residual_outcome(
         state.record_residual(denied("uncorrelated-outcome"));
         return;
     }
-    let frame = state.on_outcome(outcome);
+    // The preceding equality check must remain before this mutation.
     state.delivery = None;
+    let frame = state.on_outcome(outcome);
+    // The observation's follow-up is only reachable through a command
+    // sender, and this supervisor owns none. Retiring the request and
+    // recording it as unresolved keeps the late observation honest: the
+    // control step never became delivered, and the drain does not restart
+    // waiting for a command this process can no longer send.
+    if let Some(requested) = state.requested_command() {
+        state.delivery = None;
+        state.record_residual(LoopError::ContainmentUnresolved {
+            command: command_name(requested),
+        });
+    }
     // A publication failure is recorded against the observation that lost
     // its delivery; the exact stream fault is the loop's channel fault, and
     // what matters here is which observation never reached the owner.

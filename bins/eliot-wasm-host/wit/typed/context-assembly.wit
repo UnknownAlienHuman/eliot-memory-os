@@ -5,24 +5,39 @@ package eliot:current@0.1.0;
 // Native owner: #584/#626 (eliot-context-contracts, eliot-context-assembly).
 // Consumer: #762 (first thin WASM component). Boundary: admitted-only; exposes
 // no admission operation. Assembly formats admitted representations; mismatch is typed failure.
+// Quality wire names (native SCREAMING_SNAKE -> WIT kebab, exact I12.13 order):
+//   ACCEPTANCE_DECISION_COVERAGE -> acceptance-decision-coverage,
+//   CAUSAL_OPERATIONAL_SUFFICIENCY -> causal-operational-sufficiency,
+//   EXACT_ANCHOR_PROVENANCE_COVERAGE -> exact-anchor-provenance-coverage,
+//   FRESHNESS_STATE_FENCE_COHERENCE -> freshness-state-fence-coherence,
+//   RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY -> rivals-conflicts-unknowns-visibility,
+//   NEGATIVE_MEMORY_INVARIANT_COVERAGE -> negative-memory-invariant-coverage,
+//   VERIFIER_ACTION_READINESS -> verifier-action-readiness,
+//   ROUTE_ACCESSIBILITY_LAYOUT_RISK -> route-accessibility-layout-risk,
+//   INSTRUCTION_SUFFICIENCY -> instruction-sufficiency,
+//   PAYLOAD_HANDLE_RECONSTRUCTION_COST -> payload-handle-reconstruction-cost,
+//   KNOWN_OMISSIONS_EXPANSION_PATHS -> known-omissions-expansion-paths,
+//   TELEMETRY_MEASUREMENT_COST_COVERAGE -> telemetry-measurement-cost-coverage.
+// Native: QualityDimension + QUALITY_DIMENSIONS
+// (crates/smart/eliot-context-contracts/src/quality.rs).
 
 interface assembly {
   type artifact-id = string;
   type digest-hex = string;
 
   enum quality-dimension {
-    accuracy,
-    completeness,
-    relevance,
-    coherence,
-    groundedness,
-    freshness,
-    diversity,
-    conciseness,
-    attribution,
-    calibration,
-    robustness,
-    efficiency,
+    acceptance-decision-coverage,
+    causal-operational-sufficiency,
+    exact-anchor-provenance-coverage,
+    freshness-state-fence-coherence,
+    rivals-conflicts-unknowns-visibility,
+    negative-memory-invariant-coverage,
+    verifier-action-readiness,
+    route-accessibility-layout-risk,
+    instruction-sufficiency,
+    payload-handle-reconstruction-cost,
+    known-omissions-expansion-paths,
+    telemetry-measurement-cost-coverage,
   }
 
   enum dimension-status {

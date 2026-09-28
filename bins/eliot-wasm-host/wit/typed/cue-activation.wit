@@ -81,6 +81,20 @@ interface activation {
     strength: u16,
   }
 
+  // Closed ceiling shared with the descriptor contract; candidate-only never
+  // implies admission. Same eight cases as context-admission, context-assembly
+  // and descriptor; mirrors component_contract::ProofCeiling.
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
   record activation-trace {
     steps: list<trace-step>,
     inspected-nodes: u32,
@@ -96,7 +110,7 @@ interface activation {
     completeness: completeness,
     frontier: list<artifact-id>,
     output-bytes: u32,
-    proof-ceiling: string,
+    proof-ceiling: proof-ceiling,
     result-digest: digest-hex,
   }
 

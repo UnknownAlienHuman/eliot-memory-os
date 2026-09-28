@@ -404,7 +404,11 @@ function Test-RuntimeCase8 {
     Assert-RuntimeTrue $Failures ($allocA['artifactRoot'] -cne $allocB['artifactRoot']) '8-artifact-unique'
     Assert-RuntimeTrue $Failures ($allocA['pipeNamespace'] -cne $allocB['pipeNamespace']) '8-namespace-unique'
     Assert-RuntimeTrue $Failures ($allocA['sessionId'] -cne $allocB['sessionId']) '8-session-id-unique'
-    Assert-RuntimeTrue $Failures ($allocA['pipeNamespace'] -ceq 'eliot-fpipe-aaaaaaaa') '8-namespace-shape'
+    # The namespace is derived from the FULL 32-hex run identity, not its first 8
+    # characters: truncating it mapped distinct runs onto one mutable namespace.
+    # This is the minimal literal update that keeps this existing assertion
+    # describing the current correct derivation; no case was added or removed.
+    Assert-RuntimeTrue $Failures ($allocA['pipeNamespace'] -ceq 'eliot-fpipe-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') '8-namespace-shape'
     Assert-RuntimeTrue $Failures ($allocA['ownerMarker'] -ceq 'eliot-harness-owned-root-v1') '8-marker'
     Assert-RuntimeTrue $Failures ($allocA['principal']['scope'] -ceq 'user-isolated-foreground') '8-scope'
     $conflict = { param($ctx) throw 'namespace already reserved' }

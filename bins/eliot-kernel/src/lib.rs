@@ -123,6 +123,7 @@ pub use blob_store_controller::{
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
     BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
 };
+pub use composition_bootstrap::BackupOwnerClients;
 pub use kernel_audit::{
     AuditAnchor, AuditAnchorBinding, AuditAssuranceClass, AuditCaptureMode, AuditEventDraft,
     AuditEventKind, AuditLineage, AuditRecord, ChainVerification, KernelAuditChain,
@@ -181,6 +182,10 @@ fn observe_supervision_lease_expiry() {
 
 mod idle_lease_census;
 pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
+// The availability value every I1.13 admission guard reads. The guard
+// functions themselves stay owned by `kernel_unavailability`; only the type is
+// named here, by the composition that observes it.
+use crate::kernel_unavailability::KernelAvailability;
 pub(crate) use startup_coordinator::StartupCoordinator;
 pub use startup_coordinator::{
     AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
@@ -456,7 +461,9 @@ pub use eliot_runtime_contracts::{
     SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use eliot_runtime_contracts::{
-    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, SupervisionGenerationBinding,
+    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
+    ResumeIdentitySnapshot, ResumeProcessIdentity, SupervisionGenerationBinding,
+    SupervisionJournalEpoch, revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
 #[cfg(test)]
@@ -629,6 +636,13 @@ pub struct KernelComposition {
     /// Holds the work root only; every capture consumes already-accepted
     /// owner evidence and publishes once through the admitted owner port.
     backup_capture: KernelBackupCapture,
+    /// The exact-owner backup channel clients bound in production assembly
+    /// (issue #962). Held on the composition, not in process-global state: the
+    /// actual Host and Watchdog clients are constructed once here and every
+    /// requester reaches *these* clients through
+    /// [`KernelComposition::backup_owner_clients`], so a fresh or fake client
+    /// can never stand in for the bound pair.
+    backup_owner_clients: BackupOwnerClients,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -743,6 +757,20 @@ impl KernelComposition {
         &self.backup_capture
     }
 
+    /// Returns the exact-owner backup channel clients bound in production
+    /// assembly (issue #962).
+    ///
+    /// These are the actual bound clients, not freshly constructed ones: the
+    /// composition owns them, so a caller cannot reach a differently-bound,
+    /// fake or no-op owner. Which owner serves a given operation is resolved by
+    /// [`BackupOwnerClients::route`] from the *authenticated* requester, never
+    /// from the payload, because `RestoreStatus` and `ReconcileRestore` are
+    /// served by both owners.
+    #[must_use]
+    pub const fn backup_owner_clients(&self) -> &BackupOwnerClients {
+        &self.backup_owner_clients
+    }
+
     /// Runs one isolated restore on the composition-owned durable ORS journal
     /// (issue #960).
     ///
@@ -774,6 +802,27 @@ struct AgentBridgeProfile {
     declaration: AgentBridgeClientDeclaration,
 }
 
+/// Semantic binding retained from the exact `Resolved` activation result that
+/// completed one connection's activation (issue #1746).
+///
+/// Mechanical continuity only: the host-request admission gate compares later
+/// claimed session/task/scope/revision values against these exact retained
+/// values instead of trusting caller claims. Selection currency against live
+/// Governor state stays the Governor's; a claim naming another task or scope
+/// fails as a conflict and must re-activate, it is never silently rebound.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ActivatedApplicationBinding {
+    /// Application session resolved by Governor for this activation.
+    session_id: String,
+    /// Governor-owned task selected at activation time.
+    task_id: String,
+    /// Governor-owned `WorkScope` selected at activation time.
+    work_scope_id: String,
+    /// `TaskContract` revision selected at activation time.
+    task_revision: eliot_contracts::TaskRevision,
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct AgentBridgeConnectionState {
@@ -784,6 +833,11 @@ struct AgentBridgeConnectionState {
     /// Kernel-owned transport Session retained after successful activation.
     session: Option<Session>,
     activation_completed: bool,
+    /// Semantic binding retained from the `Resolved` activation result, if any.
+    ///
+    /// `None` until activation completes with `Resolved`; denials retain
+    /// nothing. Removed with the connection on disconnect.
+    activated_binding: Option<ActivatedApplicationBinding>,
 }
 
 #[cfg(windows)]
@@ -2569,25 +2623,79 @@ impl KernelComposition {
             })
     }
 
+    /// Observes whether this Kernel composition can still issue new authority
+    /// (I1.13, issue #1972).
+    ///
+    /// This is the one producer of [`KernelAvailability`] for the four
+    /// authorities the shared guard covers, and every value it returns comes
+    /// from a live fact this composition already owns and already consults at
+    /// its own admission boundaries. It is never a configured default, a
+    /// constant, or a health channel nothing observes:
+    ///
+    /// - `KernelService::admit_shadow_effect` is the existing I14.16 step-4
+    ///   owner that refuses Session, lease, epoch and Store issuance while a
+    ///   candidate holds no authority;
+    /// - `KernelService::generation_fenced` is the existing post-publication
+    ///   fence that closes this instance until forward recovery, the same fact
+    ///   `validate_material_target_fence` requires to be clear;
+    /// - the generation-gateway poison latch is the existing fence a failed
+    ///   generation publish sets and that `bind_session`,
+    ///   `generation_route_snapshot` and `apply_control` already honour.
+    ///
+    /// A lock this composition cannot read fails closed: an availability it
+    /// cannot prove is not an availability it may report.
+    #[must_use]
+    pub(crate) fn observed_kernel_availability(&self) -> KernelAvailability {
+        let Ok(poison) = self.generation_poison.lock() else {
+            return KernelAvailability::Unavailable;
+        };
+        if poison.is_some() {
+            return KernelAvailability::Unavailable;
+        }
+        drop(poison);
+        let Ok(service) = self.service.lock() else {
+            return KernelAvailability::Unavailable;
+        };
+        let generation_fenced = service.generation_fenced();
+        // The service's own I14.16 step-4 refusal, read through its owner
+        // method rather than a second copy of the state list.
+        let no_authority = service.admit_shadow_effect().is_err();
+        drop(service);
+        if generation_fenced || no_authority {
+            KernelAvailability::Unavailable
+        } else {
+            KernelAvailability::Available
+        }
+    }
+
     /// Material/Critical authority admission for one Governance Profile.
     /// Startup completeness is checked first with its named prerequisite;
     /// the profile ceiling alone decides once startup is complete.
     ///
-    /// This is the startup-gate half of the Material decision and is the
-    /// surface the origin-control decide path consults. It does not stand in
-    /// for current independent Watchdog coverage: a protected effect that must
-    /// be admitted as independently supervised additionally passes
+    /// This is the startup-gate half of the Material decision. It is not the
+    /// production Material/Critical boundary: every production effect,
+    /// including origin-control decide, goes through
+    /// [`Self::admit_material_authority_for_governor_issued_fence`], which
+    /// first requires the current Governor-issued governance profile. It
+    /// stands neither for that recorded profile nor for current independent
+    /// Watchdog coverage: a protected effect that must be admitted as
+    /// independently supervised additionally passes
     /// [`Self::admit_material_authority_for_fence`], which verifies the live
     /// Watchdog branch for the exact target fence.
     ///
     /// # Errors
     ///
-    /// Returns the blocking [`StartupRejection`] or the profile-ceiling
-    /// rejection as a platform error carrying the named prerequisite.
+    /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
+    /// as a platform error when the Kernel is unavailable, otherwise the
+    /// blocking [`StartupRejection`] or the profile-ceiling rejection.
     pub fn admit_material_authority(
         &self,
         profile: GovernanceProfile,
     ) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_external_material_authority(
+            self.observed_kernel_availability(),
+        )
+        .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let coordinator = self
             .startup_coordinator
             .lock()
@@ -2601,11 +2709,20 @@ impl KernelComposition {
     /// Inspection remains allowed; a blocked write fails with the named
     /// unmet startup prerequisite.
     ///
+    /// This is the one live admission point every normal canonical write
+    /// passes through, so the shared Kernel-unavailability guard runs here
+    /// first: while the Kernel is unavailable no canonical write is issued at
+    /// all, whatever the startup cursor still reports.
+    ///
     /// # Errors
     ///
-    /// Returns the blocking [`StartupRejection`] naming the unmet
-    /// prerequisite, or a lock-poison platform error.
+    /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
+    /// as a platform error when the Kernel is unavailable, the blocking
+    /// [`StartupRejection`] naming the unmet prerequisite, or a lock-poison
+    /// platform error.
     pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_canonical_write(self.observed_kernel_availability())
+            .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let coordinator = self
             .startup_coordinator
             .lock()
@@ -2712,11 +2829,20 @@ impl KernelComposition {
     /// Human-risk path requirement. The supervision half reads the revocable
     /// I1.11 supervision step, never a latched cursor and never lease
     /// continuity alone.
+    ///
+    /// The shared Kernel-unavailability guard runs before both halves, so an
+    /// unavailable Kernel issues no external Material authority at all; the
+    /// Governor-issued wrapper reaches this same gate, so there is one
+    /// Material denial, not one per caller.
     pub(crate) fn admit_material_authority_for_fence(
         &self,
         profile: GovernanceProfile,
         target: &StateFence,
     ) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_external_material_authority(
+            self.observed_kernel_availability(),
+        )
+        .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let candidate = self.validate_material_target_fence(target)?;
         if !matches!(
             profile.ceiling(),
@@ -3491,6 +3617,18 @@ impl KernelComposition {
             DaemonSupervisionRenewalOutcome::DegradedNoRenewal => {
                 progress.note_missed_renewal();
                 if progress.stale_renewal_expired(policy, now_ms) {
+                    // The third expiry decision of this join, and the same
+                    // terminal as the two above: a degraded observation that
+                    // ages the lease out refuses the renewal exactly as a
+                    // silent lease and a refused join do. The lease-expiry
+                    // observation belongs at the decision that refuses the
+                    // renewal, so leaving it out here would under-report one
+                    // real terminal expiry against I16.5 while the durable
+                    // audit event downstream still records it. I1.5: renewal
+                    // must carry fresh observed evidence, so a lease that can
+                    // no longer prove renewal ends at expiry whether the
+                    // blockage was silence, a refused join, or degradation.
+                    observe_supervision_lease_expiry();
                     return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
                 }
             }
@@ -3637,6 +3775,11 @@ impl KernelComposition {
         session: &Session,
         process: &ProcessStartReceipt,
     ) -> Result<(DaemonSupervisionContour, SupervisionLeaseSnapshot), KernelServiceError> {
+        // The one live point where this composition issues a supervision lease.
+        // The shared Kernel-unavailability guard runs first, so an unavailable
+        // Kernel issues no new lease rather than failing later inside ORS.
+        crate::kernel_unavailability::admit_lease(self.observed_kernel_availability())
+            .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let contour = self.daemon_supervision_contour(session, process)?;
         let authority = self
             .supervision_lease_authority
@@ -4417,6 +4560,15 @@ impl KernelComposition {
             generation: generation.clone(),
             lease_and_pending_snapshot: Vec::new(),
             authority_epochs_fenced,
+            // The activation generation the commit fences is the one the live
+            // admitted candidate contour carried, sampled under the same
+            // cross-owner revalidated read above. It is persisted in the same
+            // lineage-plus-sequence domain a waking `Activate` presents, so the
+            // wake/attach classification after linearization compares two
+            // values that genuinely mean the same generation instead of
+            // comparing a wire identity against this process's local
+            // `drain_generation` correlation id.
+            activation_generation_fenced: Some(revalidated.activation_generation),
             branches_to_stop: quiescence,
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),
@@ -4488,6 +4640,24 @@ impl KernelComposition {
             }
             Err(_) => return Err("authority-fence-unavailable"),
         };
+        // The activation generation of the live admitted candidate contour, in
+        // the same `SupervisionJournalEpoch` domain a waking `Activate`
+        // presents through `candidate.supervision_incarnation`. A Kernel that
+        // has admitted no activation yet has no such contour, which is the
+        // genesis case the I1.5 pairing leaves unfenced rather than a second
+        // opinion about the live one.
+        let activation_generation = match self.service.lock() {
+            Ok(service) => {
+                let candidate = service
+                    .candidate_binding()
+                    .ok_or("activation-contour-unavailable")?;
+                candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .clone()
+            }
+            Err(_) => return Err("activation-contour-unavailable"),
+        };
         let service_state = self
             .service_state()
             .map_err(|_| "service-state-unavailable")?;
@@ -4511,6 +4681,7 @@ impl KernelComposition {
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
+            activation_generation,
             service_state,
             bridge_sessions,
             host_request_operations,
@@ -4598,6 +4769,10 @@ struct DrainAdmissionCoherence {
     drain_generation: String,
     /// The front-door `StateFence` binding (`lineage:sequence@resource`).
     state_fence: String,
+    /// The activation generation of the admitted candidate contour this sample
+    /// observed, in the same `SupervisionJournalEpoch` domain a waking
+    /// activation presents.
+    activation_generation: SupervisionJournalEpoch,
     /// The service admission state the census was taken under.
     service_state: KernelServiceState,
     /// Admitted front-door bridge Session count.

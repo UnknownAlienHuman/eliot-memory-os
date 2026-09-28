@@ -45,6 +45,7 @@ mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
+pub(crate) mod surreal_capability_evidence;
 pub(crate) mod surreal_experience;
 pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;

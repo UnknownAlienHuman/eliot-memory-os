@@ -14,6 +14,12 @@
 //! never declares tasks complete (the aggregate is an observation, not a
 //! finish decision), and never conceals missing or failed stages (unobserved
 //! stages become explicit [`StageEvidence::Missing`] runs).
+//!
+//! A retained stage binds more than the kept bytes: [`StageEvidence::Retained`]
+//! also carries the [`RetainedToolIdentity`] that produced them, so the exact
+//! tool command, the environment projection, and the terminal exit outcome
+//! travel with the artifact handle instead of being reconstructed from it
+//! later.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -24,8 +30,9 @@ use eliot_instrument_api::{
     BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
     TARGET_LAYOUT_REVISION,
 };
-use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
+use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor};
 use eliot_process_executor::ExecutableObservation;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage};
@@ -63,6 +70,12 @@ pub enum ProfileRunError {
     /// A candidate identity was already bound to a different value.
     #[error("candidate identity is already bound to this stage plan")]
     CandidateIdentityAlreadyBound,
+    /// A retained exit outcome disagrees with its own disposition.
+    #[error("exit outcome for disposition {disposition} is not admissible")]
+    InvalidExitOutcome {
+        /// Observed disposition that the exit code contradicts.
+        disposition: String,
+    },
 }
 
 /// Validates one required text value.
@@ -298,6 +311,8 @@ pub enum StageEvidence {
         artifact: eliot_contracts::ArtifactId,
         /// Exact retained byte length.
         byte_len: u64,
+        /// Exact tool identity under which those bytes were produced.
+        tool: RetainedToolIdentity,
     },
     /// Material output absent for an explicit, typed reason.
     Omitted {
@@ -316,6 +331,125 @@ impl StageEvidence {
     /// Whether the stage produced no evidence at all.
     pub const fn is_missing(&self) -> bool {
         matches!(self, Self::Missing { .. })
+    }
+}
+
+/// Terminal exit observation of the process that produced one retained payload.
+///
+/// The disposition is the shared executor's own
+/// [`ExitDisposition`](eliot_process::ExitDisposition), never a re-derived
+/// guess, and the code is present exactly when the disposition admits one — the
+/// same validity rule the process contract itself enforces. A retained payload
+/// with no admissible exit observation is refused instead of defaulted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetainedExitOutcome {
+    /// Physical disposition observed by the shared process executor.
+    pub disposition: ExitDisposition,
+    /// Process exit code, present only for a `Completed` exit.
+    pub code: Option<i32>,
+}
+
+impl RetainedExitOutcome {
+    /// Whether this outcome is the exact shape its disposition admits.
+    const fn is_admissible(&self) -> bool {
+        match self.disposition {
+            ExitDisposition::Completed => self.code.is_some(),
+            ExitDisposition::Unknown => self.code.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Canonical digest over the observed exit outcome.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        sha256_hex(format!("{:?}\0{:?}", self.disposition, self.code).as_bytes())
+    }
+}
+
+/// Exact tool identity under which one retained payload was produced.
+///
+/// A retained artifact handle says *what* was kept; this says *which
+/// invocation produced it*: the exact executable and argument vector, the
+/// environment projection the launch was admitted under, and the terminal exit
+/// outcome. Two runs of the same tool over different arguments, different
+/// environments, or different exits therefore yield distinguishable retained
+/// evidence by construction rather than by later reconstruction.
+///
+/// Arguments stay separated and are never rendered into a shell command line.
+/// The environment is the launch's resolved projection digest, which the
+/// executor itself documents as attested (the declared projection) rather than
+/// machine-observed; this type preserves that distinction instead of
+/// re-observing it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedToolIdentity {
+    /// Executable selected by the authority and launched for this stage.
+    pub executable: String,
+    /// Exact argument vector handed to the executable.
+    pub arguments: Vec<String>,
+    /// Lowercase SHA-256 hex over the resolved environment projection.
+    pub environment_digest: String,
+    /// Observed terminal exit outcome of the producing process.
+    pub exit: RetainedExitOutcome,
+}
+
+impl RetainedToolIdentity {
+    /// Validates and seals the identity of one retained payload.
+    ///
+    /// Every value is checked rather than normalized: a blank or
+    /// control-character-bearing executable or argument, a malformed
+    /// environment digest, and an exit outcome that disagrees with its own
+    /// disposition are all refused. Nothing is defaulted, so a retained handle
+    /// can never claim an identity no producer observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileRunError::InvalidText`] for a blank or
+    /// control-character-bearing command value,
+    /// [`ProfileRunError::InvalidDigest`] for a malformed environment digest,
+    /// and [`ProfileRunError::InvalidExitOutcome`] when the exit code does not
+    /// match the observed disposition.
+    pub fn sealed(
+        executable: &str,
+        arguments: &[String],
+        environment_digest: &str,
+        exit: RetainedExitOutcome,
+    ) -> Result<Self, ProfileRunError> {
+        validate_text(executable, "executable")?;
+        for argument in arguments {
+            validate_text(argument, "argument")?;
+        }
+        validate_digest(environment_digest, "environment_digest")?;
+        if !exit.is_admissible() {
+            return Err(ProfileRunError::InvalidExitOutcome {
+                disposition: format!("{:?}", exit.disposition),
+            });
+        }
+        Ok(Self {
+            executable: executable.to_owned(),
+            arguments: arguments.to_vec(),
+            environment_digest: environment_digest.to_owned(),
+            exit,
+        })
+    }
+
+    /// Canonical digest over the whole retained tool identity.
+    ///
+    /// Two retained payloads that differ in any bound dimension — executable,
+    /// arguments, environment projection, or exit outcome — never share it.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut material = format!(
+            "{}\0{}\0{}\0",
+            self.executable,
+            self.environment_digest,
+            self.exit.digest()
+        );
+        for argument in &self.arguments {
+            material.push('\0');
+            material.push_str(argument);
+        }
+        sha256_hex(material.as_bytes())
     }
 }
 
@@ -565,10 +699,20 @@ impl ProfileAggregate {
             let _ = write!(material, "{:?}", run.execution);
             material.push('\0');
             match &run.evidence {
-                StageEvidence::Retained { artifact, byte_len } => {
+                StageEvidence::Retained {
+                    artifact,
+                    byte_len,
+                    tool,
+                } => {
                     material.push_str(artifact.as_str());
                     material.push('\0');
                     material.push_str(&byte_len.to_string());
+                    // The retained tool identity is part of the aggregate
+                    // digest: the same bytes produced by a different
+                    // executable, argument vector, environment projection, or
+                    // exit outcome are a different piece of evidence.
+                    material.push('\0');
+                    material.push_str(&tool.digest());
                 }
                 StageEvidence::Omitted { reason } | StageEvidence::Missing { reason } => {
                     material.push_str(reason);
@@ -1064,8 +1208,8 @@ pub fn compose_provider_dispatch(
             entry: Box::new(entry.clone()),
         },
         Err(TestdPortError::UnsupportedByTestd { kind }) => ProviderDispatch::Refused {
-            disposition: crate::ProviderDisposition::Unsupported {
-                adapter: instrument.as_str().to_owned(),
+            disposition: crate::ProviderDisposition::UnsupportedByTestd {
+                adapter: entry.adapter.clone(),
                 kind,
             },
         },

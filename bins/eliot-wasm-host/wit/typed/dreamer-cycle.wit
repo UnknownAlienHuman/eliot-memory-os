@@ -62,6 +62,20 @@ interface cycle {
     expired,
   }
 
+  // Closed ceiling shared with the descriptor contract; candidate-only never
+  // implies admission. Same eight cases as context-admission, context-assembly
+  // and descriptor; mirrors component_contract::ProofCeiling.
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
   record pending-request {
     request-id: string,
     operation-id: string,
@@ -124,7 +138,7 @@ interface cycle {
     state: dreamer-state,
     emitted: list<inert-owner-request>,
     frontier: list<artifact-id>,
-    proof-ceiling: string,
+    proof-ceiling: proof-ceiling,
     result-digest: digest-hex,
   }
 

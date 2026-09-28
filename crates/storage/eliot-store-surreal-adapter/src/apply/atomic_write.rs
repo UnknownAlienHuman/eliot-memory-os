@@ -555,6 +555,9 @@ fn build_apply_statements(
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
+    // #1773 capability-evidence rows commit atomically beside the learning
+    // rows under the same fenced compare-and-set contract.
+    append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -814,6 +817,106 @@ fn recovery_owner_id(key: &eliot_store_api::RecoveryRecordKey) -> Result<String,
     let bytes = eliot_store_api::canonical_json_bytes(key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     Ok(eliot_store_api::sha256_hex(&bytes))
+}
+
+/// Appends the admitted Governor capability-evidence row writes (issue #1773,
+/// I3.4).
+///
+/// One fenced compare-and-set per admitted command, against the
+/// `capability-evidence-v1` namespace in the canonical `recovery_owner` table
+/// — the same durable owner-row contour the finish-evidence owner image and the
+/// blackboard revisions already use, so no new table and no migration chain
+/// change is introduced. The evidence document travels as opaque bytes and the
+/// adapter arbitrates only the row address, the fence, and the outer revision;
+/// it never derives status, source, scope fingerprint, limitations, or
+/// requalification semantics from the document.
+///
+/// The issued `revision` is `expected + 1`, and that value is the owner-issued
+/// immutable revision the Governor registry orders same-key evidence by and
+/// receives back verbatim from
+/// `GetCapabilityEvidenceRecordRange`. A delayed writer holding a stale
+/// predecessor trips `capability_evidence_cas_conflict` inside the canonical
+/// transaction, so it never commits a row and never reaches the registry.
+fn append_capability_evidence_owner_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let mut matching = transition.named_operations.iter().filter(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordCapabilityEvidenceRecord
+    });
+    let Some(command) = matching.next() else {
+        return Ok(());
+    };
+    if matching.next().is_some() {
+        return Err(AdapterError::Store(StoreError::Duplicate {
+            field: "capability_evidence.named_operations",
+        }));
+    }
+    if transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let decoded = eliot_store_api::decode_capability_evidence_mutation(
+        command.operation,
+        &command.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    let row_key =
+        eliot_store_api::capability_evidence_row_key(&decoded.skill_id, &decoded.scope_key);
+    let owner_id = recovery_owner_id(&row_key)?;
+    let payload = decoded.record_json.as_bytes();
+    let expected_revision = decoded.expected_canonical_revision;
+    let revision =
+        expected_revision
+            .checked_add(1)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "capability_evidence.revision",
+                reason: "capability evidence revision overflow",
+            }))?;
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(row_key.namespace));
+    record.insert("key".to_owned(), json!(row_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert("revision".to_owned(), json!(revision));
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::CAPABILITY_EVIDENCE_STORE_SCHEMA_V1),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+    // The owner-declared identity parts travel as row fields so a read can
+    // project them without parsing the opaque document. They are the exact
+    // parts the deterministic row address was derived from.
+    record.insert("skill_id".to_owned(), json!(decoded.skill_id));
+    record.insert("scope_key".to_owned(), json!(decoded.scope_key));
+    record.insert("record_digest".to_owned(), json!(decoded.record_digest));
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
+    );
+
+    sql.push_str(schema::TX_CAPABILITY_EVIDENCE_OWNER);
+    bindings.insert(
+        "capability_evidence_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("capability_evidence_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "capability_evidence_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "capability_evidence_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert(
+        "capability_evidence_record".to_owned(),
+        Value::Object(record),
+    );
+    Ok(())
 }
 
 /// Appends canonical notification record writes (issue #1780).

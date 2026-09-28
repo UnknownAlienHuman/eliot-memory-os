@@ -22,12 +22,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod surface;
 pub mod tool_exposure;
 
+pub use surface::{
+    BudgetCoverage, BudgetOverflow, OverflowDisposition, PerToolCost, ProtectedReserves,
+    RenderedToolCost, SurfaceBudgetInput, SurfaceDispatchBinding, TOOL_SURFACE_CONTRACT_VERSION,
+    ToolSurfaceBudget, admit_dispatch_surface, compile_surface_budget,
+};
 pub use tool_exposure::{
-    LoopSignal, ResultDelivery, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
-    ToolExposureReceipt, ToolExposureReceiptV2, authorize_pre_dispatch,
-    detect_repeat_without_progress,
+    LoopSignal, ResultDelivery, TokenCountObservation, TokenCountUnavailableReason, ToolCallClass,
+    ToolCallIntent, ToolCallRequest, ToolExposureError, ToolExposureReceipt, ToolExposureReceiptV2,
+    authorize_pre_dispatch, detect_repeat_without_progress,
 };
 
 /// Stable wire name for this C0-02 contract family.

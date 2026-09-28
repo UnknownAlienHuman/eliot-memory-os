@@ -695,8 +695,12 @@ fn main() {
     // Kernel or canonical state, and the Kernel session and work state stay
     // intact kernel-side.
     if let TransportProfile::LoopbackHttp(profile) = config.transport {
-        let code =
-            run_loopback_http_bridge(profile, host_gateway, &mut host_request_client, &mut runner);
+        let code = run_loopback_http_bridge(
+            &profile,
+            host_gateway,
+            &mut host_request_client,
+            &mut runner,
+        );
         std::process::exit(code);
     }
     if mcp_mode {
@@ -2763,7 +2767,7 @@ enum ConnectionFlow {
 /// with the provider exit code; the Kernel session and work state are owned
 /// kernel-side and are never mutated by this process's death.
 fn run_loopback_http_bridge(
-    profile: LoopbackHttpProfile,
+    profile: &LoopbackHttpProfile,
     gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
@@ -2786,7 +2790,7 @@ fn run_loopback_http_bridge(
         };
         match serve_loopback_http_connection(
             stream,
-            &profile,
+            profile,
             gateway,
             port,
             runner,
@@ -2832,7 +2836,7 @@ fn serve_loopback_http_connection(
         };
         match validate_and_dispatch(
             &mut stream,
-            request,
+            &request,
             profile,
             gateway,
             port,
@@ -2862,9 +2866,13 @@ fn serve_loopback_http_connection(
     clippy::too_many_lines,
     reason = "loopback HTTP admission mirrors the I7.5 policy step for step"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one non-rederived per-request dispatch context: 5 independently borrowed handles plus request, policy, and gateway (#838)"
+)]
 fn validate_and_dispatch(
     stream: &mut std::net::TcpStream,
-    request: LoopbackHttpRequest,
+    request: &LoopbackHttpRequest,
     profile: &LoopbackHttpProfile,
     gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
@@ -2971,17 +2979,13 @@ fn read_loopback_http_request(stream: &mut std::net::TcpStream) -> LoopbackHttpR
             break position;
         }
     };
-    let header_text = match String::from_utf8(buffer[..header_end].to_vec()) {
-        Ok(text) => text,
-        Err(_) => {
-            return LoopbackHttpRead::Rejected("request headers are not valid UTF-8".to_owned());
-        }
+    let Ok(header_text) = String::from_utf8(buffer[..header_end].to_vec()) else {
+        return LoopbackHttpRead::Rejected("request headers are not valid UTF-8".to_owned());
     };
     let mut body_prefix = buffer[header_end + 4..].to_vec();
     let mut lines = header_text.split("\r\n");
-    let request_line = match lines.next() {
-        Some(line) => line,
-        None => return LoopbackHttpRead::Rejected("empty request line".to_owned()),
+    let Some(request_line) = lines.next() else {
+        return LoopbackHttpRead::Rejected("empty request line".to_owned());
     };
     let mut request_parts = request_line.split(' ');
     let method = request_parts.next().unwrap_or_default().to_owned();

@@ -25,7 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::ClockObservation;
 use eliot_platform::WorkScopePath;
-use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
+use eliot_platform_windows::{
+    NamedPipePeerEvidence, ProcessIdentity, ProtectedPathLease, WindowsPlatform,
+};
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, FencingToken, KernelDispatchKey, OperationId, PermitIssuance,
@@ -348,11 +350,14 @@ pub struct HumanStateAuthority {
 /// fresh one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OperatorSessionBinding {
+    endpoint: OperatorEndpoint,
     kernel_session_token: String,
     windows_sid: String,
     interactive_session_id: String,
     role: String,
     capabilities: Vec<String>,
+    challenge_peer: Option<ProcessIdentity>,
+    redeemed_peer: Option<ProcessIdentity>,
     redeemed: bool,
 }
 
@@ -1620,15 +1625,76 @@ impl BrokerComposition {
         self.operator_session_bindings.insert(
             endpoint.handoff_nonce.clone(),
             OperatorSessionBinding {
+                endpoint: endpoint.clone(),
                 kernel_session_token: live.registration_digest.clone(),
                 windows_sid: binding.registration.windows_sid.clone(),
                 interactive_session_id: binding.registration.interactive_session_id.clone(),
                 role: endpoint.role.clone(),
                 capabilities: endpoint.capabilities.clone(),
+                challenge_peer: None,
+                redeemed_peer: None,
                 redeemed: false,
             },
         );
         Ok(endpoint)
+    }
+
+    /// Returns the existing live Kernel registration token for one exact,
+    /// freshly issued endpoint after the connected pipe peer has been
+    /// authenticated as the approved Operator process in the bound SID and
+    /// interactive session. The peer identity is pinned so a different UI
+    /// process cannot inherit this endpoint between challenge and redemption.
+    pub fn challenge_operator_handoff(
+        &mut self,
+        endpoint: &OperatorEndpoint,
+        peer: &NamedPipePeerEvidence,
+    ) -> Result<String, CompositionError> {
+        endpoint
+            .validate()
+            .map_err(Self::classify_operator_handoff)?;
+        self.verify_launch_lease()?;
+        let artifact = self.operator_artifact()?;
+        let live = self.live_registration()?;
+        let Some(row) = self
+            .operator_session_bindings
+            .get(&endpoint.handoff_nonce)
+            .cloned()
+        else {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffNotAdmitted
+                .with_platform("challenge endpoint was not issued by this broker generation"));
+        };
+        if row.redeemed || row.endpoint != *endpoint {
+            return Err(
+                BrokerAdmissionRefusal::OperatorHandoffNotAdmitted.with_platform(
+                    "challenge endpoint is consumed or differs from its issued binding",
+                ),
+            );
+        }
+        if row.kernel_session_token != live.registration_digest {
+            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
+                .with_platform("challenge endpoint is not bound to the live Kernel registration"));
+        }
+        Self::validate_operator_pipe_peer(peer, &row, &artifact)?;
+        if row
+            .challenge_peer
+            .as_ref()
+            .is_some_and(|bound| bound != peer.process())
+        {
+            return Err(
+                BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
+                    "challenge endpoint is already bound to a different Operator process",
+                ),
+            );
+        }
+        let Some(stored) = self
+            .operator_session_bindings
+            .get_mut(&endpoint.handoff_nonce)
+        else {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffNotAdmitted
+                .with_platform("challenge binding disappeared before it could be pinned"));
+        };
+        stored.challenge_peer = Some(peer.process().clone());
+        Ok(row.kernel_session_token)
     }
 
     /// Redeems one issued Operator handoff exactly once and returns the
@@ -1654,6 +1720,7 @@ impl BrokerComposition {
         &mut self,
         endpoint: &OperatorEndpoint,
         client: &OperatorClientBinding,
+        peer: &NamedPipePeerEvidence,
     ) -> Result<OperatorArtifact, CompositionError> {
         self.verify_launch_lease()?;
         let artifact = self.operator_artifact()?;
@@ -1678,6 +1745,10 @@ impl BrokerComposition {
                 .consume_operator_handoff(endpoint, &artifact, now)
                 .map_err(Self::classify_operator_handoff);
         }
+        if row.endpoint != *endpoint {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffNotAdmitted
+                .with_platform("redeemed endpoint differs from the exact issued binding"));
+        }
         let live = self.live_registration()?;
         if client.kernel_session_token != row.kernel_session_token
             || live.registration_digest != row.kernel_session_token
@@ -1701,16 +1772,63 @@ impl BrokerComposition {
                 ),
             );
         }
-        Self::observe_operator_client(client.client_process_id, &artifact)?;
+        if row.challenge_peer.as_ref() != Some(peer.process()) {
+            return Err(
+                BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
+                    "redemption peer differs from the OS-authenticated challenge peer",
+                ),
+            );
+        }
+        if client.client_process_id != peer.process().process_id
+            || client.windows_sid != peer.sid()
+            || client.interactive_session_id != peer.session_id().to_string()
+        {
+            return Err(
+                BrokerAdmissionRefusal::OperatorBindingCrossSession.with_platform(
+                    "caller identity fields differ from the connected OS-observed peer",
+                ),
+            );
+        }
+        Self::validate_operator_pipe_peer(peer, &row, &artifact)?;
+        let redeemed_artifact = self
+            .broker
+            .consume_operator_handoff(endpoint, &artifact, now)
+            .map_err(Self::classify_operator_handoff)?;
         if let Some(stored) = self
             .operator_session_bindings
             .get_mut(&endpoint.handoff_nonce)
         {
+            stored.redeemed_peer = Some(peer.process().clone());
             stored.redeemed = true;
         }
-        self.broker
-            .consume_operator_handoff(endpoint, &artifact, now)
-            .map_err(Self::classify_operator_handoff)
+        self.operator_session_bindings.retain(|nonce, stored| {
+            nonce == &endpoint.handoff_nonce
+                || !stored.redeemed
+                || stored.kernel_session_token != row.kernel_session_token
+                || stored.windows_sid != row.windows_sid
+                || stored.interactive_session_id != row.interactive_session_id
+        });
+        Ok(redeemed_artifact)
+    }
+
+    fn validate_operator_pipe_peer(
+        peer: &NamedPipePeerEvidence,
+        row: &OperatorSessionBinding,
+        artifact: &OperatorArtifact,
+    ) -> Result<(), CompositionError> {
+        if peer.process().process_id == 0
+            || peer.sid() != row.windows_sid
+            || peer.session_id().to_string() != row.interactive_session_id
+        {
+            return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
+                .with_platform("connected pipe peer SID/session differs from the issued binding"));
+        }
+        if !eliot_platform_windows::ordinal_eq_str(&peer.process().image_path, &artifact.executable)
+        {
+            return Err(BrokerAdmissionRefusal::OperatorClientProcessForeign
+                .with_platform("connected pipe peer image is not the approved Operator artifact"));
+        }
+        Ok(())
     }
 
     /// Returns the live Kernel-issued registration this broker currently
@@ -1736,28 +1854,32 @@ impl BrokerComposition {
     /// never identity — Windows reuses ids — so the observation, not the
     /// presented number, decides.
     fn observe_operator_client(
-        client_process_id: u32,
+        expected: &ProcessIdentity,
         artifact: &OperatorArtifact,
     ) -> Result<(), CompositionError> {
         #[cfg(not(windows))]
         {
-            let _ = (client_process_id, artifact);
+            let _ = (expected, artifact);
             return Err(BrokerAdmissionRefusal::OperatorClientProcessForeign
                 .with_platform("client process observation requires Windows"));
         }
         #[cfg(windows)]
         {
             let observed =
-                eliot_platform_windows::observe_named_pipe_peer_process(client_process_id)
+                eliot_platform_windows::observe_named_pipe_peer_process(expected.process_id)
                     .map_err(|error| {
                         BrokerAdmissionRefusal::OperatorClientProcessForeign
                             .with_platform(error.to_string())
                     })?;
-            if !eliot_platform_windows::ordinal_eq_str(observed.image_path(), &artifact.executable)
+            if observed.identity() != expected
+                || !eliot_platform_windows::ordinal_eq_str(
+                    observed.image_path(),
+                    &artifact.executable,
+                )
             {
                 return Err(
                     BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
-                        "redeeming client process image is not the approved Operator artifact",
+                        "redeeming Operator process generation is no longer the authenticated peer",
                     ),
                 );
             }
@@ -1834,6 +1956,15 @@ impl BrokerComposition {
                 ),
             );
         };
+        let Some(redeemed_peer) = granted.redeemed_peer.as_ref() else {
+            return Err(
+                BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
+                    "redeemed authority has no retained OS-observed Operator process identity",
+                ),
+            );
+        };
+        let artifact = self.operator_artifact()?;
+        Self::observe_operator_client(redeemed_peer, &artifact)?;
         if authority.role != granted.role
             || authority
                 .capabilities

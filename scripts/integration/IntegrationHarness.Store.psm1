@@ -3043,10 +3043,10 @@ function Close-StoreJobBinding {
         [string]$JobName
     )
     if ([string]::IsNullOrWhiteSpace($JobName) -or $JobName -ceq 'inherited') {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'inherited' }
     }
     if (-not $Script:StoreJobHandles.ContainsKey($JobName)) {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'untracked' }
     }
     $job = $Script:StoreJobHandles[$JobName]
     try {
@@ -3060,7 +3060,7 @@ function Close-StoreJobBinding {
         }
         return @{ jobName = $JobName; closed = $false }
     } catch {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'close-failed' }
     }
 }
 

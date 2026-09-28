@@ -91,7 +91,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 /// owner-feed exchange still holds this guard across bounded IO, and the
 /// health and maintenance handlers retain their lock waits in polled flights,
 /// so neither selected handler blocks the loop behind the owner-feed lock
-/// holder. A poisoned TestD row never fails the daemon closed; transport
+/// holder. A poisoned `TestD` row never fails the daemon closed; transport
 /// failures do, mirroring the local-read poller.
 type SharedComposition = Arc<tokio::sync::Mutex<DaemonComposition>>;
 /// The run loop and its polled heartbeat share one current-thread readiness
@@ -509,6 +509,10 @@ pub(super) enum ReadyMessage {
     },
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered daemon launch funnel stays in one audit scope: args, protected config, metrics, capabilities, loop (#838)"
+)]
 pub(super) fn run() -> Result<(), String> {
     let launch = parse_launch_args(std::env::args_os().skip(1))?;
     let config = DaemonConfig::load_protected_bound(
@@ -588,6 +592,19 @@ pub(super) fn run() -> Result<(), String> {
         event = "eliotd.improvement_pipeline_owner",
         owner = eliotd::governed_improvement_pipeline_owner(),
     );
+    // #1693 (I14.22:34): publish the registered maintenance-family catalog once
+    // per process, here in the composition startup path. This is the one
+    // production reader of `maintenance_family_catalog::entries`, and it is
+    // placed on the composition startup contour rather than inside
+    // `evaluate_maintenance_trigger` so the emission is once per process and
+    // never per trigger. It performs no I/O, opens no store client, reads no
+    // clock, consults no composition state, and returns nothing, so it cannot
+    // delay or withhold startup or readiness. Do not read this line as the
+    // durable record: A13.10 lines 5-9 class it as an operational log that may
+    // rotate, and the durable record for a family that cannot start is the
+    // canonical notification the blocked family submits through
+    // `note_blocked_automation_notification` below.
+    eliotd::maintenance_family_catalog::record_registered_catalog();
     // #2560: the retained ledger answers no readiness question. This projection
     // derives the required set from the composition's own live owners and keeps
     // core control readiness separate from optional capability availability, so
@@ -603,12 +620,12 @@ pub(super) fn run() -> Result<(), String> {
     let startup_maintenance_observations = [
         maintenance_observation(
             MaintenanceTriggerOrigin::StartupReconciliation,
-            vec![startup_readiness.ledger_report()],
+            &[startup_readiness.ledger_report()],
             false,
         ),
         maintenance_observation(
             MaintenanceTriggerOrigin::ColdStartCompletion,
-            vec![
+            &[
                 format!(
                     "startup_bindings_complete={}",
                     startup_readiness.every_declared_capability_bound()
@@ -764,7 +781,9 @@ pub(super) fn run() -> Result<(), String> {
                 "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
             ),
         )),
-        (Ok(RunLoopExit::Shutdown), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (Ok(RunLoopExit::Shutdown), Err(error)) | (Err(error), Ok(())) => {
+            Err(report_terminal_failure(&kernel, error))
+        }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
                 ticket_id,
@@ -778,7 +797,6 @@ pub(super) fn run() -> Result<(), String> {
                 "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
             ),
         )),
-        (Err(error), Ok(())) => Err(report_terminal_failure(&kernel, error)),
         (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
             &kernel,
             format!("{error}; shutdown: {shutdown_error}"),
@@ -875,6 +893,18 @@ fn bind_declared_startup_capabilities(
     let agent_fabric = attach_agent_fabric(composition);
     // #1882: the two declared Skill-path capabilities, in declaration order.
     let (skill_tool_source, skill_tool_basis) = bind_skill_path_capabilities(composition);
+    // #1773 (I3.4): rebuild the daemon-held Governor capability admission view
+    // from the durable capability-evidence records, at the same attach site that
+    // already holds the concrete client and the mutable composition, and before
+    // `publish_daemon_startup_evidence` evaluates the retained capability model
+    // below. This is the production seam that makes a qualifying record survive
+    // a daemon restart: without it the view stays empty and every production
+    // route is refused for lack of evidence.
+    //
+    // The drain is complete and fail-closed, so a partial read is never
+    // reported as coverage; a refusal keeps the view as it was, which means
+    // any route it cannot evidence stays refused.
+    hydrate_capability_evidence_view(composition, kernel);
     // The retained ledger is the only readiness input for the declared
     // capabilities: it cannot be constructed without a disposition for each of
     // the seven, and the whole record (bound identity or unbound reason) is
@@ -888,6 +918,75 @@ fn bind_declared_startup_capabilities(
         skill_tool_source,
         skill_tool_basis,
     )
+}
+
+/// Drains the durable capability-evidence records into the daemon-held Governor
+/// admission view at startup (issue #1773, I3.4).
+///
+/// This is the durable-hydration production seam. The view is otherwise
+/// constructed empty, so before this drain every production route is refused
+/// for lack of evidence and no record survives a restart. It runs at the
+/// existing startup attach site that already holds the concrete Kernel client
+/// and the mutable composition — no new thread, no new transport, no new
+/// `start()` contour, and no run-loop change; the read travels the one
+/// authenticated Kernel named-read route.
+///
+/// Fail-closed: the drain either covers every page the store serves at this
+/// fence or returns an error, and an error is a `warn` diagnostic naming the
+/// exact reason. The view then keeps its previous contents, so any production
+/// route the view cannot evidence stays refused rather than being treated as
+/// "nothing to check".
+fn hydrate_capability_evidence_view(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+) {
+    let fence = composition.kernel_snapshot().state_fence();
+    let scope = match eliot_store_api::ScopeId::new(eliot_governor::GOVERNOR_SCOPE_ID) {
+        Ok(scope) => scope,
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydration_unavailable",
+                reason = %error,
+                "canonical capability evidence could not be addressed; the admission view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+            return;
+        }
+    };
+    let drained = composition
+        .capability_admission_mut()
+        .map_err(|error| error.to_string())
+        .and_then(|view| {
+            eliotd::drain_capability_evidence_records(
+                view,
+                kernel,
+                &scope,
+                &fence,
+                eliot_store_api::MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+            )
+            .map_err(|error| error.to_string())
+        });
+    match drained {
+        Ok(report) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydrated",
+                pages = report.pages,
+                observed_records = report.observed_records,
+                minted_records = report.minted_records,
+                retained_records = report.retained,
+                "durable capability evidence rebuilt the Governor admission view through the complete paged read"
+            );
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydration_unavailable",
+                reason = %reason,
+                "canonical capability evidence did not refresh the admission view; the view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
+    }
 }
 
 /// Binds the two declared Skill-path capabilities (#1882), in declaration
@@ -1570,7 +1669,7 @@ fn settle_activation_completion(
 
 /// Starts the tick-driven work for one shared-cadence tick.
 ///
-/// The local-read poller and the TestD owner drain each ride the same tick
+/// The local-read poller and the `TestD` owner drain each ride the same tick
 /// under their own gate: both must start even while an activation is in
 /// flight, so their gates are checked before the activation early-continue.
 /// The activation claim itself still starts only when its flight is idle.
@@ -1649,7 +1748,7 @@ fn note_supervision_applied(
 /// per-observation family catalog is #1693's to supply.
 fn maintenance_observation(
     origin: MaintenanceTriggerOrigin,
-    evidence_refs: Vec<String>,
+    evidence_refs: &[String],
     activation_in_flight: bool,
 ) -> MaintenanceObservation {
     let evidence_refs = evidence_refs
@@ -1746,7 +1845,7 @@ fn idle_maintenance_observation(flight: &ActivationFlight) -> MaintenanceObserva
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     maintenance_observation(
         MaintenanceTriggerOrigin::IdleTransition,
-        vec![format!("activation_in_flight={activation_in_flight}")],
+        &[format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
     )
 }
@@ -1967,7 +2066,7 @@ async fn run_health_heartbeat_tick(
         // error, and the trigger stays durable for the next eligible pass.
         let blocked_automation = match guard.evaluate_maintenance_trigger(maintenance_observation(
             MaintenanceTriggerOrigin::AdmittedObservation,
-            vec![
+            &[
                 format!("store_health={:?}", health.status),
                 health.manifest_digest.as_str().to_owned(),
             ],
@@ -2701,6 +2800,10 @@ fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
 /// the daemon closed — a claimed pair that cannot forward or submit is never
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered claim-forward-submit poll step stays whole: any step failure fails closed, never discards (#838)"
+)]
 async fn run_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -3589,7 +3692,7 @@ async fn drain_task_controller_on_shutdown(
     }
 }
 
-/// Completion of one in-flight TestD owner drain step. Bind, terminal
+/// Completion of one in-flight `TestD` owner drain step. Bind, terminal
 /// publish, finish submit, and ack share one flight branch so health and
 /// shutdown stay pollable while the bounded step is outstanding; the step
 /// handles at most one bounded poll per queue per tick.
@@ -3601,7 +3704,7 @@ struct TestdOwnerFlightState {
     future: Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>>,
 }
 
-/// Sole owner of TestD owner drain state in `run_loop`, mirroring
+/// Sole owner of `TestD` owner drain state in `run_loop`, mirroring
 /// [`LocalReadFlight`]. `Idle` means no drain work is outstanding;
 /// `InFlight` holds the one pending drain step. No second owner and no
 /// second concurrent drain step exist.
@@ -3610,7 +3713,7 @@ enum TestdOwnerFlight {
     InFlight(TestdOwnerFlightState),
 }
 
-/// Pure tick gate: the TestD owner timer starts work only when the flight
+/// Pure tick gate: the `TestD` owner timer starts work only when the flight
 /// is idle. The in-flight step is polled in its own `select!` branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestdOwnerTickDecision {
@@ -3625,7 +3728,7 @@ fn decide_testd_owner_tick(flight: &TestdOwnerFlight) -> TestdOwnerTickDecision 
     }
 }
 
-/// Starts one TestD owner drain step for the finish cadence (issue #325):
+/// Starts one `TestD` owner drain step for the finish cadence (issue #325):
 /// bind pending verifier dispatches, publish terminal verifier facts,
 /// submit finish candidates, and acknowledge terminals, all through the
 /// Kernel owner routes. At most one bounded step per tick; an empty poll
@@ -3645,7 +3748,7 @@ fn start_testd_owner_drain(
     })
 }
 
-/// Starts the TestD owner drain step when its flight is idle. Checked on
+/// Starts the `TestD` owner drain step when its flight is idle. Checked on
 /// every tick alongside the other pollers so terminal evidence publishes
 /// while activations are in flight.
 fn maybe_start_testd_owner_drain(
@@ -3660,7 +3763,7 @@ fn maybe_start_testd_owner_drain(
     }
 }
 
-/// Polls the one in-flight TestD owner drain step, pending forever while
+/// Polls the one in-flight `TestD` owner drain step, pending forever while
 /// idle so health and shutdown stay pollable with no step outstanding.
 async fn next_testd_owner_completion(flight: &mut TestdOwnerFlight) -> TestdOwnerCompletion {
     match flight {
@@ -3669,7 +3772,7 @@ async fn next_testd_owner_completion(flight: &mut TestdOwnerFlight) -> TestdOwne
     }
 }
 
-/// Settles one completed TestD owner drain step back to idle. A drained
+/// Settles one completed `TestD` owner drain step back to idle. A drained
 /// step idles until the next tick; only a step failure fails the daemon
 /// closed — a poisoned row that cannot drain is recorded as a diagnostic
 /// and skipped inside the step, never silently discarded and never fatal.
@@ -3686,7 +3789,7 @@ fn settle_testd_owner_completion(
     }
 }
 
-/// Runs one TestD owner drain step through the production finish caller.
+/// Runs one `TestD` owner drain step through the production finish caller.
 ///
 /// #18 item B: the bounded step is split into phases so the composition guard
 /// is never held across a Kernel exchange at all:
@@ -3967,24 +4070,28 @@ fn classify_reconcile_ack(
 /// (`not_before`) and only when the named dependency revision has materially
 /// changed; Kernel owns that gate. Claim-lease expiry never triggers reuse, and
 /// any changed result under the predecessor ticket is an identity conflict.
+#[expect(
+    clippy::print_stderr,
+    reason = "operator stderr line kept byte-exact per #740 alongside its structured tracing twin (#838)"
+)]
 fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
-    if result.is_transient_retry() {
-        if let Some(not_before) = transient_not_before(result) {
-            TRANSIENT_DEFERRAL_OBSERVED.fetch_add(1, Ordering::Relaxed);
-            // #740: structured twin of the operator stderr line below. The
-            // existing line keeps its exact bytes; this only adds the typed
-            // record to the diagnostics sink.
-            tracing::info!(
-                target: "eliotd::diagnostics",
-                event = "eliotd.transient_deferral",
-                ticket = %eliotd::diagnostics::sanitize_identity(&result.ticket_id),
-                not_before = not_before,
-            );
-            eprintln!(
-                "eliotd transient activation deferral ticket {} not_before {not_before}",
-                result.ticket_id
-            );
-        }
+    if result.is_transient_retry()
+        && let Some(not_before) = transient_not_before(result)
+    {
+        TRANSIENT_DEFERRAL_OBSERVED.fetch_add(1, Ordering::Relaxed);
+        // #740: structured twin of the operator stderr line below. The
+        // existing line keeps its exact bytes; this only adds the typed
+        // record to the diagnostics sink.
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.transient_deferral",
+            ticket = %eliotd::diagnostics::sanitize_identity(&result.ticket_id),
+            not_before = not_before,
+        );
+        eprintln!(
+            "eliotd transient activation deferral ticket {} not_before {not_before}",
+            result.ticket_id
+        );
     }
 }
 
@@ -4416,6 +4523,10 @@ fn plan_daemon_reconstruction_role_read(
 /// reconstruction composition can derive the role disposition from them; this
 /// seam does not decide admission, capability qualification or packet
 /// readiness from a successful retrieval.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one non-rederived exact-read binding context: response, fence, scope, operation pair, role, selector pair (#838)"
+)]
 fn project_daemon_role_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,

@@ -187,7 +187,9 @@
       "implementation_support=PARTIAL is non-admittable",
       "evidence_execution_status=NOT_EXECUTED is non-admittable",
       "execution_routes[0].status=target is non-admittable",
-      "event_contract.coverage_status=documented_not_observed is non-admittable"
+      "event_contract.coverage_status=documented_not_observed is non-admittable",
+      "RGF-AGENT-ROUTES admission evidence does not exist: no route-profile admission receipt names this route_id, so the required endpoint, OpenCode/runtime version, serializer/template revision, tool-role ordering, reasoning/continuation settings, compaction behavior, and auth/quota surface are unrecorded",
+      "the six mandated RGF-AGENT-ROUTES pilot probes have no retained route-admission artifacts, so the route is unadmitted and selects only bounded implementation, read-only scouting, or broad coverage"
     ]
   }
 }

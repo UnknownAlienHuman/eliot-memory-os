@@ -1815,6 +1815,97 @@ fn receipt_digest(value: &BootstrapDraftImportReceipt) -> Result<String, Bootstr
     canonical_digest(&unsigned, "bootstrap-draft-import-receipt")
 }
 
+/// Product identity bound by one bootstrap draft (issue #1854 A2).
+///
+/// A draft binds the exact source identity it was briefed against
+/// (`source_identity`, conventionally `{repository_root}@{source_head}`) plus
+/// the evidence snapshot and rule catalogue digests it was compiled from. Any
+/// change to this triple invalidates claims bound to it (Implementation I17.3:
+/// a dependency change invalidates the corresponding claim automatically), so
+/// an import trigger must revalidate a draft against the current identity
+/// before the old record may be presented as current.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapBoundIdentity {
+    /// Exact source identity bound at briefing time.
+    pub source_identity: String,
+    /// Evidence snapshot digest bound at briefing time.
+    pub snapshot_ref: String,
+    /// Rule catalogue digest bound at briefing time.
+    pub catalogue_ref: String,
+}
+
+/// Currentness verdict for one draft bound identity against the current
+/// product identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DraftIdentityVerdict {
+    /// The bound identity still matches the current identity exactly.
+    Current,
+    /// The bound identity changed; the old record must not be presented as
+    /// current until it is revalidated against the current identity.
+    RequiresRevalidation,
+}
+
+impl BootstrapBoundIdentity {
+    /// Reads the bound identity from one published draft JSON value.
+    ///
+    /// Failure and improvement drafts carry the same three identity members;
+    /// any other shape fails closed here.
+    pub fn from_draft(draft: &serde_json::Value) -> Result<Self, BootstrapCompileError> {
+        let object =
+            draft
+                .as_object()
+                .ok_or_else(|| BootstrapCompileError::ProviderValidation {
+                    provider: "bootstrap-bound-identity",
+                    detail: "bootstrap draft must be a JSON object".to_owned(),
+                })?;
+        let member = |field: &'static str| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BootstrapCompileError::ProviderValidation {
+                    provider: "bootstrap-bound-identity",
+                    detail: format!("bootstrap draft member {field} must be a string"),
+                })
+                .map(str::to_owned)
+        };
+        let identity = Self {
+            source_identity: member("source_identity")?,
+            snapshot_ref: member("snapshot_ref")?,
+            catalogue_ref: member("catalogue_ref")?,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Validates the three bound members.
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        let source = "bootstrap-bound-identity".to_owned();
+        text(&self.source_identity, source.clone(), "source_identity")?;
+        digest(&self.snapshot_ref, source.clone(), "snapshot_ref")?;
+        digest(&self.catalogue_ref, source, "catalogue_ref")?;
+        Ok(())
+    }
+
+    /// Compares this bound identity against the current product identity.
+    ///
+    /// Both identities are validated first; `Current` requires an exact match
+    /// on all three members. Any difference yields `RequiresRevalidation`: the
+    /// old record must not be presented as current without revalidation.
+    pub fn revalidate_against(
+        &self,
+        current: &Self,
+    ) -> Result<DraftIdentityVerdict, BootstrapCompileError> {
+        self.validate()?;
+        current.validate()?;
+        if self == current {
+            Ok(DraftIdentityVerdict::Current)
+        } else {
+            Ok(DraftIdentityVerdict::RequiresRevalidation)
+        }
+    }
+}
+
 fn canonical_digest<T: Serialize>(
     value: &T,
     artifact: &'static str,

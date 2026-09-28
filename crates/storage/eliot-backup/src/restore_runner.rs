@@ -18,7 +18,7 @@
 //! coordinator phases derive from.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use eliot_contracts::{EpochId, ResourceGeneration, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
@@ -135,8 +135,46 @@ impl FileRestoreTarget {
         self.final_evidence.as_ref()
     }
 
+    /// Resolves one member path that is guaranteed to stay inside the root.
+    ///
+    /// Bundle-supplied identifiers reach [`FileRestoreTarget::write_file`]
+    /// through `format!` (`events/{record_id}.json`, `blobs/{hash}`, ...), and
+    /// `Path::join` neither normalises `..` nor refuses an absolute,
+    /// drive-prefixed or UNC argument, so this is the single place where the
+    /// restore's "writes stay inside the isolated root" guarantee is enforced.
+    /// The accepted shape is exactly one or more non-empty plain segments:
+    /// `.`, `..`, a root component and a Windows prefix component are all
+    /// refused, and so is a path that names no segment at all. Refusal happens
+    /// before any directory is created and before any byte is written.
+    fn contained_member_path(&self, relative: &str) -> Result<PathBuf, BackupError> {
+        let refuse = |reason: &'static str| BackupError::InvalidField {
+            field: "restore member path",
+            reason,
+        };
+        let mut segments = 0usize;
+        for component in Path::new(relative).components() {
+            match component {
+                Component::Normal(_) => segments += 1,
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => {
+                    return Err(refuse(
+                        "must be plain relative segments inside the isolated root",
+                    ));
+                }
+            }
+        }
+        if segments == 0 {
+            return Err(refuse(
+                "must name at least one segment inside the isolated root",
+            ));
+        }
+        Ok(self.root.join(relative))
+    }
+
     fn write_file(&self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
-        let path = self.root.join(relative);
+        let path = self.contained_member_path(relative)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| BackupError::Target(error.to_string()))?;

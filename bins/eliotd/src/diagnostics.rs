@@ -211,9 +211,38 @@ impl ScreenedValue {
     }
 }
 
+/// Screens one daemon field through the shared `OperationalLog` scrubber.
+///
+/// The shared scrubber ([`scrub_labels_for_emit`]), the local marker check
+/// ([`local_redaction_reason`]) and the fail-closed verdict
+/// ([`ScrubbedLabels::is_clean`]) all judge one and the same canonical value:
+/// the input trimmed exactly as the compatibility sanitizers trim it
+/// ([`sanitize_identity`] and [`sanitize_detail`] both judge the trimmed
+/// string), so a whitespace-only difference can never screen one string and
+/// judge another. A recognisable secret with surrounding whitespace is
+/// therefore recognised by the scrubber too and is minted a handle with a
+/// redaction status instead of the bare [`REDACTED`] literal.
+///
+/// The compatibility sanitizer may still *transform* the canonical value
+/// ([`sanitize_detail`] maps control characters and `'` to `?` and
+/// [`sanitize_identity`] truncates to [`MAX_IDENTITY_CHARS`]), so the string
+/// this function emits is not always the string the policy judged. The
+/// fail-closed arm is therefore driven by the policy verdict alone: whenever
+/// [`ScrubbedLabels::is_clean`] denies the screened value, the field is
+/// emitted as an immutable handle over the canonical value with a redaction
+/// status and the recorded evidence disposition, whatever the sanitizer
+/// would have done to it. Sanitizer output is only ever emitted when the
+/// shared policy judges the screened value clean (issue #1842, AUDIT-1):
+/// gating that arm on the sanitizer leaving the value unchanged let a
+/// sanitizer-transformed `evh:`-shaped value — an apostrophe in a detail, an
+/// identity past the truncation bound — be emitted with no evidence handle,
+/// no redaction status and no evidence disposition, which is an accounting
+/// loss of exactly the kind `field_policy::claims_handle_shape` exists to
+/// reject.
 fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> ScreenedValue {
+    let canonical = value.trim().to_owned();
     let mut candidate = BTreeMap::new();
-    candidate.insert(key.to_owned(), value.to_owned());
+    candidate.insert(key.to_owned(), canonical.clone());
     let scrubbed = scrub_labels_for_emit(TelemetryFieldFamily::OperationalLog, &candidate);
 
     if let Some(handle) = scrubbed.handles.first() {
@@ -223,27 +252,31 @@ fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> Screene
                 redaction: Some(handle.clone()),
             };
         }
-        return screened_handle(key, value, RedactionReason::HandleOnly);
+        return screened_handle(key, &canonical, RedactionReason::HandleOnly);
     }
 
-    if let Some(reason) = local_redaction_reason(value) {
-        let handle =
-            field_policy::mint_handle(TelemetryFieldFamily::OperationalLog, key, value, reason);
+    if let Some(reason) = local_redaction_reason(&canonical) {
+        let handle = field_policy::mint_handle(
+            TelemetryFieldFamily::OperationalLog,
+            key,
+            &canonical,
+            reason,
+        );
         return ScreenedValue {
             value: handle.handle.clone(),
             redaction: Some(handle),
         };
     }
 
-    let Some(scrubbed_value) = scrubbed.labels.get(key) else {
+    if !scrubbed.labels.contains_key(key) {
         return ScreenedValue::unavailable();
-    };
-    let sanitized = sanitize(scrubbed_value);
+    }
+    let sanitized = sanitize(&canonical);
     if sanitized == UNAVAILABLE {
         return ScreenedValue::unavailable();
     }
-    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) && sanitized == value {
-        return screened_handle(key, value, RedactionReason::HandleOnly);
+    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) {
+        return screened_handle(key, &canonical, RedactionReason::HandleOnly);
     }
     ScreenedValue {
         value: sanitized,

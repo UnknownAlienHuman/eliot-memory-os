@@ -724,6 +724,10 @@ pub(super) async fn dispatch_operator_snapshot(
     .map_err(Into::into)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered query pipeline stays whole: validation gates, snapshot, records, paginate, grants, page (#838)"
+)]
 pub(super) async fn dispatch_operator_query(
     state: &McpState,
     context: AuthenticatedRequestContext,

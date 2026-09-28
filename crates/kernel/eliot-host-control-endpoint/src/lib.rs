@@ -23,10 +23,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use eliot_host_service::runtime_control::{
+    BackupRuntimeControlRequest, BackupRuntimeControlResponse,
     HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR, HostKernelRestartReceipt,
     HostReactiveContextRuntimeRequest, HostRuntimeControlOperation, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt, decode_runtime_control_request_frame,
-    runtime_control_response_frame, runtime_control_unknown_ref,
+    HostRuntimeControlResponse, HostStoreRecoveryReceipt, backup_response_frame,
+    backup_response_matches_request, decode_backup_request_frame,
+    decode_runtime_control_request_frame, runtime_control_response_frame,
+    runtime_control_unknown_ref,
 };
 use eliot_host_service::runtime_control::{operation_unknown_ref, response_matches_request};
 pub use eliot_host_service::{
@@ -44,8 +47,9 @@ use tokio::sync::oneshot;
 pub mod backup;
 pub mod responsiveness_challenge;
 pub use backup::{
-    AcceptedOwnerMethod, BackupOperationKind, accepted_host_backup_methods, authority_matches,
-    is_supported, register_backup_methods, rehearsal_resolves_cutover, requires_cutover_admission,
+    AcceptedOwnerMethod, BackupDispatchRefusal, BackupOperationKind, BackupRole, HostBackupOwner,
+    HostBackupOwnerRegistration, accepted_host_backup_methods, authority_matches, is_supported,
+    register_backup_methods, rehearsal_resolves_cutover, requires_cutover_admission,
 };
 
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
@@ -203,6 +207,7 @@ pub struct HostRuntimeControl {
     queue: HostRuntimeControlQueue,
     user_automation_queue: HostUserAutomationExecutionQueue,
     user_automation_owner: Option<UserAutomationHostOwnerBinding>,
+    backup_owner: Option<HostBackupOwnerRegistration>,
 }
 
 impl HostRuntimeControl {
@@ -231,6 +236,7 @@ impl HostRuntimeControl {
             queue,
             user_automation_queue,
             user_automation_owner: None,
+            backup_owner: None,
         })
     }
 
@@ -250,7 +256,23 @@ impl HostRuntimeControl {
             queue,
             user_automation_queue,
             user_automation_owner: Some(owner),
+            backup_owner: None,
         })
+    }
+
+    /// Registers the Host backup owner and its exact closed dispatch table on
+    /// the endpoint that already serves the canonical Host runtime-control
+    /// pipe.
+    ///
+    /// This is registration only: it opens no pipe, starts no task, and can
+    /// therefore never delay endpoint readiness. An endpoint without this
+    /// registration refuses every backup control request before effects
+    /// ([`Self::handle_backup_operation`]), exactly as an endpoint without
+    /// the UserAutomation owner refuses UserAutomation carriers.
+    #[must_use]
+    pub fn with_backup_owner(mut self, owner: HostBackupOwnerRegistration) -> Self {
+        self.backup_owner = Some(owner);
+        self
     }
 
     pub fn queue(&self) -> HostRuntimeControlQueue {
@@ -389,6 +411,116 @@ impl HostRuntimeControl {
         }
     }
 
+    /// Admits one decoded backup control request and routes it to the
+    /// registered owner operation (#962).
+    ///
+    /// The order is fail-closed and every gate runs before any owner effect:
+    /// the closed Host-accepted method table, the payload-to-authenticated
+    /// operation binding, the separate cutover admission, the registered
+    /// dispatch row, the owner itself, and finally the exact request/response
+    /// identity. An unsupported or absent method, a payload that does not
+    /// carry the authenticated operation's own wire identity, and a cutover
+    /// without its separate installation-authority admission are all refused
+    /// here, so none of them can be reported as a no-op/zero/default success.
+    ///
+    /// The answer is built by the owner of the `#954` bridge
+    /// ([`BackupRuntimeControlResponse::backup_response_for`]) and validated
+    /// against the exact request with the existing
+    /// [`backup_response_matches_request`] before it is serialized, so the
+    /// response's operation/source/destination/owner identity is exact.
+    ///
+    /// The refusal is the typed [`BackupDispatchRefusal`] and stays typed all
+    /// the way to the caller; it is rendered to text exactly once, at the
+    /// endpoint's own pre-existing `Result<(), String>` boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupDispatchRefusal`] when any gate above refuses. The
+    /// refusal is always produced before any owner effect.
+    fn handle_backup_operation(
+        &self,
+        request: &BackupRuntimeControlRequest,
+    ) -> Result<BackupRuntimeControlResponse, BackupDispatchRefusal> {
+        let operation = request.operation;
+        let refusal = BackupDispatchRefusal::new;
+        // 1. Closed Host-accepted method table. Unsupported and absent
+        //    methods fail before effects, never as a default success.
+        if !backup::is_supported(operation) {
+            return Err(refusal(
+                operation,
+                "backup method is not accepted by the Host",
+            ));
+        }
+        let method = accepted_host_backup_methods()
+            .iter()
+            .find(|method| method.op == operation)
+            .ok_or_else(|| {
+                refusal(
+                    operation,
+                    "backup method has no accepted Host registration row",
+                )
+            })?;
+        // 2. The payload's claimed operation must carry the authenticated
+        //    operation's own canonical wire identity. Only exact byte
+        //    equality passes, so a payload can never substitute another
+        //    operation's wire identity and select an owner operation.
+        if !authority_matches(operation, method.wire_id) {
+            return Err(refusal(
+                operation,
+                "backup payload does not carry the authenticated operation wire identity",
+            ));
+        }
+        // 3. Resolve the operation's separate cutover admission from the
+        //    closed accepted table. `None` means the method carries no
+        //    accepted registration at all and fails before effects.
+        let Some(needs_cutover_admission) = backup::requires_cutover_admission(operation) else {
+            return Err(refusal(
+                operation,
+                "backup method has no accepted Host cutover admission",
+            ));
+        };
+        // A cutover requires the authenticated role that carries cutover
+        // authority. A prepare-domain role cannot present a cutover
+        // admission, and a rehearsal completion is not an accepted method at
+        // all, so rehearsal can never select cutover.
+        if needs_cutover_admission && !request.role.permits(BackupOperationKind::AdmitCutover) {
+            return Err(refusal(
+                operation,
+                "backup cutover lacks its separate installation-authority admission",
+            ));
+        }
+        // 4. The registered closed dispatch table is the owner registration:
+        //    an accepted method the composition did not register has no owner
+        //    operation and fails before effects.
+        let Some(registration) = self.backup_owner.as_ref() else {
+            return Err(refusal(operation, "Host backup owner is not composed"));
+        };
+        let Some(registered) = registration.registered_method(operation) else {
+            return Err(refusal(
+                operation,
+                "no Host backup owner operation is registered for this method",
+            ));
+        };
+        if registered.needs_cutover_admission != needs_cutover_admission {
+            return Err(refusal(
+                operation,
+                "registered cutover admission diverges from the accepted Host backup table",
+            ));
+        }
+        // 5. Route to the one registered owner operation.
+        registration.dispatch(request)?;
+        // 6. Exact-identity answer. A transport acknowledgement is never
+        //    reported as backup semantic success.
+        let response = BackupRuntimeControlResponse::backup_response_for(request);
+        if !backup_response_matches_request(request, &response) {
+            return Err(refusal(
+                operation,
+                "backup response does not match the admitted request identity",
+            ));
+        }
+        Ok(response)
+    }
+
     pub async fn serve_one(&self, timeout: Duration) -> Result<(), String> {
         let installer =
             eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
@@ -445,14 +577,32 @@ impl HostRuntimeControl {
                 runtime_control_response_frame(connection_id, &response)?
             }
             Err(_) => {
-                let request = decode_user_automation_host_execution_request_frame(&frame)
-                    .map_err(|error| error.to_string())?;
-                let response = UserAutomationHostExecutionResponse::failed_for(
-                    &request,
-                    UserAutomationRuntimeError::IdentityConflict,
-                );
-                user_automation_host_execution_response_frame(&request, &response)
-                    .map_err(|error| error.to_string())?
+                // The canonical Host runtime-control pipe also carries the
+                // `#954` backup envelope. Its decoder is the existing bridge
+                // owner; a frame that is neither shape still falls through to
+                // the unchanged UserAutomation refusal below. A backup request
+                // that is not admitted fails with its typed refusal here, so
+                // no unsupported method can reach an owner effect.
+                if let Ok(backup_request) = decode_backup_request_frame(&frame) {
+                    // The typed refusal is rendered to text exactly once,
+                    // here, at the endpoint's pre-existing `Result<(), String>`
+                    // boundary. No backup request is answered with a success
+                    // frame unless every gate admitted it and the registered
+                    // owner performed the exact operation.
+                    let backup_response = self
+                        .handle_backup_operation(&backup_request)
+                        .map_err(|refused| refused.to_string())?;
+                    backup_response_frame(connection_id, &backup_response)?
+                } else {
+                    let request = decode_user_automation_host_execution_request_frame(&frame)
+                        .map_err(|error| error.to_string())?;
+                    let response = UserAutomationHostExecutionResponse::failed_for(
+                        &request,
+                        UserAutomationRuntimeError::IdentityConflict,
+                    );
+                    user_automation_host_execution_response_frame(&request, &response)
+                        .map_err(|error| error.to_string())?
+                }
             }
         };
         server

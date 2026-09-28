@@ -34,6 +34,10 @@ use crate::{ContractError, canonical_json_bytes, sha256_hex};
 /// this revision refuses the selector instead of guessing its meaning.
 pub const BRIDGE_RECOVERY_SELECTOR_VERSION: u64 = 1;
 
+/// Wire revision for the owner-scoped process-restart resume selector.
+/// Existing keyed page selectors remain revision 1.
+pub const BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION: u64 = 2;
+
 /// Key separator that may not appear inside a selector text field, because
 /// every persisted owner key is built as `<namespace>::<suffix>`.
 const SELECTOR_KEY_SEPARATOR: &str = "::";
@@ -64,6 +68,14 @@ pub const BRIDGE_RECOVERY_SELECTOR_GAP_LIMIT: u64 = 256;
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BridgeRecoverySelector {
+    /// Resume the unique active recovery window admitted for the current
+    /// authenticated owner scope. The caller supplies neither owner identity
+    /// nor a window key; the owner must fail closed if that scope does not
+    /// resolve to exactly one unexpired persisted window.
+    Resume {
+        /// Exactly [`BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION`].
+        version: u64,
+    },
     /// One page of the outer stream enumeration, starting after the
     /// owner-issued `after_stream` position.
     Streams {
@@ -138,12 +150,15 @@ impl BridgeRecoverySelector {
         Ok(selector)
     }
 
-    /// The owner-issued window this selector is bound to.
-    pub fn window_key(&self) -> &str {
+    /// The owner-issued window this selector is bound to, when the selector
+    /// already carries one. An owner-scoped [`Self::Resume`] intentionally
+    /// has no caller-supplied window key.
+    pub fn window_key(&self) -> Option<&str> {
         match self {
+            Self::Resume { .. } => None,
             Self::Streams { window_key, .. }
             | Self::Stream { window_key, .. }
-            | Self::UnscopedGaps { window_key, .. } => window_key.as_str(),
+            | Self::UnscopedGaps { window_key, .. } => Some(window_key.as_str()),
         }
     }
 
@@ -168,24 +183,16 @@ impl BridgeRecoverySelector {
     /// existence: a selector that carries the right keys with the wrong
     /// cursor, the wrong incarnation, or an out-of-window bound fails here.
     pub fn validate(&self) -> Result<(), ContractError> {
-        let version = match self {
-            Self::Streams { version, .. }
-            | Self::Stream { version, .. }
-            | Self::UnscopedGaps { version, .. } => *version,
-        };
-        if version != BRIDGE_RECOVERY_SELECTOR_VERSION {
-            return Err(ContractError::Blank {
-                field: "bridge_recovery_selector.version",
-            });
-        }
-        let window_key = self.window_key();
-        validate_digest(window_key, "bridge_recovery_selector.window_key")?;
+        self.validate_version()?;
         match self {
+            Self::Resume { .. } => {}
             Self::Streams {
+                window_key,
                 after_stream,
                 stream_limit,
                 ..
             } => {
+                validate_digest(window_key, "bridge_recovery_selector.window_key")?;
                 validate_text(after_stream, "bridge_recovery_selector.after_stream")?;
                 if *stream_limit == 0 || *stream_limit > BRIDGE_RECOVERY_SELECTOR_STREAM_LIMIT {
                     return Err(ContractError::Blank {
@@ -194,6 +201,7 @@ impl BridgeRecoverySelector {
                 }
             }
             Self::Stream {
+                window_key,
                 stream_id,
                 owner_incarnation,
                 owner_revision,
@@ -206,6 +214,7 @@ impl BridgeRecoverySelector {
                 gap_limit,
                 ..
             } => {
+                validate_digest(window_key, "bridge_recovery_selector.window_key")?;
                 validate_text(stream_id, "bridge_recovery_selector.stream_id")?;
                 if stream_id.contains(SELECTOR_KEY_SEPARATOR) {
                     return Err(ContractError::Blank {
@@ -242,11 +251,13 @@ impl BridgeRecoverySelector {
                 }
             }
             Self::UnscopedGaps {
+                window_key,
                 after_gap_scope,
                 gap_offset,
                 gap_limit,
                 ..
             } => {
+                validate_digest(window_key, "bridge_recovery_selector.window_key")?;
                 validate_digest(after_gap_scope, "bridge_recovery_selector.after_gap_scope")?;
                 if *gap_limit == 0
                     || *gap_limit > BRIDGE_RECOVERY_SELECTOR_GAP_LIMIT
@@ -257,6 +268,26 @@ impl BridgeRecoverySelector {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_version(&self) -> Result<(), ContractError> {
+        let version = match self {
+            Self::Resume { version }
+            | Self::Streams { version, .. }
+            | Self::Stream { version, .. }
+            | Self::UnscopedGaps { version, .. } => *version,
+        };
+        let expected_version = if matches!(self, Self::Resume { .. }) {
+            BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION
+        } else {
+            BRIDGE_RECOVERY_SELECTOR_VERSION
+        };
+        if version != expected_version {
+            return Err(ContractError::Blank {
+                field: "bridge_recovery_selector.version",
+            });
         }
         Ok(())
     }

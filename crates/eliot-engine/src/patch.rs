@@ -835,29 +835,51 @@ fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
     Some(command)
 }
 
-/// Admits the real agent Cargo argv of one verifier requirement through the one
+/// Admits one agent-originated Cargo argv through the one
 /// InstrumentRunner-controlled build projection (issue #1902).
 ///
 /// I18.26 line 3 reads: "Parallel agents use Cargo package selection and one
 /// InstrumentRunner-controlled build projection. They do not independently
-/// launch unrestricted `cargo --workspace` commands." This function is the
-/// agent verifier lane's only Cargo admission point, and the argv it returns is
-/// the only argv [`VerifierHarness::run_requirement`] launches, so the
-/// projection cannot be stepped over by calling the launcher directly. A
-/// [`CargoScopeRefusal`](eliot_instrument_runner::CargoScopeRefusal) is
-/// returned instead of an argv, and the caller launches nothing on that path.
+/// launch unrestricted `cargo --workspace` commands." This is the shared
+/// admission point for the verifier lanes that launch Cargo on agent work:
+/// the patch verifier lane below and the registered cargo verifier lane in
+/// `eliot-app`. Every caller launches only the returned argv, so the
+/// projection cannot be stepped over by calling a launcher directly. A refusal
+/// is a typed [`BuildProjectionError`] and the caller launches nothing on that
+/// path.
 ///
 /// The argv is presented as [`CargoOrigin::Agent`] because it is
 /// agent-originated. The projected origin additionally requires the argv to
 /// equal the argv of a live [`ProjectedBuild`](eliot_instrument_runner::ProjectedBuild),
-/// and this composition root has no admitted work-item declaration to present
-/// one, so claiming that origin here would be an unbacked assertion rather
-/// than an admission.
+/// and neither verifier lane owns an admitted work-item declaration to present
+/// one — no [`DeclaredWorkItem`](eliot_instrument_runner::DeclaredWorkItem)
+/// producer, no admitted [`GovernedWorkEnvelope`](eliot_instrument_runner::GovernedWorkEnvelope),
+/// and no [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph) source
+/// exists at either seam — so claiming that origin here would be an unbacked
+/// assertion rather than an admission.
+///
+/// # Errors
+///
+/// Returns the projection's typed refusal ([`BuildProjectionError::NotCargo`]
+/// when the argv does not name the cargo tool,
+/// [`BuildProjectionError::CargoScope`] when it requests `--workspace` or
+/// `--all`).
+pub fn admit_agent_cargo_argv(argv: &[String]) -> Result<Vec<String>, BuildProjectionError> {
+    restrict_agent_argv(argv, CargoOrigin::Agent)
+}
+
+/// Admits the real agent Cargo argv of one verifier requirement through the one
+/// InstrumentRunner-controlled build projection (issue #1902).
+///
+/// This function is the agent verifier lane's only Cargo admission point, and
+/// the argv it returns is the only argv [`VerifierHarness::run_requirement`]
+/// launches. Admission itself is [`admit_agent_cargo_argv`], shared with the
+/// registered cargo verifier lane so both lanes refuse the same selections.
 fn admitted_agent_cargo_argv(command: &FixedCommand) -> Result<Vec<String>, BuildProjectionError> {
     let mut argv = Vec::with_capacity(command.args.len() + 1);
     argv.push(command.program.to_owned());
     argv.extend(command.args.iter().map(|arg| (*arg).to_owned()));
-    restrict_agent_argv(&argv, CargoOrigin::Agent)
+    admit_agent_cargo_argv(&argv)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1298,8 +1320,10 @@ fn truncate_lossy(bytes: &[u8]) -> String {
 /// Acceptance-eligibility quarantine for the legacy command lane (issue
 /// #1852 W3): a run executed through the private command map carries
 /// [`QUARANTINED_LEGACY_LANE`] as its summary prefix, and no such run may
-/// satisfy a required verifier, no matter its status.
-fn is_quarantined_legacy_run(run: &VerifierRun) -> bool {
+/// satisfy a required verifier, no matter its status. Shared with the
+/// work-queue selection point so a quarantined run cannot be selected by an
+/// authority-facing caller either.
+pub(crate) fn is_quarantined_legacy_run(run: &VerifierRun) -> bool {
     run.summary.starts_with(QUARANTINED_LEGACY_LANE)
 }
 

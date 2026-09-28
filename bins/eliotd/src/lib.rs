@@ -87,6 +87,7 @@ mod observation_adapters;
 mod owner_feed;
 mod process_origin;
 mod reactive_feed;
+mod route_execution_identity;
 mod route_receipts;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
@@ -118,7 +119,8 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    daemon_coordinator_config, plan_candidate, prereq_ports,
+    daemon_coordinator_config, plan_candidate, prepare_swarm_definition_admission_candidate,
+    prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
@@ -137,7 +139,8 @@ pub use capability_admission::{
     canonical_required_set, evaluate_production_admission,
 };
 pub use capability_evidence_wiring::{
-    EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
+    CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, drain_capability_evidence_records,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
@@ -249,6 +252,10 @@ pub use process_origin::{
     ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
 };
 pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
+pub use route_execution_identity::{
+    DeclaredRoute, ExecutionIdentity, LaunchAuthority, RouteIdentityError, admit_declared_launch,
+    declared_continuity, declared_route_key,
+};
 pub use route_receipts::{
     GovernorRouteAttempt, RouteAdmissionVisibility, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
@@ -2501,6 +2508,32 @@ impl DaemonComposition {
         plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
+    /// Prepares one Task Controller-authored swarm definition for Governor
+    /// admission through the real coordinator owner on the admitted daemon
+    /// path (issue #1699).
+    ///
+    /// Readiness gates the call; preparation delegates to
+    /// [`prepare_swarm_definition_admission_candidate`], so the production
+    /// caller and the wired tests share one implementation. The prep is
+    /// candidate-only: no Governor receipt is minted, no durable write
+    /// occurs, and nothing is launched. Launch stays with the existing
+    /// injected admission/activation/dispatch ports.
+    pub fn agent_fabric_prepare_swarm_definition_admission(
+        &self,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+    ) -> Result<eliot_agent_coordinator::SwarmDefinitionAdmissionPrep, DaemonError> {
+        let _span =
+            tracing::info_span!("eliotd.fabric_prepare_swarm_definition_admission").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        prepare_swarm_definition_admission_candidate(&config, proposal, maps)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
     /// Resolves one admitted provider capability from live session-observed
     /// owner currentness (issue #1108, production composition caller for
     /// W4/A1/A2).
@@ -2843,18 +2876,35 @@ impl DaemonComposition {
         now: u64,
     ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
         let view = self.capability_admission_mut()?;
-        let staled = view.apply_scope_change(
-            observed_scope,
-            eliot_governor::ScopeDependencySelector::all(),
-        );
-        if staled > 0 {
-            tracing::warn!(
-                target: "eliotd::capability_evidence",
-                event = "eliotd.capability_evidence_staled",
-                staled_records = staled,
-                "an observed runtime/adapter/provider/serializer change staled dependent capability evidence; the exact route must requalify before production work"
-            );
-        }
+        // NO `apply_scope_change` CALL HERE, and the reason is the whole point
+        // of issue #1957's W4. That method stales a record whenever its
+        // fingerprint DIFFERS from the scope supplied as `current` on a selected
+        // dimension, and a scope once invalidated is not revived by a later
+        // matching record. Handing it an OBSERVED route as `current` with
+        // `ScopeDependencySelector::all()` therefore invalidates every other
+        // account's and route's still-valid evidence, on every call, and
+        // permanently — so admitting one route destroyed the evidence for the
+        // rest. I3.4 requires capability to be route/account-specific, so that
+        // call erased exactly the dimension the document protects. A documented
+        // coarse selector does not make a wrong direction right.
+        //
+        // Staleness is therefore DERIVED at the gate and needs no mutation:
+        // `admit_production_route` already requires each retained record's
+        // `scope_fingerprint` to equal the observed scope by EXACT value, so a
+        // changed adapter hash, serializer fingerprint, or any other dimension
+        // stops admitting on its own. That is the simplest correct mechanism for
+        // "runtime/adapter/provider/serializer change makes dependent evidence
+        // stale", and it is the one the document describes.
+        //
+        // `GovernorCapabilityAdmission::apply_scope_change` itself is left in
+        // place, unreferenced from production: it is pre-existing public surface
+        // whose correct direction is a narrower selector than any current
+        // observation site can supply, and removing it would exceed this issue.
+        // The intake path's durable leg
+        // (`capability_evidence_wiring::hydrate_capability_admission_view`)
+        // re-derives the invalidation index from each served record's own
+        // persisted `limitations_and_negative_evidence`, so a committed
+        // restriction still survives a restart.
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
     }
 

@@ -42,7 +42,13 @@ use crate::{
     evaluate_testd_verification_current,
 };
 
-const GOVERNOR_SCOPE_ID: &str = "governor";
+/// The Governor's own canonical store scope identity.
+///
+/// One scope identity for every Governor-owned durable owner row, so the
+/// capability-evidence commit leg (issue #1773) and its complete paged
+/// hydration read address exactly the same rows instead of inventing a second
+/// scope string per leg.
+pub const GOVERNOR_SCOPE_ID: &str = "governor";
 
 /// Typed failure at the production finish boundary.
 #[derive(Debug, Error)]

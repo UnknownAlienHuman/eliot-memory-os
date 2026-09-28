@@ -22,7 +22,7 @@ use crate::{
     IsolatedDestination, IsolationEvidence, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest,
     NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error, json_shape_name,
@@ -602,6 +602,57 @@ fn validate_dreamer_identity(
         ));
     }
     Ok(())
+}
+
+/// One scoped ECXF export input. The output location and source evidence are
+/// selected by the canonical Store owner, never supplied by the caller.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EcxfExportRequest {
+    pub context: RequestMeta,
+    pub identity: OperationIdentity,
+    pub scope_id: ScopeId,
+}
+
+impl EcxfExportRequest {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.context.validate().map_err(StoreError::Foundation)?;
+        self.identity.validate()?;
+        Ok(())
+    }
+}
+
+/// Bounded projection of an owner-published ECXF package. A report is emitted
+/// only after the package and its manifest/integrity digest have been read back.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EcxfExportReport {
+    pub export_id: String,
+    pub format: String,
+    pub package_path: String,
+    pub manifest_sha256: String,
+    pub archive_sha256: String,
+    pub file_count: u64,
+    pub event_count: u64,
+    pub projection_count: u64,
+    pub receipt_count: u64,
+    pub blob_count: u64,
+    pub purge_ledger_entries: u64,
+}
+
+impl EcxfExportReport {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        crate::validate_text(&self.export_id, "ecxf.export_id")?;
+        if self.format != "ECXF/1" {
+            return Err(StoreError::InvalidField {
+                field: "ecxf.format",
+                reason: "must be ECXF/1",
+            });
+        }
+        crate::validate_text(&self.package_path, "ecxf.package_path")?;
+        crate::validate_digest(&self.manifest_sha256, "ecxf.manifest_sha256")?;
+        crate::validate_digest(&self.archive_sha256, "ecxf.archive_sha256")
+    }
 }
 
 /// Closed backup operation catalogue over #950's accepted semantic types

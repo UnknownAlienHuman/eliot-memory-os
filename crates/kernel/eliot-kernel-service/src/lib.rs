@@ -74,7 +74,7 @@ pub use capacity_evidence::{
 };
 pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageRejection,
-    PreStageState, derive_rejection_id, pre_stage_check,
+    PreStageState, VerifiedCorrectionLink, derive_rejection_id, pre_stage_check,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
@@ -193,6 +193,16 @@ pub use store_client::{
 pub use store_gateway::KernelStoreGateway;
 #[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
+#[cfg(windows)]
+pub use store_gateway::StoreApplyRefusal;
+// Issue #2764 item 6: the Dreamer route's real caller must be able to
+// distinguish a proven mutation disposition from a still-open Problem State
+// and from a bare gateway refusal, so both the carrier and the recovered
+// outcome it carries are part of the crate's public contract.
+#[cfg(windows)]
+pub use store_gateway::DreamerCommitUncertain;
+#[cfg(windows)]
+pub use store_gateway::DreamerJobGatewayError;
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,

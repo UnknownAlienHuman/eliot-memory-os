@@ -10,7 +10,7 @@ use super::{
     HostPhaseBMaterializationReceipt, INSTALLATION_SECRET_CREATION_PROOF_VERSION,
     INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationActivationApproval,
     InstallationActivationProjectionIntent, InstallationEffectPrecondition, InstallationEpoch,
-    InstallationError, InstallationProfile, InstallationServiceBootstrap,
+    InstallationError, InstallationProfile, InstallationRoots, InstallationServiceBootstrap,
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
@@ -427,6 +427,15 @@ pub struct InstallationTransaction {
     pub installation_epoch: InstallationEpoch,
     /// Selected path/supervision profile.
     pub profile: InstallationProfile,
+    /// Versioned I3.1 four-root binding resolved for `profile`.
+    ///
+    /// `Some` only when the transaction was planned through the
+    /// profile-governed selector; legacy ungoverned plans carry `None` and are
+    /// never defaulted into a binding. The registry store persists this exact
+    /// binding with the transaction, and restart rehydration revalidates it in
+    /// [`InstallationTransaction::validate`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_governed_roots: Option<InstallationRoots>,
     /// Governing request identity.
     pub request: ManagedEnvironmentChangeRequest,
     /// Previously active generation, if one exists.
@@ -686,6 +695,7 @@ impl InstallationTransaction {
             transaction_id,
             installation_epoch,
             profile,
+            profile_governed_roots: None,
             request,
             current_active_manifest,
             candidate_manifest,
@@ -1288,6 +1298,17 @@ impl InstallationTransaction {
             return Err(InstallationError::ProfileViolation(
                 "transaction profile must equal the candidate runtime launch profile".to_owned(),
             ));
+        }
+        if let Some(binding) = &self.profile_governed_roots {
+            if binding.runtime_state_roots
+                != self.candidate_manifest.runtime_launch.runtime_state_roots
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "profile-governed root binding must agree with the candidate runtime roots"
+                        .to_owned(),
+                ));
+            }
+            binding.validate(self.profile)?;
         }
         if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
             return Err(InstallationError::InvalidField {
@@ -2416,6 +2437,8 @@ struct InstallationTransactionWire {
     transaction_id: PlatformHandle,
     installation_epoch: InstallationEpoch,
     profile: InstallationProfile,
+    #[serde(default)]
+    profile_governed_roots: Option<InstallationRoots>,
     request: ManagedEnvironmentChangeRequest,
     current_active_manifest: Option<CandidateManifest>,
     candidate_manifest: CandidateManifest,
@@ -2446,6 +2469,7 @@ impl InstallationTransactionWire {
             transaction_id: self.transaction_id,
             installation_epoch: self.installation_epoch,
             profile: self.profile,
+            profile_governed_roots: self.profile_governed_roots,
             request: self.request,
             current_active_manifest: self.current_active_manifest,
             candidate_manifest: self.candidate_manifest,

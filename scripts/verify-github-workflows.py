@@ -263,12 +263,14 @@ def _enclosing_job_block(lines: list[str], index: int, indent: int) -> list[int]
     """Line indexes of the job body that owns a step at `indent`.
 
     `steps:` sits between the job header and its steps, so the owning job's body
-    is every shallower mapping line from the job header up to (and including)
-    the `steps:` container, plus the job header line itself. Every governing
-    `if:`/`continue-on-error:`/`timeout-minutes:` in that body is returned, so a
-    skipped or soft-failure job is seen no matter which key carries it.
+    is every mapping line at the job-body indentation, from the `steps:`
+    container up to (but not including) the shallower job header. Every
+    governing `if:`/`continue-on-error:`/`timeout-minutes:` a job body can carry
+    is one of those lines, so a skipped or soft-failure job is seen no matter
+    which key carries it.
     """
     governing: list[int] = []
+    body_indent: int | None = None
     for previous in range(index, -1, -1):
         line = lines[previous]
         if _is_yaml_comment(line):
@@ -279,9 +281,13 @@ def _enclosing_job_block(lines: list[str], index: int, indent: int) -> list[int]
         leading = len(line) - len(line.lstrip(" "))
         if leading >= indent:
             continue
+        if body_indent is not None and leading < body_indent:
+            # Shallower than a job-body key: this is the job header, so the job
+            # body ends here and nothing above it governs the step.
+            break
         governing.append(previous)
         if key == "steps":
-            break
+            body_indent = leading
     return governing
 
 
@@ -471,18 +477,23 @@ def _on_block_child_key(line: str) -> str | None:
 
 
 def parse_workflow_events(content: str) -> set[str]:
-    """Extract event triggers defined in an 'on:' section.
+    """Extract event triggers defined in the top-level 'on:' section.
 
-    The block style accepts every YAML spelling of an event key (optionally
-    quoted, any spacing before the `:`), because GitHub's own YAML semantics
-    carry the event in all of them: an unrecognized spelling must never make
-    an automatic event invisible and let the workflow report no event at all.
+    Only a top-level mapping key opens the section, so a nested mapping that
+    happens to carry an `on:` key (an `env:` variable, a job input) can neither
+    shadow the real section nor fabricate a permitted event set from it: a
+    shadowed section reports what the shadow says, not what the workflow
+    triggers. The block style accepts every YAML spelling of an event key
+    (optionally quoted, any spacing before the `:`), because GitHub's own YAML
+    semantics carry the event in all of them.
     """
     lines = content.splitlines()
     for index, line in enumerate(lines):
-        if not re.fullmatch(r"on:\s*.*", line.strip()):
+        if line != line.lstrip(" "):
             continue
-        tail = line.split(":", 1)[1].strip()
+        if _yaml_key(line) != "on":
+            continue
+        tail = _yaml_value(line)
         if tail.startswith("[") and tail.endswith("]"):
             return {
                 item.strip(" '\"")
@@ -490,7 +501,7 @@ def parse_workflow_events(content: str) -> set[str]:
                 if item.strip()
             }
         if tail:
-            return {tail.strip("'\"")}
+            return {tail}
         events: set[str] = set()
         for candidate in lines[index + 1 :]:
             stripped = candidate.strip()
@@ -557,10 +568,12 @@ def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
             actions/checkout@<sha>
 
     A value that would cross a `#` comment is not a reference at all: the
-    annotation line is comment metadata, and skipping it reaches the real
-    reference underneath, so a mutable tag cannot be hidden behind an
-    annotation, and an `uses:` key that carries no reachable value is reported
-    with an empty reference so it cannot be dropped from the identity record.
+    annotation is comment metadata, so a key line that carries only an
+    annotation is read exactly like a key line that carries no value, and the
+    real reference underneath it is reached. A mutable tag therefore cannot hide
+    behind an annotation, and a `uses:` key that carries no reachable value is
+    reported with an empty reference so it cannot be dropped from the identity
+    record.
     """
     lines = content.splitlines()
     references: list[tuple[int, str]] = []
@@ -572,8 +585,7 @@ def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
                     (index + 1, value_match.group("dq") or value_match.group("sq") or value_match.group("plain"))
                 )
                 break
-            if "#" in line[key_match.end() :]:
-                break
+            resolved = False
             for follow in range(index + 1, len(lines)):
                 candidate = lines[follow]
                 if _is_yaml_comment(candidate):
@@ -591,8 +603,9 @@ def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
                         value_match.group("dq") or value_match.group("sq") or value_match.group("plain"),
                     )
                 )
+                resolved = True
                 break
-            else:
+            if not resolved:
                 references.append((index + 1, ""))
             break
     return references

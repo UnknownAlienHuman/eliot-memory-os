@@ -76,6 +76,7 @@ use eliot_agent_coordinator::{
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
+use eliot_protocol::ContinuityKind;
 use serde::Deserialize;
 
 use super::capability_admission::{
@@ -89,6 +90,10 @@ use super::capability_outcome::{
     FallbackOutcomeRequest, GenerationChallengeOutcomeRequest, MAX_REFS, OutcomeDisposition,
     fallback_outcome, generation_challenge_outcome, project_degradation, removed_promise,
     surviving_operation,
+};
+use super::route_execution_identity::{
+    DeclaredRoute, LaunchAuthority, RouteIdentityError, admit_declared_launch, declared_continuity,
+    declared_route_key,
 };
 use super::route_receipts::{RuntimeObservedFacts, effective_route_key};
 use super::{DaemonComposition, DaemonKernelClient, SERVICE_NAME, kernel_port_error};
@@ -179,6 +184,25 @@ pub struct ModelInvokeInput {
     /// `None` while the query is unserved: cold and honest — outcomes carry
     /// an empty (unknown) fingerprint, never an inferred or defaulted one.
     pub kernel_generation: Option<KernelGenerationProjection>,
+    /// Declared execution identity and route policy of the bound route
+    /// (issue #1816, I10.3–I10.7): the canonical route fingerprint plus the
+    /// declared `service | interactive_user | remote` identity and the
+    /// retention/network and workspace/scope policy that identity runs under.
+    /// `None` fails the gate closed — a route with no declared execution
+    /// identity is not launchable, and the identity is never inferred from
+    /// the route, the host, or the process account.
+    pub declared_route: Option<DeclaredRoute>,
+    /// The surface through which this launch reached the daemon. An
+    /// `INTERACTIVE_USER` route is admitted only under
+    /// [`LaunchAuthority::UserBrokerDelegated`]; a launch that claims a
+    /// user-desktop identity without resolving to the authorized User Broker
+    /// is refused.
+    pub launch_authority: LaunchAuthority,
+    /// The declared route recorded for the session this invoke would
+    /// continue, or `None` for a fresh attempt. A changed declaration yields
+    /// an explicit rehydrated new attempt instead of silent continuation,
+    /// and a carried session across such a change is refused.
+    pub resumed_from: Option<DeclaredRoute>,
 }
 
 /// Kernel-issued active-generation projection observation (R4).
@@ -476,6 +500,14 @@ const REGISTRY_REFUSAL_CONTEXT: &str = "governor capability registry";
 
 /// Refusal context naming the production admission funnel side of the gate.
 const FUNNEL_REFUSAL_CONTEXT: &str = "production admission";
+
+/// Refusal context naming the declared execution-identity and route-fingerprint
+/// side of the gate (issue #1816, I10.3).
+const EXECUTION_IDENTITY_REFUSAL_CONTEXT: &str = "declared route execution identity";
+
+/// The capability this gate tests when it refuses: the route's declared
+/// execution identity and the route fingerprint that declares it.
+const EXECUTION_IDENTITY_CAPABILITY: &str = "route.execution_identity";
 
 /// Recovery marker recorded on a generation-scoped challenge failure.
 ///
@@ -860,6 +892,95 @@ fn refuse_capability_call(
     }
 }
 
+/// Enforces the declared execution identity and route fingerprint of the bound
+/// route (issue #1816, I10.3–I10.7) before any capability evidence join runs.
+///
+/// The declaration is caller-threaded per call and is never inferred from the
+/// route, the host family, or the process account. Every refusal fails closed,
+/// is recorded on this attempt's receipt through the one existing
+/// call-scoped outcome owner ([`refuse_capability_call`]) so the declared
+/// identity and the exact limitation are visible where the invoke stopped, and
+/// is surfaced in the returned error text, which is what the invocation and
+/// recovery surfaces report:
+///
+/// - no declaration, or a malformed one: [`RouteIdentityError::RouteNotDeclared`]
+///   / [`RouteIdentityError::InvalidDeclaration`];
+/// - a declaration naming a different route than the bound fingerprint:
+///   [`RouteIdentityError::DeclarationRouteMismatch`];
+/// - an `INTERACTIVE_USER` route launched directly by the daemon or the Kernel
+///   instead of through the authorized User Broker:
+///   [`RouteIdentityError::InteractiveUserRequiresUserBroker`];
+/// - a session carried across a changed declared route — a different execution
+///   identity, a local-versus-managed adapter, or a distinct account/credential
+///   mode: [`RouteIdentityError::SessionCarryRequiresRehydration`], because the
+///   only legal transition there is an explicit rehydrated new attempt.
+///
+/// The same declared route with no session is admitted here; that is a fresh or
+/// natively-resumed attempt, not a continuation across an identity boundary.
+fn enforce_declared_route(
+    input: &ModelInvokeInput,
+    generation_fingerprint: &str,
+    intake: &mut AttemptReceipt,
+) -> Result<(), CompositionError> {
+    // The key the refusal is recorded under is the complete declared route:
+    // canonical fingerprint plus execution identity plus policy, so a service
+    // route and an interactive-user route over the same provider/model are
+    // distinct keys and never share one receipt entry.
+    let requested_key = input
+        .declared_route
+        .as_ref()
+        .and_then(|declared| declared_route_key(declared).ok())
+        .map_or_else(
+            || {
+                effective_route_key(&input.binding.route)
+                    .map(|key| key.as_str().to_owned())
+                    .unwrap_or_default()
+            },
+            |key| key.as_str().to_owned(),
+        );
+    let mut refuse = |error: RouteIdentityError| {
+        let identity = input.declared_route.as_ref().map_or_else(
+            || "none".to_owned(),
+            |declared| declared.execution_identity.as_str().to_owned(),
+        );
+        refuse_capability_call(
+            EXECUTION_IDENTITY_REFUSAL_CONTEXT,
+            EXECUTION_IDENTITY_CAPABILITY,
+            &format!("declared execution identity {identity}: {error}"),
+            &requested_key,
+            generation_fingerprint,
+            input.attempt_id.as_str(),
+            intake,
+        )
+    };
+    let Some(declared) = input.declared_route.clone() else {
+        return Err(refuse(RouteIdentityError::RouteNotDeclared));
+    };
+    if declared.route != input.binding.route {
+        return Err(refuse(RouteIdentityError::DeclarationRouteMismatch));
+    }
+    if let Err(error) = declared.validate() {
+        return Err(refuse(error));
+    }
+    if let Err(error) = admit_declared_launch(&declared, input.launch_authority) {
+        return Err(refuse(error));
+    }
+    // A session may only continue on the exact same declared route. A changed
+    // execution identity, a local-versus-managed adapter, or a distinct
+    // account/credential mode yields an explicit rehydrated new attempt, so a
+    // carried session across that boundary is refused rather than continued.
+    if let Some(resumed_from) = input.resumed_from.as_ref()
+        && input.binding.session_id.is_some()
+        && !matches!(
+            declared_continuity(resumed_from, &declared),
+            Ok(ContinuityKind::NativeResume)
+        )
+    {
+        return Err(refuse(RouteIdentityError::SessionCarryRequiresRehydration));
+    }
+    Ok(())
+}
+
 /// Lifts the retained exact-fingerprint generation block when the
 /// caller-threaded evidence requalifies the generation, returning true.
 ///
@@ -1151,6 +1272,13 @@ fn verify_gate_preconditions(
 ///   the attempt, it never admits — only the funnel disposition admits.
 ///   Absent observed facts fail closed; facts are never fabricated from
 ///   the resolved route.
+/// - issue #1816 (I10.3–I10.7): the declared execution identity and route
+///   fingerprint are enforced first, through
+///   [`enforce_declared_route`], before any capability evidence is
+///   evaluated — a route with no declared identity, an identity that was not
+///   launched through its authorized User Broker, or a session carried
+///   across a changed identity / local-versus-managed adapter / account mode
+///   is refused there and recorded on this attempt's receipt.
 ///
 /// Returns the evaluated required set for the result-intake join below.
 fn gate_model_capability(
@@ -1163,6 +1291,10 @@ fn gate_model_capability(
 ) -> Result<Vec<String>, CompositionError> {
     let required = verify_gate_preconditions(admitted_fence, input, intake)?;
     let generation = admitted_fence.resource_generation.value();
+    // Issue #1816: the declared execution identity and route fingerprint are
+    // enforced before any evidence join, so an undeclared, wrongly-launched,
+    // or silently-continued route never reaches the capability funnel.
+    enforce_declared_route(input, generation_fingerprint, intake)?;
     let scope = input.evidence_scope.as_ref().ok_or_else(|| {
         owner_error(
             "dreamer model invoke threads no observed route scope; capability evidence is unevaluable",
@@ -1922,6 +2054,9 @@ mod tests {
             evidence_scope: None,
             current_fence: fence.clone(),
             kernel_generation: None,
+            declared_route: Some(test_declared_route(&route)),
+            launch_authority: LaunchAuthority::DirectDaemonOrKernel,
+            resumed_from: None,
         };
         let execution = RecordingExecution {
             calls: Mutex::new(0),
@@ -2060,6 +2195,11 @@ mod tests {
             )
             .map_err(|error| format!("probe evidence: {error}"))?
             .expires_at(2_000),
+            eliot_governor::OwnerEvidenceRevision::issued(
+                1,
+                &eliot_store_api::sha256_hex(b"test.dreamer.probe-evidence"),
+            )
+            .map_err(|error| format!("owner revision: {error}"))?,
         );
         Ok(registry)
     }
@@ -2102,6 +2242,16 @@ mod tests {
         }
     }
 
+    fn test_declared_route(route: &RouteFingerprint) -> DeclaredRoute {
+        DeclaredRoute {
+            route: route.clone(),
+            execution_identity: ExecutionIdentity::Service,
+            retention_policy: "provider-retained-30d".to_owned(),
+            network_policy: "egress-allowlist".to_owned(),
+            workspace_scope_policy: "workroot-scoped".to_owned(),
+        }
+    }
+
     fn gate_input(
         fixtures: &InvokeFixtures,
         records: Vec<CapabilityEvidenceRecord>,
@@ -2122,6 +2272,9 @@ mod tests {
             evidence_scope: scope,
             current_fence: fixtures.fence.clone(),
             kernel_generation: None,
+            declared_route: Some(test_declared_route(&fixtures.binding.route)),
+            launch_authority: LaunchAuthority::DirectDaemonOrKernel,
+            resumed_from: None,
         }
     }
 

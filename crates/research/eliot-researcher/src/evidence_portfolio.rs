@@ -4093,6 +4093,18 @@ pub enum PrecisionKind {
     /// `eliot_research_exchange_api::AnchorPrecision` spells, so this crate
     /// never carries a rung the contract type cannot express.
     Line,
+    /// Symbol-level assertion: the claimed named symbol inside a citation.
+    ///
+    /// I21.7 names a *symbol* beside a *line* among the four things a
+    /// file-level or document-level support does not automatically support, and
+    /// a source that pins a line has still not evidenced what the named symbol
+    /// in that line does. This rung exists for the same reason as [`Self::Line`]
+    /// and reads the ladder the same way: through the one [`coordinate_rank`]
+    /// owner, against the `symbol` rung
+    /// `eliot_research_exchange_api::AnchorPrecision` now spells. Without it a
+    /// symbol claim was not merely unchecked but unrepresentable, so the
+    /// criterion's symbol case had no observable at all.
+    Symbol,
     /// Population-wide assertion: the population the statement holds for.
     ///
     /// A population is not a position inside a source, so this rung deliberately
@@ -4111,11 +4123,10 @@ pub enum PrecisionKind {
     /// kind: a citation may not claim an anchor finer than the support it
     /// actually carries.
     ///
-    /// This is the ladder-wide arm; [`Self::Line`] is the named line rung of the
-    /// same rule. The `symbol` rung I21.7 lists beside `line` has no arm here
-    /// and no rung on `AnchorPrecision` either, so a symbol claim is
-    /// unrepresentable on this path rather than checked against a rank table the
-    /// contract type does not own.
+    /// This is the ladder-wide arm; [`Self::Line`] and [`Self::Symbol`] are the
+    /// named line and symbol rungs of the same rule, and both read the ladder
+    /// through the one [`coordinate_rank`] owner rather than keeping a second
+    /// rank table per rung.
     Coordinate,
 }
 
@@ -4159,10 +4170,11 @@ pub struct UnsupportedPrecisionItem {
 /// coarse enough to admit a fine anchor.
 ///
 /// This is the single rank table in this crate, shared by
-/// [`PrecisionKind::Coordinate`] and [`PrecisionKind::Line`]. It is derived from
-/// `AnchorPrecision`, not owned by it, so a rung may be added here only when
-/// `AnchorPrecision` carries the same spelling — the `symbol` rung I21.7 names
-/// is absent from both, which is why no arm ranks it.
+/// [`PrecisionKind::Coordinate`], [`PrecisionKind::Line`] and
+/// [`PrecisionKind::Symbol`]. It is derived from `AnchorPrecision`, not owned by
+/// it, so a rung may be added here only when `AnchorPrecision` carries the same
+/// spelling. The `symbol` rung I21.7 names is carried by both, which is what lets
+/// [`PrecisionKind::Symbol`] rank it.
 fn coordinate_rank(name: &str) -> Option<u8> {
     match name {
         "source" => Some(0),
@@ -4171,7 +4183,8 @@ fn coordinate_rank(name: &str) -> Option<u8> {
         "section" => Some(3),
         "paragraph" => Some(4),
         "line" => Some(5),
-        "byte_range" => Some(6),
+        "symbol" => Some(6),
+        "byte_range" => Some(7),
         _ => None,
     }
 }
@@ -4291,13 +4304,13 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
-        // The line rung and the ladder-wide coordinate form are ONE comparison
-        // on purpose: they differ only in the residue they produce, and a
-        // separate rank table for the single rung would be the second,
-        // differently shaped vocabulary the `Coordinate` doc comment exists to
-        // prevent. An unrecognised spelling is never treated as supported for
-        // either: an unknown rank fails closed.
-        PrecisionKind::Line | PrecisionKind::Coordinate => match (
+        // The line and symbol rungs and the ladder-wide coordinate form are ONE
+        // comparison on purpose: they differ only in the residue they produce,
+        // and a separate rank table per rung would be the second, differently
+        // shaped vocabulary the `Coordinate` doc comment exists to prevent. An
+        // unrecognised spelling is never treated as supported for any of them:
+        // an unknown rank fails closed.
+        PrecisionKind::Line | PrecisionKind::Symbol | PrecisionKind::Coordinate => match (
             coordinate_rank(assertion.asserted.trim()),
             coordinate_rank(assertion.supported.trim()),
         ) {
@@ -4336,6 +4349,12 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
                 "a citation anchored at a line or line range finer than the admitted support would \
                  be unbacked text",
                 "narrow the anchor to the supported precision or admit a source that supports it",
+            ),
+            PrecisionKind::Symbol => (
+                "a claim about a named symbol finer than the admitted support would be unbacked \
+                 text",
+                "narrow the claim to the supported precision, or admit a source that evidences \
+                 the symbol",
             ),
             PrecisionKind::Population => (
                 "a population-wide claim from support that declares a different or narrower \

@@ -610,6 +610,10 @@ struct CanonicalPacketRefs {
     experience_prior_guidance: BTreeMap<String, String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "7-field authority extraction stays whole: every field is required with its exact error context (#838)"
+)]
 fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<CanonicalPacketRefs> {
     let authority = read_active_packet_authority(state, &task.task_id.to_string())?
         .context("active packet authority is missing for the current TaskContract")?;
@@ -973,6 +977,10 @@ async fn resolve_action_source_scope(
 
 const ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION: &str = "eliot.action-memory-delivery-ref.v1";
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one non-rederived delivery-binding context: 3 identities, handles, receipts, packet pair, timestamp (#838)"
+)]
 fn bind_action_memory_deliveries(
     project_id: ProjectId,
     task_id: TaskId,
@@ -1067,6 +1075,10 @@ fn action_provenance_resolver_version(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered provenance resolution stays whole: packet fence, verifier, source scope, evidence loop (#838)"
+)]
 async fn resolve_action_provenance(
     state: &McpState,
     project_id: ProjectId,

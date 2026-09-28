@@ -21,15 +21,15 @@ use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
-    UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
-    UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
-    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
-    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
-    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
-    resolve_due_wake,
+    StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
+    UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
+    UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
+    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -56,7 +56,7 @@ use eliot_store_api::{
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
@@ -73,6 +73,13 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated Governor publish operation carrying one live-derivation
+/// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
+/// publishes its exact revision, exact active fingerprint, and exact
+/// authorization axes; Kernel maps the axes to its existing three-axis
+/// profile and records the projection, so Material/Critical gates admit
+/// only under current owner-issued authority.
+pub(crate) const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
 /// Authenticated daemon route that drives the typed Host `UserAutomation`
 /// transport.  The daemon session supplies the outer authority; the Host
 /// open handshake supplies the channel evidence and the Host owner supplies
@@ -507,6 +514,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
         "initialize_owner_revision" => "initialize_owner_revision",
+        PUBLISH_GOVERNOR_AUTHORITY_OPERATION => PUBLISH_GOVERNOR_AUTHORITY_OPERATION,
         "activate_grant" => "activate_grant",
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
@@ -610,6 +618,28 @@ struct OwnerPublishOperation {
     operation: String,
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Closed Governor-derived authority publish operation (`#1935` AUD1).
+///
+/// Carries the live Governor-owned derivation's exact revision, exact active
+/// fingerprint, and exact authorization axes (`verified`,
+/// `authorizes_enforcement`, `authorizes_complete_coverage_ops`): the owner
+/// `GovernanceProfile::authorizes` vocabulary, not a third profile. The
+/// dispatcher maps the axes to the existing three-axis profile and records
+/// the projection under the strictly-advancing revision rule, so a replayed
+/// or older revision fails closed and revoked authority can never be
+/// resurrected by re-presenting superseded bytes. Unknown or absent fields
+/// fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorAuthorityPublishOperation {
+    operation: String,
+    revision: u64,
+    fingerprint: String,
+    verified: bool,
+    authorizes_enforcement: bool,
+    authorizes_complete_coverage_ops: bool,
 }
 
 /// Closed owner-lineage revision initialization operation (`#2100`).
@@ -1808,16 +1838,6 @@ struct UserAutomationDaemonTrigger {
     manual_nonce: String,
 }
 
-#[cfg(windows)]
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct UserAutomationPolicyOwnerSnapshotWire {
-    state_fence: StateFence,
-    revision: u64,
-    policy_digest: String,
-    snapshot: eliot_kernel_core::user_automation::ConfigPolicySnapshot,
-}
-
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -2211,8 +2231,7 @@ impl KernelComposition {
                     // Main's material-authority admission still runs first, so a
                     // claimant without fresh material authority never reaches
                     // the claim step at all.
-                    self.admit_material_authority_for_fence(
-                        GovernanceProfile::full(),
+                    self.admit_material_authority_for_governor_issued_fence(
                         &session.module_generation.state_fence,
                     )
                     .map_err(|_| TransportError::SessionFenced)?;
@@ -2878,8 +2897,7 @@ impl KernelComposition {
                 if !owner_bundle_agrees_with_session(&operation.bundle, session) {
                     return Err(TransportError::SessionFenced);
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -2907,6 +2925,38 @@ impl KernelComposition {
                     Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
                     Err(_) => Err(TransportError::SessionFenced),
                 }
+            }
+            PUBLISH_GOVERNOR_AUTHORITY_OPERATION => {
+                let operation: GovernorAuthorityPublishOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.operation != PUBLISH_GOVERNOR_AUTHORITY_OPERATION {
+                    return Err(TransportError::SessionFenced);
+                }
+                // Issue #1935 AUD1: the live Governor-owned derivation
+                // projects its exact revision, exact active fingerprint, and
+                // exact authorization axes across this authenticated boundary.
+                // The axes map to the existing three-axis profile and record
+                // under the strictly-advancing revision rule, so a newer
+                // degraded projection revokes everything issued under the old
+                // one. Until the first publish records, every
+                // Material/Critical gate refuses closed.
+                self.record_governor_issued_coverage_projection(
+                    operation.revision,
+                    operation.fingerprint,
+                    operation.verified,
+                    operation.authorizes_enforcement,
+                    operation.authorizes_complete_coverage_ops,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": {
+                        "kind": "governor_authority_receipt",
+                        "value": { "revision": operation.revision, "status": "recorded" },
+                    },
+                    "recovery": null,
+                }))
             }
             "query_owner_bundle" => {
                 let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
@@ -2978,8 +3028,7 @@ impl KernelComposition {
                         &refusal,
                     );
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3075,8 +3124,7 @@ impl KernelComposition {
                         &refusal,
                     );
                 }
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3168,8 +3216,7 @@ impl KernelComposition {
                 // session BEFORE the retained owner is touched, so a stale or
                 // cross-session crossing never reaches the port.
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3766,8 +3813,7 @@ impl KernelComposition {
 
         match request {
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
-                self.admit_material_authority_for_fence(
-                    GovernanceProfile::full(),
+                self.admit_material_authority_for_governor_issued_fence(
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -4388,7 +4434,7 @@ impl KernelComposition {
             Ok(snapshot) => snapshot,
             Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
         };
-        let policy_snapshot = match Self::user_automation_policy_snapshot_from_recovery(
+        let policy_snapshot = match eliot_kernel_service::KernelStoreGateway::user_automation_policy_snapshot_from_recovery(
             &preflight_owner_snapshot,
             &lookup.state_fence,
         ) {
@@ -4456,7 +4502,7 @@ impl KernelComposition {
             Ok(snapshot) => snapshot,
             Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
         };
-        let policy_snapshot_after = match Self::user_automation_policy_snapshot_from_recovery(
+        let policy_snapshot_after = match eliot_kernel_service::KernelStoreGateway::user_automation_policy_snapshot_from_recovery(
             &preflight_owner_snapshot_after,
             &lookup.state_fence,
         ) {
@@ -4637,71 +4683,21 @@ impl KernelComposition {
     /// This route deliberately accepts no handshake digest as snapshot data:
     /// the Store record key, owner schema, canonical bytes, owner revision,
     /// policy digest, embedded fence, and embedded revision must all correlate.
+    /// The decode lives in the canonical Store gateway so the typed snapshot
+    /// has one producer; this route only projects the gateway answer.
     async fn read_user_automation_policy_snapshot(
         &self,
         state_fence: &StateFence,
     ) -> Result<eliot_kernel_core::user_automation::ConfigPolicySnapshot, UserAutomationRuntimeError>
     {
-        let recovery = self
-            .read_user_automation_preflight_owner_snapshot(state_fence)
-            .await?;
-        Self::user_automation_policy_snapshot_from_recovery(&recovery, state_fence)
-    }
-
-    #[cfg(windows)]
-    fn user_automation_policy_snapshot_from_recovery(
-        recovery: &StoreRecoverySnapshot,
-        state_fence: &StateFence,
-    ) -> Result<eliot_kernel_core::user_automation::ConfigPolicySnapshot, UserAutomationRuntimeError>
-    {
-        let record = recovery
-            .owner_records
-            .iter()
-            .find(|record| record.namespace == "owner" && record.key == "policy")
-            .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
-        if recovery.state_fence != *state_fence
-            || record.state_fence != *state_fence
-            || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
-        {
-            return Err(UserAutomationRuntimeError::IdentityConflict);
-        }
-        let owner: UserAutomationPolicyOwnerSnapshotWire = serde_json::from_slice(&record.payload)
-            .map_err(|_| {
-                UserAutomationRuntimeError::Rejected(
-                    "canonical Policy owner snapshot schema is invalid".to_owned(),
-                )
-            })?;
-        let canonical_owner = canonical_json_bytes(&owner).map_err(|error| {
-            UserAutomationRuntimeError::Rejected(format!(
-                "canonical Policy owner snapshot encoding failed: {error}"
-            ))
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation preflight Store route is unavailable".to_owned(),
+            )
         })?;
-        let snapshot_bytes = canonical_json_bytes(&owner.snapshot).map_err(|error| {
-            UserAutomationRuntimeError::Rejected(format!(
-                "canonical Policy snapshot encoding failed: {error}"
-            ))
-        })?;
-        owner.snapshot.validate().map_err(|error| {
-            UserAutomationRuntimeError::Rejected(format!(
-                "canonical Policy owner snapshot is invalid: {error}"
-            ))
-        })?;
-        if canonical_owner != record.payload
-            || owner.state_fence != *state_fence
-            || owner.revision != record.revision
-            || owner.revision == 0
-            || owner.snapshot.state_fence != *state_fence
-            || owner.snapshot.revision.value() != owner.revision
-            || owner.policy_digest != sha256_hex(&snapshot_bytes)
-            || owner.policy_digest.len() != 64
-            || !owner
-                .policy_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(UserAutomationRuntimeError::IdentityConflict);
-        }
-        Ok(owner.snapshot)
+        gateway
+            .read_user_automation_policy_snapshot(state_fence)
+            .await
     }
 
     #[cfg(windows)]
@@ -5638,6 +5634,31 @@ impl KernelComposition {
                 "value": { "outcome": "unknown_outcome" },
                 "recovery": { "kind": "unknown_outcome", "reason": reason },
             }),
+            // The mutation's disposition is proven by exact receipt evidence
+            // and only the ledger answer is unread (issue #2764 item 6). It is
+            // deliberately NOT folded into `unknown_outcome`, which means the
+            // owner cannot tell whether the mutation committed at all:
+            // reporting a proven commit under that value would make the two
+            // indistinguishable and would keep an already-settled operation
+            // reconciling forever.
+            //
+            // It is also deliberately NOT shaped like `rejected`/`not_retained`.
+            // Those carry `accepted: false`, which is accurate for a refusal
+            // and for a proven absence, but would be a false statement here:
+            // something provably DID happen, and a client keying on
+            // `accepted == false` would read a proven commit as a refusal. The
+            // operation was accepted — its commit is proven — so the accepted
+            // flag stays true and the remaining ledger read is reported as the
+            // structured `recovery` obligation it is, not as English prose.
+            UserAutomationRuntimeError::OutcomeSettled(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": true,
+                    "outcome": "outcome_settled",
+                    "reason": reason,
+                },
+                "recovery": { "kind": "ledger_read_owed", "reason": reason },
+            }),
             UserAutomationRuntimeError::Rejected(reason) => serde_json::json!({
                 "status": "known",
                 "value": {
@@ -5712,11 +5733,19 @@ impl KernelComposition {
         validate_origin_session_fence(session, presentation.request().state_fence())?;
         validate_origin_control_operation(presentation.request().operation())?;
         // Implements #1967 W3: an origin-control grant issues authority, so
-        // the decide path requires Material admission (startup gates plus a
-        // material-grade profile) before touching the process gateway. The
-        // rejection names the unmet prerequisite. Emergency process kills
-        // continue through the Job/watchdog owners, never this grant path.
-        if let Some(rejection) = self.material_authority_admission_response() {
+        // the decide path requires Material admission before touching the
+        // process gateway. Issue #1892 W4: that admission runs through the
+        // one production Material/Critical gate
+        // (`admit_material_authority_for_governor_issued_fence`) under the
+        // current Governor-issued governance profile, for the exact target
+        // fence this decision presents. No compile-time profile constant is
+        // injected, so an unrecorded Governor derivation fails this grant
+        // closed. The rejection names the unmet prerequisite. Emergency
+        // process kills continue through the Job/watchdog owners, never this
+        // grant path.
+        if let Some(rejection) =
+            self.material_authority_admission_response(presentation.request().state_fence())
+        {
             return Ok(rejection);
         }
         let (owner, _) =
@@ -5733,20 +5762,21 @@ impl KernelComposition {
         let grant = gateway
             .decide_origin_control(&presentation)
             .map_err(|_| TransportError::SessionFenced)?;
-        // Graceful WASM half (`#2896`): when the decided operation is a
-        // supervised WASM-host parent, the owner first offers a versioned
-        // Shutdown delivery through its replayable control spool, so the
-        // host loop can close admission before the gateway kill lands. A
-        // foreign image skips this half with the response unchanged; a
-        // proven WASM operation that cannot stage or retain its control
-        // fails closed before the kill.
-        let wasm_control = Self::publish_wasm_host_control(
+        // Graceful WASM ladder (`#2896` W1/A1): when the decided
+        // operation is a supervised WASM-host parent, the owner first
+        // offers the ordered Reconcile/Cancel/Shutdown ladder through
+        // its replayable control spool — the exact A4 ordered pairs —
+        // so the host loop can reconcile the uncertain outcome,
+        // contain guest work, and close admission before the gateway
+        // kill lands. A foreign image skips this half with the response
+        // unchanged; a proven WASM operation that cannot stage or
+        // retain its control fails closed before the kill.
+        let wasm_control = Self::publish_wasm_host_control_sequence(
             session,
             &owner,
             &operation.operation_id,
             presentation.request(),
             &grant,
-            eliot_kernel_service::WasmControlKind::Shutdown,
         )?;
         let cancelled = gateway
             .cancel_with_origin_grant(&owner, operation.operation_id.clone(), &grant)
@@ -5781,13 +5811,13 @@ impl KernelComposition {
                 }
             }
             WasmHostControlOutcome::Published {
-                receipt,
+                receipts,
                 install_dir,
             } => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert(
                         "control".to_owned(),
-                        wasm_host_control_projection(&install_dir, &receipt),
+                        wasm_host_control_projection(&install_dir, &receipts),
                     );
                 }
             }
@@ -6376,26 +6406,32 @@ impl KernelComposition {
         // replays the same rejection identity; changed canonical bytes under
         // one idempotency key yield `IDENTITY_CONFLICT`. The gate allocates no
         // ordering sequence, mints no `write_intent_id`, and records no
-        // effect, so a refusal never reaches the Store backend below.
-        {
+        // effect, so a refusal never reaches the Store backend below. An
+        // admitted resubmission presenting exactly the corrected identity a
+        // retained refusal issued additionally returns its verified correction
+        // lineage, which travels on the commit response below.
+        let verified_correction = {
             let mut cache = self
                 .pre_stage_identity_cache
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            if let Err(rejection) = eliot_kernel_service::pre_stage_check(
+            match eliot_kernel_service::pre_stage_check(
                 &mut cache,
                 &operation.context,
                 &operation.transition,
                 &operation.expected_revision_heads,
                 &operation.expected_ordering_heads,
             ) {
-                return Ok(Self::pre_stage_rejection_response(&rejection));
+                Err(rejection) => {
+                    return Ok(Self::pre_stage_rejection_response(&rejection));
+                }
+                Ok(link) => link,
             }
-        }
+        };
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
-            .replay_committed_apply_receipt(&gateway, &operation)
+            .replay_committed_apply_receipt(&gateway, &operation, verified_correction.as_ref())
             .await?
         {
             return Ok(replayed);
@@ -6482,9 +6518,9 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt))
+                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
             }
-            Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
+            Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
     }
 
@@ -6504,6 +6540,7 @@ impl KernelComposition {
         &self,
         gateway: &Arc<KernelStoreGateway>,
         operation: &StoreApplyOperation,
+        verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
         let Ok(Some(receipt)) = gateway
             .receipt(
@@ -6526,7 +6563,7 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
-        Ok(Some(store_apply_response(&receipt)))
+        Ok(Some(store_apply_response(&receipt, verified_correction)))
     }
 
     #[cfg(not(windows))]
@@ -6597,7 +6634,7 @@ impl KernelComposition {
         {
             Ok(receipt) => receipt,
             Err(error) => {
-                return Ok(Self::store_error_response_text(
+                return Ok(Self::store_apply_refusal_response(
                     NOTIFICATION_STATE_RESPONSE_KIND,
                     &error,
                 ));
@@ -7275,8 +7312,7 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -7553,10 +7589,10 @@ impl KernelComposition {
     }
 
     /// Publishes one graceful owner control for a decided WASM-host
-    /// operation (`#2896`): the production Kernel call behind external
-    /// Cancel/Reconcile/Shutdown delivery, reached from
-    /// [`Self::origin_control_decide_operation`] after the origin grant
-    /// issues and before the gateway kill lands.
+    /// operation (`#2896`): the production Kernel call behind one
+    /// external Cancel/Reconcile/Shutdown delivery, reached per kind
+    /// from [`Self::publish_wasm_host_control_sequence`] after the
+    /// origin grant issues and before the gateway kill lands.
     ///
     /// The publisher authenticates through the existing process/control
     /// owner contract, never through path correlation alone: the image
@@ -7669,9 +7705,87 @@ impl KernelComposition {
         let receipt = eliot_kernel_service::publish_wasm_control_delivery(&inputs)
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(WasmHostControlOutcome::Published {
-            receipt,
+            receipts: vec![receipt],
             install_dir: install_dir.to_path_buf(),
         })
+    }
+
+    /// Publishes the ordered graceful owner-control ladder for a
+    /// decided WASM-host operation (`#2896` W1/A1): Reconcile, then
+    /// Cancel, then Shutdown — the exact A4 ordered pairs — through
+    /// the existing owner spool before the gateway kill lands.
+    ///
+    /// The origin-control Kill decision is the sole production trigger
+    /// that binds the exact running WASM operation (inspected
+    /// process, origin grant, live session); it funds the whole
+    /// ladder, so the child never mints its own control authority.
+    /// Shutdown keeps its terminal position closing admission; Cancel
+    /// contains the uncertain outcome first (I2.4 cancellation before
+    /// forced termination) and Reconcile resolves it while authority
+    /// is still live (the host's own settle-while-live ladder,
+    /// mirrored owner-side). Each kind reuses the single
+    /// authenticated publisher [`Self::publish_wasm_host_control`],
+    /// so same-kind retries re-offer the retained identity and any
+    /// staging or retention fault fails the decision closed before
+    /// the kill, exactly like the single publish.
+    ///
+    /// The outcome merge is total: publishes accumulate in owner
+    /// order and the first non-published kind short-circuits. When at
+    /// least one delivery staged, the ladder reports `Published` with
+    /// every staged receipt and the kill proceeds; otherwise the
+    /// binding outcome propagates (`Foreign` leaves the response
+    /// unchanged, `NotStaged` carries its honest reason and the kill
+    /// proceeds).
+    fn publish_wasm_host_control_sequence(
+        session: &Session,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
+        request: &OriginChallengeRequest,
+        grant: &OriginControlGrant,
+    ) -> Result<WasmHostControlOutcome, TransportError> {
+        match Self::publish_wasm_host_control(
+            session,
+            owner,
+            operation_id,
+            request,
+            grant,
+            eliot_kernel_service::WasmControlKind::Reconcile,
+        )? {
+            WasmHostControlOutcome::Published {
+                mut receipts,
+                install_dir,
+            } => {
+                for control_kind in [
+                    eliot_kernel_service::WasmControlKind::Cancel,
+                    eliot_kernel_service::WasmControlKind::Shutdown,
+                ] {
+                    match Self::publish_wasm_host_control(
+                        session,
+                        owner,
+                        operation_id,
+                        request,
+                        grant,
+                        control_kind,
+                    )? {
+                        WasmHostControlOutcome::Published {
+                            receipts: staged, ..
+                        } => {
+                            receipts.extend(staged);
+                        }
+                        // Partial ladder: an operation that unbinds
+                        // mid-sequence keeps every staged delivery; the
+                        // kill proceeds and the projection notes each
+                        // staged sequence honestly.
+                        _ => break,
+                    }
+                }
+                Ok(WasmHostControlOutcome::Published {
+                    receipts,
+                    install_dir,
+                })
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
@@ -7707,8 +7821,7 @@ impl KernelComposition {
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -7904,47 +8017,73 @@ impl KernelComposition {
         })
     }
 
-    /// Returns the typed rejection when startup or the Governance Profile
-    /// has not admitted Material authority for one origin-control decision.
+    /// Returns the typed rejection when the current Governor-issued
+    /// Governance Profile has not admitted Material authority for one
+    /// origin-control decision.
     ///
     /// Implements #1967 W3/A1: origin-control grants issue authority, so the
-    /// decide path consults [`Self::admit_material_authority`] (startup gates
-    /// first, then the profile ceiling) rather than inferring authority from
-    /// pipe liveness. The named prerequisite and the current ceiling travel
-    /// in `recovery`; `status`/`value.kind` keep the existing error shape.
-    /// Origin-control decisions require a material-grade profile: once every
-    /// mandatory prerequisite completes, the profile ceiling alone decides.
-    fn material_authority_admission_response(&self) -> Option<serde_json::Value> {
-        let profile = GovernanceProfile::material_grade();
-        if self.admit_material_authority(profile).is_ok() {
+    /// decide path consults the single production Material/Critical gate
+    /// rather than inferring authority from pipe liveness. Issue #1892 W4
+    /// restores the missing half: the gate is
+    /// [`Self::admit_material_authority_for_governor_issued_fence`], the same
+    /// one every other Material/Critical route uses, and it admits under the
+    /// **recorded** Governor derivation for the exact target fence this
+    /// decision presents. A compile-time `GovernanceProfile` constant no
+    /// longer reaches this path: `current_governor_issued_authority()` is
+    /// `None` until a Governor derivation is recorded, and `None` refuses
+    /// closed rather than defaulting to a material-grade preset. The named
+    /// prerequisite and the recorded ceiling travel in `recovery`;
+    /// `status`/`value.kind` keep the existing error shape. The reported
+    /// ceiling is the recorded one, and `null` when no derivation is
+    /// recorded, because the gate refuses before any ceiling is consulted.
+    fn material_authority_admission_response(
+        &self,
+        target: &StateFence,
+    ) -> Option<serde_json::Value> {
+        if self
+            .admit_material_authority_for_governor_issued_fence(target)
+            .is_ok()
+        {
             return None;
         }
+        let recorded = self
+            .startup_coordinator
+            .lock()
+            .ok()
+            .and_then(|coordinator| coordinator.current_governor_issued_authority())
+            .map(|issued| issued.profile());
         let status = self.startup_status(GovernanceProfile::minimal());
-        let ceiling = self.startup_authority_ceiling(profile);
+        // An incomplete mandatory gate keeps the existing fixed startup
+        // vocabulary. With every mandatory gate complete the blocking
+        // prerequisite is the current Governor-derived profile, which
+        // [`StartupCoordinator::admit_governor_issued_authority`] itself
+        // names as the I1.11 step 11 supervision/enforcement prerequisite.
         let prerequisite = status
             .blocking_prerequisite
-            .unwrap_or("governance-profile-ceiling");
+            .unwrap_or("supervision-evidence");
+        let ceiling = recorded.map(|profile| self.startup_authority_ceiling(profile));
         Some(serde_json::json!({
             "status": "error",
             "value": { "kind": "origin_control_decide", "value": null },
             "recovery": {
                 "prerequisite": prerequisite,
-                "authority_ceiling": ceiling.as_str(),
+                "authority_ceiling": ceiling.as_ref().map(|ceiling| ceiling.as_str()),
             },
         }))
     }
 
     /// Store apply is the production Material/Critical admission boundary.
     /// It keeps the existing helper seam used by the package-local gate proof,
-    /// but now requires the owner-backed current Watchdog observation before
-    /// the retained Store gateway can be entered.
+    /// but now requires the recorded Governor-issued projection plus the
+    /// owner-backed current Watchdog observation before the retained Store
+    /// gateway can be entered.
     ///
     /// The answer uses the daemon's `error` wire variant. A refusal must be
     /// decodable by the client: an unrecognised `status` would be surfaced as an
     /// unknown transport outcome, which is exactly the ambiguity this
     /// fail-closed path exists to avoid.
     fn material_write_admission_response(&self, target: &StateFence) -> Option<serde_json::Value> {
-        self.admit_material_authority_for_fence(GovernanceProfile::full(), target)
+        self.admit_material_authority_for_governor_issued_fence(target)
             .err()
             .map(|_| {
                 serde_json::json!({
@@ -7991,6 +8130,33 @@ impl KernelComposition {
         })
     }
 
+    /// Renders one refused Store `apply` as the operation's error response.
+    ///
+    /// A typed I5.19 admission decision is the one refusal that carries
+    /// evidence rather than prose, so the full typed `WriteSubmission` —
+    /// submission id, state, reason codes, retry-identity rule, and next
+    /// allowed action — travels in `recovery` exactly as the I6.8
+    /// [`Self::pre_stage_rejection_response`] record does. That is what lets a
+    /// client tell a `not_accepted` submission from any other failure without
+    /// parsing the operator line, and it is I5.19 line 21: a syntax/shape
+    /// refusal is an operational response, so it is reported as one.
+    ///
+    /// Every other refusal is handed to [`Self::store_error_response_text`]
+    /// with its preserved text, so no other route's response changes.
+    #[cfg(windows)]
+    fn store_apply_refusal_response(kind: &str, error: &StoreApplyRefusal) -> serde_json::Value {
+        match error.admission_decision() {
+            Some(submission) => serde_json::json!({
+                "status": "error",
+                "value": { "kind": kind, "value": null },
+                "recovery": {
+                    "write_submission": submission,
+                },
+            }),
+            None => Self::store_error_response_text(kind, &error.to_string()),
+        }
+    }
+
     #[cfg(windows)]
     fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
         if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
@@ -8019,42 +8185,50 @@ enum WasmHostControlOutcome {
         /// Stable reason code (never a path or digest).
         reason: &'static str,
     },
-    /// A versioned control was offered through the owner spool.
+    /// Versioned controls were offered through the owner spool: a
+    /// full Reconcile/Cancel/Shutdown ladder, or the staged prefix
+    /// when the operation unbound mid-sequence.
     Published {
-        /// Staged delivery receipt.
-        receipt: eliot_kernel_service::WasmControlPublishReceipt,
-        /// Spool root the delivery staged into.
+        /// Staged delivery receipts in owner-sequence order (non-empty).
+        receipts: Vec<eliot_kernel_service::WasmControlPublishReceipt>,
+        /// Spool root the deliveries staged into.
         install_dir: std::path::PathBuf,
     },
 }
 
-/// Projects the post-kill control status for one published WASM
-/// control (`#2896` item 12): the supervised-termination note lands
-/// first (a decisive ack still wins over `Unknown`), then a fresh
-/// spool reconcile reports every retained delivery and its
-/// terminal-or-open disposition.
+/// Projects the post-kill control status for the published WASM
+/// control ladder (`#2896` item 12): the supervised-termination note
+/// lands per staged delivery (a decisive ack still wins over `Unknown`
+/// on each), then a fresh spool reconcile reports every retained
+/// delivery and its terminal-or-open disposition.
 ///
 /// Never fails the decide response: the kill receipt is authoritative,
 /// so a spool fault degrades to an honest `unrecorded` marker instead
 /// of losing the receipt.
 fn wasm_host_control_projection(
     install_dir: &std::path::Path,
-    receipt: &eliot_kernel_service::WasmControlPublishReceipt,
+    receipts: &[eliot_kernel_service::WasmControlPublishReceipt],
 ) -> serde_json::Value {
+    let Some(head) = receipts.first() else {
+        return serde_json::json!({"staged": false, "reason": "ladder-empty"});
+    };
     let now = unix_ms();
-    let noted = eliot_kernel_service::note_wasm_control_supervised_end(
-        install_dir,
-        receipt.operation_id.as_str(),
-        receipt.generation,
-        receipt.owner_sequence,
-        "origin-kill-acknowledged",
-        now,
-    )
-    .is_ok();
+    let mut noted = true;
+    for receipt in receipts {
+        noted &= eliot_kernel_service::note_wasm_control_supervised_end(
+            install_dir,
+            receipt.operation_id.as_str(),
+            receipt.generation,
+            receipt.owner_sequence,
+            "origin-kill-acknowledged",
+            now,
+        )
+        .is_ok();
+    }
     let spool = eliot_kernel_service::reconcile_wasm_control_spool(
         install_dir,
-        receipt.operation_id.as_str(),
-        receipt.generation,
+        head.operation_id.as_str(),
+        head.generation,
         now,
     );
     let (spool_value, spool_ok) = match spool {
@@ -8066,7 +8240,7 @@ fn wasm_host_control_projection(
     };
     let mut control = serde_json::json!({
         "staged": true,
-        "publish": receipt,
+        "publishes": receipts,
         "spool": spool_value,
     });
     if (!noted || !spool_ok)
@@ -8546,7 +8720,9 @@ fn store_recovery_response(
 /// integrity bindings the owner already validated. The reservation digest is
 /// the owner's own scan digest, and `readiness` is the same verdict that gates
 /// I1.11 step 6, so an operator reads the gate's actual state rather than a
-/// derived claim about it.
+/// derived claim about it. The `control_*` fields restate the ORS control
+/// projection coverage that same digest binds, so a partial obligation scan is
+/// visible rather than reported as no obligations.
 fn staged_write_recovery_view(
     staged: &eliot_kernel_service::StagedWriteRecovery,
 ) -> serde_json::Value {
@@ -8617,6 +8793,14 @@ fn staged_write_recovery_view(
         "last_reservation_order": reservations.last_reservation_order,
         "next_after_order": reservations.next_after_order,
         "truncated": reservations.truncated,
+        "control_scan_source": reservations.control_scan_source,
+        "control_scanned": reservations.control_scanned,
+        "control_cursor_start_after_order": reservations.control_cursor_start_after_order,
+        "control_next_after_order": reservations.control_next_after_order,
+        "control_truncated": reservations.control_truncated,
+        "job_checkpoint_refs": reservations.job_checkpoint_refs,
+        "delivery_cursor_refs": reservations.delivery_cursor_refs,
+        "recovery_inbox_refs": reservations.recovery_inbox_refs,
         "pending": reservations.pending.iter().map(startup_pending_view).collect::<Vec<_>>(),
         "unknown": reservations.unknown.iter().map(startup_unknown_view).collect::<Vec<_>>(),
         "envelopes": envelopes,
@@ -8648,6 +8832,9 @@ fn recovery_problem_kind_label(kind: eliot_ors::RecoveryProblemKind) -> &'static
         eliot_ors::RecoveryProblemKind::EnvelopeIntegrity => "envelope-integrity",
         eliot_ors::RecoveryProblemKind::MissingKey => "missing-key",
         eliot_ors::RecoveryProblemKind::DecryptionFailure => "decryption-failure",
+        eliot_ors::RecoveryProblemKind::UnsupportedPreparedTransition => {
+            "unsupported-prepared-transition"
+        }
     }
 }
 
@@ -8685,12 +8872,30 @@ fn store_genesis_response(receipt: &WriteReceipt) -> serde_json::Value {
     })
 }
 
-fn store_apply_response(receipt: &WriteReceipt) -> serde_json::Value {
-    serde_json::json!({
+/// Renders one committed `store.apply` receipt (issue #1796, I6.8).
+///
+/// A resubmission the pre-stage gate verified as a correction carries its
+/// proven lineage on the response, so the committed write is observably
+/// linked to the rejected operation it corrects. Any other write renders
+/// exactly the historical shape: lineage is never stamped without the
+/// gate's verified link.
+fn store_apply_response(
+    receipt: &WriteReceipt,
+    verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+) -> serde_json::Value {
+    let mut response = serde_json::json!({
         "status": "known",
         "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
-    })
+    });
+    if let Some(link) = verified_correction {
+        response["correction_lineage"] = serde_json::json!({
+            "corrected_operation_id": link.corrected_operation_id,
+            "corrected_from_operation_id": link.corrected_from_operation_id,
+            "correction_rejection_id": link.correction_rejection_id,
+        });
+    }
+    response
 }
 
 /// Requires a local-read store request to be the closed evidence-pack read.

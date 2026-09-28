@@ -62,9 +62,9 @@ use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, ScopeId, SecurityContext,
-    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
-    parse_revocation_history_payload,
+    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecordedRevocationDisposition,
+    ScopeId, SecurityContext, TransitionClass, WriteReceipt, generated_operation_manifests,
+    operation_manifest_set_digest, parse_revocation_history_payload,
 };
 
 use crate::{
@@ -361,37 +361,24 @@ pub fn revocation_history_read_request(
 ///
 /// The reply must name the history operation and the exact expected fence;
 /// its payload must be a well-formed [`parse_revocation_history_payload`]
-/// view. Every recorded row decodes to a terminal `Revoked` closure stamped
-/// with the response fence: only committed revocations are recorded, so
-/// unknown or partial outcomes can never appear here. Currency
+/// view. Every recorded row carries the response fence. Currency
 /// (CURRENT vs stale/unknown) is enforced at restore by
 /// [`AuthorityOwner::from_snapshot_with_revocation_history`](crate::AuthorityOwner::from_snapshot_with_revocation_history),
 /// not here.
 ///
-/// #2966 step 2: each row is declared here as the authority-specific
-/// versioned evidence, not as the shared `eliot-influence` observation DTO.
-/// The declared coordinates come from what the durable owner actually served
-/// and from what this owner actually did:
-///
-/// * the owner namespace is the exact `origin_ref` selector the durable
-///   payload echoes — the axis this owner pre-partitions history by, so a row
-///   served under another namespace is never merged into this one;
-/// * the declared bounds are the bounded-engine limits this owner used for
-///   the closure evidence it commits. The durable recorded row does not yet
-///   carry producer-chosen limits, so this is the same default the closure
-///   was always computed under, now declared by its producer instead of
-///   minted by the authority at admission;
-/// * the declared disposition is `Complete` because only committed
-///   revocations are ever recorded, and the authority re-proves that claim
-///   against the denominator it recomputes. A producer that cannot vouch for
-///   the whole membership must declare `Partial`/`Unknown` and is refused as
-///   incomplete coverage;
-/// * the declared omission set is empty because a recorded row carries no
-///   omission evidence. A closure that genuinely omitted a dependent must
-///   declare the reference and is refused as incomplete coverage;
-/// * the committed affected-member digest/count and the canonical request
-///   hash are the content addresses of exactly these presented bytes, and the
-///   authority recomputes and compares both.
+/// #2966 step 2: each row is translated into the authority-specific
+/// versioned evidence, not into the shared `eliot-influence` observation
+/// DTO. The translation carries every producer-declared coordinate
+/// verbatim — owner namespace, bounds, disposition, omissions, influence
+/// state, affected-member count and digest, and the canonical request
+/// hash — and mints none of them: the durable producer computed them from
+/// the served bytes through the one shared canonical codec, and recovery
+/// recomputes and compares them, so any mistranslation here breaks the
+/// digest at validation instead of being re-blessed. The only value this
+/// adapter names is the evidence version, which the v2 wire rows carry
+/// field-for-field: filling a newer evidence shape from these rows would
+/// fail to compile, never silently upgrade. A v1 payload carries no
+/// producer coordinates and is refused at parse, never reinterpreted.
 pub fn decode_revocation_history_evidence(
     response: &NamedReadResponse,
     expected_fence: &eliot_contracts::StateFence,
@@ -414,44 +401,42 @@ pub fn decode_revocation_history_evidence(
     })?;
     let mut closures = Vec::with_capacity(payload.closures.len());
     for row in payload.closures {
-        let dependent_refs = row.dependent_refs;
-        let affected =
-            AuthorityRevocationClosureEvidence::members_of(&row.root_ref, &dependent_refs);
-        let affected_member_digest = AuthorityRevocationClosureEvidence::affected_members_digest(
-            &affected,
-        )
-        .ok_or_else(|| {
-            owner_refused("revocation history affected membership is not addressable".to_owned())
+        // The admitted bounds are the bounds the evidence declared: mapped
+        // field-for-field from the served row and re-validated, never
+        // minted. A mapping slip breaks the canonical digest at restore.
+        let bounds = RevocationBounds {
+            max_nodes: row.bounds.max_nodes,
+            max_edges: row.bounds.max_edges,
+            max_depth: row.bounds.max_depth,
+            max_result: row.bounds.max_result,
+            max_work: row.bounds.max_work,
+            max_frontier: row.bounds.max_frontier,
+            max_time: row.bounds.max_time,
+        };
+        bounds.validate().map_err(|error| {
+            owner_refused(format!("revocation history bounds are invalid: {error}"))
         })?;
-        let canonical_request_digest =
-            AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
-                &row.closure_id,
-                &row.root_ref,
-                &dependent_refs,
-                Some(row.invalidation_reason),
-                eliot_store_api::InfluenceState::Revoked,
-                &response.state_fence,
-                row.revision,
-            )
-            .ok_or_else(|| {
-                owner_refused("revocation history closure is not addressable".to_owned())
-            })?;
+        let disposition = match row.disposition {
+            RecordedRevocationDisposition::Complete => RevocationEvidenceDisposition::Complete,
+            RecordedRevocationDisposition::Partial => RevocationEvidenceDisposition::Partial,
+            RecordedRevocationDisposition::Unknown => RevocationEvidenceDisposition::Unknown,
+        };
         closures.push(AuthorityRevocationClosureEvidence {
             evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
             closure_id: row.closure_id,
-            owner_namespace: payload.origin_ref.clone(),
+            owner_namespace: row.owner_namespace,
             root_ref: row.root_ref,
-            dependent_refs,
+            dependent_refs: row.dependent_refs,
             invalidation_reason: Some(row.invalidation_reason),
-            current_influence: eliot_store_api::InfluenceState::Revoked,
+            current_influence: row.current_influence,
             state_fence: response.state_fence.clone(),
             revision: row.revision,
-            bounds: RevocationBounds::default_bounds(),
-            disposition: RevocationEvidenceDisposition::Complete,
-            omissions: Vec::new(),
-            affected_member_count: affected.len() as u64,
-            affected_member_digest,
-            canonical_request_digest,
+            bounds,
+            disposition,
+            omissions: row.omissions,
+            affected_member_count: row.affected_member_count,
+            affected_member_digest: row.affected_member_digest,
+            canonical_request_digest: row.canonical_request_digest,
         });
     }
     Ok(RevocationHistoryEvidence {

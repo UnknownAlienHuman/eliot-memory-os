@@ -46,13 +46,30 @@
 //! mismatched binding returns `Err` — a missing binding is never replaced
 //! by a default.
 //!
+//! Injection: [`BackupOwnerClients::bind_production`] binds both owners once,
+//! and production assembly holds the result on the composition
+//! (`KernelComposition::backup_owner_clients`). A caller therefore reaches the
+//! *bound* clients and can never construct a substitute. There is no
+//! process-global "clients are bound" marker: such a marker recorded a binding
+//! that nothing held.
+//!
+//! Supervision: [`OwnerRoundBudget`] is the mechanism the
+//! [`OWNER_OPS_QUANTUM_PER_ROUND`] bound names. Every owner request spends one
+//! unit of the current round's quantum and refuses pre-effect once it is spent,
+//! so backup traffic can never starve supervision or consume the control
+//! reserve.
+//!
+//! Send outcome: [`classify_owner_timeout`] is where the before-send /
+//! possible-effect-after-send distinction is carried. A before-send timeout
+//! proves no effect and is safe to retry; an after-send timeout leaves the
+//! effect unknown and requires reconciliation by identity first.
+//!
 //! Capability cell: Kernel backup owner-channel binding (exact-owner client
 //! construction and pre-effect admission checks only; no I/O, no transport,
 //! no journal, no cutover execution here).
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use eliot_protocol::AckPhase;
 use eliot_protocol::backup::{
@@ -219,6 +236,15 @@ pub enum OwnerClientError {
         /// The exact acknowledgement phase that was refused.
         phase: AckPhase,
     },
+    /// The bounded per-round owner-operation quantum
+    /// ([`OWNER_OPS_QUANTUM_PER_ROUND`]) is already spent for this
+    /// supervision round. The refusal is pre-effect: the owner channel never
+    /// borrows from the supervision control reserve, so the next request
+    /// waits for the next round instead of displacing supervision.
+    OwnerRoundQuantumExhausted {
+        /// Stable wire name of the refused operation.
+        op: &'static str,
+    },
     /// The bound owner's role is not an admitted attester for a lifecycle
     /// stage its own accepted table can advance. One owner can never attest
     /// another owner's phase.
@@ -305,6 +331,10 @@ impl fmt::Display for OwnerClientError {
             Self::TransportAckIsNotSuccess { phase } => write!(
                 formatter,
                 "transport acknowledgement {phase} is never backup semantic success"
+            ),
+            Self::OwnerRoundQuantumExhausted { op } => write!(
+                formatter,
+                "owner round quantum is spent; {op} waits for the next supervision round"
             ),
             Self::PhaseNotAttestedByOwner { stage } => write!(
                 formatter,
@@ -1169,9 +1199,137 @@ impl ReplayLedger {
     }
 }
 
+/// One object scope of the duplicate-key scan.
+///
+/// A payload owns one key set per JSON *object*; sibling objects may reuse the
+/// same key name, so a child scope reports only its own duplicate flag and
+/// never contributes its keys to the parent's set.
+struct DuplicateKeyScope {
+    keys: std::collections::BTreeSet<String>,
+    duplicate: bool,
+}
+
+impl<'de> serde::de::Deserialize<'de> for DuplicateKeyScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyVisitor {
+            keys: std::collections::BTreeSet::new(),
+            duplicate: false,
+        })
+    }
+}
+
+struct DuplicateKeyVisitor {
+    keys: std::collections::BTreeSet<String>,
+    duplicate: bool,
+}
+
+impl<'de> serde::de::Visitor<'de> for DuplicateKeyVisitor {
+    type Value = DuplicateKeyScope;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any bounded backup payload value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(self.scope())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        serde::de::Deserialize::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut duplicate = self.duplicate;
+        while let Some(element) = sequence.next_element::<DuplicateKeyScope>()? {
+            if element.duplicate {
+                duplicate = true;
+            }
+        }
+        Ok(DuplicateKeyScope {
+            keys: self.keys,
+            duplicate,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut duplicate = self.duplicate;
+        let mut keys = self.keys;
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                duplicate = true;
+            }
+            if map.next_value::<DuplicateKeyScope>()?.duplicate {
+                duplicate = true;
+            }
+        }
+        Ok(DuplicateKeyScope { keys, duplicate })
+    }
+}
+
+impl DuplicateKeyVisitor {
+    /// Terminates this scope; a scalar or array scope repeats nothing, so it
+    /// reports whatever its own elements reported.
+    fn scope(self) -> DuplicateKeyScope {
+        DuplicateKeyScope {
+            keys: self.keys,
+            duplicate: self.duplicate,
+        }
+    }
+}
+
+/// Whether one bounded payload repeats an object key anywhere in it.
+///
+/// `serde_json::Value` keeps the *last* occurrence of a duplicated key and
+/// discards the earlier ones silently, so `{"op":"PrepareIsolatedRestore",
+/// "op":"AdmitCutover"}` would decode to one clean-looking object while the
+/// authenticated metadata the reader consumed first is the value that lost.
+/// That is a payload overriding authenticated metadata, so a duplicate key
+/// refuses the payload instead of resolving. The traversal depth is bounded by
+/// `serde_json`'s own parser recursion limit and every key is bounded by
+/// [`MAX_BACKUP_PAYLOAD_BYTES`].
+pub fn payload_repeats_a_key(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<DuplicateKeyScope>(bytes).is_ok_and(|scope| scope.duplicate)
+}
+
 /// Validates one bounded typed owner payload: nonempty, within the
-/// canonical payload ceiling, and a JSON object (typed, never an arbitrary
-/// command string, path, or endpoint).
+/// canonical payload ceiling, a JSON object (typed, never an arbitrary
+/// command string, path, or endpoint), and free of a repeated object key.
 pub fn validate_bounded_payload(bytes: &[u8]) -> Result<serde_json::Value, OwnerClientError> {
     if bytes.is_empty() {
         return Err(OwnerClientError::PayloadRejected {
@@ -1190,6 +1348,11 @@ pub fn validate_bounded_payload(bytes: &[u8]) -> Result<serde_json::Value, Owner
     if !value.is_object() {
         return Err(OwnerClientError::PayloadRejected {
             reason: "payload must be a typed object",
+        });
+    }
+    if payload_repeats_a_key(bytes) {
+        return Err(OwnerClientError::PayloadRejected {
+            reason: "payload repeats an object key",
         });
     }
     Ok(value)
@@ -1240,25 +1403,158 @@ pub const fn rehearsal_proves_cutover() -> bool {
 }
 
 /// Supervision priority is never starved by the owner channel: the bounded
-/// per-round quantum ([`OWNER_OPS_QUANTUM_PER_ROUND`]) keeps owner work from
-/// consuming the supervision control reserve.
+/// per-round quantum ([`OWNER_OPS_QUANTUM_PER_ROUND`]) is consumed by
+/// [`OwnerRoundBudget::admit`], which every owner request passes through, so
+/// owner work can never take the supervision control reserve.
 #[must_use]
 pub const fn supervision_priority_preserved() -> bool {
     true
 }
 
-/// Process-wide marker recording that production assembly bound the actual
-/// owner clients. Set once by the composition bootstrap after both
-/// production constructors succeed; read back by diagnostics only.
-static OWNER_CLIENTS_BOUND_IN_ASSEMBLE: AtomicBool = AtomicBool::new(false);
-
-/// Records that production assembly bound the actual owner clients.
-pub fn mark_owner_clients_bound() {
-    OWNER_CLIENTS_BOUND_IN_ASSEMBLE.store(true, Ordering::SeqCst);
+/// Bounded owner-operation budget for one supervision round.
+///
+/// This is the mechanism the quantum bound names, not an assertion about it:
+/// [`OwnerRoundBudget::admit`] spends one unit per admitted owner operation and
+/// refuses pre-effect once [`OWNER_OPS_QUANTUM_PER_ROUND`] units are spent, and
+/// [`OwnerRoundBudget::begin_round`] returns the budget at the start of the
+/// next supervision round. Owner work therefore never grows the round's share
+/// and never consumes the supervision control reserve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerRoundBudget {
+    round: u64,
+    admitted: u32,
 }
 
-/// Whether production assembly has bound the actual owner clients.
-#[must_use]
-pub fn owner_clients_bound_in_assemble() -> bool {
-    OWNER_CLIENTS_BOUND_IN_ASSEMBLE.load(Ordering::SeqCst)
+impl OwnerRoundBudget {
+    /// A budget with nothing spent in round 0.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            round: 0,
+            admitted: 0,
+        }
+    }
+
+    /// Opens the next supervision round and returns the whole quantum.
+    pub const fn begin_round(&mut self) {
+        self.round += 1;
+        self.admitted = 0;
+    }
+
+    /// The current supervision round number.
+    #[must_use]
+    pub const fn round(&self) -> u64 {
+        self.round
+    }
+
+    /// Owner operations already admitted in this round (never above the
+    /// quantum).
+    #[must_use]
+    pub const fn admitted(&self) -> u32 {
+        self.admitted
+    }
+
+    /// Whether the round's quantum is spent.
+    #[must_use]
+    pub const fn is_spent(&self) -> bool {
+        self.admitted >= OWNER_OPS_QUANTUM_PER_ROUND
+    }
+
+    /// Spends one unit of the round's quantum for `op`, or refuses
+    /// pre-effect with [`OwnerClientError::OwnerRoundQuantumExhausted`] when
+    /// the quantum is already spent.
+    pub fn admit(&mut self, op: BackupOperationKind) -> Result<(), OwnerClientError> {
+        if self.is_spent() {
+            return Err(OwnerClientError::OwnerRoundQuantumExhausted { op: op.as_str() });
+        }
+        self.admitted += 1;
+        Ok(())
+    }
+}
+
+impl Default for OwnerRoundBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One admitted owner-channel send, classified by whether any byte crossed.
+///
+/// The distinction is carried here, in the owner client itself, because a
+/// before-send timeout proves no effect and is safe to retry, while an
+/// after-send timeout leaves the effect state unknown and requires
+/// reconciliation by identity before any retry.
+pub fn classify_owner_timeout(
+    op: BackupOperationKind,
+    after_write_started: bool,
+    timeout_ms: u64,
+) -> OwnerClientError {
+    if after_write_started {
+        OwnerClientError::TimeoutAfterSend {
+            op: op.as_str(),
+            timeout_ms,
+        }
+    } else {
+        OwnerClientError::TimeoutBeforeSend {
+            op: op.as_str(),
+            timeout_ms,
+        }
+    }
+}
+
+/// The exact-owner backup channel clients bound by production assembly.
+///
+/// This is the injection #962 asks for: one value holding the actual Host and
+/// Watchdog clients, held on [`crate::KernelComposition`] by
+/// `composition_bootstrap`, so a requester reaches the *bound* clients and can
+/// never substitute a fresh, differently-bound or fake client for them. The
+/// previous process-global marker is gone: it recorded a binding that never
+/// happened, and the composition field is the real binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupOwnerClients {
+    host: HostBackupOwnerClient,
+    watchdog: WatchdogBackupOwnerClient,
+}
+
+impl BackupOwnerClients {
+    /// Binds both production owner clients over the canonical pipes and the
+    /// exact peer expectations. Fails closed: a fake, no-op, mismatched or
+    /// unbound client never reaches the composition.
+    pub fn bind_production() -> Result<Self, OwnerClientError> {
+        Ok(Self {
+            host: HostBackupOwnerClient::production()?,
+            watchdog: WatchdogBackupOwnerClient::production()?,
+        })
+    }
+
+    /// The bound Host owner client.
+    #[must_use]
+    pub const fn host(&self) -> &HostBackupOwnerClient {
+        &self.host
+    }
+
+    /// The bound Watchdog owner client.
+    #[must_use]
+    pub const fn watchdog(&self) -> &WatchdogBackupOwnerClient {
+        &self.watchdog
+    }
+
+    /// Resolves the one owner that serves `op` for an authenticated requester
+    /// that named `requested`.
+    ///
+    /// `RestoreStatus` and `ReconcileRestore` are served by *both* owners, so
+    /// the owner is authenticated requester metadata and is never inferred
+    /// from the operation. A request whose named owner does not serve the
+    /// operation is refused pre-effect: the payload cannot redirect a request
+    /// to another owner's operation.
+    pub fn route(
+        &self,
+        requested: OwnerRole,
+        op: BackupOperationKind,
+    ) -> Result<OwnerRole, OwnerClientError> {
+        if !requested.supported_ops().contains(&op) {
+            return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
+        }
+        Ok(requested)
+    }
 }

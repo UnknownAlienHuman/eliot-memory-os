@@ -8,7 +8,13 @@
 //! missing admission, or unbound evidence is rejected, never relabelled.
 //! I14-21: unknown stays reconciling. Import receipts keep an explicit
 //! per-entry outcome including `Unresolved`; callers attest full validation
-//! via [`OrsBackupImportReceipt::known_zero_unresolved`]. No blind retry.
+//! via [`OrsBackupImportReceipt::known_zero_unresolved`], which since issue
+//! #953/A17 requires a [`CurrentOwnerValidation`] — a record of what the
+//! CURRENT owner was asked about the receipt's members and what it answered,
+//! observed from the store's own live recovery rows — and compares that
+//! record's asked-about roster against the receipt's members in both
+//! directions. A zero `unresolved_count` is not a zero somebody validated, so
+//! it is not trusted. No blind retry.
 //!
 //! Issue #2884 adds the typed row-family cursor. A family that has no canonical
 //! operation order cannot share the operational `after_order` window, so it is
@@ -77,7 +83,7 @@
 //! Storage-free: no `redb`, no filesystem, no `eliot-backup` dependency.
 //! Distinct from `snapshot_model`; every new name starts `OrsBackup`/`Backup`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -128,7 +134,31 @@ use crate::OrsError;
 /// changes, nothing is rewritten, and no migration is introduced — the existing
 /// [`OrsError::MigrationRequired`] refusal in
 /// [`OrsBackupSourceIdentity::new`] covers it exactly as it covered v2 and v3.
-pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
+///
+/// Issue #2967 bumps this from `4` to `5` because the v4 wire shape has NO
+/// operational continuation at all, and the property this issue requires cannot be
+/// stated without one. A v4 [`OrsBackupRequest`] carries only `after_order: u64`,
+/// so the only boundary a v4 page could name was `after_order + page_entries *
+/// page_index` — count arithmetic over a SPARSE order domain (I05-7: one ORS
+/// coordinator allocates `NEXT_GLOBAL_ORDER` for reservation bookkeeping and for
+/// operational rows alike, so the orders that reach `OPERATIONAL_HISTORY` contain
+/// arbitrary gaps). Orders `1, 3, 5` with `page_entries = 2` therefore emitted
+/// `[1, 3]`, then `[3, 5]`, then `[5]`: row 3 twice and row 5 twice. A v4 page also
+/// carries no upper bound on its window, so a stable row above the declared
+/// `high_water_order` was emitted under the older fence, and no v4 field lets a
+/// validator refuse either fact. v5 adds [`OrsOperationalSnapshotIdentity`],
+/// [`OrsOperationalCursor`] and [`OrsOperationalContinuation`] to all three carriers
+/// (request, page, snapshot) and folds them into the page digest and the
+/// denominator, which is the same wire-version change #2884 and #1971 each made for
+/// their own cursor. The bump is a WIRE constant, not durable schema: no table,
+/// column or row changes, nothing is rewritten, and no migration is introduced.
+/// A v4 snapshot is therefore NEVER silently promoted to the operational-coverage
+/// claim: the existing [`OrsError::MigrationRequired`] refusal in
+/// [`OrsBackupSourceIdentity::new`] rejects it at construction and at import, and
+/// [`OrsBackupSnapshot::validate`] additionally requires an operational identity and
+/// no outstanding operational continuation for `Complete`, which a v4 value cannot
+/// express in the first place.
+pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
 /// Hard ceiling for entries in one backup page (mirrors `MAX_RECOVERY_PAGE`).
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
@@ -149,6 +179,14 @@ pub const MAX_BACKUP_ID_LEN: usize = 256;
 pub const MAX_BACKUP_PAGE_LIFETIME_MS: i64 = 60 * 60 * 1000;
 /// Version tag of the typed row-family cursor contract (issue #2884).
 pub const ORS_FAMILY_CURSOR_VERSION: u16 = 1;
+/// Version tag of the typed operational-history continuation contract (#2967).
+///
+/// Its own tag, separate from [`ORS_FAMILY_CURSOR_VERSION`] and separate from
+/// [`BACKUP_SNAPSHOT_SCHEMA_VERSION`], because the two continuation domains have
+/// different owners, different orders and different wire carriers. A cursor that
+/// carried the family tag could not be told apart from a family cursor by version
+/// alone.
+pub const ORS_OPERATIONAL_CURSOR_VERSION: u16 = 1;
 /// Lowercase 64-hex digest shape check (local copy: `model` is private).
 fn require_digest(value: &str, field: &'static str) -> Result<(), OrsError> {
     let ok = value.len() == 64
@@ -260,6 +298,13 @@ pub enum RowFamilyKind {
     RecoveryInboxHistory,
     ProcessStartReplay,
     AuthorityHandoffs,
+    /// Observation-only process-evidence rows (issue #269, A1).
+    ///
+    /// A row of this family may be a pre-#269 row that still holds the accepted
+    /// `ProcessEvidence` value inline, bounded preview bytes included, so the
+    /// family carries payload a restore must never receive as an answer. It is
+    /// `ForensicOnly`: an exported row lands as forensics and never as an
+    /// importable observation.
     ProcessEvidence,
     /// Immutable process-stream recovery projections (issue #269): one durable
     /// row per `(operation_id, stream)` identity, carrying only the locator,
@@ -363,7 +408,18 @@ impl RowFamilyKind {
             // variant would otherwise silently fall through to `Restorable`.
             Self::StoreRebindReplay
             | Self::StoreFailureRetention
-            | Self::BackupVerificationResults => RowDisposition::ForensicOnly,
+            | Self::BackupVerificationResults
+            // `ProcessEvidence` (issue #269, A1) is listed EXPLICITLY for the
+            // same reason `BackupVerificationResults` is. The family has no
+            // `import_*_suspended` path at all, so `Restorable` would advertise
+            // a durable re-import that does not exist; and a row of it may be a
+            // pre-#269 row that still holds the inline stdout/stderr payload, so
+            // an imported copy of that row would be raw stream payload crossing
+            // a restore boundary. `ForensicOnly`'s premise — evidence, never
+            // authority — is the one that actually holds. Listing it explicitly
+            // is what makes that true rather than merely stated: a new trailing
+            // variant would otherwise silently fall through to `Restorable`.
+            | Self::ProcessEvidence => RowDisposition::ForensicOnly,
             Self::AuthorityHandoffs
             | Self::HostRequests
             | Self::ActivationLifecycle
@@ -631,6 +687,319 @@ impl OrsFamilyCursor {
         Ok(())
     }
 }
+
+/// Frozen owner identity of the operational-history axis of one backup
+/// (issue #2967).
+///
+/// The operational twin of [`OrsFamilySnapshotIdentity`], and the same three
+/// questions answered for the axis that used to have none:
+///
+/// - `high_water_order` is the exact ordering head the owner observed when the
+///   identity was frozen. It is the UPPER bound of the walk, and it is the value
+///   [`OrsBackupFence::high_water_order`] claims. A row above it is not a member of
+///   this snapshot; it belongs to a successor snapshot even when it already existed
+///   and was stable when the export began.
+/// - `operational_root_digest`, `operational_row_count` and
+///   `operational_total_bytes` are the streamed content root, the eligible row
+///   count and the bounded encoded-byte denominator measured by the OWNER over the
+///   window `(lower_order_bound, high_water_order]`. They are the denominator the
+///   pages are counted against, exactly as `family_row_count` is the denominator
+///   [`check_declared_members`] counts a family's members against, so a `Complete`
+///   snapshot is a measurement rather than a claim.
+/// - `lower_order_bound` is the walk's declared exclusive start. It is part of the
+///   identity rather than of the cursor because it is what makes the denominator
+///   mean something: "every operational row above order N and at or below the
+///   high-water" is a statement, while "every operational row" is not what a
+///   windowed export measured.
+///
+/// `source_installation_id`, `ors_generation` and `schema_version` are folded in so
+/// the identity is bound to the source it was read from and to the wire contract
+/// under which it is meaningful; a cursor minted for one source is refused for
+/// another because the whole identity differs, not because a field was edited.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OrsOperationalSnapshotIdentity {
+    /// Installation the walk was read from.
+    pub source_installation_id: String,
+    /// ORS generation the walk was read from.
+    pub ors_generation: u64,
+    /// Backup-snapshot wire contract this identity belongs to.
+    pub schema_version: u16,
+    /// Inclusive upper order bound of the walk, as the owner observed it.
+    pub high_water_order: u64,
+    /// Exclusive lower order bound the walk was declared to start above.
+    pub lower_order_bound: u64,
+    /// Streamed content root over the window at that high-water.
+    pub operational_root_digest: String,
+    /// Eligible operational rows in the window.
+    pub operational_row_count: u64,
+    /// Summed encoded bytes of the window.
+    pub operational_total_bytes: u64,
+}
+impl OrsOperationalSnapshotIdentity {
+    /// Validate and bind one frozen operational identity.
+    ///
+    /// The only structural rule the identity itself must satisfy is that the
+    /// declared window is non-empty as an interval: a lower bound above the
+    /// high-water would declare a denominator of negative width, and every count
+    /// taken from it would be meaningless. The CONTENT is the owner's business and
+    /// is re-derived from durable state by the store before the identity is used;
+    /// see `check_operational_identity_frozen`.
+    pub fn new(
+        source: &OrsBackupSourceIdentity,
+        high_water_order: u64,
+        lower_order_bound: u64,
+        operational_root_digest: String,
+        operational_row_count: u64,
+        operational_total_bytes: u64,
+    ) -> Result<Self, OrsError> {
+        require_installation_id(
+            &source.installation_id,
+            "operational_source_installation_id",
+        )?;
+        if source.schema_version != BACKUP_SNAPSHOT_SCHEMA_VERSION {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "backup schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
+                    source.schema_version
+                ),
+            });
+        }
+        if lower_order_bound > high_water_order {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_lower_order_bound",
+                reason: "the declared walk window must not start above the high-water order",
+            });
+        }
+        require_digest(&operational_root_digest, "backup_operational_root_digest")?;
+        Ok(Self {
+            source_installation_id: source.installation_id.clone(),
+            ors_generation: source.ors_generation,
+            schema_version: source.schema_version,
+            high_water_order,
+            lower_order_bound,
+            operational_root_digest,
+            operational_row_count,
+            operational_total_bytes,
+        })
+    }
+    /// Deterministic binding token for the frozen operational snapshot.
+    ///
+    /// Folded into every operational page digest (through
+    /// [`OrsOperationalCursor::fence_token`]) and into
+    /// [`OrsBackupSnapshot::snapshot_digest`], so the frozen operational identity is
+    /// bound by the page token and the denominator and not only by the request. A
+    /// page emitted under a different high-water, a different denominator or a
+    /// different source cannot hash to the same value.
+    #[must_use]
+    pub fn fence_token(&self) -> String {
+        sha256_hex(
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                self.source_installation_id,
+                self.ors_generation,
+                self.schema_version,
+                self.high_water_order,
+                self.lower_order_bound,
+                self.operational_root_digest,
+                self.operational_row_count,
+                self.operational_total_bytes
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+/// Typed continuation cursor for the operational-history axis (issue #2967).
+///
+/// The operational twin of [`OrsFamilyCursor`], and it exists for the reason
+/// #2967 names: `after_order + page_entries * page_index` is count arithmetic over a
+/// sparse order domain, so it is not a continuation. A count stride re-selects rows
+/// the previous page already emitted whenever the domain is sparse, and it skips
+/// rows whenever the domain is dense enough to hide the defect; with orders
+/// `1, 3, 5` and `page_entries = 2` it emits `[1, 3]`, `[3, 5]`, `[5]`. This cursor
+/// instead names the frozen operational identity plus the exact durable row the
+/// owner last emitted, so the next page starts strictly after the previous page's
+/// real tail and a sparse order can neither repeat nor be skipped.
+///
+/// Its boundary is not self-authenticating, for exactly the reason
+/// [`OrsFamilyCursor`]'s is not: every field of a presented cursor is observable.
+/// `emitted_prefix_digest` is a hash chain over the emitted prefix's durable keys
+/// (the same [`OrsFamilyRowChain`] construction, seeded for the operational family),
+/// and the store re-derives that chain from durable state and refuses any cursor
+/// whose `after_order`/`after_key` is not the row at `emitted_rows`. A caller
+/// therefore cannot choose which operational rows a page covers, and cannot present
+/// a later boundary under an earlier offset to drop the rows in between out of the
+/// denominator.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OrsOperationalCursor {
+    /// Cursor contract version. A snapshot produced before this cursor existed
+    /// declares no operational denominator and is legacy/partial evidence.
+    pub version: u16,
+    /// The one frozen operational snapshot every page must still observe.
+    pub identity: OrsOperationalSnapshotIdentity,
+    /// Exclusive `operation_order` bound; the identity's `lower_order_bound` at the
+    /// start of the walk.
+    pub after_order: u64,
+    /// Exclusive durable-key bound; empty at the start of the walk.
+    pub after_key: String,
+    /// Operational rows the owner has already emitted for this walk.
+    pub emitted_rows: u64,
+    /// Summed encoded bytes the owner has already emitted for this walk.
+    pub emitted_bytes: u64,
+    /// Chained digest of the emitted operational durable-key prefix.
+    pub emitted_prefix_digest: String,
+}
+impl OrsOperationalCursor {
+    /// Opens the first operational cursor for one frozen operational identity.
+    pub fn start(identity: OrsOperationalSnapshotIdentity) -> Result<Self, OrsError> {
+        let emitted_prefix_digest = OrsFamilyRowChain::start(RowFamilyKind::OperationalHistory)
+            .link()
+            .to_owned();
+        // The walk's declared start IS the start cursor's exclusive bound: a cursor
+        // that had emitted nothing but named any other boundary would be a caller
+        // choosing where the walk begins, which `validate` refuses below.
+        let after_order = identity.lower_order_bound;
+        let cursor = Self {
+            version: ORS_OPERATIONAL_CURSOR_VERSION,
+            identity,
+            after_order,
+            after_key: String::new(),
+            emitted_rows: 0,
+            emitted_bytes: 0,
+            emitted_prefix_digest,
+        };
+        cursor.validate()?;
+        Ok(cursor)
+    }
+    /// Exact deterministic identity of this cursor, including the frozen
+    /// operational snapshot and the emitted prefix.
+    #[must_use]
+    pub fn fence_token(&self) -> String {
+        sha256_hex(
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                self.version,
+                self.identity.fence_token(),
+                self.after_order,
+                self.after_key,
+                self.emitted_rows,
+                self.emitted_bytes,
+                self.emitted_prefix_digest
+            )
+            .as_bytes(),
+        )
+    }
+    /// Validate the cursor's version, identity, prefix and window shape.
+    ///
+    /// This is a shape gate only, in the same sense and for the same reason as
+    /// [`OrsFamilyCursor::validate`]: it proves the cursor is well formed, never
+    /// that its boundary is the owner's. Only the store, by re-deriving the prefix
+    /// chain from durable state, can bind the boundary. A cursor that passed this
+    /// gate alone would prove nothing, which is why the store's re-derivation is a
+    /// separate, mandatory step and not a refinement of this one.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.version != ORS_OPERATIONAL_CURSOR_VERSION {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "backup operational cursor {} unsupported, expected {ORS_OPERATIONAL_CURSOR_VERSION}",
+                    self.version
+                ),
+            });
+        }
+        if self.identity.schema_version != BACKUP_SNAPSHOT_SCHEMA_VERSION {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "backup operational identity schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
+                    self.identity.schema_version
+                ),
+            });
+        }
+        require_digest(
+            &self.emitted_prefix_digest,
+            "backup_operational_emitted_prefix_digest",
+        )?;
+        if self.after_key.is_empty() != (self.emitted_rows == 0) {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_cursor",
+                reason: "an emitted operational prefix must name its last durable key",
+            });
+        }
+        if self.emitted_rows == 0 {
+            // A start cursor carries no emitted row, so its only legal boundary is
+            // the walk's declared start. Any other value would be a caller choosing
+            // where the walk begins while claiming nothing had been emitted.
+            if self.after_order != self.identity.lower_order_bound {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_cursor",
+                    reason: "a start cursor must begin at the frozen walk's lower order bound",
+                });
+            }
+        }
+        if self.emitted_rows > self.identity.operational_row_count {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_cursor",
+                reason: "emitted operational rows exceed the frozen operational row count",
+            });
+        }
+        if self.after_order > self.identity.high_water_order {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_cursor",
+                reason: "an emitted operational prefix cannot reach above the frozen high-water order",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Per-page operational continuation state (issue #2967).
+///
+/// The operational twin of [`OrsFamilyContinuation`], and deliberately a separate
+/// type with a separate field on the page: operational rows are ordered by
+/// `operation_order` under the store's ordering high-water, while each paged family
+/// is ordered by its own durable key under its own frozen revision. One cursor can
+/// never stand in for the other, so neither the wire nor the digest can either.
+///
+/// `next` is the exact cursor for the next operational page and is `None` only when
+/// the walk reached the frozen denominator. The boundary it names is the page's
+/// ACTUAL last emitted row, so a sparse order domain neither duplicates nor skips
+/// rows across pages.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OrsOperationalContinuation {
+    /// Cursor in force for this page.
+    pub cursor: OrsOperationalCursor,
+    /// Exact next operational cursor; `None` when the walk is exhausted here.
+    pub next: Option<OrsOperationalCursor>,
+}
+impl OrsOperationalContinuation {
+    /// Reports whether the operational walk still has rows behind `next`.
+    #[must_use]
+    pub fn operational_open(&self) -> bool {
+        self.next.is_some()
+    }
+    /// Validate the in-force cursor and the next cursor.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.cursor.validate()?;
+        match &self.next {
+            Some(next) => {
+                next.validate()?;
+                if next.identity != self.cursor.identity {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "next operational cursor left the frozen operational snapshot",
+                    });
+                }
+                if next.emitted_rows < self.cursor.emitted_rows {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "operational continuation must not reset its emitted prefix",
+                    });
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
 /// Stored effect class per backup entry (bytes stay in the store).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -649,7 +1018,15 @@ pub enum StoredEffectClass {
 pub struct OrsBackupRequest {
     pub source: OrsBackupSourceIdentity,
     pub fence: OrsBackupFence,
-    /// Exclusive lower order bound for pagination.
+    /// Exclusive lower order bound for pagination: the start of the WHOLE walk.
+    ///
+    /// This is a subsetting declaration, not a continuation, and that is the whole
+    /// reason it is still here while `page_index` arithmetic is gone. It names where
+    /// the owner-issued walk begins; it can never name a page boundary inside the
+    /// walk, because every boundary after the first is
+    /// [`Self::operational_cursor`]. The denominator the walk declares is measured
+    /// from it, so a caller that starts late gets a snapshot that is complete over
+    /// the window it asked for and is not thereby complete over the whole history.
     pub after_order: u64,
     /// Entries per page, `1..=MAX_BACKUP_PAGE_ENTRIES`.
     pub page_entries: u16,
@@ -657,6 +1034,22 @@ pub struct OrsBackupRequest {
     pub max_bytes: u64,
     /// Page budget, `1..=MAX_BACKUP_PAGES`.
     pub max_pages: u16,
+    /// Typed continuation for the operational-history axis (issue #2967), or `None`
+    /// for the FIRST page of a walk.
+    ///
+    /// A THIRD named slot, never a widened `after_order`. The operational axis has
+    /// its own total order (the store's `operation_order` allocator) and its own
+    /// frozen identity, so it is paged the way each cursor-paged family is: by an
+    /// owner-issued cursor whose boundary is re-derived from durable state, not by
+    /// `after_order + page_entries * page_index`. `None` means "this is the first
+    /// page of the walk declared by `after_order`" and is the only case in which the
+    /// store mints the operational cursor itself, from the high-water, content root
+    /// and denominator it observes.
+    ///
+    /// The slot is never reused for a family cursor and a family slot is never
+    /// reused for it: `OrsOperationalCursor::validate` refuses a family identity by
+    /// construction, and a family cursor cannot be constructed in this slot.
+    pub operational_cursor: Option<OrsOperationalCursor>,
     /// Typed continuation for the paged process-stream recovery family
     /// (issue #2884), or `None` when the caller declared no family
     /// continuation.
@@ -734,9 +1127,41 @@ impl OrsBackupRequest {
             page_entries,
             max_bytes,
             max_pages,
+            operational_cursor: None,
             process_stream_recovery_cursor: None,
             versioned_artifact_cursor: None,
         })
+    }
+    /// Binds one typed operational continuation to this request (issue #2967).
+    ///
+    /// The cursor comes from the store's operational-snapshot opener or from the
+    /// `next_operational_cursor` an earlier partial snapshot published, never from
+    /// a boundary the caller computed: it names a frozen high-water, a frozen
+    /// content root and the operational durable-key prefix the owner already
+    /// emitted, and the store re-derives that prefix from durable state before it
+    /// reads a single row (see `check_operational_cursor_boundary`). A caller that
+    /// echoes the exact cursor back resumes; a caller that edits the boundary, the
+    /// offset, the prefix commitment, the high-water or the source is refused before
+    /// any suffix read.
+    ///
+    /// A request carrying this cursor is paged from the cursor's own boundary, not
+    /// from `after_order`: `after_order` remains the walk's declared start and the
+    /// frozen identity carries it, so a cursor whose identity disagrees with this
+    /// request's `after_order` is refused rather than silently restarting the walk
+    /// at a different window.
+    pub fn with_operational_cursor(
+        mut self,
+        cursor: OrsOperationalCursor,
+    ) -> Result<Self, OrsError> {
+        cursor.validate()?;
+        if cursor.identity.lower_order_bound != self.after_order {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_cursor",
+                reason: "the operational cursor is frozen for a different walk start than this request declares",
+            });
+        }
+        self.operational_cursor = Some(cursor);
+        Ok(self)
     }
     /// Binds one typed family continuation to this request (issue #2884).
     ///
@@ -795,11 +1220,12 @@ impl OrsBackupRequest {
     }
     /// Deterministic binding token for source, fence, and page cursor.
     ///
-    /// The family cursor is deliberately not folded in: a family continuation
-    /// advances by exactly one owner-issued cursor per family page, so the
-    /// operational fence token has to stay stable across a whole snapshot
-    /// while the family token moves. The family snapshot identity reaches the
-    /// page token through [`OrsFamilyCursor::fence_token`] instead.
+    /// Neither cursor is deliberately folded in: an operational or family
+    /// continuation advances by exactly one owner-issued cursor per page, so the
+    /// store-wide token has to stay stable across a whole snapshot while those
+    /// tokens move. Each frozen snapshot identity reaches the page through its own
+    /// cursor's `fence_token` instead, which
+    /// [`OrsBackupPage::expected_page_digest`] folds in.
     pub fn page_fence_token(&self) -> String {
         sha256_hex(
             format!(
@@ -888,8 +1314,9 @@ pub struct OrsBackupEntry {
 /// states which frozen family snapshot and which emitted prefix produced it.
 /// `next` is the exact cursor for the next family page and is `None` only when
 /// this page carried the family's final segment. Operational-history paging and
-/// family paging therefore never share a cursor: the operational window stays
-/// `page_index * page_entries` and the family keeps its own durable-key bound.
+/// family paging therefore never share a cursor: the operational walk is bounded
+/// by its own frozen high-water under [`OrsOperationalContinuation`] and each family
+/// keeps its own durable-key bound.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsFamilyContinuation {
     /// Cursor in force for this page.
@@ -960,13 +1387,26 @@ pub struct OrsBackupPage {
     pub page_digest: String,
     /// True only on the final page.
     ///
-    /// Unambiguous by construction (issue #2884, extended by #1971): it is the
-    /// conjunction of the operational window being exhausted and EVERY paged
-    /// family having no continuation left. A page that still owes rows to
-    /// either the process-stream recovery family or the versioned-artifact family
-    /// is never `is_last` even when its operational segment ended, so page
-    /// continuity can never hide an unemitted family tail behind a final page.
+    /// Unambiguous by construction (issue #2884, extended by #1971 and by #2967):
+    /// it is the conjunction of the operational walk having no continuation left and
+    /// EVERY paged family having no continuation left. A page that still owes rows
+    /// to the operational walk, to the process-stream recovery family or to the
+    /// versioned-artifact family is never `is_last` even when its own segment
+    /// ended, so page continuity can never hide an unemitted tail behind a final
+    /// page. Since #2967 the operational half is derived from the frozen
+    /// denominator rather than from a scan that returned fewer rows than the page
+    /// size, so a page can no longer claim finality by having found nothing this
+    /// time.
     pub is_last: bool,
+    /// Operational-history continuation this page was read under (issue #2967).
+    ///
+    /// Present on every page and never shared with a family continuation: the two
+    /// axes have different owners, different total orders and different frozen
+    /// identities, so a page states the operational boundary in its own field. The
+    /// frozen operational identity and the page's actual last emitted row both
+    /// reach [`Self::page_digest`] through it, which is what makes a page that was
+    /// stitched from two operational windows detectable.
+    pub operational_continuation: OrsOperationalContinuation,
     /// Process-stream recovery family continuation this page was read under, or
     /// `None` when the request declared no continuation for that family.
     pub family_continuation: Option<OrsFamilyContinuation>,
@@ -992,13 +1432,14 @@ impl OrsBackupPage {
     /// and a shape-checked digest bound nothing at all.
     ///
     /// Binds, in order: the capture token, the page index, finality, the whole
-    /// capture window, the entry count, the process-stream recovery family
+    /// capture window, the entry count, the operational continuation in force and
+    /// its exact next cursor (issue #2967), the process-stream recovery family
     /// continuation in force and its exact next cursor, then the SAME four family
     /// facts for the versioned-artifact family (issue #1971), then one 64-hex
-    /// digest per entry. Both family segments are folded in a FIXED order with a
-    /// literal label in front of each, so a page that carried only the
-    /// versioned-artifact family cannot produce the same material as a page that
-    /// carried only the process-stream recovery family. Every contribution is
+    /// digest per entry. All three continuation segments are folded in a FIXED
+    /// order with a literal label in front of each, so a page that carried only one
+    /// axis cannot produce the same material as a page that carried another. Every
+    /// contribution is
     /// either a fixed-width digest or a delimiter-separated decimal/bool field, so
     /// the concatenation is length-delimited by construction and an embedded
     /// separator inside a `record_id` cannot make two different pages produce the
@@ -1008,13 +1449,14 @@ impl OrsBackupPage {
     /// [`RowPayloadState`], so the page digest moves when a member's payload
     /// availability moves and an unavailable member can never be laundered into
     /// an available one behind an unchanged digest. The `v2`→`v3` label change
-    /// is that addition; it is a wire constant, not durable schema, and the
+    /// is that addition, and issue #2967's `v3` to `v4` label change is the
+    /// operational segment; each is a wire constant, not durable schema, and the
     /// pre-existing [`OrsError::MigrationRequired`] refusal is the migration
     /// story.
     #[must_use]
     pub fn expected_page_digest(&self) -> String {
         let mut material = format!(
-            "eliot.ors.backup_page.v3|{}|{}|{}|{}|{}|{}|",
+            "eliot.ors.backup_page.v4|{}|{}|{}|{}|{}|{}|",
             self.fence_token,
             self.page_index,
             self.is_last,
@@ -1022,6 +1464,14 @@ impl OrsBackupPage {
             self.expires_at_ms,
             self.entries.len()
         );
+        material.push_str("operational-axis=");
+        material.push_str(&self.operational_continuation.cursor.fence_token());
+        material.push(':');
+        match &self.operational_continuation.next {
+            Some(next) => material.push_str(&next.fence_token()),
+            None => material.push_str("no-next-operational"),
+        }
+        material.push(':');
         push_family_continuation_material(
             &mut material,
             "recovery-family",
@@ -1038,7 +1488,7 @@ impl OrsBackupPage {
             // cannot shift a field boundary and alias one entry set onto another.
             material.push_str(&sha256_hex(
                 format!(
-                    "eliot.ors.backup_entry.v3|{}|{:?}|{}|{}|{:?}|{:?}",
+                    "eliot.ors.backup_entry.v4|{}|{:?}|{}|{}|{:?}|{:?}",
                     entry.record_id,
                     entry.family,
                     entry.order,
@@ -1081,6 +1531,7 @@ impl OrsBackupPage {
         if self.expires_at_ms - self.created_at_ms > MAX_BACKUP_PAGE_LIFETIME_MS {
             return Err(OrsError::InvalidExpiry);
         }
+        self.operational_continuation.validate()?;
         if let Some(continuation) = &self.family_continuation {
             continuation.validate()?;
         }
@@ -1120,16 +1571,64 @@ fn push_family_continuation_material(
     }
     material.push(':');
 }
+/// Typed reason a snapshot is partial (issue #2967).
+///
+/// A reason STRING is not a disposition: it cannot be matched on, so a caller that
+/// must "distinguish operational partial, family partial, moved snapshot, malformed
+/// continuation and complete export" (the issue's W13) had nothing to match on and
+/// every partial read as the same undifferentiated fact. Each variant names the AXIS
+/// that is unfinished and carries the exact outstanding boundary, so the caller's
+/// next action — resume the operational walk with this cursor, resume that family
+/// with that key, or re-open the snapshot because the store moved — is a decision
+/// the value makes and not a substring the caller has to parse.
+///
+/// A moved snapshot and a malformed continuation are NOT variants here on purpose:
+/// both are refusals, not dispositions, and they arrive as typed [`OrsError`]
+/// values instead. Putting them here would turn a refusal into a report.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupPartialReason {
+    /// The operational walk still owes rows and the exact next cursor is
+    /// published on the snapshot as `next_operational_cursor`.
+    OperationalContinuationOutstanding {
+        /// Frozen high-water the walk is still under.
+        high_water_order: u64,
+        /// Rows already emitted under that frozen identity.
+        emitted_rows: u64,
+        /// Rows the frozen denominator still owes.
+        remaining_rows: u64,
+    },
+    /// A cursor-paged row family still owes rows; the exact next cursor is
+    /// published on the snapshot in that family's own slot.
+    FamilyContinuationOutstanding {
+        /// The family that is unfinished.
+        family: RowFamilyKind,
+        /// Rows already emitted for that family.
+        emitted_rows: u64,
+        /// Rows that family's frozen denominator still owes.
+        remaining_rows: u64,
+    },
+    /// The request declared no denominator for a cursor-paged family, so the
+    /// snapshot cannot distinguish "no rows were retained" from "this exporter
+    /// never looked at the family" (I05-16: absence of a closure or coverage
+    /// record means `unknown`, not unrestricted/complete).
+    NoFamilyDenominator {
+        /// The family with no declared denominator.
+        family: RowFamilyKind,
+    },
+    /// The declared denominator is empty, so there is nothing to certify.
+    EmptyDenominator,
+}
 /// Completeness of a backup snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupCompleteness {
     /// Every bound page present.
     Complete,
-    /// Truncated but usable with a stated reason.
+    /// Truncated but usable with a typed reason.
     Partial {
-        /// Why the snapshot is partial.
-        reason: String,
+        /// Which axis is unfinished, and the exact boundary it is unfinished at.
+        reason: BackupPartialReason,
     },
     /// Unusable as an export; retained for forensics.
     Incomplete {
@@ -1149,6 +1648,28 @@ pub struct OrsBackupSnapshot {
     pub entry_count: u64,
     pub total_bytes: u64,
     pub completeness: BackupCompleteness,
+    /// Frozen operational-history snapshot every page of this snapshot was read
+    /// under (issue #2967).
+    ///
+    /// Not optional, and that is the point. The operational axis is the axis that
+    /// was previously unaccounted for: its pages could repeat and skip rows and
+    /// could carry rows above the declared high-water while every digest in the
+    /// archive still agreed, because nothing stated what the operational walk was
+    /// supposed to cover. Carrying the frozen identity here makes the denominator
+    /// and the pages two statements about the same window, and
+    /// [`Self::validate`] requires every page's in-force cursor to be this
+    /// identity.
+    pub operational_history: OrsOperationalSnapshotIdentity,
+    /// Exact continuation that resumes an unfinished operational walk, or `None`
+    /// when the walk reached the frozen denominator.
+    ///
+    /// Page-budget or byte exhaustion leaves a resumable typed partial disposition
+    /// carrying this cursor, never a permanent all-or-nothing failure and never a
+    /// fabricated finality. It is the operational twin of
+    /// [`Self::next_process_stream_recovery_cursor`] and is independent of it: a
+    /// snapshot may carry both, either, or neither, and one never stands in for the
+    /// other.
+    pub next_operational_cursor: Option<OrsOperationalCursor>,
     /// Frozen process-stream recovery family snapshot this snapshot exported,
     /// or `None` when the request declared no family continuation.
     ///
@@ -1211,6 +1732,24 @@ impl OrsBackupSnapshot {
             self.fence.fence_digest,
             self.fence.high_water_order
         );
+        // The operational axis is folded FIRST and under its own label, because it
+        // is the axis the high-water above only ever claimed: the fence digest and
+        // the declared high-water are caller-asserted fields until the frozen
+        // operational identity beside them binds a measured content root, row count
+        // and byte denominator to them (issue #2967). The outstanding operational
+        // cursor is folded with it, so a snapshot that stops early and one that
+        // finished cannot share a denominator.
+        material.push_str("operational:");
+        material.push_str(&self.operational_history.fence_token());
+        material.push(':');
+        match &self.next_operational_cursor {
+            Some(next) => {
+                material.push_str("operational_next:");
+                material.push_str(&next.fence_token());
+                material.push(':');
+            }
+            None => material.push_str("operational_next:none:"),
+        }
         match &self.process_stream_recovery_family {
             Some(identity) => {
                 material.push_str("family:");
@@ -1245,6 +1784,20 @@ impl OrsBackupSnapshot {
         }
         for page in &self.pages {
             material.push_str(&page.page_digest);
+            material.push(':');
+            // The page's own operational boundary is folded here as well as inside
+            // `page_digest`. That is not redundancy: `page_digest` proves the page
+            // agrees with itself, and this is what lets the denominator prove the
+            // pages form one walk in one order — a page whose outgoing operational
+            // cursor is not the next page's incoming cursor moves this value even
+            // when every individual page re-derives its own digest.
+            material.push_str("operational-axis=");
+            material.push_str(&page.operational_continuation.cursor.fence_token());
+            material.push(':');
+            match &page.operational_continuation.next {
+                Some(next) => material.push_str(&next.fence_token()),
+                None => material.push_str("no-next-operational"),
+            }
             material.push(':');
             push_family_continuation_material(
                 &mut material,
@@ -1287,6 +1840,21 @@ impl OrsBackupSnapshot {
         require_digest(&self.fence.fence_digest, "backup_fence_digest")?;
         require_digest(&self.denominator_digest, "backup_denominator_digest")?;
         let last_page = self.pages.last();
+        // The OPERATIONAL axis is checked independently of both family axes (issue
+        // #2967). It is the axis a v4 snapshot could not state at all: there was no
+        // frozen identity, no continuation and no upper bound, so a snapshot could
+        // repeat a row across pages, skip rows between pages, or carry a row above
+        // its own declared high-water and still be internally self-digesting. The
+        // field-level rules run below, next to the family rules they are independent
+        // of; this one needs no page and so runs here.
+        if matches!(self.completeness, BackupCompleteness::Complete)
+            && self.next_operational_cursor.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "backup_completeness",
+                reason: "a complete snapshot must have no outstanding operational continuation",
+            });
+        }
         let last_recovery = last_page.and_then(|page| page.family_continuation.as_ref());
         let last_artifact =
             last_page.and_then(|page| page.versioned_artifact_continuation.as_ref());
@@ -1312,26 +1880,7 @@ impl OrsBackupSnapshot {
             "backup_next_versioned_artifact_cursor",
         )?;
         if matches!(self.completeness, BackupCompleteness::Complete) {
-            if self.process_stream_recovery_family.is_none() {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must carry a process-stream recovery family denominator",
-                });
-            }
-            if self.versioned_artifact_family.is_none() {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must carry a versioned-artifact family denominator",
-                });
-            }
-            if self.next_process_stream_recovery_cursor.is_some()
-                || self.next_versioned_artifact_cursor.is_some()
-            {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must have no outstanding family continuation",
-                });
-            }
+            check_complete_denominators(self)?;
         }
         if self.pages.is_empty() {
             return Err(OrsError::InvalidField {
@@ -1345,6 +1894,14 @@ impl OrsBackupSnapshot {
                 reason: "snapshot exceeds MAX_BACKUP_PAGES",
             });
         }
+        // The declared operational state against the last page's own continuation,
+        // after the empty-page refusal so an empty snapshot is named as one.
+        check_declared_operational(
+            &self.fence,
+            &self.operational_history,
+            self.next_operational_cursor.as_ref(),
+            last_page.map(|page| &page.operational_continuation),
+        )?;
         let mut counted: u64 = 0;
         let mut previous_page_was_final = false;
         for (index, page) in self.pages.iter().enumerate() {
@@ -1358,6 +1915,13 @@ impl OrsBackupSnapshot {
                         reason: "entry count overflow",
                     })?;
         }
+        // Cross-page operational continuity, over the whole page sequence. It runs
+        // on BOTH completeness arms, not only on `Complete`: a truncated snapshot
+        // is still a statement about which rows it walked and in what order, and a
+        // repeated or out-of-window row is a contradiction on either arm. The
+        // family continuations get the same treatment through
+        // `check_declared_family`, which is why the two domains stay independent.
+        check_operational_pages(&self.pages, &self.operational_history)?;
         if counted != self.entry_count {
             return Err(OrsError::InvalidField {
                 field: "backup_entry_count",
@@ -1380,10 +1944,260 @@ impl OrsBackupSnapshot {
             &self.completeness,
             counted,
             &self.pages,
+            &self.operational_history,
             self.process_stream_recovery_family.as_ref(),
             self.versioned_artifact_family.as_ref(),
         )
     }
+}
+
+/// Requires a `Complete` snapshot to declare every family denominator and to owe
+/// nothing on either family axis (issue #2967, W8).
+///
+/// The operational half of the same precondition needs no page, so it stays
+/// directly in [`OrsBackupSnapshot::validate`]; these two need the declared family
+/// slots, and splitting them out keeps the whole completeness precondition readable
+/// as one list instead of an arm buried in the middle of a long function.
+///
+/// Each missing denominator is refused by its own name, because the reason they are
+/// required is a compatibility rule and the operator needs to know WHICH family the
+/// snapshot never looked at: a snapshot exported before a family cursor existed
+/// declares no denominator for that family, so it stays `Partial`, can never be
+/// read as a proven complete family, and can never be silently promoted to the
+/// operational-coverage claim either (I05-16: absent coverage means unknown, not
+/// complete).
+fn check_complete_denominators(snapshot: &OrsBackupSnapshot) -> Result<(), OrsError> {
+    if snapshot.process_stream_recovery_family.is_none() {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry a process-stream recovery family denominator",
+        });
+    }
+    if snapshot.versioned_artifact_family.is_none() {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry a versioned-artifact family denominator",
+        });
+    }
+    if snapshot.next_process_stream_recovery_cursor.is_some()
+        || snapshot.next_versioned_artifact_cursor.is_some()
+    {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must have no outstanding family continuation",
+        });
+    }
+    Ok(())
+}
+
+/// Checks the declared operational snapshot state against the last page's own
+/// operational continuation (issue #2967).
+///
+/// The operational twin of [`check_declared_family`], and the same three questions
+/// asked of the same three facts: does the declared frozen identity name the
+/// identity the last page was actually read under, does the declared outstanding
+/// cursor equal the last page's own next cursor, and can the declared identity
+/// disagree with the request's own high-water?
+///
+/// The third question has no family analogue and is the A5 rule. `fence` is
+/// caller-asserted input, and `OrsBackupFence::high_water_order` was never compared
+/// with anything that could refuse it, so a snapshot could declare one high-water
+/// at the top and freeze its operational window at another. Here the declared
+/// identity's high-water must equal the fence's, and it is the identity — a value
+/// the store measured — that the pages are then counted against.
+fn check_declared_operational(
+    fence: &OrsBackupFence,
+    identity: &OrsOperationalSnapshotIdentity,
+    declared_next: Option<&OrsOperationalCursor>,
+    last: Option<&OrsOperationalContinuation>,
+) -> Result<(), OrsError> {
+    if identity.schema_version != BACKUP_SNAPSHOT_SCHEMA_VERSION {
+        return Err(OrsError::MigrationRequired {
+            reason: format!(
+                "backup operational identity schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
+                identity.schema_version
+            ),
+        });
+    }
+    // A5, at the snapshot boundary. The store already refuses a request whose
+    // declared high-water is not the one it observed (`check_export_fence`), so a
+    // store-produced snapshot always agrees here; the rule exists for a RECEIVED
+    // snapshot, where the fence is a bare field and the pages are somebody else's
+    // bytes. Without it a snapshot could declare one high-water at the top and
+    // freeze its window at another, and the A5 bound the pages are counted under
+    // would be the one the sender chose rather than the one the fence claims.
+    if identity.high_water_order != fence.high_water_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_history",
+            reason: "the declared operational window is frozen at a different high-water order than the snapshot's own fence claims",
+        });
+    }
+    if identity.lower_order_bound > identity.high_water_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_lower_order_bound",
+            reason: "the declared walk window must not start above the high-water order",
+        });
+    }
+    require_digest(
+        &identity.operational_root_digest,
+        "backup_operational_root_digest",
+    )?;
+    if let Some(next) = declared_next {
+        next.validate()?;
+    }
+    let Some(last) = last else {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_continuation",
+            reason: "a snapshot must carry an operational continuation on its last page",
+        });
+    };
+    if last.cursor.identity != *identity {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_history",
+            reason: "declared operational denominator is not the frozen operational snapshot the last page was read under",
+        });
+    }
+    if last.next.as_ref() != declared_next {
+        return Err(OrsError::InvalidField {
+            field: "backup_next_operational_cursor",
+            reason: "declared operational continuation does not match the last page",
+        });
+    }
+    Ok(())
+}
+
+/// Proves cross-page operational continuity independently of the family axes
+/// (issue #2967, A11/A12).
+///
+/// Every page is checked against the SAME frozen identity, and the pages must form
+/// ONE exact chain:
+///
+/// - `pages[i].operational_continuation.next == pages[i + 1].operational_continuation.cursor`,
+///   exactly. This single rule is what makes duplication and skipping structurally
+///   impossible rather than merely unlikely: page N+1 cannot re-read anything page N
+///   emitted, and cannot start anywhere other than where page N actually stopped,
+///   because the boundary it must present IS page N's emitted tail. A page after an
+///   exhausted walk is refused here too, since an exhausted walk has no next cursor
+///   for the following page to present.
+/// - The first page starts the walk: its in-force cursor must have emitted nothing.
+///   A chain that is exact from page 1 onward can still under-report coverage if
+///   page 0 opens in the middle, which is the same defect as a stride window with a
+///   large offset. A cursor that emitted nothing is already forced to name the
+///   frozen window's lower bound by [`OrsOperationalCursor::validate`], so this is
+///   the whole opening-boundary rule.
+/// - Within a page, operational orders strictly increase, stay above the incoming
+///   cursor's exclusive bound, and never exceed the frozen high-water. The last rule
+///   is A5: a row above the high-water belongs to a successor snapshot and cannot
+///   appear under the older fence even though it may have been durable and stable
+///   before the export began.
+/// - A page that declares no next cursor must have exactly consumed the frozen
+///   denominator, and a page that does declare one must have made strict progress.
+///   Without the progress rule a page could emit no operational rows at all while
+///   pointing at the same boundary, and the page budget would be spent without the
+///   walk ever moving.
+///
+/// The one thing deliberately NOT checked here is the outgoing cursor's durable key
+/// and prefix chain: an entry carries the operation's `record_id` and its digest,
+/// not the durable history key the owner walked under or the chained commitment
+/// over the emitted prefix, so a pure validator cannot re-derive them. They are
+/// proved at the READ boundary instead, where the store re-derives the chain from
+/// durable state against the next page's in-force cursor — the same division of
+/// labour the family axis already uses.
+fn check_operational_pages(
+    pages: &[OrsBackupPage],
+    identity: &OrsOperationalSnapshotIdentity,
+) -> Result<(), OrsError> {
+    for (index, page) in pages.iter().enumerate() {
+        let continuation = &page.operational_continuation;
+        if continuation.cursor.identity != *identity {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "a page was read under a different frozen operational snapshot than the snapshot declares",
+            });
+        }
+        if index == 0 && continuation.cursor.emitted_rows != 0 {
+            // The first page of a walk is the walk's start. Without this, an archive
+            // could open mid-walk and still chain every later page correctly: the
+            // chain would be exact and the coverage would silently start in the
+            // middle, which is the same defect as a stride window with a large
+            // offset.
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "the first page must start the walk, not continue one that is already under way",
+            });
+        }
+        let mut previous_order = continuation.cursor.after_order;
+        let mut emitted: u64 = 0;
+        for entry in &page.entries {
+            if entry.family != RowFamilyKind::OperationalHistory {
+                continue;
+            }
+            emitted = emitted.checked_add(1).ok_or(OrsError::InvalidField {
+                field: "backup_operational_entry",
+                reason: "operational entry count overflow",
+            })?;
+            if entry.order <= previous_order {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_entry",
+                    reason: "operational entries must strictly increase and follow the incoming cursor; a repeated or reordered row is a duplicated or out-of-order member",
+                });
+            }
+            if entry.order > identity.high_water_order {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_entry",
+                    reason: "an operational entry is above the frozen high-water order and belongs to a successor snapshot",
+                });
+            }
+            previous_order = entry.order;
+        }
+        let walked = continuation
+            .cursor
+            .emitted_rows
+            .checked_add(emitted)
+            .ok_or(OrsError::InvalidField {
+                field: "backup_operational_cursor",
+                reason: "emitted operational row count overflow",
+            })?;
+        match &continuation.next {
+            Some(next) => {
+                if emitted == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "a page must not declare an operational continuation without emitting an operational row",
+                    });
+                }
+                if next.after_order != previous_order {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "the next operational cursor is not derived from the page's last operational member",
+                    });
+                }
+                if next.emitted_rows != walked {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "the next operational cursor does not account for exactly the rows this page emitted",
+                    });
+                }
+            }
+            None => {
+                if walked != identity.operational_row_count {
+                    return Err(OrsError::InvalidField {
+                        field: "backup_operational_continuation",
+                        reason: "the walk stopped without a continuation before the frozen operational denominator was reached",
+                    });
+                }
+            }
+        }
+        if let Some(next_page) = pages.get(index + 1)
+            && continuation.next.as_ref() != Some(&next_page.operational_continuation.cursor)
+        {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "the next page did not continue from this page's exact emitted operational tail",
+            });
+        }
+    }
+    Ok(())
 }
 /// Checks one paged family's declared snapshot state against the last page's
 /// continuation for that SAME family (issue #2884, extended to the second
@@ -1482,10 +2296,12 @@ fn check_page_shape(
         });
     }
     page.validate_binding()?;
-    // A final page must leave NO paged family open. Both continuations are
-    // checked because `is_last` is the conjunction over both of them, so a
-    // producer that computed finality from only one family would be caught here
-    // (issue #1971).
+    // A final page must leave NO continuation open on ANY axis. All three are
+    // checked because `is_last` is the conjunction over all of them, so a producer
+    // that computed finality from only the operational walk or only the families
+    // would be caught here (issue #1971, extended by #2967). This is what makes
+    // finality AUTHORITATIVE: it cannot be asserted while any axis still owes rows.
+    let operational_open = page.operational_continuation.operational_open();
     let family_open = page
         .family_continuation
         .as_ref()
@@ -1494,10 +2310,10 @@ fn check_page_shape(
             .versioned_artifact_continuation
             .as_ref()
             .is_some_and(OrsFamilyContinuation::family_open);
-    if page.is_last && family_open {
+    if page.is_last && (operational_open || family_open) {
         return Err(OrsError::InvalidField {
             field: "backup_page_is_last",
-            reason: "a final page must not leave an open family continuation",
+            reason: "a final page must not leave an open operational or family continuation",
         });
     }
     Ok(())
@@ -1517,6 +2333,7 @@ fn check_completeness(
     completeness: &BackupCompleteness,
     counted: u64,
     pages: &[OrsBackupPage],
+    operational_history: &OrsOperationalSnapshotIdentity,
     recovery_family: Option<&OrsFamilySnapshotIdentity>,
     artifact_family: Option<&OrsFamilySnapshotIdentity>,
 ) -> Result<(), OrsError> {
@@ -1539,6 +2356,21 @@ fn check_completeness(
             }
             check_member_payload_states(pages, true)?;
             check_observed_members(pages)?;
+            // The operational denominator is counted exactly like each family
+            // denominator, and for the same reason: `Complete` is a claim that the
+            // declared walk was walked, and a claim is proved by the members the
+            // pages carry rather than by a number the snapshot declared. A
+            // non-empty denominator is a precondition for `Complete` for the same
+            // reason it is for the families (I05-16: absent coverage means unknown,
+            // not complete), and it is checked on the identity rather than inferred
+            // from row presence.
+            if operational_history.operational_row_count == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "backup_completeness",
+                    reason: "a complete snapshot must declare a non-empty operational denominator; an empty declared window is unknown coverage, not complete coverage",
+                });
+            }
+            check_declared_operational_members(operational_history, pages)?;
             check_declared_members(RowFamilyKind::ProcessStreamRecovery, recovery_family, pages)?;
             check_declared_members(RowFamilyKind::VersionedArtifacts, artifact_family, pages)?;
             // Digest shapes are required only now, and only for members whose
@@ -1556,11 +2388,28 @@ fn check_completeness(
             }
             Ok(())
         }
-        BackupCompleteness::Partial { reason } | BackupCompleteness::Incomplete { reason } => {
+        BackupCompleteness::Partial { reason } => {
+            // A typed reason needs no emptiness check: every
+            // `BackupPartialReason` variant carries the axis and the exact
+            // outstanding boundary, so there is no way to state "partial" without
+            // saying which axis is unfinished. That is the whole reason the string
+            // was replaced (issue #2967, W13).
+            if let BackupPartialReason::FamilyContinuationOutstanding { family, .. } = reason
+                && !family.uses_family_cursor()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "backup_completeness",
+                    reason: "a partial family continuation must name a cursor-paged row family",
+                });
+            }
+            check_member_payload_states(pages, false)?;
+            Ok(())
+        }
+        BackupCompleteness::Incomplete { reason } => {
             if reason.is_empty() {
                 return Err(OrsError::InvalidField {
                     field: "backup_completeness",
-                    reason: "partial snapshots must state a reason",
+                    reason: "an incomplete snapshot must state a reason",
                 });
             }
             check_member_payload_states(pages, false)?;
@@ -1622,7 +2471,7 @@ fn check_member_payload_states(
 
 /// What one member identity was first observed to say, so a later occurrence of
 /// the same identity can be told apart from a genuinely different row.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ObservedMember {
     order: u64,
     effect_class: StoredEffectClass,
@@ -1662,8 +2511,21 @@ enum MemberRoster {
 /// point of a denominator is that it spans pages. The key is the typed
 /// `(RowFamilyKind, String)` pair, not a formatted string, so no `record_id` can
 /// alias two members onto one.
+///
+/// ONE family is the exception, and it is an exact exception rather than a
+/// relaxation. Operational history is append-only by construction: every phase
+/// transition of one operation allocates a NEW `operation_order` and inserts a NEW
+/// history row carrying the same `record_id`, so a single operation legitimately
+/// appears once per phase it passed through, each at its own order with its own
+/// effect class. A repeated `record_id` at a DIFFERENT order is therefore a
+/// revision, not a duplicate, and a repeated `(record_id, order)` is a duplicate
+/// even though its facts differ — one operation order is one durable revision, so
+/// two entries claiming it are two claims about one row. Every other family keeps
+/// the stricter one-observation-per-identity rule, and the operational exception is
+/// scoped to the one family whose durable write path actually produces revisions;
+/// it is not a general weakening of the census.
 fn check_observed_members(pages: &[OrsBackupPage]) -> Result<(), OrsError> {
-    let mut roster: BTreeMap<(RowFamilyKind, &str), ObservedMember> = BTreeMap::new();
+    let mut roster: BTreeMap<(RowFamilyKind, &str), Vec<ObservedMember>> = BTreeMap::new();
     for page in pages {
         for entry in &page.entries {
             let key = (entry.family, entry.record_id.as_str());
@@ -1673,17 +2535,22 @@ fn check_observed_members(pages: &[OrsBackupPage]) -> Result<(), OrsError> {
                 payload_state: entry.payload_state,
                 has_payload_digest: !entry.payload_digest.is_empty(),
             };
-            match roster.get(&key) {
+            match roster.get_mut(&key) {
                 None => {
-                    roster.insert(key, observed);
+                    roster.insert(key, vec![observed]);
                 }
-                Some(first) => {
-                    if first.order == observed.order
-                        && first.effect_class == observed.effect_class
-                        && first.payload_state == observed.payload_state
-                        && first.has_payload_digest == observed.has_payload_digest
-                    {
+                Some(history) => {
+                    if history.contains(&observed) {
                         return Err(member_roster_refused(MemberRoster::Duplicate, entry));
+                    }
+                    if entry.family == RowFamilyKind::OperationalHistory
+                        && !history.iter().any(|first| first.order == observed.order)
+                    {
+                        // A later phase of the same operation: a distinct durable
+                        // revision at its own order, which is what append-only
+                        // operational history looks like.
+                        history.push(observed);
+                        continue;
                     }
                     return Err(member_roster_refused(MemberRoster::Conflicting, entry));
                 }
@@ -1710,6 +2577,47 @@ fn member_roster_refused(roster: MemberRoster, entry: &OrsBackupEntry) -> OrsErr
             ),
         },
     }
+}
+
+/// Requires the operational rows a `Complete` snapshot declares in its frozen
+/// window to be the operational rows its pages actually carry (issue #2967).
+///
+/// The same measurement, not a trust, that
+/// [`check_declared_members`] performs for each cursor-paged family. The declared
+/// side is `operational_row_count`, taken by the owner from a streaming pass over
+/// the operational history in `(lower_order_bound, high_water_order]`; the observed
+/// side is the count of this snapshot's operational entries. When the two disagree
+/// the snapshot claims a walk it did not perform.
+///
+/// Both directions are refused. A shortfall means rows left the denominator, which
+/// is the A4 starvation case; an excess means the pages carry a row the frozen
+/// window never contained, which is either an above-high-water row or a page from a
+/// different walk. The exact continuation chain in [`check_operational_pages`]
+/// already makes duplication structurally impossible, so the excess arm is the
+/// measurement that catches a window the pages were not read under at all.
+fn check_declared_operational_members(
+    declared: &OrsOperationalSnapshotIdentity,
+    pages: &[OrsBackupPage],
+) -> Result<(), OrsError> {
+    let observed: u64 = pages
+        .iter()
+        .flat_map(|page| &page.entries)
+        .filter(|entry| entry.family == RowFamilyKind::OperationalHistory)
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if observed != declared.operational_row_count {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "backup_operational_denominator",
+            reason: format!(
+                "declared operational window ({}, {}] counts {} row(s) but the pages carry {observed}",
+                declared.lower_order_bound,
+                declared.high_water_order,
+                declared.operational_row_count
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Requires the members a `Complete` snapshot declares for one cursor-paged
@@ -1826,6 +2734,125 @@ pub enum PerEntryOutcome {
         reason: String,
     },
 }
+/// What one current owner was asked about a backup import's members, and what it
+/// answered (issue #953, A17).
+///
+/// This is a RECORD of one consultation, not a claim: nothing here is trusted
+/// because it is well formed, and nothing here is recomputed by
+/// [`OrsBackupImportReceipt::known_zero_unresolved`]. The record exists so the
+/// two halves of the guarantee are separately checkable — that the current owner
+/// was asked (which members, which live families, at which instant) and what it
+/// answered (whether it still holds any of them unresolved).
+///
+/// The current owner of ORS recovery effects is the ORS store itself, observed
+/// through its own live durable rows. The producer is the store: it opens
+/// [`RowFamilyKind::RecoveryInbox`] and [`RowFamilyKind::RecoveryProblems`]
+/// inside the read transaction the import already holds, and decides per member
+/// whether the current owner still holds it unresolved. A caller that never read
+/// that live state has no validation to present, which is why
+/// [`Self::consulted_families`] is part of the record and part of the gate.
+///
+/// [`Self::validated_record_ids`] stores the identifiers rather than only a
+/// count, so COMPLETENESS is a comparison against the receipt's own member set
+/// and not a number the validation declared about itself. A validation that
+/// covered fewer members, more members, or different members than the receipt
+/// carries is refused, which is the property a count could never express.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CurrentOwnerValidation {
+    /// Snapshot denominator digest this validation covers.
+    ///
+    /// Bound to the operation, not merely well formed: a validation of a
+    /// different snapshot answers a different question, so the gate refuses a
+    /// validation whose digest is not this receipt's.
+    pub snapshot_digest: String,
+    /// The COMPLETE set of record ids the current owner was asked about.
+    pub validated_record_ids: Vec<String>,
+    /// Identities the current owner still holds unresolved.
+    pub unresolved_effect_identities: Vec<String>,
+    /// The live row families actually read to reach that answer.
+    pub consulted_families: Vec<RowFamilyKind>,
+    /// When the current owner was consulted, in Unix milliseconds.
+    pub validated_at_ms: i64,
+}
+impl CurrentOwnerValidation {
+    /// Shape-checks every field of the record.
+    ///
+    /// Reuses this module's existing validators and rules; it adds none of its
+    /// own. [`require_digest`] covers the snapshot binding,
+    /// [`require_installation_id`] is this module's single bounded-identifier
+    /// shape check and covers each member and each still-unresolved identity,
+    /// and the positive-stamp half of the module's existing
+    /// `expires_at_ms > created_at_ms` rule (`OrsBackupPage::validate_binding`)
+    /// covers the consultation instant. A family roster additionally may not be
+    /// empty and may not repeat a family, because a roster that padded itself
+    /// with a repeat would satisfy the gate's "both families were consulted"
+    /// test without having read both.
+    ///
+    /// Shape is necessary and not sufficient: every obligation
+    /// [`OrsBackupImportReceipt::known_zero_unresolved`] adds on top is a
+    /// relation to the receipt, and none of them is implied here.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        require_digest(&self.snapshot_digest, "backup_owner_validation_digest")?;
+        if self.consulted_families.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "backup_owner_consulted_families",
+                reason: "a current owner validation must name the live families it read",
+            });
+        }
+        let mut families: BTreeSet<RowFamilyKind> = BTreeSet::new();
+        for family in &self.consulted_families {
+            if !families.insert(*family) {
+                return Err(OrsError::InvalidField {
+                    field: "backup_owner_consulted_families",
+                    reason: "a current owner validation must not list one consulted family twice",
+                });
+            }
+        }
+        // The complete asked-about roster. Each identifier takes the module's
+        // existing bounded-identifier check, and a repeat is refused: a roster
+        // that asked the same member twice is not a roster, and comparing it as
+        // a SET against the receipt's members would let a repeated ask stand in
+        // for a member that was never asked about.
+        let mut asked: BTreeSet<&str> = BTreeSet::new();
+        for record_id in &self.validated_record_ids {
+            require_installation_id(record_id, "backup_owner_validated_record_id")?;
+            if !asked.insert(record_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "backup_owner_validated_record_id",
+                    reason: "a current owner validation must ask about each record id at most once",
+                });
+            }
+        }
+        for identity in &self.unresolved_effect_identities {
+            require_installation_id(identity, "backup_owner_unresolved_effect_identity")?;
+        }
+        if self.validated_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "backup_owner_validated_at_ms",
+                reason: "current owner validation must carry a positive unix millisecond stamp",
+            });
+        }
+        Ok(())
+    }
+}
+/// Typed verdict of the known-zero-unresolved gate for one import receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownZeroVerdict {
+    /// A complete current-owner validation covered every member of this receipt
+    /// and the current owner holds none of them unresolved.
+    Satisfied,
+    /// The gate refused; `reason` states which obligation was unmet.
+    ///
+    /// A reason STRING is a report, never the decision: the decision is this
+    /// enum's variant, and [`OrsBackupImportReceipt::known_zero_unresolved`]
+    /// re-derives it from the recorded validation rather than reading this
+    /// field, so a stale or wrong record cannot become a satisfied gate.
+    Refused {
+        /// Why the gate refused.
+        reason: String,
+    },
+}
 /// Import receipt with explicit per-entry outcomes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsBackupImportReceipt {
@@ -1837,9 +2864,28 @@ pub struct OrsBackupImportReceipt {
     pub per_entry: Vec<(String, PerEntryOutcome)>,
     pub unresolved_count: u64,
     pub import_at_ms: i64,
+    /// The live current-owner validation this receipt's members were checked
+    /// against (issue #953, A17).
+    ///
+    /// Recorded, not recomputed: it is what makes the gate observable on the
+    /// receipt, and it is what a replayed receipt re-evaluates from instead of
+    /// carrying a verdict forward.
+    pub current_owner_validation: CurrentOwnerValidation,
+    /// Typed verdict of [`Self::known_zero_unresolved`] for
+    /// [`Self::current_owner_validation`].
+    pub known_zero_verdict: KnownZeroVerdict,
 }
 impl OrsBackupImportReceipt {
     /// Validate and bind an import receipt.
+    ///
+    /// The known-zero verdict is COMPUTED here, by invoking
+    /// [`Self::known_zero_unresolved`] against the supplied validation. It is
+    /// not a parameter, and that is deliberate on both sides: a verdict a caller
+    /// asserted would be a claim with nothing behind it, and a verdict left to a
+    /// later step would mean a receipt exists whose recorded gate was never run.
+    /// A gate refusal is a verdict, not a construction failure, so it is
+    /// recorded on the receipt and does not fail `new` — the caller reads the
+    /// verdict and the standalone gate.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot_digest: String,
@@ -1848,21 +2894,89 @@ impl OrsBackupImportReceipt {
         per_entry: Vec<(String, PerEntryOutcome)>,
         unresolved_count: u64,
         import_at_ms: i64,
+        current_owner_validation: CurrentOwnerValidation,
     ) -> Result<Self, OrsError> {
         require_digest(&snapshot_digest, "backup_snapshot_digest")?;
         require_installation_id(&source_installation, "source_installation_id")?;
         require_installation_id(&destination_installation, "destination_installation_id")?;
-        Ok(Self {
+        let mut receipt = Self {
             snapshot_digest,
             source_installation,
             destination_installation,
             per_entry,
             unresolved_count,
             import_at_ms,
-        })
+            current_owner_validation,
+            known_zero_verdict: KnownZeroVerdict::Refused {
+                reason: "the known-zero gate has not been evaluated for this receipt".to_owned(),
+            },
+        };
+        // ONE evaluation, and the recorded verdict is its result. Assigning from
+        // the gate's own answer (rather than hard-coding either arm) is what
+        // keeps the receipt and the gate the same judgement.
+        receipt.known_zero_verdict =
+            match receipt.known_zero_unresolved(&receipt.current_owner_validation) {
+                Ok(()) => KnownZeroVerdict::Satisfied,
+                Err(error) => KnownZeroVerdict::Refused {
+                    reason: error.to_string(),
+                },
+            };
+        Ok(receipt)
     }
-    /// Explicit gate: succeeds only when no entry remains unresolved.
-    pub fn known_zero_unresolved(&self) -> Result<(), OrsError> {
+    /// The known-zero gate: succeeds only when this receipt's members are
+    /// completely covered by a current-owner validation that found nothing
+    /// unresolved (issue #953, A17).
+    ///
+    /// A zero `unresolved_count` says only that no imported member came back
+    /// `Unresolved`. It says nothing about whether the CURRENT owner still holds
+    /// an effect for any of them, because a brand-new empty destination has no
+    /// row to collide with and therefore triages every entry as a fresh
+    /// quarantined candidate. Trusting that zero is exactly the claim this gate
+    /// now refuses to make on its own, so it takes the current owner's answer as
+    /// an input and refuses unless ALL of the following hold:
+    ///
+    /// 1. the validation's own recorded shape passes
+    ///    ([`CurrentOwnerValidation::validate`]), checked on the ORIGINAL
+    ///    recorded value and never recomputed from live state;
+    /// 2. `owner.snapshot_digest == self.snapshot_digest` — bound to THIS
+    ///    operation, so a well-formed validation of a different snapshot cannot
+    ///    vouch for this one;
+    /// 3. `owner.validated_record_ids` set-equals the record-id set of
+    ///    `self.per_entry` — the completeness comparison. Fewer members, more
+    ///    members or different members are all refused; a count would not
+    ///    distinguish any of them;
+    /// 4. `owner.unresolved_effect_identities` is empty — the current owner
+    ///    still holds nothing unresolved for what it was asked about;
+    /// 5. `owner.consulted_families` contains BOTH
+    ///    [`RowFamilyKind::RecoveryInbox`] and
+    ///    [`RowFamilyKind::RecoveryProblems`] — a validation that did not read
+    ///    the current owner's live recovery state proves nothing about it;
+    /// 6. `unresolved_count == 0` and no `per_entry` outcome is
+    ///    [`PerEntryOutcome::Unresolved`].
+    ///
+    /// Every refusal is [`OrsError::ReconciliationMismatch`]: I14-21 — unknown
+    /// stays reconciling, and a zero that nobody validated is unknown, not
+    /// resolved. Nothing here retries, replays or repairs; it refuses.
+    pub fn known_zero_unresolved(&self, owner: &CurrentOwnerValidation) -> Result<(), OrsError> {
+        owner.validate()?;
+        if owner.snapshot_digest != self.snapshot_digest {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !self.owner_validation_is_complete(owner) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !owner.unresolved_effect_identities.is_empty() {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !owner
+            .consulted_families
+            .contains(&RowFamilyKind::RecoveryInbox)
+            || !owner
+                .consulted_families
+                .contains(&RowFamilyKind::RecoveryProblems)
+        {
+            return Err(OrsError::ReconciliationMismatch);
+        }
         let any_unresolved = self
             .per_entry
             .iter()
@@ -1872,6 +2986,29 @@ impl OrsBackupImportReceipt {
         } else {
             Err(OrsError::ReconciliationMismatch)
         }
+    }
+    /// Compares the validation's asked-about roster with this receipt's members
+    /// in BOTH directions.
+    ///
+    /// Two distinct failures, both refused and neither reachable from the
+    /// other: a validation that covered a SUBSET leaves members the current
+    /// owner never spoke about, and one that covered a SUPERSET (or a different
+    /// set) answers a question this receipt is not. Comparing sets rather than
+    /// lengths is what makes the difference observable at all — the W31 producer
+    /// set completeness from the same untrusted import vector it was validating,
+    /// so its length always agreed and its gate could never fire.
+    fn owner_validation_is_complete(&self, owner: &CurrentOwnerValidation) -> bool {
+        let asked: BTreeSet<&str> = owner
+            .validated_record_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let members: BTreeSet<&str> = self
+            .per_entry
+            .iter()
+            .map(|(record_id, _)| record_id.as_str())
+            .collect();
+        asked == members
     }
 }
 /// Reject imports that relabel identity or arrive without bound evidence.

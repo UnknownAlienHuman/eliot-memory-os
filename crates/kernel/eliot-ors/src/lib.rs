@@ -34,12 +34,14 @@ pub use admission_reservation::{
     verify_admission_reservation_launch_prerequisite,
 };
 pub use backup_snapshot::{
-    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
-    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION, OrsBackupDestination,
-    OrsBackupEntry, OrsBackupFence, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
-    OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, OrsFamilyContinuation,
-    OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition,
-    RowFamilyDisposition, RowFamilyKind, StoredEffectClass,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
+    MAX_BACKUP_ID_LEN, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION,
+    ORS_OPERATIONAL_CURSOR_VERSION, OrsBackupDestination, OrsBackupEntry, OrsBackupFence,
+    OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest,
+    OrsBackupSnapshot, OrsBackupSourceIdentity, OrsFamilyContinuation, OrsFamilyCursor,
+    OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
+    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
+    RowFamilyKind, RowPayloadState, StoredEffectClass,
 };
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
@@ -53,6 +55,7 @@ pub use effect_operation_lease::{
     ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
     EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
     EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics, authorize_effect_replay,
+    deny_unleased_effect_replay,
 };
 pub use execution_manifest::{
     AdmittedModuleGeneration, BoundKernelExecutionManifest, CatalogPolicyView,
@@ -66,14 +69,15 @@ pub use execution_manifest::{
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
 pub use process_stream_recovery::{
-    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamRecoveryBinding,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryRefusal, ProcessStreamRecoveryRevalidation,
-    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceReadback,
-    ProcessStreamSourceResolution, ProcessStreamSourceResolver, StreamRecoveryActivation,
-    StreamRecoveryAvailability, StreamRecoveryCoverage, StreamRecoveryEvidenceScope,
-    StreamRecoveryPreview, StreamRecoveryRange, StreamRecoveryReconciliation,
-    StreamRecoveryReconciliationState, StreamRecoverySourceFault,
+    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamObservation,
+    ProcessStreamRecoveryBinding, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRefusal,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryWriteOutcome,
+    ProcessStreamRetirementProof, ProcessStreamSourceReadback, ProcessStreamSourceResolution,
+    ProcessStreamSourceResolver, StreamRecoveryActivation, StreamRecoveryAvailability,
+    StreamRecoveryCoverage, StreamRecoveryEvidenceScope, StreamRecoveryPreview,
+    StreamRecoveryRange, StreamRecoveryReconciliation, StreamRecoveryReconciliationState,
+    StreamRecoverySourceFault,
 };
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,

@@ -120,10 +120,24 @@ pub enum ProjectionError {
 // Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
 // only, with no dedup cache. The single terminal record per failed operation
 // belongs to the outer caller boundary, which owns the one
-// `observe_terminal_error` call. Handoff (caller-owned, not applied here):
-// when HostComposition delegation lands, its dispatch wrapper arms one
-// terminal guard with a frozen `host-backup-config-failed` code; these leaf
-// records correlate beneath it by emission order.
+// `observe_terminal_error` call. Handoff (caller-owned, APPLIED for the
+// admitted preparation port under #983 W4): the production path is
+// `project_backup_config_owner_bound`, invoked by
+// `crate::backup_preparation::OwnerEvidence::project_backup_configuration`
+// from the delegated preparation owner path, so a projection refusal here is a
+// failed PREPARATION operation, not an operation of its own. That one terminal
+// record is already owned by `HostComposition::backup_dispatch_prepare`
+// through the crate's own `HostTerminalGuard` and the frozen
+// `host-backup-prepare-failed` code; these leaf records correlate beneath that
+// record by emission order. This leaf therefore deliberately arms no guard: a
+// second terminal for the same failed operation would break "exactly one
+// terminal emitter per failed operation". STILL PENDING, and deliberately not
+// claimed: the snapshot variant `project_backup_config` has no production
+// caller anywhere in the repository (only this crate's own
+// `tests/backup_preparation.rs` reaches it) and its `AuthoritySnapshot` has no
+// production constructor, which is why the owner-bound variant is the only
+// production projector. No wrapper and no new terminal code were invented to
+// close that gap.
 //
 // Explicit no-event list: `describe_audit_fence` (pure renderer, not an
 // observation point; its forensic text must never be logged),
@@ -169,7 +183,7 @@ fn observe_config_progress(
     backup_config_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_phase",
         op = op.text(),
@@ -186,7 +200,7 @@ fn observe_config_progress(
 fn observe_bind_progress(outcome: &'static str, artifact_count: u64) {
     backup_config_note_event_log_unavailable();
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_phase",
         op = "bind_build",
@@ -204,7 +218,7 @@ fn note_config_error(op: &'static str, error: ProjectionError) -> ProjectionErro
     let op = crate::host_diagnostics::bound_field(op);
     let category = crate::host_diagnostics::bound_field(category);
     let field = crate::host_diagnostics::bound_field(field);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_refusal",
         op = op.text(),

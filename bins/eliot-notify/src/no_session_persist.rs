@@ -5,11 +5,16 @@
 //! I11.6:19 (adapter loss degrades delivery only), I11.7:7-8 (a suppressed
 //! delivery never resolves its item).
 //!
-//! [`record_no_session`] is called from four production contours, all of them
-//! real delivery outcomes rather than identity-lookup failures:
+//! [`record_no_session`] is called from the production contours below, all of
+//! them real delivery outcomes or a real loss of the adapter itself, never
+//! identity-lookup failures:
 //!
 //! - the fail-closed no-session branches of the Watchdog fallback composition
 //!   (`register`, `activate`, `load`);
+//! - the construction of that same composition, when the Watchdog fallback
+//!   cannot start at all (`fallback:adapter-unavailable`): adapter loss
+//!   degrades delivery only, so the control-loss evidence is persisted before
+//!   the rejection is answered (I11.6, adapter-loss sentence);
 //! - the normal and fallback delivery contours of
 //!   [`crate::NotificationComposition`], whenever the adapter returned no
 //!   observed OS acceptance (a missing interactive session, an unavailable

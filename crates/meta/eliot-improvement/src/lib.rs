@@ -80,7 +80,7 @@ pub use learning_closure::{
     OverlayAndActivationAssessments, OverlayRecord, PriorClosure, PriorClosureHistory,
     StageAssessment, allowed_disposition, assemble_campaign_learning_closure,
     assemble_campaign_learning_closure_with_evidence, closure_evidence_digest,
-    evidence_refs_complete, trigger_closure_due,
+    evidence_refs_complete, supported_episode_disposition, trigger_closure_due,
 };
 pub use promotion_input::{
     AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,

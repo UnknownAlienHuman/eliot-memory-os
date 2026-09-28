@@ -122,6 +122,133 @@
 //! ([`ReservedWriteReconciliation::proven_not_applied`]). No arm finalizes the
 //! reservation ([`ReservedWriteReconciliation::finalizes_reservation`]).
 //!
+//! The wire cannot widen that separation. A decoded payload is held to the
+//! same evidence requirements as a constructed one: a committed arm must carry
+//! the exact canonical receipt the commit entry point demands, and a payload
+//! that merely asserts proven-not-applied is refused, because asserting it on
+//! the wire is not the act.
+//!
+//! # Write submission and the admission decision
+//!
+//! [`WriteSubmission`] is the I5.19 admission result returned by the front door
+//! before a final canonical [`WriteReceipt`] exists, and
+//! [`admit_write_submission`] is the one pure function that decides it. The
+//! three outcomes stay separate and are decided, not narrated: a gate refusal
+//! is a typed `not_accepted` value carrying the closed [`ErrorCode`] of the
+//! refusal and, for an over-bound envelope, the [`SplitDirective`] that makes
+//! the refusal actionable. It is never an erased string.
+//! [`WriteSubmission::validate`] enforces the I5.19 state invariants rather
+//! than describing them.
+//!
+//! The decision is taken at the I5.6 steps 1-12 gate boundary, which is strictly
+//! before I5.6 step 13 stages the operation in ORS. That placement is what
+//! makes `not_accepted` honest here: no Ordering Scope sequence has been
+//! reserved and no external effect has been issued, so the state can claim
+//! exactly that. A refusal taken after a reservation is issued is a different
+//! act with a different owner (the Kernel reserved-write path) and is not
+//! represented here.
+//!
+//! `ors_stage_ref` is the deterministic Store-side handle derived from the exact
+//! operation identity (see [`derive_ors_stage_ref`]). It is the handle the
+//! owner stages and polls under and it carries no ORS authority, no sequence,
+//! and no epoch. When a sealed reservation projection exists, its
+//! `reservation_id` is the owner-issued ORS label under this same module owner.
+//!
+//! The HANDLE and the STATE are separate claims and only the handle is
+//! derived. `ors_stage_ref` is a pure function of the operation identity, so it
+//! is computable before any ORS exists. `WriteSubmissionState::Staged` is the
+//! pre-ORS admission DECISION to stage, taken at the I5.6 steps 1-12 gate
+//! boundary; the ORS-backed staging act of I5.6 step 13 follows it and is the
+//! first point at which an owner-issued stage record exists. Nothing in this
+//! crate keys ORS state by the handle, and a `staged` submission is not
+//! evidence that ORS accepted anything — it is evidence that this exact
+//! operation identity is the one the owner will stage next, and that the
+//! caller must not create a duplicate.
+//!
+//! # Activated named-mutation inventory
+//!
+//! Issue #1874 asks for every existing named mutation to be inventoried against
+//! the active-contract catalogue. I5.15 states that no generated authoritative
+//! catalogue exists yet (`ImplementationSupport = TARGET`, and appendices N/P/H
+//! cannot become a second field-level schema owner), so this inventory is
+//! written against the owning I-sections and against the single declaration
+//! table `operation_catalogue::ACTIVATED_MUTATIONS`, which is the only
+//! activation source this crate has. It is documentation at the admission
+//! surface: not a generated catalogue, not a second schema registry, and not a
+//! claim of support.
+//!
+//! I5.19 owns the shared canonical execution every activated mutation travels:
+//! steps 1-3 resolve the existing receipt, verify the ordering predecessor and
+//! active Authority Epoch, and revalidate revisions/policy; step 4 executes the
+//! one named parameterized transaction; steps 5-11 append canonical events,
+//! update projections and typed relations, update the exact affected
+//! `RevisionHeads`/`OrderingHeads`, append audit-chain fields, create the final
+//! receipt and outbox rows, commit, and reconcile ORS. The named mutation is
+//! therefore step 4 inside one shared spine: it never owns admission,
+//! sequencing, or reconciliation.
+//!
+//! I5.17 owns the command family and the activation rule. Its families, in the
+//! order I5.17 lists them, are abbreviated here as `F1` to `F9`:
+//!
+//! ```text
+//! F1  Capture and source observation
+//! F2  Task/WorkScope/plan state
+//! F3  Epistemic revision and conflict/attention
+//! F4  Canonical transition and receipt
+//! F5  Instrument, verification and finish
+//! F6  Authority, lease, capability and external effect
+//! F7  Session, agent attempt, coordination and integration
+//! F8  Module/config/lifecycle and recovery
+//! F9  Audit/telemetry evidence
+//! ```
+//!
+//! | Named mutation | I5.17 family | Transition class | Effect ceiling | I5.19 step |
+//! |---|---|---|---|---|
+//! | `CaptureObservation` | F1 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `AppendAuditEvent` | F9 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `RecordLearningRecord` | F1 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `CommitExperienceBank` | F1 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `CommitAgentFeedback` | F7 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `ApplyBlackboardItem` | F7 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `ApplyEpistemicRevision` | F3 | `Epistemic` | `Candidate` | 4 |
+//! | `UpdateTaskState` | F2 | `TaskControl` | `ReversibleMutation` | 4 |
+//! | `ApplyLifecyclePolicy` | F8 | `LifecyclePolicy` | `ReversibleMutation` | 4 |
+//! | `ReconcileRecovery` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `ApplyErasure` | F8 | `Erasure` | `ReversibleMutation` | 4 |
+//! | `ApplyUserAutomationState` | F8 | `UserAutomation` | `ReversibleMutation` | 4 |
+//! | `RecordFinishDecision` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `RecordFinishEvidence` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `ApplyNotificationState` | F6 | `NotificationState` | `ReversibleMutation` | 4 |
+//! | `ApplyReactiveInjectionState` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |
+//! | `ApplyResourceSnapshot` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |
+//! | `RecordCapabilityEvidenceRecord` | F6 | `CaptureCandidate` | `Candidate` | 4 |
+//!
+//! The transition-class and effect-ceiling columns are not judgment: they are the
+//! declared transition classes and maximum effect of the activated entry. The
+//! family column is this inventory's reading of the I5.17 family list; I5.17
+//! itself does not map a named mutation to a family, so the mapping documents
+//! the existing surface rather than making a new activation decision.
+//!
+//! Declared in [`crate::NamedMutationOperation`] but not activated, and therefore
+//! refused pre-stage with `StoreError::UnknownOperation` rather than mapped to a
+//! status or upsert behavior: `RecordAuthorityRevocation`,
+//! `ApplySwarmOwnerRevisions`, and `ApplyInstrumentRegistryState`.
+//! `RecordAuthorityRevocation` is explicitly known-but-unsupported (issue #686):
+//! its typed parameter contract and the Governor decision edge are closed, but
+//! its catalogue row, proven per-backend handlers, and consumer triple are not.
+//! `ApplySwarmOwnerRevisions` stays known-but-unactivated until Governor's
+//! owner-specific authorization evidence is carried and verified at this
+//! boundary. The genesis bootstrap entry is mutation-shaped and binds to
+//! `TransitionClass::RecoverySchema` under I5.15 rather than under I5.17.
+//!
+//! Issue #1874's body describes seven reachable mutations and names
+//! `RecordAuthorityRevocation` among them. That list is a subset, not the
+//! activated set, and `RecordAuthorityRevocation` is not reachable at all; the
+//! activated set is the eighteen rows above. I5.15's own initial executable set
+//! is a contract-denomination list and does not enumerate named mutations, so
+//! the eighteen rows activate under I5.17 against this crate's proven
+//! handler, schema, and consumer triple.
+//!
 //! # Non-goals
 //!
 //! No wire-enum activation, no Store-client apply operation introduced in
@@ -130,16 +257,17 @@
 //! operation gated on a real backend, preserving legacy compatibility.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    OperationId, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    RevisionHeadExpectation, StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    sha256_hex,
+    OperationId, OperationIdentity, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, RevisionHeadExpectation, StoreError, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, generated_operation_manifests, named_mutation_operation_name, sha256_hex,
 };
-use eliot_contracts::StateFence;
+use eliot_contracts::{ErrorCode, StateFence};
 
 /// Closed contract version of the write-admission projection (I5.22).
 ///
@@ -723,12 +851,19 @@ impl ReservationEnvelopeState {
 ///
 /// Construction is closed: the fields are private, so outside this module a
 /// value can only come from the four named constructors above. Decoding is
-/// gated the same way: the wire shape deserializes into a private shadow
-/// struct and then passes through
-/// [`ReservedWriteReconciliation::validate`], so an inconsistent payload
-/// fails closed with a typed [`StoreError`] instead of yielding a value. A
-/// decoded value is still shape-only under the module contract, not fresh
-/// proof of currency; no new authority mechanism is introduced here.
+/// gated by the same requirements, not by a weaker copy: the wire shape
+/// deserializes into a private shadow struct, a payload that asserts
+/// [`ReservedWriteOutcome::ProvenNotApplied`] is refused because the wire
+/// carries no store read that could have performed the named act, and the rest
+/// passes through [`ReservedWriteReconciliation::validate`], whose committed
+/// arm applies the identical check sequence
+/// (`require_committed_receipt_evidence`) that
+/// [`ReservedWriteReconciliation::committed`] applies. So an inconsistent
+/// payload fails closed with a typed [`StoreError`] instead of yielding a
+/// value, and no decoded value carries a commit claim the commit entry point
+/// would refuse. A decoded value is still shape-only under the module
+/// contract, not fresh proof of currency; no new authority mechanism is
+/// introduced here.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "ReconciliationWire", into = "ReconciliationWire")]
 pub struct ReservedWriteReconciliation {
@@ -758,7 +893,31 @@ struct ReconciliationWire {
 impl TryFrom<ReconciliationWire> for ReservedWriteReconciliation {
     type Error = StoreError;
 
+    /// Decodes a wire payload under the SAME requirements as construction.
+    ///
+    /// Two arms survive the wire and one does not:
+    ///
+    /// - `Committed` is accepted only when the receipt passes
+    ///   [`require_committed_receipt_evidence`] — the canonical envelope must
+    ///   be present, the receipt must be valid, and its exact identity must
+    ///   match the admitting projection. This is the check
+    ///   [`ReservedWriteReconciliation::committed`] applies, so the decode
+    ///   path cannot hand out a receipt the commit entry point would refuse;
+    /// - `ProvenNotApplied` is REFUSED. It is a named act
+    ///   ([`ReservedWriteReconciliation::proven_not_applied`]) over durable
+    ///   store evidence that the wire does not carry, so a payload asserting
+    ///   it has proven nothing. A payload claiming it fails closed with a
+    ///   typed [`StoreError`] instead of yielding a value; the receiving
+    ///   boundary performs the act itself;
+    /// - `StillUnknown` is the unresolved arm and carries no evidence to
+    ///   check beyond identity consistency.
     fn try_from(wire: ReconciliationWire) -> Result<Self, Self::Error> {
+        if matches!(wire.outcome, ReservedWriteOutcome::ProvenNotApplied) {
+            return Err(StoreError::InvalidField {
+                field: "admission.outcome",
+                reason: "proven_not_applied is a named act and is not assertable on the wire",
+            });
+        }
         let value = Self {
             operation_id: wire.operation_id,
             admission: wire.admission,
@@ -837,14 +996,7 @@ impl ReservedWriteReconciliation {
         receipt: WriteReceipt,
     ) -> Result<Self, StoreError> {
         admission.validate()?;
-        receipt
-            .require_reconciliation_envelope()
-            .map_err(|_| StoreError::MissingReceiptEnvelope)?;
-        receipt.validate().map_err(|_| StoreError::InvalidReceipt)?;
-        validate_receipt_binding(admission, &receipt)?;
-        if receipt.status != WriteReceiptStatus::Committed {
-            return Err(StoreError::InvalidReceipt);
-        }
+        require_committed_receipt_evidence(admission, &receipt)?;
         Ok(Self {
             operation_id: admission.operation_id.clone(),
             admission: admission.clone(),
@@ -893,10 +1045,20 @@ impl ReservedWriteReconciliation {
 
     /// Checks the outcome against the original identity and receipt binding.
     ///
-    /// A committed arm must carry a canonical receipt whose exact identity
-    /// matches both this value and its own admission projection. The other two
-    /// arms are checked only for consistency with the identity they are
-    /// reported under.
+    /// This is the decode gate as well as the checking entry point, and it is
+    /// the SAME gate: a committed arm is accepted only through
+    /// `require_committed_receipt_evidence`, which is the identical check
+    /// sequence [`ReservedWriteReconciliation::committed`] applies. Decoding
+    /// therefore cannot produce a weaker commit claim than constructing one:
+    /// an envelope-less or otherwise invalid receipt is refused with the same
+    /// typed [`StoreError`] in both paths, and a receipt that
+    /// [`ReservedWriteReconciliation::require_committed_receipt`] would hand
+    /// back has necessarily passed every requirement the commit entry point
+    /// applies.
+    ///
+    /// The other two arms are checked only for consistency with the identity
+    /// they are reported under; which of them the wire may assert is decided
+    /// by the decode gate itself (`TryFrom<ReconciliationWire>`).
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.finalizes_reservation() {
             return Err(StoreError::InvalidField {
@@ -909,10 +1071,7 @@ impl ReservedWriteReconciliation {
             return Err(StoreError::IdentityConflict);
         }
         if let ReservedWriteOutcome::Committed(receipt) = &self.outcome {
-            if receipt.status != WriteReceiptStatus::Committed {
-                return Err(StoreError::InvalidReceipt);
-            }
-            validate_receipt_binding(&self.admission, receipt)?;
+            require_committed_receipt_evidence(&self.admission, receipt)?;
         }
         Ok(())
     }
@@ -969,6 +1128,751 @@ impl ReservedWriteUnsupported {
     pub const fn into_error(self) -> StoreError {
         StoreError::UnknownOperation
     }
+}
+
+/// Applies the exact canonical-receipt requirements of the committed arm.
+///
+/// This is the single owner of the commit evidence rule, shared by the commit
+/// entry point ([`ReservedWriteReconciliation::committed`]) and the decode gate
+/// ([`ReservedWriteReconciliation::validate`], reached from
+/// `TryFrom<ReconciliationWire>`). There is no second, weaker scheme: in both
+/// paths, in this exact order, the receipt must
+///
+/// 1. carry the canonical receipt envelope
+///    ([`WriteReceipt::require_reconciliation_envelope`], whose own contract
+///    states that an envelope-less transport receipt is unknown to the
+///    reconciler and must never be reported as a successful write);
+/// 2. be internally valid ([`WriteReceipt::validate`], which refuses a
+///    committed receipt with no `commit_id`, no `committed_at`, or no applied
+///    command);
+/// 3. bind to the admitting projection's exact operation identity, idempotency
+///    key, and canonical request hash ([`validate_receipt_binding`]); and
+/// 4. carry the terminal [`WriteReceiptStatus::Committed`] status.
+///
+/// A value that passes this cannot be one this crate would classify the
+/// transaction as unknown for, so the existence of the arm and the guarantee
+/// of the evidence behind it can never diverge between the two paths.
+fn require_committed_receipt_evidence(
+    admission: &WriteAdmissionProjection,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+    receipt.validate().map_err(|_| StoreError::InvalidReceipt)?;
+    validate_receipt_binding(admission, receipt)?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+/// Maximum reason codes one [`WriteSubmission`] may carry.
+///
+/// The bound keeps an admission decision a bounded operational response. A
+/// refusal carries the closed code of the gate that refused; the bound leaves
+/// room for a caller that already holds a typed multi-code refusal and stops a
+/// decision from becoming a log.
+pub const MAX_WRITE_SUBMISSION_REASON_CODES: usize = 8;
+
+/// Domain separator of the deterministic [`WriteSubmission`] submission identity.
+///
+/// A domain separator keeps the submission identity a distinct value even if
+/// some future owner derives an identity from the same two inputs.
+const WRITE_SUBMISSION_ID_DOMAIN: &str = "eliot.store.write_submission.submission_id.v1";
+
+/// Domain separator of the deterministic ORS stage handle.
+const WRITE_SUBMISSION_STAGE_REF_DOMAIN: &str = "eliot.store.write_submission.ors_stage_ref.v1";
+
+/// Stable retry-identity rule carried by a `not_accepted` submission (I5.19).
+///
+/// I5.19: a corrected payload uses a new operation identity, and an exact retry
+/// of the same request hash returns the same decision.
+pub const NOT_ACCEPTED_RETRY_IDENTITY_RULE: &str = "a corrected payload uses a new operation identity; an exact retry of the same request hash \
+     returns this same not_accepted decision";
+
+/// Stable retry-identity rule carried by a `staged` submission (I5.19).
+///
+/// I5.19: the exact operation identity is accepted once, so the caller must not
+/// create a duplicate and may poll.
+///
+/// The acceptance named here is scoped to the admission DECISION to stage, and
+/// that scope is exact: the rule is decided at the I5.6 steps 1-12 gate
+/// boundary, strictly before the I5.6 step 13 ORS-backed staging act. It binds
+/// the caller to one operation identity for the request and nothing more; it
+/// grants no Ordering Scope sequence, no epoch, and no external effect, and it
+/// is not evidence that ORS holds a record for this operation.
+pub const STAGED_RETRY_IDENTITY_RULE: &str = "the exact operation identity is accepted once; the caller must not create a duplicate and \
+     may poll for the terminal receipt";
+
+/// Stable retry-identity rule carried by a `resolved_existing` submission (I5.19).
+///
+/// I5.19: a final receipt is immutable, so retrying the same identity returns the
+/// same receipt and never creates a second canonical transition.
+pub const RESOLVED_EXISTING_RETRY_IDENTITY_RULE: &str = "retrying the same operation identity returns the same immutable final receipt; no second \
+     canonical transition is created";
+
+/// Next allowed caller action for a `staged` submission.
+pub const STAGED_NEXT_ALLOWED_ACTION: &str =
+    "poll the terminal receipt under the same operation identity; do not resubmit";
+
+/// Next allowed caller action for a `resolved_existing` submission.
+pub const RESOLVED_EXISTING_NEXT_ALLOWED_ACTION: &str =
+    "read the final receipt under the referenced operation identity; do not resubmit";
+
+/// Closed admission decision reported for one write submission (I5.19).
+///
+/// The three arms are the only admission outcomes and they stay separate. The
+/// wire strings are the I5.19 vocabulary exactly, and the state is decided by
+/// [`admit_write_submission`] rather than narrated by a caller.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteSubmissionState {
+    /// The requested domain mutation was not staged, no Ordering Scope sequence
+    /// was reserved, and no external effect was issued.
+    NotAccepted,
+    /// The admission decision to stage the exact operation identity under one
+    /// stage handle, taken at the pre-ORS gate boundary.
+    ///
+    /// The scope of this claim is exact and is deliberately narrower than the
+    /// word "staged" suggests on its own. This state says: the request passed
+    /// the pre-ORS gates, and this is the one operation identity the owner will
+    /// stage next, under the derived handle carried beside it. It does NOT say
+    /// ORS has accepted the operation. The decision is emitted before the ORS
+    /// exists in the call — strictly before the I5.6 step 13 ORS-backed
+    /// staging act, which is the separate act that will key an owner-issued
+    /// stage record under that handle. Nothing at this point has reserved a
+    /// sequence, issued an epoch, or produced an external effect, and this
+    /// state grants none of those.
+    Staged,
+    /// An already final canonical receipt exists for the idempotency key.
+    ResolvedExisting,
+}
+
+impl WriteSubmissionState {
+    /// Returns the stable bounded identity of this admission state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAccepted => "not_accepted",
+            Self::Staged => "staged",
+            Self::ResolvedExisting => "resolved_existing",
+        }
+    }
+}
+
+/// Measured envelope dimension that exceeded its bound (I5.17).
+///
+/// I5.17 requires a rejected oversized envelope to name the dimension that
+/// exceeded its command-profile bound, so the two command-profile dimensions
+/// are closed here rather than described in prose.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDimension {
+    /// Count of items in the bounded causal envelope.
+    Items,
+    /// Canonical byte length of the bounded causal envelope.
+    Bytes,
+}
+
+impl SplitDimension {
+    /// Returns the stable bounded identity of this measured dimension.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Items => "items",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// Actionable refusal directive for one over-bound causal envelope (I5.17).
+///
+/// I5.17: oversized input is rejected before sequence reservation with a split
+/// directive, and the server never silently splits one causal envelope into
+/// several commits. This type carries exactly the three facts that make the
+/// refusal actionable — which dimension was measured, the measured value, and
+/// the bound it exceeded — and it grants nothing, reserves nothing, and holds
+/// no payload bytes.
+///
+/// The `limit` is never invented: it is the bound the owning command profile
+/// already declares, so the directive and the gate that produced it always name
+/// the same number.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitDirective {
+    /// Measured dimension that exceeded the bound.
+    pub dimension: SplitDimension,
+    /// Measured value of that dimension in the refused envelope.
+    pub measured: u64,
+    /// Bound the measured value exceeded, as declared by the command profile.
+    pub limit: u64,
+}
+
+impl SplitDirective {
+    /// Builds the directive for one measured value above its declared bound.
+    ///
+    /// A directive for a value that did not exceed the bound is refused: it
+    /// would instruct the caller to split an envelope that was never over
+    /// bound.
+    pub fn new(dimension: SplitDimension, measured: u64, limit: u64) -> Result<Self, StoreError> {
+        let directive = Self {
+            dimension,
+            measured,
+            limit,
+        };
+        directive.validate()?;
+        Ok(directive)
+    }
+
+    /// Checks that the measured value really is above the declared bound.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.limit == 0 {
+            return Err(StoreError::InvalidField {
+                field: "submission.split_directive.limit",
+                reason: "a declared bound must be non-zero",
+            });
+        }
+        if self.measured <= self.limit {
+            return Err(StoreError::InvalidField {
+                field: "submission.split_directive.measured",
+                reason: "a split directive requires a measured value above the declared bound",
+            });
+        }
+        Ok(())
+    }
+
+    /// Renders the directive as one bounded operational instruction.
+    ///
+    /// The rendered text states the refusal the caller must act on and repeats
+    /// the I5.17 rule that the server does not split one causal envelope into
+    /// several commits on the caller's behalf.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "split the causal envelope: {} {} measured against the {} {} bound; resubmit each \
+             part under a new operation identity because the server never splits one causal envelope \
+             into several commits",
+            self.measured,
+            self.dimension.as_str(),
+            self.limit,
+            self.dimension.as_str(),
+        )
+    }
+}
+
+/// Admission result for one write submission (I5.19).
+///
+/// This is the front-door result returned before a final canonical
+/// [`WriteReceipt`] exists, and it is deliberately not a receipt: it carries no
+/// commit id, no ordering sequence, no revision span, and no emitted event ids.
+/// Those belong to the terminal receipt and are never inferred here.
+///
+/// The state and its evidence are kept consistent by [`WriteSubmission::validate`]
+/// rather than by convention: a `not_accepted` submission can claim no stage
+/// and no receipt and must name a reason, a `staged` submission must carry the
+/// stage handle and no receipt, and a `resolved_existing` submission must point
+/// at the final receipt it resolved to and must carry no stage handle, because
+/// an already final operation stages nothing.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteSubmission {
+    /// Stable identity of this admission decision, derived from the exact
+    /// operation identity and request hash.
+    pub submission_id: String,
+    /// The exact operation identity this decision is reported under.
+    pub operation_id: OperationId,
+    /// Canonical request hash of the exact admitted bytes.
+    pub request_hash: String,
+    /// The closed admission decision.
+    pub state: WriteSubmissionState,
+    /// Bounded closed reason codes; non-empty exactly for a refusal.
+    pub reason_codes: Vec<ErrorCode>,
+    /// Stage handle for the exact operation identity; absent exactly when
+    /// nothing was staged.
+    pub ors_stage_ref: Option<String>,
+    /// Operation identity of the final receipt this decision resolves to;
+    /// absent exactly when no final receipt was resolved.
+    pub canonical_receipt_ref: Option<OperationId>,
+    /// Retry-identity rule that holds for this state.
+    pub retry_identity_rule: String,
+    /// Bounded next allowed caller action for this state.
+    pub next_allowed_action: String,
+}
+
+impl WriteSubmission {
+    /// Reports a refusal as a typed `not_accepted` decision.
+    ///
+    /// The refusal keeps its own typed evidence: the closed
+    /// [`ErrorCode`] becomes the reason code, and the specific next action is
+    /// derived from the refusal itself rather than from a caller-supplied
+    /// string. An over-bound envelope additionally carries the split directive
+    /// the caller must act on. Nothing is staged, so neither reference is
+    /// present.
+    pub fn not_accepted(
+        operation_id: &OperationId,
+        request_hash: &str,
+        refusal: &StoreError,
+        split_directive: Option<SplitDirective>,
+    ) -> Result<Self, StoreError> {
+        let submission = Self {
+            submission_id: derive_submission_id(operation_id, request_hash)?,
+            operation_id: operation_id.clone(),
+            request_hash: request_hash.to_owned(),
+            state: WriteSubmissionState::NotAccepted,
+            reason_codes: vec![reason_code_for(refusal)],
+            ors_stage_ref: None,
+            canonical_receipt_ref: None,
+            retry_identity_rule: NOT_ACCEPTED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: next_allowed_action_for(refusal, split_directive),
+        };
+        submission.validate()?;
+        Ok(submission)
+    }
+
+    /// Reports an accepted exact operation identity as a `staged` decision.
+    ///
+    /// The stage handle is derived from the exact operation identity, so the
+    /// owner and the caller name the same staged operation without a second
+    /// identity scheme. No final receipt is referenced: a staged submission is
+    /// not final.
+    ///
+    /// The claim is scoped to the decision, not to ORS. This value is produced
+    /// at the pre-ORS admission gate, strictly before the I5.6 step 13
+    /// ORS-backed staging act that the derived handle will key, and nothing
+    /// here observes an ORS record.
+    pub fn staged(operation_id: &OperationId, request_hash: &str) -> Result<Self, StoreError> {
+        let submission = Self {
+            submission_id: derive_submission_id(operation_id, request_hash)?,
+            operation_id: operation_id.clone(),
+            request_hash: request_hash.to_owned(),
+            state: WriteSubmissionState::Staged,
+            reason_codes: Vec::new(),
+            ors_stage_ref: Some(derive_ors_stage_ref(operation_id)),
+            canonical_receipt_ref: None,
+            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        submission.validate()?;
+        Ok(submission)
+    }
+
+    /// Reports that an already final receipt exists for the idempotency key.
+    ///
+    /// `receipt_operation_id` is the operation identity of the final receipt
+    /// that was actually observed, which is not necessarily the retried
+    /// operation identity: I5.19 resolves this state by idempotency key, and
+    /// the receipt is terminal and immutable either way.
+    pub fn resolved_existing(
+        operation_id: &OperationId,
+        request_hash: &str,
+        receipt_operation_id: &OperationId,
+    ) -> Result<Self, StoreError> {
+        let submission = Self {
+            submission_id: derive_submission_id(operation_id, request_hash)?,
+            operation_id: operation_id.clone(),
+            request_hash: request_hash.to_owned(),
+            state: WriteSubmissionState::ResolvedExisting,
+            reason_codes: Vec::new(),
+            ors_stage_ref: None,
+            canonical_receipt_ref: Some(receipt_operation_id.clone()),
+            retry_identity_rule: RESOLVED_EXISTING_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: RESOLVED_EXISTING_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        submission.validate()?;
+        Ok(submission)
+    }
+
+    /// Renders the carried reason codes as one bounded comma-separated list.
+    ///
+    /// An accepted decision has no reason code, so this renders as the empty
+    /// string rather than as a placeholder code.
+    #[must_use]
+    pub fn reason_codes_text(&self) -> String {
+        self.reason_codes
+            .iter()
+            .copied()
+            .map(ErrorCode::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Checks the state against the evidence this submission claims.
+    ///
+    /// The text and digest fields are checked with this module's own label and
+    /// digest helpers, so a wire-decoded submission cannot carry unbounded or
+    /// malformed text in any of them. The two operation identities are closed
+    /// [`OperationId`] values whose owning contract already refuses blank or
+    /// control-bearing text in its own constructor; what this check adds on top
+    /// is this module's own bounded-label rule for a mirrored identity label,
+    /// so the two identity fields are held to the same bound as every other
+    /// text this struct carries rather than escaping it. Every state-specific
+    /// requirement is a typed refusal against the existing [`StoreError`]
+    /// surface rather than a described convention.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_digest(&self.submission_id, "submission.submission_id")?;
+        validate_digest(&self.request_hash, "submission.request_hash")?;
+        validate_label(self.operation_id.as_str(), "submission.operation_id")?;
+        if let Some(receipt_ref) = &self.canonical_receipt_ref {
+            validate_label(receipt_ref.as_str(), "submission.canonical_receipt_ref")?;
+        }
+        validate_label(&self.retry_identity_rule, "submission.retry_identity_rule")?;
+        validate_label(&self.next_allowed_action, "submission.next_allowed_action")?;
+        if self.reason_codes.len() > MAX_WRITE_SUBMISSION_REASON_CODES {
+            return Err(StoreError::InvalidField {
+                field: "submission.reason_codes",
+                reason: "reason codes are bounded",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for code in &self.reason_codes {
+            if !seen.insert(code.as_str()) {
+                return Err(StoreError::Duplicate {
+                    field: "submission.reason_codes",
+                });
+            }
+        }
+        if let Some(stage_ref) = &self.ors_stage_ref {
+            validate_label(stage_ref, "submission.ors_stage_ref")?;
+        }
+        let expected_rule = match self.state {
+            WriteSubmissionState::NotAccepted => NOT_ACCEPTED_RETRY_IDENTITY_RULE,
+            WriteSubmissionState::Staged => STAGED_RETRY_IDENTITY_RULE,
+            WriteSubmissionState::ResolvedExisting => RESOLVED_EXISTING_RETRY_IDENTITY_RULE,
+        };
+        if self.retry_identity_rule != expected_rule {
+            return Err(StoreError::InvalidField {
+                field: "submission.retry_identity_rule",
+                reason: "the retry identity rule must be the rule this state holds",
+            });
+        }
+        match self.state {
+            WriteSubmissionState::NotAccepted => {
+                if self.ors_stage_ref.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.ors_stage_ref",
+                        reason: "a not_accepted submission staged nothing and claims no stage",
+                    });
+                }
+                if self.canonical_receipt_ref.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.canonical_receipt_ref",
+                        reason: "a not_accepted submission resolved no canonical receipt",
+                    });
+                }
+                if self.reason_codes.is_empty() {
+                    return Err(StoreError::Empty {
+                        field: "submission.reason_codes",
+                    });
+                }
+            }
+            WriteSubmissionState::Staged => {
+                if self.ors_stage_ref.is_none() {
+                    return Err(StoreError::Empty {
+                        field: "submission.ors_stage_ref",
+                    });
+                }
+                if self.canonical_receipt_ref.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.canonical_receipt_ref",
+                        reason: "a staged submission is not final and references no receipt",
+                    });
+                }
+                if !self.reason_codes.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.reason_codes",
+                        reason: "an accepted submission carries no refusal reason code",
+                    });
+                }
+            }
+            WriteSubmissionState::ResolvedExisting => {
+                // I5.19: `resolved_existing` points at an ALREADY FINAL receipt
+                // for the idempotency key. The operation is final, so this
+                // decision stages nothing and claims no stage handle. That is
+                // the same invariant the other two arms already police in
+                // opposite directions — a refusal forbids the handle because it
+                // staged nothing, a staged decision requires it because it did
+                // — and an unpolled third arm would let a wire-decoded
+                // submission carry a stage handle for an operation that will
+                // never be staged under it, which is exactly the false
+                // "ORS accepted this" claim `WriteSubmissionState::Staged`
+                // documents that it does not make.
+                if self.ors_stage_ref.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.ors_stage_ref",
+                        reason: "a resolved submission points at an already final receipt and stages nothing",
+                    });
+                }
+                if self.canonical_receipt_ref.is_none() {
+                    return Err(StoreError::Empty {
+                        field: "submission.canonical_receipt_ref",
+                    });
+                }
+                if !self.reason_codes.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.reason_codes",
+                        reason: "a resolved submission carries no refusal reason code",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for WriteSubmission {
+    /// Renders the decision as one bounded operational response line.
+    ///
+    /// The rendered line is a projection of the typed decision, so an operator
+    /// reads the same state, reason codes, and next action the value carries.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "write submission {} is {} for operation {} with request hash {} and reason codes \
+             [{}]; {}",
+            self.submission_id,
+            self.state.as_str(),
+            self.operation_id.as_str(),
+            self.request_hash,
+            self.reason_codes_text(),
+            self.next_allowed_action,
+        )
+    }
+}
+
+/// Derives the stable submission identity of one exact request.
+///
+/// The identity is a pure function of the exact operation identity and the
+/// canonical request hash, so an exact retry of the same bytes always reports
+/// the same submission identity and a corrected payload under a new operation
+/// identity always reports a different one. No nonce, clock, or counter
+/// participates, and a malformed request hash is refused rather than hashed.
+pub fn derive_submission_id(
+    operation_id: &OperationId,
+    request_hash: &str,
+) -> Result<String, StoreError> {
+    validate_digest(request_hash, "submission.request_hash")?;
+    Ok(sha256_hex(
+        format!(
+            "{WRITE_SUBMISSION_ID_DOMAIN}:{}:{request_hash}",
+            operation_id.as_str(),
+        )
+        .as_bytes(),
+    ))
+}
+
+/// Derives the deterministic stage handle of one exact operation identity.
+///
+/// The handle is derived, not issued: it names the staged operation for its
+/// exact operation identity so the owner stages and the caller polls under the
+/// same value, without a second identity scheme and without a clock, sequence,
+/// epoch, or ORS authority. Because it is a pure function of the operation
+/// identity it is computable before ORS exists in the call, and nothing in this
+/// crate keys an ORS record by it: it is the key the later I5.6 step 13
+/// ORS-backed staging act will use, not evidence that such a record is
+/// already held.
+#[must_use = "a derived stage handle must be used or checked"]
+pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
+    sha256_hex(
+        format!(
+            "{WRITE_SUBMISSION_STAGE_REF_DOMAIN}:{}",
+            operation_id.as_str(),
+        )
+        .as_bytes(),
+    )
+}
+
+/// Decides one I5.19 admission result from the ordered pre-reservation gates.
+///
+/// This is the single admission decision function. It is pure over data the
+/// caller already holds, reads no clock, queries no owner, reserves nothing,
+/// and issues no external effect:
+///
+/// - an already final receipt resolves first (I5.19 canonical execution step
+///   1). A terminal immutable receipt is never contradicted by a later gate,
+///   and the observed receipt must bind the exact idempotency key and canonical
+///   request hash, otherwise this is an identity conflict;
+/// - a gate refusal is a typed `not_accepted` decision carrying the closed
+///   reason code and, for an over-bound envelope, the split directive;
+/// - an accepted exact operation identity with no final receipt is `staged`
+///   under the stage handle derived from that identity. That is the decision
+///   to stage, taken at the pre-ORS gate; it precedes the I5.6 step 13
+///   ORS-backed staging act and observes no ORS record.
+///
+/// A request whose own identity is unnameable — a malformed operation identity
+/// or canonical request hash — has no submission identity to report a decision
+/// under, so it is refused with the typed [`StoreError`] instead of a
+/// `WriteSubmission` that would claim a name it cannot hold.
+pub fn admit_write_submission(
+    transition: &PreparedTransition,
+    gate: Result<(), StoreError>,
+    existing_final_receipt: Option<&WriteReceipt>,
+) -> Result<WriteSubmission, StoreError> {
+    let identity: &OperationIdentity = &transition.identity;
+    if let Some(receipt) = existing_final_receipt {
+        return resolve_existing_submission(identity, receipt);
+    }
+    match gate {
+        Ok(()) => WriteSubmission::staged(&identity.operation_id, &identity.canonical_request_hash),
+        Err(refusal) => WriteSubmission::not_accepted(
+            &identity.operation_id,
+            &identity.canonical_request_hash,
+            &refusal,
+            split_directive_for(transition, &refusal),
+        ),
+    }
+}
+
+/// Resolves one already final receipt into a `resolved_existing` decision.
+///
+/// The observed receipt must be the final receipt for this exact idempotency key
+/// and canonical request hash, and it must itself validate. Anything else is an
+/// identity conflict: a receipt that does not bind the request cannot be used to
+/// claim that the request already resolved.
+fn resolve_existing_submission(
+    identity: &OperationIdentity,
+    receipt: &WriteReceipt,
+) -> Result<WriteSubmission, StoreError> {
+    if receipt.idempotency_key != identity.idempotency_key
+        || receipt.canonical_request_hash != identity.canonical_request_hash
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    receipt.validate()?;
+    WriteSubmission::resolved_existing(
+        &identity.operation_id,
+        &identity.canonical_request_hash,
+        &receipt.operation_id,
+    )
+}
+
+/// Measures the over-bound envelope of a refusal, when the refusal is one.
+///
+/// Only an over-bound refusal produces a directive: a shape, fence, ceiling, or
+/// unsupported-variant refusal has no dimension to split, and inventing one
+/// would misdescribe the refusal. The measurement and the bound are the same two
+/// values the catalogue gate used, so the directive can never disagree with the
+/// gate that produced it.
+fn split_directive_for(
+    transition: &PreparedTransition,
+    refusal: &StoreError,
+) -> Option<SplitDirective> {
+    if !matches!(refusal, StoreError::PayloadTooLarge) {
+        return None;
+    }
+    measure_oversized_command_envelope(transition)
+}
+
+/// Measures every activated command in one envelope against its declared bound.
+///
+/// The measured value is the canonical parameter byte length the catalogue gate
+/// itself measures, and the limit is the activated entry's own declared
+/// `max_input_bytes`; neither is invented here. The item dimension is never
+/// produced: no activated command profile in this crate declares an item-count
+/// limit, and an item bound would have to come from an owner that does not
+/// exist yet.
+fn measure_oversized_command_envelope(transition: &PreparedTransition) -> Option<SplitDirective> {
+    let entries = generated_operation_manifests().ok()?;
+    for command in &transition.named_operations {
+        let name = named_mutation_operation_name(command.operation);
+        let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
+            continue;
+        };
+        let Ok(parameter_bytes) = canonical_json_bytes(&command.parameters) else {
+            return None;
+        };
+        let measured = u64::try_from(parameter_bytes.len()).ok()?;
+        let limit = u64::from(entry.max_input_bytes);
+        if measured > limit {
+            return SplitDirective::new(SplitDimension::Bytes, measured, limit).ok();
+        }
+    }
+    None
+}
+
+/// Maps one typed store refusal onto the closed code a submission carries.
+///
+/// The mapping is total over [`StoreError`] and never invents a code: a shape,
+/// ceiling, or unsupported-variant refusal is an `InvalidRequest` operational
+/// response (I5.19), a fence or revision staleness keeps its own code, a
+/// content/identity divergence is a conflict, and a receipt or envelope defect
+/// is an internal inconsistency rather than a caller request error.
+fn reason_code_for(refusal: &StoreError) -> ErrorCode {
+    match refusal {
+        StoreError::FenceMismatch => ErrorCode::FenceMismatch,
+        StoreError::RevisionConflict => ErrorCode::StaleRevision,
+        StoreError::OrderingConflict
+        | StoreError::IdentityConflict
+        | StoreError::TransitionDigestMismatch { .. } => ErrorCode::Conflict,
+        StoreError::InvalidReceipt
+        | StoreError::MissingReceiptEnvelope
+        | StoreError::InvalidOutbox
+        | StoreError::InvalidProjection
+        | StoreError::AutomationContinuation(_)
+        | StoreError::Security(_)
+        | StoreError::Receipt(_)
+        | StoreError::Serialization(_) => ErrorCode::Internal,
+        StoreError::ReceiptNotFound => ErrorCode::NotFound,
+        StoreError::Unavailable => ErrorCode::Unavailable,
+        StoreError::SnapshotClosePending { .. } => ErrorCode::UnknownOutcome,
+        StoreError::InvalidField { .. }
+        | StoreError::Empty { .. }
+        | StoreError::Duplicate { .. }
+        | StoreError::Foundation(_)
+        | StoreError::UnknownOperation
+        | StoreError::ManifestMismatch
+        | StoreError::TransitionClassExceeded
+        | StoreError::EffectCeilingExceeded
+        | StoreError::PayloadTooLarge => ErrorCode::InvalidRequest,
+    }
+}
+
+/// Derives the bounded next allowed action of one refusal.
+///
+/// The action is derived from the refusal itself so it cannot drift from the
+/// state it explains, and it stays inside the same bounded-label rule as every
+/// other mirrored label in this module. A refusal that leaves a plan outside
+/// current support is never told to retry as-is: it names recovery, matching
+/// the I5.6 rule that a preserved plan is not reinterpreted under newer code.
+///
+/// The split composition stays inside
+/// [`MAX_WRITE_ADMISSION_LABEL_BYTES`] and the bound is asserted on the
+/// resulting text, not assumed: [`WriteSubmission::not_accepted`] runs
+/// [`WriteSubmission::validate`], which applies the same `validate_label`
+/// bound to `next_allowed_action`. The two parts are the longest base action
+/// plus [`SplitDirective::render`], whose only unbounded-looking part is two
+/// `u64` measurements, so the composition cannot approach the bound by
+/// construction. The cost of that bound being enforced here is deliberate and
+/// fails closed: if a future render format ever did exceed it, this function
+/// would be the place that refuses, because no second limit is invented to
+/// paper over a render that outgrew the label it must fit in.
+fn next_allowed_action_for(
+    refusal: &StoreError,
+    split_directive: Option<SplitDirective>,
+) -> String {
+    let base = match refusal {
+        StoreError::ManifestMismatch | StoreError::UnknownOperation => {
+            "preserve the refused prepared transition as recovery work; do not reinterpret it under \
+             another command"
+        }
+        StoreError::FenceMismatch => {
+            "refetch the current state fence and resubmit under a new operation identity"
+        }
+        StoreError::RevisionConflict | StoreError::OrderingConflict => {
+            "refetch the current revision and ordering heads and resubmit under a new operation \
+             identity"
+        }
+        StoreError::IdentityConflict => "resubmit the changed bytes under a new idempotency key",
+        StoreError::TransitionDigestMismatch { .. } => {
+            "rebuild the plan from the current contract set and resubmit under a new operation \
+             identity"
+        }
+        _ => "correct the refused envelope and resubmit under a new operation identity",
+    };
+    split_directive.map_or_else(
+        || base.to_owned(),
+        |directive| format!("{}; {base}", directive.render()),
+    )
 }
 
 /// Checks the exact operation identity and reservation binding of one observed

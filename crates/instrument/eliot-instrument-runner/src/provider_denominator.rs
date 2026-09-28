@@ -243,6 +243,14 @@ pub enum ProviderDisposition {
         /// Requested instrument class.
         kind: InstrumentKind,
     },
+    /// The entry resolved, is current, and is supported on this host, but
+    /// live Testd cannot dispatch the requested class.
+    UnsupportedByTestd {
+        /// Registry-selected adapter identity.
+        adapter: String,
+        /// Requested instrument class.
+        kind: InstrumentKind,
+    },
     /// Two entries claim the same instrument and class.
     Ambiguous {
         /// Contested instrument contract name.
@@ -279,6 +287,12 @@ impl fmt::Display for ProviderDisposition {
             Self::Stale { reason } => write!(f, "stale: {reason}"),
             Self::Unsupported { adapter, kind } => {
                 write!(f, "unsupported: {adapter} does not support {kind:?}")
+            }
+            Self::UnsupportedByTestd { adapter, kind } => {
+                write!(
+                    f,
+                    "unsupported-by-testd: {adapter} with {kind:?} is not dispatchable via testd"
+                )
             }
             Self::Ambiguous {
                 instrument,

@@ -57,6 +57,13 @@ pub struct ProfessionalExecutionContract {
     pub forbidden_shortcuts: Vec<String>,
     pub reference_visibility: String,
     pub evaluator_isolation: String,
+    /// Typed enforcement of the visibility declaration above: every handle
+    /// listed here is an immutable source reference visible to the evaluator
+    /// only and is excluded from every worker-visible set this contract
+    /// derives. This list is the enforced mechanism; the two declaration
+    /// strings carry the human-readable policy.
+    #[serde(default)]
+    pub evaluator_only_reference_handles: Vec<String>,
     pub environment_profile: String,
     pub professional_tool_route: String,
     pub artifact_evaluator: String,
@@ -142,8 +149,236 @@ impl ProfessionalExecutionContract {
                 ));
             }
         }
+        Self::validate_handle_sets(self)
+    }
+
+    fn validate_handle_sets(
+        contract: &ProfessionalExecutionContract,
+    ) -> Result<(), ProfessionalExecutionError> {
+        Self::validate_handles(
+            &contract.input_asset_handles,
+            "input_asset_handles",
+            "input_asset_handle",
+        )?;
+        Self::validate_handles(
+            &contract.source_reference_handles,
+            "source_reference_handles",
+            "source_reference_handle",
+        )?;
+        Self::validate_handles(
+            &contract.allowed_write_roots,
+            "allowed_write_roots",
+            "allowed_write_root",
+        )?;
+        if contract.allowed_write_roots.is_empty() {
+            return Err(ProfessionalExecutionError::InvalidField(
+                "allowed_write_roots",
+            ));
+        }
+        if !Self::workspace_in_roots(&contract.output_workspace, &contract.allowed_write_roots) {
+            return Err(ProfessionalExecutionError::InvalidField("output_workspace"));
+        }
+        let declared: std::collections::BTreeSet<_> =
+            contract.source_reference_handles.iter().collect();
+        let mut hidden = std::collections::BTreeSet::new();
+        for handle in &contract.evaluator_only_reference_handles {
+            required_text(handle, "evaluator_only_reference_handle")?;
+            if !declared.contains(handle) {
+                return Err(ProfessionalExecutionError::InvalidField(
+                    "evaluator_only_reference_handles",
+                ));
+            }
+            if !hidden.insert(handle) {
+                return Err(ProfessionalExecutionError::InvalidField(
+                    "evaluator_only_reference_handles",
+                ));
+            }
+        }
         Ok(())
     }
+
+    fn validate_handles(
+        handles: &[String],
+        set_field: &'static str,
+        item_field: &'static str,
+    ) -> Result<(), ProfessionalExecutionError> {
+        let mut known = std::collections::BTreeSet::new();
+        for handle in handles {
+            required_text(handle, item_field)?;
+            if !known.insert(handle) {
+                return Err(ProfessionalExecutionError::InvalidField(set_field));
+            }
+        }
+        Ok(())
+    }
+
+    fn workspace_in_roots(workspace: &str, roots: &[String]) -> bool {
+        roots.iter().any(|root| {
+            let root = root.trim_end_matches('/');
+            workspace == root
+                || workspace
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// Reports whether a source reference handle is evaluator-only and must
+    /// never enter a worker-visible set.
+    pub fn is_evaluator_only_reference(&self, handle: &str) -> bool {
+        self.evaluator_only_reference_handles
+            .iter()
+            .any(|hidden| hidden == handle)
+    }
+
+    /// Derives the worker-visible reference set: every declared source
+    /// reference except the evaluator-only handles, in declaration order.
+    pub fn worker_visible_reference_handles(&self) -> Vec<String> {
+        self.source_reference_handles
+            .iter()
+            .filter(|handle| !self.is_evaluator_only_reference(handle))
+            .cloned()
+            .collect()
+    }
+
+    /// Materializes the worker packet, tool/filesystem view and log-safe
+    /// handle sets from the permitted immutable handles and declared output
+    /// roots only. The contract is revalidated first, so an unadmitted or
+    /// corrupted contract cannot yield a packet; evaluator-only references
+    /// never enter the returned sets.
+    pub fn materialize_worker_packet(
+        &self,
+    ) -> Result<ProfessionalWorkerPacket, ProfessionalExecutionError> {
+        self.validate()?;
+        Ok(ProfessionalWorkerPacket {
+            contract_ref: self.contract_ref.clone(),
+            contract_revision: self.revision,
+            asset_handles: self.input_asset_handles.clone(),
+            reference_handles: self.worker_visible_reference_handles(),
+            allowed_write_roots: self.allowed_write_roots.clone(),
+            output_workspace: self.output_workspace.clone(),
+            tool_route: self.professional_tool_route.clone(),
+            environment_profile: self.environment_profile.clone(),
+        })
+    }
+
+    /// Redacts every evaluator-only reference handle from worker-destined log
+    /// text. The contract is revalidated first so redaction always runs
+    /// against the admitted hidden set.
+    pub fn redact_evaluator_only_references(
+        &self,
+        log: &str,
+    ) -> Result<String, ProfessionalExecutionError> {
+        self.validate()?;
+        let mut hidden: Vec<&String> = self.evaluator_only_reference_handles.iter().collect();
+        hidden.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        let mut redacted = log.to_owned();
+        for handle in hidden {
+            redacted = redacted.replace(handle.as_str(), "[withheld evaluator-only reference]");
+        }
+        Ok(redacted)
+    }
+
+    /// Builds the reference-isolation receipt recording which references were
+    /// visible to each principal on the declared route. The contract is
+    /// revalidated first so the receipt always binds the admitted contract
+    /// revision and hidden set.
+    pub fn isolation_receipt(
+        &self,
+    ) -> Result<ProfessionalReferenceIsolationReceipt, ProfessionalExecutionError> {
+        self.validate()?;
+        let route = ProfessionalIsolationRoute {
+            tool_route: self.professional_tool_route.clone(),
+            environment_profile: self.environment_profile.clone(),
+        };
+        let worker = ProfessionalPrincipalVisibility {
+            principal: ProfessionalIsolationPrincipal::Worker,
+            route: route.clone(),
+            visible_asset_handles: self.input_asset_handles.clone(),
+            visible_reference_handles: self.worker_visible_reference_handles(),
+        };
+        let evaluator = ProfessionalPrincipalVisibility {
+            principal: ProfessionalIsolationPrincipal::Evaluator,
+            route,
+            visible_asset_handles: self.input_asset_handles.clone(),
+            visible_reference_handles: self.source_reference_handles.clone(),
+        };
+        Ok(ProfessionalReferenceIsolationReceipt {
+            contract_ref: self.contract_ref.clone(),
+            contract_revision: self.revision,
+            evaluator_only_reference_handles: self.evaluator_only_reference_handles.clone(),
+            entries: vec![worker, evaluator],
+        })
+    }
+}
+
+/// Principal dimension of reference visibility: the worker receives only
+/// permitted handles, while the evaluator additionally sees hidden
+/// evaluator-only references.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfessionalIsolationPrincipal {
+    Worker,
+    Evaluator,
+}
+
+/// Route dimension of reference visibility: the declared professional tool
+/// route and environment profile the visibility entries were derived for.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalIsolationRoute {
+    pub tool_route: String,
+    pub environment_profile: String,
+}
+
+/// Per-principal-per-route visibility: the exact asset and reference handles
+/// one principal may observe on one route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalPrincipalVisibility {
+    pub principal: ProfessionalIsolationPrincipal,
+    pub route: ProfessionalIsolationRoute,
+    pub visible_asset_handles: Vec<String>,
+    pub visible_reference_handles: Vec<String>,
+}
+
+/// Reference-isolation receipt bound to one exact contract revision: which
+/// references were hidden from the worker and which handles each principal
+/// could observe on the declared route.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalReferenceIsolationReceipt {
+    pub contract_ref: String,
+    pub contract_revision: u64,
+    pub evaluator_only_reference_handles: Vec<String>,
+    pub entries: Vec<ProfessionalPrincipalVisibility>,
+}
+
+impl ProfessionalReferenceIsolationReceipt {
+    /// Returns the visibility entry for one principal, if recorded.
+    pub fn visibility_for(
+        &self,
+        principal: ProfessionalIsolationPrincipal,
+    ) -> Option<&ProfessionalPrincipalVisibility> {
+        self.entries
+            .iter()
+            .find(|entry| entry.principal == principal)
+    }
+}
+
+/// Worker packet, tool surface and filesystem view derived only from the
+/// contract's permitted immutable handles and declared output roots.
+/// Evaluator-only references are structurally absent: no field carries them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalWorkerPacket {
+    pub contract_ref: String,
+    pub contract_revision: u64,
+    pub asset_handles: Vec<String>,
+    pub reference_handles: Vec<String>,
+    pub allowed_write_roots: Vec<String>,
+    pub output_workspace: String,
+    pub tool_route: String,
+    pub environment_profile: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -263,6 +498,12 @@ pub struct ProfessionalAbandonmentDecision {
 #[serde(deny_unknown_fields)]
 pub struct ProfessionalExecutionState {
     pub contract: ProfessionalExecutionContract,
+    /// Reference-isolation receipt constructed at admission from the admitted
+    /// contract; it records per-principal-per-route visibility for the exact
+    /// contract revision above. Legacy snapshots predate this field and
+    /// deserialize to an empty receipt.
+    #[serde(default)]
+    pub reference_isolation_receipt: ProfessionalReferenceIsolationReceipt,
     #[serde(default)]
     pub completion_evidence: Vec<ProfessionalCompletionEvidence>,
     pub attempts: Vec<ProfessionalAttempt>,
@@ -300,14 +541,23 @@ impl ProfessionalExecutionState {
         contract: ProfessionalExecutionContract,
     ) -> Result<Self, ProfessionalExecutionError> {
         contract.validate()?;
+        let reference_isolation_receipt = contract.isolation_receipt()?;
         Ok(Self {
             contract,
+            reference_isolation_receipt,
             completion_evidence: Vec::new(),
             attempts: Vec::new(),
             abandonment_signals: Vec::new(),
             approach_revisions: Vec::new(),
             controller_decisions: Vec::new(),
         })
+    }
+
+    /// Materializes the worker packet for the admitted contract: only
+    /// permitted immutable handles and declared output roots, with
+    /// evaluator-only references excluded.
+    pub fn worker_packet(&self) -> Result<ProfessionalWorkerPacket, ProfessionalExecutionError> {
+        self.contract.materialize_worker_packet()
     }
 
     pub fn record_attempt(
@@ -467,16 +717,30 @@ impl ProfessionalExecutionState {
         Ok(())
     }
 
+    /// Admits completion only when recorded evidence satisfies the contract:
+    /// an artifact manifest in the declared output workspace covering the
+    /// expected deliverables with checksums, plus the applicable bound
+    /// evaluator result while the contract carries a Verifier requirement.
+    /// Recorded values are revalidated with the admission checks, so
+    /// prose-only completion keeps the boundary unresolved.
     pub fn require_evaluator_result(&self) -> Result<(), ProfessionalExecutionError> {
-        if self
+        if !self
             .contract
             .requirements
             .iter()
             .any(|requirement| requirement.kind == ProfessionalRequirementKind::Verifier)
         {
-            return Err(ProfessionalExecutionError::EvaluatorBoundaryUnresolved);
+            return Ok(());
         }
-        Ok(())
+        let satisfied = self.completion_evidence.iter().any(|evidence| {
+            evidence.evaluator_result.is_some()
+                && self.validate_completion_evidence(evidence).is_ok()
+        });
+        if satisfied {
+            Ok(())
+        } else {
+            Err(ProfessionalExecutionError::EvaluatorBoundaryUnresolved)
+        }
     }
 
     /// Stores structurally valid evidence without treating caller claims as
@@ -484,6 +748,20 @@ impl ProfessionalExecutionState {
     pub fn record_completion_evidence(
         &mut self,
         evidence: ProfessionalCompletionEvidence,
+    ) -> Result<(), ProfessionalExecutionError> {
+        self.validate_completion_evidence(&evidence)?;
+        self.completion_evidence.push(evidence);
+        Ok(())
+    }
+
+    /// Admission checks shared by the record path and the completion gate:
+    /// the manifest is bound to this exact contract revision and declared
+    /// output workspace, every expected deliverable is observed exactly once
+    /// with a checksum, and any evaluator result is bound to the manifest,
+    /// contract revision, evaluator owner and artifact evaluator.
+    fn validate_completion_evidence(
+        &self,
+        evidence: &ProfessionalCompletionEvidence,
     ) -> Result<(), ProfessionalExecutionError> {
         let manifest = &evidence.artifact_manifest;
         required_text(&manifest.manifest_ref, "manifest_ref")?;
@@ -533,7 +811,6 @@ impl ProfessionalExecutionState {
                 ));
             }
         }
-        self.completion_evidence.push(evidence);
         Ok(())
     }
 

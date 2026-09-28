@@ -70,7 +70,7 @@
 //! Value-based escapes.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupClass, BackupError, BlobRestorationReceipt, CanonicalRecord,
@@ -80,7 +80,7 @@ use eliot_backup::{
     RestoreJournalPort, RestoreObligationState, RestoreObligations, RestoreOwnerObligation,
     RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
     RestoredFence, RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts,
-    suspended_recovery_entries, verify_key_coverage,
+    suspended_recovery_entries, verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -786,7 +786,7 @@ impl KernelBackupRestore {
         check_kernel_effect_fence(ports.kernel_fence, bundle)
             .map_err(|error| KernelRestoreError::FenceMismatch(error.to_string()))?;
         if let Some(manifest) = ports.keys {
-            verify_key_coverage(&bundle.blobs, manifest)
+            verify_portable_key_material(bundle, manifest)
                 .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         } else if !bundle.blobs.is_empty() {
             return Err(KernelRestoreError::CapabilityMissing {
@@ -1272,7 +1272,7 @@ impl<'a> KernelRestoreTarget<'a> {
         // Atomic temp-write + rename: a crash never leaves a torn receipt
         // that later reads as success. An unparseable receipt still reports
         // Unknown (rollback disposition), never a fabricated outcome.
-        let path = self.root.join(relative);
+        let path = self.contained_member_path(relative)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| BackupError::Target(error.to_string()))?;
@@ -1284,6 +1284,54 @@ impl<'a> KernelRestoreTarget<'a> {
         self.staged_bytes = staged_bytes;
         self.staged.push(path);
         Ok(())
+    }
+
+    /// Resolves one member path that is guaranteed to stay inside the root.
+    ///
+    /// Bundle-supplied identifiers reach [`KernelRestoreTarget::write_file`]
+    /// through `format!` (`events/{record_id}.json`, `receipts/{operation_id}.json`,
+    /// `blobs/{hash}`, `projections/{record_id}.json`), and `Path::join` neither
+    /// normalises `..` nor refuses an absolute, drive-prefixed or UNC argument,
+    /// so this is the single place where the "owner-admitted isolated
+    /// destination" guarantee is enforced. The accepted shape is exactly one or
+    /// more non-empty plain segments: `.`, `..`, a root component and a Windows
+    /// prefix component are all refused, and so is a path that names no segment
+    /// at all. Refusal happens before any directory is created, before the
+    /// staged-member and staged-byte counters are committed, and before any byte
+    /// is written — so a refused path is also absent from `self.staged`, and the
+    /// ownership-scoped cleanup can never be pointed at a path outside the
+    /// isolated root.
+    ///
+    /// This is the same refusal the file-runner target enforces
+    /// (`eliot_backup`'s `FileRestoreTarget::contained_member_path`, issue
+    /// #1873). The two targets are separate owners of the same documented
+    /// guarantee, and a guarantee that holds on one restore path must not be
+    /// weaker on the other.
+    fn contained_member_path(&self, relative: &str) -> Result<PathBuf, BackupError> {
+        let refuse = |reason: &'static str| BackupError::InvalidField {
+            field: "restore member path",
+            reason,
+        };
+        let mut segments = 0usize;
+        for component in Path::new(relative).components() {
+            match component {
+                Component::Normal(_) => segments += 1,
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => {
+                    return Err(refuse(
+                        "must be plain relative segments inside the isolated restore root",
+                    ));
+                }
+            }
+        }
+        if segments == 0 {
+            return Err(refuse(
+                "must name at least one segment inside the isolated restore root",
+            ));
+        }
+        Ok(self.root.join(relative))
     }
 
     fn phase_receipt_path(&self, phase: &RestorePhase) -> Result<PathBuf, BackupError> {

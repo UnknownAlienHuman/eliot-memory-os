@@ -15,6 +15,9 @@
 //!   [`CapabilityHealth`]);
 //! - the bounded control reserve and synchronous front door
 //!   ([`ControlReserve`], [`FrontDoor`]);
+//! - the I14.3 multidimensional capacity-profile compiler that joins
+//!   owner-produced evidence into one canonical row per frozen bottleneck
+//!   ([`compile_control_reserve_profile`]);
 //! - the role-filtered recovery view ([`RecoveryViewBuilder`]).
 //!
 //! [`KernelAuthority`] and [`RouteFence`] are the existing P-07 control-plane
@@ -80,6 +83,9 @@ pub use module::control_reserve_front_door::{
     ControlReserve, DecisionDenialReason, EMERGENCY_PREALLOCATED_SLOTS, EmergencyOperationClass,
     FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition, IdempotencyLedger, NormalWorkClass,
     PermitOperation,
+};
+pub use module::control_reserve_profile_compiler::{
+    BottleneckOwnerEvidence, ControlReserveProfileIdentity, compile_control_reserve_profile,
 };
 pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
 pub use module::generation_readiness::{

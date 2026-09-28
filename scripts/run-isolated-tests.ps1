@@ -311,7 +311,8 @@ function New-HarnessRunProviderTable {
         [Parameter(Mandatory)][string]$BaseTemp,
         [Parameter(Mandatory)][hashtable]$RunState,
         [Parameter(Mandatory)][scriptblock]$Entropy,
-        [Parameter(Mandatory)][scriptblock]$PortReservation
+        [Parameter(Mandatory)][scriptblock]$PortReservation,
+        [Parameter(Mandatory)][scriptblock]$NamespaceReservation
     )
 
     $table = @{
@@ -341,7 +342,12 @@ function New-HarnessRunProviderTable {
             $class = Resolve-HarnessBoundProviderClass -Binding $binding
             $key = [string]$context.arguments['resourceKey']
             if ($class -ceq 'RUNTIME') {
-                $result = Invoke-RuntimeAllocate -Binding $binding -Plan $context.arguments['plan'] -BaseTemp $BaseTemp -Entropy $Entropy
+                # #911 W1 namespace half: the run must win the exclusive create of
+                # the canonical F-PIPE namespace and hand the provider its own live
+                # claim, exactly as the Store lane threads its port reservation.
+                # Without this the runtime provisioner is unreachable: the module
+                # requires the seam and refuses a name that was never reserved.
+                $result = Invoke-RuntimeAllocate -Binding $binding -Plan $context.arguments['plan'] -BaseTemp $BaseTemp -Entropy $Entropy -NamespaceReservation $NamespaceReservation
             } else {
                 $result = Invoke-StoreAllocate -Binding $binding -Plan $context.arguments['plan'] -BaseTemp $BaseTemp -Entropy $Entropy -PortReservation $PortReservation
             }
@@ -698,8 +704,17 @@ if ($activeProfile -eq 'Run') {
         }
         return @{ host = '127.0.0.1'; port = $port }
     }.GetNewClosure()
+    # #911 W1 namespace half: a real, run-owned namespace reservation. The
+    # canonical F-PIPE namespace is a mutable namespace, so the run holds it the
+    # same way it holds a port: by winning the exclusive create and keeping the
+    # live claim, not by naming a predictable string. The provider module owns
+    # the claim record and re-proves it by handle identity; this coordinator only
+    # supplies the seam, exactly as for the port reservation above. Nothing is
+    # created, deleted or replaced by name.
+    $providerNamespaceReservation = New-RuntimeDefaultNamespaceReservation
     $seamArgs['Provider'] = New-HarnessRunProviderTable -BaseTemp $candidateRoot `
-        -RunState $providerRunState -Entropy $providerEntropy -PortReservation $providerPortReservation
+        -RunState $providerRunState -Entropy $providerEntropy -PortReservation $providerPortReservation `
+        -NamespaceReservation $providerNamespaceReservation
     if ($HarnessProbe -ne 'none') { $seamArgs['HarnessProbe'] = $HarnessProbe }
     if ($InjectFailureAfterSecretSetup) { $seamArgs['InjectFailureAfterSecretSetup'] = $true }
     if ($null -ne $resolvedEvidenceLogPath) { $seamArgs['EvidenceLogPath'] = $resolvedEvidenceLogPath }

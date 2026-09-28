@@ -122,7 +122,9 @@
 //! [`reconcile_staged_writes_at_startup`] is the read side of the envelope
 //! [`reserve_for_transition`] stages, and it is the I1.11 step 6 owner for it:
 //! every unresolved reservation is enumerated by operation identity, observed
-//! against its exact canonical Store receipt, and revalidated through
+//! against its exact canonical Store receipt through the same named
+//! authenticated gateway ([`StartupReceiptRoute`]) every other receipt
+//! observation in this crate uses, and revalidated through
 //! [`RedbRecoveryStore::verify_staged_envelope`]. A corrupted or unreadable
 //! staged payload keeps a durable [`eliot_ors::RecoveryProblem`] and stays
 //! available for disposition; nothing is decoded, re-hashed, defaulted to
@@ -151,6 +153,8 @@
 //! reconciliation.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use eliot_contracts::{EpochId, RequestMetadata, StateFence};
@@ -166,14 +170,12 @@ use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CanonicalStoreClient, OperationId,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
-    ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation, WriteAdmissionParams,
-    WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
-    prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, ReceiptEnvelope, ReservedScopeBinding,
+    ReservedWriteRequest, RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection,
+    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest, sha256_hex,
+    verify_canonical_request_hash,
 };
-
-use crate::{EbpCanonicalStoreClient, EbpStoreTransport};
 
 /// Requested key-provider label carried on reservation envelopes.
 ///
@@ -197,6 +199,60 @@ pub const RESERVATION_VISIBILITY: &str = "owner-only";
 pub const UNKNOWN_OUTCOME_REASON: &str = "store-unknown-outcome";
 
 const STARTUP_RESERVATION_SCAN_SOURCE: &str = "ors.pending_reservations";
+const STARTUP_CONTROL_SCAN_SOURCE: &str = "ors.control_projection";
+
+/// Boxed named-gateway receipt observation for one startup record.
+pub type StartupReceiptObservation<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<WriteReceipt>, ReservationWriteError>> + Send + 'a>>;
+
+/// The named authenticated canonical-Store receipt path the startup scan must
+/// cross (issue #1713, item 6).
+///
+/// `A12.3` states: "Direct storage access, a shell or database-protocol bypass,
+/// or a second writer is a security and integrity problem regardless of how
+/// plausible the content appears", and `I14.21` states: "Kernel queries
+/// `WriteReceipt` by idempotency key". Every other receipt observation in this
+/// crate reaches the canonical receipt through the one named gateway, which
+/// takes the flight slot, refuses a fenced rebind, validates the fence, checks
+/// the active route before and after the query, and validates the receipt's
+/// own operation and fence binding. This port exists so the startup scan can
+/// reach that same method; it declares no second implementation of those
+/// checks, and a refusal crosses as an error, never as an absent receipt.
+pub trait StartupReceiptRoute: Send + Sync {
+    /// Observes one canonical receipt by exact operation identity under the
+    /// exact state fence the staged operation was admitted with.
+    fn observe_receipt<'a>(
+        &'a self,
+        state_fence: &'a StateFence,
+        operation_id: OperationId,
+    ) -> StartupReceiptObservation<'a>;
+}
+
+/// Recovers the exact admitted State Fence from one reservation token.
+///
+/// [`WriterReservationToken::state_fence`] is an
+/// [`StateFenceSnapshot`] - the ORS contour - while the named gateway takes the
+/// canonical [`StateFence`]. The snapshot is validated first, so the digest and
+/// the canonical JSON it recorded are proven, and only then is that exact
+/// recorded JSON decoded back into the canonical type. Nothing is defaulted or
+/// substituted: a token that does not record a decodable canonical fence
+/// refuses, and the live fence is never passed off as an older token's own.
+fn admitted_state_fence(
+    token: &WriterReservationToken,
+) -> Result<StateFence, ReservationWriteError> {
+    token
+        .state_fence
+        .validate()
+        .map_err(ReservationWriteError::Ors)?;
+    serde_json::from_str::<StateFence>(token.state_fence.canonical_json.as_str()).map_err(
+        |error| ReservationWriteError::Binding {
+            operation_id: token.operation_id.as_str().to_owned(),
+            detail: format!(
+                "the reservation's recorded state fence does not decode to a canonical State Fence: {error}"
+            ),
+        },
+    )
+}
 
 /// Typed failure for reserved-write binding, dispatch, and reconciliation.
 ///
@@ -1012,6 +1068,32 @@ pub fn cancel_before_send(
     Ok(owner.ors.release(token, owner.writer_identity())?)
 }
 
+/// Records one staged `PreparedTransition` this build refuses to execute as a
+/// visible durable Recovery Problem (issue #1927, I05-06).
+///
+/// Called when the single send resolved to a determinate refusal because the
+/// plan's recorded contract or operation manifest lies outside current
+/// admissible support. No external effect occurred, so the reserved order is
+/// still safely disposable and the caller releases it as usual - but I05-06
+/// requires the plan itself to stay staged and enter visible recovery instead
+/// of being reinterpreted by newer code, so the refusal is recorded durably
+/// first, keyed by the staged operation identity.
+///
+/// Recording before the release matters: the retention reads the staged
+/// operation's own epoch, fence, recovery owner and reservation identity, so
+/// the problem cannot disagree with what was actually staged. It carries no
+/// payload bytes, and an unresolved problem blocks normal writer readiness
+/// until an explicit canonical receipt or owner disposition resolves it.
+pub fn retain_unsupported_prepared_plan(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+    detail: &str,
+) -> Result<eliot_ors::RecoveryProblem, ReservationWriteError> {
+    Ok(owner
+        .ors
+        .retain_unsupported_prepared_transition(&token.operation_id, detail)?)
+}
+
 /// Marks an ambiguous effect non-replayable until canonical reconciliation.
 ///
 /// Called when the single send resolves to a still-unknown outcome after
@@ -1441,41 +1523,69 @@ pub struct StartupUnknownOperation {
 /// Step-6 readiness verdict over a startup reconciliation report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupReconciliationReadiness {
-    /// The ORS pending-reservation scan is exhausted and has no unresolved rows.
-    /// This reservation-only result does not certify the complete W5 startup gate.
+    /// The ORS pending-reservation scan and the ORS control-projection coverage
+    /// scan are both exhausted and there is no unresolved row. This still does
+    /// not certify the complete W5 startup gate: the protected ORS root is not
+    /// opened or integrity-checked and no projection is rebuilt.
     Ready,
-    /// A reservation remains unresolved or the bounded reservation scan did not
-    /// reach exhaustion.
+    /// A reservation remains unresolved, or either bounded scan did not reach
+    /// exhaustion, or a cursor coverage field disagrees with the rows observed.
     Blocked,
 }
 
-/// Bounded reconciliation report for the ORS pending-reservation source only.
+/// Bounded reconciliation report over the ORS startup obligation sources.
 ///
 /// Produced by [`reconcile_pending_at_startup`] from the persisted ORS
-/// reservation recovery pages plus exact canonical Store receipt observations.
-/// A missing or ambiguous receipt leaves its token unresolved and
-/// reported; nothing is synthesized, retried, or released to pass. This does
-/// not enumerate checkpoint/inbox obligations or retained Problems, open or
-/// integrity-check the protected ORS root, rebuild projections, or certify the
-/// full W5 startup readiness gate.
+/// reservation recovery pages, the ORS control projection pages, plus exact
+/// canonical Store receipt observations read through the named authenticated
+/// gateway. A missing or ambiguous receipt leaves its token unresolved and
+/// reported; nothing is synthesized, retried, or released to pass. Retained
+/// Problems are enumerated by [`reconcile_staged_writes_at_startup`], which
+/// also reports them; this report does not open or integrity-check the
+/// protected ORS root, rebuild projections, or certify the full W5 startup
+/// readiness gate.
 #[derive(Clone, Debug)]
 pub struct StartupReconciliation {
     /// Live fence the scan ran under; Kernel matches it exactly.
     pub fence: StateFence,
-    /// Digest over the fence, source, cursor coverage and every returned
-    /// reservation identity/outcome.
+    /// Digest over the fence, both scan sources, every cursor coverage field
+    /// and every returned reservation identity/outcome and control obligation
+    /// reference.
     pub digest: String,
     /// Number of nonterminal reservation rows returned and examined, bounded by
     /// `scan_limit`.
     pub scanned: u64,
-    /// Exact source covered by this report: `ors.pending_reservations`.
+    /// Exact reservation source covered by this report:
+    /// `ors.pending_reservations`.
     pub scan_source: &'static str,
-    /// Exclusive starting cursor used for the first page.
+    /// Exclusive starting cursor used for the first reservation page.
     pub cursor_start_after_order: u64,
-    /// Last reservation order returned by the scan, if any.
+    /// Last reservation order returned by the reservation scan, if any.
     pub last_reservation_order: Option<u64>,
-    /// ORS continuation cursor when the whole-scan bound stopped traversal.
+    /// ORS continuation cursor when the whole-scan bound stopped the reservation
+    /// scan.
     pub next_after_order: Option<u64>,
+    /// True when more pending reservations exist after the whole-scan bound.
+    pub truncated: bool,
+    /// Exact control-projection source covered by this report:
+    /// `ors.control_projection`.
+    pub control_scan_source: &'static str,
+    /// Exclusive starting cursor used for the first control-projection page.
+    pub control_cursor_start_after_order: u64,
+    /// Nonterminal reservation orders the control-projection cursor covered.
+    pub control_scanned: u64,
+    /// ORS continuation cursor when the whole-scan bound stopped the
+    /// control-projection scan.
+    pub control_next_after_order: Option<u64>,
+    /// True when more control-projection rows exist after the whole-scan bound.
+    pub control_truncated: bool,
+    /// Active durable job-checkpoint subjects the control projection published.
+    pub job_checkpoint_refs: Vec<String>,
+    /// Active delivery-cursor subjects the control projection published.
+    pub delivery_cursor_refs: Vec<String>,
+    /// Imported recovery-inbox item identities the control projection
+    /// published.
+    pub recovery_inbox_refs: Vec<String>,
     /// Whole-scan ceiling supplied by the caller; receipt lookups never exceed
     /// this count. Individual page sizes also respect the ORS page ceiling.
     pub scan_limit: u16,
@@ -1483,16 +1593,15 @@ pub struct StartupReconciliation {
     pub pending: Vec<StartupPendingOperation>,
     /// Ambiguous operations that must stay unresolved.
     pub unknown: Vec<StartupUnknownOperation>,
-    /// True when more pending reservations exist after the whole-scan bound;
-    /// the reservation-only readiness verdict is blocked.
-    pub truncated: bool,
 }
 
 impl StartupReconciliation {
-    /// Returns the verdict for this reservation scan only: `Ready` requires
-    /// source/cursor consistency, exhaustion, and empty pending/unknown sets.
-    /// This must not be used as the complete W5 startup readiness gate because
-    /// other durable obligation sources are not covered here.
+    /// Returns the verdict for this report: `Ready` requires both sources to
+    /// have consistent cursor coverage, both bounded scans to be exhausted, and
+    /// the pending/unknown sets to be empty. A control obligation that is merely
+    /// present does not block: what must be unproven is its coverage, not its
+    /// existence. A truncated, corrupt or non-advancing control scan is a
+    /// failed check, never an empty answer (issue #1713, item 5).
     pub fn readiness(&self) -> StartupReconciliationReadiness {
         let cursor_coverage_is_consistent = self.scan_source == STARTUP_RESERVATION_SCAN_SOURCE
             && self.scan_limit > 0
@@ -1505,8 +1614,15 @@ impl StartupReconciliation {
             } else {
                 self.next_after_order.is_none()
             };
+        let control_coverage_is_consistent = self.control_scan_source
+            == STARTUP_CONTROL_SCAN_SOURCE
+            && self.control_cursor_start_after_order == 0
+            && self.control_scanned <= u64::from(self.scan_limit)
+            && self.control_truncated == self.control_next_after_order.is_some();
         if cursor_coverage_is_consistent
+            && control_coverage_is_consistent
             && !self.truncated
+            && !self.control_truncated
             && self.pending.is_empty()
             && self.unknown.is_empty()
         {
@@ -1531,9 +1647,16 @@ enum StartupRecordOutcome {
 /// reconciles it where the receipt resolves. Records minted under a
 /// different writer epoch than the bound owner are never touched. A
 /// failed check (transport/ORS) is an error, never a guessed outcome.
-async fn reconcile_one_record<T: EbpStoreTransport + 'static>(
+///
+/// The receipt is read through the named authenticated gateway
+/// ([`StartupReceiptRoute`]), never through the raw `CanonicalStoreClient`
+/// trait call, and it is read under the exact fence the token itself recorded
+/// (issue #1713, item 6). A gateway refusal is a failed check and propagates
+/// as an error; it is never reported as an absent receipt, a rejection, or a
+/// safely absent operation.
+async fn reconcile_one_record(
     owner: &CompositionReservation,
-    store: &EbpCanonicalStoreClient<T>,
+    route: &dyn StartupReceiptRoute,
     record: &ReservationRecord,
 ) -> Result<StartupRecordOutcome, ReservationWriteError> {
     let token = &record.token;
@@ -1554,9 +1677,8 @@ async fn reconcile_one_record<T: EbpStoreTransport + 'static>(
             detail: format!("startup scan cannot address the reservation: {error}"),
         }
     })?;
-    let observed = CanonicalStoreClient::receipt(store, operation_id)
-        .await
-        .map_err(ReservationWriteError::Store)?;
+    let state_fence = admitted_state_fence(token)?;
+    let observed = route.observe_receipt(&state_fence, operation_id).await?;
     let Some(receipt) = observed else {
         if record.state == ReservationState::Reconciling {
             return Ok(StartupRecordOutcome::Unknown {
@@ -1649,11 +1771,18 @@ fn append_startup_digest_field(encoded: &mut String, value: &str) {
     encoded.push_str(value);
 }
 
-fn startup_reservation_scan_integrity_error(reason: impl Into<String>) -> ReservationWriteError {
+fn startup_scan_integrity_error(
+    record_type: &'static str,
+    reason: impl Into<String>,
+) -> ReservationWriteError {
     ReservationWriteError::Ors(eliot_ors::OrsError::IntegrityProblem {
-        record_type: "startup_reservation_cursor",
+        record_type,
         reason: reason.into(),
     })
+}
+
+fn startup_reservation_scan_integrity_error(reason: impl Into<String>) -> ReservationWriteError {
+    startup_scan_integrity_error("startup_reservation_cursor", reason)
 }
 
 struct StartupReservationPageScan {
@@ -1740,35 +1869,184 @@ fn scan_startup_reservation_pages(
     })
 }
 
+/// One bounded pass over the ORS control projection's durable obligations.
+///
+/// The control page returns the checkpoint, delivery-cursor and recovery-inbox
+/// references the owner rebuilt from validated durable records, together with
+/// the reservation-order continuation its own recovery page used. Those
+/// references are a whole-table publication rather than a cursor-bounded
+/// window, so the scan unions and de-duplicates them instead of summing them:
+/// a reference seen on three pages is one obligation, not three.
+struct StartupControlPageScan {
+    cursor_start_after_order: u64,
+    scanned: u16,
+    next_after_order: Option<u64>,
+    truncated: bool,
+    job_checkpoint_refs: Vec<String>,
+    delivery_cursor_refs: Vec<String>,
+    recovery_inbox_refs: Vec<String>,
+}
+
+/// Pages the ORS control projection to exhaustion under the same exclusive
+/// cursor, page ceiling and whole-scan bound as the reservation scan
+/// (issue #1713, item 5).
+///
+/// A page that returns more rows than the bound allows, or a continuation
+/// cursor that does not strictly advance past the cursor it followed, is a
+/// corrupt or missing page and fails the whole scan: coverage is never
+/// reported as smaller than it is, and never as an empty answer.
+fn scan_startup_control_projection_pages(
+    ors: &RedbRecoveryStore,
+    limit: u16,
+) -> Result<StartupControlPageScan, ReservationWriteError> {
+    let cursor_start_after_order = 0;
+    let mut after_order = cursor_start_after_order;
+    let mut scanned = 0u16;
+    let mut next_after_order = None;
+    let mut truncated = false;
+    let mut job_checkpoint_refs: BTreeSet<String> = BTreeSet::new();
+    let mut delivery_cursor_refs: BTreeSet<String> = BTreeSet::new();
+    let mut recovery_inbox_refs: BTreeSet<String> = BTreeSet::new();
+
+    loop {
+        let remaining = limit - scanned;
+        let page_limit = remaining.min(eliot_ors::MAX_RECOVERY_PAGE);
+        let cursor = RecoveryCursor::new(after_order, page_limit)?;
+        let (projection, next) = ors.control_projection_page(cursor).map_err(|error| {
+            startup_scan_integrity_error(
+                "startup_control_projection_cursor",
+                format!("control projection page after {after_order} is unreadable: {error}"),
+            )
+        })?;
+        let page_row_count = projection.pending_operation_refs.len();
+        if page_row_count > usize::from(page_limit) {
+            return Err(startup_scan_integrity_error(
+                "startup_control_projection_cursor",
+                format!(
+                    "control projection page returned {page_row_count} rows for limit {page_limit}"
+                ),
+            ));
+        }
+        if let Some(next) = next
+            && (page_row_count != usize::from(page_limit) || next <= after_order)
+        {
+            return Err(startup_scan_integrity_error(
+                "startup_control_projection_cursor",
+                format!(
+                    "continuation cursor {next} does not advance a full control projection page after {after_order}"
+                ),
+            ));
+        }
+        scanned = scanned
+            .checked_add(u16::try_from(page_row_count).map_err(|_| {
+                startup_scan_integrity_error(
+                    "startup_control_projection_cursor",
+                    "control projection page row count exceeds the bounded counter",
+                )
+            })?)
+            .ok_or_else(|| {
+                startup_scan_integrity_error(
+                    "startup_control_projection_cursor",
+                    "control projection coverage overflowed the whole-scan bound",
+                )
+            })?;
+        job_checkpoint_refs.extend(projection.job_checkpoint_refs);
+        delivery_cursor_refs.extend(projection.delivery_cursor_refs);
+        recovery_inbox_refs.extend(projection.recovery_inbox_refs);
+
+        match next {
+            Some(next) if scanned == limit => {
+                truncated = true;
+                next_after_order = Some(next);
+                break;
+            }
+            Some(next) => after_order = next,
+            None => break,
+        }
+    }
+
+    Ok(StartupControlPageScan {
+        cursor_start_after_order,
+        scanned,
+        next_after_order,
+        truncated,
+        job_checkpoint_refs: job_checkpoint_refs.into_iter().collect(),
+        delivery_cursor_refs: delivery_cursor_refs.into_iter().collect(),
+        recovery_inbox_refs: recovery_inbox_refs.into_iter().collect(),
+    })
+}
+
+/// Binds the control-projection coverage into the startup scan digest.
+///
+/// The source, the exclusive cursor and its continuation, the truncation flag,
+/// the covered row count and every observed obligation reference go into the
+/// same digest as the reservation rows, so a partial obligation scan can never
+/// be digest-indistinguishable from a complete one.
+fn append_control_coverage_digest(encoded: &mut String, control: &StartupControlPageScan) {
+    for field in [
+        STARTUP_CONTROL_SCAN_SOURCE.to_owned(),
+        control.cursor_start_after_order.to_string(),
+        control
+            .next_after_order
+            .map_or_else(|| "none".to_owned(), |order| order.to_string()),
+        control.scanned.to_string(),
+        control.truncated.to_string(),
+        control.job_checkpoint_refs.len().to_string(),
+        control.delivery_cursor_refs.len().to_string(),
+        control.recovery_inbox_refs.len().to_string(),
+    ] {
+        append_startup_digest_field(encoded, &field);
+    }
+    for refs in [
+        &control.job_checkpoint_refs,
+        &control.delivery_cursor_refs,
+        &control.recovery_inbox_refs,
+    ] {
+        for reference in refs {
+            append_startup_digest_field(encoded, reference);
+        }
+    }
+}
+
 /// Reconciles persisted pending/unknown ORS reservations against exact
-/// canonical Store receipts at startup. This helper covers only the ORS
-/// pending-reservation source; it is not a complete W5 startup gate.
+/// canonical Store receipts at startup, and covers the ORS control projection's
+/// durable checkpoint/inbox obligations. This helper still does not open or
+/// integrity-check the protected ORS root, rebuild projections, or certify the
+/// full W5 startup gate.
 ///
 /// For every non-terminal reservation up to the caller's whole-scan `limit`,
-/// this observes the exact Store receipt by operation identity: a committed
+/// this observes the exact Store receipt by operation identity through the
+/// named authenticated gateway ([`StartupReceiptRoute`]): a committed
 /// (or terminally not-applied, receipt-proven) answer reconciles and
 /// finalizes through the real receipt path, so resolved work leaves no
 /// trace in the report. Records minted under a different writer epoch
 /// than the bound owner are reported pending with `fence mismatch` and
 /// never touched — cross-epoch disposition belongs to the
 /// cutover/rebind owner, not to startup. A missing receipt, a refused
-/// reconciliation, or a transport/ORS failure of the check itself is
+/// reconciliation, or a gateway/ORS failure of the check itself is
 /// reported honestly: unknown outcomes stay unresolved, and a failed
 /// check is an error, never a synthetic empty report.
+///
+/// The same whole-scan bound then pages the ORS control projection so the
+/// job-checkpoint, delivery-cursor and recovery-inbox obligations its owner
+/// publishes reach the startup gate with their own cursor and coverage
+/// accounting instead of being silently absent (issue #1713, item 5).
 ///
 /// Bounds: `limit` is the whole-scan ceiling, not a page size. Each ORS request
 /// is additionally capped at `MAX_RECOVERY_PAGE`; no more than `limit` rows are
 /// collected and no more than `limit` Store receipts are observed. A continued
-/// cursor at that ceiling sets `truncated`, records exact reservation cursor
-/// coverage and blocks this scan verdict. ORS corruption and malformed,
-/// missing, repeated or non-progressing continuation pages fail closed.
-pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
+/// cursor at that ceiling sets `truncated` and `control_truncated`, records
+/// exact cursor coverage and blocks this report's verdict. ORS corruption and
+/// malformed, missing, repeated or non-progressing continuation pages fail
+/// closed in either scan.
+pub async fn reconcile_pending_at_startup(
     owner: &CompositionReservation,
     fence: &StateFence,
-    store: &EbpCanonicalStoreClient<T>,
+    route: &dyn StartupReceiptRoute,
     limit: u16,
 ) -> Result<StartupReconciliation, ReservationWriteError> {
     let scan = scan_startup_reservation_pages(owner, limit)?;
+    let control = scan_startup_control_projection_pages(&owner.ors, limit)?;
     let mut pending = Vec::new();
     let mut unknown = Vec::new();
     let mut scan_entries = Vec::with_capacity(scan.records.len());
@@ -1782,7 +2060,7 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
             .collect();
         scopes.sort_unstable();
         let recovery_owner = token.recovery_owner.as_str().to_owned();
-        let entry = reconcile_one_record(owner, store, record).await?;
+        let entry = reconcile_one_record(owner, route, record).await?;
         let outcome_for_digest = match &entry {
             StartupRecordOutcome::Resolved => "resolved".to_owned(),
             StartupRecordOutcome::Pending { reason } => format!("pending:{reason}"),
@@ -1814,6 +2092,7 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
         }
     }
     let scanned = u64::from(scan.scanned);
+    let control_scanned = u64::from(control.scanned);
     let mut digest_input = String::new();
     for field in [
         STARTUP_RESERVATION_SCAN_SOURCE.to_owned(),
@@ -1835,6 +2114,10 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
     for entry in &scan_entries {
         append_startup_digest_field(&mut digest_input, entry);
     }
+    // The control-projection coverage is bound here too: a truncated or
+    // partial obligation scan must not be digest-indistinguishable from a
+    // complete one.
+    append_control_coverage_digest(&mut digest_input, &control);
     let digest = sha256_hex(digest_input.as_bytes());
     Ok(StartupReconciliation {
         fence: fence.clone(),
@@ -1844,10 +2127,18 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
         cursor_start_after_order: scan.cursor_start_after_order,
         last_reservation_order: scan.last_reservation_order,
         next_after_order: scan.next_after_order,
+        truncated: scan.truncated,
+        control_scan_source: STARTUP_CONTROL_SCAN_SOURCE,
+        control_cursor_start_after_order: control.cursor_start_after_order,
+        control_scanned,
+        control_next_after_order: control.next_after_order,
+        control_truncated: control.truncated,
+        job_checkpoint_refs: control.job_checkpoint_refs,
+        delivery_cursor_refs: control.delivery_cursor_refs,
+        recovery_inbox_refs: control.recovery_inbox_refs,
         scan_limit: limit,
         pending,
         unknown,
-        truncated: scan.truncated,
     })
 }
 
@@ -1904,17 +2195,22 @@ pub struct StartupStagedEnvelope {
 /// One staged operation whose envelope could not be validated at startup.
 ///
 /// I5.2 requires a durable Recovery Problem here, never plaintext fallback and
-/// never silent deletion: ORS retained one before returning
-/// `RecoveryProblemRetained`, and the staged record stays available for
-/// disposition. `reason` uses a fixed vocabulary so the report stays a bounded
-/// diagnostic, not an error log.
+/// never silent deletion. `recovery-problem-retained` names the case where ORS
+/// retained that problem before returning `RecoveryProblemRetained`, and the
+/// staged record stays available for disposition.
+/// `recovery-problem-not-retained` names the case where retaining the problem
+/// failed as well: no durable Problem exists for this operation, so it keeps
+/// its exact recovery reference in the reservation report and is never reported
+/// absent or clean. `reason` uses a fixed vocabulary so the report stays a
+/// bounded diagnostic, not an error log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupEnvelopeProblem {
     /// Operation identity whose staged envelope failed validation.
     pub operation_id: String,
     /// ORS-assigned reservation order of the owning reservation.
     pub reservation_order: u64,
-    /// Fixed-vocabulary cause (`recovery-problem-retained`).
+    /// Fixed-vocabulary cause (`recovery-problem-retained` or
+    /// `recovery-problem-not-retained`).
     pub reason: &'static str,
 }
 
@@ -1960,11 +2256,15 @@ impl StagedWriteRecovery {
     ///
     /// A bounded scan that stopped early is `Blocked`: a partial read has not
     /// proven anything about the rows it did not reach, so it can never certify
-    /// readiness.
+    /// readiness. A retained-problem listing that filled the whole-scan ceiling
+    /// is the same shape: an unseen retained Problem cannot be shown to be
+    /// resolved, so coverage is unproven and the verdict stays `Blocked`
+    /// (issue #1713, item 5).
     #[must_use]
     pub fn readiness(&self) -> StagedWriteReadiness {
         if self.reservations.readiness() == StartupReconciliationReadiness::Ready
             && self.problems.is_empty()
+            && self.retained_problems.len() < usize::from(self.reservations.scan_limit)
             && self
                 .retained_problems
                 .iter()
@@ -1997,21 +2297,25 @@ impl StagedWriteRecovery {
 /// ```
 ///
 /// A failed check is an error, never a synthetic empty report: an unreadable
-/// ORS, an undecodable envelope that is not already a retained problem, or a
-/// transport failure of a receipt lookup all propagate, so the caller keeps
-/// step 6 incomplete rather than claiming a clean scan.
+/// ORS, an envelope whose Recovery Problem could not be retained at all, or a
+/// failure of the named gateway receipt lookup all propagate, so the caller
+/// keeps step 6 incomplete rather than claiming a clean scan. The one
+/// exception is a staged operation whose durable Recovery Problem the owner
+/// already holds: that is reported as a visible problem, and a failure to
+/// retain that problem is reported as `recovery-problem-not-retained` rather
+/// than as an absent or clean operation.
 ///
 /// Bounds: `limit` is the whole-scan ceiling for both the reservation scan and
 /// the retained-problem listing, exactly as in
 /// [`reconcile_pending_at_startup`]. Nothing here interprets a payload, resolves
 /// a key, or deletes a staged record.
-pub async fn reconcile_staged_writes_at_startup<T: EbpStoreTransport + 'static>(
+pub async fn reconcile_staged_writes_at_startup(
     owner: &CompositionReservation,
     fence: &StateFence,
-    store: &EbpCanonicalStoreClient<T>,
+    route: &dyn StartupReceiptRoute,
     limit: u16,
 ) -> Result<StagedWriteRecovery, ReservationWriteError> {
-    let reservations = reconcile_pending_at_startup(owner, fence, store, limit).await?;
+    let reservations = reconcile_pending_at_startup(owner, fence, route, limit).await?;
     let mut envelopes = Vec::new();
     let mut problems = Vec::new();
     // Pending and unknown are the same operation population read from the two
@@ -2062,6 +2366,22 @@ pub async fn reconcile_staged_writes_at_startup<T: EbpStoreTransport + 'static>(
                     operation_id: operation_id.to_owned(),
                     reservation_order,
                     reason: "recovery-problem-retained",
+                });
+            }
+            // Retaining that Recovery Problem failed too (issue #1713, item 4).
+            // The item forbids claiming a durable Problem was created and
+            // forbids calling the operation safely absent, so the operation is
+            // reported as an unrecorded problem under its exact recovery
+            // reference. Its reservation stays in the pending/unknown report
+            // from the pass above, so step 6 stays `Blocked`.
+            Err(eliot_ors::OrsError::IntegrityProblem {
+                record_type: "recovery_problem_record",
+                ..
+            }) => {
+                problems.push(StartupEnvelopeProblem {
+                    operation_id: operation_id.to_owned(),
+                    reservation_order,
+                    reason: "recovery-problem-not-retained",
                 });
             }
             Err(error) => return Err(ReservationWriteError::Ors(error)),

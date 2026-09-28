@@ -69,7 +69,9 @@ use crate::dispatch_drive::{DriveError, OwnerRecords, assemble_owner_records};
 use crate::dispatch_material::ValidatedDispatchMaterial;
 use crate::installed_binary::{WasmHostBinaryBinding, resolve_installed_binary};
 use crate::parent_authority::ParentDispatchAuthority;
-use crate::parent_runtime::{BoundedParentSink, derive_parent_intent};
+use crate::parent_runtime::{
+    BoundedParentSink, ProcessTermination, ProcessTerminationKey, derive_parent_intent,
+};
 use crate::typed_bindings::typed_wit_digest;
 use crate::wasmtime_provider::{WIT_VERSION, WIT_WORLD, provider_configuration_digest};
 
@@ -196,6 +198,12 @@ pub struct ResolvedPortGrant {
     pub engine_binding: EngineBinding,
     /// Shared live authority cell for the resolved window.
     pub live: Arc<LiveAuthority>,
+    /// Read-only handle onto the same P-03 evidence sink the engine and the
+    /// process adapters record through, bound to the exact derived child
+    /// identity. It is the SAME sink instance, not a second one, so the
+    /// termination the loop reads is the owner's own observation of the
+    /// child it launched (issue #2785 audit, defect 2).
+    pub termination: ProcessTermination,
 }
 
 /// Canonical digest helper: deterministic JSON bytes hashed with SHA-256,
@@ -789,7 +797,11 @@ pub fn resolve_kernel_port_grant(
         .issue_permit(&intent, now_ms)
         .map_err(|_| PortGrantError::Permit)?;
     let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(authority)));
-    let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(BoundedParentSink::new());
+    // One bounded evidence sink instance, shared by every port that reports
+    // P-03 observations and by the read-only termination handle below, so
+    // the loop reads this child's own evidence and never a second sink.
+    let sink = Arc::new(BoundedParentSink::new());
+    let sink_port: Arc<dyn ProcessEvidenceSink> = Arc::clone(&sink) as Arc<dyn ProcessEvidenceSink>;
     let artifact_digest = Sha256Digest::of_bytes(&material.artifact_bytes);
     let owners = AdmittedOwnerPorts::resolve(
         material,
@@ -800,16 +812,16 @@ pub fn resolve_kernel_port_grant(
         engine_binding.clone(),
         artifact_digest.clone(),
     )?;
-    let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
+    let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_port));
     process
         .stage_admitted_request(issued)
         .map_err(|_| PortGrantError::Permit)?;
     // The verifier-side adapter never stages: its slot stays empty, so it
     // observes receipts and evidence but can never launch a second child.
-    let verifier = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
+    let verifier = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_port));
     let engine = IsolatedChildEngine::new(
         executor,
-        sink,
+        sink_port,
         engine_binding.clone(),
         artifact_digest,
         provider_configuration_digest(),
@@ -831,5 +843,8 @@ pub fn resolve_kernel_port_grant(
         ports,
         engine_binding,
         live,
+        // The read projection is bound to the exact intent this grant issued
+        // a permit for, so it can only ever report on that one child.
+        termination: ProcessTermination::new(sink, ProcessTerminationKey::from_intent(&intent)),
     })
 }

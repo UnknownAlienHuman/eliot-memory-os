@@ -6,7 +6,7 @@ use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, HostJson
 use eliot_protocol::{
     AgentHostRequestFailure, HARD_STRUCTURED_RESPONSE_BYTES, MAX_HOST_REQUEST_TEXT_BYTES,
 };
-use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
+use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding, admit_dispatch_surface};
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
@@ -21,9 +21,11 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection,
-    decode_protected_request_bytes, published_mcp_tool_surface, reject_duplicate_keys,
-    validate_proof_ceiling, validate_tool_request_owner,
+    McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, ToolRequest, ToolSchema,
+    TypedRejection, bind_act_owner_inputs, bind_list_surface_budget, canonical_tool_schemas,
+    classify_tool_request, decode_protected_request_bytes, is_act_request,
+    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
+    validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1129,6 +1131,33 @@ fn validate_application_request(
     }
     request.tool.validate().map_err(contract_violation)?;
     let semantic_profile = validate_tool_semantic_owner(&request.tool)?;
+    // I7.24 dispatch: join the live generated descriptor against the owner
+    // and carry the Kernel-verified task revisions into admission. Dispatch
+    // re-resolves live owners by method name on every call; no advertised
+    // disposition is trusted here, so hidden-by-name calls face the
+    // identical check. No grant owner is joined at this seam.
+    let live_descriptor = canonical_tool_schemas()
+        .map_err(|_| {
+            BridgeError::invalid("tool.name", "generated tool descriptors are unavailable")
+        })?
+        .into_iter()
+        .find(|descriptor| descriptor.name == request.tool.canonical_name())
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "tool.name",
+                "tool has no generated descriptor on the live surface",
+            )
+        })?;
+    let dispatch_task = dispatch_task_binding(request, &semantic_profile)?;
+    admit_dispatch_surface(
+        request.tool.canonical_name(),
+        &live_descriptor.definition_version,
+        &semantic_profile.method.definition_version,
+        &semantic_profile.profile_version,
+        dispatch_task.as_deref(),
+        None,
+    )
+    .map_err(|error| BridgeError::invalid("tool.name", error.to_string()))?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1181,6 +1210,67 @@ fn validate_tool_semantic_owner(
             format!("no registered semantic owner: {error}"),
         )
     })
+}
+
+/// Binds the Kernel-verified task identity and fence revision carried into
+/// dispatch admission. Pre-task discovery requests carry no task and bind
+/// `None` rather than an invented reference.
+///
+/// Issue #1742: an `eliot.act` request is not dispatched from its caller
+/// contributions alone. It takes the explicit
+/// [`bind_act_owner_inputs`](crate::bind_act_owner_inputs) path, which resolves
+/// the effect class from the single registered semantic owner, refuses a
+/// read-only downgrade of a material effect, and refuses an effectful action
+/// request whose retained fence carries no task/acceptance revision - the
+/// revision the applicable Decision Safety Floor and the phase-aware decision
+/// lineage must be bound to. The caller fields travel as non-evidence
+/// contributions, and every owner input still owed is named rather than
+/// fabricated here; the semantic owner resolves them downstream.
+fn dispatch_task_binding(
+    request: &ApplicationRequest,
+    semantic_profile: &crate::ToolSemanticProfile,
+) -> Result<Option<String>, BridgeError> {
+    let fence = request.identity.request.state_fence.clone();
+    let task_id = request
+        .identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned());
+    if !is_act_request(&request.tool) {
+        return Ok(task_ref(&fence, task_id.as_deref()));
+    }
+    let ToolRequest::Act(input) = &request.tool else {
+        return Err(BridgeError::invalid(
+            "tool.name",
+            "only an eliot.act request carries an action input",
+        ));
+    };
+    let requirement = classify_tool_request(&request.tool).map_err(|_| {
+        BridgeError::invalid(
+            "tool.name",
+            "eliot.act has no canonical operation requirement",
+        )
+    })?;
+    let binding = bind_act_owner_inputs(
+        input,
+        &requirement,
+        semantic_profile,
+        &fence,
+        task_id.as_deref(),
+    )?;
+    Ok(binding.owner_task_ref)
+}
+
+/// The exact task reference the dispatch gate is given for a non-action request.
+fn task_ref(fence: &eliot_contracts::StateFence, task_id: Option<&str>) -> Option<String> {
+    match (task_id, fence.task_revision) {
+        (Some(task), Some(revision)) => Some(format!("{task}@{}", revision.value())),
+        (Some(task), None) => Some(task.to_owned()),
+        (None, Some(revision)) => Some(format!("task-revision:{}", revision.value())),
+        (None, None) => None,
+    }
 }
 
 fn validate_active_session_binding(
@@ -2187,14 +2277,39 @@ pub fn initialize_result(version: NegotiatedWireVersion, server_version: &str) -
     })
 }
 
-/// Builds the `tools/list` result from the generated canonical schemas.
+/// Builds the no-task discovery `tools/list` result from the generated schemas.
 ///
 /// Every entry comes from `canonical_tool_schemas`, generated from the same
 /// `serde`/`schemars` contract types EBP clients use. A method with no
 /// registered semantic owner is absent here, so the listing follows the
 /// owner and never advertises an unimplemented tool.
+///
+/// Discovery carries no owner-supplied task conditions, so no task-relative
+/// narrowing applies here: the bridge never mints task, role, grant, or
+/// capability facts. Task-bound publication compiles a decision from real
+/// owner facts (#1745) and renders through
+/// [`tools_list_result_for_permitted_surface`], which shares the single
+/// projection below, so discovery and task-relative listings cannot drift.
 pub fn tools_list_result() -> Result<Value, WireRejection> {
-    canonical_tool_schemas_for_list()
+    let schemas = published_mcp_tool_surface().map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "generated tool schemas are unavailable",
+        )
+    })?;
+    render_tool_list_surface(&schemas)
+}
+
+/// Builds a task-relative `tools/list` result from a #1745 permitted subset.
+///
+/// The subset arrives already derived from a decision compiled over
+/// owner-supplied task conditions; this entry only projects it through the
+/// same envelopes, identity `_meta`, dialect record, and budget binding as
+/// discovery, so withheld methods stay absent without a second projection.
+pub fn tools_list_result_for_permitted_surface(
+    surface: &PermittedTaskSurface,
+) -> Result<Value, WireRejection> {
+    render_tool_list_surface(&surface.permitted)
 }
 
 /// Rejects a blank string wire identity before typed projection.
@@ -2284,6 +2399,26 @@ pub fn build_host_invocation(
             json!({ "tool": bound_wire_text(tool_name) }),
         ));
     }
+    // I7.24 call admission: carry the invoked surface/method/profile revisions
+    // through the shared dispatch gate. The wire carries no authenticated
+    // task or grant, so those bind as unresolved rather than invented; the
+    // bridge never mints them. Visibility is never consulted: a hidden
+    // method invoked by name admits through this identical check.
+    admit_dispatch_surface(
+        tool_name,
+        &descriptor.definition_version,
+        &owner.method.definition_version,
+        &owner.profile_version,
+        None,
+        None,
+    )
+    .map_err(|_| {
+        WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool surface revisions do not satisfy the dispatch contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        )
+    })?;
     reject_blank_wire_id(correlation)?;
     validate_correlation_text_budget(correlation)?;
     let correlation_projection = correlation.correlation_projection(HostCorrelationDomain::Request);
@@ -2680,14 +2815,18 @@ fn bound_wire_text(value: &str) -> String {
     }
 }
 
-fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
-    let schemas = published_mcp_tool_surface().map_err(|_| {
-        WireRejection::new(
-            WIRE_INTERNAL_ERROR,
-            "generated tool schemas are unavailable",
-        )
-    })?;
-    let tools: Vec<Value> = schemas
+/// Projects generated descriptors onto the single advertised list shape.
+///
+/// Presentation translates only the `tools/list` envelope keys: each
+/// descriptor's input and output schemas move verbatim, preserving
+/// referenced definitions, nested discriminators, and semantic constraints.
+/// Identity travels in the additive per-entry `_meta` (schema digest plus
+/// the definition version owned by the canonical version owner), and the
+/// list `_meta` records the one schema dialect every rendered schema
+/// declares, so a host that cannot represent it can withhold the surface
+/// instead of silently dropping constraints.
+fn render_tool_list_surface(descriptors: &[ToolSchema]) -> Result<Value, WireRejection> {
+    let tools: Vec<Value> = descriptors
         .iter()
         .map(|schema| {
             json!({
@@ -2702,7 +2841,63 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
             })
         })
         .collect();
-    Ok(json!({ "tools": tools }))
+    let dialect = list_schema_dialect(descriptors)?;
+    // I7.24 host catalogue projection: bind the actual rendered surface to
+    // its generated budget. The budget measures these exact entries; the
+    // additive `_meta` object carries the evidence without changing the
+    // `tools` array shape.
+    let budget = bind_list_surface_budget(&tools).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface budget is unavailable")
+    })?;
+    let budget_value = serde_json::to_value(&budget).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface budget is unavailable")
+    })?;
+    let mut meta = Map::new();
+    meta.insert("eliot/surfaceBudget".to_owned(), budget_value);
+    if let Some(dialect) = dialect {
+        meta.insert("eliot/schemaDialect".to_owned(), Value::String(dialect));
+    }
+    Ok(json!({
+        "tools": tools,
+        "_meta": Value::Object(meta),
+    }))
+}
+
+/// Reads the one schema dialect declared by every rendered schema.
+///
+/// The value comes from the generator's own `$schema` output, never from a
+/// second configuration, so the record cannot drift from what is served. An
+/// empty surface records no dialect; disagreement fails closed.
+fn list_schema_dialect(descriptors: &[ToolSchema]) -> Result<Option<String>, WireRejection> {
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+    let mut expected: Option<&str> = None;
+    for descriptor in descriptors {
+        for schema in [&descriptor.input_schema, &descriptor.output_schema] {
+            let Some(dialect) = schema
+                .get("$schema")
+                .and_then(Value::as_str)
+                .filter(|dialect| !dialect.is_empty())
+            else {
+                return Err(WireRejection::new(
+                    WIRE_INTERNAL_ERROR,
+                    "generated tool schemas disagree on schema dialect",
+                ));
+            };
+            match expected {
+                None => expected = Some(dialect),
+                Some(known) if known == dialect => {}
+                Some(_) => {
+                    return Err(WireRejection::new(
+                        WIRE_INTERNAL_ERROR,
+                        "generated tool schemas disagree on schema dialect",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(expected.map(str::to_owned))
 }
 
 #[cfg(test)]

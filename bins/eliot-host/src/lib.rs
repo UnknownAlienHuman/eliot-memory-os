@@ -270,7 +270,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostJobBranches::cutover_with_rollback",
         owner_state: "candidate/prior generations and artifacts",
         event: "host.cutover-rollback requested",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -278,7 +278,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostJobBranches::cutover_with_rollback",
         owner_state: "prior contour relaunched",
         event: "host.cutover-rollback restored",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -286,7 +286,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::cutover_generation",
         owner_state: "prior generation/registry/observations",
         event: "host.cutover-rollback reactivated",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -966,7 +966,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::cutover_generation (candidate arm)",
         owner_state: "candidate generation/registry",
         event: "propagated: candidate launch observed at start-manifest boundary",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -1120,6 +1120,38 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         event: "host.wake-satisfied observed",
         caller: "main::HostIdleDrainSupervisor::observe_readiness",
         test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "backup-cutover.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover",
+        owner_state: "admitted cutover body/evidence/retirement fence",
+        event: "host-backup-cutover-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "backup-cutover-disposition.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover_disposition",
+        owner_state: "durable cutover intent/registry/retirement records",
+        event: "host-backup-cutover-disposition-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "backup-prepare.terminal",
+        source_item: "HostComposition::backup_dispatch_prepare",
+        owner_state: "caller auth, owner lease/installation binding, owner evidence, registry-revision fence, journal persistence",
+        event: "host-backup-prepare-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "backup-cutover-retire.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover_retire",
+        owner_state: "admitted cutover body/retirement barrier/authorization",
+        event: "host-backup-cutover-retire-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
     },
 ];
 
@@ -1418,6 +1450,21 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
+// F-LOG-HOST-8 (#983 W4): the three admitted cutover dispatch arms are the
+// outer caller boundaries for one failed cutover operation, so each arms the
+// crate's own `HostTerminalGuard` and owns exactly one terminal record. The
+// leaf `backup_cutover` phase/refusal records stay nonterminal and correlate
+// beneath the armed guard by emission order; there is no dedup cache, and each
+// code keeps its own operation distinct from its siblings and from any process
+// shutdown failure (`host-stop-failed`, `host-open-failed`).
+const BOUNDARY_BACKUP_CUTOVER_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-failed");
+const BOUNDARY_BACKUP_PREPARE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-prepare-failed");
+const BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-disposition-failed");
+const BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-retire-failed");
 
 /// Static identifiers for the propagated-to-boundary exclusions (#891 case
 /// 1): the table rows that own no emission because a coordinated child
@@ -1487,7 +1534,8 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
-    HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
+    HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
     HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
     UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
@@ -1532,6 +1580,8 @@ use std::io;
 #[cfg(windows)]
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::Arc;
 #[cfg(all(windows, test))]
 type Duration = std::time::Duration;
 #[cfg(windows)]
@@ -4736,7 +4786,6 @@ impl HostJobBranches {
     /// the prior approved contour fails.
     #[allow(
         clippy::too_many_arguments,
-        dead_code,
         reason = "candidate and rollback authority sets stay explicit to prevent cross-generation substitution"
     )]
     fn cutover_with_rollback(
@@ -5517,6 +5566,104 @@ pub enum BackupDispatchTarget {
     Cutover,
 }
 
+/// The exact closed prepare/cutover dispatch table this Host composition
+/// registers on the canonical Host runtime-control endpoint (#962).
+///
+/// It is the composition's own [`HostComposition::register_backup_dispatch`]
+/// entries expressed in the endpoint's [`AcceptedOwnerMethod`] row type, so
+/// the endpoint admits against one row shape and the routing below stays
+/// load-bearing. `PREPARE_ISOLATED_RESTORE` is the preparation owner
+/// operation and carries no cutover admission; `ADMIT_CUTOVER` is the
+/// separately admitted cutover owner operation. Every other method the
+/// endpoint accepts has no row here and therefore no owner operation.
+#[cfg(windows)]
+const HOST_BACKUP_DISPATCH_REGISTRATION: &[eliot_host_control_endpoint::AcceptedOwnerMethod] = &[
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::PrepareIsolatedRestore,
+        false,
+    ),
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::AdmitCutover,
+        true,
+    ),
+];
+
+/// The registered Host backup owner for the canonical Host runtime-control
+/// pipe (#962).
+///
+/// It owns only the typed dispatch decision: it resolves the admitted
+/// operation through the composition's own
+/// [`HostComposition::backup_dispatch_target`] and
+/// [`HostComposition::backup_dispatch_needs_cutover_admission`] routing and
+/// refuses every operation that has no registered owner row — a rehearsal
+/// completion, a capture or page read, an archive verification, a restore
+/// step, and every accepted method the composition did not register — before
+/// any effect. It opens no pipe, decodes no frame, authenticates no peer,
+/// admits no capability, and computes no digest.
+///
+/// The owner effect for the resolved target is
+/// [`HostComposition::backup_dispatch_prepare`] and
+/// [`HostComposition::backup_dispatch_cutover`]. Both need an owner-issued
+/// admitted body that the closed `#954`
+/// [`BackupRuntimeControlRequest`] envelope does not carry and that this
+/// composition does not retain, so this owner refuses them with a bounded
+/// typed refusal instead of fabricating an owner-issued body from a payload
+/// claim. That refusal is the honest pre-effect answer; the admitted bodies
+/// are the stitching phase's input.
+#[cfg(windows)]
+pub struct HostBackupDispatchOwner;
+
+#[cfg(windows)]
+impl HostBackupDispatchOwner {
+    /// Binds the owner to the exact closed prepare/cutover dispatch table.
+    #[must_use]
+    pub fn accepted() -> Self {
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
+    fn dispatch_backup_operation(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), eliot_host_control_endpoint::BackupDispatchRefusal> {
+        use eliot_host_control_endpoint::BackupDispatchRefusal;
+        let operation = request.operation;
+        let refusal = |reason: &'static str| BackupDispatchRefusal::new(operation, reason);
+        // Rehearsal completion resolves to no cutover admission, so it can
+        // never select the cutover owner operation. The assertion pins the
+        // excluded-rehearsal contract on the real routing path.
+        debug_assert!(!eliot_host_control_endpoint::rehearsal_resolves_cutover());
+        // The type-checked routing is the decision: a table marker string is
+        // never followed.
+        let Some(target) = HostComposition::backup_dispatch_target(operation) else {
+            return Err(refusal(
+                "no Host backup owner operation is registered for this method",
+            ));
+        };
+        // The routing's cutover-admission bit and the endpoint's own closed
+        // accepted table must agree; divergence is a stale registration and
+        // fails before effects rather than running an operation the endpoint
+        // did not admit.
+        if HostComposition::backup_dispatch_needs_cutover_admission(operation)
+            != eliot_host_control_endpoint::backup::requires_cutover_admission(operation)
+        {
+            return Err(refusal(
+                "registered cutover admission diverges from the accepted Host backup table",
+            ));
+        }
+        Err(refusal(match target {
+            BackupDispatchTarget::Prepare => {
+                "no owner-issued admitted isolated-restore preparation is retained by this Host"
+            }
+            BackupDispatchTarget::Cutover => {
+                "no separately admitted cutover body is retained by this Host"
+            }
+        }))
+    }
+}
+
 impl HostComposition {
     /// Opens one short-lived installation-registry handle below the retained
     /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
@@ -5616,6 +5763,44 @@ impl HostComposition {
         // wiring-only, no backup operation runs here.
         Self::validate_backup_dispatch_prepare_routing(dispatch);
         dispatch
+    }
+
+    /// Builds the registered Host backup owner for the canonical Host
+    /// runtime-control endpoint (#962).
+    ///
+    /// The owner carries the exact closed prepare/cutover dispatch table in
+    /// the endpoint's own [`AcceptedOwnerMethod`] row type, so the endpoint
+    /// admits against one table shape and the composition's routing stays
+    /// load-bearing. Construction cross-checks that table against
+    /// [`HostComposition::register_backup_dispatch`] and against the
+    /// endpoint's own accepted Host backup table, so a registration that
+    /// diverges from the routing refuses instead of serving a stale table.
+    /// Registration only: no pipe is opened, no task is started, and no
+    /// backup effect runs here.
+    #[cfg(windows)]
+    fn backup_owner_registration() -> HostBackupOwnerRegistration {
+        use eliot_host_control_endpoint::backup;
+        for (operation, _, needs_cutover_admission) in Self::register_backup_dispatch() {
+            let Some(row) = backup::accepted_host_backup_methods()
+                .iter()
+                .find(|row| row.op == operation)
+            else {
+                continue;
+            };
+            assert_eq!(
+                row.needs_cutover_admission, needs_cutover_admission,
+                "registered backup dispatch diverges from the accepted Host backup table"
+            );
+            assert_eq!(
+                row.wire_id,
+                operation.wire_id(),
+                "registered backup dispatch carries a drifted wire identity"
+            );
+        }
+        HostBackupOwnerRegistration::new(
+            HOST_BACKUP_DISPATCH_REGISTRATION,
+            Arc::new(HostBackupDispatchOwner::accepted()),
+        )
     }
 
     /// Validates the accepted backup dispatch routing shared by
@@ -5766,11 +5951,20 @@ impl HostComposition {
         ),
         crate::backup_preparation::PreparationError,
     > {
+        // F-LOG-HOST-8 (#983 W4): this admitted preparation port is the outer
+        // caller boundary for one failed preparation operation, so it owns the
+        // single terminal record. Armed on entry and disarmed on the success
+        // return only; the leaf's `backup_preparation` phase/refusal records
+        // stay nonterminal and correlate beneath it. Operation failure stays
+        // distinct from a separate process shutdown failure.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_PREPARE_TERMINAL);
         // Route through the shared dispatch validation before delegating:
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        self.prepare_backup_destination(journal, caller, request)
+        let prepared = self.prepare_backup_destination(journal, caller, request)?;
+        host_terminal.disarm();
+        Ok(prepared)
     }
 
     /// Dispatches one admitted installation cutover through the existing
@@ -5848,6 +6042,13 @@ impl HostComposition {
             admitted_cutover_operation, execute_cutover, plan_cutover_attempt,
             reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
+        // F-LOG-HOST-8 (#983 W4): this admitted cutover port is the outer
+        // caller boundary, so it owns the single terminal record per failed
+        // cutover operation. Armed on entry and disarmed on every success
+        // return; the leaf's `backup_cutover` phase/refusal records stay
+        // nonterminal and correlate beneath it. Operation failure stays
+        // distinct from a separate process shutdown failure.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_TERMINAL);
         // Real dispatch decision, resolved from the admitted cutover payload
         // itself rather than from the routing table: the presented body must
         // first prove it is the body the owner admitted, and only then does the
@@ -5920,6 +6121,7 @@ impl HostComposition {
         // is returned exactly as its owner observation produced it, so this
         // read model can never restate a retained unknown as progress (#2737).
         if committed.disposition != CutoverDisposition::Committed {
+            host_terminal.disarm();
             return Ok((committed, barrier));
         }
         // The registry and the journal are separate owners with no shared
@@ -5981,6 +6183,7 @@ impl HostComposition {
             coherence,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
+            host_terminal.disarm();
             return Ok((reconciled, barrier));
         }
         // Reached only when the projection above DID return `RetirementPending`,
@@ -5988,6 +6191,7 @@ impl HostComposition {
         // operation-bound receipt. A torn pair returned `Unknown` +
         // `ConcurrentOwnerMovement` at the branch above, so the proven
         // `Committed` never reaches here unreported.
+        host_terminal.disarm();
         Ok((committed, barrier))
     }
 
@@ -6027,7 +6231,16 @@ impl HostComposition {
         request: &crate::backup_cutover::CutoverRequest,
         retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
     ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
-        crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)
+        // F-LOG-HOST-8 (#983 W4): the disposition read is its own operation,
+        // so it owns its own single terminal record, distinct from the
+        // admitted cutover port and from any process shutdown failure. The
+        // leaf's read-failure observation stays nonterminal beneath it.
+        let mut host_terminal =
+            HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL);
+        let outcome =
+            crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;
+        host_terminal.disarm();
+        Ok(outcome)
     }
 
     /// Executes the separately authorized prior-generation retirement that
@@ -6077,6 +6290,12 @@ impl HostComposition {
         use crate::backup_cutover::{
             CutoverError, admitted_cutover_operation, retire_authorized_generation,
         };
+        // F-LOG-HOST-8 (#983 W4): the separately authorized retirement is its
+        // own operation with its own single terminal record, distinct from the
+        // cutover port and the disposition read, and distinct from any process
+        // shutdown failure. The leaf's `retire` refusal records stay
+        // nonterminal beneath it.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL);
         // Same admitted-payload resolution as the activation port: the body
         // must prove it is the body the owner admitted, and the separately
         // supplied selector must then agree with the operation that body
@@ -6089,7 +6308,15 @@ impl HostComposition {
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        retire_authorized_generation(self, request, evidence, barrier, retirement_authorization)
+        let retired = retire_authorized_generation(
+            self,
+            request,
+            evidence,
+            barrier,
+            retirement_authorization,
+        )?;
+        host_terminal.disarm();
+        Ok(retired)
     }
 
     /// Opens the durable Host contour for one installation identity and
@@ -7013,7 +7240,12 @@ impl HostComposition {
             std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
         )
-        .map_err(HostError::Platform)?;
+        .map_err(HostError::Platform)?
+        // Register the accepted prepare/cutover backup dispatch on the
+        // endpoint that already serves the canonical Host runtime-control
+        // pipe (#962). Registration only: it starts no task and opens no
+        // second pipe, so it cannot delay readiness.
+        .with_backup_owner(Self::backup_owner_registration());
         host_terminal.disarm();
         host_lifecycle_observe_scm(BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
         Ok(control)
@@ -8565,9 +8797,8 @@ impl HostComposition {
     /// cutover or rollback fails, or the registry cannot be persisted.
     #[cfg(windows)]
     #[allow(
-        clippy::too_many_lines,
         dead_code,
-        reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
+        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches the contour without one"
     )]
     fn cutover_generation(
         &mut self,
@@ -8587,9 +8818,6 @@ impl HostComposition {
                 "cutover pending generation does not match request".to_owned(),
             ));
         }
-        let prior = self.registry.active().cloned().ok_or_else(|| {
-            HostError::ProcessContour("no active generation to cut over".to_owned())
-        })?;
         let candidate = self
             .registry
             .generations()
@@ -8599,6 +8827,95 @@ impl HostComposition {
             .ok_or_else(|| {
                 HostError::ProcessContour("candidate generation is not approved".to_owned())
             })?;
+        self.cutover_generation_contour(
+            &candidate,
+            Some(&pending),
+            candidate_kernel,
+            candidate_store,
+            prior_kernel,
+            prior_store,
+        )?;
+        self.commit_pending_durable(&pending, &host_capability)?;
+        Ok(())
+    }
+
+    /// Records this contour's failure in the installer's staged pending
+    /// activation, when that activation exists.
+    ///
+    /// The staged pending activation is the recovery carrier for the
+    /// candidate-cutover failure arms and exists only for the installer-owned
+    /// activation that stages one. An installation cutover (#961) activates
+    /// through its own durable cutover-intent record and stages no installer
+    /// activation, so it dispatches the contour with `None` and this never
+    /// writes the installer's recovery record on its behalf: there is no
+    /// synthesized pending activation and no second recovery owner.
+    #[cfg(windows)]
+    fn persist_contour_pending_recovery(
+        &mut self,
+        pending: Option<&eliot_installation::PendingActivation>,
+        reason: &str,
+    ) -> Result<(), HostError> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        // The same live owner-lease capability the installer cutover captured
+        // before the launch; the lease is not mutated by the contour, so the
+        // value is identical.
+        let host_capability = self.owner_lease.activation_capability();
+        let registry_root = self.registry_host_root.clone();
+        persist_pending_recovery(
+            &registry_root,
+            &mut self.registry,
+            &host_capability,
+            pending,
+            reason,
+        )
+    }
+
+    /// Runs the ordered durable process contour of one approved-generation
+    /// cutover: resolve the prior generation and both child artifact sets,
+    /// launch the candidate beside the prior image, and on any rejection
+    /// restore and durably reactivate the prior contour before the rejection
+    /// is reported.
+    ///
+    /// This is the ordered sequence the installer cutover has always run, with
+    /// two owner decisions deliberately left to the caller that owns them: the
+    /// staged-pending-activation precondition and the trailing durable commit.
+    /// The #961 installation cutover dispatches this identical sequence from the
+    /// admitted cutover path once its own durable cutover intent is `Pending`,
+    /// so that path moves the live process contour and not only the registry
+    /// generation, under the same owner (A13.7 cutover is a governed
+    /// transition; I14.14 the old route never revives).
+    ///
+    /// `candidate` is the exact approved candidate generation the caller
+    /// resolved from its own owner readback, and the prior generation is read
+    /// here from this composition's approved-generation registry exactly as the
+    /// installer cutover always read it. `pending` is the installer's staged
+    /// activation, the recovery carrier for the failure arms below; see
+    /// [`Self::persist_contour_pending_recovery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either generation is invalid, the candidate
+    /// cannot be launched, or the prior contour cannot be restored and durably
+    /// reactivated.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
+    )]
+    fn cutover_generation_contour(
+        &mut self,
+        candidate: &eliot_installation::ApprovedGeneration,
+        pending: Option<&eliot_installation::PendingActivation>,
+        candidate_kernel: impl AsRef<Path>,
+        candidate_store: impl AsRef<Path>,
+        prior_kernel: impl AsRef<Path>,
+        prior_store: impl AsRef<Path>,
+    ) -> Result<(), HostError> {
+        let prior = self.registry.active().cloned().ok_or_else(|| {
+            HostError::ProcessContour("no active generation to cut over".to_owned())
+        })?;
         let (candidate_kernel_artifact, candidate_store_artifact) = candidate
             .manifest
             .host_child_artifact_digests()
@@ -8641,25 +8958,14 @@ impl HostComposition {
         let launch = match result {
             Ok(launch) => launch,
             Err(error) => {
-                let registry_root = self.registry_host_root.clone();
-                persist_pending_recovery(
-                    &registry_root,
-                    &mut self.registry,
-                    &host_capability,
-                    &pending,
-                    &error.to_string(),
-                )?;
+                self.persist_contour_pending_recovery(pending, &error.to_string())?;
                 return Err(error);
             }
         };
         if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
             let cleanup = self.cleanup_launched_contour(error);
-            let registry_root = self.registry_host_root.clone();
-            persist_pending_recovery(
-                &registry_root,
-                &mut self.registry,
-                &host_capability,
-                &pending,
+            self.persist_contour_pending_recovery(
+                pending,
                 "prior Kernel termination evidence failed",
             )?;
             return cleanup;
@@ -8686,13 +8992,7 @@ impl HostComposition {
                     "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
                 )));
             }
-            if let Err(error) = persist_pending_recovery(
-                &self.registry_host_root.clone(),
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                candidate_error,
-            ) {
+            if let Err(error) = self.persist_contour_pending_recovery(pending, candidate_error) {
                 return self.cleanup_active_kernel_contour(error, "rollback-registry-save-failed");
             }
             if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
@@ -8748,13 +9048,7 @@ impl HostComposition {
                 )));
             }
             let reason = candidate_error.to_string();
-            if let Err(error) = persist_pending_recovery(
-                &self.registry_host_root.clone(),
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                &reason,
-            ) {
+            if let Err(error) = self.persist_contour_pending_recovery(pending, &reason) {
                 return self.cleanup_active_kernel_contour(error, "rollback-registry-save-failed");
             }
             if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
@@ -8770,17 +9064,9 @@ impl HostComposition {
             let reason = error.to_string();
             let cleanup =
                 self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
-            let registry_root = self.registry_host_root.clone();
-            persist_pending_recovery(
-                &registry_root,
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                &reason,
-            )?;
+            self.persist_contour_pending_recovery(pending, &reason)?;
             cleanup
         } else {
-            self.commit_pending_durable(&pending, &host_capability)?;
             Ok(())
         }
     }
@@ -8856,6 +9142,28 @@ impl HostComposition {
         // reconcile's own outcome rather than becoming one: this contour is a
         // process/readiness reconcile, not a cutover gate, so a cutover
         // disposition is never allowed to steer it.
+        //
+        // The corroboration lives in the projection, not here, and the value is
+        // deliberately not consumed by this caller. The observed artifact is
+        // the `observe_cutover_progress` record the projection emits, and that
+        // projection resolves the disposition from BOTH owners on one
+        // coherence-bracketed read, applying the same arms in the same order
+        // `reconcile_cutover_outcome` applies to the same durable state: a
+        // retained intent whose target is the active generation is reported
+        // `RetirementPending` only when the registry's own operation-bound
+        // receipt names this operation, and `Unknown` otherwise; a retained
+        // `Pending` intent reaches `Prepared` only when the installation
+        // registry's active generation is still the intent's own durable
+        // `expected_predecessor` and the cross-store pair read as one moment.
+        // So a journal slot alone cannot emit `Prepared` for a state the full
+        // owner read model calls ambiguous, and cannot emit a settlement claim
+        // either — which is what "nothing downstream to correct" means here: no
+        // observed word overstates what its two owners proved. It does NOT mean
+        // the two paths are word-identical: the resolved retirement evidence is
+        // not an input to this read, so a cutover the retirement owner has
+        // already settled is `Reconciled` on the two-owner read model and only
+        // its recorded `Committed` word here. Nothing here needs the returned
+        // outcome, and reading it would add a gate this contour does not have.
         let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {

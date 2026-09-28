@@ -34,7 +34,7 @@ pub enum ToolExposureError {
     NoProgress { signal: LoopSignal },
 }
 
-fn text(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
     if value.trim().is_empty() {
         return Err(ToolExposureError::InvalidField {
             field,
@@ -50,7 +50,7 @@ fn text(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
     Ok(())
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
     if value.len() != 64
         || !value
             .bytes()

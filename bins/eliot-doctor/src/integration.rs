@@ -138,7 +138,20 @@ pub fn hash_file(path: &Path) -> Result<String, IntegrationError> {
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
+/// Install receipt contract minted by `eliot plugin install`
+/// (`bins/eliot/src/plugin_preview.rs::install_with_rollback`). A document
+/// carrying this contract is the preview-minted record itself — not a
+/// hand-transcribed expectation — and is bound through
+/// [`expectation_from_install_receipt`].
+const INSTALL_RECEIPT_CONTRACT: &str = "eliot.plugin.install";
+
 /// Loads an expectation document. The path must be absolute.
+///
+/// Two shapes are admitted: a plain expectation record (the
+/// [`IntegrationExpectation`] contract), or the install receipt minted by
+/// `eliot plugin install`, whose embedded preview record becomes the
+/// expectation after its digest binding is verified. Verification mismatches
+/// stay data inside the report either way; only malformed inputs are `Err`.
 pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, IntegrationError> {
     if !path.is_absolute() {
         return Err(IntegrationError::InputInvalid(
@@ -149,11 +162,84 @@ pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, Integrati
         path: path.display().to_string(),
         detail: error.to_string(),
     })?;
-    let expectation: IntegrationExpectation = serde_json::from_slice(&bytes)
+    let document: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| IntegrationError::InputInvalid(error.to_string()))?;
+    if document.get("contract").and_then(serde_json::Value::as_str)
+        == Some(INSTALL_RECEIPT_CONTRACT)
+    {
+        return expectation_from_install_receipt(&document);
+    }
+    let expectation: IntegrationExpectation = serde_json::from_value(document)
         .map_err(|error| IntegrationError::InputInvalid(error.to_string()))?;
     if expectation.profile.trim().is_empty() {
         return Err(IntegrationError::InputInvalid(
             "expectation profile must be non-empty".to_owned(),
+        ));
+    }
+    Ok(expectation)
+}
+
+/// Extracts the verification expectation from an install receipt, binding
+/// post-installation verification to the exact preview record the
+/// installation was previewed with.
+///
+/// Fail-closed input checks only; observation authority is unchanged. The
+/// receipt's embedded `preview.expected_coverage_profile` becomes the
+/// expectation, and only after two coherence proofs: the embedded `preview`
+/// object re-hashes to the receipt's `preview_digest`
+/// (`sha256_hex(canonical_json_bytes(preview))`, the same rule the preview
+/// front door mints), and the coverage profile names the receipt's own
+/// `profile`. A missing digest, a digest mismatch, or a cross-profile chain
+/// is a typed input error, never a degraded verification: checking against
+/// bytes the preview never minted could promote a forged expectation into an
+/// installed claim.
+fn expectation_from_install_receipt(
+    document: &serde_json::Value,
+) -> Result<IntegrationExpectation, IntegrationError> {
+    let profile = document
+        .get("profile")
+        .and_then(serde_json::Value::as_str)
+        .filter(|profile| !profile.trim().is_empty())
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no non-empty profile".to_owned(),
+            )
+        })?;
+    let preview = document.get("preview").ok_or_else(|| {
+        IntegrationError::InputInvalid(
+            "install receipt carries no preview record to verify against".to_owned(),
+        )
+    })?;
+    let digest = document
+        .get("preview_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no preview digest; refusing to verify against an unbound record"
+                    .to_owned(),
+            )
+        })?;
+    let recomputed = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(preview)
+            .map_err(|error| IntegrationError::InputInvalid(error.to_string()))?,
+    );
+    if recomputed != digest {
+        return Err(IntegrationError::InputInvalid(
+            "install receipt preview digest mismatch: the embedded preview record does not match preview_digest; refusing a drifted expectation"
+                .to_owned(),
+        ));
+    }
+    let coverage = preview.get("expected_coverage_profile").ok_or_else(|| {
+        IntegrationError::InputInvalid(
+            "install receipt preview carries no expected coverage profile".to_owned(),
+        )
+    })?;
+    let expectation: IntegrationExpectation = serde_json::from_value(coverage.clone())
+        .map_err(|error| IntegrationError::InputInvalid(error.to_string()))?;
+    if expectation.profile != profile {
+        return Err(IntegrationError::InputInvalid(
+            "install receipt coverage profile names a different profile than the receipt"
+                .to_owned(),
         ));
     }
     Ok(expectation)
@@ -244,6 +330,11 @@ pub fn evaluate(
 /// machine-readable contract JSON. Verification mismatches are data inside
 /// the returned JSON; only input errors (including a cross-profile
 /// expectation record) are `Err`.
+///
+/// The expectation may be the install receipt minted by `eliot plugin
+/// install`: its digest-bound embedded preview then becomes the expectation,
+/// so verification checks the installation against the record it was
+/// previewed with rather than a retyped copy.
 ///
 /// Authority rule: file hashes come from real readback — every named target
 /// is re-hashed here and the caller-supplied `actual_file_hashes` map never

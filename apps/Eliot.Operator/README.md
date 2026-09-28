@@ -7,17 +7,31 @@ independent authoritative cache.
 
 ## Toolchain
 
-Pinned toolchain, taken from `Eliot.Operator.csproj` and
-`packages.lock.json` (not from memory):
+Pinned toolchain, taken from the four sources the identity is compared across
+and not from memory:
 
-- Target framework `net10.0-windows10.0.19041.0`, minimum platform
-  `10.0.17763.0`, `PlatformTarget`/`Platforms` `x64`;
-- .NET 10 SDK — the resolved SDK is whatever `dotnet --version` reports for the
-  machine; the project does not pin an SDK patch release and no README claim
-  substitutes for `dotnet --version`;
-- `Microsoft.WindowsAppSDK` `2.3.1` — `PackageReference` in
-  `Eliot.Operator.csproj` and the `resolved` version in `packages.lock.json`;
-- unpackaged (`WindowsPackageType=None`), self-contained `win-x64`.
+- **Project metadata** — `Eliot.Operator.csproj`: `TargetFramework`
+  `net10.0-windows10.0.19041.0`, `TargetPlatformMinVersion` `10.0.17763.0`,
+  `Platforms`/`PlatformTarget` `x64`, `RuntimeIdentifier` `win-x64`,
+  `WindowsPackageType` `None`, `SelfContained` `true`,
+  `WindowsAppSDKSelfContained` `true`, `UseWinUI` `true`, and the single
+  `PackageReference` `Microsoft.WindowsAppSDK` `Version` `2.3.1`.
+- **Dependency lock** — `packages.lock.json`, under
+  `dependencies."net10.0-windows10.0.19041"."Microsoft.WindowsAppSDK"`:
+  `"type": "Direct"`, `"requested": "[2.3.1, )"`, `"resolved": "2.3.1"`.
+- **Publish evidence** — `OPERATOR_BUILD_RECEIPT.json`, schema
+  `eliot-operator-build-receipt-v2`, written into the publish directory by the
+  `WriteOperatorBuildReceipt` MSBuild target
+  (`Eliot.Operator.csproj`, `AfterTargets="Publish"`) which shells out to
+  `scripts/write-operator-build-receipt.ps1`. The identity fields are
+  `target_framework`, `runtime_identifier`, `platform`, `configuration`,
+  `windows_app_sdk_version`, `restore_locked_mode`, `packages_lock_sha256`,
+  `csproj_sha256`, `source_inputs[]`, `producer`, `contracts`, `sdk`, `build`,
+  `artifact` and `artifacts`.
+- **.NET SDK** — the resolved SDK is whatever `dotnet --version` reports for the
+  machine; the project pins no SDK patch release and no README claim
+  substitutes for `dotnet --version`. The publish receipt records the observed
+  `sdk.dotnet_sdk` and `sdk.msbuild_version` instead of asserting one here.
 
 Build and publish with an installed x64 .NET 10 SDK:
 
@@ -25,6 +39,43 @@ Build and publish with an installed x64 .NET 10 SDK:
 dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
 dotnet publish apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --self-contained true -o dist/windows-x64/Eliot.Operator
 ```
+
+**That publish command emits no publish evidence.** The
+`WriteOperatorBuildReceipt` target is guarded by
+`Condition="'$(OperatorBuildReceiptPath)' != ''"`, and the command above passes
+no `OperatorBuildReceiptPath`, so the receipt is not produced and
+`Get-VerifiedOperatorBuildReceipt`
+(`scripts/build-eliot-windows-x64-release.ps1`) refuses the directory. The
+evidence-producing path is the release builder, which owns the publish
+directory, passes `-p:RestoreLockedMode=true` and
+`-p:OperatorBuildReceiptPath=...`, and then verifies the result:
+
+```powershell
+pwsh -NoProfile -File scripts/build-eliot-windows-x64-release.ps1 -BuildOperator
+```
+
+### What is enforced about this identity, and what is not
+
+Stated precisely, because a README that implies more enforcement than exists
+is worse than one that states the gap:
+
+- **Enforced.** `dotnet restore --locked-mode` fails with `NU1004` when the
+  csproj `PackageReference` range stops matching the lock's `requested` range,
+  so project-metadata-to-lock drift on the *requested* range cannot reach a
+  build. The receipt is bound to the source commit by SHA-256 over the csproj,
+  the lock and the protocol contract, and
+  `Get-VerifiedOperatorBuildReceipt` re-derives those digests and compares
+  `receipt.windows_app_sdk_version` against the csproj `PackageReference`
+  before the publish directory is consumed.
+- **Not enforced anywhere in this repository.** Nothing value-compares the
+  lock's `resolved` version against the csproj `requested` version. Measured on
+  the committed bytes: editing `resolved` to `2.2.0` while leaving
+  `requested` as `[2.3.1, )` still restores with `--locked-mode` at exit 0,
+  and the receipt binds the lock by digest alone, so the digest agrees with
+  whatever the lock says. Closing that needs a value comparison in
+  `scripts/write-operator-build-receipt.ps1` or in
+  `Get-VerifiedOperatorBuildReceipt`; `scripts/**` is outside this project's
+  mutable scope, so the gap is recorded here rather than papered over.
 
 ## One-shot handoff and reconnect
 

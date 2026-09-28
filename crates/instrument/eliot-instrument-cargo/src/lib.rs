@@ -3,17 +3,26 @@
 //! This adapter owns Cargo's provider-facing policy and result projection. It
 //! does not spawn a process, read the filesystem, mint a fence, or interpret
 //! output as proof. Those effects are supplied by the two explicit ports below.
+//!
+//! [`parse_jsonl`] projects Cargo's own `--message-format=json` message stream:
+//! diagnostic counters, the terminal `build-finished` outcome, and the artifact
+//! identity Cargo reports for each produced artifact. It is a bounded
+//! projection of real output only — it never reconstructs a message, never
+//! treats an unterminated stream as a clean build, and never becomes a
+//! verification verdict on its own.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
-use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
+use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation, VerificationOutcome};
 use eliot_process::{
     CancellationReceipt, ExitDisposition, ExitStatus, OperationId, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
     ProcessRequest, ProcessStartReceipt,
 };
+use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 /// Stable identity of the Cargo adapter.
@@ -54,6 +63,18 @@ pub enum CargoAdapterError {
     /// The physical executor returned a receipt for a different generation.
     #[error("Cargo process receipt does not preserve the bound generation")]
     GenerationMismatch,
+    /// The captured message stream exceeds the bounded capture limit.
+    #[error("Cargo message stream exceeds the bounded capture limit")]
+    OutputTooLarge,
+    /// One message line exceeds the bounded per-line limit.
+    #[error("Cargo message stream contains an oversized line")]
+    LineTooLarge,
+    /// The stream is not a valid Cargo `--message-format=json` message stream.
+    #[error("Cargo emitted a malformed message stream")]
+    MalformedMessage,
+    /// A diagnostic counter overflowed its bounded type.
+    #[error("Cargo diagnostic counter overflowed")]
+    CounterOverflow,
 }
 
 /// The immutable pair passed between the adapter's admission and execution
@@ -250,6 +271,211 @@ fn successful_exit(exit: &ExitStatus) -> bool {
         .ok()
         .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
         .is_some_and(|code| code == 0)
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable Cargo message stream
+// ---------------------------------------------------------------------------
+
+/// Content type of Cargo's newline-delimited `--message-format=json` stream.
+///
+/// Cargo writes one JSON message per line to stdout. Its stderr carries plain
+/// progress text (`Compiling`, `Downloading`, …) which is never parsed as a
+/// message: concatenating it would turn ordinary progress into malformed
+/// messages and could hide a split line boundary.
+pub const CARGO_MESSAGE_CONTENT_TYPE: &str = "application/json";
+/// Maximum complete Cargo message stream accepted by the bounded parser.
+pub const MAX_CARGO_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MESSAGE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Artifact identity retained from one `compiler-artifact` message.
+///
+/// This is the identity Cargo itself reports for a produced artifact: the
+/// package that owns it, the target it was produced for, the exact executable
+/// path when the artifact is executable, and the produced filenames. It is
+/// observation, never inference: nothing is derived from a path spelling, a
+/// branch name, or a caller string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoArtifactRecord {
+    /// Exact `package_id` Cargo reported for the artifact.
+    pub package_id: String,
+    /// Exact target name the artifact was produced for.
+    pub target_name: String,
+    /// Target kinds Cargo reported (for example `lib`, `bin`, `test`).
+    pub target_kinds: Vec<String>,
+    /// Executable path Cargo reported, when the artifact is an executable.
+    pub executable: Option<String>,
+    /// Exact produced filenames, in Cargo's own order.
+    pub filenames: Vec<String>,
+}
+
+/// Bounded projection of one real Cargo message stream.
+///
+/// Diagnostic counters and the terminal `build-finished` outcome come from
+/// Cargo's own messages. Lint codes are deliberately *not* projected here: the
+/// Clippy lint projection over the same JSON dialect is owned by
+/// `eliot_instrument_rustc::parse_clippy_jsonl`, so one stream has exactly one
+/// owner per fact instead of two normalizers over one stream.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CargoReport {
+    /// Number of `error` diagnostics Cargo reported.
+    pub errors: u32,
+    /// Number of `warning` diagnostics Cargo reported.
+    pub warnings: u32,
+    /// Number of `note` and `help` diagnostics Cargo reported.
+    pub informational: u32,
+    /// Artifact identities retained from the stream, in first-seen order.
+    pub artifacts: Vec<CargoArtifactRecord>,
+    /// Terminal `build-finished` success flag, when the stream reported one.
+    pub build_finished: Option<bool>,
+}
+
+impl CargoReport {
+    /// Maps the observed messages to the conservative verification algebra.
+    ///
+    /// A reported failure, or any error diagnostic, is [`VerificationOutcome::Fail`].
+    /// A stream that never reported `build-finished` is
+    /// [`VerificationOutcome::Unknown`], never Pass: a truncated or interrupted
+    /// capture is not a successful build. Warnings alone never fail a build.
+    pub fn outcome(&self) -> VerificationOutcome {
+        if self.build_finished == Some(false) || self.errors != 0 {
+            VerificationOutcome::Fail
+        } else if self.build_finished == Some(true) {
+            VerificationOutcome::Pass
+        } else {
+            VerificationOutcome::Unknown
+        }
+    }
+
+    /// Maps the semantic result to execution status without conflating a
+    /// failed build with a failed process launch.
+    pub fn execution_status(&self) -> ExecutionStatus {
+        match self.outcome() {
+            VerificationOutcome::Pass => ExecutionStatus::Succeeded,
+            VerificationOutcome::Cancelled => ExecutionStatus::Cancelled,
+            VerificationOutcome::Unknown => ExecutionStatus::Unknown,
+            _ => ExecutionStatus::Failed,
+        }
+    }
+}
+
+/// Parses Cargo's real newline-delimited `--message-format=json` stream.
+///
+/// The parser accepts exactly the four message kinds Cargo emits:
+/// `compiler-message`, `compiler-artifact`, `build-finished`, and
+/// `build-script-executed`. Any other or missing `reason` fails closed as
+/// [`CargoAdapterError::MalformedMessage`] rather than being skipped, so a
+/// stream this parser does not understand can never be read as a clean build.
+/// The caller retains the exact raw bytes separately under
+/// [`CARGO_MESSAGE_CONTENT_TYPE`]; this projection adds no verdict of its own.
+///
+/// # Errors
+///
+/// Returns [`CargoAdapterError::OutputTooLarge`] or
+/// [`CargoAdapterError::LineTooLarge`] for an over-bound capture,
+/// [`CargoAdapterError::MalformedMessage`] for any line that is not a valid
+/// Cargo message of an accepted kind, and [`CargoAdapterError::CounterOverflow`]
+/// for a diagnostic counter overflow.
+pub fn parse_jsonl(bytes: &[u8]) -> Result<CargoReport, CargoAdapterError> {
+    if bytes.len() > MAX_CARGO_OUTPUT_BYTES {
+        return Err(CargoAdapterError::OutputTooLarge);
+    }
+    let mut report = CargoReport::default();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.len() > MAX_MESSAGE_LINE_BYTES {
+            return Err(CargoAdapterError::LineTooLarge);
+        }
+        let line = std::str::from_utf8(line).map_err(|_| CargoAdapterError::MalformedMessage)?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let message: CargoMessage =
+            serde_json::from_str(line).map_err(|_| CargoAdapterError::MalformedMessage)?;
+        apply_message(&mut report, message)?;
+    }
+    Ok(report)
+}
+
+/// Folds one accepted Cargo message into the report.
+fn apply_message(report: &mut CargoReport, message: CargoMessage) -> Result<(), CargoAdapterError> {
+    match message.reason.as_deref() {
+        Some("compiler-message") => {
+            let diagnostic = message.message.ok_or(CargoAdapterError::MalformedMessage)?;
+            match diagnostic.level.as_deref() {
+                Some("error") => report.errors = checked_increment(report.errors)?,
+                Some("warning") => report.warnings = checked_increment(report.warnings)?,
+                Some("note" | "help") => {
+                    report.informational = checked_increment(report.informational)?;
+                }
+                Some(_) => {}
+                None => return Err(CargoAdapterError::MalformedMessage),
+            }
+        }
+        Some("compiler-artifact") => report.artifacts.push(artifact_record(message)),
+        Some("build-finished") => {
+            report.build_finished =
+                Some(message.success.ok_or(CargoAdapterError::MalformedMessage)?);
+        }
+        // `build-script-executed` carries build-script outputs, not a build
+        // outcome; it is accepted and contributes no counter.
+        Some("build-script-executed") => {}
+        Some(_) | None => return Err(CargoAdapterError::MalformedMessage),
+    }
+    Ok(())
+}
+
+/// Projects the artifact identity of one `compiler-artifact` message.
+fn artifact_record(message: CargoMessage) -> CargoArtifactRecord {
+    let target = message.target.unwrap_or(JsonTarget {
+        name: None,
+        kind: Vec::new(),
+    });
+    CargoArtifactRecord {
+        package_id: message.package_id.unwrap_or_default(),
+        target_name: target.name.unwrap_or_default(),
+        target_kinds: target.kind,
+        executable: message.executable,
+        filenames: message.filenames,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMessage {
+    reason: Option<String>,
+    #[serde(default)]
+    message: Option<JsonDiagnostic>,
+    #[serde(default)]
+    package_id: Option<String>,
+    #[serde(default)]
+    target: Option<JsonTarget>,
+    #[serde(default)]
+    filenames: Vec<String>,
+    #[serde(default)]
+    executable: Option<String>,
+    #[serde(default)]
+    success: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonDiagnostic {
+    level: Option<String>,
+    #[serde(flatten)]
+    _extra: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonTarget {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Vec<String>,
+}
+
+fn checked_increment(value: u32) -> Result<u32, CargoAdapterError> {
+    value
+        .checked_add(1)
+        .ok_or(CargoAdapterError::CounterOverflow)
 }
 
 #[cfg(test)]

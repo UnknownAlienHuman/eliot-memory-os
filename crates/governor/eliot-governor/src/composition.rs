@@ -3555,7 +3555,8 @@ pub struct GovernorComposition<P: ?Sized> {
     /// rehydrated, or an authority for rebind: durable quarantine with an
     /// owner-issued write/readback receipt and restart recovery belongs to
     /// the `WorkScope` owner path. Read the latest with
-    /// [`Self::last_scope_quarantine`].
+    /// [`Self::last_scope_quarantine`]; read the full bounded history with
+    /// [`Self::scope_quarantine_history`].
     scope_quarantine: Vec<QuarantinedScopeRecord>,
 }
 
@@ -4201,6 +4202,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
         self.scope_quarantine.last()
+    }
+
+    /// Returns the bounded in-process quarantine history with authenticated
+    /// readback (issue #1787, AUD3 readback leg).
+    ///
+    /// Every returned record was built through
+    /// [`QuarantinedScopeRecord::for_report`] and
+    /// [`QuarantinedScopeRecord::validate`] at retention; this read
+    /// re-validates each record through the same existing validator so a
+    /// corrupt projection fails here instead of reaching a rebind decision.
+    /// An empty history means no mismatch has been observed since
+    /// construction (unavailable, not committed). This is not durable, not
+    /// rehydrated, and never an authority for rebind: committed,
+    /// possible-commit, and retired states belong to the durable `WorkScope`
+    /// owner path. The STITCH consumer is the future rebind/recovery
+    /// reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] when any retained record fails
+    /// its existing validation.
+    pub fn scope_quarantine_history(&self) -> Result<&[QuarantinedScopeRecord], CompositionError> {
+        for record in &self.scope_quarantine {
+            record.validate().map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "retained scope quarantine history is corrupt: {error}"
+                ))
+            })?;
+        }
+        Ok(&self.scope_quarantine)
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,

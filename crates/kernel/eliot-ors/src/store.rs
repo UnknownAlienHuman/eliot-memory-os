@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, EpochId, EpochRelation, EpochTransition,
-    HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
+    AuthorityEpoch, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
+    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, EpochId, EpochRelation,
+    EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
     canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
@@ -24,7 +24,7 @@ use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[path = "persistence_codec.rs"]
 mod persistence_codec;
@@ -75,9 +75,10 @@ use crate::{
     LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
     OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
-    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
-    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
+    ProcessEvidenceReadback, ProcessEvidenceRecord, ProcessStartReplayAbort,
+    ProcessStartReplayRecord, ProcessStartReplayState, ProcessStreamRecoveryFence,
+    ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
@@ -85,10 +86,10 @@ use crate::{
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
     ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    StateFenceSnapshot, StreamRecoveryActivation, StreamRecoveryReconciliationState,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
@@ -134,6 +135,45 @@ const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_evidence_v1");
+/// The table name is unchanged by issue #269's row revision: the byte-free
+/// observation is a ROW version, not a new table, so no migration, no rewrite
+/// and no census entry is introduced. The row's own
+/// [`crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA`] field is the codec's version
+/// discriminator (see `RedbRecoveryStore::decode_process_evidence_row`), a
+/// pre-#269 row is dispositioned rather than rewritten, and the table's backup
+/// disposition is `ForensicOnly` so a row that still holds the inline payload
+/// can never cross a restore boundary as an answer.
+/// The pre-#269 `ors_process_evidence_v1` row shape, read only far enough to be
+/// dispositioned (issue #269, A1).
+///
+/// `evidence` is the accepted `ProcessEvidence` value, bounded inline preview
+/// bytes included. It is read as raw JSON so the decoder can report WHICH
+/// physical streams still carry an inline byte array without ever materializing
+/// those bytes, and the payload is dropped with the row. The row is never
+/// re-encoded, never migrated and never written back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyInlineProcessEvidenceRow {
+    operation_id: OperationIdentity,
+    process_tree_id: OpaqueLabel,
+    job_id: OpaqueLabel,
+    image_id: OpaqueLabel,
+    session_id: OpaqueLabel,
+    evidence_digest: String,
+    observed_at_ms: i64,
+    evidence: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct InlineProcessEvidenceIdentity<'a> {
+    operation_id: &'a str,
+    process_tree_id: &'a str,
+    job_id: &'a str,
+    image_id: &'a str,
+    session_id: &'a str,
+    evidence_digest: &'a str,
+    observed_at_ms: i64,
+}
 /// Versioned per-stream process-evidence recovery projections (issue #269).
 ///
 /// One row per `(operation_id, stream)` identity, keyed `operation:stdout` or
@@ -222,6 +262,20 @@ const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
 /// intake or application claim.
 const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_handoffs_v1");
+/// Durable normalized projections of staged bridge events (issue #1934,
+/// I7.23). One projection per staged event identity, keyed exactly like
+/// [`BRIDGE_EVENT_RECORDS`], and bound to that record by the immutable
+/// transport hash plus the recorded `EventEnvelope` disposition. This is the
+/// I7.23 "normalized `HostEventEnvelope`" item of the storage list: before any
+/// stream cursor is published, the raw-or-redacted record, this projection,
+/// and the disposition must be durably related (see
+/// [`RedbRecoveryStore::require_bridge_event_relation_in`]). A redacted event
+/// therefore has a durable normalized projection of its own instead of only
+/// the deterministic redacted marker, and the projection never carries source
+/// content. Disjoint from `HOST_REQUESTS`; it is a second durable item of ONE
+/// relation, not a second ingestion owner.
+const BRIDGE_EVENT_PROJECTIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_projections_v1");
 /// Maximum staged bridge-event rows. Mirrors the I14.2 canonical-writes pool
 /// (2048 items): breach fails with [`OrsError::ProjectionLimitExceeded`]
 /// (typed backpressure), never with silent loss.
@@ -316,6 +370,15 @@ const BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN: &str = "FORBIDDEN_CONTENT_DETECTE
 /// own deterministic projection so a receipt always names the projection its
 /// owner actually stored.
 const BRIDGE_EVENT_REDACTED_PROJECTION_MARKER: &str = "redacted/bridge-event-v1";
+/// Marker prefix of the deterministic NORMALIZED projection minted for a
+/// redacted bridge event (issue #1934, I7.23). The redacted record stores
+/// [`BRIDGE_EVENT_REDACTED_PROJECTION_MARKER`] bytes; the durable normalized
+/// projection of the same event is this distinct, separately validated form,
+/// so a reader can never mistake a copy of the record marker for the
+/// normalized envelope. Like the record marker it is a pure function of the
+/// immutable transport hash and the redaction receipt, and it carries no
+/// source content.
+const BRIDGE_EVENT_REDACTED_NORMALIZED_MARKER: &str = "redacted/bridge-event-normalized-v1";
 /// Byte patterns that must never persist as admissible staged bytes. Matched
 /// case-insensitively against the lossy UTF-8 decoding of the canonical
 /// envelope bytes.
@@ -339,10 +402,37 @@ const BRIDGE_EVENT_DENIED_CONTENT_TOKENS: &[&str] = &[
 ];
 /// Maximum redacted classes carried by one bridge-event redaction.
 const MAX_BRIDGE_EVENT_REDACTED_CLASSES: usize = 16;
+/// Version of the verbatim-or-projection transformation this owner performs
+/// at stage time (issue #1934, I7.23): the canonical envelope bytes become
+/// either the verbatim admissible row bytes or the deterministic redacted
+/// projection. Stamped on every owner-checked row as `transformation_version`
+/// so the storage list stays reconstructible after restart; nonzero on every
+/// current row, zero only on rows written before provenance existed.
+const BRIDGE_EVENT_STAGING_TRANSFORMATION_VERSION: u16 = 1;
+/// Actual intake route that persisted an owner-checked row (issue #1934,
+/// I7.23): the store stamps the entry that ran, while the Kernel stages the
+/// wire operation the frame requested, so requested versus actual stays
+/// answerable after restart.
+const BRIDGE_EVENT_CHECKED_STAGE_ROUTE: &str = "eliot.bridge-event.stage-checked.v1";
+/// Maximum normalization warnings carried by one bridge-event row (issue
+/// #1934, I7.23). Warnings are advisory provenance only: they never gate
+/// persistence and never carry raw provider content.
+const BRIDGE_EVENT_MAX_NORMALIZATION_WARNINGS: usize = 8;
+/// Normalization warning recorded when the staged envelope addresses its
+/// payload through an immutable blob handle (issue #1934, I7.23): the row
+/// preserves the handle, not the referenced content, so forensic replay of
+/// the raw payload cannot be satisfied from this row alone.
+const BRIDGE_EVENT_BLOB_CONTENT_WARNING: &str = "blob_payload_content_not_staged";
 /// Maximum staged bridge-event handoff rows. Mirrors the bridge-event record
 /// bound: breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
 /// backpressure), never with silent loss of handoff state.
 const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
+/// Maximum durable normalized projections. A projection exists exactly when
+/// its raw-or-redacted record exists (issue #1934, I7.23), so it shares the
+/// record admission budget one-for-one: breach fails the whole stage with
+/// typed `EventRecords` backpressure and commits neither row, never a record
+/// whose normalized projection is missing.
+const MAX_BRIDGE_EVENT_PROJECTIONS: usize = 2048;
 /// Handoff state persisted at DURABLE stage time: the staged envelope is
 /// durably held and handed toward Governor/coordinator intake, not yet
 /// reconciled against a consumed frontier.
@@ -548,6 +638,26 @@ struct BridgeEventRow {
     /// event identity is a policy change, never a duplicate.
     #[serde(default)]
     admitted_policy_revision: u64,
+    /// Ingest provenance reconstructible after restart (issue #1934, I7.23):
+    /// the bridge-ingest adapter version the Kernel staged, the staging
+    /// transformation version this owner stamped, the wire operation the
+    /// frame requested, and the intake route that actually persisted the row.
+    /// All empty/zero only on rows written before provenance existed; a row
+    /// written by the current checked stage entry always carries all four.
+    #[serde(default)]
+    adapter_version: String,
+    #[serde(default)]
+    transformation_version: u16,
+    #[serde(default)]
+    requested_route: String,
+    #[serde(default)]
+    actual_route: String,
+    /// Advisory normalization warnings derived at stage time (issue #1934,
+    /// I7.23): bounded, never raw provider content, never a persistence gate.
+    /// Empty means no warning was emitted, which is itself a reconstructible
+    /// answer.
+    #[serde(default)]
+    normalization_warnings: Vec<String>,
 }
 
 impl BridgeEventRow {
@@ -589,7 +699,56 @@ impl BridgeEventRow {
         if !self.owner_namespace.is_empty() {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
-        self.validate_privacy()
+        self.validate_privacy()?;
+        self.validate_provenance()
+    }
+
+    /// Validates the I7.23 ingest provenance carried by this row (issue
+    /// #1934): adapter version, transformation version, requested route, and
+    /// actual route are either all unbound (rows written before provenance
+    /// existed, which keep validating) or all bound on a row written by the
+    /// current checked stage entry — never a partial binding, which would
+    /// attribute the row to an adapter, transform, or route that did not
+    /// jointly produce it. Normalization warnings are always allowed (empty
+    /// included) and stay bounded advisory text, never raw content and never
+    /// a second digest scheme: the ORIGINAL digest checks in
+    /// [`Self::validate_privacy`] are unchanged.
+    fn validate_provenance(&self) -> Result<(), OrsError> {
+        let bound = [
+            self.adapter_version.as_str(),
+            self.requested_route.as_str(),
+            self.actual_route.as_str(),
+        ];
+        let none_bound =
+            bound.iter().all(|field| field.is_empty()) && self.transformation_version == 0;
+        if none_bound {
+            return self.validate_warnings();
+        }
+        if bound.iter().any(|field| field.is_empty()) || self.transformation_version == 0 {
+            return Err(OrsError::InvalidField {
+                field: "adapter_version",
+                reason: "bridge event ingest provenance binds adapter, transformation, requested route, and actual route together",
+            });
+        }
+        crate::model::validate_text(&self.adapter_version, "adapter_version")?;
+        crate::model::validate_text(&self.requested_route, "requested_route")?;
+        crate::model::validate_text(&self.actual_route, "actual_route")?;
+        self.validate_warnings()
+    }
+
+    /// Validates the advisory normalization warnings: bounded count, bounded
+    /// text each, never a persistence gate.
+    fn validate_warnings(&self) -> Result<(), OrsError> {
+        if self.normalization_warnings.len() > BRIDGE_EVENT_MAX_NORMALIZATION_WARNINGS {
+            return Err(OrsError::InvalidField {
+                field: "normalization_warnings",
+                reason: "bridge event normalization warnings must be bounded",
+            });
+        }
+        for warning in &self.normalization_warnings {
+            crate::model::validate_text(warning, "normalization_warnings")?;
+        }
+        Ok(())
     }
 
     /// Validates the I7.23 disclosure/retention decision carried by this row.
@@ -716,6 +875,235 @@ impl BridgeEventRow {
 
 impl persistence_codec::PersistedValue for BridgeEventRow {
     const RECORD_TYPE: &'static str = "bridge_event_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// The durable normalized projection of one staged bridge event, related to
+/// its raw-or-redacted record (issue #1934, I7.23).
+///
+/// I7.23 requires the storage list to contain BOTH the immutable raw/hash
+/// record AND the normalized `HostEventEnvelope`, and requires cursor
+/// advancement to be published only after the two are durably related and the
+/// `EventEnvelope` disposition is recorded. [`BridgeEventRow`] alone cannot
+/// carry that second item on the redacted path: its `envelope_bytes` are
+/// structurally constrained by [`BridgeEventRow::validate_privacy`] to the
+/// deterministic redacted marker, so the normalized projection had nowhere to
+/// live and the cursor advanced over an event with no normalized form in any
+/// durable store.
+///
+/// This row is that second item. It is keyed by exactly the same
+/// `namespace::event_id` key as its record, so the relation is an exclusive
+/// creation inside the same ORS transaction — never a second owner, never a
+/// predictable name standing in for a proven claim:
+///
+/// ```text
+/// normalized_envelope  the durable normalized projection (see
+///                       [`RedbRecoveryStore::bridge_event_normalized_bytes`]);
+/// record_transport_hash the immutable transport hash of the ORIGINAL source
+///                       bytes this projection belongs to — the same value the
+///                       record row persists as `transport_hash`;
+/// record_redacted        whether that record stores the deterministic
+///                       redacted representation instead of the original bytes;
+/// record_disposition     the recorded `EventEnvelope` privacy disposition
+///                       (`allowed` | `redacted`);
+/// record_redaction_reason / record_redacted_classes
+///                       the record's redaction receipt, so the disposition
+///                       this projection is bound to is reconstructible without
+///                       reading the record row first.
+/// ```
+///
+/// `binds_record` is the relation check the stage entry re-verifies through
+/// [`BridgeEventProjectionRow::validate`] before it may advance any cursor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventProjectionRow {
+    contract_version: u16,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    /// Owner namespace this projection is bound under (issue #2729): the
+    /// same namespace the record row and the stage key carry. Empty only on
+    /// the legacy ownerless stage entry, mirroring
+    /// [`BridgeEventRow::owner_namespace`]; never a partial binding.
+    owner_namespace: String,
+    /// The durable normalized projection bytes. Verbatim canonical envelope
+    /// bytes on the admissible path; the deterministic source-free normalized
+    /// projection on the redacted path.
+    normalized_envelope: Vec<u8>,
+    /// Immutable transport hash of the original source bytes, equal to the
+    /// bound record's own `transport_hash`.
+    record_transport_hash: String,
+    /// Whether the bound record stores the deterministic redacted
+    /// representation rather than the original bytes.
+    record_redacted: bool,
+    /// The recorded `EventEnvelope` disposition this projection belongs to.
+    record_disposition: String,
+    /// Rejection reason of the bound record's redaction receipt; empty exactly
+    /// when `record_redacted` is false.
+    record_redaction_reason: String,
+    /// Redaction classes of the bound record's receipt; empty exactly when
+    /// `record_redacted` is false.
+    record_redacted_classes: Vec<String>,
+    /// Scope the privacy owner evaluated the source bytes under.
+    admitted_scope: String,
+    /// Privacy policy revision the owner's verdict was made under.
+    admitted_policy_revision: u64,
+    staged_at_ms: u64,
+    staging_connection: String,
+}
+
+impl BridgeEventProjectionRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        bridge_identity_text(&self.event_id, "event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "bridge event projection sequence must be nonzero",
+            });
+        }
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
+        crate::model::validate_digest(&self.record_transport_hash, "record_transport_hash")?;
+        crate::model::validate_digest(&self.admitted_scope, "admitted_scope")?;
+        if self.admitted_policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "admitted_policy_revision",
+                reason: "bridge event projection binds a nonzero privacy policy revision",
+            });
+        }
+        crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        self.validate_record_disposition()?;
+        self.validate_normalized_envelope()
+    }
+
+    /// Validates the recorded `EventEnvelope` disposition and its redaction
+    /// receipt facts as one binding: a redacted record binds a known wire
+    /// reason plus a bounded nonempty class list, an admissible record binds
+    /// neither. A disposition that names a redaction without the receipt, or a
+    /// receipt without the disposition, is refused rather than read as either
+    /// state.
+    fn validate_record_disposition(&self) -> Result<(), OrsError> {
+        let disposition = match self.record_disposition.as_str() {
+            x if x == BRIDGE_EVENT_PRIVACY_ALLOWED => {
+                if self.record_redacted
+                    || !self.record_redaction_reason.is_empty()
+                    || !self.record_redacted_classes.is_empty()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "record_disposition",
+                        reason: "an admissible bridge event binds no redaction receipt",
+                    });
+                }
+                false
+            }
+            x if x == BRIDGE_EVENT_PRIVACY_REDACTED => {
+                if !self.record_redacted {
+                    return Err(OrsError::InvalidField {
+                        field: "record_disposition",
+                        reason: "a redacted bridge event binds a redacted record",
+                    });
+                }
+                true
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "record_disposition",
+                    reason: "bridge event projection disposition must be allowed or redacted",
+                });
+            }
+        };
+        if !disposition {
+            return Ok(());
+        }
+        if self.record_redaction_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
+            && self.record_redaction_reason != BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE
+        {
+            return Err(OrsError::InvalidField {
+                field: "record_redaction_reason",
+                reason: "bridge event projection redaction carries a known wire reason",
+            });
+        }
+        if self.record_redacted_classes.is_empty()
+            || self.record_redacted_classes.len() > MAX_BRIDGE_EVENT_REDACTED_CLASSES
+        {
+            return Err(OrsError::InvalidField {
+                field: "record_redacted_classes",
+                reason: "bridge event projection redaction classes must be nonempty and bounded",
+            });
+        }
+        for class in &self.record_redacted_classes {
+            crate::model::validate_text(class, "record_redacted_classes")?;
+        }
+        Ok(())
+    }
+
+    /// Validates the stored normalized projection bytes against the recorded
+    /// disposition. The admissible form must be exactly the canonical envelope
+    /// bytes the transport hash covers, so a projection that claims a verbatim
+    /// normalized envelope over other bytes fails as an integrity mismatch. The
+    /// redacted form must be the deterministic source-free projection
+    /// recomputed here from the transport hash and the receipt classes, so a
+    /// corrupted or content-bearing projection is refused instead of being read
+    /// as the normalized form of a redacted event.
+    fn validate_normalized_envelope(&self) -> Result<(), OrsError> {
+        if self.normalized_envelope.is_empty()
+            || self.normalized_envelope.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES
+        {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.record_redacted {
+            let expected = RedbRecoveryStore::bridge_event_redacted_normalized_bytes(
+                &self.record_transport_hash,
+                &self.record_redacted_classes,
+                &self.record_redaction_reason,
+            );
+            if self.normalized_envelope != expected {
+                return Err(OrsError::PayloadIntegrityMismatch);
+            }
+            return Ok(());
+        }
+        if crate::model::sha256_hex(&self.normalized_envelope) != self.record_transport_hash {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reports whether this projection durably relates to exactly this
+    /// raw-or-redacted record. Every relation leg is compared, not a digest of
+    /// them: identity, sequence, owner namespace, the immutable transport hash,
+    /// the stored form, and the recorded disposition with its redaction
+    /// receipt. A projection that does not bind the record it was found under
+    /// is a torn relation, never a verified one.
+    fn binds_record(&self, record: &BridgeEventRow) -> bool {
+        self.stream_id == record.stream_id
+            && self.event_id == record.event_id
+            && self.sequence == record.sequence
+            && self.owner_namespace == record.owner_namespace
+            && self.record_transport_hash == record.transport_hash
+            && self.record_redacted == record.redacted
+            && self.record_disposition
+                == if record.redacted {
+                    BRIDGE_EVENT_PRIVACY_REDACTED
+                } else {
+                    BRIDGE_EVENT_PRIVACY_ALLOWED
+                }
+            && self.record_redaction_reason == record.redaction_reason
+            && self.record_redacted_classes == record.redacted_classes
+            && self.admitted_scope == record.admitted_scope
+            && self.admitted_policy_revision == record.admitted_policy_revision
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventProjectionRow {
+    const RECORD_TYPE: &'static str = "bridge_event_projection";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1009,11 +1397,11 @@ impl BridgeEventHandoffRow {
         Ok(())
     }
 
-    /// Reports whether this row carries a complete receiving-owner receipt
-    /// (issue #2731, item 1): the reconciled state with the full presented
-    /// triple (covering frontier plus admitting revision/incarnation).
-    /// Ownerless rows and rows reconciled before the receipt existed report
-    /// false — their old state string alone is never receiver evidence.
+    /// Checks the persisted reconcile tuple. Despite this helper's legacy
+    /// name, the tuple is recorded from the presenting producer's frontier
+    /// and owner snapshot; it is not proof of receiving-owner durable
+    /// acceptance. Ownerless rows and rows reconciled before the tuple existed
+    /// report false.
     fn has_receiver_receipt(&self) -> bool {
         self.state == BRIDGE_EVENT_HANDOFF_RECONCILED
             && !self.owner_namespace.is_empty()
@@ -1023,21 +1411,13 @@ impl BridgeEventHandoffRow {
             && self.reconcile_owner_incarnation != 0
     }
 
-    /// Reports whether this row may retire once its payload is gone (issue
-    /// #2731, items 1, 4 and 5). A receipt-complete row covered by the
-    /// receiver's acked cursor is eligible even above the retained
-    /// compacted boundary: the boundary advances only past the retained
-    /// 512-row acked window, so a stream that stops producing at or below
-    /// the window would otherwise hold its receipt-complete charges
-    /// against the table-global budget forever — the exact quiet-stream
-    /// lifetime quota item 4 forbids. Otherwise the admitted terminal
-    /// disposition still applies: still `handed_off` but covered by the
-    /// receiver's acked cursor at or below the retained compacted
-    /// boundary, whose missing row answers the explicit retired
-    /// disposition instead of a fresh event. Pending rows (above the
-    /// boundary without the exact receipt) and ownerless legacy rows never
-    /// report true: unknown and pending work is never evicted to admit new
-    /// work.
+    /// Reports the current eligibility decision (issue #2731). The existing
+    /// reconcile tuple is only producer-presented frontier/owner data, not a
+    /// receiver's durable receipt, so this predicate does not establish the
+    /// complete handoff terminal condition. This edit only rejects a
+    /// `handed_off` row without that tuple after producer acknowledgement and
+    /// compaction pass it. The pre-existing tuple-based path remains
+    /// unproven; the full receiving-owner disposition contract is unresolved.
     fn retirement_eligible(&self, acked_cursor: u64, compacted_boundary: u64) -> bool {
         if self.owner_namespace.is_empty() || self.sequence == 0 {
             return false;
@@ -1051,7 +1431,7 @@ impl BridgeEventHandoffRow {
         if self.has_receiver_receipt() {
             return true;
         }
-        self.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF && self.sequence <= acked_cursor
+        self.has_receiver_receipt()
     }
 }
 
@@ -1435,6 +1815,7 @@ impl persistence_codec::PersistedValue for BridgeEventRecoveryRevisionRow {
 /// what a selector means; it no longer parses the selector itself.
 enum BridgeRecoveryScopeSelector {
     Open,
+    Resume,
     Streams {
         window_key: String,
         after_stream: u64,
@@ -1719,6 +2100,31 @@ struct BridgeEventPrivacyStaging {
     /// #1934).
     policy_revision: u64,
     stored_bytes: Vec<u8>,
+    /// Durable normalized projection of the same event (issue #1934, I7.23):
+    /// the canonical envelope bytes on the admissible path, or the
+    /// deterministic source-free normalized projection of the redacted record.
+    /// Persisted as its own durable row and related to `stored_bytes` before
+    /// any cursor may be advanced.
+    normalized_bytes: Vec<u8>,
+}
+
+/// Resolved I7.23 ingest provenance for one staged bridge event (issue
+/// #1934).
+///
+/// The adapter version and the requested route arrive as staged legs from the
+/// Kernel bridge-ingest adapter that admitted the event; the transformation
+/// version and the actual route are stamped by this owner for the entry that
+/// ran; the warnings are derived here from the staged envelope itself. The
+/// row persists all five, so the I7.23 storage list stays reconstructible
+/// after restart. Provenance never authorizes and never gates: verbatim
+/// persistence still requires the owner's privacy authorization plus a clean
+/// deny scan (see [`Self::bridge_event_privacy_staging`]).
+struct BridgeEventIngestProvenance {
+    adapter_version: String,
+    transformation_version: u16,
+    requested_route: String,
+    actual_route: String,
+    warnings: Vec<String>,
 }
 
 /// Builds the stage/lookup outcome object for one bridge-event row.
@@ -1784,6 +2190,11 @@ fn bridge_event_outcome(
         "redaction": redaction,
         "privacy_authorization": privacy_authorization,
         "handoff": handoff,
+        "adapter_version": row.adapter_version,
+        "transformation_version": row.transformation_version,
+        "requested_route": row.requested_route,
+        "actual_route": row.actual_route,
+        "normalization_warnings": row.normalization_warnings,
     })
 }
 
@@ -1896,13 +2307,44 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// retired lookup answers the typed recovery limitation instead of absence.
 /// Tombstones are never deleted. Historical unmarked rows are represented
 /// only by a separately versioned presence marker; this primary link never
-/// infers or returns their operation identity. Record/byte ceilings and a
-/// numeric replay horizon are not declared by the current contract: growth is
-/// bounded only by staged operations, and fresh stages beyond legitimate
-/// history fail closed through the typed errors below rather than through a
-/// capacity counter.
+/// infers or returns their operation identity. The retention denominator is
+/// one entry per staged operation, bounded by
+/// [`MAX_HOST_REQUEST_LOGICAL_RECORDS`] records and
+/// [`MAX_HOST_REQUEST_LOGICAL_LINK_BYTES`] bytes per link value: a fresh
+/// stage beyond either ceiling fails with
+/// [`OrsError::ProjectionLimitExceeded`] (typed backpressure) while exact
+/// replays and retired-key limitation answers keep succeeding. The replay
+/// horizon is terminal-state-driven, not wall-clock: links live while their
+/// winner row stays unretired, unresolved effects/results never expire
+/// without canonical reconciliation (I5.2), and retirement swaps the link
+/// for a tombstone only under exact terminal evidence, so a retired key
+/// answers the typed recovery limitation instead of absence and is never
+/// reusable.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
+/// Maximum staged logical host-request index entries (issue #2571).
+///
+/// Mirrors [`MAX_BRIDGE_EVENT_RECORDS`] (the I14.2 canonical-writes pool,
+/// 2048 items): the nearest durable replay-table precedent in this owner.
+/// Breach fails fresh stages with [`OrsError::ProjectionLimitExceeded`]
+/// (typed backpressure), never with silent loss or fresh-absence treatment.
+/// Exact replays of staged keys and retired-key limitation answers never
+/// consume capacity, and unresolved winners plus tombstones are never
+/// evicted to make room: a full table is a refusal, not a reclamation.
+const MAX_HOST_REQUEST_LOGICAL_RECORDS: usize = 2048;
+/// Maximum encoded bytes of one logical-index link or tombstone value
+/// (issue #2571).
+///
+/// Composes two existing owner ceilings: six bytes per bounded-text byte
+/// (the `MAX_BRIDGE_POSITION_RECORD_BYTES` JSON-escaping math over the
+/// `validate_text`-bounded `operation_id`) plus one [`MAX_ORS_MARKER_BYTES`]
+/// for the fixed fields (digests, tombstone marker, framing). An
+/// over-ceiling value fails with [`OrsError::ProjectionLimitExceeded`].
+/// The derived index total (`MAX_HOST_REQUEST_LOGICAL_RECORDS` times this
+/// ceiling) stays under the existing backup byte ceiling
+/// ([`crate::backup_snapshot::MAX_BACKUP_BYTES`]), so retention introduces
+/// no second byte-policy owner.
+const MAX_HOST_REQUEST_LOGICAL_LINK_BYTES: usize = 6 * 1_024 + MAX_ORS_MARKER_BYTES;
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
 /// Format marker carried by every logical host-request tombstone (issue #2571).
@@ -2020,6 +2462,24 @@ const GRANT_CLOSURE_MIGRATION_KEY_PREFIX: &str = "grant_closure_migration:v1:";
 /// the stored revision only moves forward.
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
+/// Durable effect operation leases (issue #1885; I1.9). Keyed by the lease
+/// identity. One row per exact already-authorized effect the Kernel may
+/// replay; a second insert under the same key with different content is a
+/// durable conflict, never an overwrite.
+const EFFECT_OPERATION_LEASES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_operation_leases_v1");
+/// Durable execution manifests copied into the Generation Registry (issue
+/// #1885; I1.9). Keyed by `{module_id}::{generation}`. The row is the exact
+/// immutable manifest, so a restart reads the same artifact/config/protocol
+/// hashes, start command, restart class and accepted Catalog revision.
+const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_kernel_execution_manifests_v1");
+/// Durable effect-replay reconciliation intents (issue #1885; I1.9). Keyed by
+/// `{module_id}::{generation}::{operation_id}`, so a repeated denied replay of
+/// the same exact operation updates one row instead of growing the table, and
+/// every distinct denied operation keeps its own durable escalation.
+const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_replay_reconciliations_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 /// Durable monotone revision of the process-stream recovery family (issue
 /// #2884).
@@ -2543,6 +3003,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// Lists retained Recovery Problems in operation-identity order, bounded
     /// by [`crate::MAX_RECOVERY_PAGE`].
     fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError>;
+    /// Retains a visible durable Recovery Problem for one staged
+    /// `PreparedTransition` that this build refuses to execute because its
+    /// recorded contract/operation manifest is outside admissible support
+    /// (issue #1927, I05-06).
+    ///
+    /// I05-06: such a plan "stays staged and enters visible recovery instead of
+    /// being reinterpreted by newer code". Bindings (epoch, state fence,
+    /// recovery owner, reservation identity) are read back from the staged
+    /// operation itself rather than from caller values, the record carries no
+    /// payload bytes, and an exact replay returns the durable record unchanged.
+    fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError>;
     /// Closes one retained Recovery Problem only from an explicit terminal
     /// receipt under the exact recovery owner (issue #1925).
     ///
@@ -2616,7 +3091,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// `Submitted` → `ResultReceived`, or a direct legal edge such as
     /// `Unknown`/`Reconciling`/`Submitted`/`PossiblyEffected` →
     /// `ResultReceived`) and stores the exact bounded response JSON with its
-    /// digest. An exact replay (same digest and byte-identical body) returns
+    /// digest. `result_evidence` carries the executor-observed effect and
+    /// evidence references the executing leg submitted (issue #1853 W2); it is
+    /// stored in the SAME owner transaction as the result it observes and is
+    /// re-checked against this operation, this request digest, and this result
+    /// digest by [`crate::HostRequestRecord::validate`], so the durable
+    /// evidence can never drift from the completion it describes.
+    /// `result_lineage` carries the result-side lineage claims and references
+    /// the read owner submitted, under the same transaction and the same
+    /// rules: it is bound to this row's own recorded result digest and is
+    /// refused without one, and it is written once and never replaced.
+    /// An exact
+    /// replay (same digest and byte-identical body) returns
     /// the durable record unchanged without re-dispatch; a changed digest or
     /// body under the same identity fails as
     /// [`OrsError::HostRequestIdentityConflict`] and never overwrites the
@@ -2628,6 +3114,8 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
+        result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
@@ -3086,6 +3574,38 @@ impl RedbRecoveryStore {
         )
     }
 
+    /// Opens the typed operational-history cursor for a backup (issue #2967).
+    ///
+    /// The operational twin of
+    /// [`Self::open_backup_process_stream_recovery_family`], and for the same
+    /// reason it is the ONLY producer of an operational cursor: it reads the
+    /// owner-observed ordering high-water and the streamed content root, eligible
+    /// row count and encoded-byte denominator of the declared window under ONE read
+    /// transaction, so the frozen operational identity can never mix two moments.
+    /// Attach the returned cursor with
+    /// [`crate::backup_snapshot::OrsBackupRequest::with_operational_cursor`] so the
+    /// operational history is paged by an exact continuation under a frozen
+    /// high-water instead of by `after_order + page_entries * page_index`, which is
+    /// not a continuation in a sparse operation-order domain.
+    ///
+    /// `after_order` is the walk's declared EXCLUSIVE start and becomes part of the
+    /// frozen identity, so the denominator this cursor declares is the window the
+    /// caller asked for and not the whole history. Omitting the cursor entirely
+    /// exports the first page of exactly that window and nothing beyond it, which is
+    /// the same subsetting statement in a different form.
+    ///
+    /// Opening the cursor is not authority, confers no restore path, and does not
+    /// bound the family's retention. Rows above the frozen high-water are a
+    /// successor snapshot's rows, never this one's, even when they were already
+    /// durable and stable when the cursor was opened.
+    pub fn open_backup_operational_history(
+        &self,
+        source: &crate::backup_snapshot::OrsBackupSourceIdentity,
+        after_order: u64,
+    ) -> Result<crate::backup_snapshot::OrsOperationalCursor, OrsError> {
+        backup_snapshot::open_backup_operational_history(&self.database, source, after_order)
+    }
+
     /// Triages one backup page as quarantined import outcomes without writing.
     ///
     /// Every entry returns imported/rejected/forensic/blocked/unresolved;
@@ -3107,23 +3627,33 @@ impl RedbRecoveryStore {
 
     /// Reconciles quarantined per-entry outcomes into one import receipt.
     ///
-    /// Pure receipt binding over already-triaged outcomes; emits no store
-    /// writes. A new empty target never means old effects are resolved:
-    /// `unresolved_count` is counted from the outcomes, and
-    /// `known_zero_unresolved` must attest complete current-owner validation
-    /// before zero is trusted.
+    /// Emits no store writes, but it is NOT a pure receipt binding any more: it
+    /// reads the store's own live recovery rows through `&self.database` to
+    /// establish what the CURRENT owner of ORS recovery effects still holds
+    /// unresolved for the members being imported, and it records that answer on
+    /// the receipt together with the typed verdict of the known-zero gate.
+    ///
+    /// A new empty target never means old effects are resolved: `unresolved_count`
+    /// is counted from the outcomes, and a zero is trusted only when
+    /// `current_owner_validation` covers this receipt's members completely, is
+    /// bound to this snapshot, was read from the live recovery families, and
+    /// reports no still-unresolved identity.
     pub fn reconcile_backup_import(
+        &self,
         import: &crate::backup_snapshot::OrsBackupImportRequest,
         per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
         import_at_ms: i64,
     ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
-        backup_snapshot::reconcile_import_receipt(import, per_entry, import_at_ms)
+        backup_snapshot::reconcile_import_receipt(&self.database, import, per_entry, import_at_ms)
     }
 
     /// Replays a lost import response without any duplicate effect.
     ///
     /// Idempotent clone of the prior receipt: no store read, no store write,
     /// no re-triage, so a retried response can never double-apply outcomes.
+    /// The known-zero gate is re-evaluated from the validation recorded on the
+    /// receipt rather than from the verdict recorded beside it, so a stale or
+    /// disagreeing verdict is corrected on replay instead of carried forward.
     /// Unknown import outcomes stay quarantined for the existing canonical
     /// reconciliation owner; never blindly retried here.
     pub fn reconcile_lost_backup_import_response(
@@ -5264,7 +5794,7 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
-            let mut links = write
+            let links = write
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?;
             if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
@@ -5309,10 +5839,7 @@ impl RedbRecoveryStore {
                     operation_id: staged.operation_id.clone(),
                     request_digest: staged.request_digest.clone(),
                 };
-                let payload = encode(&link)?;
-                links
-                    .insert(logical_key.as_str(), payload.as_str())
-                    .map_err(storage)?;
+                Self::stage_host_request_logical_link_in(&write, logical_key.as_str(), &link)?;
                 staged
             }
         };
@@ -5664,15 +6191,44 @@ impl RedbRecoveryStore {
                 operation_id: staged.operation_id.clone(),
                 request_digest: staged.request_digest.clone(),
             };
-            let payload = encode(&link)?;
-            let mut links = write
-                .open_table(HOST_REQUEST_LOGICAL_KEYS)
-                .map_err(storage)?;
-            links
-                .insert(logical_key, payload.as_str())
-                .map_err(storage)?;
+            Self::stage_host_request_logical_link_in(write, logical_key, &link)?;
         }
         Ok(staged)
+    }
+
+    /// Stages one logical-index link under the index capacity ceilings
+    /// (issue #2571).
+    ///
+    /// Both fresh-stage entries claim through here, so the operation row and
+    /// its link still commit atomically in the caller's owner transaction.
+    /// The encoded link value is compared against
+    /// [`MAX_HOST_REQUEST_LOGICAL_LINK_BYTES`] and a fresh key is admitted
+    /// only while the table holds fewer than
+    /// [`MAX_HOST_REQUEST_LOGICAL_RECORDS`] entries; either breach fails
+    /// with [`OrsError::ProjectionLimitExceeded`] (typed backpressure).
+    /// Exact replays never reach here — they resolve through the staged link
+    /// above — and tombstones are written by retirement, not by staging, so
+    /// a full table refuses fresh growth without evicting unresolved
+    /// winners or tombstones and without answering absence.
+    fn stage_host_request_logical_link_in(
+        write: &redb::WriteTransaction,
+        logical_key: &str,
+        link: &HostRequestLogicalLink,
+    ) -> Result<(), OrsError> {
+        let payload = encode(link)?;
+        if payload.len() > MAX_HOST_REQUEST_LOGICAL_LINK_BYTES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let mut links = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        if links.len().map_err(storage)? >= MAX_HOST_REQUEST_LOGICAL_RECORDS as u64 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        links
+            .insert(logical_key, payload.as_str())
+            .map_err(storage)?;
+        Ok(())
     }
 
     /// Derives bounded historical occurrence spellings that could represent
@@ -7645,6 +8201,11 @@ impl RedbRecoveryStore {
     /// fence is unchanged. A `Requested` operation cannot receive a result
     /// (it must be admitted first); terminal states without a result cannot
     /// gain one.
+    ///
+    /// Issue #1853 W2: the executor-observed evidence and the result-side
+    /// lineage are written with the result in the same transaction, so the
+    /// operation/effect identity and its evidence references are never
+    /// separable at the authority boundary.
     #[allow(
         clippy::too_many_lines,
         reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
@@ -7655,6 +8216,8 @@ impl RedbRecoveryStore {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
+        result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
         let campaign_view = campaign_view_publication(result_response)?;
@@ -7758,6 +8321,20 @@ impl RedbRecoveryStore {
         next.state = crate::HostRequestState::ResultReceived;
         next.result_digest = Some(result_digest.to_owned());
         next.result_response = Some(result_response.clone());
+        // Issue #1853 W2: the retained evidence is written with the completion
+        // and is never replaced. A second submission of the SAME result — an
+        // at-least-once replay from a restarted daemon — cannot rewrite the
+        // observation the operation already recorded, and cannot erase it
+        // either: the first durable observation stands for the operation.
+        if next.result_evidence.is_none() {
+            next.result_evidence = result_evidence.cloned();
+        }
+        // Same rule for the retained lineage: the first durable provenance
+        // stands for the operation and a later replay can neither replace nor
+        // erase it.
+        if next.result_lineage.is_none() {
+            next.result_lineage = result_lineage.cloned();
+        }
         if next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
@@ -7916,6 +8493,128 @@ impl RedbRecoveryStore {
             sorted_classes.join(",")
         )
         .into_bytes()
+    }
+
+    /// Builds the durable NORMALIZED projection bytes for one staged event
+    /// (issue #1934, I7.23).
+    ///
+    /// An admissible event's normalized form is its canonical envelope JSON:
+    /// the normalized envelope IS the canonical `EventEnvelope` on the wire,
+    /// so it is persisted verbatim and stays covered by the immutable transport
+    /// hash.
+    ///
+    /// A redacted event has no admissible canonical envelope to normalize, and
+    /// persisting the denied bytes as a "normalized" copy would re-persist
+    /// exactly the content the redaction withheld. Its normalized projection is
+    /// therefore the deterministic, source-free form built from the immutable
+    /// transport hash and the redaction receipt — a pure function of its
+    /// inputs, recomputed by
+    /// [`BridgeEventProjectionRow::validate_normalized_envelope`], so a stored
+    /// projection is verified rather than trusted.
+    fn bridge_event_normalized_bytes(
+        envelope_bytes: &[u8],
+        transport_hash: &str,
+        denied: bool,
+        classes: &[String],
+        reason: &str,
+    ) -> Vec<u8> {
+        if denied {
+            return Self::bridge_event_redacted_normalized_bytes(transport_hash, classes, reason);
+        }
+        envelope_bytes.to_vec()
+    }
+
+    /// Builds the deterministic source-free normalized projection of a
+    /// redacted bridge event. The output is a pure function of the immutable
+    /// transport hash, the redaction receipt classes, and the receipt reason;
+    /// it carries no source content beyond the hash itself, so a redacted event
+    /// has a durable normalized form without republishing withheld content.
+    fn bridge_event_redacted_normalized_bytes(
+        transport_hash_hex: &str,
+        sorted_classes: &[String],
+        redaction_reason: &str,
+    ) -> Vec<u8> {
+        format!(
+            "{BRIDGE_EVENT_REDACTED_NORMALIZED_MARKER}:hash={transport_hash_hex}:classes={}:reason={redaction_reason}",
+            sorted_classes.join(",")
+        )
+        .into_bytes()
+    }
+
+    /// Derives the advisory normalization warnings for one staged envelope
+    /// (issue #1934, I7.23).
+    ///
+    /// Read-only over the already-validated canonical envelope JSON: a
+    /// `blob_ref` payload addresses its content through an immutable handle,
+    /// so the row preserves the handle rather than the referenced bytes.
+    /// Advisory only — warnings never gate persistence, never carry raw
+    /// content, and an empty result is itself a reconstructible answer. An
+    /// envelope that carries no recognized loss shape warns about nothing
+    /// rather than guessing.
+    fn bridge_event_normalization_warnings(envelope: &serde_json::Value) -> Vec<String> {
+        let blob_ref = envelope
+            .get("payload_or_blob_ref")
+            .and_then(|payload| payload.get("blob_ref"))
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+        if blob_ref {
+            vec![BRIDGE_EVENT_BLOB_CONTENT_WARNING.to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Resolves the I7.23 ingest provenance for one stage call (issue #1934).
+    ///
+    /// On the owner-checked entry (`checked == true`) the Kernel stages its
+    /// own adapter version and the wire operation the frame requested, and
+    /// this owner stamps the transformation version and the actual route of
+    /// the entry that ran, deriving the warnings from the staged envelope.
+    /// The legacy ownerless entry (`checked == false`) binds no provenance at
+    /// all, so its rows keep validating as pre-provenance rows; it stages no
+    /// invented adapter, transform, or route for bytes it did not admit
+    /// through the checked path.
+    fn bridge_event_provenance_staging(
+        staged: &serde_json::Value,
+        envelope: &serde_json::Value,
+        checked: bool,
+    ) -> Result<BridgeEventIngestProvenance, OrsError> {
+        let warnings = Self::bridge_event_normalization_warnings(envelope);
+        if !checked {
+            return Ok(BridgeEventIngestProvenance {
+                adapter_version: String::new(),
+                transformation_version: 0,
+                requested_route: String::new(),
+                actual_route: String::new(),
+                warnings: Vec::new(),
+            });
+        }
+        let adapter_version = bridge_text(staged, "adapter_version")?;
+        let requested_route = bridge_text(staged, "requested_route")?;
+        Ok(BridgeEventIngestProvenance {
+            adapter_version,
+            transformation_version: BRIDGE_EVENT_STAGING_TRANSFORMATION_VERSION,
+            requested_route,
+            actual_route: BRIDGE_EVENT_CHECKED_STAGE_ROUTE.to_owned(),
+            warnings,
+        })
+    }
+
+    /// Compares one persisted row's ingest provenance against the provenance
+    /// resolved for the current stage call (issue #1934): adapter version,
+    /// transformation version, requested route, actual route, and warnings
+    /// must all agree, so a replay admitted under different provenance
+    /// conflicts instead of answering stale provenance as a duplicate. A
+    /// pre-provenance row never matches current provenance.
+    fn bridge_event_provenance_matches(
+        row: &BridgeEventRow,
+        provenance: &BridgeEventIngestProvenance,
+    ) -> bool {
+        row.adapter_version == provenance.adapter_version
+            && row.transformation_version == provenance.transformation_version
+            && row.requested_route == provenance.requested_route
+            && row.actual_route == provenance.actual_route
+            && row.normalization_warnings == provenance.warnings
     }
 
     /// Runs the conservative deny detector over the canonical envelope bytes
@@ -8087,6 +8786,18 @@ impl RedbRecoveryStore {
         } else {
             envelope_bytes.to_vec()
         };
+        // The durable normalized projection of the same event (issue #1934,
+        // I7.23). It is resolved here, beside the disclosure decision, so a
+        // redacted event has a normalized form that is bound to the same
+        // transport hash and redaction receipt as its stored bytes — never a
+        // copy of withheld content and never a second independent decision.
+        let normalized_bytes = Self::bridge_event_normalized_bytes(
+            envelope_bytes,
+            &transport_hash,
+            denied,
+            &classes,
+            &reason,
+        );
         Ok(BridgeEventPrivacyStaging {
             denied,
             reason,
@@ -8095,6 +8806,7 @@ impl RedbRecoveryStore {
             scope: grant.scope,
             policy_revision: grant.policy_revision,
             stored_bytes,
+            normalized_bytes,
         })
     }
 
@@ -8265,6 +8977,10 @@ impl RedbRecoveryStore {
     /// are staged as the deterministic redacted projection plus the redaction
     /// receipt facts — never as verbatim raw. A decision mismatch fails the
     /// stage instead of persisting a disputed form.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "legacy stage keeps the duplicate-check and fresh-insert branches in one auditable decision"
+    )]
     pub fn stage_bridge_event(
         &self,
         staged: &serde_json::Value,
@@ -8297,6 +9013,10 @@ impl RedbRecoveryStore {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
         let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes, None)?;
+        // Legacy entry binds no ingest provenance: its rows keep validating
+        // as pre-provenance rows, and the duplicate check below compares the
+        // same empty legs, so legacy behavior is unchanged.
+        let provenance = Self::bridge_event_provenance_staging(staged, &envelope_value, false)?;
         let key = format!("{stream_id}::{event_id}");
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -8313,6 +9033,7 @@ impl RedbRecoveryStore {
                     || row.transport_hash != staging.transport_hash
                     || row.admitted_scope != staging.scope
                     || row.admitted_policy_revision != staging.policy_revision
+                    || !Self::bridge_event_provenance_matches(&row, &provenance)
                     || !row.owner_namespace.is_empty()
                 {
                     return Err(OrsError::DuplicateConflict);
@@ -8330,7 +9051,7 @@ impl RedbRecoveryStore {
                     producer_generation,
                     authority_epoch,
                     envelope_sha256: presented_sha,
-                    envelope_bytes: staging.stored_bytes,
+                    envelope_bytes: staging.stored_bytes.clone(),
                     staging_connection,
                     staged_at_ms: now_ms,
                     phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
@@ -8342,7 +9063,7 @@ impl RedbRecoveryStore {
                     transport_hash: staging.transport_hash.clone(),
                     redacted: staging.denied,
                     redaction_reason: staging.reason.clone(),
-                    redacted_classes: staging.classes,
+                    redacted_classes: staging.classes.clone(),
                     redaction_marker: if staging.denied {
                         BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
                     } else {
@@ -8357,9 +9078,16 @@ impl RedbRecoveryStore {
                     // decision even on this ownerless entry, so the persisted
                     // verdict stays attributable to the exact bytes, the
                     // scope, and the policy revision it was made about.
-                    admitted_source: staging.transport_hash,
-                    admitted_scope: staging.scope,
+                    admitted_source: staging.transport_hash.clone(),
+                    admitted_scope: staging.scope.clone(),
                     admitted_policy_revision: staging.policy_revision,
+                    // No provenance was presented on this entry: the row
+                    // stays pre-provenance, exactly as before.
+                    adapter_version: provenance.adapter_version,
+                    transformation_version: provenance.transformation_version,
+                    requested_route: provenance.requested_route,
+                    actual_route: provenance.actual_route,
+                    normalization_warnings: provenance.warnings,
                 };
                 row.validate()?;
                 {
@@ -8368,6 +9096,13 @@ impl RedbRecoveryStore {
                         .insert(key.as_str(), encode(&row)?.as_str())
                         .map_err(storage)?;
                 }
+                // Same I7.23 relation as the owner-checked entry (issue #1934):
+                // the durable normalized projection is written beside the
+                // raw-or-redacted record and re-verified through its own
+                // validator before the cursor advance below is allowed to
+                // publish a new frontier.
+                Self::insert_bridge_projection_in(&write, &key, &row, &staging, now_ms)?;
+                Self::require_bridge_event_relation_in(&write, &row, &key)?;
                 Self::mark_bridge_recovery_legacy_unproven_in(&write)?;
                 let (durable, acked) = Self::advance_bridge_cursor_in(&write, &stream_id)?;
                 let handoff = Self::bridge_handoff_state_in(&write, &stream_id, &event_id)?;
@@ -9322,6 +10057,52 @@ impl RedbRecoveryStore {
         Ok((stream_list_total, unscoped_gap_total))
     }
 
+    /// Finds persisted windows for exactly one authenticated recovery owner.
+    /// The table has a strict 64-row cap, so this scan is bounded. Matching
+    /// requires both source identity fields and their derived scope digest;
+    /// a digest collision or duplicate historical window is never resolved
+    /// by choosing the newest row.
+    fn bridge_recovery_windows_for_owner_in(
+        write: &redb::WriteTransaction,
+        lineage: &str,
+        principal: &str,
+    ) -> Result<Vec<BridgeEventRecoveryWindowRow>, OrsError> {
+        let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
+        let windows = write
+            .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
+            .map_err(storage)?;
+        if windows.len().map_err(storage)? > MAX_BRIDGE_RECOVERY_WINDOWS as u64 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let mut matches = Vec::new();
+        for entry in windows.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
+            row.validate()?;
+            if row.window_key != key.value()
+                || row.owner_scope_digest
+                    != Self::bridge_owner_scope_digest(&row.authority_lineage, &row.principal)?
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_recovery_window",
+                    reason: "window key or authenticated owner scope does not match its row"
+                        .to_owned(),
+                });
+            }
+            if row.owner_scope_digest == scope {
+                if row.authority_lineage != lineage || row.principal != principal {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason: "owner-scope digest resolves to foreign authenticated identity"
+                            .to_owned(),
+                    });
+                }
+                matches.push(row);
+            }
+        }
+        Ok(matches)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "window cleanup, identity issuance, and cutoff commit share one transaction"
@@ -9332,6 +10113,11 @@ impl RedbRecoveryStore {
         principal: &str,
     ) -> Result<BridgeEventRecoveryWindowRow, OrsError> {
         let now_ms = current_unix_ms_u64()?;
+        let existing = Self::bridge_recovery_windows_for_owner_in(write, lineage, principal)?;
+        if existing.len() > 1 {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let reusable = existing.into_iter().find(|row| row.expires_at_ms > now_ms);
         let expired = {
             let windows = write
                 .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
@@ -9391,6 +10177,9 @@ impl RedbRecoveryStore {
             for key in cut_keys {
                 cuts.remove(key.as_str()).map_err(storage)?;
             }
+        }
+        if let Some(window) = reusable {
+            return Ok(window);
         }
         {
             let windows = write
@@ -9480,10 +10269,14 @@ impl RedbRecoveryStore {
         };
         let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
         row.validate()?;
-        if row.window_key != window_key {
+        if row.window_key != window_key
+            || row.owner_scope_digest
+                != Self::bridge_owner_scope_digest(&row.authority_lineage, &row.principal)?
+        {
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_event_recovery_window",
-                reason: "window key does not match its table key".to_owned(),
+                reason: "window key or owner scope does not match its persisted identity"
+                    .to_owned(),
             });
         }
         if row.authority_lineage != lineage || row.principal != principal {
@@ -9507,10 +10300,14 @@ impl RedbRecoveryStore {
         };
         let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
         row.validate()?;
-        if row.window_key != window_key {
+        if row.window_key != window_key
+            || row.owner_scope_digest
+                != Self::bridge_owner_scope_digest(&row.authority_lineage, &row.principal)?
+        {
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_event_recovery_window",
-                reason: "window key does not match its table key".to_owned(),
+                reason: "window key or owner scope does not match its persisted identity"
+                    .to_owned(),
             });
         }
         if row.authority_lineage != lineage || row.principal != principal {
@@ -9607,6 +10404,7 @@ impl RedbRecoveryStore {
             Ok(limit)
         };
         match selector {
+            BridgeRecoverySelector::Resume { .. } => Ok(BridgeRecoveryScopeSelector::Resume),
             BridgeRecoverySelector::Streams {
                 window_key,
                 after_stream,
@@ -10306,9 +11104,10 @@ impl RedbRecoveryStore {
     fn bridge_recovery_typed_reply(
         window: &BridgeEventRecoveryWindowRow,
         disposition: BridgeRecoveryWindowDisposition,
+        recovery_scope: Option<&BridgeRecoverySelector>,
         selected_scope: &serde_json::Value,
         unproven_scope_present: Option<bool>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, OrsError> {
         let unproven_scope_present = unproven_scope_present.unwrap_or(true);
         let unresolved = BridgeRecoveryUnresolvedFrontier {
             // An unusable window completes nothing: all four dimensions stay
@@ -10318,8 +11117,9 @@ impl RedbRecoveryStore {
             stream_pages_pending: true,
             unproven_scope_present,
         };
-        json!({
+        let response = json!({
             "window_key": window.window_key,
+            "expires_at_ms": window.expires_at_ms,
             "window_status": match disposition {
                 BridgeRecoveryWindowDisposition::Active => "active",
                 BridgeRecoveryWindowDisposition::Moved => "moved",
@@ -10338,7 +11138,14 @@ impl RedbRecoveryStore {
             "streams": [],
             "unscoped_gaps": [],
             "unproven_scope_present": unproven_scope_present,
-        })
+        });
+        Self::bridge_recovery_seal_reply(
+            response,
+            recovery_scope,
+            &window.window_key,
+            disposition,
+            &unresolved,
+        )
     }
 
     /// Seals a finished page with its canonical commitment and enforces the
@@ -11249,15 +12056,17 @@ impl RedbRecoveryStore {
     ) -> Result<(), OrsError> {
         let positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
         let prefix = format!("{}::", access.namespace);
-        let prefix_end = format!("{}\u{10ffff}", access.namespace);
+        let prefix_end = format!("{prefix}\u{10ffff}");
         let mut live = 0_u64;
         for entry in positions
             .range(prefix.as_str()..=prefix_end.as_str())
             .map_err(storage)?
         {
             let (key, value) = entry.map_err(storage)?;
-            let (namespace, _sequence) = Self::parse_bridge_position_key(key.value())?;
-            if namespace != access.namespace {
+            let (namespace, sequence) = Self::parse_bridge_position_key(key.value())?;
+            if namespace != access.namespace
+                || key.value() != Self::bridge_position_key(&namespace, sequence)
+            {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_position",
                     reason: "position key escapes its namespace".to_owned(),
@@ -11608,7 +12417,7 @@ impl RedbRecoveryStore {
         &self,
         staged: &serde_json::Value,
     ) -> Result<serde_json::Value, OrsError> {
-        let (stage, staging) = Self::parse_bridge_stage_checked(staged)?;
+        let (stage, staging, provenance) = Self::parse_bridge_stage_checked(staged)?;
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
         let outcome = {
@@ -11625,10 +12434,21 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
                 BridgeStreamRight::Append,
             )?;
-            match Self::check_bridge_retained_replay_in(&write, &access, &stage, &staging)? {
+            match Self::check_bridge_retained_replay_in(
+                &write,
+                &access,
+                &stage,
+                &staging,
+                &provenance,
+            )? {
                 Some(outcome) => outcome,
                 None => Self::stage_fresh_bridge_event_checked(
-                    &write, &access, &stage, &staging, now_ms,
+                    &write,
+                    &access,
+                    &stage,
+                    &staging,
+                    &provenance,
+                    now_ms,
                 )?,
             }
         };
@@ -11661,11 +12481,12 @@ impl RedbRecoveryStore {
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
     ) -> Result<Option<serde_json::Value>, OrsError> {
         if let Some(row) = Self::load_bridge_event_row_in(write, &stage.key)? {
             row.validate()?;
             return Ok(Some(Self::replay_bridge_event_outcome_checked(
-                write, access, &row, stage, staging,
+                write, access, &row, stage, staging, provenance,
             )?));
         }
         if let Some(commitment) =
@@ -11744,21 +12565,32 @@ impl RedbRecoveryStore {
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
         now_ms: u64,
     ) -> Result<serde_json::Value, OrsError> {
         access.require(BridgeStreamRight::Append)?;
         Self::check_bridge_handoff_compatible_in(write, access, stage)?;
-        let outcome = Self::insert_bridge_event_row_checked(write, access, stage, staging, now_ms)?;
+        let outcome = Self::insert_bridge_event_row_checked(
+            write, access, stage, staging, provenance, now_ms,
+        )?;
         Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
         Ok(outcome)
     }
 
     /// Parses and validates one owner-checked stage request (issue #2729):
     /// the sidecar identity, the Kernel-derived owner evidence, the
-    /// sidecar-to-envelope bind, the digest, and the disclosure staging.
+    /// sidecar-to-envelope bind, the digest, the disclosure staging, and the
+    /// ingest provenance (issue #1934).
     fn parse_bridge_stage_checked(
         staged: &serde_json::Value,
-    ) -> Result<(BridgeCheckedStage, BridgeEventPrivacyStaging), OrsError> {
+    ) -> Result<
+        (
+            BridgeCheckedStage,
+            BridgeEventPrivacyStaging,
+            BridgeEventIngestProvenance,
+        ),
+        OrsError,
+    > {
         let stream_id = bridge_key_text(staged, "stream_id")?;
         let event_id = bridge_key_text(staged, "event_id")?;
         let sequence = bridge_sequence(staged, "sequence")?;
@@ -11813,6 +12645,10 @@ impl RedbRecoveryStore {
         // bytes inside the scope this store will actually record.
         let staging =
             Self::bridge_event_privacy_staging(staged, &envelope_bytes, Some(&namespace))?;
+        // The ingest provenance is resolved from the staged adapter legs plus
+        // this owner's stamps, so the row answers the I7.23 storage list
+        // after restart.
+        let provenance = Self::bridge_event_provenance_staging(staged, &envelope_value, true)?;
         let key = format!("{namespace}::{event_id}");
         let stage = BridgeCheckedStage {
             evidence,
@@ -11826,7 +12662,7 @@ impl RedbRecoveryStore {
             namespace,
             key,
         };
-        Ok((stage, staging))
+        Ok((stage, staging, provenance))
     }
 
     /// Answers an exact replay under an owner-checked identity (issue
@@ -11845,12 +12681,19 @@ impl RedbRecoveryStore {
     /// privacy policy conflicts rather than answering a stale permission as a
     /// duplicate. The exact source digest is already covered by
     /// `transport_hash`.
+    ///
+    /// Issue #1934 also binds the ingest provenance: a replay admitted by a
+    /// different adapter version, staging transform, requested route, actual
+    /// route, or warning set under the same identity conflicts instead of
+    /// answering stale provenance as a duplicate. A pre-provenance row never
+    /// matches current provenance, so it conflicts rather than duplicating.
     fn replay_bridge_event_outcome_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         row: &BridgeEventRow,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
     ) -> Result<serde_json::Value, OrsError> {
         if row.owner_namespace != stage.namespace
             || row.envelope_sha256 != stage.presented_sha
@@ -11875,6 +12718,7 @@ impl RedbRecoveryStore {
                 }
             || row.admitted_scope != staging.scope
             || row.admitted_policy_revision != staging.policy_revision
+            || !Self::bridge_event_provenance_matches(row, provenance)
         {
             return Err(OrsError::DuplicateConflict);
         }
@@ -11947,6 +12791,111 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Stages the durable normalized projection of one freshly staged event
+    /// (issue #1934, I7.23). Runs inside a stage transaction, immediately
+    /// after the raw-or-redacted record row and under the identical
+    /// `namespace::event_id` key, so the projection is an exclusive creation
+    /// owned by this stage call rather than a row that merely happens to have
+    /// a predictable name.
+    ///
+    /// A projection table at its admission budget fails the whole stage with
+    /// typed `EventRecords` backpressure before any cursor moves: a record
+    /// without its normalized projection is never committed.
+    ///
+    /// Every relation leg is copied from the VALIDATED record row that was just
+    /// written, not re-derived from the staging input, so the projection
+    /// describes the record that actually exists on disk.
+    fn insert_bridge_projection_in(
+        write: &redb::WriteTransaction,
+        key: &str,
+        record: &BridgeEventRow,
+        staging: &BridgeEventPrivacyStaging,
+        now_ms: u64,
+    ) -> Result<(), OrsError> {
+        let projection = BridgeEventProjectionRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: record.stream_id.clone(),
+            event_id: record.event_id.clone(),
+            sequence: record.sequence,
+            owner_namespace: record.owner_namespace.clone(),
+            normalized_envelope: staging.normalized_bytes.clone(),
+            record_transport_hash: record.transport_hash.clone(),
+            record_redacted: record.redacted,
+            record_disposition: if record.redacted {
+                BRIDGE_EVENT_PRIVACY_REDACTED.to_owned()
+            } else {
+                BRIDGE_EVENT_PRIVACY_ALLOWED.to_owned()
+            },
+            record_redaction_reason: record.redaction_reason.clone(),
+            record_redacted_classes: record.redacted_classes.clone(),
+            admitted_scope: record.admitted_scope.clone(),
+            admitted_policy_revision: record.admitted_policy_revision,
+            staged_at_ms: now_ms,
+            staging_connection: record.staging_connection.clone(),
+        };
+        projection.validate()?;
+        let mut projections = write
+            .open_table(BRIDGE_EVENT_PROJECTIONS)
+            .map_err(storage)?;
+        if projections.len().map_err(storage)? >= MAX_BRIDGE_EVENT_PROJECTIONS as u64
+            && projections.get(key).map_err(storage)?.is_none()
+        {
+            return Err(OrsError::BridgeEventCapacityExceeded(
+                eliot_contracts::BridgeEventCapacityPressure::event_records(
+                    eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                ),
+            ));
+        }
+        projections
+            .insert(key, encode(&projection)?.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Requires the durable I7.23 relation for one staged record before any
+    /// cursor may be published (issue #1934).
+    ///
+    /// The projection stored under the record's own key is READ BACK and
+    /// validated through [`BridgeEventProjectionRow::validate`] — the
+    /// originally recorded value, checked by its own validator, not a
+    /// recomputed copy of what the caller still holds — and then compared leg
+    /// by leg with the record it claims to normalize
+    /// ([`BridgeEventProjectionRow::binds_record`]). A missing projection, a
+    /// foreign namespace, a different transport hash, a different stored form,
+    /// or a disposition that disagrees with the redaction receipt is a torn
+    /// relation and fails closed as an integrity problem: the whole stage fails
+    /// before the cursor frontier moves, so the unacknowledged event is
+    /// redelivered instead of answered `DURABLE` over an unproven relation.
+    fn require_bridge_event_relation_in(
+        write: &redb::WriteTransaction,
+        record: &BridgeEventRow,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        let stored: Option<BridgeEventProjectionRow> = {
+            let projections = write
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
+            projections
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let stored = stored.ok_or(OrsError::IntegrityProblem {
+            record_type: "bridge_event_projection",
+            reason: "staged bridge event has no durable normalized projection".to_owned(),
+        })?;
+        stored.validate()?;
+        if !stored.binds_record(record) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_projection",
+                reason: "durable normalized projection does not bind its raw-or-redacted record"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Inserts one fresh owner-checked row and advances its cursor (issue
     /// #2729). Runs inside the stage transaction owned by
     /// [`Self::stage_bridge_event_checked`].
@@ -11963,11 +12912,33 @@ impl RedbRecoveryStore {
     /// stages the event plus its pending delivery intent atomically, so no
     /// crash or timeout between the former split commits can leave a staged
     /// event without its required handoff.
+    ///
+    /// Issue #1934 persists the ingest provenance on the same row in the same
+    /// transaction: the row, its ordered position binding, its cursor
+    /// advance, and its pending handoff commit together, so a crash before
+    /// commit advances nothing and a crash after commit leaves the full I7.23
+    /// storage list — transport hash, raw-or-redacted bytes, receipt,
+    /// adapter/transformation versions, routes, and warnings — durably
+    /// related.
+    ///
+    /// Issue #1934 also makes the durable relation a COMMIT PRECONDITION of the
+    /// cursor advance rather than a description of it. The record row and its
+    /// normalized projection are both written first; the stored projection is
+    /// then re-read and re-validated through
+    /// [`Self::require_bridge_event_relation_in`] and compared against the
+    /// record it claims to normalize; only then may
+    /// [`Self::advance_bridge_cursor_in_checked`] publish a new durable
+    /// frontier. On the redacted path this is what was missing: the event has
+    /// its own durable normalized projection instead of only the deterministic
+    /// redacted marker, and a stage that cannot prove the relation fails the
+    /// whole transaction, leaving the cursor unadvanced for redelivery rather
+    /// than answering `DURABLE` over an event with no normalized form.
     fn insert_bridge_event_row_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
         now_ms: u64,
     ) -> Result<serde_json::Value, OrsError> {
         let row = BridgeEventRow {
@@ -12006,6 +12977,18 @@ impl RedbRecoveryStore {
             admitted_source: staging.transport_hash.clone(),
             admitted_scope: staging.scope.clone(),
             admitted_policy_revision: staging.policy_revision,
+            // The ingest provenance travels with the row in the same
+            // transaction: adapter and transformation versions, requested
+            // and actual route references, and normalization warnings, so
+            // the I7.23 storage list is reconstructible after restart. A
+            // later replay under different provenance is a different
+            // admission, not a duplicate (see
+            // [`Self::replay_bridge_event_outcome_checked`]).
+            adapter_version: provenance.adapter_version.clone(),
+            transformation_version: provenance.transformation_version,
+            requested_route: provenance.requested_route.clone(),
+            actual_route: provenance.actual_route.clone(),
+            normalization_warnings: provenance.warnings.clone(),
         };
         row.validate()?;
         {
@@ -12014,6 +12997,12 @@ impl RedbRecoveryStore {
                 .insert(stage.key.as_str(), encode(&row)?.as_str())
                 .map_err(storage)?;
         }
+        Self::insert_bridge_projection_in(write, &stage.key, &row, staging, now_ms)?;
+        // The cursor advance is conditioned on the durable relation, not merely
+        // ordered after it: the projection just written is read back from the
+        // table, validated through its own `validate()`, and compared leg by
+        // leg against the record row before any frontier moves.
+        Self::require_bridge_event_relation_in(write, &row, &stage.key)?;
         {
             Self::check_bridge_position_budget_in(write, access)?;
             let position = BridgeEventPosition {
@@ -12617,6 +13606,21 @@ impl RedbRecoveryStore {
             for victim in &victims {
                 let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
                 records.remove(key.as_str()).map_err(storage)?;
+            }
+        }
+        // The normalized projection is retired with its record (issue #1934):
+        // the retained commitment is the admissible representation of a
+        // compacted event, so a projection left behind under the same key would
+        // be a projection whose raw-or-redacted record no longer exists. Both
+        // removals commit in the transaction that writes the commitment and the
+        // compacted boundary.
+        {
+            let mut projections = write
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
+            for victim in &victims {
+                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
+                projections.remove(key.as_str()).map_err(storage)?;
             }
         }
         Self::write_bridge_cursors_compacted_in(
@@ -13340,15 +14344,40 @@ impl RedbRecoveryStore {
         {
             let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
             let mut due = Vec::new();
-            for entry in handoffs.iter().map_err(storage)? {
+            let prefix = format!("{}::", access.namespace);
+            let prefix_end = format!("{prefix}\u{10ffff}");
+            for entry in handoffs
+                .range(prefix.as_str()..=prefix_end.as_str())
+                .map_err(storage)?
+            {
                 let (key, value) = entry.map_err(storage)?;
                 let row: BridgeEventHandoffRow = decode(value.value())?;
                 row.validate()?;
+                let key = key.value();
+                if row.owner_namespace.is_empty() {
+                    if key != format!("{}::{}", row.stream_id, row.event_id) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_event_handoff",
+                            reason: "legacy handoff key does not match its stream identity"
+                                .to_owned(),
+                        });
+                    }
+                    continue;
+                }
+                if row.owner_namespace != access.namespace
+                    || row.stream_id != owner.local_stream
+                    || key != format!("{}::{}", access.namespace, row.event_id)
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_handoff",
+                        reason: "handoff key, owner, and stream identity disagree".to_owned(),
+                    });
+                }
                 if row.owner_namespace == access.namespace
                     && row.sequence <= acked_sequence
                     && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF
                 {
-                    due.push(key.value().to_owned());
+                    due.push(key.to_owned());
                 }
             }
             if !due.is_empty() {
@@ -13389,6 +14418,13 @@ impl RedbRecoveryStore {
                     reconciled += 1;
                 }
             }
+        }
+        if reconciled > 0 {
+            // Handoff state and its accounted bytes are visible in a finite
+            // recovery page. Move the same view revision in this transaction
+            // so a page cannot stitch old capacity with a newly reconciled
+            // handoff row.
+            Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
         }
         write.commit().map_err(storage)?;
         Ok(json!({
@@ -13724,13 +14760,13 @@ impl RedbRecoveryStore {
     /// Retires one namespace's eligible handoffs inside the recovery
     /// transaction (issue #2731, items 4 and 5). Eligibility is evaluated
     /// per row by [`BridgeEventHandoffRow::retirement_eligible`] against
-    /// the current acked cursor and compacted boundary; a receipt-complete
-    /// row covered by the acked cursor is eligible even above the compacted
-    /// boundary, so quiet streams that stop producing at or below the
-    /// retained acked window still release their charges instead of holding
-    /// the table-global budget forever. An eligible row with no live
-    /// payload deletes by exact key. An eligible receipt-complete row whose
-    /// payload is still retained terminalizes: its #2730 replay commitment
+    /// the current acked cursor and compacted boundary. Its existing
+    /// `has_receiver_receipt` predicate is producer-presented frontier/owner
+    /// data, not a receiving-owner durable receipt; tuple-based retirement
+    /// therefore remains unproven. An eligible row with no live payload
+    /// deletes by exact key under the current predicate. An eligible row
+    /// matching that producer-presented tuple whose payload is still retained
+    /// terminalizes: its #2730 replay commitment
     /// is written first — the identical evidence window-driven compaction
     /// retains, under the same per-stream and total pressure bounds — then
     /// the payload record and the handoff row delete together and the
@@ -13738,10 +14774,13 @@ impl RedbRecoveryStore {
     /// exact replays keep answering duplicate from the commitment, old
     /// occurrences below the boundary keep answering retired, and the
     /// repair step (which restores handoffs only for retained records)
-    /// never resurrects them. Rows with a live payload but no receiver
-    /// receipt are never touched: unknown or pending work is never evicted
-    /// to admit new work, and a torn record/handoff identity mismatch fails
-    /// closed by skipping the row instead of guessing. Deletes are by exact
+    /// never resurrects them. Rows with a live payload but without the
+    /// persisted producer-presented tuple are never touched; this only blocks
+    /// the separate `handed_off` plus acked/compacted fallback and does not
+    /// make tuple-based retirement safe. The producer tuple's downstream
+    /// disposition is not verified here; torn record/handoff identity
+    /// mismatches fail closed by skipping the row instead of guessing. Deletes are by
+    /// exact
     /// key, so the charge releases exactly once. At most `budget` rows
     /// delete or terminalize per call; `retirement_continuation` reports
     /// whether eligible rows remain for the next legitimate recovery entry.
@@ -13895,6 +14934,14 @@ impl RedbRecoveryStore {
                 Self::create_bridge_recovery_window_in(&write, &lineage, &principal)?,
                 true,
             ),
+            BridgeRecoveryScopeSelector::Resume => {
+                let mut matches =
+                    Self::bridge_recovery_windows_for_owner_in(&write, &lineage, &principal)?;
+                if matches.len() != 1 {
+                    return Err(OrsError::RecoveryOwnerMismatch);
+                }
+                (matches.remove(0), false)
+            }
             BridgeRecoveryScopeSelector::Streams { window_key, .. }
             | BridgeRecoveryScopeSelector::Stream { window_key, .. }
             | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => (
@@ -13905,19 +14952,20 @@ impl RedbRecoveryStore {
         };
         if window.expires_at_ms <= now_ms {
             drop(write);
-            return Ok(Self::bridge_recovery_typed_reply(
+            return Self::bridge_recovery_typed_reply(
                 &window,
                 BridgeRecoveryWindowDisposition::Expired,
+                recovery_scope,
                 &selected_scope,
                 None,
-            ));
+            );
         }
 
         let mut stream_owners: Vec<(BridgeStreamOwnerRow, u64)> = Vec::new();
         let mut requested_stream: Option<(u64, u64, u64, usize, usize, usize)> = None;
         let mut requested_gap: Option<(usize, usize)> = None;
         match &selector {
-            BridgeRecoveryScopeSelector::Open => {
+            BridgeRecoveryScopeSelector::Open | BridgeRecoveryScopeSelector::Resume => {
                 let page = Self::bridge_recovery_owner_page_in(
                     &write,
                     &window,
@@ -14021,9 +15069,6 @@ impl RedbRecoveryStore {
             }
         }
 
-        for (owner, _) in &stream_owners {
-            let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
-        }
         let gap_owner_for_page = match &selector {
             BridgeRecoveryScopeSelector::UnscopedGaps {
                 after_gap_scope, ..
@@ -14054,7 +15099,20 @@ impl RedbRecoveryStore {
             .next(),
         };
         if let Some((owner, _)) = &gap_owner_for_page {
-            let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
+            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
+                Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
+                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            } else {
+                let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
+            }
+        }
+        for (owner, _) in &stream_owners {
+            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
+                Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
+                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            } else {
+                let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
+            }
         }
         if opening || matches!(selector, BridgeRecoveryScopeSelector::Streams { .. }) {
             Self::save_bridge_recovery_window_in(&write, &window)?;
@@ -14066,21 +15124,63 @@ impl RedbRecoveryStore {
         // this one immutable read snapshot; revision checks reject movement
         // between the write and this snapshot.
         let read = self.database.begin_read().map_err(storage)?;
-        let Some(read_window) =
+        let Some(mut read_window) =
             Self::load_bridge_recovery_window(&read, &window.window_key, &lineage, &principal)?
         else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
         if read_window.expires_at_ms <= current_unix_ms_u64()? {
-            return Ok(Self::bridge_recovery_typed_reply(
+            return Self::bridge_recovery_typed_reply(
                 &read_window,
                 BridgeRecoveryWindowDisposition::Expired,
+                recovery_scope,
                 &selected_scope,
                 None,
-            ));
+            );
+        }
+        if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
+            // Resume re-derives the deterministic first outer page. The
+            // persisted window may carry a later page's mutable list cursor;
+            // project this first-page cursor only in memory and never advance
+            // the persisted window or any producer/consumer cursor.
+            read_window
+                .stream_list_continuation
+                .clone_from(&window.stream_list_continuation);
+            read_window.stream_list_complete = window.stream_list_complete;
         }
         let mut moved = false;
         let mut stream_pages = Vec::with_capacity(stream_owners.len());
+        if stream_owners.len() > MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        // Divide the existing complete-reply ceiling across the entire
+        // operation before any event or gap projection is materialized.
+        // Keep 64 KiB for bounded page metadata, capacity fields, the page
+        // commitment and framing, and reserve the existing 10 KiB
+        // unscoped-gap page budget. Each stream receives a proportional
+        // share of the existing 36 KiB event / 10 KiB gap limits; this only
+        // advances the existing per-dimension continuations and never drops
+        // a suffix.
+        let stream_fact_budget = MAX_BRIDGE_RECOVERY_REPLY_BYTES
+            .saturating_sub(64 * 1024)
+            .saturating_sub(if gap_owner_for_page.is_some() {
+                10 * 1024
+            } else {
+                0
+            });
+        let per_stream_fact_budget = if stream_owners.is_empty() {
+            0
+        } else {
+            stream_fact_budget / stream_owners.len()
+        };
+        let event_byte_limit = per_stream_fact_budget
+            .saturating_mul(36)
+            .checked_div(46)
+            .unwrap_or(0)
+            .min(36 * 1024);
+        let gap_byte_limit = per_stream_fact_budget
+            .saturating_sub(event_byte_limit)
+            .min(10 * 1024);
         for (listed_owner, position) in &stream_owners {
             let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
             let Some(value) = owners
@@ -14140,16 +15240,16 @@ impl RedbRecoveryStore {
                 after_sequence,
                 BridgeRecoveryPageBudget {
                     event_limit,
-                    event_byte_limit: 36 * 1024,
+                    event_byte_limit,
                     gap_offset,
                     gap_limit,
-                    gap_byte_limit: 10 * 1024,
+                    gap_byte_limit,
                 },
             )?;
             if suffix_proven {
                 // #2731 capacity accounting is an observation leg of the
                 // same snapshot, separate from recovery completion proof.
-                page["capacity"] = Self::bridge_capacity_accounting_for(&read, &owner.namespace)?;
+                page["capacity"] = Self::bridge_capacity_accounting_for(&read, &owner)?;
                 stream_pages.push(page);
             } else {
                 moved = true;
@@ -14227,12 +15327,13 @@ impl RedbRecoveryStore {
             // A moved window never returns half a stitched page: the typed
             // Moved disposition is the whole answer, and its commitment still
             // binds the window and the selector the caller asked for.
-            return Ok(Self::bridge_recovery_typed_reply(
+            return Self::bridge_recovery_typed_reply(
                 &read_window,
                 BridgeRecoveryWindowDisposition::Moved,
+                recovery_scope,
                 &selected_scope,
                 Some(unproven_scope_present),
-            ));
+            );
         }
         let gap_continuation = unscoped_gap_cursor.map(|(after_gap_scope, gap_offset)| {
             json!({ "after_gap_scope": after_gap_scope, "gap_offset": gap_offset })
@@ -14258,6 +15359,7 @@ impl RedbRecoveryStore {
         };
         let response = json!({
             "window_key": read_window.window_key,
+            "expires_at_ms": read_window.expires_at_ms,
             "window_status": "active",
             "window_disposition": BridgeRecoveryWindowDisposition::Active,
             "window_disposition_reason": BridgeRecoveryWindowDisposition::Active.reason(),
@@ -14282,25 +15384,103 @@ impl RedbRecoveryStore {
         )
     }
 
-    /// Counts one namespace's #2730 ordered position rows with their total
-    /// encoded bytes (issue #2731, item 4): key bytes plus serialized-record
-    /// bytes, the accountable persisted size. Read-only — positions are
-    /// owned, written, and capped by #2730/#2885 and are never mutated
-    /// here. The namespace key range bounds the inspected row count at
-    /// [`MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE`]; legacy overflow fails
-    /// with [`OrsError::ProjectionLimitExceeded`] instead of returning a
-    /// partial count. Serialized values are size-checked before decoding.
-    /// Called by [`Self::bridge_capacity_accounting_for`]; kept separate so
-    /// the inventory stays within its line budget.
+    /// Counts one namespace's #2730 position rows and corresponding live
+    /// event records (issue #2731, item 4). The owner-keyed position index is
+    /// the exact set of modern admitted identities: legacy ownerless records
+    /// were never indexed and remain excluded as before. Each position is
+    /// counted; a live identity contributes the exact raw key and value
+    /// lengths at its canonical event key without decoding its potentially
+    /// large envelope. Recovery pages still fully validate event identity
+    /// and checksums before returning event contents. A missing row requires
+    /// either its retained commitment or the cursor's documented retired
+    /// boundary. Position values are bounded and validated. The namespace
+    /// range is bounded by [`MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE`].
+    fn bridge_position_entry_accounting_for(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+        position: &BridgeEventPosition,
+        sequence: u64,
+        compacted_boundary: u64,
+        cursor_stream_id: Option<&str>,
+    ) -> Result<(u64, u64), OrsError> {
+        let namespace = owner.namespace.as_str();
+        let record_key = format!("{namespace}::{}", position.event_id);
+        let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        let commitments = read
+            .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
+            .map_err(storage)?;
+        let record = records.get(record_key.as_str()).map_err(storage)?;
+        let commitment = commitments.get(record_key.as_str()).map_err(storage)?;
+        match (record, commitment) {
+            (Some(record), None) => Ok((1, (record_key.len() + record.value().len()) as u64)),
+            (None, Some(commitment)) => {
+                let row: BridgeEventReplayCommitment = decode(commitment.value())?;
+                row.validate()?;
+                if row.owner_namespace != namespace
+                    || row.event_id != position.event_id
+                    || row.sequence != sequence
+                    || row.sequence > compacted_boundary
+                    || row.record_key() != record_key
+                    || cursor_stream_id != Some(row.stream_id.as_str())
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_replay_commitment",
+                        reason: "commitment does not prove its compacted position identity"
+                            .to_owned(),
+                    });
+                }
+                Ok((0, 0))
+            }
+            (None, None) if sequence <= compacted_boundary => {
+                // Compaction intentionally preserves position bindings after
+                // bounded replay commitments expire; deleted bytes are not pending.
+                Ok((0, 0))
+            }
+            (None, None) => Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_position",
+                reason: "position above retired boundary has no live row or commitment".to_owned(),
+            }),
+            (Some(_), Some(_)) => Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_position",
+                reason: "live event and retained commitment coexist for one identity".to_owned(),
+            }),
+        }
+    }
+
     fn bridge_position_accounting_for(
         read: &redb::ReadTransaction,
-        namespace: &str,
-    ) -> Result<(u64, u64), OrsError> {
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<(u64, u64, u64, u64), OrsError> {
+        let namespace = owner.namespace.as_str();
         let stored = read.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        let cursor = {
+            let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .get(namespace)
+                .map_err(storage)?
+                .map(|value| decode::<BridgeEventCursorRow>(value.value()))
+                .transpose()?
+        };
         let prefix = format!("{namespace}::");
-        let prefix_end = format!("{namespace}\u{10ffff}");
+        let prefix_end = format!("{prefix}\u{10ffff}");
+        let compacted_boundary = if let Some(cursor) = &cursor {
+            cursor.validate()?;
+            if cursor.owner_namespace != namespace || cursor.stream_id != owner.local_stream {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_cursor",
+                    reason: "cursor key and owner namespace disagree".to_owned(),
+                });
+            }
+            cursor.last_compacted_sequence
+        } else {
+            0
+        };
+        let cursor_stream_id = cursor.as_ref().map(|cursor| cursor.stream_id.as_str());
         let mut positions = 0_u64;
         let mut position_bytes = 0_u64;
+        let mut pending_events = 0_u64;
+        let mut pending_event_bytes = 0_u64;
+        let mut event_ids = BTreeSet::new();
         for entry in stored
             .range(prefix.as_str()..=prefix_end.as_str())
             .map_err(storage)?
@@ -14326,10 +15506,37 @@ impl RedbRecoveryStore {
             }
             let position: BridgeEventPosition = decode(value.value())?;
             position.validate()?;
+            if !event_ids.insert(position.event_id.clone()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "one owner event identity is indexed at multiple sequences".to_owned(),
+                });
+            }
             positions += 1;
             position_bytes += (key.len() + value.value().len()) as u64;
+            // The immutable #2730 position binding scopes the raw event
+            // bytes without decoding its large envelope. Selected rows still
+            // undergo full identity/checksum validation before reply emission.
+            let (event_count, event_bytes) = Self::bridge_position_entry_accounting_for(
+                read,
+                owner,
+                &position,
+                sequence,
+                compacted_boundary,
+                cursor_stream_id,
+            )?;
+            if pending_events + event_count > MAX_BRIDGE_EVENT_RECORDS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            pending_events += event_count;
+            pending_event_bytes += event_bytes;
         }
-        Ok((positions, position_bytes))
+        Ok((
+            positions,
+            position_bytes,
+            pending_events,
+            pending_event_bytes,
+        ))
     }
 
     /// Counts only the owner namespace's bounded gap rows, rejecting a
@@ -14368,6 +15575,90 @@ impl RedbRecoveryStore {
         Ok((gaps, gap_bytes))
     }
 
+    fn bridge_handoff_accounting_for(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<(u64, u64), OrsError> {
+        let namespace = owner.namespace.as_str();
+        let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+        let prefix = format!("{namespace}::");
+        let prefix_end = format!("{prefix}\u{10ffff}");
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for entry in handoffs
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let row: BridgeEventHandoffRow = decode(value.value())?;
+            row.validate()?;
+            let key = key.value();
+            if row.owner_namespace.is_empty() {
+                // Legacy handoffs use stream_id::event_id; validate and
+                // exclude them even when the stream collides with namespace.
+                if key != format!("{}::{}", row.stream_id, row.event_id) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_handoff",
+                        reason: "legacy handoff key does not match its stream identity".to_owned(),
+                    });
+                }
+                continue;
+            }
+            if row.owner_namespace != namespace
+                || row.stream_id != owner.local_stream
+                || key != format!("{namespace}::{}", row.event_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_handoff",
+                    reason: "handoff key, owner, and stream identity disagree".to_owned(),
+                });
+            }
+            if count >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            count += 1;
+            bytes += (key.len() + value.value().len()) as u64;
+        }
+        Ok((count, bytes))
+    }
+
+    fn bridge_commitment_accounting_for(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+    ) -> Result<(u64, u64), OrsError> {
+        let namespace = owner.namespace.as_str();
+        let retained = read
+            .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
+            .map_err(storage)?;
+        let prefix = format!("{namespace}::");
+        let prefix_end = format!("{prefix}\u{10ffff}");
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for entry in retained
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let commitment: BridgeEventReplayCommitment = decode(value.value())?;
+            commitment.validate()?;
+            if commitment.owner_namespace != namespace
+                || commitment.stream_id != owner.local_stream
+                || key.value() != commitment.record_key()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_replay_commitment",
+                    reason: "commitment key, owner, and stream identity disagree".to_owned(),
+                });
+            }
+            if count >= MAX_BRIDGE_EVENT_REPLAY_COMMITMENTS_PER_STREAM as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            count += 1;
+            bytes += (key.value().len() + value.value().len()) as u64;
+        }
+        Ok((count, bytes))
+    }
+
     /// Accounts one namespace's bridge-event capacity under its owner
     /// (issue #2731, item 4): pending live events, handoffs, retained replay
     /// commitments, the #2730 ordered position index, stream/cursor
@@ -14384,53 +15675,14 @@ impl RedbRecoveryStore {
     /// backpressure against pending versus retained evidence.
     fn bridge_capacity_accounting_for(
         read: &redb::ReadTransaction,
-        namespace: &str,
+        owner: &BridgeStreamOwnerRow,
     ) -> Result<serde_json::Value, OrsError> {
+        let namespace = owner.namespace.as_str();
         crate::model::validate_digest(namespace, "owner_namespace")?;
-        let mut pending_events = 0_u64;
-        let mut pending_event_bytes = 0_u64;
-        {
-            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for entry in records.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == namespace {
-                    pending_events += 1;
-                    pending_event_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut handoffs_count = 0_u64;
-        let mut handoff_bytes = 0_u64;
-        {
-            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for entry in handoffs.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventHandoffRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == namespace {
-                    handoffs_count += 1;
-                    handoff_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut commitments = 0_u64;
-        let mut commitment_bytes = 0_u64;
-        {
-            let retained = read
-                .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
-                .map_err(storage)?;
-            for entry in retained.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let commitment: BridgeEventReplayCommitment = decode(value.value())?;
-                commitment.validate()?;
-                if commitment.owner_namespace == namespace {
-                    commitments += 1;
-                    commitment_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
+        let (positions, position_bytes, pending_events, pending_event_bytes) =
+            Self::bridge_position_accounting_for(read, owner)?;
+        let (handoffs_count, handoff_bytes) = Self::bridge_handoff_accounting_for(read, owner)?;
+        let (commitments, commitment_bytes) = Self::bridge_commitment_accounting_for(read, owner)?;
         let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -14439,7 +15691,8 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
                 .map_or(0, |value| (namespace.len() + value.value().len()) as u64)
         };
-        let (positions, position_bytes) = Self::bridge_position_accounting_for(read, namespace)?;
+        // Position counts/bytes were gathered with the owner-indexed live
+        // event rows above, so this view has no second position-table scan.
         let owner_bytes = {
             let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
             owners
@@ -16303,40 +17556,67 @@ impl RedbRecoveryStore {
     }
 
     /// Appends one observation-only evidence projection, preserving conflicts.
+    ///
+    /// Issue #269, A1: the row written here is the byte-free
+    /// [`crate::ProcessEvidenceRecord`]. The accepted `ProcessEvidence` value is
+    /// read at this boundary to take the digest over the ORIGINAL observed bytes
+    /// and is then dropped; the bounded inline preview bytes never reach ORS.
+    ///
+    /// A pre-#269 row already held at the same key is NOT replaced. Same key
+    /// means the same observation, so overwriting it would rewrite history with
+    /// a payload-stripped copy of the same observation; that is refused with its
+    /// own reason instead.
     pub fn persist_process_evidence(&self, record: &ProcessEvidenceRecord) -> Result<(), OrsError> {
         record.validate()?;
         let key = record.record_key()?;
         let write = self.database.begin_write().map_err(storage)?;
         {
             let mut table = write.open_table(PROCESS_EVIDENCE).map_err(storage)?;
-            let existing: Option<ProcessEvidenceRecord> = table
+            let existing = table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| Self::decode_process_evidence_row(value.value()))
                 .transpose()?;
-            if let Some(existing) = existing {
-                existing.validate()?;
-                if existing != *record {
+            match existing {
+                Some(ProcessEvidenceReadback::Observation(existing)) => {
+                    if *existing != *record {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "process_evidence",
+                            reason: "conflicting evidence replacement rejected".to_owned(),
+                        });
+                    }
+                }
+                Some(ProcessEvidenceReadback::InlinePayloadNotRetained(_)) => {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "process_evidence",
-                        reason: "conflicting evidence replacement rejected".to_owned(),
+                        reason: "a pre-#269 row retaining the inline stream payload is held at \
+                                 this key and is never replaced"
+                            .to_owned(),
                     });
                 }
-            } else {
-                let payload = encode(record)?;
-                table
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
+                None => {
+                    let payload = encode(record)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
             }
         }
         write.commit().map_err(storage)
     }
 
     /// Reads bounded observation-only evidence history for one operation.
+    ///
+    /// The element type is the codec's explicit version transition
+    /// ([`ProcessEvidenceReadback`]): a current row reads back as a byte-free
+    /// [`ProcessEvidenceRecord`], and a pre-#269 row reads back as its
+    /// [`crate::ProcessInlineEvidenceRow`] disposition with the inline payload
+    /// left on disk and unretained here. The two are never merged, and a
+    /// dispositioned row is never deleted, stripped or upgraded.
     pub fn load_process_evidence(
         &self,
         operation_id: &crate::OperationIdentity,
-    ) -> Result<Vec<ProcessEvidenceRecord>, OrsError> {
+    ) -> Result<Vec<ProcessEvidenceReadback>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
         // Process-evidence rows are written by ProcessEvidenceRecord::record_key with the
@@ -16344,7 +17624,7 @@ impl RedbRecoveryStore {
         // physical prefix range inclusively so the U+10FFFF endpoint cannot hide a row.
         let prefix = format!("{}::", operation_id.as_str());
         let prefix_end = format!("{prefix}\u{10ffff}");
-        let mut records = Vec::new();
+        let mut records: Vec<ProcessEvidenceReadback> = Vec::new();
         for entry in table
             .range(prefix.as_str()..=prefix_end.as_str())
             .map_err(storage)?
@@ -16354,16 +17634,18 @@ impl RedbRecoveryStore {
             if !key.starts_with(prefix.as_str()) {
                 break;
             }
-            let record: ProcessEvidenceRecord = decode(value.value())?;
-            record.validate()?;
+            let record = Self::decode_process_evidence_row(value.value())?;
             // Raw sibling identities can fall inside the physical prefix range (for example,
             // `op::sibling` while reading `op`). Decode the identity before applying the
             // canonical-key check so those rows are not misclassified as corruption.
-            if record.operation_id != *operation_id {
+            let row_operation = match &record {
+                ProcessEvidenceReadback::Observation(row) => &row.operation_id,
+                ProcessEvidenceReadback::InlinePayloadNotRetained(row) => &row.operation_id,
+            };
+            if row_operation != operation_id {
                 continue;
             }
-            let canonical_key = record.record_key()?;
-            if key != canonical_key {
+            if key != record.record_key() {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "process_evidence",
                     reason: "evidence record does not match its canonical key".to_owned(),
@@ -16392,9 +17674,12 @@ impl RedbRecoveryStore {
                 if !key.starts_with(encoded_prefix.as_str()) {
                     break;
                 }
-                let record: ProcessEvidenceRecord = decode(value.value())?;
-                record.validate()?;
-                if record.operation_id == *operation_id && key != record.record_key()? {
+                let record = Self::decode_process_evidence_row(value.value())?;
+                let row_operation = match &record {
+                    ProcessEvidenceReadback::Observation(row) => &row.operation_id,
+                    ProcessEvidenceReadback::InlinePayloadNotRetained(row) => &row.operation_id,
+                };
+                if row_operation == operation_id && key != record.record_key() {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "process_evidence",
                         reason:
@@ -16405,12 +17690,122 @@ impl RedbRecoveryStore {
             }
         }
         records.sort_by(|left, right| {
-            left.observed_at_ms
-                .cmp(&right.observed_at_ms)
-                .then_with(|| left.evidence_digest.cmp(&right.evidence_digest))
-                .then_with(|| left.record_key().ok().cmp(&right.record_key().ok()))
+            left.observed_at_ms()
+                .cmp(&right.observed_at_ms())
+                .then_with(|| left.evidence_digest().cmp(right.evidence_digest()))
+                .then_with(|| left.record_key().cmp(&right.record_key()))
         });
         Ok(records)
+    }
+
+    /// The explicit process-evidence codec version transition (issue #269, A1).
+    ///
+    /// The discriminator is the row's own
+    /// [`crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA`] field, read from the raw
+    /// JSON before any typed decode:
+    ///
+    /// - the current value decodes as a byte-free
+    ///   [`ProcessEvidenceRecord`] through the existing ORS codec;
+    /// - a field that is absent is a pre-#269 row: it is decoded into the
+    ///   inline-payload disposition and the payload is dropped with the row,
+    ///   never re-encoded and never written back;
+    /// - a field carrying a different value is a codec-version mismatch and is
+    ///   refused as such rather than being read as either shape.
+    ///
+    /// A row that is neither shape is an integrity problem, so a corrupt current
+    /// row is never downgraded into a legacy disposition.
+    fn decode_process_evidence_row(value: &str) -> Result<ProcessEvidenceReadback, OrsError> {
+        let raw: Value =
+            serde_json::from_str(value).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: error.to_string(),
+            })?;
+        let declared = match raw.get("observation_schema_version") {
+            None => return Self::dispose_inline_process_evidence_row(value),
+            Some(Value::String(declared)) => declared.as_str(),
+            Some(_) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_evidence",
+                    reason: "observation_schema_version must be a string".to_owned(),
+                });
+            }
+        };
+        if declared != crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "process evidence observation revision {declared:?} is not the current ORS \
+                     observation revision {}",
+                    crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA
+                ),
+            });
+        }
+        decode::<ProcessEvidenceRecord>(value)
+            .map(|record| ProcessEvidenceReadback::Observation(Box::new(record)))
+    }
+
+    /// Decodes one pre-#269 row into its inline-payload disposition.
+    ///
+    /// The `evidence` value is read as raw JSON and never decoded into bytes: the
+    /// disposition reports which physical streams still carry an inline preview
+    /// byte array, and the payload is dropped with the row. No digest is
+    /// re-derived, because ORS cannot revalidate a digest over the bytes it must
+    /// not keep.
+    fn dispose_inline_process_evidence_row(
+        value: &str,
+    ) -> Result<ProcessEvidenceReadback, OrsError> {
+        let legacy: LegacyInlineProcessEvidenceRow =
+            serde_json::from_str(value).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence_legacy",
+                reason: error.to_string(),
+            })?;
+        let evidence_schema_version = legacy
+            .evidence
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut inline_streams = Vec::new();
+        for (field, stream) in [
+            ("stdout", ProcessStreamKind::Stdout),
+            ("stderr", ProcessStreamKind::Stderr),
+        ] {
+            let carries_inline_bytes = legacy
+                .evidence
+                .get(field)
+                .and_then(|stream_value| stream_value.get("preview"))
+                .and_then(|preview| preview.get("bytes"))
+                .is_some_and(Value::is_array);
+            if carries_inline_bytes {
+                inline_streams.push(stream);
+            }
+        }
+        let record_key = format!(
+            "{}::{}",
+            legacy.operation_id.as_str(),
+            crate::model::sha256_hex(
+                serde_json::to_vec(&InlineProcessEvidenceIdentity {
+                    operation_id: legacy.operation_id.as_str(),
+                    process_tree_id: legacy.process_tree_id.as_str(),
+                    job_id: legacy.job_id.as_str(),
+                    image_id: legacy.image_id.as_str(),
+                    session_id: legacy.session_id.as_str(),
+                    evidence_digest: &legacy.evidence_digest,
+                    observed_at_ms: legacy.observed_at_ms,
+                })
+                .map_err(|error| OrsError::Encoding(error.to_string()))?
+                .as_slice()
+            )
+        );
+        Ok(ProcessEvidenceReadback::InlinePayloadNotRetained(
+            crate::ProcessInlineEvidenceRow {
+                record_key,
+                operation_id: legacy.operation_id,
+                evidence_schema_version,
+                evidence_digest: legacy.evidence_digest,
+                observed_at_ms: legacy.observed_at_ms,
+                inline_streams,
+            },
+        ))
     }
 
     /// Durable key of one `(operation, stream)` recovery projection.
@@ -16443,13 +17838,355 @@ impl RedbRecoveryStore {
     /// continuation holding the family frozen detect the movement. An exact
     /// re-presentation that wrote nothing leaves the revision alone, so a
     /// replayed observation never looks like movement.
+    ///
+    /// This path never CREATES terminality. A move into `Retired` from any
+    /// other activation is refused here with a typed error, and so is a
+    /// `Retired` projection presented for an empty `(operation, stream)` key:
+    /// no path creates terminality out of nothing, because a terminal
+    /// disposition and a proven evidence handoff/readback are facts about the
+    /// owning operation contract that this projection cannot carry. The only
+    /// two writers that may place a terminal row are the retirement that
+    /// proves it ([`Self::retire_process_stream_recovery`]) and the restore
+    /// that re-preserves already-proven terminal evidence
+    /// ([`Self::import_process_stream_recovery_suspended`]); each carries its
+    /// own reason, and the family's write body names both. An already `Retired`
+    /// row that a restore re-presents over an already `Retired` row is not a
+    /// move and is still accepted unchanged, so terminal evidence survives
+    /// backup/restore.
+    ///
+    /// This path never RECORDS a handoff either, and that is the property the
+    /// retirement gate leans on. It passes the placement token as `false`, so
+    /// the write body refuses ANY change to a durable row's `reconciliation`
+    /// here — in the merge arm and in the transition arm alike, in either
+    /// direction and onto any owner, state or digest — and refuses an empty-key
+    /// insert that carries a handoff digest. An observation therefore advances
+    /// `availability`, and only `availability`. The digest that
+    /// [`Self::retire_process_stream_recovery`] later compares cannot be
+    /// authored here; the one remaining author is a restore into an EMPTY
+    /// `(operation, stream)` key, which is disclosed at
+    /// [`Self::import_process_stream_recovery_suspended`].
     pub fn put_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
     ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        self.write_process_stream_recovery(projection, false)
+    }
+
+    /// The one refusal a writer without the placement token gets, shared by both
+    /// placement sites and naming both admitted writers truthfully instead of
+    /// calling either of them the only one.
+    const TERMINAL_PLACEMENT_REFUSED: &str = "no path creates terminality out of nothing: a terminal recovery projection is placed \
+         only by retire_process_stream_recovery, which proves terminal disposition against the \
+         durable row, or by a restore that re-preserves already-proven terminal evidence";
+
+    /// The one refusal a reconciliation rewrite by a writer without the
+    /// placement token gets, shared by the durable-row check and the empty-key
+    /// check. It keys on the WRITER, so it says nothing about an admitted one;
+    /// [`Self::HANDOFF_WRITE_ONCE_REFUSED`] is the other half and keys on the
+    /// VALUE.
+    const HANDOFF_AUTHORSHIP_REFUSED: &str = "a durable recovery reconciliation is rewritten only by the \
+         owning operation contract's own write: a writer that is not admitted for terminal placement may \
+         not change a durable row's reconciliation at all — not into Reconciled, not out of it, and not \
+         onto a different one — and may not insert a row that carries a handoff digest";
+
+    /// The one refusal a WRITE-ONCE `Reconciled` handoff rewrite gets. It is a
+    /// separate message from [`Self::HANDOFF_AUTHORSHIP_REFUSED`] on purpose:
+    /// that one says no writer outside the operation contract's own write may
+    /// record a handoff, and this one says that once a DURABLE row carries
+    /// one, nothing may move it, re-point it or erase it — not the owning
+    /// operation contract, and not the admitted restore either.
+    const HANDOFF_WRITE_ONCE_REFUSED: &str = "a durable reconciled handoff is write-once and immutable: a \
+         recovery reconciliation is never moved into Reconciled by a later write, never moved out of it, \
+         and a row that is already Reconciled keeps its owner and its handoff digest byte for byte";
+
+    /// THE RULE, stated once and applied ABOVE the whole match: a writer that
+    /// is not admitted for terminal placement may not change a durable row's
+    /// `reconciliation` AT ALL.
+    ///
+    /// It is deliberately not written inside any one arm of
+    /// [`Self::write_process_stream_recovery`]. The transition arm can change
+    /// a row's reconciliation just as the merge arm can, and it is reached by
+    /// any `Active -> Suspended` observation, so a rule that lived in the merge
+    /// arm alone would leave the same caller able to author a handoff digest
+    /// one call earlier and then present it back as proof. This helper sits
+    /// above the `match`, so every arm — merge, transition, exact-replay and
+    /// empty-key — is covered by construction, and an arm added later cannot
+    /// bypass it.
+    ///
+    /// `existing` is the durable row this write transaction just read, or
+    /// `None` for an empty `(operation, stream)` key. With a durable row the
+    /// rule is a comparison against it, so it refuses moving into `Reconciled`,
+    /// moving out of `Reconciled`, and substituting a different owner, state
+    /// or digest alike. With no durable row there is nothing to compare, so the
+    /// refusal is stated on the value that matters instead: a non-admitted
+    /// writer may not ESTABLISH a handoff digest on a brand-new row.
+    /// `StreamRecoveryReconciliation::validate` makes `handoff_sha256`
+    /// non-`None` if and only if the state is `Reconciled`, so that one
+    /// comparison covers both spellings of the handoff.
+    ///
+    /// `evidence_axes_sha256` cannot see any of this: it excludes
+    /// `reconciliation` by design, which is exactly why the rule is here. What
+    /// the two admitted writers do instead is in
+    /// [`Self::write_process_stream_recovery`]: retirement writes the row it
+    /// read back, so the reconciliation is byte-identical and no rule fires,
+    /// and the restore is re-presenting an archived row and is held by the
+    /// SECOND rule below, [`Self::refuse_handoff_rewrite`], which speaks to
+    /// every writer.
+    fn refuse_unadmitted_handoff(
+        unadmitted: bool,
+        projection: &ProcessStreamRecoveryProjection,
+        existing: Option<&ProcessStreamRecoveryProjection>,
+    ) -> Result<(), OrsError> {
+        let authors = match existing {
+            Some(existing) => projection.reconciliation != existing.reconciliation,
+            None => projection.reconciliation.handoff_sha256.is_some(),
+        };
+        if unadmitted && authors {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_reconciliation",
+                reason: Self::HANDOFF_AUTHORSHIP_REFUSED,
+            });
+        }
+        Ok(())
+    }
+
+    /// THE SECOND RULE, also above the whole `match`, and applying to EVERY
+    /// writer: a `Reconciled` handoff on a DURABLE row is write-once.
+    ///
+    /// [`Self::refuse_unadmitted_handoff`] keys on the WRITER, so it is silent
+    /// about a writer that IS admitted — and the admitted restore is not
+    /// hypothetical. It reaches the TRANSITION arm, which writes
+    /// `encode(projection)` verbatim, so a rule that lived in the merge arm
+    /// alone left a reachable counterexample: take a live destination row, hand
+    /// the same observation an archive page that carries a different
+    /// `reconciliation.owner` in state `Reconciled` with any well-formed
+    /// digest, and the axes compare equal (they exclude `reconciliation` by
+    /// design), the activation moves `Active -> Suspended` which
+    /// [`StreamRecoveryActivation::permits_transition_to`] allows, and the
+    /// archived `Reconciled` row is written over the live one. That durable
+    /// row then passes the handoff half of
+    /// [`Self::retire_process_stream_recovery`], so the terminal record's
+    /// "proven evidence handoff" was authored by a backup page.
+    ///
+    /// The protected thing is therefore the HANDOFF, not the owner. A
+    /// cross-installation restore legitimately carries a different
+    /// `reconciliation.owner` (`mod:source` against `mod:local`) and is still
+    /// allowed to present it, so a byte-identical-reconciliation rule would
+    /// have refused every ordinary W7 restore. Three clauses instead:
+    /// - a reconciliation that is not `Reconciled` is never moved INTO it;
+    /// - a `Reconciled` one is never moved OUT of it;
+    /// - a row already `Reconciled` keeps its `owner` and its `handoff_sha256`
+    ///   byte for byte.
+    ///
+    /// A `Unreconciled`, `Reconciling` or `Blocked` row may still change owner
+    /// and move between those three states: none of them carries a handoff, and
+    /// the retirement gate reads only `Reconciled` plus its digest.
+    ///
+    /// `existing` is the durable row this write transaction just read, or `None`
+    /// for an empty `(operation, stream)` key. With no durable row there is
+    /// nothing to compare and this rule cannot fire, so the ONE remaining
+    /// author of a `Reconciled` handoff is a restore into an empty key. That is
+    /// a disclosed pre-existing residual, at
+    /// [`Self::import_process_stream_recovery_suspended`].
+    fn refuse_handoff_rewrite(
+        projection: &ProcessStreamRecoveryProjection,
+        existing: Option<&ProcessStreamRecoveryProjection>,
+    ) -> Result<(), OrsError> {
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let reconciled = StreamRecoveryReconciliationState::Reconciled;
+        let rewrites = match (
+            existing.reconciliation.state == reconciled,
+            projection.reconciliation.state == reconciled,
+        ) {
+            // Clause one (not `Reconciled` -> `Reconciled`) and clause two
+            // (`Reconciled` -> anything else) are the same refusal: the handoff
+            // is never moved across that state boundary in either direction.
+            (false, true) | (true, false) => true,
+            // Clause three: an already `Reconciled` row keeps its owner and its
+            // digest. Its handoff digest is `Some` by
+            // `StreamRecoveryReconciliation::validate`, so comparing the
+            // option compares the digest.
+            (true, true) => {
+                projection.reconciliation.owner != existing.reconciliation.owner
+                    || projection.reconciliation.handoff_sha256
+                        != existing.reconciliation.handoff_sha256
+            }
+            // Neither side is `Reconciled`, so no handoff exists on either side
+            // to rewrite. This is the ordinary cross-installation restore.
+            (false, false) => false,
+        };
+        if rewrites {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_reconciliation",
+                reason: Self::HANDOFF_WRITE_ONCE_REFUSED,
+            });
+        }
+        Ok(())
+    }
+
+    /// The activation half of the write body's TRANSITION arm, as one named rule
+    /// set, so that arm is a payload write and nothing else. Extracted as a
+    /// real helper because these three refusals are the arm's whole content.
+    ///
+    /// In the order the arm applies them:
+    /// 1. a writer that is not admitted for terminal placement may not move a
+    ///    live row to `Retired` — the same
+    ///    [`Self::TERMINAL_PLACEMENT_REFUSED`] the empty-key arm raises;
+    /// 2. the transition itself must be one
+    ///    [`StreamRecoveryActivation::permits_transition_to`] allows, so a
+    ///    restore can never revive `Suspended` or re-terminalise `Retired`;
+    /// 3. the row that becomes terminal must be the row that was proved, as
+    ///    THIS transaction reads it, in every field except the activation.
+    ///
+    /// Clause 3 compares the whole projection rather than only the evidence
+    /// axes on purpose: `availability`, `reconciliation` and the observation
+    /// timestamp are excluded from `evidence_axes_sha256` by design. It is also
+    /// what makes the read-before/write window in
+    /// [`Self::retire_process_stream_recovery`] fail closed instead of
+    /// persisting a stale copy of the row it proved.
+    ///
+    /// This says nothing about `reconciliation`: the two rules that do live
+    /// above the `match`, so they are already decided by the time the arm
+    /// reaches here.
+    fn permit_process_stream_recovery_transition(
+        existing: &ProcessStreamRecoveryProjection,
+        projection: &ProcessStreamRecoveryProjection,
+        places_terminal_row: bool,
+        unadmitted: bool,
+    ) -> Result<(), OrsError> {
+        if places_terminal_row && unadmitted {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_activation",
+                reason: Self::TERMINAL_PLACEMENT_REFUSED,
+            });
+        }
+        if !existing
+            .activation
+            .permits_transition_to(projection.activation)
+        {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_activation",
+                reason: "durable activation transition is not permitted",
+            });
+        }
+        if places_terminal_row {
+            let mut proved = projection.clone();
+            proved.activation = existing.activation;
+            if proved != *existing {
+                return Err(OrsError::ReconciliationMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// The family's one durable write body, shared by the gated public writer,
+    /// by retirement and by the restore's terminal re-presentation.
+    ///
+    /// `terminal_placement_admitted` is `true` on exactly two call sites, and
+    /// they are admitted for DIFFERENT reasons:
+    /// - [`Self::retire_process_stream_recovery`], which proves terminal
+    ///   disposition, the terminal receipt and the evidence handoff against the
+    ///   durable row immediately before this write, and writes that row back
+    ///   with only its activation changed;
+    /// - [`Self::import_process_stream_recovery_suspended`], where a restore
+    ///   does not decide terminality: it re-preserves terminal evidence the
+    ///   owning operation contract already proved and durably archived, which is
+    ///   why an archived `Retired` row stays `Retired`.
+    ///
+    /// Every other caller passes `false`, and the flag is an admission token
+    /// rather than a licence: no path creates terminality out of nothing, and an
+    /// empty `(operation, stream)` key is no exemption, so the insert arm
+    /// refuses a `Retired` projection exactly as the transition arm does. A
+    /// write that changes a live row's activation to `Retired` is accepted only
+    /// when the projection equals that row, as read by THIS transaction, in
+    /// every field except the activation, and is refused with
+    /// [`OrsError::ReconciliationMismatch`] otherwise: the exact shape
+    /// retirement writes, and what makes the read-before/write window fail
+    /// closed instead of rolling the row back to a stale copy.
+    ///
+    /// THE SAME TOKEN GATES RECONCILIATION, AND THE RULE SITS ABOVE BOTH ARMS.
+    /// A writer that is not admitted may not change a durable row's
+    /// `reconciliation` AT ALL: not into `Reconciled`, not out of it, and not
+    /// onto a different owner, state or digest. It is checked ONCE, by
+    /// [`Self::refuse_unadmitted_handoff`] above the `match` on the durable
+    /// row, so the same-activation merge arm and the transition arm are covered
+    /// by construction and no arm can be added later that bypasses it; the same
+    /// call states the empty-key refusal for the one way a non-admitted writer
+    /// could otherwise ESTABLISH a handoff on a brand-new row.
+    ///
+    /// A SECOND RULE, ALSO ABOVE THE `match`, COVERS EVERY WRITER, because the
+    /// first one is silent about an admitted one and the admitted restore
+    /// reaches the transition arm, which writes the incoming projection
+    /// verbatim. [`Self::refuse_handoff_rewrite`] makes a `Reconciled` handoff
+    /// on a durable row write-once for EVERY writer: never moved into
+    /// `Reconciled`, never moved out of it, and a row already `Reconciled`
+    /// keeps its owner and its digest byte for byte. An `Unreconciled` ->
+    /// `Unreconciled` owner change stays allowed, because that is what a
+    /// legitimate cross-installation restore does and it carries no proof.
+    /// `evidence_axes_sha256` cannot see any of this — it excludes
+    /// `reconciliation` by design — which is exactly why the rules are here and
+    /// not left to the immutability check.
+    ///
+    /// Together they are what the handoff half of
+    /// [`Self::retire_process_stream_recovery`] compares against. With ONE
+    /// exception, which is disclosed rather than closed: a restore into an
+    /// EMPTY `(operation, stream)` key has no durable row to compare against,
+    /// so an archived `Reconciled` row lands there carrying its digest. Both
+    /// rules compare against a durable row, so neither can see it, and the
+    /// exception is pre-existing — before any of this the restore went through
+    /// [`Self::put_process_stream_recovery`] and could do the same. Closing it
+    /// would mean either refusing "restore proven terminal evidence into a
+    /// fresh store" or inventing an archive signature, and this item names
+    /// neither.
+    ///
+    /// The two admitted shapes are unaffected, and neither is a licence to
+    /// rewrite proven history. The retirement writes the row it read back with
+    /// only its activation changed, so its reconciliation is byte-identical to
+    /// the durable row and no reconciliation rule fires at all. The restore
+    /// re-preserves an archived row, and the write body refuses every rewrite
+    /// of a proven handoff on a durable row: the hoisted
+    /// [`Self::refuse_handoff_rewrite`] in BOTH arms, and, for a destination
+    /// row that is already `Retired` and carries an `Unreconciled`
+    /// reconciliation, the merge arm's retained-history check, which the
+    /// hoisted rule cannot subsume because it compares STATES rather than
+    /// values. Re-presentation therefore cannot overwrite a proven handoff on a
+    /// durable row, in either direction, through any arm.
+    ///
+    /// DISCLOSED LIMIT OF THE ADMITTED RESTORE. A restore is admitted, so it
+    /// can still terminate a LIVE destination row in the one
+    /// byte-identical-except-activation shape, which the proved-row comparison
+    /// accepts. That is kept deliberately: the alternative breaks "an archived
+    /// `Retired` row stays `Retired`" (merged W7). The restore driver
+    /// pre-flights and refuses that shape before its first write (see
+    /// `restore_row_refusal`), so the driver-level property holds; this is an
+    /// operator-facing disclosure, not a hidden exemption, and it is not
+    /// narrowed here with a second flag or a new type.
+    ///
+    /// The same-activation merge arm never moves `activation`, so it cannot
+    /// create terminality and is not gated by the placement token itself. For a
+    /// non-admitted writer it now advances `availability` and nothing else: an
+    /// observation advances what it observed, and the handoff is recorded by the
+    /// owning operation contract, not by whoever is watching the stream.
+    /// Availability still advances even on an already `Retired` row, and that
+    /// exception stays open for one reason: availability GRANTS NO AUTHORITY
+    /// and `Retired` ADMITS NO DEPENDENT RECONCILIATION
+    /// ([`StreamRecoveryActivation::admits_dependent_reconciliation`] is false
+    /// for `Retired`), so it cannot be a step toward any terminal fact, and
+    /// [`Self::revalidate_process_stream_recovery`] re-observes every projection
+    /// it loads, a terminal one included, through `with_availability` alone, so
+    /// refusing it would turn a re-observation into a hard read failure for the
+    /// whole operation.
+    fn write_process_stream_recovery(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+        terminal_placement_admitted: bool,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
         projection.validate()?;
         let key = projection.record_key()?;
         let incoming_axes = projection.evidence_axes_sha256()?;
+        let places_terminal_row = projection.activation == StreamRecoveryActivation::Retired;
         let write = self.database.begin_write().map_err(storage)?;
         let outcome = {
             let mut table = write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
@@ -16458,6 +18195,16 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
                 .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
                 .transpose()?;
+            // BOTH reconciliation rules, ABOVE every arm of the match below, so
+            // the merge arm, the transition arm, the exact-replay arm and the
+            // empty-key arm cannot each be a way around either one. The first
+            // keys on the writer and is silent about an admitted one; the
+            // second keys on the value and speaks to every writer, which is why
+            // the admitted restore cannot author a `Reconciled` handoff on a
+            // durable row either.
+            let unadmitted = !terminal_placement_admitted;
+            Self::refuse_unadmitted_handoff(unadmitted, projection, existing.as_ref())?;
+            Self::refuse_handoff_rewrite(projection, existing.as_ref())?;
             match existing {
                 Some(existing) if existing == *projection => {
                     ProcessStreamRecoveryWriteOutcome::Unchanged
@@ -16469,22 +18216,101 @@ impl RedbRecoveryStore {
                             reason: "recovery evidence axes are immutable".to_owned(),
                         });
                     }
-                    if !existing
-                        .activation
-                        .permits_transition_to(projection.activation)
-                    {
-                        return Err(OrsError::InvalidField {
-                            field: "stream_recovery_activation",
-                            reason: "durable activation transition is not permitted",
-                        });
+                    // Both reconciliation rules already ran above the `match`,
+                    // against this very row, so from here on a non-admitted
+                    // writer's reconciliation is byte-identical to the durable
+                    // row's in every arm of this one, and an admitted writer's
+                    // can differ only between the non-`Reconciled` states.
+                    if existing.activation == projection.activation {
+                        // Same durable activation under unchanged evidence axes:
+                        // this is an observation advance, not a lifecycle
+                        // transition (issue #269). Exact replay of the same
+                        // evidence under a later observation timestamp returns
+                        // the retained row without attempting an activation
+                        // transition; a fresh availability observation advances
+                        // only that explicitly mutable field. The original
+                        // source-observation timestamp is preserved (I14.26
+                        // never merges by timestamp), activation can never move
+                        // on this path, and changed evidence under this key is
+                        // still a conflict above. Because activation never moves
+                        // here, this arm cannot create terminality and is not
+                        // gated by the placement token; the two reconciliation
+                        // rules above are what cover this arm and the transition
+                        // arm together.
+                        let mut merged = existing.clone();
+                        merged.availability = projection.availability;
+                        // Retained history of an ALREADY TERMINAL row, and the
+                        // only reconciliation refusal left inside an arm. The
+                        // hoisted [`Self::refuse_handoff_rewrite`] above
+                        // already refuses every way of authoring, moving or
+                        // re-pointing a `Reconciled` handoff, so the half of
+                        // this condition that can still fire here is the
+                        // terminal one: an already `Retired` destination row's
+                        // retained reconciliation is not rewritten even when
+                        // NEITHER side is `Reconciled`, because an owner change
+                        // over a terminal row rewrites the history that row
+                        // exists to preserve.
+                        //
+                        // This is NOT redundant with the hoisted rule, and the
+                        // difference is exact: `refuse_handoff_rewrite`
+                        // compares reconciliation STATES, so a `Retired` row
+                        // carrying an `Unreconciled` reconciliation that a
+                        // restore re-presents under a different owner is a
+                        // difference it cannot see, and such a row is
+                        // reachable because the empty-key restore path places
+                        // one. A retirement never reaches this rule: it is a
+                        // transition arm, and its reconciliation is the durable
+                        // row's.
+                        if projection.reconciliation != existing.reconciliation
+                            && existing.activation == StreamRecoveryActivation::Retired
+                        {
+                            return Err(OrsError::InvalidField {
+                                field: "stream_recovery_reconciliation",
+                                reason: "the reconciliation of an already retired recovery projection is \
+                                         retained history and is not rewritten",
+                            });
+                        }
+                        merged.reconciliation = projection.reconciliation.clone();
+                        merged.validate()?;
+                        if merged == existing {
+                            ProcessStreamRecoveryWriteOutcome::Unchanged
+                        } else {
+                            let payload = encode(&merged)?;
+                            table
+                                .insert(key.as_str(), payload.as_str())
+                                .map_err(storage)?;
+                            ProcessStreamRecoveryWriteOutcome::Advanced
+                        }
+                    } else {
+                        Self::permit_process_stream_recovery_transition(
+                            &existing,
+                            projection,
+                            places_terminal_row,
+                            unadmitted,
+                        )?;
+                        // Both reconciliation rules already ran above the
+                        // `match` against this very row, so neither a
+                        // non-admitted writer NOR the admitted restore can
+                        // author, move or re-point a handoff digest here. An
+                        // ordinary observation is `Suspended` against a live
+                        // `Unreconciled` sink row on both sides, so no rule
+                        // fires for it.
+                        let payload = encode(projection)?;
+                        table
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                        ProcessStreamRecoveryWriteOutcome::Advanced
                     }
-                    let payload = encode(projection)?;
-                    table
-                        .insert(key.as_str(), payload.as_str())
-                        .map_err(storage)?;
-                    ProcessStreamRecoveryWriteOutcome::Advanced
                 }
                 None => {
+                    // The same refusal as the transition arm: an empty
+                    // `(operation, stream)` key is not an exemption.
+                    if places_terminal_row && unadmitted {
+                        return Err(OrsError::InvalidField {
+                            field: "stream_recovery_activation",
+                            reason: Self::TERMINAL_PLACEMENT_REFUSED,
+                        });
+                    }
                     let payload = encode(projection)?;
                     table
                         .insert(key.as_str(), payload.as_str())
@@ -16600,8 +18426,60 @@ impl RedbRecoveryStore {
     /// Retirement is not deletion: the row stays durable as terminal evidence so
     /// a mistaken retirement remains recoverable, which is why the Architecture
     /// forbids destroying it outright. Nothing here infers terminality from the
-    /// projection; the terminal reservation state, its named recovery owner,
-    /// its terminal receipt and the proven handoff digest must all agree.
+    /// projection the caller passed in: the terminal reservation state, its named
+    /// recovery owner, its terminal receipt and the proven handoff digest are
+    /// all read from durable state — the reservation rows and the recovery
+    /// projection row this operation owns — and the caller's proof must match
+    /// them, never replace them.
+    ///
+    /// Exactly what the handoff half compares: the DURABLE row's
+    /// reconciliation must already be `Reconciled` and must already carry
+    /// `proof.handoff_sha256` as its handoff digest. This is no longer a
+    /// property of one arm. The family's write body applies TWO checks above
+    /// the merge and transition arms alike: a non-admitted writer may not
+    /// change a durable row's `reconciliation` at all
+    /// ([`Self::refuse_unadmitted_handoff`]), and for EVERY writer, admitted
+    /// ones included, a `Reconciled` handoff on a durable row is write-once —
+    /// never moved into `Reconciled`, never moved out of it, and a row already
+    /// `Reconciled` keeps its owner and its digest byte for byte
+    /// ([`Self::refuse_handoff_rewrite`]). The second rule is what stops the
+    /// other admitted writer, the restore, from authoring the handoff: an
+    /// archived `Reconciled` row cannot be moved onto a live destination row
+    /// through the transition arm, and the merge arm's retained-history check
+    /// still covers an already `Retired` row whose reconciliation is not
+    /// `Reconciled`.
+    ///
+    /// So a digest on a DURABLE row can only have been recorded by the owning
+    /// operation contract's own write — and there is no owner-facing API for
+    /// that write yet, so the handoff half of this gate is enforced rather
+    /// than satisfiable today. ONE residual is disclosed rather than closed: a
+    /// restore into an EMPTY `(operation, stream)` key has no durable row for
+    /// either rule to compare, so an archived `Reconciled` row lands there
+    /// carrying its digest. That is pre-existing (before any of this the
+    /// restore went through [`Self::put_process_stream_recovery`] and could do
+    /// the same), and closing it would mean either refusing the legitimate
+    /// restore of proven terminal evidence into a fresh store or inventing an
+    /// archive signature this item does not name. Apart from that one case, a
+    /// handoff the owning operation contract has not already recorded and read
+    /// back into this row is refused.
+    ///
+    /// The reservation facts are proven in a read transaction that is dropped
+    /// before the write opens, so `reservation.state.is_terminal()` and
+    /// `terminal_receipt_id` are a pre-transaction check and are NOT re-read at
+    /// commit. What the write transaction does re-verify is the row: the write
+    /// body requires the projection to equal the row that same transaction
+    /// reads, in every field except the activation. A retirement therefore
+    /// refuses, rather than persisting a stale copy of the proved row, whenever
+    /// anything advanced that row in between.
+    ///
+    /// Retirement is one of exactly two writers that may place a terminal row:
+    /// the other is the restore that re-preserves already-proven terminal
+    /// evidence ([`Self::import_process_stream_recovery_suspended`]). Neither
+    /// [`Self::put_process_stream_recovery`] nor any other observation writer
+    /// can create terminality in either the empty-key or the transition arm, so
+    /// a caller cannot reach a terminal record by presenting a retired copy of
+    /// its own projection. The row written here is the row that was read back,
+    /// with only `activation` changed.
     ///
     /// Because the retired row is written through the family's one write path,
     /// retirement advances the durable family revision in the same transaction
@@ -16617,9 +18495,13 @@ impl RedbRecoveryStore {
         proof.validate()?;
         let key = projection.record_key()?;
         let read = self.database.begin_read().map_err(storage)?;
-        {
+        // The durable row, already decoded and validated by the existing ORS
+        // codec. It is the ORIGINAL RECORDED projection: every fact below is
+        // checked against this row, never against the caller's copy of it, so a
+        // caller cannot carry its own reconciliation into a terminal record.
+        let stored = {
             let table = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
-            let stored = table
+            table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
@@ -16627,13 +18509,13 @@ impl RedbRecoveryStore {
                 .ok_or(OrsError::IntegrityProblem {
                     record_type: "process_stream_recovery",
                     reason: "the named recovery projection row is not durable".to_owned(),
-                })?;
-            if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: "retirement target does not match the durable evidence axes".to_owned(),
-                });
-            }
+                })?
+        };
+        if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_stream_recovery",
+                reason: "retirement target does not match the durable evidence axes".to_owned(),
+            });
         }
         let reservation_id = {
             let operations = read.open_table(OPERATIONS).map_err(storage)?;
@@ -16655,22 +18537,47 @@ impl RedbRecoveryStore {
             decode::<ReservationRecord>(value.value())?
         };
         if reservation.token.recovery_owner != proof.recovery_owner
-            || projection.reconciliation.owner != proof.recovery_owner
+            || stored.reconciliation.owner != proof.recovery_owner
         {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         if !reservation.state.is_terminal() {
             return Err(OrsError::UnsafeExpiry);
         }
-        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id)
-            || projection.reconciliation.handoff_sha256.as_deref()
+        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        // The handoff/readback proof is read off the DURABLE reconciliation,
+        // not recomputed over what the caller holds: the durable row's
+        // reconciliation must already be `Reconciled` and must already carry
+        // this exact digest. No write may author that state on a durable row:
+        // the write body refuses every reconciliation change by a writer that
+        // is not admitted, and it makes a `Reconciled` handoff write-once for
+        // every writer, the admitted restore included, in the merge arm and the
+        // transition arm alike. A live projection records `Unreconciled` with
+        // no handoff digest, and absent a handoff the owning operation contract
+        // already recorded and read back into this row — or one a restore
+        // placed on an EMPTY key, which is the disclosed residual above — no
+        // proof object can retire anything.
+        if stored.reconciliation.state != StreamRecoveryReconciliationState::Reconciled
+            || stored.reconciliation.handoff_sha256.as_deref()
                 != Some(proof.handoff_sha256.as_str())
         {
             return Err(OrsError::ReconciliationMismatch);
         }
         drop(read);
-        let retired = projection.with_activation(StreamRecoveryActivation::Retired)?;
-        self.put_process_stream_recovery(&retired)
+        // The reservation half above is a pre-transaction check: this read
+        // transaction ends here, so the terminal state and terminal receipt are
+        // not re-read at commit. The write body re-verifies the row itself, so a
+        // row that moved in between is refused instead of being overwritten by
+        // this stale copy.
+        //
+        // The row that becomes terminal is the row that was read back and
+        // checked, with only its activation changed. Nothing the gate did not
+        // compare against the durable row can be smuggled in through the
+        // caller's copy.
+        let retired = stored.with_activation(StreamRecoveryActivation::Retired)?;
+        self.write_process_stream_recovery(&retired, true)
     }
 
     /// Imports a recovery projection from backup/restore as suspended evidence.
@@ -16681,6 +18588,61 @@ impl RedbRecoveryStore {
     /// state through this record. Only the recovery projection row is written;
     /// no reservation, session or authority row is created, reactivated or
     /// otherwise revived.
+    ///
+    /// A restore does not DECIDE terminality, so it is not the public write
+    /// path: it is one of exactly two writers that may place a terminal row,
+    /// and it is admitted for the opposite reason retirement is. A restore
+    /// re-preserves terminal evidence the owning operation contract already
+    /// proved and durably archived, so an archived `Retired` row stays
+    /// `Retired`; downgrading it to `Suspended` would be a hidden rewrite of
+    /// retained history, which is why the incoming activation is discarded for
+    /// every OTHER row rather than for this one.
+    ///
+    /// What a restore may never do is terminate a live destination row. When
+    /// the destination already holds a non-`Retired` row for the same
+    /// `(operation, stream)` key, a retired backup row is refused rather than
+    /// terminating that row, because the restore proves no handoff and no
+    /// terminal disposition: the restore driver pre-flights that conflict
+    /// against destination state before its first write and refuses the page as
+    /// a whole instead of restoring it halfway, and the family's write body
+    /// refuses the row too unless the archived row is byte-identical to the
+    /// destination's apart from the activation. An empty key and an
+    /// already-`Retired` destination row are the two cases this path is
+    /// admitted for, and a `Retired` row whose retained reconciliation differs
+    /// from the destination's `Retired` row's is refused too, so re-presentation
+    /// never rewrites proven evidence.
+    ///
+    /// Being admitted for terminal placement is also what admits this path to
+    /// CARRY a `Reconciled` reconciliation, because re-preserving a proven
+    /// handoff is exactly what an archived terminal row is. It does NOT admit it
+    /// to MANUFACTURE one on a durable row. The admission token keys on the
+    /// WRITER, so the refusal an unadmitted writer gets
+    /// ([`Self::refuse_unadmitted_handoff`]) is silent here — and that is
+    /// exactly why a SECOND rule exists, [`Self::refuse_handoff_rewrite`],
+    /// which speaks to every writer and is applied above the whole `match`, in
+    /// the merge arm and the transition arm alike: this path may not move a
+    /// durable reconciliation INTO `Reconciled`, may not move one OUT of it, and
+    /// may not change the owner or the `handoff_sha256` of a row that is already
+    /// `Reconciled`. It may still carry a different `owner` on a row that is
+    /// not `Reconciled`, which is the ordinary cross-installation restore. An
+    /// already `Retired` destination row's retained reconciliation is refused
+    /// even when neither side is `Reconciled`, by the merge arm's own
+    /// retained-history check.
+    ///
+    /// DISCLOSED RESIDUAL, THE ONE REMAINING AUTHOR OF A `RECONCILED` HANDOFF.
+    /// Both rules compare against a DURABLE row, so neither can fire when the
+    /// `(operation, stream)` key is EMPTY, and this path is admitted. An
+    /// archived `Reconciled` row therefore lands on a fresh key carrying its
+    /// digest — which is also the one way the handoff half of
+    /// [`Self::retire_process_stream_recovery`] is reachable at all. It is
+    /// disclosed, not closed: it is pre-existing behaviour (before any of this
+    /// the restore went through [`Self::put_process_stream_recovery`] and could
+    /// do the same), and closing it would mean either refusing the legitimate
+    /// "restore proven terminal evidence into a fresh store" path or inventing an
+    /// archive signature, neither of which this item names. Note also that
+    /// `OrsBackupPage::validate_binding` is a self-digest with no signature, so
+    /// an archived `Reconciled` row is not authenticated as the owning
+    /// contract's record either.
     ///
     /// This stays the only durable restore route for the family (issue #2884):
     /// paging the family into more backup pages raises no authority, and every
@@ -16698,7 +18660,17 @@ impl RedbRecoveryStore {
         } else {
             projection.with_activation(StreamRecoveryActivation::Suspended)?
         };
-        self.put_process_stream_recovery(&imported)
+        // The second admitted placement site, for the reason its doc gives: this
+        // is a re-presentation of terminal evidence the owning operation
+        // contract already proved, not a decision about terminality. The write
+        // body still refuses a restore that would terminate a live destination
+        // row, still refuses any re-presentation that would author, move or
+        // re-point a `Reconciled` handoff on a durable row
+        // (`refuse_handoff_rewrite`, above the `match`, admitted or not), and
+        // still refuses a rewrite of a terminal row's retained reconciliation.
+        // An EMPTY key is the disclosed residual above: no durable row exists
+        // for any of those rules to compare, so the archived row lands.
+        self.write_process_stream_recovery(&imported, true)
     }
 
     /// Maps a codec failure onto its explicit recovery disposition.
@@ -17770,6 +19742,255 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads the recorded effect operation lease for one exact authorized
+    /// operation (issue #1885; I1.9).
+    ///
+    /// Keyed by the lease identity, exactly like the supervision-lease current
+    /// projection. The row is re-validated on readback and the key is checked
+    /// against the row's own lease identity, so a mismatched row fails closed
+    /// as corruption. Returns `Ok(None)` for an absent lease: the effect
+    /// replay gate reads that as "no lease" and denies the replay.
+    pub fn load_effect_operation_lease(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<crate::EffectOperationLease>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?;
+        current
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let lease: crate::EffectOperationLease = decode(value.value())?;
+                if &lease.lease_id != lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "effect_operation_lease",
+                        reason: "effect operation lease key does not match lease identity"
+                            .to_owned(),
+                    });
+                }
+                Ok(lease)
+            })
+            .transpose()
+    }
+
+    /// Loads the recorded execution manifest for one generation (issue #1885;
+    /// I1.9).
+    ///
+    /// Keyed by `{module_id}::{generation}` in the Generation Registry. The
+    /// stored manifest re-verifies its own bound digest on readback, so a
+    /// tampered row cannot authorize a restart. Returns `Ok(None)` for an
+    /// absent manifest, which the effect replay gate treats as `ManifestAbsent`.
+    pub fn load_kernel_execution_manifest(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::KernelExecutionManifest>, OrsError> {
+        crate::model::validate_text(module_id, "kernel_execution_manifest_module_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let manifests = read
+            .open_table(KERNEL_EXECUTION_MANIFESTS)
+            .map_err(storage)?;
+        let key = Self::effect_manifest_key(module_id, generation);
+        manifests
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let manifest: crate::KernelExecutionManifest = decode(value.value())?;
+                if manifest.admission.module_id != module_id
+                    || manifest.admission.generation.value() != generation
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "kernel_execution_manifest",
+                        reason: "execution manifest key does not match the recorded admission"
+                            .to_owned(),
+                    });
+                }
+                Ok(manifest)
+            })
+            .transpose()
+    }
+
+    /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
+    ///
+    /// A denied, expired or unknown replay escalates here instead of being
+    /// discarded. Keyed by `{module_id}::{generation}::{operation_id}`, so a
+    /// repeated denial of the same exact operation updates one durable row
+    /// instead of growing the table, while every distinct denied operation
+    /// keeps its own escalation. An exact re-persist is idempotent.
+    pub fn persist_effect_replay_reconciliation(
+        &self,
+        item: &crate::KernelReconciliationItem,
+    ) -> Result<(), OrsError> {
+        item.validate()?;
+        let Some(operation_id) = item.operation_id.as_ref() else {
+            return Err(OrsError::InvalidField {
+                field: "kernel_reconciliation_item_operation_id",
+                reason: "an effect replay reconciliation must name the replayed operation",
+            });
+        };
+        let key = format!(
+            "{}::{:020}::{}",
+            Self::encode_key_component(item.module_id.as_str()),
+            item.generation.value(),
+            Self::encode_key_component(operation_id.as_str())
+        );
+        let payload = encode(item)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut intents = write
+                .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?;
+            intents
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    fn effect_manifest_key(module_id: &str, generation: u64) -> String {
+        format!(
+            "{}::{:020}",
+            Self::encode_key_component(module_id),
+            generation
+        )
+    }
+
+    /// Gates one effect replay against its durable effect operation lease
+    /// (issue #1885; I1.9, W2/W5).
+    ///
+    /// This is the one store-backed query an effect-capable dispatch or replay
+    /// path consults before it dispatches an external effect. The caller passes
+    /// only what its spawn seam actually holds: the effect operation lease
+    /// identity it is acting for, the module identity and generation the spawn
+    /// is bound to, its live Authority Epoch and the observation time of the
+    /// decision. Everything else is read from the durable rows, so the gate can
+    /// neither invent an effect receipt nor widen a recorded scope.
+    ///
+    /// A recorded lease **is** the exact already-authorized effect, so the
+    /// request's `operation_id`, `effect_receipt_sha256`, `allowed_scope` and
+    /// `bound_manifest_sha256` are the lease's own recorded values and the
+    /// manifest is the lease's own recorded execution manifest. Every liveness
+    /// and currency check in [`crate::authorize_effect_replay`] still runs
+    /// against them, so this is a real gate and not a tautology: the lease must
+    /// still be active, unexpired at `observed_at_ms`, un-revoked, gap-free,
+    /// issued under the caller's current Authority Epoch, bound to the caller's
+    /// module/generation, and issued against a Governor-admitted manifest.
+    /// `catalog_revision` and `policy_revision` are the **loaded manifest's**
+    /// admitting revisions — the exact revisions the lease was issued against.
+    ///
+    /// `current.catalog_view` is reported as
+    /// [`crate::CatalogPolicyView::Unavailable`]: the Kernel holds no
+    /// independent live Module Catalog/Policy owner at this seam, so it can
+    /// never prove a current view here. I1.9 lines 48-49 then require denial
+    /// rather than an unproven admission, and the verifier produces
+    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`]. No view
+    /// is ever upgraded to `Current` here. `current.revocation` is
+    /// [`crate::RevocationAcknowledgement::None`] because no revocation event is
+    /// observed at this seam, and `current.delivery` is the lease's own recorded
+    /// delivery acknowledgement, so a lease whose delivery gap is open still
+    /// denies.
+    ///
+    /// A replay is denied whenever no lease covers the operation, the recorded
+    /// manifest is missing or receipt-less, the lease is not active or is
+    /// expired, or any recorded binding disagrees with the caller's identity.
+    /// Every denied, expired or unknown replay is escalated durably through
+    /// [`Self::persist_effect_replay_reconciliation`] before this returns, so a
+    /// denied attempt is never discarded (W5). Only
+    /// `decision.authority.authorized_lease()` carries effect authority; the
+    /// shadow decision carries none and can produce no external effect or
+    /// canonical write admission.
+    pub fn authorize_effect_replay_for_operation(
+        &self,
+        lease_id: &OperationIdentity,
+        module_id: &str,
+        generation: u64,
+        current_authority_epoch: AuthorityEpoch,
+        observed_at_ms: i64,
+    ) -> Result<crate::EffectReplayDecision, OrsError> {
+        let Some(lease) = self.load_effect_operation_lease(lease_id)? else {
+            // No recorded lease covers this operation, so there is no
+            // already-authorized effect to replay and the caller holds no
+            // effect receipt, route scope or manifest digest to name one. The
+            // gate refuses here without fabricating a request; the durable
+            // reconciliation intent is still produced below, naming the exact
+            // operation that was refused.
+            return self.deny_effect_replay_without_lease(
+                lease_id,
+                module_id,
+                generation,
+                observed_at_ms,
+            );
+        };
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        let request = crate::EffectReplayRequest {
+            operation_id: lease.operation_id.clone(),
+            manifest_module_id: lease.manifest_module_id.clone(),
+            manifest_generation: lease.manifest_generation,
+            bound_manifest_sha256: lease.bound_manifest_sha256.clone(),
+            effect_receipt_sha256: lease.effect_receipt_sha256.clone(),
+            allowed_scope: lease.allowed_scope.clone(),
+            current: crate::EffectAuthorizationView {
+                authority_epoch: current_authority_epoch,
+                // Admitting Catalog/Policy revisions of the loaded manifest — the
+                // exact revisions this lease was issued against. Never
+                // defaulted; a receipt-less manifest is refused downstream as
+                // `ManifestReceiptless` and an absent one as `ManifestAbsent`.
+                catalog_revision: manifest
+                    .as_ref()
+                    .map_or(0, |recorded| recorded.admission.catalog_revision),
+                policy_revision: manifest
+                    .as_ref()
+                    .map_or(0, |recorded| recorded.admission.policy_revision),
+                catalog_view: crate::CatalogPolicyView::Unavailable,
+                revocation: crate::RevocationAcknowledgement::None,
+                delivery: lease.delivery,
+            },
+            observed_at_ms,
+        };
+        let decision = crate::authorize_effect_replay(Some(&lease), manifest.as_ref(), &request)?;
+        if let Some(item) = decision.reconciliation.as_ref() {
+            self.persist_effect_replay_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
+    /// Denies one replay that no effect operation lease covers, and makes the
+    /// denial durable (issue #1885; W5).
+    ///
+    /// A caller with no recorded lease holds no effect receipt, route scope or
+    /// manifest digest, so there is nothing exact to name and no request can be
+    /// built. The shadow/no-effect authority and its durable reconciliation item
+    /// come from [`crate::deny_unleased_effect_replay`], the one place the
+    /// absence is asserted, so no request is fabricated here.
+    fn deny_effect_replay_without_lease(
+        &self,
+        lease_id: &OperationIdentity,
+        module_id: &str,
+        generation: u64,
+        observed_at_ms: i64,
+    ) -> Result<crate::EffectReplayDecision, OrsError> {
+        // The manifest is read even on the no-lease path, so the durable intent
+        // names the generation's real manifest digest when one is recorded
+        // rather than an absence marker.
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        let decision = crate::deny_unleased_effect_replay(
+            lease_id,
+            module_id,
+            eliot_contracts::ResourceGeneration::new(generation).map_err(|_error| {
+                OrsError::InvalidField {
+                    field: "effect_replay_manifest_generation",
+                    reason: "must be greater than zero",
+                }
+            })?,
+            manifest.map(|recorded| recorded.manifest_sha256),
+            observed_at_ms,
+        );
+        if let Some(item) = decision.reconciliation.as_ref() {
+            self.persist_effect_replay_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
     /// Reads newest-first bounded committed history for one lease.
     pub fn load_supervision_lease_history(
         &self,
@@ -18131,6 +20352,23 @@ impl RedbRecoveryStore {
         drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
         drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
         drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+        // #1885: the effect-operation-lease, execution-manifest and
+        // effect-replay-reconciliation families are part of the base family,
+        // materialized empty on every open like every other base table, so a
+        // replay gate on a store that never admitted an effect operation reads
+        // authoritatively absent instead of failing on a missing table. No row
+        // is backfilled or inferred here.
+        drop(write.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?);
+        drop(
+            write
+                .open_table(KERNEL_EXECUTION_MANIFESTS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?,
+        );
         // #2571: the logical host-request index is part of the base family,
         // materialized empty on every open like every other base table, so a
         // lookup on a pre-index store reads authoritatively absent instead
@@ -18810,7 +21048,10 @@ impl RedbRecoveryStore {
     /// staged envelope and reservation rows are left untouched so the
     /// operation remains available for reconciliation or explicit disposition.
     /// An identical retained problem is returned unchanged; a conflicting
-    /// binding under the same identity fails without overwriting.
+    /// binding under the same identity fails without overwriting. A failure of
+    /// this write itself is never propagated on its own: its callers route it
+    /// through [`Self::staging_problem_record_failed`] so the original staging
+    /// failure survives next to it.
     fn retain_staging_problem(
         &self,
         token: &WriterReservationToken,
@@ -18874,6 +21115,40 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(problem)
+    }
+
+    /// Second chance for the durable Recovery Problem write itself (issue #1713,
+    /// I5.2, I5.6).
+    ///
+    /// `I5.2`: "Decryption failure, missing key or hash mismatch creates a
+    /// Recovery Problem; plaintext fallback and silent deletion are forbidden",
+    /// and `I5.6` step 13/14: "stage the complete immutable operation in
+    /// ORS/redb; return `ACCEPTED_PENDING` for `accept_after_stage`". Once the
+    /// staging transaction committed, the operation may already have been
+    /// observed as accepted, so the original staging failure and that possible
+    /// acceptance are the evidence a caller needs. Propagating the recorder's
+    /// own error instead would replace both texts with a bare storage failure
+    /// and read as "no problem, no possible acceptance", which is exactly what
+    /// this state is not.
+    ///
+    /// The returned error claims only what is true - the problem record could
+    /// not be written - and carries both texts verbatim. Nothing is deleted, no
+    /// envelope is removed, and the reservation keeps the state it already had.
+    fn staging_problem_record_failed(
+        token: &WriterReservationToken,
+        original: &OrsError,
+        recorder: &OrsError,
+    ) -> OrsError {
+        OrsError::IntegrityProblem {
+            record_type: "recovery_problem_record",
+            reason: format!(
+                "durable Recovery Problem for staged operation {} under reservation {} could \
+                 not be retained: {recorder}; that operation may already be accepted, nothing was \
+                 deleted or released, and the original staging failure was: {original}",
+                token.operation_id.as_str(),
+                token.reservation_id.as_str()
+            ),
+        }
     }
 
     fn existing_token(
@@ -21783,44 +24058,32 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
 
     fn stage_admission_reservation(
         &self,
-        reservation: AdmissionReservation,
+        _reservation: AdmissionReservation,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            reservation.0,
-            false,
-            &[],
-            OperationalPhase::Staged,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_stage",
+            reason: "legacy generic admission reservation staging is retired; use typed Kernel reservation staging",
+        })
     }
 
     fn activate_admission_reservation(
         &self,
-        activation: AdmissionReservationActivation,
+        _activation: AdmissionReservationActivation,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            activation.0,
-            true,
-            &[OperationalPhase::Staged],
-            OperationalPhase::Active,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_activation",
+            reason: "legacy generic admission reservation activation is retired; typed activation awaits the canonical owner contract",
+        })
     }
 
     fn release_admission_reservation(
         &self,
-        release: AdmissionReservationRelease,
+        _release: AdmissionReservationRelease,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            release.0,
-            true,
-            &[OperationalPhase::Staged, OperationalPhase::Active],
-            OperationalPhase::Released,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_release",
+            reason: "legacy generic admission reservation release is retired; use typed receipt-backed reservation release",
+        })
     }
 
     fn stage_kernel_admission_reservation(
@@ -21859,7 +24122,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 return Err(OrsError::DuplicateConflict);
             };
             existing_record.validate()?;
-            if existing_record != &record {
+            // A replay names the original immutable stage request, while the
+            // persisted reservation may have advanced through later
+            // receipt-backed transitions. Compare only the stage inputs so an
+            // exact replay returns that current snapshot without overwriting
+            // its lifecycle state.
+            let same_stage_request = existing_record.reservation_id == record.reservation_id
+                && existing_record.work_item_id == record.work_item_id
+                && existing_record.proposed_attempt_id == record.proposed_attempt_id
+                && existing_record.stage_operation_id == record.stage_operation_id
+                && existing_record.claims == record.claims
+                && existing_record.authority_epoch == record.authority_epoch
+                && existing_record.state_fence == record.state_fence
+                && existing_record.expires_at_ms == record.expires_at_ms
+                && existing_record.created_at_ms == record.created_at_ms;
+            if !same_stage_request {
                 return Err(OrsError::DuplicateConflict);
             }
             let snapshot = Self::admission_reservation_snapshot(&existing)?;
@@ -23353,7 +25630,11 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         .map_err(storage)?
                         .map(|value| raw_fingerprint(value.value()))
                 };
-                let retained = self.retain_staging_problem(&token, &error, fingerprint)?;
+                let retained = self
+                    .retain_staging_problem(&token, &error, fingerprint)
+                    .map_err(|recorder| {
+                        Self::staging_problem_record_failed(&token, &error, &recorder)
+                    })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
@@ -23380,14 +25661,16 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             Ok(envelope) => {
                 if envelope.operation_or_checkpoint_id != *operation_id {
                     let context = self.staging_context(operation_id)?;
-                    let retained = self.retain_staging_problem(
-                        &context,
-                        &OrsError::IntegrityProblem {
-                            record_type: "recovery_envelope",
-                            reason: "envelope identity does not match its operation key".to_owned(),
-                        },
-                        Some(raw_fingerprint(&raw)),
-                    )?;
+                    let original = OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "envelope identity does not match its operation key".to_owned(),
+                    };
+                    let fingerprint = Some(raw_fingerprint(&raw));
+                    let retained = self
+                        .retain_staging_problem(&context, &original, fingerprint)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&context, &original, &recorder)
+                        })?;
                     return Err(OrsError::RecoveryProblemRetained {
                         operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                     });
@@ -23397,12 +25680,58 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             Err(error) => {
                 let fingerprint = Some(raw_fingerprint(&raw));
                 let context = self.staging_context(operation_id)?;
-                let retained = self.retain_staging_problem(&context, &error, fingerprint)?;
+                let retained = self
+                    .retain_staging_problem(&context, &error, fingerprint)
+                    .map_err(|recorder| {
+                        Self::staging_problem_record_failed(&context, &error, &recorder)
+                    })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
             }
         }
+    }
+
+    /// Retains one visible durable Recovery Problem for a staged
+    /// `PreparedTransition` that this build refuses to execute (issue #1927,
+    /// I05-06).
+    ///
+    /// The caller has already proved the refusal is determinate: the plan's
+    /// recorded contract or operation manifest lies outside current admissible
+    /// support, so no effect occurred and the reserved order stays safely
+    /// disposable. The staged plan itself must not simply disappear, because
+    /// I05-06 requires such a plan to stay staged and enter visible recovery
+    /// instead of being reinterpreted by newer code. Without this record the
+    /// refusal is only a returned error string, and once the reservation is
+    /// released nothing durable marks the operation for an operator.
+    ///
+    /// Every binding (epoch, state fence, recovery owner, reservation
+    /// identity) is read back from the staged operation itself rather than
+    /// from caller values, so the retained problem cannot disagree with what
+    /// was actually staged. No payload bytes are recorded, and the refused plan
+    /// is never translated, widened or re-derived.
+    fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError> {
+        let token = self.staging_context(operation_id)?;
+        let problem = RecoveryProblem::new(
+            token.operation_id.clone(),
+            Some(token.reservation_id.clone()),
+            RecoveryProblemKind::UnsupportedPreparedTransition,
+            OpaqueLabel::new(detail.to_owned()).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "recovery_problem_detail",
+                reason: error.to_string(),
+            })?,
+            None,
+            None,
+            token.writer_epoch.clone(),
+            token.state_fence.clone(),
+            token.recovery_owner.clone(),
+            current_unix_ms()?,
+        )?;
+        self.report_recovery_problem(problem)
     }
 
     fn report_recovery_problem(
@@ -23412,11 +25741,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         problem.validate()?;
         if !matches!(
             problem.kind,
-            RecoveryProblemKind::MissingKey | RecoveryProblemKind::DecryptionFailure
+            RecoveryProblemKind::MissingKey
+                | RecoveryProblemKind::DecryptionFailure
+                | RecoveryProblemKind::UnsupportedPreparedTransition
         ) {
             return Err(OrsError::InvalidField {
                 field: "recovery_problem_kind",
-                reason: "external reports are limited to missing-key and decryption-failure causes",
+                reason: "external reports are limited to missing-key, decryption-failure and \
+                         unsupported-prepared-transition causes",
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
@@ -23678,6 +26010,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
+        result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         RedbRecoveryStore::persist_host_request_result(
             self,
@@ -23685,6 +26019,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             request_digest,
             result_digest,
             result_response,
+            result_evidence,
+            result_lineage,
         )
     }
 
@@ -24160,6 +26496,26 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.list_recovery_problems(limit)
     }
 
+    /// Retains a visible durable Recovery Problem for one staged
+    /// `PreparedTransition` that the current build refuses to execute because
+    /// its recorded contract/operation manifest is outside admissible support
+    /// (issue #1927, I05-06).
+    ///
+    /// I05-06: such a plan "stays staged and enters visible recovery instead of
+    /// being reinterpreted by newer code". This is that entry into visible
+    /// recovery. The problem is keyed by the staged operation identity, carries
+    /// no payload bytes, and blocks normal writer readiness until an explicit
+    /// canonical receipt or owner disposition resolves it. Bindings are read
+    /// back from the staged operation, never from caller values.
+    pub fn retain_unsupported_prepared_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        detail: &str,
+    ) -> Result<RecoveryProblem, OrsError> {
+        self.store
+            .retain_unsupported_prepared_transition(operation_id, detail)
+    }
+
     /// Closes one retained Recovery Problem from an explicit terminal receipt
     /// under the exact recovery owner.
     pub fn resolve_recovery_problem(
@@ -24231,12 +26587,16 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
+        result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.persist_host_request_result(
             operation_id,
             request_digest,
             result_digest,
             result_response,
+            result_evidence,
+            result_lineage,
         )
     }
 
@@ -25041,6 +27401,8 @@ mod host_request_result_tests {
             attempt: None,
             result_digest: None,
             result_response: None,
+            result_evidence: None,
+            result_lineage: None,
             commit_order: 0,
         }
     }
@@ -25082,6 +27444,8 @@ mod host_request_result_tests {
                 &early_digest,
                 &"f".repeat(64),
                 &json!({"response": "early"}),
+                None,
+                None,
             ),
             Err(OrsError::InvalidTransition)
         ));
@@ -25100,7 +27464,7 @@ mod host_request_result_tests {
         let result_digest =
             crate::model::sha256_hex(&serde_json::to_vec(&body).expect("test body must serialize"));
         let received = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None, None)?
             .expect("resulted record must load");
         assert_eq!(received.state, HostRequestState::ResultReceived);
         assert_eq!(
@@ -25112,14 +27476,21 @@ mod host_request_result_tests {
 
         // Exact replay returns the durable row unchanged: no duplicate dispatch.
         let replay = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None, None)?
             .expect("replay must load");
         assert_eq!(replay, received);
 
         // A changed payload digest or a forged body under the same identity is
         // rejected before any readback and never overwrites the durable row.
         assert!(matches!(
-            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            store.persist_host_request_result(
+                &operation,
+                &digest,
+                &"0".repeat(64),
+                &body,
+                None,
+                None,
+            ),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
         assert!(matches!(
@@ -25128,6 +27499,8 @@ mod host_request_result_tests {
                 &digest,
                 &result_digest,
                 &json!({"forged": true}),
+                None,
+                None,
             ),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
@@ -25189,7 +27562,7 @@ mod host_request_result_tests {
         // anything else stays a conflict.
         let body = json!({"completed": "legacy-body"});
         let completed = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None, None)?
             .expect("exact-digest completion must store");
         assert_eq!(
             completed.result_digest.as_deref(),
@@ -25197,7 +27570,14 @@ mod host_request_result_tests {
         );
         assert_eq!(completed.result_response.as_ref(), Some(&body));
         assert!(matches!(
-            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            store.persist_host_request_result(
+                &operation,
+                &digest,
+                &"0".repeat(64),
+                &body,
+                None,
+                None,
+            ),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
 

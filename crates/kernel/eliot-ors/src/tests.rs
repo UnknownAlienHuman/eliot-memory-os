@@ -1882,7 +1882,7 @@ fn process_evidence_record(
         eliot_process::Generation::new(1)?,
     )?;
     Ok(ProcessEvidenceRecord::from_evidence(
-        process_evidence(operation_id, lifecycle)?,
+        &process_evidence(operation_id, lifecycle)?,
         owner,
         observed_at_ms,
     )?)
@@ -1956,7 +1956,10 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     store.persist_process_evidence(&first)?;
     assert_eq!(
         store.load_process_evidence(&operation_id)?,
-        vec![first.clone(), second.clone()]
+        vec![
+            ProcessEvidenceReadback::Observation(Box::new(first.clone())),
+            ProcessEvidenceReadback::Observation(Box::new(second.clone())),
+        ]
     );
 
     let mut conflicting = first.clone();
@@ -1973,7 +1976,10 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     ));
     assert_eq!(
         store.load_process_evidence(&operation_id)?,
-        vec![first.clone(), second.clone()]
+        vec![
+            ProcessEvidenceReadback::Observation(Box::new(first.clone())),
+            ProcessEvidenceReadback::Observation(Box::new(second.clone())),
+        ]
     );
     let mut mismatched = first.clone();
     mismatched.operation_id = OperationIdentity::new("other-operation")?;
@@ -2035,7 +2041,10 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     let reopened = RedbRecoveryStore::open(&path)?;
     assert_eq!(
         reopened.load_process_evidence(&operation_id)?,
-        vec![first, second]
+        vec![
+            ProcessEvidenceReadback::Observation(Box::new(first)),
+            ProcessEvidenceReadback::Observation(Box::new(second)),
+        ]
     );
     cleanup(&path);
     Ok(())
@@ -2072,9 +2081,14 @@ fn process_evidence_raw_wire_handles_colon_percent_siblings_mixed_rows_and_endpo
     store.persist_process_evidence(&sibling)?;
     assert_eq!(
         store.load_process_evidence(&operation_id)?,
-        vec![record.clone()]
+        vec![ProcessEvidenceReadback::Observation(Box::new(
+            record.clone()
+        ))]
     );
-    assert_eq!(store.load_process_evidence(&sibling_id)?, vec![sibling]);
+    assert_eq!(
+        store.load_process_evidence(&sibling_id)?,
+        vec![ProcessEvidenceReadback::Observation(Box::new(sibling))]
+    );
 
     let mixed_path = database_path("process-evidence-encoded-mixed");
     let mixed_store = RedbRecoveryStore::open(&mixed_path)?;

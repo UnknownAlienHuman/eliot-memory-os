@@ -1,0 +1,20 @@
+[package]
+name = "eliot-messaging-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Optional replay-safe MessagingBridge adapter over existing owners (issue 1828, I10.23)"
+
+[lib]
+name = "eliot_messaging_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

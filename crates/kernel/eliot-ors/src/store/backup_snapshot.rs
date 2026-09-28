@@ -170,6 +170,38 @@
 //! current durable formats and epoch lineage. Reading a generation out of a backup
 //! is reading history, never acquiring the authority to activate it.
 //!
+//! Issue #2967 gives the OPERATIONAL axis the same treatment, because it was the
+//! only axis that had none of it. The operational window used to be
+//! `after_order + page_entries * page_index` over a full table scan, and that is not
+//! a continuation in a sparse order domain: with orders `1, 3, 5` and
+//! `page_entries = 2` it emitted `[1, 3]`, then `[3, 5]`, then `[5]`, so row 3 and
+//! row 5 were each exported twice and no page after page 0 could prove which rows
+//! it owed. The window also had no upper bound, so a stable row above the captured
+//! `high_water_order` was emitted under the older fence.
+//!
+//! What replaced it, by imitation of the family axis rather than by a second design:
+//! - `RedbRecoveryStore::open_backup_operational_history` freezes the operational
+//!   window once - the owner-observed high-water, the streamed content root under
+//!   it, the eligible row count and the encoded-byte denominator - and returns the
+//!   start of an [`OrsOperationalCursor`]. It is the only producer of that cursor.
+//! - The walk is enumerated in the table's OWN durable-key order, which
+//!   `persist_operational_record` already makes the `operation_order` order (its key
+//!   is the zero-padded order followed by the record key), so a page costs one
+//!   bounded seek plus its own rows. There is no full materialize-and-sort step, no
+//!   new table and no parallel history database.
+//! - Every page re-derives the frozen identity from durable state, proves the
+//!   presented cursor's boundary against the emitted prefix, and emits only rows in
+//!   `(previous_cursor, frozen_high_water]`. The next cursor is derived from the
+//!   page's ACTUAL last emitted row.
+//! - Exhausting the page or byte budget is a resumable `Partial` disposition
+//!   carrying the exact next operational cursor, and `Complete` is reachable only
+//!   when the operational walk AND every cursor-paged family are demonstrably
+//!   exhausted under one set of frozen identities.
+//! - Movement of the operational window under a frozen cursor is the existing typed
+//!   [`OrsError::OrderingHeadMismatch`] movement disposition (the same variant the
+//!   versioned-artifact family uses), never a page stitched from two revisions and
+//!   never an old cursor reinterpreted against current rows.
+//!
 //! Issue #953 makes the capture coherent and the page binding self-proving:
 //! - ONE `ReadTransaction` is opened per capture and threaded through the
 //!   store-wide fence observation, the pre witness and EVERY page
@@ -206,7 +238,26 @@
 //! token re-derived from page content. The lineage, canonical cursor and
 //! pending-operation-hash fields I05-13 describes are cross-store material this
 //! crate does not hold, and are NOT approximated by a lookalike struct.
+//!
+//! Issue #953 A17 gives the import receipt a real current owner. A quarantined
+//! entry comes back `Unresolved` because nothing durable was written, so a
+//! brand-new empty destination produces a `unresolved_count` of zero while
+//! holding no evidence whatsoever about the effects those members describe —
+//! "no row to collide with" is not "no effect pending". `reconcile_import_receipt`
+//! therefore no longer builds a receipt out of the import vector alone: it
+//! opens the store's OWN live recovery rows in one read transaction —
+//! `RECOVERY_INBOX` and `RECOVERY_PROBLEMS`, the two tables this crate already
+//! owns and writes — asks the current owner about every member of the receipt,
+//! and records the answer as a `CurrentOwnerValidation` beside the typed verdict
+//! of `OrsBackupImportReceipt::known_zero_unresolved`. That gate then refuses
+//! unless the validation is bound to this snapshot, covers exactly this
+//! receipt's members, read both live recovery families, and reports no
+//! still-unresolved identity. The completeness comparison is deliberately NOT
+//! derived from the untrusted import vector's own length: a validation whose
+//! asked-about roster is built from the vector it is meant to police can never
+//! disagree with it, and its gate could then never fire.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -214,20 +265,296 @@ use std::sync::Arc;
 use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableHandle};
 
 use super::persistence_codec::{decode, decode_named, encode};
-use super::persistence_models::DurableOperationalRecord;
+use super::persistence_models::{DurableInboxRecord, DurableOperationalRecord};
 use super::storage;
 use crate::backup_snapshot::{
-    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason,
+    CurrentOwnerValidation, KnownZeroVerdict, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES,
     MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest,
     OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor,
-    OrsFamilyRowChain, OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition,
-    RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
-    check_canonical_frozen, validate_import_binding,
+    OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
+    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
+    RowFamilyKind, RowPayloadState, StoredEffectClass, check_canonical_frozen,
+    validate_import_binding,
 };
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
-    StreamRecoveryActivation, VersionedArtifactEntry,
+    ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
+    StreamRecoveryReconciliation, StreamRecoveryReconciliationState, VersionedArtifactEntry,
 };
+
+impl super::RedbRecoveryStore {
+    /// Restores exported process-stream recovery rows as suspended recovery
+    /// evidence (issue #269, W7).
+    ///
+    /// This is the restore-side driver the family's own durable import was
+    /// missing. It supplies ACTUAL projection rows — the rows the archive holds
+    /// for this page — to the family's one fail-closed import,
+    /// [`RedbRecoveryStore::import_process_stream_recovery_suspended`], which
+    /// discards the incoming activation and always writes `Suspended` (or keeps
+    /// an already `Retired` row `Retired`). It creates no reservation, session or
+    /// authority row, so an imported projection is recovered as suspended
+    /// evidence and can never revive old process, session or authority state
+    /// (A13.7: old sessions, leases, approvals and epochs do not revive).
+    ///
+    /// Each row is bound to the exact backup entry the page already carries for
+    /// it before anything is written, so a restore cannot import a row the
+    /// presented page never exported:
+    /// - the entry's `record_id` is the family's durable key, its `order` and
+    ///   `effect_class` are read off the same decoded row through the one
+    ///   [`stream_recovery_entry`] the export uses, and its `payload_digest` is
+    ///   the digest of the row re-encoded through the same ORS codec. Any
+    ///   disagreement refuses the whole driver with zero writes.
+    /// - every row is then pre-flighted against the destination's CURRENT
+    ///   durable row for the same `(operation, stream)` key, still before the
+    ///   first write, through [`restore_row_refusal`], which MIRRORS the
+    ///   refusals the family's write body applies to a restored row — the write
+    ///   body is the owner of every one of them. The mirrored set is: differing
+    ///   evidence axes; an activation the destination may not become; an
+    ///   archived `Retired` row landing on a destination row that is not already
+    ///   `Retired` (a restore must not terminate a live row); a restore
+    ///   rewriting the retained reconciliation of an already `Retired`
+    ///   destination row; and the write-once `Reconciled` handoff rule, in ALL
+    ///   THREE of its clauses and in BOTH branches of the check — a destination
+    ///   that is not `Reconciled` may not be moved into it, one that is may not
+    ///   be moved out of it, and one that is already `Reconciled` may not have
+    ///   its owner or its `handoff_sha256` changed. Any of these refuses the
+    ///   whole driver with zero writes, so a page is never left half-restored
+    ///   by a refusal the driver could have seen in advance. The pre-pass is
+    ///   strictly stronger than the write body for the terminal-over-live case:
+    ///   it refuses that page even when the archived row is byte-identical to
+    ///   the destination row apart from the activation. The pre-pass has no
+    ///   case for an EMPTY `(operation, stream)` key, because the write body
+    ///   has none either: the disclosed residual is that an archived
+    ///   `Reconciled` row lands on a fresh key carrying its digest.
+    ///
+    /// The pre-pass reads destination state in one read transaction that is
+    /// dropped before the first write, so the zero-write property is exact for
+    /// a destination that does not move during the driver's pre-pass. A
+    /// destination that does move is still stopped row by row by the write body
+    /// itself, fail closed; the only difference is that such a move can abort
+    /// the page after an earlier row was already written.
+    ///
+    /// The same source/destination and page bindings
+    /// [`import_page_quarantined`](super::RedbRecoveryStore::import_backup_page_quarantined)
+    /// applies are applied here, so a same-installation or expired page restores
+    /// nothing. The family is not re-triaged, because triage is the quarantine
+    /// reader: it constructs no `PerEntryOutcome::Imported` and confers no
+    /// authority, and the suspended write below IS the family's own durable
+    /// route.
+    pub fn import_backup_process_stream_recovery_suspended(
+        &self,
+        import: &OrsBackupImportRequest,
+        page: &OrsBackupPage,
+        rows: &[ProcessStreamRecoveryProjection],
+    ) -> Result<Vec<ProcessStreamRecoveryWriteOutcome>, OrsError> {
+        validate_import_binding(&import.source, &import.destination)?;
+        page.validate_binding()?;
+        if page.expires_at_ms <= super::current_unix_ms()? {
+            return Err(OrsError::InvalidExpiry);
+        }
+        let mut bound = Vec::with_capacity(rows.len());
+        {
+            // One read transaction for the whole pre-pass, dropped before the
+            // first write so no reader overlaps the write loop below.
+            let read = self.database.begin_read().map_err(storage)?;
+            let destination_rows = read
+                .open_table(super::PROCESS_STREAM_RECOVERY)
+                .map_err(storage)?;
+            for projection in rows {
+                let record_id = projection.record_key()?;
+                let entry = page
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.family == RowFamilyKind::ProcessStreamRecovery
+                            && entry.record_id == record_id
+                    })
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} is not an entry of the presented backup page"
+                        ),
+                    })?;
+                let (order, effect_class) = stream_recovery_entry(projection)?;
+                if entry.order != order || entry.effect_class != effect_class {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} does not match the exported entry's order \
+                             and effect class"
+                        ),
+                    });
+                }
+                let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
+                if entry.payload_digest != digest {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+                // The pre-flight, in the same pass and still before any write:
+                // a refusal the write body would raise on this row is raised
+                // here, once for the whole page, instead of after an earlier row
+                // of the same page was already written.
+                let destination = destination_rows
+                    .get(record_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                    .transpose()?;
+                if let Some(destination) = destination
+                    && let Some(refusal) =
+                        restore_row_refusal(&record_id, projection, &destination)?
+                {
+                    return Err(refusal);
+                }
+                bound.push(projection);
+            }
+        }
+        let mut outcomes = Vec::with_capacity(bound.len());
+        for projection in bound {
+            outcomes.push(self.import_process_stream_recovery_suspended(projection)?);
+        }
+        Ok(outcomes)
+    }
+}
+
+/// Whether one archived row must be refused against the destination's current
+/// durable row for the same `(operation, stream)` key.
+///
+/// THE WRITE BODY IS THE OWNER OF EVERY RULE MIRRORED HERE. This pre-pass
+/// duplicates them on purpose, so that the driver's documented "any
+/// disagreement refuses the whole driver with zero writes" property holds and
+/// the pre-pass can never say `Ok(None)` where the write body will refuse; the
+/// duplication is accepted rather than factored into a cross-module helper
+/// because a shared helper would put the rule outside the write body it
+/// describes. If a rule changes in `RedbRecoveryStore`'s write body, it changes
+/// here in the same item.
+///
+/// The activation an archived row imports as is restated here exactly as
+/// [`RedbRecoveryStore::import_process_stream_recovery_suspended`] maps it,
+/// which is the single owner of that rule: an already `Retired` row stays
+/// `Retired` and every other row becomes `Suspended`.
+///
+/// `Ok(None)` means the write body accepts the pair. Each refusal below is one
+/// the write body raises too, except the terminal-over-live case, where this
+/// pre-flight is deliberately stricter: a restore proves no terminal
+/// disposition, so it may re-preserve a terminal row into an empty key or over
+/// an already terminal row, and never turns a live destination row terminal.
+/// That single stricter case is disclosed at its own write path rather than
+/// closed here, because closing it would break "an archived `Retired` row stays
+/// `Retired`" (merged W7).
+///
+/// The caller invokes this only for a key the destination already holds; for
+/// an EMPTY `(operation, stream)` key it is not called, and neither is the write
+/// body able to compare any of its rules against anything, so an archived
+/// `Reconciled` row lands on a fresh key with its digest. That is the one
+/// remaining author of a `Reconciled` handoff and it is disclosed, not closed,
+/// at [`RedbRecoveryStore::import_process_stream_recovery_suspended`].
+fn restore_row_refusal(
+    record_id: &str,
+    archived: &ProcessStreamRecoveryProjection,
+    destination: &ProcessStreamRecoveryProjection,
+) -> Result<Option<OrsError>, OrsError> {
+    let refusal = |reason: String| OrsError::IntegrityProblem {
+        record_type: "process_stream_recovery",
+        reason: format!(
+            "restored row {record_id:?} conflicts with the destination's durable row: {reason}"
+        ),
+    };
+    if destination.evidence_axes_sha256()? != archived.evidence_axes_sha256()? {
+        return Ok(Some(refusal(
+            "the durable evidence axes are immutable and differ".to_owned(),
+        )));
+    }
+    let imported = if archived.activation == StreamRecoveryActivation::Retired {
+        StreamRecoveryActivation::Retired
+    } else {
+        StreamRecoveryActivation::Suspended
+    };
+    let terminal_restore = imported == StreamRecoveryActivation::Retired;
+    // The write-once `Reconciled` handoff rule, mirrored into BOTH branches
+    // below, because the write body applies it above its whole `match`.
+    let handoff_rewrite =
+        reconciled_handoff_rewrite(&destination.reconciliation, &archived.reconciliation);
+    if destination.activation == imported {
+        // Observation-advance arm of the write body, which cannot move
+        // activation. The write body's blanket "a non-admitted writer may not
+        // change a durable row's reconciliation" rule does NOT apply here,
+        // because a restore is admitted; what still applies is the write-once
+        // handoff rule mirrored above, and the retained-history rule, which is
+        // the comparison below. Mirroring both is what keeps this pre-pass
+        // faithful to the write body it stands in front of, so the documented
+        // "any disagreement refuses the whole driver with zero writes" property
+        // holds for these conflicts instead of aborting the page after an
+        // earlier row was written.
+        if let Some(reason) = handoff_rewrite {
+            return Ok(Some(refusal(reason.to_owned())));
+        }
+        if terminal_restore && destination.reconciliation != archived.reconciliation {
+            return Ok(Some(refusal(
+                "a restore must not rewrite the retained reconciliation of an already retired \
+                 destination row"
+                    .to_owned(),
+            )));
+        }
+        return Ok(None);
+    }
+    if let Some(reason) = handoff_rewrite {
+        return Ok(Some(refusal(reason.to_owned())));
+    }
+    if terminal_restore || !destination.activation.permits_transition_to(imported) {
+        return Ok(Some(refusal(format!(
+            "the destination row is {:?} and the restored row imports as {:?}, which that durable \
+             row may not become",
+            destination.activation, imported
+        ))));
+    }
+    Ok(None)
+}
+
+/// The refusal reason for a write that rewrites a `Reconciled` handoff on a
+/// durable row, or `None` for a write that does not.
+///
+/// This MIRRORS `RedbRecoveryStore`'s write-body rule and is not its owner: the
+/// write body applies that rule above its whole `match`, for every writer, and
+/// this pre-pass must agree with it in both the same-activation branch and the
+/// transition branch or the driver's zero-write property would not hold. Three
+/// clauses, exactly as the write body states them: a reconciliation that is not
+/// `Reconciled` is never moved into it, a `Reconciled` one is never moved out
+/// of it, and a row already `Reconciled` keeps its `owner` and its
+/// `handoff_sha256` byte for byte.
+///
+/// A `destination` that is not `Reconciled` may still change owner and move
+/// between the other three states — that is the ordinary cross-installation
+/// restore, which legitimately presents a different `owner` and carries no
+/// proof.
+fn reconciled_handoff_rewrite(
+    destination: &StreamRecoveryReconciliation,
+    archived: &StreamRecoveryReconciliation,
+) -> Option<&'static str> {
+    let reconciled = StreamRecoveryReconciliationState::Reconciled;
+    match (
+        destination.state == reconciled,
+        archived.state == reconciled,
+    ) {
+        (false, true) => Some(
+            "a durable reconciliation is never moved into Reconciled by a restore, so an archived \
+             reconciled handoff cannot be placed on a row that does not already carry one",
+        ),
+        (true, false) => Some(
+            "a durable Reconciled handoff is write-once, so a restore may never move it out of \
+             Reconciled",
+        ),
+        (true, true)
+            if archived.owner != destination.owner
+                || archived.handoff_sha256 != destination.handoff_sha256 =>
+        {
+            Some(
+                "a durable Reconciled handoff is write-once and immutable, so a restore may not \
+                 re-point its owner or its handoff digest",
+            )
+        }
+        _ => None,
+    }
+}
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
 /// freeze digest. Keeps quarantine reads from becoming unbounded scans;
@@ -265,7 +592,9 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::ProcessStartReplay),
         // Past handoffs never re-fence authority.
         RowFamilyDisposition::of(RowFamilyKind::AuthorityHandoffs),
-        // Process evidence is observational only.
+        // Process evidence is observational only, and a pre-#269 row of this
+        // family still holds the inline stdout/stderr payload: it exports as
+        // forensics and never as an importable observation (#269 A1).
         RowFamilyDisposition::of(RowFamilyKind::ProcessEvidence),
         // Process-stream recovery re-imports as suspended evidence only, never
         // a live process, session or authority owner (#269).
@@ -1137,6 +1466,339 @@ pub(super) fn open_backup_family(
     OrsFamilyCursor::start(identity)
 }
 
+/// Opens the typed operational-history cursor for one live backup walk
+/// (issue #2967).
+///
+/// The ONE producer of an [`OrsOperationalCursor`], and the exact operational twin
+/// of [`open_backup_family`]: it reads the owner-observed ordering high-water and
+/// the streamed content root, row count and byte denominator of the declared window
+/// under ONE read transaction, so the frozen identity can never mix two moments.
+/// Because it is the only producer, a caller cannot mint an operational window and
+/// therefore cannot choose where the walk starts or what it is measured against;
+/// it can only choose the walk's declared LOWER bound, which becomes part of the
+/// frozen identity and therefore part of the denominator the pages are counted
+/// against.
+///
+/// `source` is the caller's own source identity and is bound into the identity, so a
+/// cursor opened for one installation cannot be replayed against another.
+pub(super) fn open_backup_operational_history(
+    database: &Database,
+    source: &crate::backup_snapshot::OrsBackupSourceIdentity,
+    lower_order_bound: u64,
+) -> Result<OrsOperationalCursor, OrsError> {
+    let read = database.begin_read().map_err(storage)?;
+    let identity = operational_history_identity(&read, source, lower_order_bound)?;
+    drop(read);
+    OrsOperationalCursor::start(identity)
+}
+
+/// Fixed width of the zero-padded `operation_order` prefix every operational-history
+/// durable key begins with (issue #2967).
+///
+/// `persist_operational_record` builds the key as `format!("{:020}:{key}",
+/// record.operation_order)`, and a `u64` never renders wider than twenty decimal
+/// digits, so the prefix is a FIXED width and the durable-key order of
+/// `OPERATIONAL_HISTORY` is its `operation_order` order. That is the ordered read
+/// path this issue reuses instead of adding a table: seeking to
+/// `"{order:020}:"` is an exact seek, not a scan, and no second index, no second
+/// history database and no durable schema change is introduced to obtain it.
+///
+/// The consequence is a PREMISE, and [`operational_history_order`] is where it is
+/// checked rather than assumed: every row the walk visits must carry a key of this
+/// shape and a decoded `operation_order` equal to the order its key names, and a
+/// row that does not is refused with its own identity. A silently reordered index
+/// would be exactly the "named but not owned" failure this issue forbids.
+const OPERATIONAL_ORDER_KEY_WIDTH: usize = 20;
+
+/// The `operation_order` an operational-history durable key names, or a refusal
+/// naming that exact key.
+///
+/// The one place the ordered read path's premise is enforced. Every caller that
+/// relies on durable-key order being `operation_order` order — the window root, the
+/// cursor-boundary proof and the page walk — goes through here, so a durable key
+/// outside the documented `{operation_order:020}:{record_key}` form can never be
+/// skipped into or out of the denominator by a range seek that assumed otherwise.
+fn operational_history_order(record_key: &str) -> Result<u64, OrsError> {
+    let bytes = record_key.as_bytes();
+    let malformed = || {
+        family_row_refused(
+            "operational_history",
+            record_key,
+            "durable key is not the ordered {operation_order:020}:{record_key} form the operational walk is ordered by",
+        )
+    };
+    if bytes.len() <= OPERATIONAL_ORDER_KEY_WIDTH + 1 || bytes[OPERATIONAL_ORDER_KEY_WIDTH] != b':'
+    {
+        return Err(malformed());
+    }
+    std::str::from_utf8(&bytes[..OPERATIONAL_ORDER_KEY_WIDTH])
+        .ok()
+        .and_then(|order| order.parse::<u64>().ok())
+        .ok_or_else(malformed)
+}
+
+/// The first durable key an operational walk above `lower_order_bound` can have, or
+/// `None` when no operation order can exceed that bound.
+///
+/// `{order + 1:020}:` is an INCLUSIVE lower seek bound that skips every key of
+/// order `lower_order_bound` exactly: the constant is a strict prefix of those keys
+/// and therefore sorts before them, while every key of a larger order begins with a
+/// greater twenty-digit number and therefore sorts after it. A start cursor carries
+/// no durable key of its own, so this is how the walk's first seek is expressed
+/// without scanning the rows below the declared window.
+fn operational_history_lower_key(lower_order_bound: u64) -> Option<String> {
+    lower_order_bound
+        .checked_add(1)
+        .map(|next| format!("{next:020}:"))
+}
+
+/// One bounded read of the operational-history window: the streamed content root
+/// plus the observed size, with nothing retained.
+struct OperationalWindow {
+    /// Chained content root over the window's durable keys and encoded rows.
+    root_digest: String,
+    /// Eligible rows observed in the window.
+    row_count: u64,
+    /// Summed encoded row bytes observed in the window.
+    total_bytes: u64,
+}
+
+/// Computes the operational window's content root in one ordered streaming pass.
+///
+/// The operational twin of [`family_root`], and the same cost characteristic: each
+/// row is folded into an [`OrsFamilyRowChain`] link and then dropped, so the pass
+/// costs constant memory no matter how much history the window contains. Because the
+/// table is walked in durable-key order and that order IS the `operation_order`
+/// order (see [`operational_history_order`]), the pass needs no collection and no
+/// sort — which is what replaces the full materialize-and-sort scan that this issue
+/// removes from every page.
+///
+/// Two bounds, both of them the contract's rather than the caller's: the walk starts
+/// strictly above `lower_order_bound` and stops at the first row above
+/// `high_water_order`, so the root, the row count and the byte denominator describe
+/// exactly the frozen window and a row above the high-water is never counted here
+/// either. Bounded by [`IMPORT_SCAN_ROW_CAP`] and fails closed rather than
+/// certifying a truncated window as a complete denominator.
+fn operational_window_root(
+    table: &redb::ReadOnlyTable<&str, &str>,
+    lower_order_bound: u64,
+    high_water_order: u64,
+) -> Result<OperationalWindow, OrsError> {
+    let mut chain = OrsFamilyRowChain::start(RowFamilyKind::OperationalHistory);
+    let mut window = OperationalWindow {
+        root_digest: chain.link().to_owned(),
+        row_count: 0,
+        total_bytes: 0,
+    };
+    // A lower bound no order can exceed makes the declared window empty by
+    // construction; the chain seed is the root of an empty window, which is what
+    // makes "no rows" a measured value rather than an absent one.
+    let Some(start) = operational_history_lower_key(lower_order_bound) else {
+        return Ok(window);
+    };
+    let rows = table
+        .range::<&str>((Bound::Included(start.as_str()), Bound::Unbounded))
+        .map_err(storage)?;
+    for row in rows {
+        if window.row_count >= IMPORT_SCAN_ROW_CAP {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let (key, value) = row.map_err(storage)?;
+        if operational_history_order(key.value())? > high_water_order {
+            break;
+        }
+        let encoded = value.value().as_bytes();
+        window.row_count = window
+            .row_count
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        window.total_bytes = window
+            .total_bytes
+            .checked_add(encoded.len() as u64)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        chain.advance_row(key.value(), &crate::model::sha256_hex(encoded));
+    }
+    chain.link().clone_into(&mut window.root_digest);
+    Ok(window)
+}
+
+/// Reads the owner-observed high-water and the streamed window root under one read
+/// transaction, so the frozen operational identity can never mix two moments.
+fn operational_history_identity(
+    read: &ReadTransaction,
+    source: &crate::backup_snapshot::OrsBackupSourceIdentity,
+    lower_order_bound: u64,
+) -> Result<OrsOperationalSnapshotIdentity, OrsError> {
+    let observation = capture_store_fence(read)?;
+    let window = {
+        let table = read
+            .open_table(super::OPERATIONAL_HISTORY)
+            .map_err(storage)?;
+        let window =
+            operational_window_root(&table, lower_order_bound, observation.high_water_order)?;
+        drop(table);
+        window
+    };
+    OrsOperationalSnapshotIdentity::new(
+        source,
+        observation.high_water_order,
+        lower_order_bound,
+        window.root_digest,
+        window.row_count,
+        window.total_bytes,
+    )
+}
+
+/// The movement refusal for an operational window that moved after a backup froze
+/// it (issue #2967).
+///
+/// NO new [`OrsError`] variant is introduced, for the reason
+/// [`family_moved_error`] records and with the same consequence: `OrsError` is
+/// matched EXHAUSTIVELY outside this crate, so a new variant would not compile
+/// outside it, and the two files owning those mappings are not this change's to
+/// edit. The operational axis therefore reuses
+/// [`OrsError::OrderingHeadMismatch`] — the crate's existing typed refusal for a
+/// canonical ordering head that does not match durable ORS state, and precisely the
+/// fact that failed here: the ordering high-water the walk was frozen at no longer
+/// describes the store.
+///
+/// The operator action is the same one the versioned-artifact family already uses
+/// and the same one the issue names: restart the operational walk from a freshly
+/// opened window. Pages already emitted are never re-read under the new window and
+/// never concatenated with pages read under it, so a moved operational history can
+/// never be stitched into one archive. Be precise about what the variant does NOT
+/// carry: unlike the process-stream recovery family's rich variant it does not
+/// carry the observed root, because a unit variant has nowhere to put one. The
+/// evidence is still available to the operator, who re-opens the window and reads
+/// the new high-water that caused the refusal.
+fn operational_moved_error() -> OrsError {
+    OrsError::OrderingHeadMismatch
+}
+
+/// The refusal for a presented operational cursor that does not name the
+/// owner-emitted operational prefix (issue #2967).
+///
+/// The operational twin of [`family_cursor_mismatch_error`], and the same reuse
+/// decision: no new variant, so the crate's existing typed refusal for a
+/// caller-presented value that does not name durable state,
+/// [`OrsError::InvalidField`], with the operational axis's own field name so no two
+/// refusals read alike. A fabricated boundary, an edited offset, a changed prefix
+/// commitment and a cursor replayed under another source or high-water all land
+/// here, and all of them land BEFORE a suffix row is read.
+fn operational_cursor_mismatch_error() -> OrsError {
+    OrsError::InvalidField {
+        field: "backup_operational_cursor",
+        reason: "cursor must name the owner-emitted operational prefix under the frozen window",
+    }
+}
+
+/// Refuses an operational page whose window moved after the backup froze it
+/// (issue #2967).
+///
+/// The operational twin of [`check_family_revision_frozen`], and it re-derives
+/// rather than reading a counter, because the operational axis has no dedicated
+/// durable revision: what it freezes instead is the ordering high-water together
+/// with the streamed content root of the window under it, and BOTH are re-measured
+/// here. The fast path is therefore a comparison of the frozen high-water against
+/// the one this read transaction observed — the store's own `NEXT_GLOBAL_ORDER`, the
+/// same owner-established fact [`check_export_fence`] already compares — and the
+/// streamed root is re-measured only when that comparison has already failed, or
+/// when the high-water agrees but the content does not.
+///
+/// The second branch is why this is stronger than a high-water comparison alone.
+/// Operational history is append-only in its single write path — every insert
+/// allocates a new order — so a high-water that has not moved is expected to imply
+/// an unchanged window, and measuring the root anyway turns that expectation into a
+/// checked precondition at the cost of one streaming pass per page, in constant
+/// memory. That is strictly cheaper than the full materialize-and-sort scan this
+/// issue removes from every page, so paying it is not a regression.
+fn check_operational_identity_frozen(
+    read: &ReadTransaction,
+    identity: &OrsOperationalSnapshotIdentity,
+) -> Result<(), OrsError> {
+    let observation = capture_store_fence(read)?;
+    if observation.high_water_order != identity.high_water_order {
+        return Err(operational_moved_error());
+    }
+    let table = read
+        .open_table(super::OPERATIONAL_HISTORY)
+        .map_err(storage)?;
+    let observed = operational_window_root(
+        &table,
+        identity.lower_order_bound,
+        identity.high_water_order,
+    )?;
+    drop(table);
+    if observed.root_digest != identity.operational_root_digest
+        || observed.row_count != identity.operational_row_count
+        || observed.total_bytes != identity.operational_total_bytes
+    {
+        return Err(operational_moved_error());
+    }
+    Ok(())
+}
+
+/// Proves that a presented operational cursor names exactly the operational prefix
+/// the owner already emitted (issue #2967).
+///
+/// The operational twin of [`check_family_cursor_boundary`], with the same shape
+/// and the same reason for it: the boundary is not authenticated by shape, because
+/// every field of a presented cursor is observable. The emitted-prefix chain is
+/// re-derived from live durable keys and the walk stops the instant the presented
+/// row count is reached, so the cost is the prefix the owner already exported and
+/// the memory is constant. No row VALUE is decoded on this path, so a refusal costs
+/// no more than the keys it read.
+///
+/// The chain is seeded for the operational family, so it cannot be satisfied by a
+/// family cursor's chain, and it is walked from the frozen window's lower bound so
+/// it can only ever describe rows inside the frozen window. A cursor whose chain,
+/// offset, last key or last order disagrees with durable state is the operational
+/// boundary refusal ([`operational_cursor_mismatch_error`]): a caller cannot present
+/// a later boundary under an earlier offset and drop the rows in between out of the
+/// denominator, which is the exact defect `after_order + page_entries * page_index`
+/// allowed.
+fn check_operational_cursor_boundary(
+    table: &redb::ReadOnlyTable<&str, &str>,
+    cursor: &OrsOperationalCursor,
+) -> Result<(), OrsError> {
+    let identity = &cursor.identity;
+    let mut chain = OrsFamilyRowChain::start(RowFamilyKind::OperationalHistory);
+    let mut emitted: u64 = 0;
+    let mut durable_order = identity.lower_order_bound;
+    let mut durable_key = String::new();
+    if cursor.emitted_rows > 0 {
+        let Some(start) = operational_history_lower_key(identity.lower_order_bound) else {
+            return Err(operational_cursor_mismatch_error());
+        };
+        let rows = table
+            .range::<&str>((Bound::Included(start.as_str()), Bound::Unbounded))
+            .map_err(storage)?;
+        for row in rows {
+            let (key, _) = row.map_err(storage)?;
+            if operational_history_order(key.value())? > identity.high_water_order {
+                break;
+            }
+            chain.advance_key(key.value());
+            key.value().clone_into(&mut durable_key);
+            durable_order = operational_history_order(key.value())?;
+            emitted = emitted
+                .checked_add(1)
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
+            if emitted == cursor.emitted_rows {
+                break;
+            }
+        }
+    }
+    if emitted != cursor.emitted_rows
+        || chain.link() != cursor.emitted_prefix_digest
+        || durable_key != cursor.after_key
+        || durable_order != cursor.after_order
+    {
+        return Err(operational_cursor_mismatch_error());
+    }
+    Ok(())
+}
+
 /// The movement refusal for a family that moved after a backup froze it.
 ///
 /// NO new [`OrsError`] variant is introduced here (issue #1971). Both `OrsError`
@@ -1549,6 +2211,267 @@ fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize
     Ok((entries, continuation, page_bytes))
 }
 
+/// One page's bounded operational-history segment (issue #2967).
+struct OperationalSegment {
+    /// Entries emitted from the operational walk on this page.
+    entries: Vec<OrsBackupEntry>,
+    /// The page's in-force cursor and the exact next one.
+    continuation: OrsOperationalContinuation,
+    /// Encoded bytes this segment charged to the page.
+    page_bytes: u64,
+}
+
+/// The walk's running state as this page advanced it (issue #2967).
+///
+/// A named state rather than eight locals, so the boundary the next cursor names
+/// is assembled in ONE place instead of being spread across a loop and read back
+/// from a variable the reader has to find. Every field is either the cursor's own
+/// starting value or a value derived from a row the loop actually emitted.
+struct OperationalProgress {
+    /// Chained digest of the emitted durable-key prefix, resumed from the cursor.
+    chain: OrsFamilyRowChain,
+    /// Entries emitted so far on this page.
+    entries: Vec<OrsBackupEntry>,
+    /// Encoded bytes charged to this page so far.
+    page_bytes: u64,
+    /// Rows emitted for the whole walk so far.
+    emitted_rows: u64,
+    /// Encoded bytes emitted for the whole walk so far.
+    emitted_bytes: u64,
+    /// Order of the walk's last emitted row, which is the next cursor's bound.
+    after_order: u64,
+    /// Durable key of the walk's last emitted row.
+    after_key: String,
+    /// Whether an eligible row is still behind this page.
+    open: bool,
+}
+impl OperationalProgress {
+    /// The state a walk begins in: exactly what the in-force cursor says it has
+    /// already emitted, with the chain resumed from its own commitment.
+    fn resumed(cursor: &OrsOperationalCursor) -> Self {
+        Self {
+            chain: OrsFamilyRowChain::resume(cursor.emitted_prefix_digest.clone()),
+            entries: Vec::new(),
+            page_bytes: 0,
+            emitted_rows: cursor.emitted_rows,
+            emitted_bytes: cursor.emitted_bytes,
+            after_order: cursor.after_order,
+            after_key: cursor.after_key.clone(),
+            open: false,
+        }
+    }
+}
+
+/// The durable-key bound this page's walk starts from, and whether it is inclusive.
+///
+/// A start cursor carries no durable key, so the first seek is the frozen window's
+/// declared lower bound; every later page seeks strictly after the exact durable key
+/// of the row the previous page ACTUALLY emitted, which is what makes page N+1 start
+/// after page N's real tail instead of at a count-stride guess. `None` means the
+/// declared window is empty by construction, which is a truthful exhausted page
+/// rather than a failure.
+fn operational_seek(cursor: &OrsOperationalCursor) -> Option<(String, bool)> {
+    if cursor.emitted_rows > 0 {
+        return Some((cursor.after_key.clone(), false));
+    }
+    operational_history_lower_key(cursor.identity.lower_order_bound).map(|key| (key, true))
+}
+
+/// Decodes one candidate operational row and refuses it unless it names the order
+/// its durable key named.
+///
+/// The ordered read path's premise, checked rather than assumed: the range seek
+/// above selected by `operation_order` only because the durable key's padded prefix
+/// IS that order, and a row whose own field disagrees would silently be emitted at
+/// the wrong position in the walk. Re-encoding here is also what produces the
+/// payload digest the entry carries, so the decoded bytes and the hashed bytes are
+/// the same bytes by construction.
+fn operational_row(
+    record_key: &str,
+    encoded_value: &str,
+    order: u64,
+) -> Result<(DurableOperationalRecord, String), OrsError> {
+    let record: DurableOperationalRecord = decode_named(encoded_value, "operational_history")?;
+    if record.operation_order != order {
+        return Err(family_row_refused(
+            "operational_history",
+            record_key,
+            &format!(
+                "row carries operation order {} but its durable key names {order}",
+                record.operation_order
+            ),
+        ));
+    }
+    let encoded = encode(&record)?;
+    Ok((record, encoded))
+}
+
+/// Walks this page's segment of the frozen operational window in durable-key order.
+///
+/// The operational twin of `family_segment`'s loop, and it obeys the same rules:
+/// the row and byte budgets are charged per row as the loop goes, so the path never
+/// holds more than one page of rows plus the one row it declined to emit; there is
+/// no "read the table, then slice" step and no sort; and every emitted row satisfies
+/// `previous_cursor < operation_order <= frozen_high_water`. A row at or below the
+/// previous cursor is a REFUSAL rather than a skip, because it would mean the
+/// ordered read path's premise is false, and a row above the high-water ENDS the walk
+/// because it belongs to a successor snapshot - which is what makes the A5 bound a
+/// property of the read boundary rather than of the caller's fence.
+fn operational_walk(
+    table: &redb::ReadOnlyTable<&str, &str>,
+    cursor: &OrsOperationalCursor,
+    mut progress: OperationalProgress,
+    row_budget: usize,
+    byte_budget: u64,
+    max_bytes: u64,
+) -> Result<OperationalProgress, OrsError> {
+    let identity = &cursor.identity;
+    let Some((seek_key, inclusive)) = operational_seek(cursor) else {
+        return Ok(progress);
+    };
+    let lower = if inclusive {
+        Bound::Included(seek_key.as_str())
+    } else {
+        Bound::Excluded(seek_key.as_str())
+    };
+    let rows = table
+        .range::<&str>((lower, Bound::Unbounded))
+        .map_err(storage)?;
+    let mut previous_order = cursor.after_order;
+    for row in rows {
+        let (key, value) = row.map_err(storage)?;
+        let record_key = key.value().to_owned();
+        let order = operational_history_order(&record_key)?;
+        if order > identity.high_water_order {
+            break;
+        }
+        if order <= previous_order {
+            return Err(family_row_refused(
+                "operational_history",
+                &record_key,
+                "operational durable keys must name strictly increasing operation orders",
+            ));
+        }
+        // The budget is checked after the row is decoded and after the window is
+        // applied, so "open" can only ever be set for a row that really is this
+        // snapshot's member. The family path checks its budget first, which is
+        // harmless there because a family has no upper bound to stop at.
+        let (record, encoded) = operational_row(&record_key, value.value(), order)?;
+        if progress.entries.len() >= row_budget {
+            progress.open = true;
+            break;
+        }
+        let encoded_len = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if encoded_len > max_bytes {
+            return Err(family_row_refused(
+                "operational_history",
+                &record_key,
+                &format!(
+                    "row encodes to {encoded_len} bytes, above the declared backup byte budget {max_bytes}"
+                ),
+            ));
+        }
+        let charged = progress
+            .page_bytes
+            .checked_add(encoded_len)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if charged > byte_budget {
+            progress.open = true;
+            break;
+        }
+        progress.page_bytes = charged;
+        progress.emitted_rows = progress
+            .emitted_rows
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        progress.emitted_bytes = progress
+            .emitted_bytes
+            .checked_add(encoded_len)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        progress.after_order = order;
+        progress.after_key.clone_from(&record_key);
+        previous_order = order;
+        progress.chain.advance_key(&record_key);
+        progress.entries.push(OrsBackupEntry {
+            record_id: record.input.record_id.as_str().to_owned(),
+            family: RowFamilyKind::OperationalHistory,
+            order,
+            payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
+            effect_class: effect_class_for_export(record.phase),
+            // A row that reached this point was decoded and re-encoded from the
+            // source bytes, so its payload was obtained. A row this path cannot
+            // read is refused above and never becomes an entry, so `Unavailable` is
+            // unreachable from the store and is an admission-side refusal only
+            // (issue #953, A6).
+            payload_state: RowPayloadState::Obtained,
+        });
+    }
+    Ok(progress)
+}
+
+/// Builds one bounded page segment for the operational-history walk.
+///
+/// The operational twin of [`family_segment`], in the same order:
+///
+/// - the boundary is proved against durable state BEFORE a single row is decoded
+///   ([`check_operational_cursor_boundary`]), so a fabricated or edited cursor is
+///   refused before a suffix read;
+/// - a row that does not fit the page's remaining budget is not emitted and not
+///   dropped: it stays behind `next`, so the following page carries it and the walk
+///   cannot be silently truncated;
+/// - `next` is `None` only when the walk reached the end of the FROZEN denominator,
+///   never because this scan happened to find nothing, and the two are cross-checked
+///   here so the measuring pass and the walking pass cannot silently disagree.
+fn operational_segment(
+    table: &redb::ReadOnlyTable<&str, &str>,
+    cursor: &OrsOperationalCursor,
+    row_budget: usize,
+    byte_budget: u64,
+    max_bytes: u64,
+) -> Result<OperationalSegment, OrsError> {
+    check_operational_cursor_boundary(table, cursor)?;
+    let progress = operational_walk(
+        table,
+        cursor,
+        OperationalProgress::resumed(cursor),
+        row_budget,
+        byte_budget,
+        max_bytes,
+    )?;
+    if !progress.open && progress.emitted_rows != cursor.identity.operational_row_count {
+        // The window was re-measured by `check_operational_identity_frozen` on this
+        // same read transaction, so the two passes cannot legitimately disagree. If
+        // they do, the walk would be about to be declared exhausted against a
+        // denominator it never reached, which is the "Complete from row presence"
+        // defect in its exact form, so it is refused by name instead.
+        return Err(family_row_refused(
+            "operational_history",
+            &progress.after_key,
+            &format!(
+                "the walk stopped at {} emitted row(s) against a frozen denominator of {}",
+                progress.emitted_rows, cursor.identity.operational_row_count
+            ),
+        ));
+    }
+    let next = progress.open.then(|| OrsOperationalCursor {
+        version: cursor.version,
+        identity: cursor.identity.clone(),
+        after_order: progress.after_order,
+        after_key: progress.after_key,
+        emitted_rows: progress.emitted_rows,
+        emitted_bytes: progress.emitted_bytes,
+        emitted_prefix_digest: progress.chain.link().to_owned(),
+    });
+    Ok(OperationalSegment {
+        entries: progress.entries,
+        continuation: OrsOperationalContinuation {
+            cursor: cursor.clone(),
+            next,
+        },
+        page_bytes: progress.page_bytes,
+    })
+}
+
 /// Returns true for a 64-character lowercase hex digest; rejects uppercase,
 /// short, long, or non-hex input so malformed bindings fail with stable
 /// [`OrsError::InvalidField`] instead of passing silently.
@@ -1559,38 +2482,34 @@ fn is_digest_shape(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Deterministic digest over durable operational-history state.
+/// Deterministic digest over durable operational-history state under an observed
+/// high-water (issue #2967).
 ///
-/// Binds `(order, record-bytes digest)` pairs in order under the caller's read
-/// transaction. Used as one half of the composite pre/post freeze witness: any
-/// canonical advance between the two observations fails the import/export with
-/// [`OrsError::OrderingHeadMismatch`] instead of tearing the snapshot.
-fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
+/// The witness's operational half, and it is now the SAME measured value the walk
+/// is frozen against rather than a separate digest computed a different way. It
+/// used to collect every decoded `(order, record-digest)` pair into a vector and
+/// sort it, so the witness cost memory proportional to the retained history and
+/// bound nothing; it is now one ordered streaming pass over the table's own
+/// durable-key order, cut at the high-water this read transaction observed, which
+/// is O(1) in memory and O(walk) in time.
+///
+/// SCOPE CHANGE, stated so it is not read as narrower than it is. The old digest
+/// bound EVERY operational row regardless of order; this one bounds the rows at or
+/// below the observed high-water, which is what the backup walk can see, and
+/// `composite_state_digest` now folds the high-water itself into the material so a
+/// commit that consumes an order without writing a history row still moves the
+/// witness. The composition of the two is therefore at least as sensitive as the old
+/// digest, and it no longer has to sort the table to say so.
+fn operational_state_digest(
+    read: &ReadTransaction,
+    high_water_order: u64,
+) -> Result<String, OrsError> {
     let table = read
         .open_table(super::OPERATIONAL_HISTORY)
         .map_err(storage)?;
-    let mut rows: Vec<(u64, String)> = Vec::new();
-    for entry in table.iter().map_err(storage)? {
-        if rows.len() as u64 >= IMPORT_SCAN_ROW_CAP {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        let (_, value) = entry.map_err(storage)?;
-        let record: DurableOperationalRecord = decode_named(value.value(), "operational_history")?;
-        rows.push((
-            record.operation_order,
-            crate::model::sha256_hex(encode(&record)?.as_bytes()),
-        ));
-    }
+    let window = operational_window_root(&table, 0, high_water_order)?;
     drop(table);
-    rows.sort_by_key(|(order, _)| *order);
-    let mut material = String::new();
-    for (order, digest) in &rows {
-        material.push_str(&order.to_string());
-        material.push(':');
-        material.push_str(digest);
-        material.push(';');
-    }
-    Ok(crate::model::sha256_hex(material.as_bytes()))
+    Ok(window.root_digest)
 }
 
 /// Deterministic digest over the composite durable state a backup certifies.
@@ -1608,9 +2527,12 @@ fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> 
 /// triaged against a family that moved underneath it.
 ///
 /// Each family axis is a streaming hash chain, so this stays O(1) in the number
-/// of retained family rows; only the pre-existing operational-history half
-/// collects its rows. The families are named in the material string, so the
-/// versioned-artifact axis cannot be satisfied by the process-stream axis.
+/// of retained family rows; the operational-history half is now the same streaming
+/// pass the walk itself uses, so every axis of the witness is allocation-free. The
+/// families are named in the material string, so the versioned-artifact axis cannot
+/// be satisfied by the process-stream axis, and since issue #2967 the operational
+/// axis is named together with the high-water it was measured under, so it cannot
+/// be satisfied by a family root either.
 ///
 /// SCOPE, unchanged in kind and widened in coverage: this binds the operational
 /// history and BOTH cursor-paged family roots. It still does not bind every
@@ -1629,7 +2551,11 @@ fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> 
 /// after that one is released, and the import triage takes the two transactions
 /// that straddle its work.
 fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
-    let operational = operational_state_digest(read)?;
+    // The high-water is observed by the SAME transaction that measures the window
+    // under it, so the pair describes one moment and a commit that consumed an
+    // order without writing a history row still moves the witness.
+    let observation = capture_store_fence(read)?;
+    let operational = operational_state_digest(read, observation.high_water_order)?;
     let recovery_revision = family_revision(read, RowFamilyKind::ProcessStreamRecovery)?;
     let recovery = family_identity(read, RowFamilyKind::ProcessStreamRecovery)?;
     let artifact_revision = family_revision(read, RowFamilyKind::VersionedArtifacts)?;
@@ -1637,7 +2563,8 @@ fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
     let mut material = String::new();
     let _ = write!(
         material,
-        "eliot.ors.composite_state.v2|operational={operational}|recovery_family_revision={recovery_revision}|recovery_family_root={}|recovery_rows={}|recovery_bytes={}|artifact_family_revision={artifact_revision}|artifact_family_root={}|artifact_rows={}|artifact_bytes={}",
+        "eliot.ors.composite_state.v3|operational_high_water={}|operational_root={operational}|recovery_family_revision={recovery_revision}|recovery_family_root={}|recovery_rows={}|recovery_bytes={}|artifact_family_revision={artifact_revision}|artifact_family_root={}|artifact_rows={}|artifact_bytes={}",
+        observation.high_water_order,
         recovery.family_root_digest,
         recovery.family_row_count,
         recovery.family_total_bytes,
@@ -1646,6 +2573,86 @@ fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
         artifact.family_total_bytes
     );
     Ok(crate::model::sha256_hex(material.as_bytes()))
+}
+
+/// Resolves the operational cursor this page is read under (issue #2967).
+///
+/// Two cases and one rule. A request that carries no operational cursor is the
+/// FIRST page of the walk its `after_order` declares, and the store mints the
+/// cursor itself from the high-water, content root and denominator it observes
+/// under the capture transaction — the same "the owner is the only producer"
+/// property `open_backup_family` has. A request that DOES carry one has that cursor
+/// re-proved against durable state before it is applied: the frozen identity is
+/// re-measured, and the cursor must belong to this request's own source and fence.
+///
+/// The four refusals here are the A6 cases and each is a different fact:
+///
+/// - a cursor whose frozen window no longer describes the store is the movement
+///   disposition ([`operational_moved_error`]), because the store advanced;
+/// - a cursor frozen for a different source, or at a different high-water than the
+///   fence this request declares, is refused here, BEFORE any row is read, so an
+///   old window cannot be reinterpreted against a newer fence;
+/// - a start cursor whose frozen lower bound is not this request's `after_order` is
+///   refused, so a walk cannot be restarted at a different window under a cursor
+///   that looks well formed.
+fn resolve_operational_cursor(
+    read: &ReadTransaction,
+    request: &OrsBackupRequest,
+) -> Result<OrsOperationalCursor, OrsError> {
+    let Some(cursor) = &request.operational_cursor else {
+        return operational_history_identity(read, &request.source, request.after_order)
+            .and_then(OrsOperationalCursor::start);
+    };
+    check_operational_identity_frozen(read, &cursor.identity)?;
+    if cursor.identity.source_installation_id != request.source.installation_id
+        || cursor.identity.ors_generation != request.source.ors_generation
+    {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "the operational cursor was frozen for a different source installation or ORS generation",
+        });
+    }
+    if cursor.identity.high_water_order != request.fence.high_water_order {
+        return Err(operational_moved_error());
+    }
+    // The declared walk start is re-checked here and not only in
+    // `OrsBackupRequest::with_operational_cursor`, because that setter is a
+    // convenience, not the only way the field can be populated: the store is the
+    // boundary an unvalidated request crosses and must judge it itself.
+    if cursor.identity.lower_order_bound != request.after_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "the operational cursor is frozen for a different walk start than this request declares",
+        });
+    }
+    Ok(cursor.clone())
+}
+
+/// Reads this page's operational-history segment (issue #2967).
+///
+/// The operational counterpart of [`family_page`], and it runs FIRST so the
+/// remaining row and byte admission every family segment is charged from is what
+/// the walk actually spent. It is given this page's WHOLE admission, because nothing
+/// has been charged yet on this page; the walk does not get a private allowance, so
+/// paging it can never raise the per-page ceiling, and it is charged first precisely
+/// so it can never take more than the page's ceiling either.
+fn operational_page(
+    read: &ReadTransaction,
+    request: &OrsBackupRequest,
+) -> Result<OperationalSegment, OrsError> {
+    let cursor = resolve_operational_cursor(read, request)?;
+    let table = read
+        .open_table(super::OPERATIONAL_HISTORY)
+        .map_err(storage)?;
+    let segment = operational_segment(
+        &table,
+        &cursor,
+        usize::from(request.page_entries),
+        request.max_bytes,
+        request.max_bytes,
+    );
+    drop(table);
+    segment
 }
 
 /// Reads this page's segment for one cursor-paged row family, if the request
@@ -1822,17 +2829,26 @@ fn attach_family_cursor(
 /// repeated read transactions and are therefore not one snapshot, whatever
 /// timestamp they carry.
 ///
-/// `page_index` selects a legacy count-stride window beginning at
-/// `after_order + page_entries * page_index`. Operation orders may be sparse,
-/// so this is not an exact continuation and does not prove complete coverage.
-/// Callers building a snapshot must reuse the same request (same fence token)
-/// across pages; [`export_snapshot`] applies a bounded refusal when its page
-/// budget ends on a non-final page without an exact family continuation. This
-/// does not make multi-page operational coverage exact. Any row decode failure
-/// returns [`OrsError::IntegrityProblem`]; a page is never fabricated from
-/// reference counts alone. Accumulated entry bytes are bounded by
-/// `request.max_bytes` (already `1..=MAX_BACKUP_BYTES` by the request
-/// constructor).
+/// `page_index` is the page's position in the walk, NOT a window selector. Since
+/// issue #2967 there is no count-stride window left to select: page 0 is the walk
+/// the request's `after_order` declares, and every later page is read under the
+/// owner-issued operational cursor its previous page ended with, echoed back
+/// through [`OrsBackupRequest::with_operational_cursor`]. Calling this with
+/// `page_index > 0` and no declared operational cursor is refused rather than
+/// answered with a count-stride guess, because a guess over a sparse order domain
+/// is how rows were duplicated in the first place. The mirror rule holds at
+/// `page_index == 0`: a declared cursor that has already emitted rows is refused
+/// there too, because a page 0 that opens mid-walk is a page
+/// [`OrsBackupSnapshot::validate`] will not accept, and this crate must not
+/// manufacture a page its own validator rejects.
+///
+/// Callers building a snapshot should use [`export_snapshot`], which holds ONE
+/// transaction across the whole page loop; pages taken from repeated calls to this
+/// function are pages from repeated read transactions and are therefore not one
+/// snapshot, whatever timestamp they carry. Any row decode failure returns
+/// [`OrsError::IntegrityProblem`]; a page is never fabricated from reference counts
+/// alone. Accumulated entry bytes are bounded by `request.max_bytes` (already
+/// `1..=MAX_BACKUP_BYTES` by the request constructor).
 pub(super) fn export_page(
     database: &Database,
     request: &OrsBackupRequest,
@@ -1876,16 +2892,17 @@ pub(super) fn export_page(
 /// [`MAX_BACKUP_BYTES`], so the transaction's lifetime is bounded work, not
 /// unbounded wait (A13.9: no unbounded wait may be held).
 ///
-/// The operational-history window is unchanged. Neither cursor-paged family
-/// (#269 process-stream recovery, #1971 versioned artifacts) is paged on that
-/// window: their rows carry no canonical operation order, so each is paged
-/// through its OWN request slot in durable-key order, sharing this page's
-/// remaining row and byte budget so the per-page ceiling is unchanged. Each
-/// family segment is admitted from what the previous one actually spent, so a
-/// page can never exceed `page_entries` or `max_bytes` by running two families.
-/// `is_last` is the conjunction of the operational window being exhausted and
-/// BOTH families having no continuation left, so a page that still owes rows to
-/// either family is never final.
+/// The operational-history walk is the page's FIRST segment and is paged by its
+/// own owner-issued cursor under its own frozen window (issue #2967). Neither
+/// cursor-paged family (#269 process-stream recovery, #1971 versioned artifacts)
+/// shares that cursor: their rows carry no canonical operation order, so each is
+/// paged through its OWN request slot in durable-key order, sharing this page's
+/// remaining row and byte budget so the per-page ceiling is unchanged. Each family
+/// segment is admitted from what the previous one actually spent, so a page can
+/// never exceed `page_entries` or `max_bytes` by running three segments.
+/// `is_last` is the conjunction of the operational walk having no continuation left
+/// and BOTH families having no continuation left, so a page that still owes rows on
+/// any axis is never final.
 fn export_page_in(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -1907,77 +2924,60 @@ fn export_page_in(
             reason: "byte budget must be within 1 and MAX_BACKUP_BYTES",
         });
     }
+    if page_index > 0 && request.operational_cursor.is_none() {
+        // The count-stride window this used to derive is gone, and a page beyond the
+        // first with no declared operational cursor has no boundary to be read
+        // under. Answering it anyway would mean recomputing a stride guess, which
+        // is the defect this issue closes.
+        return Err(OrsError::InvalidField {
+            field: "backup.page_index",
+            reason: "a page beyond the first requires the owner-issued operational continuation from the previous page",
+        });
+    }
+    if page_index == 0
+        && request
+            .operational_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.emitted_rows != 0)
+    {
+        // The mirror of the rule above, and the exact reason a snapshot always
+        // opens its operational axis at the walk's declared start: pages must be
+        // continuous from zero, and `check_operational_pages` refuses a page 0
+        // that opens mid-walk, so a snapshot built here would be one this crate's
+        // own validator rejects. Continuation therefore goes the way
+        // `after_order` is documented to work — a truncated walk is resumed by
+        // opening a NEW window at the outstanding cursor's `after_order`, and that
+        // window is a snapshot in its own right, complete over exactly the window
+        // it declares. Appending a suffix to a frozen identity is refused here
+        // rather than answered, because its declared denominator covers rows the
+        // pages could never carry.
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "a snapshot opens the operational walk at its declared start; resume a truncated walk by opening a new window at the outstanding cursor's after_order",
+        });
+    }
     // The token binds the owner-observed fence, not only the caller's claim
     // about it, and the page's digest is derived from the finished page by the
     // ONE derivation in the contract module.
     let fence_token =
         request.observed_fence_token(observation.high_water_order, observation.family_revision);
-    let stride = u64::from(request.page_entries)
-        .checked_mul(u64::from(page_index))
-        .ok_or(OrsError::InvalidField {
-            field: "backup.page_index",
-            reason: "page window overflows the operation order",
-        })?;
-    let window_start = request
-        .after_order
-        .checked_add(stride)
-        .ok_or(OrsError::InvalidField {
-            field: "backup.page_index",
-            reason: "page window overflows the operation order",
-        })?;
-    let table = read
-        .open_table(super::OPERATIONAL_HISTORY)
-        .map_err(storage)?;
-    let mut selected: Vec<(u64, DurableOperationalRecord, String)> = Vec::new();
-    for entry in table.iter().map_err(storage)? {
-        let (_, value) = entry.map_err(storage)?;
-        let record: DurableOperationalRecord = decode_named(value.value(), "operational_history")?;
-        if record.operation_order > window_start {
-            let encoded = encode(&record)?;
-            selected.push((record.operation_order, record, encoded));
-        }
-    }
-    drop(table);
-    // The operational-history segment decides whether its own window is
-    // exhausted, exactly as the post-truncation `entries.len()` check below
-    // does. The family has its own cursor, so it is read on every page that
-    // carries a family continuation and never depends on this flag.
-    let operational_exhausted = selected.len() < usize::from(request.page_entries);
-    selected.sort_by_key(|(order, _, _)| *order);
-    selected.truncate(usize::from(request.page_entries));
-    let mut entries: Vec<OrsBackupEntry> = Vec::with_capacity(selected.len());
-    let mut total_bytes: u64 = 0;
-    for (order, record, encoded) in selected {
-        let encoded_len = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
-        total_bytes = total_bytes
-            .checked_add(encoded_len)
-            .ok_or(OrsError::ProjectionLimitExceeded)?;
-        if total_bytes > request.max_bytes {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        entries.push(OrsBackupEntry {
-            record_id: record.input.record_id.as_str().to_owned(),
-            family: RowFamilyKind::OperationalHistory,
-            order,
-            payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
-            effect_class: effect_class_for_export(record.phase),
-            // `selected` holds only rows that decoded and re-encoded, so the
-            // payload was obtained; an unreadable operational row fails the
-            // export at `decode_named` instead of becoming an unavailable entry
-            // (issue #953, A6).
-            payload_state: RowPayloadState::Obtained,
-        });
-    }
+    // The walk: an exact continuation under a re-proved frozen window, enumerated
+    // in the table's own durable-key order. No full table scan, no sort, no
+    // truncation, and no row above the frozen high-water.
+    let operational = operational_page(read, request)?;
+    let mut entries = operational.entries;
+    let total_bytes = operational.page_bytes;
     // Family paging, in a fixed order, each charged from what is actually left
     // of this page's admission.
     let families = family_page_segments(read, request, entries.len(), total_bytes)?;
-    // `is_last` is the conjunction over BOTH families: a page that still owes rows
-    // to either one is not final, so page continuity can never hide an unemitted
-    // family tail behind a final page (issue #1971). A family the request declared
-    // no cursor for contributes no continuation, which is `!open` and so does not
-    // block finality — it makes the snapshot partial instead, which
-    // `OrsBackupSnapshot::validate` is what refuses as `Complete`.
-    let is_last = operational_exhausted && !families.open;
+    // `is_last` is the conjunction over ALL THREE axes: a page that still owes rows
+    // to the operational walk or to either family is not final, so page continuity
+    // can never hide an unemitted tail behind a final page (issue #1971, extended by
+    // #2967). A family the request declared no cursor for contributes no
+    // continuation, which is `!open` and so does not block finality — it makes the
+    // snapshot partial instead, which `OrsBackupSnapshot::validate` is what refuses
+    // as `Complete`.
+    let is_last = !operational.continuation.operational_open() && !families.open;
     entries.extend(families.entries);
     // Stamped by the store's own clock at capture, never by the caller, and
     // bounded by the ceiling the contract module enforces on validation. The
@@ -1995,6 +2995,7 @@ fn export_page_in(
         expires_at_ms,
         page_digest: String::new(),
         is_last,
+        operational_continuation: operational.continuation,
         family_continuation: families.recovery,
         versioned_artifact_continuation: families.artifacts,
     };
@@ -2018,11 +3019,13 @@ struct SnapshotPages {
     entry_count: u64,
     /// Whether the last page emitted was final.
     last_page_was_final: bool,
+    /// Exact continuation resuming the operational walk, if owed.
+    outstanding_operational: Option<OrsOperationalCursor>,
     /// Exact continuation resuming the process-stream recovery family, if owed.
     outstanding_recovery: Option<OrsFamilyCursor>,
     /// Exact continuation resuming the versioned-artifact family, if owed.
     outstanding_artifact: Option<OrsFamilyCursor>,
-    /// The request as the loop left it, carrying each family's final cursor.
+    /// The request as the loop left it, carrying each axis's final cursor.
     continuing: OrsBackupRequest,
 }
 
@@ -2033,9 +3036,13 @@ struct SnapshotPages {
 /// or the page budget is spent. Holding one transaction across the whole loop is
 /// what makes the pages one moment.
 ///
-/// Each family advances by EXACTLY the owner-issued cursor its own previous page
-/// ended with, and the advance is dispatched on that cursor's own frozen family,
-/// so one family's next cursor can only ever land in that family's request slot.
+/// EVERY axis advances by EXACTLY the owner-issued cursor its own previous page
+/// ended with, and each advance is dispatched on that cursor's own axis, so one
+/// axis's next cursor can only ever land in that axis's request slot. The
+/// operational axis is the one this issue adds: page N+1 is read under page N's
+/// actual emitted tail, so the walk neither repeats nor skips a row in the sparse
+/// order domain, and the loop can no longer spend its whole page budget re-reading
+/// a stride window.
 fn export_pages_in(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -2050,6 +3057,8 @@ fn export_pages_in(
         entry_count = entry_count
             .checked_add(page.entries.len() as u64)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let next_operational = page.operational_continuation.next.clone();
+        let in_force_operational = page.operational_continuation.cursor.clone();
         let next_recovery = page
             .family_continuation
             .as_ref()
@@ -2063,6 +3072,17 @@ fn export_pages_in(
         if last_page_was_final {
             break;
         }
+        if let Some(next) = next_operational {
+            continuing = continuing.with_operational_cursor(next)?;
+        } else {
+            // The operational axis always carries a cursor forward, even when the
+            // walk is already exhausted, because an exhausted walk is still a real
+            // boundary and the next page is a family page. Dropping the cursor here
+            // would leave the request with none, and the page function would have to
+            // refuse a page it can answer exactly - re-reading an exhausted window
+            // yields the same empty segment, at the cost of one seek.
+            continuing = continuing.with_operational_cursor(in_force_operational)?;
+        }
         if let Some(next) = next_recovery {
             continuing = attach_family_cursor(continuing, next)?;
         }
@@ -2073,10 +3093,10 @@ fn export_pages_in(
     if pages.is_empty() {
         return Err(OrsError::ProjectionLimitExceeded);
     }
-    // The last page is the authority on whether EACH family is finished: a page
-    // that ended a family leaves no continuation for it even when an earlier page
-    // did, so a snapshot is never left claiming an outstanding cursor it has
-    // already emitted past.
+    // The last page is the authority on whether EACH axis is finished: a page that
+    // ended an axis leaves no continuation for it even when an earlier page did, so
+    // a snapshot is never left claiming an outstanding cursor it has already
+    // emitted past.
     let outstanding_of = |page: Option<&OrsBackupPage>, family: RowFamilyKind| {
         page.and_then(|page| match family {
             RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
@@ -2087,6 +3107,7 @@ fn export_pages_in(
     };
     let last = pages.last();
     Ok(SnapshotPages {
+        outstanding_operational: last.and_then(|page| page.operational_continuation.next.clone()),
         outstanding_recovery: outstanding_of(last, RowFamilyKind::ProcessStreamRecovery),
         outstanding_artifact: outstanding_of(last, RowFamilyKind::VersionedArtifacts),
         pages,
@@ -2094,6 +3115,93 @@ fn export_pages_in(
         last_page_was_final,
         continuing,
     })
+}
+
+/// Derives the snapshot's completeness from EXHAUSTION on every axis (issue #2967).
+///
+/// `Complete` used to be a function of row presence and of the process-stream
+/// family's continuation alone, so a one-page budget that stopped on a non-final
+/// operational page could still mint it. Every arm below is one demonstrable reason
+/// the walk is NOT exhausted, tested in a fixed order and each naming its own axis
+/// through [`BackupPartialReason`], so "the caller's next action" is a decision the
+/// value makes rather than a substring a caller has to parse (W13).
+///
+/// The arms, in order:
+/// 1. the operational walk still owes rows, or a cursor-paged family does;
+/// 2. a cursor-paged family was never given a denominator at all, which is unknown
+///    coverage rather than an empty complete family (I05-16);
+/// 3. the declared operational window is empty, which is also unknown coverage;
+/// 4. otherwise, and only then, `Complete` — and only with a non-empty aggregate and
+///    a final last page, because a final page is the conjunction of every axis
+///    having no continuation left.
+///
+/// The final `else` is a refusal rather than a fifth reason: every axis reported
+/// itself exhausted and the last page was final, yet the aggregate is empty, and
+/// that combination is a contradiction rather than a truncated walk. Reporting it as
+/// a partial would state a reason the snapshot does not have.
+fn snapshot_completeness(
+    operational_history: &OrsOperationalSnapshotIdentity,
+    outstanding_operational: Option<&OrsOperationalCursor>,
+    outstanding_recovery: Option<&OrsFamilyCursor>,
+    outstanding_artifact: Option<&OrsFamilyCursor>,
+    continuing: &OrsBackupRequest,
+    entry_count: u64,
+    last_page_was_final: bool,
+) -> Result<BackupCompleteness, OrsError> {
+    let family_outstanding =
+        |cursor: &OrsFamilyCursor, family| BackupPartialReason::FamilyContinuationOutstanding {
+            family,
+            emitted_rows: cursor.emitted_rows,
+            remaining_rows: cursor
+                .identity
+                .family_row_count
+                .saturating_sub(cursor.emitted_rows),
+        };
+    if let Some(next) = outstanding_operational {
+        return Ok(BackupCompleteness::Partial {
+            reason: BackupPartialReason::OperationalContinuationOutstanding {
+                high_water_order: next.identity.high_water_order,
+                emitted_rows: next.emitted_rows,
+                remaining_rows: next
+                    .identity
+                    .operational_row_count
+                    .saturating_sub(next.emitted_rows),
+            },
+        });
+    }
+    if let Some(next) = outstanding_recovery {
+        return Ok(BackupCompleteness::Partial {
+            reason: family_outstanding(next, RowFamilyKind::ProcessStreamRecovery),
+        });
+    }
+    if let Some(next) = outstanding_artifact {
+        return Ok(BackupCompleteness::Partial {
+            reason: family_outstanding(next, RowFamilyKind::VersionedArtifacts),
+        });
+    }
+    if continuing.process_stream_recovery_cursor.is_none() {
+        return Ok(BackupCompleteness::Partial {
+            reason: BackupPartialReason::NoFamilyDenominator {
+                family: RowFamilyKind::ProcessStreamRecovery,
+            },
+        });
+    }
+    if continuing.versioned_artifact_cursor.is_none() {
+        return Ok(BackupCompleteness::Partial {
+            reason: BackupPartialReason::NoFamilyDenominator {
+                family: RowFamilyKind::VersionedArtifacts,
+            },
+        });
+    }
+    if operational_history.operational_row_count == 0 {
+        return Ok(BackupCompleteness::Partial {
+            reason: BackupPartialReason::EmptyDenominator,
+        });
+    }
+    if entry_count > 0 && last_page_was_final {
+        return Ok(BackupCompleteness::Complete);
+    }
+    Err(OrsError::ProjectionLimitExceeded)
 }
 
 /// Exports a snapshot by paging with one request until a page is final or the
@@ -2170,25 +3278,25 @@ fn export_pages_in(
 /// the window is a triage-eligibility horizon, not a claim about any of the five
 /// durable time fields, and it certifies nothing about the rows' times.
 ///
-/// The operational request (fence token, `after_order`, page size) is reused
-/// for every page, but its count-stride windows are not an exact continuation
-/// in the sparse operation-order domain. Only the typed family cursors advance,
-/// each by exactly the owner-issued cursor its own previous page ended with.
+/// Since issue #2967 the operational window is not arithmetic at all. `after_order`
+/// names the walk's declared START, every later page is read under the owner-issued
+/// [`OrsOperationalCursor`] its own previous page ended with, and every emitted row
+/// satisfies `previous_cursor < operation_order <= frozen_high_water`. The typed
+/// family cursors advance the same way, each by exactly the owner-issued cursor its
+/// own previous page ended with, on its own axis.
 ///
-/// When the page budget ends on a non-final page, the exact family cursor is
-/// retained as a `Partial` disposition when one exists. If no family cursor
-/// remains, export returns [`OrsError::ProjectionLimitExceeded`] rather than
-/// letting budget exhaustion fall through to `Complete` or an unresumable
-/// partial snapshot. This bounded refusal does not make the legacy operational
-/// count-stride windows an exact multi-page continuation; sparse-order coverage
-/// still requires an operational cursor. A request that declared no family
-/// cursor for some cursor-paged family yields `Partial` with the legacy reason
-/// when its final page is otherwise exhausted, because a snapshot with no
-/// denominator for that family is partial evidence and not an empty complete
-/// family. A decode failure reports [`OrsError::IntegrityProblem`], never
-/// fabricated completeness. The denominator digest binds every exported entry's
-/// payload digest together with the frozen identity of every cursor-paged family
-/// this request declared.
+/// When the page budget ends on a non-final page, the exact outstanding cursor of
+/// whichever axis still owes rows is retained as a typed `Partial` disposition
+/// carrying that cursor, so the caller resumes rather than restarts. Every axis now
+/// has such a cursor, which is why this function no longer has to fall back on a
+/// bounded refusal for a non-resumable operational stop. A request that declared no
+/// family cursor for a cursor-paged family yields `Partial` with the typed
+/// no-denominator reason, because a snapshot with no denominator for that family is
+/// partial evidence and not an empty complete family. A decode failure reports
+/// [`OrsError::IntegrityProblem`], never fabricated completeness. The denominator
+/// digest binds every exported entry's payload digest together with the frozen
+/// operational identity and the frozen identity of every cursor-paged family this
+/// request declared.
 pub(super) fn export_snapshot(
     database: &Database,
     request: &OrsBackupRequest,
@@ -2210,9 +3318,12 @@ pub(super) fn export_snapshot(
     // contract refuses the whole export rather than producing a snapshot whose
     // denominator silently omits a table (issue #953, A5).
     check_row_family_census(&read)?;
-    // Every declared family cursor is proved frozen BEFORE the page loop, so a
-    // family that already moved refuses the whole export rather than only the
-    // page that would have read it.
+    // Every declared cursor is proved frozen BEFORE the page loop, so an axis that
+    // already moved refuses the whole export rather than only the page that would
+    // have read it.
+    if let Some(cursor) = &request.operational_cursor {
+        check_operational_identity_frozen(&read, &cursor.identity)?;
+    }
     if let Some(cursor) = request.family_cursor(RowFamilyKind::ProcessStreamRecovery) {
         check_family_revision_frozen(&read, cursor)?;
     }
@@ -2238,16 +3349,11 @@ pub(super) fn export_snapshot(
         pages,
         entry_count,
         last_page_was_final,
+        outstanding_operational,
         outstanding_recovery,
         outstanding_artifact,
         continuing,
     } = paged;
-    if !last_page_was_final && outstanding_recovery.is_none() && outstanding_artifact.is_none() {
-        // Operational pagination has no exact continuation yet. Refuse this
-        // bounded export instead of allowing page-budget exhaustion to be
-        // mistaken for an exhausted operational denominator.
-        return Err(OrsError::ProjectionLimitExceeded);
-    }
     // Byte budget is re-summed from the pages so the snapshot total is a
     // function of observed rows, never of a declared count alone. Entries
     // carry digests only (no raw bytes cross the boundary), so the total
@@ -2261,32 +3367,24 @@ pub(super) fn export_snapshot(
                 .ok_or(OrsError::ProjectionLimitExceeded)?;
         }
     }
-    let completeness = if outstanding_recovery.is_some() || outstanding_artifact.is_some() {
-        // The page budget ran out with family rows still owed. The exact cursor
-        // travels on the snapshot so the caller resumes rather than restarts,
-        // and the snapshot stays explicitly partial instead of all-or-nothing.
-        BackupCompleteness::Partial {
-            reason: format!(
-                "cursor-paged row families are not fully exported; resume with next_process_stream_recovery_cursor / next_versioned_artifact_cursor (recovery outstanding: {}, versioned artifact outstanding: {}, page budget spent: {})",
-                outstanding_recovery.is_some(),
-                outstanding_artifact.is_some(),
-                !last_page_was_final
-            ),
-        }
-    } else if continuing.process_stream_recovery_cursor.is_none()
-        || continuing.versioned_artifact_cursor.is_none()
-    {
-        BackupCompleteness::Partial {
-            reason: "no process-stream recovery or versioned-artifact family denominator was declared; legacy evidence, not an empty complete family"
-                .to_owned(),
-        }
-    } else if entry_count > 0 {
-        BackupCompleteness::Complete
-    } else {
-        BackupCompleteness::Partial {
-            reason: "snapshot denominator is empty; no rows above after_order".to_owned(),
-        }
-    };
+    // THE frozen operational identity, read off the LAST page's in-force cursor:
+    // the last page is the authority on which window the walk was read under, for
+    // the same reason it is the authority on which families are finished.
+    let operational_history = pages
+        .last()
+        .map(|page| page.operational_continuation.cursor.identity.clone())
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    // `Complete` is derived from EXHAUSTION on every axis, never from row presence
+    // (issue #2967, W8).
+    let completeness = snapshot_completeness(
+        &operational_history,
+        outstanding_operational.as_ref(),
+        outstanding_recovery.as_ref(),
+        outstanding_artifact.as_ref(),
+        &continuing,
+        entry_count,
+        last_page_was_final,
+    )?;
     let mut snapshot = OrsBackupSnapshot {
         source: request.source.clone(),
         fence: request.fence.clone(),
@@ -2295,6 +3393,8 @@ pub(super) fn export_snapshot(
         entry_count,
         total_bytes,
         completeness,
+        operational_history,
+        next_operational_cursor: outstanding_operational,
         process_stream_recovery_family: continuing
             .process_stream_recovery_cursor
             .as_ref()
@@ -2373,21 +3473,23 @@ pub(super) fn import_page_quarantined(
     // reports the same `InvalidCursorLimit` the snapshot validator already
     // reported for an oversized page.
     page.validate_binding()?;
-    // Same rule as the snapshot validator: a final page must leave NO paged family
-    // open, and `validate_binding` cannot know that from one page alone. Both
-    // continuations are checked because `is_last` is their conjunction (#1971).
-    let family_open = page
-        .family_continuation
-        .as_ref()
-        .is_some_and(OrsFamilyContinuation::family_open)
+    // Same rule as the snapshot validator: a final page must leave NO continuation
+    // open on any axis, and `validate_binding` cannot know that from one page alone.
+    // All three are checked because `is_last` is their conjunction (#1971, extended
+    // by #2967).
+    let open = page.operational_continuation.operational_open()
+        || page
+            .family_continuation
+            .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open)
         || page
             .versioned_artifact_continuation
             .as_ref()
             .is_some_and(OrsFamilyContinuation::family_open);
-    if page.is_last && family_open {
+    if page.is_last && open {
         return Err(OrsError::InvalidField {
             field: "backup_page_is_last",
-            reason: "a final page must not leave an open family continuation",
+            reason: "a final page must not leave an open operational or family continuation",
         });
     }
     if page.expires_at_ms <= super::current_unix_ms()? {
@@ -2486,14 +3588,139 @@ fn triage_entry(
     }))
 }
 
+/// Observes the CURRENT owner of ORS recovery effects for one import's member
+/// set, inside the caller's read transaction (issue #953, A17).
+///
+/// The current owner is the ORS store itself, read through its own live durable
+/// rows: `RECOVERY_INBOX` (`DurableInboxRecord`, keyed by `item_id`) and
+/// `RECOVERY_PROBLEMS` (`RecoveryProblem`, keyed by
+/// `operation_or_checkpoint_id`). A member is STILL UNRESOLVED when the current
+/// owner holds a live inbox row for it — present, with no terminal receipt yet
+/// written, which is the durable shape `import_recovery_inbox` writes on
+/// arrival and the only shape `record_recovery_inbox_disposition` closes — or
+/// when it holds a recovery problem for it that
+/// [`RecoveryProblem::is_resolved`] reports unresolved. The problem test is the
+/// crate's own: unresolved problems never expire automatically, so absence of a
+/// terminal receipt is a live obligation rather than a cleanup horizon.
+///
+/// Takes `&ReadTransaction` and never calls `load_recovery_problem` or
+/// `list_recovery_problems`, because each of those opens its OWN `begin_read()`
+/// and would therefore observe a different moment than the transaction this
+/// validation is about. Both tables are read here, in the one transaction, so
+/// the recorded answer describes a single instant.
+///
+/// Both scans are bounded by the existing [`IMPORT_SCAN_ROW_CAP`] and return the
+/// existing [`OrsError::ProjectionLimitExceeded`] when it is exceeded, exactly as
+/// [`triage_entry`] does. No new cap, timeout or field is introduced.
+fn observe_current_owner_validation(
+    read: &ReadTransaction,
+    snapshot_digest: &str,
+    per_entry: &[(String, PerEntryOutcome)],
+    validated_at_ms: i64,
+) -> Result<CurrentOwnerValidation, OrsError> {
+    // The roster the current owner is being asked about, indexed once so the two
+    // bounded scans below are a membership test per row rather than a linear
+    // search per row against the whole member list. Sorted and de-duplicated
+    // because the record states the COMPLETE set that was asked about, and a
+    // repeated ask of one member is not a second member.
+    let mut validated_record_ids: Vec<String> = per_entry
+        .iter()
+        .map(|(record_id, _)| record_id.clone())
+        .collect();
+    validated_record_ids.sort();
+    validated_record_ids.dedup();
+    let asked: BTreeSet<&str> = validated_record_ids.iter().map(String::as_str).collect();
+    let mut unresolved_effect_identities: Vec<String> = Vec::new();
+
+    let mut scanned: u64 = 0;
+    let inbox = read.open_table(super::RECOVERY_INBOX).map_err(storage)?;
+    for row in inbox.iter().map_err(storage)? {
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if scanned > IMPORT_SCAN_ROW_CAP {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let (_, value) = row.map_err(storage)?;
+        let record: DurableInboxRecord = decode_named(value.value(), "recovery_inbox")?;
+        // A terminal receipt is what closes an inbox row; without one the
+        // current owner still holds the staged effect, whatever disposition
+        // marker the row carries.
+        if record.terminal_receipt_id.is_some() {
+            continue;
+        }
+        if asked.contains(record.item.item_id.as_str())
+            && !unresolved_effect_identities
+                .iter()
+                .any(|identity| identity == record.item.item_id.as_str())
+        {
+            unresolved_effect_identities.push(record.item.item_id.as_str().to_owned());
+        }
+    }
+    drop(inbox);
+
+    let mut scanned: u64 = 0;
+    let problems = read.open_table(super::RECOVERY_PROBLEMS).map_err(storage)?;
+    for row in problems.iter().map_err(storage)? {
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if scanned > IMPORT_SCAN_ROW_CAP {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let (_, value) = row.map_err(storage)?;
+        let problem: RecoveryProblem = decode_named(value.value(), "recovery_problems")?;
+        if problem.is_resolved() {
+            continue;
+        }
+        let identity = problem.operation_or_checkpoint_id.as_str();
+        if asked.contains(identity)
+            && !unresolved_effect_identities
+                .iter()
+                .any(|held| held == identity)
+        {
+            unresolved_effect_identities.push(identity.to_owned());
+        }
+    }
+    drop(problems);
+    unresolved_effect_identities.sort();
+
+    let validation = CurrentOwnerValidation {
+        snapshot_digest: snapshot_digest.to_owned(),
+        validated_record_ids,
+        unresolved_effect_identities,
+        // Both families, unconditionally: both were read above, and a validation
+        // that omitted one would be refused by the gate anyway, so recording
+        // what was actually read is both true and necessary.
+        consulted_families: vec![
+            RowFamilyKind::RecoveryInbox,
+            RowFamilyKind::RecoveryProblems,
+        ],
+        validated_at_ms,
+    };
+    // Rejected here rather than carried: a record that does not pass its own
+    // shape check can never satisfy the gate, so failing the builder is honest
+    // and failing the gate later would only hide it.
+    validation.validate()?;
+    Ok(validation)
+}
+
 /// Reconciles per-entry quarantine outcomes into one import receipt.
 ///
 /// Binds `import.snapshot_digest` with the source/destination installations
 /// and the full per-entry outcome vector via
 /// [`OrsBackupImportReceipt::new`], which validates every shape. Emits no
 /// store writes: receipt building is a pure function over already-triaged
-/// outcomes.
+/// outcomes, and the one store read it performs is the read that observes the
+/// current owner for [`CurrentOwnerValidation`].
+///
+/// It opens that read ITSELF (rather than taking a `&ReadTransaction`) and hands
+/// it to [`observe_current_owner_validation`], so the current owner's answer and
+/// the receipt it lands on describe one instant. `import_page_quarantined` opens
+/// its own read the same way, for the same reason: a validation assembled from
+/// reads taken at different moments would not be an answer to any question.
 pub(super) fn reconcile_import_receipt(
+    database: &Database,
     import: &OrsBackupImportRequest,
     per_entry: &[(String, PerEntryOutcome)],
     import_at_ms: i64,
@@ -2504,6 +3731,12 @@ pub(super) fn reconcile_import_receipt(
         .count();
     let unresolved_count =
         u64::try_from(unresolved_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let read = database.begin_read().map_err(storage)?;
+    let current_owner_validation =
+        observe_current_owner_validation(&read, &import.snapshot_digest, per_entry, import_at_ms)?;
+    drop(read);
+    // `new` is the receipt builder and it runs the known-zero gate against this
+    // freshly observed validation, recording the typed verdict on the receipt.
     OrsBackupImportReceipt::new(
         import.snapshot_digest.clone(),
         import.source.installation_id.clone(),
@@ -2511,16 +3744,34 @@ pub(super) fn reconcile_import_receipt(
         per_entry.to_vec(),
         unresolved_count,
         import_at_ms,
+        current_owner_validation,
     )
 }
 
 /// Replays a lost import response without any duplicate effect.
 ///
-/// Returns an idempotent clone of the prior receipt: pure value copy, no
-/// store read, no store write, no re-triage, so a retried response can never
-/// double-apply quarantine outcomes.
+/// An idempotent clone of the prior receipt: no store write, no re-triage, so a
+/// retried response can never double-apply quarantine outcomes.
+///
+/// It does NOT carry the prior verdict forward. The gate is RE-EVALUATED from
+/// the validation RECORDED ON THE RECEIPT, so a verdict that is stale, or that
+/// disagrees with the validation it was recorded beside, is corrected on replay
+/// instead of being trusted. That re-evaluation is the whole point: the verdict
+/// is a report of the gate, never the gate's input, so a caller cannot replay a
+/// receipt into a satisfied gate by writing a satisfied verdict into it. No
+/// store read happens here either — the recorded validation is the record, and
+/// re-reading live state would make a replay's answer depend on when it was
+/// replayed rather than on what it attests.
 pub(super) fn reconcile_lost_import_response(
     prior: &OrsBackupImportReceipt,
 ) -> OrsBackupImportReceipt {
-    prior.clone()
+    let mut replayed = prior.clone();
+    replayed.known_zero_verdict =
+        match replayed.known_zero_unresolved(&replayed.current_owner_validation) {
+            Ok(()) => KnownZeroVerdict::Satisfied,
+            Err(error) => KnownZeroVerdict::Refused {
+                reason: error.to_string(),
+            },
+        };
+    replayed
 }

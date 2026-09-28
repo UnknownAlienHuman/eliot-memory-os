@@ -41,13 +41,16 @@
 //!   cannot start is therefore reportable by something other than a rotatable
 //!   log.
 //!
-//!   Stated rather than implied: the daemon's persistent notification record
-//!   (`crate::notification_state_emit::automation_failure_key`) is a different
-//!   owner's record and it currently builds its `required_action` from the
-//!   Governor's closed [`DecisionReason`] alone, so it does not yet carry
-//!   [`MaintenanceFamilyDecision`]. This module supplies the value; wiring that
-//!   owner to it is a separate change in a file this issue does not own, and it
-//!   is not claimed here.
+//!   Stated rather than implied: the durable carrier of that value is a
+//!   different owner's record. `crate::notification_state_emit` resolves this
+//!   entry for every decision it emits and puts
+//!   [`MaintenanceFamilyEntry::recommendation`] into that record's
+//!   `required_action` (through `notification_state_emit`'s private
+//!   `automation_failure_key_with_family_decision`),
+//!   so a family that cannot start leaves a canonical notification keyed by
+//!   this entry's [`MaintenanceDedupScope`] rather than only a log line. What
+//!   that owner still cannot do is preserve a decision it failed to write; that
+//!   is a durable-intake owner this issue does not have.
 //! * **No direct execution.** This module never runs maintenance work, never
 //!   constructs an executor, and never calls a family owner. I14.22 requires
 //!   every start to be a Durable Job request, and the catalog resolves only
@@ -85,6 +88,17 @@ pub const SYSTEM_OBSERVATION_PATH: &str = "eliot_system";
 /// names for the `mode` field, and this catalog is the single place that
 /// states it.
 pub const UNRESOLVED_POLICY_MODE: MaintenanceAutomationMode = MaintenanceAutomationMode::Off;
+
+/// What a row states when an execution owner arm answered with nothing.
+///
+/// `MaintenanceExecutionOwner` pairs [`MaintenanceExecutionOwner::Owned`]
+/// with a `symbol` and [`MaintenanceExecutionOwner::Unavailable`] with a
+/// `dependency`, so exactly one of `owner_symbol()` and
+/// `unavailable_dependency()` answers for any given entry and this text is
+/// unreachable. It is stated rather than left to a panic, because a row that
+/// cannot name an owner must not be able to abort the emission that reports
+/// the other fourteen.
+const UNRECORDED_EXECUTION_OWNER: &str = "unrecorded";
 
 /// The expiry position every preserved maintenance recommendation carries.
 ///
@@ -713,6 +727,57 @@ impl MaintenanceFamilyEntry {
             .collect()
     }
 
+    /// The one execution-or-absence statement this entry carries.
+    ///
+    /// I03.04 is load-bearing here: "Registry stores evidence-linked facts, not
+    /// vendor labels and booleans." The statement is therefore the named
+    /// `path::symbol` or the exact absent capability itself, never a label and
+    /// never a bare `owned: true` a reader would have to resolve elsewhere.
+    /// [`MaintenanceExecutionOwner::is_owned`] is the fact that decides which
+    /// of the two accessors is the evidence, and the accessors are what supply
+    /// the text, so owned and unavailable families cannot disagree here.
+    #[must_use]
+    pub fn execution_or_dependency(&self) -> String {
+        if self.owner.is_owned() {
+            format!(
+                "owner={owner}",
+                owner = self
+                    .owner
+                    .owner_symbol()
+                    .unwrap_or(UNRECORDED_EXECUTION_OWNER)
+            )
+        } else {
+            format!(
+                "unavailable_dependency={dependency}",
+                dependency = self
+                    .owner
+                    .unavailable_dependency()
+                    .unwrap_or(UNRECORDED_EXECUTION_OWNER)
+            )
+        }
+    }
+
+    /// One row of the inspectable catalog table.
+    ///
+    /// Exactly the five facts A1 names for each family: which registered family
+    /// this is, which `MaintenanceAutomationMode` is selected for it, the
+    /// execution owner or the exact capability that is absent, whether the
+    /// resolved route admits a start today, and the deduplication scope that
+    /// coalesces repeated triggers of it. Nothing else is rendered, so a row
+    /// cannot drift from the entry it is rendered from.
+    #[must_use]
+    pub fn catalog_row(&self) -> String {
+        let route = self.start_route();
+        format!(
+            "{family} mode={mode} {execution} admits_start={admits_start} dedup_scope={dedup}",
+            family = self.family,
+            mode = selected_mode_name(self.mode),
+            execution = self.execution_or_dependency(),
+            admits_start = route.admits_start(),
+            dedup = self.dedup.scope_name(),
+        )
+    }
+
     /// The cost class an admitted job for this family carries, read from the
     /// family's own required conditions.
     #[must_use]
@@ -860,6 +925,23 @@ impl MaintenanceFamilyEntry {
             recommendation = %recorded.recommendation.text(),
         );
     }
+}
+
+/// Renders one closed maintenance discriminator in the wire form its own owner
+/// declares.
+///
+/// `eliot_maintenance::MaintenanceAutomationMode` declares
+/// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and implements no `Display`,
+/// so this reads the owner's own declared spelling through the same
+/// serialization contract the canonical notification emitter already uses
+/// ([`crate::notification_state_emit`]) rather than restating a second spelling
+/// here. The catalog therefore still defines no mode, decision, reason or family
+/// vocabulary of its own, which is the property its module header claims.
+fn selected_mode_name(mode: MaintenanceAutomationMode) -> String {
+    serde_json::to_value(mode)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "no declared wire name".to_owned())
 }
 
 /// Joins the shared Durable Job admission blockers into one inspectable line.
@@ -1246,4 +1328,48 @@ maintenance_family_catalog! {
 #[must_use]
 pub const fn entries() -> &'static [MaintenanceFamilyEntry] {
     &ALL
+}
+
+/// Emits the whole registered catalog once, on the daemon's own diagnostics
+/// target. This is the one production reader of [`entries`], and therefore of
+/// [`ALL`] and [`REGISTERED_FAMILY_COUNT`].
+///
+/// I14.22:34 says Human policy "selects one `MaintenanceAutomationMode` per
+/// family", and A1 asks for a catalog that "enumerates all fifteen named
+/// families and, for each, exposes selected automation mode and
+/// execution/defer owner". That is a table an operator must be able to read, so
+/// the table is published: one event carrying all [`REGISTERED_FAMILY_COUNT`]
+/// rows, each rendered by [`MaintenanceFamilyEntry::catalog_row`] from the same
+/// entry every other reader sees.
+///
+/// Three properties are load-bearing and are asserted here rather than assumed:
+///
+/// * **Bounded.** The event count is one and the row count is
+///   [`REGISTERED_FAMILY_COUNT`]. This is called once from the composition
+///   startup path, never from
+///   [`crate::maintenance_trigger_evaluator::DaemonComposition::evaluate_maintenance_trigger`],
+///   so it cannot become per-trigger spam.
+/// * **Non-blocking and never a gate.** It opens no store client, performs no
+///   I/O, reads no clock, consults no composition state, and returns nothing,
+///   so it cannot delay or withhold startup or readiness.
+/// * **Not the durable record.** A13.10 lines 5-9 separate operational logs,
+///   which "may rotate", from the durable audit of authority, transitions,
+///   receipts and incidents. This line is an operational log. The durable
+///   record for a family that cannot start is the canonical notification the
+///   blocked family submits through
+///   [`crate::notification_state_emit::emit_blocked_automation_notification`],
+///   which is keyed by the deduplication scope this same table prints.
+pub fn record_registered_catalog() {
+    let table = entries()
+        .iter()
+        .map(MaintenanceFamilyEntry::catalog_row)
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.maintenance_family_catalog",
+        service = SERVICE_NAME,
+        registered_families = REGISTERED_FAMILY_COUNT,
+        families = %table,
+    );
 }

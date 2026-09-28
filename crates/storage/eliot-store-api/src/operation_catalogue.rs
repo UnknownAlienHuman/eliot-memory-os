@@ -281,7 +281,7 @@ struct ActivatedReadDescriptor {
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
 /// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 21] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -387,11 +387,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 21] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetCapabilityEvidenceRecordRange,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 21] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -414,6 +419,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 21] {
         ACTIVATED_READS[18].operation,
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
+        ACTIVATED_READS[21].operation,
     ]
 }
 
@@ -454,11 +460,17 @@ struct ActivatedMutationDescriptor {
 /// through the `CaptureCandidate` family (issue #1868, I12.24: Store-owned
 /// durable learning rows keyed `(record_kind, handle, record_digest)` with the
 /// closed learning typed contract; the only Kernel-owned learning surface, so
-/// learning crates can never become autonomous persistence systems). All
-/// seventeen address no store scope, mirroring the scope-free read
+/// learning crates can never become autonomous persistence systems);
+/// `RecordCapabilityEvidenceRecord` persists `Candidate` through the same
+/// family (issue #1773, I3.4: Store-owned durable capability-evidence rows
+/// keyed `(skill_id, scope_key)` with the closed capability-evidence typed
+/// contract; the store issues the fenced row revision the Governor orders
+/// same-key evidence by, and the write itself grants no admission, support,
+/// influence, or lifecycle change). All
+/// eighteen address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 17] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -557,6 +569,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 17] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordLearningRecord,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordCapabilityEvidenceRecord,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -786,8 +804,8 @@ pub fn validate_read_against_catalogue(
 /// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`,
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
-/// `CommitExperienceBank`, `CommitAgentFeedback`, and
-/// `RecordLearningRecord` have activated
+/// `CommitExperienceBank`, `CommitAgentFeedback`,
+/// `RecordLearningRecord`, and `RecordCapabilityEvidenceRecord` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// consumer triple, and semantic owner-authority gate. `ApplySwarmOwnerRevisions`
@@ -894,6 +912,11 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::RecordLearningRecord => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::decode_learning_mutation(command.operation, &command.parameters)
+                    .map(|_| ())?;
+            }
+            NamedMutationOperation::RecordCapabilityEvidenceRecord => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
                     .map(|_| ())?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {

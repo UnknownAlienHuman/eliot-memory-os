@@ -307,6 +307,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
         provider_identity: forged_identity,
         g11_admission_receipt_ref: "forged-g11-admission".to_owned(),
         durable_job_ref: "forged-job".to_owned(),
+        expires_at_unix_ms: u64::MAX,
         admitted_lanes: vec![AdmittedLaneReceipt {
             work_unit_id: candidate.lanes[0].work_unit_id.clone(),
             role_id: candidate.lanes[0].role_id.clone(),
@@ -532,6 +533,7 @@ fn integration_admission_receipt(
         provider_identity: integration_provider_identity()?,
         g11_admission_receipt_ref: "proof-admission-integration-1".to_owned(),
         durable_job_ref: "durable-job-integration-1".to_owned(),
+        expires_at_unix_ms: u64::MAX,
         admitted_lanes: vec![AdmittedLaneReceipt {
             work_unit_id: lane.work_unit_id.clone(),
             role_id: lane.role_id.clone(),

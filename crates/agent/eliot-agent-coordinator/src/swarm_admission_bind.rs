@@ -10,8 +10,37 @@
 //! selection digests, catalogue/policy pins, attempt/lease/fence identities,
 //! and admitted routes stay owned by their exact owners; this module only
 //! admits exact values present in the supplied envelope and records the
-//! resulting binding. The current external receipt contracts expose no
-//! expiry field, so this module cannot establish their time currency.
+//! resulting binding.
+//!
+//! Time currency is an owner-issued bound, enforced here. The external
+//! [`ProviderAdmissionReceipt`] carries `expires_at_unix_ms` — the admission's
+//! own expiry, issued by the admission owner (I6.10:79-91, "issued/expires/
+//! heartbeat" on the admission that authorizes work; I14.6:45-61,
+//! `expires_at_and_release_reason` on the matching canonical admission). This
+//! compiler compares that recorded value against the request's observation
+//! instant in exactly the shape the sibling adapters already use for every
+//! other owner-issued bound
+//! ([`crates/agent/eliot-agent-opencode/src/catalogue.rs`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/crates/agent/eliot-agent-opencode/src/catalogue.rs) `window`),
+//! so an expired receipt fails closed with
+//! [`SwarmAdmissionBindError::ExpiredAdmission`] and a stale epoch, a rotated
+//! generation, and an aged receipt stay three distinct refusals. A zero
+//! expiry is refused as an unissued bound, never read as "never expires".
+//!
+//! One residual is not expressible as a value and is stated once here instead:
+//! **no production issuer of `expires_at_unix_ms` exists in this tree yet.**
+//! Every construction site of the receipt is a test fixture, so a bound that
+//! passes today has been validated as a supplied value, not yet as a value
+//! some live owner issued against a real admission. See
+//! [`ADMISSION_EXPIRY_PRODUCER_STATUS`]. This is deliberately not a field on
+//! [`SwarmAdmissionPlanCandidate`]: a durable, replayable plan carrying a
+//! "no producer yet" flag would become false the moment a real issuer lands and
+//! would retroactively invalidate every stored plan.
+//!
+//! No production caller publishes a [`SwarmAdmissionPlanCandidate`] yet: a
+//! repo-wide grep finds the type only in this module and in the serde-boundary
+//! data file, with no `From`/`Into` to any launch or Task-completion type. The
+//! only constructor is [`compile_swarm_admission_plan`] plus validating
+//! deserialization.
 //!
 //! Fail-closed binding, in deterministic precedence:
 //!
@@ -50,8 +79,14 @@
 //!     external route receipt. Lease and attempt identity must match the
 //!     route receipt and supplied envelope exactly, and the lane's recorded
 //!     routing digest must equal the receipt's admitted candidate digest, so
-//!     a receipt crossed into a foreign lane fails. Expiry cannot be checked
-//!     without a time-bound field from the external receipt owner.
+//!     a receipt crossed into a foreign lane fails;
+//! 11. owner-issued expiry: the recorded observation instant must fall inside
+//!     the external receipt's own `expires_at_unix_ms`. A zero observation
+//!     instant, a zero (unissued) expiry, or an expiry already passed fails
+//!     closed; on `validate()` the check re-runs against the plan's own stored
+//!     `observed_at_unix_ms` and the stored receipt's stored expiry, so a
+//!     tampered expiry or a restated observation is rejected rather than
+//!     silently treated as current.
 //!
 //! The output is structurally candidate-only: `candidate_only` is true,
 //! `dispatch_authority` is false, execution counters are zero, and the value
@@ -113,8 +148,63 @@ pub enum SwarmAdmissionBindError {
     StaleEpoch,
     #[error("swarm admission binding pins a stale admission generation")]
     StaleGeneration,
+    #[error("swarm admission binding pins an expired external admission receipt")]
+    ExpiredAdmission,
     #[error("swarm admission binding identity conflict: same id with changed bytes")]
     IdentityConflict,
+}
+
+/// Field label for the owner-issued admission expiry window.
+pub const ADMISSION_EXPIRY_WINDOW_FIELD: &str = "admission.expires_at_unix_ms";
+
+/// The one fact about the expiry bound that a type cannot express: no
+/// PRODUCTION issuer of [`ProviderAdmissionReceipt`] populates
+/// `expires_at_unix_ms` yet. Every construction site of that receipt in this
+/// tree is a test fixture
+/// (`crates/agent/eliot-agent-coordinator/tests/coordinator.rs`,
+/// `crates/agent/eliot-agent-coordinator/src/tests.rs`,
+/// `crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs`),
+/// so a bound that passes this module's window check today has been validated
+/// as a supplied value, not yet as a value some owner actually issued against a
+/// live admission.
+///
+/// This is deliberately a documentation constant and not a field on
+/// [`SwarmAdmissionPlanCandidate`]. A plan is a durable, replayable record: a
+/// per-plan "no production issuer yet" flag would become false the moment a
+/// real issuer lands and would retroactively invalidate every stored plan,
+/// which is a worse failure than saying it once, here.
+pub const ADMISSION_EXPIRY_PRODUCER_STATUS: &str =
+    "no production issuer of ProviderAdmissionReceipt::expires_at_unix_ms in this tree yet";
+
+/// Enforces the owner-issued admission expiry window, in the shape the sibling
+/// adapters already use for every owner-issued bound
+/// (`crates/agent/eliot-agent-opencode/src/catalogue.rs::window`,
+/// `crates/agent/eliot-agent-codex/src/catalogue.rs::window`).
+///
+/// Both values are the ORIGINAL recorded ones: `expires_at_unix_ms` is read
+/// from the supplied external receipt and `observed_at_unix_ms` is the
+/// instant the binding was recorded at. Nothing is recomputed and the receipt
+/// is never re-derived.
+///
+/// A zero observation instant and a zero expiry both fail closed with
+/// [`SwarmAdmissionBindError::InvalidField`]: an unissued bound is not a
+/// current bound, and zero is never read as "never expires". An expiry that
+/// has already passed fails closed with
+/// [`SwarmAdmissionBindError::ExpiredAdmission`], so a stale epoch, a rotated
+/// generation, and an aged receipt are three distinct refusals rather than one.
+fn check_admission_window(
+    observed_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> Result<(), SwarmAdmissionBindError> {
+    if observed_at_unix_ms == 0 || expires_at_unix_ms == 0 {
+        return Err(SwarmAdmissionBindError::InvalidField(
+            ADMISSION_EXPIRY_WINDOW_FIELD,
+        ));
+    }
+    if expires_at_unix_ms < observed_at_unix_ms {
+        return Err(SwarmAdmissionBindError::ExpiredAdmission);
+    }
+    Ok(())
 }
 
 /// One immutable admission-binding input per staffed role slot.
@@ -143,9 +233,10 @@ pub struct SwarmSlotAdmission {
 
 /// Exact binding input: the complete staffing candidate, the current external
 /// admission envelope, one [`SwarmSlotAdmission`] per staffed slot, and the
-/// non-zero observation instant the binding is recorded against. Current
-/// external admission contracts have no expiry field, so the instant cannot
-/// establish receipt freshness.
+/// non-zero observation instant the binding is recorded against. That instant
+/// is compared against the owner-issued `expires_at_unix_ms` carried on the
+/// supplied receipt, so it establishes the receipt's time currency rather than
+/// asserting a local deadline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmAdmissionBindRequest {
@@ -153,8 +244,9 @@ pub struct SwarmAdmissionBindRequest {
     pub staffing: SwarmStaffingCandidate,
     pub admission: ProviderAdmissionReceipt,
     pub bindings: Vec<SwarmSlotAdmission>,
-    /// Must be non-zero. The supplied external receipt has no expiry field,
-    /// so this timestamp cannot establish its time currency.
+    /// Must be non-zero. The instant the binding is observed at; it is compared
+    /// against the receipt's own owner-issued `expires_at_unix_ms`, and a
+    /// zero value is refused rather than read as "before any expiry".
     pub now_unix_ms: u64,
 }
 
@@ -269,8 +361,15 @@ pub struct SwarmAdmissionPlanCandidate {
     /// validation is self-contained.
     pub staffing: SwarmStaffingCandidate,
     /// The current external admission envelope this plan was compiled
-    /// against, stored verbatim so validation is self-contained.
+    /// against, stored verbatim so validation is self-contained. Its
+    /// owner-issued `expires_at_unix_ms` is the recorded time bound.
     pub admission: ProviderAdmissionReceipt,
+    /// The instant this plan was compiled and observed at. Stored so
+    /// [`SwarmAdmissionPlanCandidate::validate`] can re-check the recorded
+    /// expiry against a recorded observation instead of a caller-supplied
+    /// clock, and sealed into `plan_digest` so a replay cannot restate the
+    /// same binding at a different observation.
+    pub observed_at_unix_ms: u64,
     pub execution: ZeroModelExecutionCounters,
     pub candidate_only: bool,
     pub dispatch_authority: bool,
@@ -293,6 +392,7 @@ struct SwarmAdmissionPlanCandidateFields {
     slots: Vec<SwarmBoundSlot>,
     staffing: SwarmStaffingCandidate,
     admission: ProviderAdmissionReceipt,
+    observed_at_unix_ms: u64,
     execution: ZeroModelExecutionCounters,
     candidate_only: bool,
     dispatch_authority: bool,
@@ -319,6 +419,7 @@ impl<'de> Deserialize<'de> for SwarmAdmissionPlanCandidate {
             slots: fields.slots,
             staffing: fields.staffing,
             admission: fields.admission,
+            observed_at_unix_ms: fields.observed_at_unix_ms,
             execution: fields.execution,
             candidate_only: fields.candidate_only,
             dispatch_authority: fields.dispatch_authority,
@@ -341,6 +442,7 @@ impl SwarmAdmissionPlanCandidate {
             self.plan_id.as_str(),
             self.staffing_digest.as_str(),
             envelope_digest.as_str(),
+            self.observed_at_unix_ms,
             self.admission_id.as_str(),
             self.task_id.as_str(),
             self.task_revision.as_str(),
@@ -352,11 +454,11 @@ impl SwarmAdmissionPlanCandidate {
     }
 
     /// Validates identity, staffing completeness, envelope structure,
-    /// slot/route/fence/epoch/lane binding, digest closure, and the
-    /// candidate-only ceiling. Called on deserialization and after
-    /// compilation. Full compilation against fresh caller inputs requires
-    /// [`compile_swarm_admission_plan`]; this check covers internal
-    /// consistency of the stored value only.
+    /// slot/route/fence/epoch/lane binding, the owner-issued admission expiry
+    /// window, digest closure, and the candidate-only ceiling. Called on
+    /// deserialization and after compilation. Full compilation against fresh
+    /// caller inputs requires [`compile_swarm_admission_plan`]; this check
+    /// covers internal consistency of the stored value only.
     pub fn validate(&self) -> Result<(), SwarmAdmissionBindError> {
         if self.schema_version != SWARM_ADMISSION_PLAN_VERSION {
             return Err(SwarmAdmissionBindError::ModelControl(
@@ -372,6 +474,7 @@ impl SwarmAdmissionPlanCandidate {
         }
         validate_envelope(&self.admission)?;
         self.validate_pins()?;
+        self.validate_admission_window()?;
         self.validate_slots()?;
         if !self.candidate_only || self.dispatch_authority {
             return Err(SwarmAdmissionBindError::InvalidField("admission.authority"));
@@ -403,6 +506,19 @@ impl SwarmAdmissionPlanCandidate {
             return Err(SwarmAdmissionBindError::InvalidField("admission.envelope"));
         }
         Ok(())
+    }
+
+    /// Re-checks the owner-issued expiry against this plan's own recorded
+    /// observation instant.
+    ///
+    /// Both operands are ORIGINAL recorded values: the expiry is the
+    /// `expires_at_unix_ms` on the stored external receipt and the observation
+    /// is this plan's `observed_at_unix_ms`, which is sealed into
+    /// `plan_digest`. Nothing is recomputed and the receipt is never
+    /// re-derived, so a tampered expiry or a restated observation fails here
+    /// rather than being silently accepted as current.
+    fn validate_admission_window(&self) -> Result<(), SwarmAdmissionBindError> {
+        check_admission_window(self.observed_at_unix_ms, self.admission.expires_at_unix_ms)
     }
 
     fn validate_slots(&self) -> Result<(), SwarmAdmissionBindError> {
@@ -460,6 +576,26 @@ impl SwarmAdmissionPlanCandidate {
         true
     }
 
+    /// The owner-issued expiry of the external admission receipt this plan was
+    /// compiled against, in Unix milliseconds.
+    ///
+    /// This is the recorded value, not a recomputed one. It was already
+    /// checked against [`SwarmAdmissionPlanCandidate::observed_at_unix_ms`] by
+    /// [`SwarmAdmissionPlanCandidate::validate`]; reading it re-exposes the
+    /// bound without re-deciding currency.
+    #[must_use]
+    pub const fn admission_expires_at_unix_ms(&self) -> u64 {
+        self.admission.expires_at_unix_ms
+    }
+
+    /// The instant this plan was compiled and observed at, in Unix
+    /// milliseconds. Sealed into the plan digest, so replaying the same plan
+    /// identity at a different instant is a conflict, not a silent refresh.
+    #[must_use]
+    pub const fn observed_at_unix_ms(&self) -> u64 {
+        self.observed_at_unix_ms
+    }
+
     /// Exact-replay/conflict rule: identical canonical bytes replay, a reused
     /// plan id with changed bytes conflicts, and a different plan id is a new
     /// plan rather than a replay.
@@ -500,9 +636,10 @@ fn has_duplicate_slot_ids(slots: &[SwarmBoundSlot]) -> bool {
 /// Structural validation of the external admission envelope: receipt refs are
 /// non-blank, the envelope fence validates, the provider identity validates
 /// through its exact owner, and the lane denominator is non-empty and
-/// bounded. The external contract has no expiry/currentness field, so this
-/// function cannot establish time currency; the compiler pins these exact
-/// bytes into the plan digest and never mints a newer admission.
+/// bounded. The envelope's owner-issued `expires_at_unix_ms` is the time bound
+/// this compiler validates; the currentness of that bound is
+/// [`check_admission_window`], not a field-shape question. The compiler pins
+/// these exact bytes into the plan digest and never mints a newer admission.
 fn validate_envelope(admission: &ProviderAdmissionReceipt) -> Result<(), SwarmAdmissionBindError> {
     validate_text(&admission.task_revision, "admission.task_revision")?;
     validate_text(
@@ -607,7 +744,9 @@ fn check_bound_slot(
 /// must equal the bound route. A triple the supplied envelope does not
 /// admit — rotated or foreign — fails closed, as does a receipt crossed
 /// into a lane admitted for another candidate; this compiler does not mint
-/// replacements or establish envelope freshness.
+/// replacements. Envelope age is a separate axis, refused through
+/// [`check_admission_window`] against the receipt's own
+/// `expires_at_unix_ms`.
 fn check_lane_currency(
     bound: &SwarmBoundSlot,
     admission: &ProviderAdmissionReceipt,
@@ -641,9 +780,9 @@ fn check_lane_currency(
 /// Pure and deterministic: no provider/model call, no process launch or
 /// cancel, no lease/fence/attempt/route issuance, no Task write, no mailbox
 /// mutation, no fallback. Any missing, extra, duplicate, stale, mismatched,
-/// or tampered binding fails closed. The external receipt owner currently
-/// exposes no expiry field, so this candidate compiler cannot reject solely
-/// on receipt age.
+/// expired, or tampered binding fails closed. Receipt age is refused through
+/// the owner-issued `expires_at_unix_ms` on the supplied external receipt,
+/// compared against the request's observation instant.
 pub fn compile_swarm_admission_plan(
     request: &SwarmAdmissionBindRequest,
 ) -> Result<SwarmAdmissionPlanCandidate, SwarmAdmissionBindError> {
@@ -658,6 +797,7 @@ pub fn compile_swarm_admission_plan(
         return Err(SwarmAdmissionBindError::IncompleteStaffing);
     }
     validate_envelope(&request.admission)?;
+    check_admission_window(request.now_unix_ms, request.admission.expires_at_unix_ms)?;
     let slots = admit_all_slots(request)?;
     let mut plan = SwarmAdmissionPlanCandidate {
         schema_version: SWARM_ADMISSION_PLAN_VERSION.to_owned(),
@@ -674,6 +814,7 @@ pub fn compile_swarm_admission_plan(
         slots,
         staffing: request.staffing.clone(),
         admission: request.admission.clone(),
+        observed_at_unix_ms: request.now_unix_ms,
         execution: ZeroModelExecutionCounters::zero(),
         candidate_only: true,
         dispatch_authority: false,
@@ -730,9 +871,15 @@ fn admit_all_slots(
 }
 
 /// Admits one slot binding and records the compiled bound slot. The bound
-/// pins echo the caller-presented binding verbatim; [`check_bound_slot`]
-/// rejects any drift against the staffed slot before the digest seals the
-/// record.
+/// pins echo the caller-presented binding verbatim. The digest seals the
+/// record first, exactly as the staffing owner seals `slot_digest`
+/// immediately after construction, and only then does [`check_bound_slot`]
+/// run: its final branch compares the stored `slot_binding_digest` against a
+/// canonical digest that is never empty, so it can only be a tamper guard
+/// once the record is sealed. Validating first would compare the still-empty
+/// field against a canonical digest and refuse every honest handoff.
+/// [`check_bound_slot`] still runs every other check first and still fails
+/// closed, digest closure included.
 fn admit_one_slot(
     binding: &SwarmSlotAdmission,
     staffed: &StaffedSlot,
@@ -758,7 +905,7 @@ fn admit_one_slot(
         runtime_generation: binding.admitted_route.runtime_generation,
         slot_binding_digest: String::new(),
     };
-    check_bound_slot(&bound, staffed, plan_id, admission)?;
     bound.slot_binding_digest = bound.digest(plan_id)?;
+    check_bound_slot(&bound, staffed, plan_id, admission)?;
     Ok(bound)
 }

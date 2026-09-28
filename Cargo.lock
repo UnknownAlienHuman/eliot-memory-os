@@ -668,6 +668,7 @@ dependencies = [
  "eliot-agent-api",
  "eliot-backup",
  "eliot-bootstrap",
+ "eliot-build-test-graph",
  "eliot-cli",
  "eliot-config",
  "eliot-contracts",
@@ -835,6 +836,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1132,6 +1134,7 @@ name = "eliot-context-admission"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
+ "eliot-authority",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
@@ -1148,6 +1151,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
  "eliot-context-contracts",
+ "eliot-context-measurement",
  "eliot-contracts",
  "eliot-evidence",
  "eliot-governor",
@@ -1799,6 +1803,7 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-bootstrap",
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
@@ -2344,6 +2349,7 @@ dependencies = [
  "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-influence",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
@@ -2590,6 +2596,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-messaging-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
@@ -2669,6 +2684,7 @@ dependencies = [
  "eliot-config",
  "eliot-contracts",
  "eliot-kernel-service",
+ "eliot-messaging-bridge",
  "eliot-notify-core",
  "eliot-platform",
  "eliot-platform-windows",
@@ -3374,6 +3390,7 @@ dependencies = [
  "eliot-process-executor",
  "eliot-protocol",
  "eliot-user-broker-core",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

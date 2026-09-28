@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::profile::{AdmittedProfile, ProfileError, ProfileScopeClasses, StageEnvironment};
-use crate::profile_run::{AggregateStatus, ProfileAggregate, StageEvidence};
+use crate::profile_run::{AggregateStatus, ProfileAggregate, RetainedToolIdentity, StageEvidence};
 use crate::registry::SupplyChainReceipt;
 
 /// Stable verifier identity recorded in every profile verification receipt.
@@ -328,6 +328,14 @@ pub struct ProfileRunEvidence {
 }
 
 /// Raw evidence state for one receipt-recorded stage run.
+///
+/// The retained state carries the same [`RetainedToolIdentity`] the in-memory
+/// [`StageEvidence`] carries, so a serialized receipt states which
+/// executable, argument vector, environment projection, and exit outcome
+/// produced the retained bytes instead of leaving them to be reconstructed
+/// later. That is why the receipt schema is versioned forward below: a `1.x`
+/// retained record names no tool identity and must be refused rather than read
+/// as one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "state")]
 pub enum StageEvidenceRecord {
@@ -337,6 +345,8 @@ pub enum StageEvidenceRecord {
         artifact: String,
         /// Exact retained byte length.
         byte_len: u64,
+        /// Exact tool identity that produced the retained bytes.
+        tool: RetainedToolIdentity,
     },
     /// Material output absent for an explicit, typed reason.
     Omitted {
@@ -353,9 +363,14 @@ pub enum StageEvidenceRecord {
 impl From<&StageEvidence> for StageEvidenceRecord {
     fn from(evidence: &StageEvidence) -> Self {
         match evidence {
-            StageEvidence::Retained { artifact, byte_len } => Self::Retained {
+            StageEvidence::Retained {
+                artifact,
+                byte_len,
+                tool,
+            } => Self::Retained {
                 artifact: artifact.as_str().to_owned(),
                 byte_len: *byte_len,
+                tool: tool.clone(),
             },
             StageEvidence::Omitted { reason } => Self::Omitted {
                 reason: reason.clone(),
@@ -371,8 +386,12 @@ impl ProfileRunEvidence {
     /// Deterministic identity over one raw stage run.
     pub fn digest(&self) -> String {
         let evidence = match &self.evidence {
-            StageEvidenceRecord::Retained { artifact, byte_len } => {
-                format!("retained\0{artifact}\0{byte_len}")
+            StageEvidenceRecord::Retained {
+                artifact,
+                byte_len,
+                tool,
+            } => {
+                format!("retained\0{artifact}\0{byte_len}\0{}", tool.digest())
             }
             StageEvidenceRecord::Omitted { reason } => format!("omitted\0{reason}"),
             StageEvidenceRecord::Missing { reason } => format!("missing\0{reason}"),
@@ -469,7 +488,15 @@ pub const RECEIPT_SCHEMA: &str = "eliot.instrument.verification-profile-receipt"
 /// `InstrumentProfile::revision` the receipt carries: a profile revision bump
 /// does not change the receipt schema, and a schema change is exactly what a
 /// local/CI pair must refuse.
-pub const RECEIPT_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// `2.0.0` makes the retained-evidence change wire-breaking on purpose: a
+/// `StageEvidenceRecord::Retained` value now carries the required tool identity
+/// (executable, argument vector, environment projection digest, exit outcome),
+/// so a `1.x` retained record that names no tool identity can no longer be read
+/// as a retained run. It is refused rather than upgraded, because inventing the
+/// missing identity after the fact is exactly the reconstruction this schema
+/// exists to prevent.
+pub const RECEIPT_SCHEMA_VERSION: &str = "2.0.0";
 
 /// The one receipt schema shared by local and CI profile runs (I18.21).
 ///

@@ -30,20 +30,28 @@
 //! requires a declared claim plus a lease, and [`GovernedWorkEnvelope::admit`]
 //! fails closed when the claim set is empty.
 //!
-//! The envelope allocates and records; it does not launch. Attaching the
-//! identity to an emitted result is [`EnvelopedInstrumentResult`], which
+//! The envelope allocates and records; it does not launch. Callers attach the
+//! lane identity to emitted results through [`CandidateIdentity`], which
 //! carries the fingerprint digest, candidate identity, and contract revision
-//! next to the runner's own governed result so a caller can attribute it to
-//! the candidate that produced it.
+//! next to the execution's own governed result so a caller can attribute it to
+//! the candidate that produced it. The instrument runner wraps its governed
+//! results with this identity and the test daemon persists it on the
+//! verification receipt; both read it from the one envelope, so the two can
+//! never disagree.
+//!
+//! The tuple lives in the build/test graph for the same reason the resource
+//! declaration does: a governed work item is admitted on the instrument plane
+//! and executed on the test daemon, and both sides depend on this crate and
+//! never on each other, so one envelope type here stops two competing lane
+//! tuples from existing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use eliot_build_test_graph::{BuildFingerprint, GraphError, ResourceClaim};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::GovernedInstrumentResult;
+use crate::{BuildFingerprint, GraphError, ResourceClaim};
 
 /// Directory name under the local application data root that anchors every
 /// governed build lane. I2.22 fixes the target roots under `Eliot\build`.
@@ -102,7 +110,7 @@ impl BuildMode {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEnvironmentLease {
     /// Leased resource class.
-    pub kind: eliot_build_test_graph::ResourceKind,
+    pub kind: crate::ResourceKind,
     /// Leased resource name, equal to the claimed name.
     pub resource: String,
     /// Holder identity, equal to this work item's ID.
@@ -156,16 +164,6 @@ pub struct GovernedWorkEnvelope {
     pub local_app_data: PathBuf,
 }
 
-/// A governed result with the lane identity that produced it attached.
-#[derive(Clone, Debug)]
-pub struct EnvelopedInstrumentResult {
-    /// The runner's governed result: invocation, executable identity, argv,
-    /// raw output, and execution axis.
-    pub result: GovernedInstrumentResult,
-    /// Which candidate, fingerprint, and contract revision produced it.
-    pub identity: CandidateIdentity,
-}
-
 /// Failures refusing a governed work item before it executes.
 ///
 /// Every variant is fail-closed: a work item that cannot present a complete,
@@ -199,7 +197,7 @@ pub enum WorkEnvelopeError {
         /// The refused work item.
         work_item_id: String,
         /// Unleased claim class.
-        kind: eliot_build_test_graph::ResourceKind,
+        kind: crate::ResourceKind,
         /// Unleased claim name.
         name: String,
     },
@@ -209,7 +207,7 @@ pub enum WorkEnvelopeError {
         /// The refused work item.
         work_item_id: String,
         /// Unbacked lease class.
-        kind: eliot_build_test_graph::ResourceKind,
+        kind: crate::ResourceKind,
         /// Unbacked lease name.
         name: String,
     },
@@ -232,7 +230,8 @@ pub enum WorkEnvelopeError {
 /// `local_app_data` is the `%LOCALAPPDATA%` root the governed build lanes
 /// live under; it is a parameter rather than an environment read so the
 /// caller that already resolved the user's local root keeps owning it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaneIdentity {
     /// Work item identity; also the lease holder.
     pub work_item_id: String,
@@ -397,12 +396,12 @@ impl GovernedWorkEnvelope {
                 work_item_id: self.work_item_id.clone(),
             });
         }
-        let claimed: BTreeSet<(eliot_build_test_graph::ResourceKind, &str)> = self
+        let claimed: BTreeSet<(crate::ResourceKind, &str)> = self
             .resource_claims
             .iter()
             .map(|claim| (claim.kind, claim.name.as_str()))
             .collect();
-        let held: BTreeSet<(eliot_build_test_graph::ResourceKind, &str)> = self
+        let held: BTreeSet<(crate::ResourceKind, &str)> = self
             .runtime_leases
             .iter()
             .map(|lease| (lease.kind, lease.resource.as_str()))
@@ -461,22 +460,6 @@ impl GovernedWorkEnvelope {
             environment.push(("CARGO_INCREMENTAL".to_owned(), "true".to_owned()));
         }
         Ok(environment)
-    }
-
-    /// Attaches this work item's identity to one emitted governed result.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkEnvelopeError::InvalidFingerprint`] when the fingerprint
-    /// is not a valid fingerprint.
-    pub fn attach(
-        &self,
-        result: GovernedInstrumentResult,
-    ) -> Result<EnvelopedInstrumentResult, WorkEnvelopeError> {
-        Ok(EnvelopedInstrumentResult {
-            result,
-            identity: self.candidate_identity()?,
-        })
     }
 }
 

@@ -333,10 +333,16 @@ impl PreparationError {
 // only, with no dedup cache. Child phase records may remain beneath one
 // caller-level record. The single terminal record per failed operation belongs
 // to the outer caller boundary, which owns the one `observe_terminal_error`
-// call. Handoff (caller-owned, not applied here): `prepare_backup_destination`
-// / `backup_dispatch_prepare` and the reconcile/cancel/cleanup holders arm one
-// terminal guard each with a frozen `host-backup-prepare-failed` code;
-// operation failure stays distinct from any process shutdown failure.
+// call. Handoff (caller-owned, APPLIED for the admitted preparation port under
+// #983 W4): `HostComposition::backup_dispatch_prepare` arms one
+// `HostTerminalGuard` with the frozen `host-backup-prepare-failed` code and
+// disarms only on its success return, so a failed preparation operation
+// produces exactly one terminal record here while the leaf's phase/refusal
+// records stay nonterminal beneath it; operation failure stays distinct from
+// any process shutdown failure. STILL PENDING, and deliberately not claimed:
+// the reconcile/cancel/cleanup holders named below are `DelegatedPreparation`
+// passthroughs reached by the caller of the returned handle rather than by this
+// port, and this issue arms no second guard for them.
 //
 // Explicit no-event list: `DelegatedPreparation::{reconcile, cancel, cleanup}`
 // (pure passthroughs; the inner operation owns the record),
@@ -409,7 +415,7 @@ fn observe_prepare_progress(
     let op = crate::host_diagnostics::bound_field(op);
     let phase = crate::host_diagnostics::bound_field(phase);
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.prepare_phase",
         op = op.text(),
@@ -435,7 +441,7 @@ fn note_prepare_error(
     let phase = crate::host_diagnostics::bound_field(phase);
     let category = crate::host_diagnostics::bound_field(category);
     let field = crate::host_diagnostics::bound_field(field);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.prepare_refusal",
         op = op.text(),

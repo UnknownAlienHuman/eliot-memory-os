@@ -535,6 +535,7 @@ fn provider_receipt(
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: format!("proof-admission-{tag}"),
         durable_job_ref: format!("durable-job-{tag}"),
+        expires_at_unix_ms: u64::MAX,
         admitted_lanes,
     })
 }

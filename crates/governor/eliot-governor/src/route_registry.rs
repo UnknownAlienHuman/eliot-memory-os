@@ -12,7 +12,8 @@
 //! - **Fingerprint.** [`RouteBehaviorFingerprint`] covers exactly the
 //!   semantics I3.4 lists as behaviour-changing: host family and adapter,
 //!   protocol/transport, runtime and adapter hashes, provider/model/auth/
-//!   billing, the message serializer, tool-call ID and role ordering, and
+//!   billing, the declared execution identity and the User Broker class it is
+//!   delegated to, the message serializer, tool-call ID and role ordering, and
 //!   reasoning continuation/compaction plus feature-flag and tool/context
 //!   profile hashes. Task Policy/Config snapshots, privacy classes and budget
 //!   envelopes are deliberately outside it, so an unrelated policy edit does
@@ -56,9 +57,15 @@ use crate::capability_evidence::{
 /// The key is versioned material, not a bare hash of a value: a change to the
 /// material shape moves the domain instead of silently reinterpreting an
 /// already-published key. This mirrors the shared epoch-identity recipe in
-/// `eliot-contracts` (`canonical_json_bytes` over a struct carrying a
+/// `eliot_contracts` (`canonical_json_bytes` over a struct carrying a
 /// `domain_separator`, then `sha256_hex`).
-pub const EFFECTIVE_ROUTE_KEY_DOMAIN: &str = "eliot.governor.effective-route-key.v1";
+///
+/// Version `v2` is this constant because issue #1816 added the declared
+/// execution identity and its User Broker class to
+/// [`RouteBehaviorFingerprint`], so a `v1` key and a `v2` key over otherwise
+/// identical route material are different keys, exactly as the rule above
+/// requires.
+pub const EFFECTIVE_ROUTE_KEY_DOMAIN: &str = "eliot.governor.effective-route-key.v2";
 
 /// Execution identity a route is configured for (I3.4 `RuntimeRoute`).
 #[derive(
@@ -115,6 +122,15 @@ impl RuntimeRoute {
     ///
     /// A blank or control-bearing identity field is not a route: admitting it
     /// would key the registry on an unusable identity instead of failing.
+    ///
+    /// The declared [`ExecutionIdentity`] is mandatory by construction: it is
+    /// a non-optional enum, so every route names exactly one of `service`,
+    /// `interactive_user`, or `remote` and none can omit it. I10-04's pairing
+    /// requirement — "`interactive_user` routes ... run through the authorized
+    /// User Broker" — is already covered by `required_user_broker_class` being
+    /// in the required-identity list above: an `interactive_user` route that
+    /// names no User Broker class is blank there and is refused here, and
+    /// `define_route` / `record_receipt` admit nothing that fails this.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         [
@@ -216,6 +232,14 @@ pub enum RouteIdentityLayer {
     ReasoningContinuation,
     /// Feature flags and behaviour-affecting profile hashes.
     FeatureFlags,
+    /// Declared execution identity and the User Broker class it is delegated
+    /// to.
+    ///
+    /// I10-04: "The two are separate `RuntimeRoute` fingerprints and
+    /// continuity does not transfer silently between them." Without this layer
+    /// a `service` and an `interactive_user` route over one adapter and
+    /// provider would report no divergence at all.
+    ExecutionIdentityBroker,
 }
 
 /// All route semantics that can change behaviour (I3.4 `RouteFingerprint`).
@@ -246,6 +270,15 @@ pub struct RouteBehaviorFingerprint {
     pub auth_profile_class: String,
     /// Billing mode.
     pub billing_mode: String,
+    /// Identity the route is configured to execute under.
+    pub execution_identity: ExecutionIdentity,
+    /// User Broker class this route is delegated to.
+    ///
+    /// Carried beside `execution_identity` rather than folded into it, so
+    /// re-pointing an `interactive_user` route at a different broker class
+    /// moves the fingerprint too: I10-04 makes "the two are separate
+    /// `RuntimeRoute` fingerprints".
+    pub required_user_broker_class: String,
     /// Message serializer or chat template fingerprint.
     pub serializer_fingerprint: String,
     /// Tool-call ID and role ordering semantics.
@@ -270,6 +303,8 @@ impl RouteBehaviorFingerprint {
             provider_and_model_request: route.provider_and_model_request.clone(),
             auth_profile_class: route.auth_profile_class.clone(),
             billing_mode: route.billing_mode.clone(),
+            execution_identity: route.execution_identity,
+            required_user_broker_class: route.required_user_broker_class.clone(),
             serializer_fingerprint: route.serializer_fingerprint.clone(),
             tool_call_id_and_role_ordering: installation.tool_call_id_and_role_ordering.clone(),
             reasoning_continuation_and_compaction: installation
@@ -287,7 +322,8 @@ impl RouteBehaviorFingerprint {
     /// This is the route-identity half of the staleness comparison: it covers
     /// all semantics I3.4 lists as behaviour-changing, including the layers an
     /// evidence scope does not carry (host family, protocol/transport,
-    /// tool-call ordering, reasoning continuation/compaction).
+    /// tool-call ordering, reasoning continuation/compaction, declared
+    /// execution identity and the User Broker class it is delegated to).
     #[must_use]
     pub fn diverging_layers(&self, other: &Self) -> Vec<RouteIdentityLayer> {
         let mut layers = Vec::new();
@@ -324,6 +360,15 @@ impl RouteBehaviorFingerprint {
         record(
             RouteIdentityLayer::BillingMode,
             self.billing_mode != other.billing_mode,
+        );
+        // Declared execution identity and the User Broker class it is delegated
+        // to are one identity layer: a change to either names the same layer
+        // once, so an interactive_user route and a service route over one
+        // adapter and provider never share a fingerprint (I10-04).
+        record(
+            RouteIdentityLayer::ExecutionIdentityBroker,
+            self.execution_identity != other.execution_identity
+                || self.required_user_broker_class != other.required_user_broker_class,
         );
         record(
             RouteIdentityLayer::Serializer,
@@ -997,6 +1042,19 @@ impl CapabilityRouteRegistry {
     /// derived scope, the exact-fingerprint match fails, and the refusal names
     /// the diverging layers so the route can be requalified.
     ///
+    /// An execution-identity move is reported the same way, as an explicit
+    /// changed layer rather than silent continuity: `route_layers_changed`
+    /// names [`RouteIdentityLayer::ExecutionIdentityBroker`] whenever the
+    /// previously retained receipt for this `route_id` declared a different
+    /// execution identity or User Broker class. That layer alone also refuses
+    /// admission: the evidence scope carries no execution identity, so retained
+    /// records still match the current scope exactly across the move, and
+    /// without the refusal the route would be admitted under fresh evidence
+    /// observed for a different identity. The route must requalify under the
+    /// identity it now declares. This is the I10-04 "the two are separate
+    /// `RuntimeRoute` fingerprints and continuity does not transfer silently
+    /// between them" rule, derived rather than asserted.
+    ///
     /// # Errors
     ///
     /// Returns [`RouteRegistryError`] when the receipt is not a consistent,
@@ -1043,14 +1101,24 @@ impl CapabilityRouteRegistry {
             .map(|prior| prior.diverging_layers(&requested_fingerprint))
             .unwrap_or_default();
         let retained: Vec<&CapabilityEvidenceRecord> = evidence
-            .records()
+            .retained()
             .iter()
+            .map(|retained| &retained.record)
             .filter(|record| record.skill_id == capability)
             .collect();
         let summaries: Vec<RouteEvidenceSummary> =
             retained.iter().map(|record| (*record).into()).collect();
         let observed_diverging_layers = receipt.observed.diverging_layers(&receipt.requested);
         let unknown_layers = receipt.observed.unknown_layers();
+        // I10-04: "The two are separate `RuntimeRoute` fingerprints and
+        // continuity does not transfer silently between them." The evidence
+        // scope carries no execution identity, so prior evidence still matches
+        // the current scope exactly across an identity change. Admission must
+        // therefore refuse on the identity layer itself rather than let the
+        // unchanged scope carry the route over silently; the route requalifies
+        // under evidence observed for the identity it now declares.
+        let identity_changed =
+            route_layers_changed.contains(&RouteIdentityLayer::ExecutionIdentityBroker);
         let Some(current) = receipt.current_scope() else {
             return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
@@ -1079,7 +1147,7 @@ impl CapabilityRouteRegistry {
                 && record.is_time_fresh(now)
                 && evidence.admit_production_route(capability, &current, now)
         });
-        if let Some(record) = admitting {
+        if let Some(record) = admitting.filter(|_| !identity_changed) {
             return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
                 requested_fingerprint,
@@ -1103,6 +1171,12 @@ impl CapabilityRouteRegistry {
             .collect();
         let reason = if restrictive {
             RouteRefusalReason::EvidenceRestrictive
+        } else if identity_changed {
+            // Prior evidence was observed under a different declared execution
+            // identity. The evidence scope carries no identity, so the retained
+            // records still match it exactly; the route is stale for the
+            // identity it now declares and must be requalified.
+            RouteRefusalReason::EvidenceStale
         } else if retained.is_empty() {
             RouteRefusalReason::EvidenceAbsent
         } else {

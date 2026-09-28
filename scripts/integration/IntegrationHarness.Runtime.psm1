@@ -16,7 +16,13 @@
 # requirement; Start launches only the Plan scope when a Plan is supplied and the
 # full topology otherwise (recorded default, never silent); unique run-owned
 # installation/session/config/
-# data/log/temp/artifact identities + canonical F-PIPE namespace + user-scoped
+# data/log/temp/artifact identities + canonical F-PIPE namespace held by a real
+# exclusive single-instance named-pipe server claim (registered in a module-private
+# owner table, re-proven live by the single ownership rule at every Start before
+# anything launches, and released only by the owner-authorised reset; a name-only
+# seam is backfilled with this module's own exclusive create of the same namespace
+# at Allocate, and a squatted/foreign/released claim never authorizes a launch) +
+# user-scoped
 # isolated-foreground principal; per-executable digest + PE target/profile before
 # launch; Job Object (or accepted equivalent) containment before descendants escape;
 # request/observed handle separation; owner-issued generation/fence/epoch (never
@@ -90,6 +96,15 @@ $Script:RuntimeJobObjectPrefix = 'eliot-job-'
 $Script:RuntimeMaxArtifactBytes = 134217728
 $Script:RuntimeMaxConfigBytes = 65536
 $Script:RuntimeMaxPriorFailureChars = 2000
+# Namespace reservation (#911). The canonical F-PIPE namespace is a mutable
+# namespace: one exclusive server instance per namespace, exactly as the loopback
+# port is one bind per endpoint. The count is part of the namespace's identity,
+# so the claim is what reserves, never the name. This table is the ONLY holder of
+# the authoritative claim handle and is never handed out; a registration returns a
+# detached copy, so no caller can rewrite what the ownership rule compares against.
+$Script:RuntimeNamespaceReservations = @{}
+$Script:RuntimeReservationServerInstances = 1
+$Script:RuntimeReservationPipeBufferBytes = 65536
 function Get-RuntimeProviderIdentity {
     [CmdletBinding()]
     param()
@@ -438,6 +453,275 @@ function Get-RuntimeSafeDiagnosticText {
     if ([bool]$redacted.failed) { return '' }
     return [string]$redacted.text
 }
+# Namespace-reservation owner table (#911 W1, namespace half). This is the same
+# shape the Store lane uses for its loopback bind: a length-delimited identity
+# key, an exclusive create, a registration that refuses a duplicate, and a
+# claim that is re-proven live before anyone may act on it. Nothing here
+# recognises a reservation by its name, and nothing deletes or replaces a
+# directory, file or handle it has not proven it owns.
+function Get-RuntimeNamespaceReservationId {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][int]$Generation,
+        [Parameter(Mandatory)][string]$AllocationSeed,
+        [Parameter(Mandatory)][string]$PipeNamespace
+    )
+    $builder = [System.Text.StringBuilder]::new()
+    foreach ($part in @($RunId, $Owner, [string]$Generation, $AllocationSeed, $PipeNamespace)) {
+        [void]$builder.Append($part.Length).Append(':').Append($part)
+    }
+    return $builder.ToString()
+}
+function Register-RuntimeNamespaceReservation {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][hashtable]$Reservation,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][int]$Generation,
+        [Parameter(Mandatory)][string]$AllocationSeed,
+        [Parameter(Mandatory)][string]$PipeNamespace,
+        [Parameter()][AllowNull()][object]$Claim
+    )
+    $id = Get-RuntimeNamespaceReservationId -RunId $RunId -Owner $Owner -Generation $Generation `
+        -AllocationSeed $AllocationSeed -PipeNamespace $PipeNamespace
+    if ($Script:RuntimeNamespaceReservations.ContainsKey($id)) {
+        throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: namespace reservation identity has already been used for this namespace.')
+    }
+    $handle = $null
+    if ($null -ne $Claim -and ($Claim -is [System.IO.Pipes.NamedPipeServerStream])) {
+        try { $handle = $Claim.SafePipeHandle } catch { $handle = $null }
+    }
+    # The owner table holds the ONLY authoritative claim handle and is never
+    # handed out: the returned identity is a DETACHED copy, so a caller that
+    # rewrites its own 'claim'/'handle'/'state' keys cannot change what the
+    # ownership gate below reads or what Complete-RuntimeNamespaceReservation
+    # releases. This is the Store lane's shape, where the returned record is
+    # likewise a copy of the registered one.
+    $Script:RuntimeNamespaceReservations[$id] = @{
+        reservationId  = $id
+        runId          = $RunId
+        owner          = $Owner
+        generation     = $Generation
+        allocationSeed = $AllocationSeed
+        pipeNamespace  = $PipeNamespace
+        claim          = $Claim
+        handle         = $handle
+        state          = 'Pending'
+    }
+    return [hashtable]($Script:RuntimeNamespaceReservations[$id].Clone())
+}
+function Close-RuntimeSuppliedReservationClaim {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][AllowNull()]$Reservation)
+    if ($null -eq $Reservation) { return $true }
+    $claim = $null
+    if ($Reservation -is [System.IO.Pipes.NamedPipeServerStream]) { $claim = $Reservation }
+    elseif (($Reservation -is [hashtable]) -and $Reservation.ContainsKey('claim')) { $claim = $Reservation['claim'] }
+    else { return $true }
+    if ($null -eq $claim) { return $true }
+    if ($claim -isnot [System.IO.Pipes.NamedPipeServerStream]) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-CLEANUP-UNKNOWN: supplied namespace claim has an unsupported type.')
+    }
+    try { $claim.Dispose() }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-RESERVATION-CLEANUP-UNKNOWN: supplied namespace claim release failed: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
+    return $true
+}
+# THE ownership rule, and the only implementation of it (#911). One function,
+# two callers: Invoke-RuntimeStart (prove, then keep the namespace held) and
+# Complete-RuntimeNamespaceReservation (prove, then release it).
+#
+# Every value this rule trusts is read from the module-private owner table. The
+# caller's record is treated as an untrusted PRESENTATION: it proves only which
+# reservation is being claimed, never what the reservation holds. A caller that
+# rewrites the 'claim' key of the record it was handed can therefore only make
+# this check FAIL; it can never make a check that reads the private copy pass.
+# The rule proves, in order: the presented identity is complete and matches its
+# binding; its length-delimited id recomputes from the caller's own seed; the
+# registered record for that id still exists and is not already released; the
+# registered record is bound to the same run, owner, generation, namespace and
+# seed; the caller still presents the exact registered claim object; and that
+# claim is a live exclusive server handle. A name is never enough.
+function Test-RuntimeNamespaceReservationOwnership {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Reservation,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][int]$Generation,
+        [Parameter(Mandatory)][string]$AllocationSeed,
+        [Parameter(Mandatory)][string]$PipeNamespace
+    )
+    if (($Reservation -isnot [hashtable])) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-UNKNOWN: a namespace reservation identity is required; a namespace name is not a reservation.')
+    }
+    foreach ($field in @('reservationId', 'runId', 'owner', 'generation', 'allocationSeed', 'pipeNamespace')) {
+        if (-not $Reservation.ContainsKey($field)) {
+            throw [System.InvalidOperationException]::new("RUNTIME-RESERVATION-FOREIGN: namespace reservation identity is missing '$field'.")
+        }
+    }
+    if ([string]$Reservation['runId'] -cne $RunId -or [string]$Reservation['owner'] -cne $Owner -or
+        [int]$Reservation['generation'] -ne $Generation -or [string]$Reservation['pipeNamespace'] -cne $PipeNamespace) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-FOREIGN: namespace reservation identity does not match its binding.')
+    }
+    $expectedId = Get-RuntimeNamespaceReservationId -RunId $RunId -Owner $Owner -Generation $Generation `
+        -AllocationSeed ([string]$AllocationSeed) -PipeNamespace $PipeNamespace
+    $id = [string]$Reservation['reservationId']
+    if ($id -cne $expectedId -or -not $Script:RuntimeNamespaceReservations.ContainsKey($id)) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-UNKNOWN: pending namespace reservation owner is unavailable.')
+    }
+    # From here on every value is read from the private record.
+    $registered = $Script:RuntimeNamespaceReservations[$id]
+    if ([string]$registered['runId'] -cne $RunId -or [string]$registered['owner'] -cne $Owner -or
+        [int]$registered['generation'] -ne $Generation -or [string]$registered['pipeNamespace'] -cne $PipeNamespace -or
+        [string]$registered['allocationSeed'] -cne [string]$AllocationSeed) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-FOREIGN: namespace reservation identity does not match its registered owner.')
+    }
+    if ([string]$registered['state'] -ceq 'Released') {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-REUSED: released namespace reservation cannot authorize another launch.')
+    }
+    # The presented claim is compared against the private copy, so substituting a
+    # different live handle on the caller's own record is a failure, never a pass.
+    if (-not $Reservation.ContainsKey('claim') -or -not [object]::ReferenceEquals($registered['claim'], $Reservation['claim'])) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-FOREIGN: pending namespace reservation handle does not match its registered claim.')
+    }
+    # A namespace with no live exclusive claim was never reserved by this run; a
+    # name alone can never authorize a launch.
+    if ($null -eq $registered['claim'] -or ($registered['claim'] -isnot [System.IO.Pipes.NamedPipeServerStream])) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-UNKNOWN: namespace reservation carries no live exclusive claim.')
+    }
+    $liveHandle = $null
+    try { $liveHandle = $registered['claim'].SafePipeHandle } catch { $liveHandle = $null }
+    if ($null -eq $liveHandle -or $liveHandle.IsInvalid -or $liveHandle.IsClosed) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-UNKNOWN: namespace reservation claim is no longer live.')
+    }
+    return $registered
+}
+function Complete-RuntimeNamespaceReservation {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][hashtable]$Identity,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][int]$Generation,
+        [Parameter(Mandatory)][string]$PipeNamespace
+    )
+    $registered = Test-RuntimeNamespaceReservationOwnership -Reservation $Identity -RunId $RunId -Owner $Owner `
+        -Generation $Generation -AllocationSeed ([string]$Identity['allocationSeed']) -PipeNamespace $PipeNamespace
+    try { $registered['claim'].Dispose() }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-RESERVATION-CLEANUP-FAILED: owned namespace claim release failed: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
+    $registered['state'] = 'Released'
+    $registered['claim'] = $null
+    $Identity['state'] = 'Released'
+    $Identity['claim'] = $null
+    return $true
+}
+# Owner-authorised reset of the module's own reservation owner table for ONE run.
+# A reset that left the identities registered would make a second Allocate for
+# the same run collide with its own predecessor forever, so the identities of
+# released namespaces are dropped. This does not weaken the duplicate-identity
+# refusal: a reservation whose claim is still live is not dropped, so a genuine
+# duplicate is still refused. Only the run whose owner authorised the reset, and
+# only after the claims it owns are released, is affected.
+function Clear-RuntimeNamespaceReservations {
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([Parameter(Mandatory)][string]$RunId)
+    $released = 0
+    foreach ($id in @($Script:RuntimeNamespaceReservations.Keys)) {
+        $registered = $Script:RuntimeNamespaceReservations[$id]
+        if ([string]$registered['runId'] -cne $RunId) { continue }
+        $claim = $registered['claim']
+        if ($null -ne $claim -and ($claim -is [System.IO.Pipes.NamedPipeServerStream])) {
+            try { $claim.Dispose() }
+            catch { throw [System.InvalidOperationException]::new("RUNTIME-RESERVATION-CLEANUP-FAILED: owned namespace claim release failed: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
+        }
+        $registered['state'] = 'Released'
+        $registered['claim'] = $null
+        $registered['handle'] = $null
+        [void]$Script:RuntimeNamespaceReservations.Remove($id)
+        $released++
+    }
+    return $released
+}
+function Get-RuntimeNamespaceReservationReceipt {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)][hashtable]$Identity)
+    return @{
+        reservationId  = [string]$Identity['reservationId']
+        runId          = [string]$Identity['runId']
+        owner          = [string]$Identity['owner']
+        generation     = [int]$Identity['generation']
+        allocationSeed = [string]$Identity['allocationSeed']
+        pipeNamespace  = [string]$Identity['pipeNamespace']
+        state          = [string]$Identity['state']
+    }
+}
+# THE exclusive create of the canonical F-PIPE namespace, in one place. The
+# count is part of what the namespace is, so a namespace already taken by a live
+# instance fails this create instead of being announced and contended later. A
+# held server instance never accepts a connection, so holding the namespace does
+# not consume a pipe, a thread or a peer.
+# Two callers, so there is no second way to "reserve" a namespace: the default
+# claim source below, and Invoke-RuntimeAllocate when a seam hands back a name
+# instead of a claim. Losing this create is never downgraded to the name.
+function New-RuntimeExclusiveNamespaceClaim {
+    [CmdletBinding()]
+    [OutputType([System.IO.Pipes.NamedPipeServerStream])]
+    param([Parameter(Mandatory)][string]$PipeNamespace)
+    # The counts are read from the script scope at call time, not captured into a
+    # closure, so the namespace identity cannot drift from the module's own constant.
+    return [System.IO.Pipes.NamedPipeServerStream]::new(
+        $PipeNamespace,
+        [System.IO.Pipes.PipeDirection]::InOut,
+        $Script:RuntimeReservationServerInstances,
+        [System.IO.Pipes.PipeTransmissionMode]::Byte,
+        [System.IO.Pipes.PipeOptions]::None,
+        $Script:RuntimeReservationPipeBufferBytes,
+        $Script:RuntimeReservationPipeBufferBytes)
+}
+# Real namespace reservation: win that exclusive create and return the live
+# single-instance server claim.
+# The same seam this seam substitutes for is the hook a caller may pass to supply
+# its own claim source, exactly as New-StoreDefaultPortReservation does for the
+# port reservation; with no hook the exclusive create above is the claim source.
+# In: {runId,pipeNamespace,sessionId}. Out: {pipeNamespace,claim}.
+function New-RuntimeDefaultNamespaceReservation {
+    [CmdletBinding()]
+    [OutputType([scriptblock])]
+    param([Parameter()][AllowNull()][scriptblock]$Reservation)
+    $source = $Reservation
+    if ($null -eq $source) {
+        $source = { param($Context) New-RuntimeExclusiveNamespaceClaim -PipeNamespace ([string]$Context['pipeNamespace']) }
+    }
+    $reserve = {
+        param($Context)
+        $namespace = [string]$Context['pipeNamespace']
+        $claim = $null
+        try {
+            $claim = (& $source @{ runId = [string]$Context['runId']; pipeNamespace = $namespace; sessionId = [string]$Context['sessionId'] })
+        }
+        catch {
+            $primary = $_.Exception.Message
+            if ($primary -match '^RUNTIME-[A-Z0-9-]+:') { throw [System.InvalidOperationException]::new($primary) }
+            # Losing the exclusive create IS the squatting / foreign-ownership
+            # signal: some live holder already owns this mutable namespace. It is
+            # never downgraded to a reusable name.
+            throw [System.InvalidOperationException]::new(
+                "RUNTIME-NAMESPACE-CONFLICT: exclusive namespace create failed for the canonical namespace: $(Get-RuntimeSafeDiagnosticText -Text $primary)")
+        }
+        return @{ pipeNamespace = $namespace; claim = $claim }
+    }
+    return $reserve.GetNewClosure()
+}
 function Invoke-RuntimeAllocate {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Plan, [Parameter(Mandatory)][string]$BaseTemp, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][scriptblock]$NamespaceReservation, [Parameter()][AllowNull()][hashtable]$GovernorConfigReceipt, [Parameter()][AllowNull()][AllowEmptyCollection()][hashtable[]]$ProviderReceipts, [Parameter()][AllowNull()][hashtable]$PeerCredential, [Parameter()][AllowNull()][hashtable]$GovernorConfigContent, [Parameter()][AllowNull()][hashtable]$GovernorConfigStoreHandles, [Parameter()][switch]$VerifyPrincipal)
@@ -462,11 +746,25 @@ function Invoke-RuntimeAllocate {
         [void](Resolve-RuntimeOwnedPath -RunRoot $runRoot -Path $full -ExpectedRunId $runId)
         $roots[$leaf] = $full
     }
-    $pipeNamespace = ($Script:RuntimePipePrefix + $runId.Substring(0, 8))
+    # Every MUTABLE identity below is derived from the FULL 128-bit run identity.
+    # The previous first-8-hex form mapped distinct run identities onto one pipe
+    # namespace, one job object and one session, which is the cross-run mutable
+    # sharing this operation exists to prevent. No hash, seed or counter replaces
+    # the discarded bits. The canonical prefixes are 12 and 10 characters, so a
+    # 32-hex run identity yields 44 and 42 characters and both 64-character shape
+    # guards below still hold without a second truncation.
+    #
+    # $nonce is deliberately NOT used for any of the three: it stays the path
+    # suffix and the allocation seed, where the full $runId already present in the
+    # same leaf keeps distinct runs distinct, and where a caller-supplied -Entropy
+    # value of up to 64 hex characters would otherwise push 'sess-' past the
+    # 64-character principal shape and fail as RUNTIME-INVALID-PRINCIPAL rather
+    # than the RUNTIME-INVALID-ENTROPY the bad entropy actually is.
+    $pipeNamespace = ($Script:RuntimePipePrefix + $runId)
     if ($pipeNamespace -cnotmatch '^[A-Za-z0-9_.-]{1,64}$') { throw [System.InvalidOperationException]::new('RUNTIME-ALLOCATION-MISMATCH: derived pipe namespace has an invalid shape.') }
-    $jobObjectName = ($Script:RuntimeJobObjectPrefix + $runId.Substring(0, 8))
+    $jobObjectName = ($Script:RuntimeJobObjectPrefix + $runId)
     if ($jobObjectName -cnotmatch '^[A-Za-z0-9_.-]{1,64}$') { throw [System.InvalidOperationException]::new('RUNTIME-ALLOCATION-MISMATCH: derived job-object identity has an invalid shape.') }
-    $sessionId = ('sess-' + $nonce)
+    $sessionId = ('sess-' + $runId)
     $principal = @{ principal = [string]$Binding['owner']; sessionId = $sessionId; scope = $Script:RuntimePrincipalScope }
     [void](Test-RuntimePrincipalShape -Principal $principal)
     $principalLane = 'shape-only'
@@ -479,10 +777,54 @@ function Invoke-RuntimeAllocate {
     try { $reservation = (& $NamespaceReservation @{ runId = $runId; pipeNamespace = $pipeNamespace; sessionId = $sessionId }) }
     catch { throw [System.InvalidOperationException]::new("RUNTIME-NAMESPACE-CONFLICT: reservation failed: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     $reserved = ''
-    if ($reservation -is [hashtable] -and $reservation.ContainsKey('pipeNamespace')) { $reserved = [string]$reservation['pipeNamespace'] }
+    if ($reservation -is [hashtable] -and $reservation.ContainsKey('pipeNamespace')) {
+        $reserved = [string]$reservation['pipeNamespace']
+    }
     elseif ($reservation -is [string]) { $reserved = $reservation }
     else { throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: reservation must return a pipe-namespace mapping.') }
     if ($reserved -cne $pipeNamespace) { throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: reserved namespace does not match the derived canonical namespace.') }
+    # A previous Allocate for THIS run identity is superseded, so the claim it
+    # registered is released before a new one is taken. Without this the run would
+    # collide with its own predecessor: the owner table still held the first
+    # identity, so the duplicate-identity refusal fired (or, because this run
+    # really does own the namespace, the exclusive create below failed against
+    # its own live claim). This is the SAME release the owner-authorised reset
+    # performs, from the same function, for the same reason: a second allocation
+    # for one run is a new attempt, not a second run. It is scoped to this runId,
+    # so the refusal still fires for a genuinely different run, owner, generation,
+    # seed or namespace -- which is the case the refusal exists for.
+    $supersededReservations = Clear-RuntimeNamespaceReservations -RunId $runId
+    # A name echo is never a claim, so it can never BE the reservation. When a
+    # seam hands back only the name, this module wins the exclusive create of that
+    # SAME namespace itself, through the one shared exclusive-create path, and the
+    # run's own claim is what is registered. Refusing the name instead would leave
+    # this run holding no claim at all on a namespace it is about to launch onto;
+    # taking it back here is what makes a name-only seam safe rather than merely
+    # rejected, and a namespace a live holder already owns still fails the create.
+    $claimed = $null
+    if (($reservation -isnot [hashtable]) -or (-not $reservation.ContainsKey('claim'))) { $claimed = $null }
+    elseif (($null -ne $reservation['claim']) -and ($reservation['claim'] -is [System.IO.Pipes.NamedPipeServerStream])) { $claimed = $reservation['claim'] }
+    else { throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: reservation carries a namespace claim of an unsupported type.') }
+    if ($null -eq $claimed) {
+        $claimed = New-RuntimeExclusiveNamespaceClaim -PipeNamespace $pipeNamespace
+    }
+    $reservationIdentity = $null
+    try {
+        $reservationIdentity = Register-RuntimeNamespaceReservation -Reservation $reservation `
+            -RunId $runId -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) `
+            -AllocationSeed $nonce -PipeNamespace $pipeNamespace -Claim $claimed
+    }
+    catch {
+        $primary = $_.Exception.Message
+        # The registration never took ownership, so the run's claim is still this
+        # run's to release: an abandoned live exclusive handle would otherwise keep
+        # reserving a namespace nobody is using. A name-only seam has no claim of
+        # its own to release, so this is a no-op for it.
+        [void](Close-RuntimeSuppliedReservationClaim -Reservation $reservation)
+        try { $claimed.Dispose() } catch { }
+        if ($null -ne $primary -and $primary -cmatch '^RUNTIME-[A-Z0-9-]+:') { throw [System.InvalidOperationException]::new($primary) }
+        throw [System.InvalidOperationException]::new("RUNTIME-NAMESPACE-CONFLICT: namespace reservation could not be registered: $(Get-RuntimeSafeDiagnosticText -Text $primary)")
+    }
     $allocation = @{ runId = $runId; runRoot = $runRoot; installationRoot = $roots['installation']; sessionRoot = $roots['session']; configRoot = $roots['config']; dataRoot = $roots['data']; logRoot = $roots['logs']; tempRoot = $roots['temp']; artifactRoot = $roots['artifacts']; ownerMarker = $Script:RuntimeOwnedRootMarker; pipeNamespace = $pipeNamespace; jobObjectName = $jobObjectName; sessionId = $sessionId; principal = $principal; owner = [string]$Binding['owner']; generation = [int]$Binding['generation']; allocationSeed = $nonce }
     $requiredLanes = @()
     if ($Plan.ContainsKey('requiredReceipts') -and $null -ne $Plan['requiredReceipts']) { $requiredLanes = @($Plan['requiredReceipts']) }
@@ -513,6 +855,13 @@ function Invoke-RuntimeAllocate {
         foreach ($accepted in $acceptedReceipts) { if ([string]$accepted['testClass'] -ceq 'STORE') { $storeReceiptForConfig = $accepted } }
     }
     $allocation['providerReceipts'] = $acceptedReceipts
+    # The namespace stays HELD across Start: Allocate registers the run's live
+    # exclusive claim in the module-private owner table and puts a detached
+    # copy of the record on the allocation. Invoke-RuntimeStart re-proves that
+    # record with the same ownership rule before it launches anything, so a
+    # released, foreign or substituted claim cannot authorize a launch.
+    $allocation['namespaceReservation'] = $reservationIdentity
+    $allocation['supersededNamespaceReservations'] = $supersededReservations
     $governorConfigLane = 'none'
     if ($null -ne $PeerCredential) {
         $allocation['peerCredential'] = (Resolve-RuntimePeerCredential -Credential $PeerCredential)
@@ -545,6 +894,26 @@ function Invoke-RuntimeStart {
     foreach ($field in @('runRoot', 'installationRoot', 'sessionRoot', 'configRoot', 'pipeNamespace', 'sessionId')) {
         if (-not $Allocation.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Allocation[$field])) { throw [System.ArgumentException]::new("RUNTIME-INVALID-ALLOCATION: allocation is missing '$field'.") }
     }
+    # THE GATE. Before any acquisition, any issuance and any launch, the namespace
+    # this topology is about to act on must be re-proven as still owned by THIS
+    # run through the same ownership rule Complete-RuntimeNamespaceReservation
+    # applies. The claim is NOT released here: the components still use the pipe
+    # namespace, so the exclusive server instance keeps holding it for the whole
+    # run and a second run's exclusive create of the same namespace still fails.
+    # A missing, foreign, released, dead or substituted reservation throws, so no
+    # component is ever launched onto an unproven namespace. A name is never
+    # enough and a caller cannot turn this off: the check reads the module's own
+    # owner table, not the record the caller was handed.
+    if (-not $Allocation.ContainsKey('namespaceReservation') -or $null -eq $Allocation['namespaceReservation']) {
+        throw [System.InvalidOperationException]::new('RUNTIME-RESERVATION-UNKNOWN: allocation carries no namespace reservation; a namespace name is not a reservation.')
+    }
+    if (-not $Allocation.ContainsKey('allocationSeed') -or [string]::IsNullOrWhiteSpace([string]$Allocation['allocationSeed'])) {
+        throw [System.ArgumentException]::new("RUNTIME-INVALID-ALLOCATION: allocation is missing 'allocationSeed'.")
+    }
+    $namespaceReservationLane = 'claim-reproven-live'
+    [void](Test-RuntimeNamespaceReservationOwnership -Reservation $Allocation['namespaceReservation'] `
+        -RunId $runId -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) `
+        -AllocationSeed ([string]$Allocation['allocationSeed']) -PipeNamespace ([string]$Allocation['pipeNamespace']))
     $governorBinding = $null
     if ($Allocation.ContainsKey('governorConfig') -and $null -ne $Allocation['governorConfig']) {
         $candidate = $Allocation['governorConfig']
@@ -756,7 +1125,11 @@ function Invoke-RuntimeStart {
     if ($null -ne $governorBinding) { $startResult['governorConfig'] = $governorBinding }
     if ($null -ne $governorConfigFullPath) { $startResult['governorConfigPath'] = $governorConfigFullPath }
     $startResult['principal'] = $Allocation['principal']
-    $startResult['verificationLanes'] = @{ artifact = $artifactLane; issuance = $issuanceLane; containment = $containmentLane; governorConfig = $governorStartLane }
+    $startResult['verificationLanes'] = @{ artifact = $artifactLane; issuance = $issuanceLane; containment = $containmentLane; governorConfig = $governorStartLane; namespace = $namespaceReservationLane }
+    # The receipt names WHICH reservation authorized this launch, so a reader of
+    # the evidence never has to take the pipe namespace on trust. The claim
+    # handle itself is deliberately absent: it stays in the owner table.
+    $startResult['namespaceReservation'] = (Get-RuntimeNamespaceReservationReceipt -Identity $Allocation['namespaceReservation'])
     if ($null -ne $artifactProof) { $startResult['binary']['artifactVerification'] = $artifactProof }
     $startResult['launchScope'] = @($launchScope)
     $startResult['launchScopeSource'] = $launchScopeSource
@@ -945,10 +1318,18 @@ function Invoke-RuntimeResetForTest {
     if (-not $result.ContainsKey('resetOk') -or -not $result.ContainsKey('baselineOk') -or -not $result.ContainsKey('owner')) { throw [System.InvalidOperationException]::new('RUNTIME-CLIENT-FAILED: owner reset receipt is missing resetOk/baselineOk/owner.') }
     if ([string]$result['owner'] -cne [string]$Binding['owner']) { throw [System.InvalidOperationException]::new('RUNTIME-RESET-FOREIGN-OWNER: reset was not issued by the run owner.') }
     if ($result.ContainsKey('fixtureName') -and ([string]$result['fixtureName'] -cne $fixtureName)) { throw [System.InvalidOperationException]::new('RUNTIME-FIXTURE-MISMATCH: owner reset receipt fixture does not match the declared fixture.') }
+    # An owner-authorised reset releases this run's namespace reservations and
+    # drops their identities from the module's owner table, so a reset genuinely
+    # resets module state: without this the table stayed process-global and every
+    # later Allocate for the same run identity collided with its own predecessor
+    # instead of with a real competitor. Scoped to this runId, and only for claims
+    # this run owns, so another live run's reservation is untouched and a genuine
+    # duplicate is still refused.
+    $releasedReservations = Clear-RuntimeNamespaceReservations -RunId $runId
     if ([bool]$result['resetOk'] -and [bool]$result['baselineOk']) {
-        return @{ runId = $runId; fixtureName = $fixtureName; baselineVerified = $true; contaminationScope = 'none'; resetState = 'GroupInitialization' }
+        return @{ runId = $runId; fixtureName = $fixtureName; baselineVerified = $true; contaminationScope = 'none'; resetState = 'GroupInitialization'; releasedNamespaceReservations = $releasedReservations }
     }
-    return @{ runId = $runId; fixtureName = $fixtureName; baselineVerified = $false; contaminationScope = 'group'; resetState = 'GroupContaminated'; resetOk = [bool]$result['resetOk']; baselineOk = [bool]$result['baselineOk'] }
+    return @{ runId = $runId; fixtureName = $fixtureName; baselineVerified = $false; contaminationScope = 'group'; resetState = 'GroupContaminated'; resetOk = [bool]$result['resetOk']; baselineOk = [bool]$result['baselineOk']; releasedNamespaceReservations = $releasedReservations }
 }
 function Invoke-RuntimeCollectEvidence {
     [CmdletBinding()]
@@ -1539,4 +1920,26 @@ function Test-RuntimePortObservation {
     if ([bool]$Observation['portsOpen'] -or $ports.Count -gt 0) { $portFailures += 'ports-still-open' }
     return @{ runId = [string]$Allocation['runId']; portsObserved = $ports.Count; failures = $portFailures }
 }
-Export-ModuleMember -Function @('Get-RuntimeProviderIdentity', 'Get-RuntimeLockIdentity', 'Get-RuntimeClosedOperations', 'Get-RuntimeTerminalDispositions', 'Test-RuntimeDigestFormat', 'Test-RuntimeClosedOperation', 'Test-RuntimeTerminalDisposition', 'Resolve-RuntimeDeadline', 'Test-RuntimeBindingShape', 'Test-RuntimeProviderResultClosed', 'Invoke-RuntimeProviderOperation', 'Invoke-RuntimeValidateRequirement', 'Invoke-RuntimePlan', 'Resolve-RuntimeOwnedPath', 'Get-RuntimeChildEnv', 'New-RuntimeEphemeralCredential', 'Test-RuntimePrincipalShape', 'Test-RuntimeProviderReceipt', 'Get-RuntimeRedactedText', 'Get-RuntimeSafeDiagnosticText', 'Invoke-RuntimeAllocate', 'Invoke-RuntimeStart', 'Invoke-RuntimeObserveReadiness', 'Invoke-RuntimeResetForTest', 'Invoke-RuntimeCollectEvidence', 'Invoke-RuntimeStop', 'Invoke-RuntimeVerifyCleanup', 'Resolve-RuntimeGovernorConfig', 'Test-RuntimeStoreHandleReference', 'Test-RuntimeArtifactFile', 'Test-RuntimeOwnerHandshake', 'Test-RuntimeContainmentProof', 'Get-RuntimeProcessBinding', 'Test-RuntimePrincipalBinding', 'Test-RuntimeOwnedRootAcl', 'New-RuntimeGovernorConfigFile', 'Test-RuntimePortObservation')
+Export-ModuleMember -Function @('Get-RuntimeProviderIdentity', 'Get-RuntimeLockIdentity', 'Get-RuntimeClosedOperations', 'Get-RuntimeTerminalDispositions', 'Test-RuntimeDigestFormat', 'Test-RuntimeClosedOperation', 'Test-RuntimeTerminalDisposition', 'Resolve-RuntimeDeadline', 'Test-RuntimeBindingShape', 'Test-RuntimeProviderResultClosed', 'Invoke-RuntimeProviderOperation', 'Invoke-RuntimeValidateRequirement', 'Invoke-RuntimePlan', 'Resolve-RuntimeOwnedPath', 'Get-RuntimeChildEnv', 'New-RuntimeEphemeralCredential', 'Test-RuntimePrincipalShape', 'Test-RuntimeProviderReceipt', 'Get-RuntimeRedactedText', 'Get-RuntimeSafeDiagnosticText', 'Get-RuntimeNamespaceReservationId', 'Register-RuntimeNamespaceReservation', 'Close-RuntimeSuppliedReservationClaim', 'Test-RuntimeNamespaceReservationOwnership', 'Complete-RuntimeNamespaceReservation', 'Clear-RuntimeNamespaceReservations', 'Get-RuntimeNamespaceReservationReceipt', 'New-RuntimeExclusiveNamespaceClaim', 'New-RuntimeDefaultNamespaceReservation', 'Invoke-RuntimeAllocate', 'Invoke-RuntimeStart', 'Invoke-RuntimeObserveReadiness', 'Invoke-RuntimeResetForTest', 'Invoke-RuntimeCollectEvidence', 'Invoke-RuntimeStop', 'Invoke-RuntimeVerifyCleanup', 'Resolve-RuntimeGovernorConfig', 'Test-RuntimeStoreHandleReference', 'Test-RuntimeArtifactFile', 'Test-RuntimeOwnerHandshake', 'Test-RuntimeContainmentProof', 'Get-RuntimeProcessBinding', 'Test-RuntimePrincipalBinding', 'Test-RuntimeOwnedRootAcl', 'New-RuntimeGovernorConfigFile', 'Test-RuntimePortObservation')
+# ---------------------------------------------------------------------------
+# KNOWN GAP, recorded not implemented (MEDIUM-1, #911). Two items, both left
+# exactly as they are so neither is hidden by a change that only makes evidence
+# look better:
+#
+# 1. Close-RuntimeSuppliedReservationClaim currently has no caller outside the
+#    one Invoke-RuntimeAllocate failure path above. It exists for the case where a
+#    seam hands this module a live claim and the run never takes ownership of it;
+#    that path is the only one reachable today. It is NOT wired to the
+#    run-isolated-tests harness pipe, and it is not to be wired to it as a
+#    tidy-up: that pipe is the harness's own live claim, not an abandoned one.
+#
+# 2. run-isolated-tests.ps1 keeps \\.\pipe\eliot-fpipe-<runId> held by the harness
+#    and never disposes it before process exit. The moment VerifyCleanup
+#    (run-isolated-tests.ps1 ~:386-394) stops throwing HARNESS-NO-START-RECEIPT,
+#    that still-open pipe will be observed by the module's own pipes-still-open
+#    cleanup assertion and will fail it. The fix belongs in the harness, which owns
+#    that handle: dispose the claim when the run ends, or complete the reservation
+#    through the ownership rule above. The cleanup assertion itself must NOT be
+#    relaxed to tolerate it, because "no pipe from this run is still open" is
+#    exactly what it exists to prove.
+# ---------------------------------------------------------------------------

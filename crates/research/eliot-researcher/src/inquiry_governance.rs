@@ -9,6 +9,15 @@
 //! ([`EvidenceFreeze`], [`ClaimAuditRecord`], [`ResearchDebt`]). Source
 //! admissibility itself lives in [`crate::source_admissibility`].
 //!
+//! The terminal projection carries the governed artifacts rather than restating
+//! them: [`InquiryTerminalRecord`] holds the [`EvidenceFreeze`], the
+//! [`UnsupportedPrecisionItem`] residue and, when one exists, the
+//! [`ClaimAuditRecord`], and re-proves and binds each of them. What it does not
+//! carry it does not summarise either — the claim audit is `None` on the live
+//! path because nothing in this repository produces an
+//! [`crate::evidence_portfolio::AuditedClaim`] to bind, and that absence is
+//! reported rather than filled.
+//!
 //! Everything here is candidate-only. The domain emits
 //! [`GovernorInquiryAdmissionRequest`] and source transition requests for the
 //! existing Governor admission path; it never writes canonical state, never
@@ -65,6 +74,22 @@ use crate::source_admissibility::{
 pub const INQUIRY_GOVERNANCE_CONTRACT: &str = "eliot.research.inquiry-governance";
 /// Current revision of this domain surface.
 ///
+/// #1762: `2.0.0` -> `3.0.0`. The terminal projection changed incompatibly:
+/// `InquiryTerminalRecord` gained three carried fields — the `EvidenceFreeze`,
+/// the `Option<ClaimAuditRecord>` and the `Vec<UnsupportedPrecisionItem>` — and
+/// all three are inside `InquiryTerminalRecord::compute_digest`, so every
+/// terminal record has a different digest than it did under
+/// `inquiry-terminal-record/v1` and the surface a consumer reads gained three
+/// typed fields. The claim audit is honestly absent on the live path: binding one
+/// needs an `evidence_portfolio::AuditedClaim`, and no production path in this
+/// repository produces one, so the field is `None` today rather than a stand-in
+/// verdict. See the field's own doc comment.
+///
+/// **What this constant does not do, stated plainly:** it is in no digest
+/// preimage. It appears only in the `Display` impl below. The invalidation above
+/// is real but rests entirely on the three added fields being inside
+/// `InquiryTerminalRecord::compute_digest`, not on this constant.
+///
 /// #2894: `1.0.0` -> `2.0.0`. The untrusted-reference diagnostic changed
 /// incompatibly: `UnadmittedReferenceKind` gained
 /// `INTERNAL_OWNED_REFERENCE` and `AMBIGUOUS_REFERENCE`, the kind of every
@@ -90,7 +115,7 @@ pub const INQUIRY_GOVERNANCE_CONTRACT: &str = "eliot.research.inquiry-governance
 ///
 /// So the honest statement is: a diagnostic *this path* produced before the bump
 /// cannot re-present as one produced after it, and nothing stronger is claimed.
-pub const INQUIRY_GOVERNANCE_VERSION: &str = "2.0.0";
+pub const INQUIRY_GOVERNANCE_VERSION: &str = "3.0.0";
 
 /// Typed inquiry-governance failure. Every variant names the failing concept or
 /// field path only; no supplied value is ever echoed back.
@@ -2639,13 +2664,17 @@ impl CoverageReceipt {
         // change; what changed is the value space of a field that was already
         // there, which is the same reason `source-record/v1` -> `v2` was recorded.
         //
-        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/v1` bind
+        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/*` bind
         // this digest and therefore produce different values for the same run.
-        // Their own field sets and domains are unchanged and are deliberately not
-        // bumped: a domain names the shape of the record being hashed, and a
-        // changed value in a field they already declared is exactly the dependency
-        // behaving as declared, not a new shape. `research-debt/v1` is unaffected
-        // because its preimage never named the receipt digest.
+        // `evidence-freeze/v1`'s own field set and domain are unchanged and are
+        // deliberately not bumped: a domain names the shape of the record being
+        // hashed, and a changed value in a field it already declared is exactly
+        // the dependency behaving as declared, not a new shape.
+        // `inquiry-terminal-record` was bumped `v1` -> `v2` by #1762 for the
+        // opposite reason: its preimage *field set* changed when the evidence
+        // freeze, the claim audit and the unsupported-precision residue became
+        // carried fields. `research-debt/v1` is unaffected because its preimage
+        // never named the receipt digest.
         let mut preimage = String::from("coverage-receipt/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
@@ -3712,6 +3741,36 @@ pub struct InquiryTerminalRecord {
     pub debt_restriction: ResearchDebtRestriction,
     /// Preserved next probe.
     pub next_probe: Option<PreservedNextProbe>,
+    /// Evidence freeze of the accepted evidence revision this disposition was
+    /// taken over (I21.8).
+    ///
+    /// The freeze is carried whole, not as a digest beside it, because the
+    /// terminal claim is exactly the claim the freeze is supposed to bound: a
+    /// record that named the freeze's identity without its included set, its
+    /// exclusions, its open contradictions and its open debts could not show
+    /// that the evidence it rests on was the evidence that was frozen.
+    pub freeze: EvidenceFreeze,
+    /// Claim audit bound to this terminal record, when one exists (I21.8).
+    ///
+    /// `None` means no audited claim was bound to this run, and it is the honest
+    /// value rather than a stand-in: binding one needs an
+    /// [`crate::evidence_portfolio::AuditedClaim`] and the
+    /// [`crate::evidence_portfolio::EvidencePortfolio`] plus
+    /// [`crate::evidence_portfolio::AuditReferenceBinding`] that
+    /// [`crate::evidence_portfolio::audit_claim`] judges it against, and no
+    /// production path in this crate builds any of them from an admitted
+    /// observation. This is the same absent producer
+    /// `ClaimAuditRecord::bind` itself is blocked on, so a `Some` here is only
+    /// reachable once that owner lands, and every check in
+    /// `validate_carried_artifacts` runs on a real audit the moment it can.
+    pub claim_audit: Option<ClaimAuditRecord>,
+    /// Unsupported-precision residue the evidence set preserves (I21.7).
+    ///
+    /// The typed items, not a count: each one names the asserted coordinate, the
+    /// highest supported precision, the basis, the false-precision risk and the
+    /// probe or narrower wording required, so a reader learns what the claim may
+    /// not say rather than only that something was imprecise.
+    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
     /// State Fence the disposition was taken under.
     pub state_fence: StateFence,
     /// Always true: a terminal inquiry record stays candidate-only.
@@ -3767,6 +3826,11 @@ impl InquiryTerminalRecord {
     /// disposition follows an unsuccessful acquisition, and a field error for
     /// blank identities or malformed digests. [`InquiryError::Portfolio`] is
     /// returned when a provided preservation field is blank or control-bearing.
+    /// The carried evidence freeze, claim audit and unsupported-precision residue
+    /// are re-proved and bound to this record here, and
+    /// [`InquiryError::IntegrityMismatch`] is returned when one of them describes
+    /// a different inquiry, profile revision digest, manifest or State Fence than
+    /// the record it is being carried on.
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         profile: &InquiryProtocolProfile,
@@ -3782,6 +3846,9 @@ impl InquiryTerminalRecord {
         narrower_claim: Option<String>,
         debt_restriction: ResearchDebtRestriction,
         next_probe: Option<PreservedNextProbe>,
+        freeze: EvidenceFreeze,
+        claim_audit: Option<ClaimAuditRecord>,
+        unsupported_precision: Vec<UnsupportedPrecisionItem>,
     ) -> Result<Self, InquiryError> {
         require_text(evidence_set_id, "terminal.evidence_set_id")?;
         require_text(reason_code, "terminal.reason_code")?;
@@ -3840,13 +3907,88 @@ impl InquiryTerminalRecord {
             narrower_claim,
             debt_restriction,
             next_probe,
+            freeze,
+            claim_audit,
+            unsupported_precision,
             state_fence: profile.state_fence.clone(),
             candidate_only: true,
             canonical_write_authorized: false,
             digest: String::new(),
         };
+        // The same method `validate_integrity` runs, so a record that is built
+        // can never differ from a record that is read back: the three carried
+        // artifacts are re-proved and bound here, before the digest is taken.
+        record.validate_carried_artifacts()?;
         record.digest = record.compute_digest();
         Ok(record)
+    }
+
+    /// Re-proves the evidence freeze, claim audit and unsupported-precision
+    /// residue this record carries, and binds each of them to this record's own
+    /// identity.
+    ///
+    /// The three checks are the whole point of carrying the artifacts, so they
+    /// are stated once and run from both `bind` and `validate_integrity`:
+    ///
+    /// - the freeze must re-prove its own digest and must name the same inquiry,
+    ///   profile revision digest, portfolio, manifest, coverage receipt, evidence
+    ///   set and State Fence this record does. A freeze that disagrees is not a
+    ///   stricter version of this one, it is a freeze of different evidence, so
+    ///   the terminal claim it would appear to bound is not the claim that was
+    ///   frozen;
+    /// - a claim audit, when present, must re-prove its own digest and its own
+    ///   run binding and must name the same inquiry, profile revision digest, run
+    ///   reference manifest, evidence set and State Fence. An audit for another
+    ///   run is a real record of a real audit and is simply not this one's;
+    /// - every unsupported-precision item must name its asserted coordinate, its
+    ///   highest supported precision, its basis, its risk and its required probe
+    ///   as non-blank, non-control-bearing text. A residue item with a hole in it
+    ///   cannot be checked, so it is refused here instead of being carried as a
+    ///   shape a reader would have to trust.
+    ///
+    /// Absence is not a failure: an empty residue is a measurement, and a missing
+    /// claim audit is the state this path is honestly in.
+    fn validate_carried_artifacts(&self) -> Result<(), InquiryError> {
+        self.freeze.validate_integrity()?;
+        if self.freeze.inquiry_id != self.inquiry_id
+            || self.freeze.profile_digest != self.profile_digest
+            || self.freeze.portfolio_digest != self.portfolio_digest
+            || self.freeze.manifest_digest != self.manifest_digest
+            || self.freeze.coverage_receipt_digest != self.coverage_receipt_digest
+            || self.freeze.evidence_set_id != self.evidence_set_id
+            || self.freeze.state_fence != self.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "terminal.freeze_binding",
+            });
+        }
+        if let Some(audit) = &self.claim_audit {
+            audit.validate_integrity()?;
+            if audit.inquiry_id != self.inquiry_id
+                || audit.profile_digest != self.profile_digest
+                || audit.run_reference_manifest_digest != self.manifest_digest
+                || audit.evidence_set_id != self.evidence_set_id
+                || audit.state_fence != self.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "terminal.claim_audit_binding",
+                });
+            }
+        }
+        for item in &self.unsupported_precision {
+            require_text(&item.asserted, "terminal.unsupported_precision.asserted")?;
+            require_text(
+                &item.highest_supported,
+                "terminal.unsupported_precision.highest_supported",
+            )?;
+            require_text(&item.basis, "terminal.unsupported_precision.basis")?;
+            require_text(&item.risk, "terminal.unsupported_precision.risk")?;
+            require_text(
+                &item.required_probe,
+                "terminal.unsupported_precision.required_probe",
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether this disposition may close its inquiry.
@@ -3869,7 +4011,16 @@ impl InquiryTerminalRecord {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("inquiry-terminal-record/v1;");
+        // `v1` -> `v2` for #1762 W8. The preimage field set changed: the evidence
+        // freeze, the claim audit and the unsupported-precision residue are now
+        // carried here and their content is inside this preimage, and one name
+        // must not cover two field sets. This is the rule the `coverage-receipt`
+        // preimage comment states for itself: a domain names the shape of the
+        // record being hashed, so a shape change bumps it, while a changed *value*
+        // in a field that was already declared does not (which is why
+        // `evidence-freeze/v1` above is deliberately left alone — its own field
+        // set is unchanged and only the values it transitively binds moved).
+        let mut preimage = String::from("inquiry-terminal-record/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_id", &self.profile_id);
         push_field(
@@ -3948,10 +4099,60 @@ impl InquiryTerminalRecord {
             }
         }
         push_field(&mut preimage, "may_close", bool_text(self.may_close()));
+        self.push_carried_artifacts(&mut preimage);
         freeze(&preimage)
     }
 
-    /// Re-proves this record's own digest and the debt restriction it carries.
+    /// Pushes the three carried artifacts of #1762 W8 into the terminal
+    /// record's digest preimage.
+    ///
+    /// The freeze is bound by its own re-proved digest, which covers every
+    /// field of it, and the residue by its typed items rather than by a count,
+    /// so a binding that covers this digest cannot be re-pointed at a
+    /// different frozen evidence set, or at a different asserted coordinate,
+    /// by editing only the rendered narrower claim. The claim audit is pushed
+    /// by its own digest and verdict, or as the explicit literal `none` when
+    /// no audited claim exists — an absent audit is a recorded fact, never an
+    /// omitted field that would let a digest cover two different records.
+    fn push_carried_artifacts(&self, preimage: &mut String) {
+        push_field(preimage, "evidence_freeze_digest", &self.freeze.digest);
+        push_field(preimage, "evidence_freeze_id", &self.freeze.freeze_id);
+        if let Some(audit) = &self.claim_audit {
+            push_field(preimage, "claim_audit_digest", &audit.digest);
+            push_field(preimage, "claim_audit_claim_id", &audit.claim_id);
+            push_field(
+                preimage,
+                "claim_audit_outcome",
+                audit.verdict.outcome.wire_name(),
+            );
+        } else {
+            push_field(preimage, "claim_audit", "none");
+        }
+        push_count(
+            preimage,
+            "unsupported_precision",
+            self.unsupported_precision.len(),
+        );
+        for item in &self.unsupported_precision {
+            push_field(preimage, "unsupported_precision_asserted", &item.asserted);
+            push_field(
+                preimage,
+                "unsupported_precision_highest_supported",
+                &item.highest_supported,
+            );
+            push_field(preimage, "unsupported_precision_basis", &item.basis);
+            push_field(preimage, "unsupported_precision_risk", &item.risk);
+            push_field(
+                preimage,
+                "unsupported_precision_required_probe",
+                &item.required_probe,
+            );
+        }
+    }
+
+    /// Re-proves this record's own digest, the debt restriction it carries and
+    /// the evidence freeze, claim audit and unsupported-precision residue it
+    /// carries beside it.
     ///
     /// # Errors
     ///
@@ -3963,8 +4164,11 @@ impl InquiryTerminalRecord {
     /// [`InquiryError::DebtRestrictedDisposition`] when a disposition coexists
     /// with an open debt that refuses it, or
     /// [`InquiryError::ClosureWithoutSuccessfulAcquisition`] when a closing
-    /// disposition follows an unsuccessful acquisition.
+    /// disposition follows an unsuccessful acquisition. The carried artifacts are
+    /// checked by `validate_carried_artifacts`, which `bind` also runs, so a
+    /// stored-but-never-re-proved field cannot pass here.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        self.validate_carried_artifacts()?;
         self.debt_restriction.validate_integrity()?;
         if self.debt_restriction.refuses(self.disposition) {
             return Err(InquiryError::DebtRestrictedDisposition {
@@ -4536,6 +4740,19 @@ impl InquiryGovernance {
             &admissibility,
             &research_debts,
         )?;
+        // No claim audit is bound here, and the honest reason is recorded rather
+        // than papered over: `ClaimAuditRecord::bind` needs an
+        // `evidence_portfolio::AuditedClaim` plus the `EvidencePortfolio` and
+        // `AuditReferenceBinding` that `audit_claim` judges it against, and no
+        // production path in this repository builds any of them from an admitted
+        // `InquiryObservation` — the observation carries candidate source custody
+        // (handle, content digest, receipt handle, lineage), never a structured
+        // material claim. The terminal record therefore carries `None`, which is
+        // the state the world is actually in; it is not a stand-in verdict and
+        // nothing in this crate will mint one to fill it. When the admitted
+        // evidence-bundle producer lands, the value is threaded from here and
+        // every check in `InquiryTerminalRecord::validate_carried_artifacts`
+        // starts running against a real audit.
         let terminal = terminal_record(
             &observation,
             &profile,
@@ -4544,6 +4761,8 @@ impl InquiryGovernance {
             &precision,
             &obligations,
             &research_debts,
+            &freeze,
+            None,
         )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
@@ -4631,6 +4850,7 @@ impl InquiryGovernance {
                 field: "inquiry.freeze_binding",
             });
         }
+        self.validate_terminal_carried_bindings()?;
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
@@ -4688,6 +4908,38 @@ impl InquiryGovernance {
         }
         Ok(())
     }
+
+    /// I21.7/I21.8: the terminal projection has to carry the evidence freeze and
+    /// the unsupported-precision residue this run produced, not a copy that was
+    /// restated while it was being bound. Comparing the two owners to what the
+    /// terminal record carries catches a freeze or a residue that was replaced,
+    /// dropped or added between the two constructions.
+    ///
+    /// There is deliberately no equivalent comparison for the claim audit: the
+    /// composite has no second claim-audit owner to compare against, because no
+    /// production path produces one (see the `None` at the `terminal_record`
+    /// call). The terminal record's own `validate_carried_artifacts` still
+    /// re-proves an audit and binds it to this inquiry, profile, manifest and
+    /// State Fence, so a `Some` cannot be a foreign or edited record, and this
+    /// domain will not invent a comparison against a second absent owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first carried
+    /// artifact that disagrees with the composite that produced it.
+    fn validate_terminal_carried_bindings(&self) -> Result<(), InquiryError> {
+        if self.terminal.freeze != self.freeze {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.terminal_freeze_binding",
+            });
+        }
+        if self.terminal.unsupported_precision != self.precision.residue {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.terminal_unsupported_precision_binding",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for InquiryGovernance {
@@ -4697,6 +4949,14 @@ impl std::fmt::Display for InquiryGovernance {
     /// dispositions appear: no provider prose, payload body or credential is
     /// reproduced, and the candidate-only flag is printed so a reader cannot
     /// mistake the line for an admitted result.
+    ///
+    /// What the terminal record *carries* is printed as its own key so a reader
+    /// can see which freeze, claim audit and unsupported-precision residue the
+    /// disposition was bound over rather than only that the composite holds some.
+    /// `terminal_claim_audit=none` is the honest spelling of the live state: no
+    /// production path produces an `AuditedClaim`, so the terminal record carries
+    /// no claim audit, and the line says that instead of omitting the field or
+    /// printing a digest for an audit that never ran.
     ///
     /// The Governor-facing source-admission requests are counted and their
     /// digests published here, which is what makes this line the Researcher half
@@ -4721,8 +4981,9 @@ impl std::fmt::Display for InquiryGovernance {
              expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
-             materialisable={} deferred={} compilation_inputs={} freeze={} debts={} \
-             debt_kinds={} debt_restricted={} debt_restriction_refused={} \
+             materialisable={} deferred={} compilation_inputs={} freeze={} \
+             terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
+             debts={} debt_kinds={} debt_restricted={} debt_restriction_refused={} \
              disposition={} terminal_denominator_kind={} may_close={} \
              acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
              next_probe={} reason={} authority_epoch={}/{} candidate_only={} \
@@ -4765,6 +5026,12 @@ impl std::fmt::Display for InquiryGovernance {
             self.compilation_inputs.deferred().len(),
             self.compilation_inputs.digest,
             self.freeze.digest,
+            terminal.freeze.digest,
+            terminal
+                .claim_audit
+                .as_ref()
+                .map_or("none", |audit| audit.digest.as_str()),
+            terminal.unsupported_precision.len(),
             self.research_debts.len(),
             debt_kinds_wire(&self.research_debts),
             terminal.debt_restriction.restricted,
@@ -5917,6 +6184,13 @@ fn preserved_next_probe(
 /// is bound. Deriving the restriction from the registered debts rather than
 /// restating it is what makes the I21.12 use-time check an invariant of the
 /// record rather than a comment about it.
+///
+/// `freeze` and `claim_audit` are the artifacts this run actually produced, and
+/// they are carried onto the record rather than re-derived from it, so the
+/// terminal projection publishes the same values the freeze and the audit
+/// committed to. `precision` supplies the unsupported-precision residue the
+/// evidence set already produced, for the same reason.
+#[allow(clippy::too_many_arguments)]
 fn terminal_record(
     observation: &InquiryObservation,
     profile: &InquiryProtocolProfile,
@@ -5925,6 +6199,8 @@ fn terminal_record(
     precision: &EvidenceSetPrecision,
     obligations: &[InquiryObligation],
     debts: &[ResearchDebt],
+    freeze: &EvidenceFreeze,
+    claim_audit: Option<&ClaimAuditRecord>,
 ) -> Result<InquiryTerminalRecord, InquiryError> {
     let debt_restriction = ResearchDebtRestriction::derive(&observation.inquiry_id, debts);
     let derived = terminal_disposition(observation, coverage_receipt);
@@ -5975,6 +6251,9 @@ fn terminal_record(
             coverage_receipt,
             obligations,
         )),
+        freeze.clone(),
+        claim_audit.cloned(),
+        precision.residue.clone(),
     )
 }
 
@@ -6154,6 +6433,7 @@ fn anchor_wire(precision: AnchorPrecision) -> &'static str {
         AnchorPrecision::Section => "section",
         AnchorPrecision::Paragraph => "paragraph",
         AnchorPrecision::Line => "line",
+        AnchorPrecision::Symbol => "symbol",
         AnchorPrecision::ByteRange => "byte_range",
     }
 }

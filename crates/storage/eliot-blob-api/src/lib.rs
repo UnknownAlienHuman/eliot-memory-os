@@ -46,7 +46,7 @@ pub const CONTRACT_VERSION: &str = "s-04-v2";
 pub mod backup_io;
 pub use backup_io::{
     BLOB_BACKUP_GENESIS, BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage,
-    BlobBackupPartial, BlobBackupScope, PageCompletion, SealedBlobCaptureRecord,
+    BlobBackupPartial, BlobBackupScope, PageCompletion, SealedBlobCaptureRecord, SealedBlobRead,
 };
 
 fn valid_text(value: &str, field: &'static str) -> Result<(), BlobError> {
@@ -3608,6 +3608,12 @@ pub type BlobFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BlobError>> +
 pub trait BlobStoreClient: Send + Sync {
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt>;
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk>;
+    /// Reads and verifies the original sealed envelope under the same lease,
+    /// metadata digest, and ready-receipt identity as `read`.
+    ///
+    /// The result carries that exact owner-issued `BlobReadyReceipt`; no new
+    /// receipt or re-sealed payload is substituted for the stored object.
+    fn read_sealed(&self, request: BlobReadRequest) -> BlobFuture<'_, SealedBlobRead>;
     fn reachability(
         &self,
         request: BlobReachabilityRequest,

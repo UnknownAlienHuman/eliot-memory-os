@@ -10,6 +10,8 @@
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
 
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,42 +22,51 @@ use eliot_contracts::{
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::UserAutomationOperation;
+use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    UserAutomationConfigurationState, UserAutomationInvocation, UserAutomationRevision,
+    AutomationWorkClass, ConfigPolicySnapshot, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
+    UserAutomationInvocation, UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind, HostRequestRecord, HostRequestState,
-    OpaqueLabel, RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
-    WriterReservationToken,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
+    HostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel, RedbRecoveryStore,
+    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord, WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
+    PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission, WriteSubmissionState, admit_write_submission,
+    canonical_request_hash, dreamer_job_queue_key, generated_operation_manifests,
+    verify_canonical_request_hash,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PauseReleaseOutcome,
     PauseScopeView, PausedScopeMirror, RetainedCommitState, classify_commit_receipt,
     classify_retained_commit, open_record_for, receipt_evidence_digest, recover_commit,
-    resolve_open_record, verify_receipt_binding, verify_retained_binding, verify_terminal_evidence,
+    resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
+    verify_retained_binding, verify_terminal_evidence,
 };
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    writer_epoch_for_fence_from_epoch,
+    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationRemovalResult,
-    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
-    read_retirement_wake_targets, retirement_wake_enumeration_request,
+    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
+    UserAutomationRemovalResult, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
+    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+    retirement_wake_enumeration_request,
 };
 use crate::user_automation_orchestration::{
     USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationRecord,
@@ -69,15 +80,25 @@ use crate::{
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
     UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationService, UserAutomationServiceRequest,
-    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
-    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
-    run_now_wake_read_request,
+    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationReadResult,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationService,
+    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStoreRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePhase, UserAutomationWakePort,
+    committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+
+/// Monotonic per-process counter behind one `UserAutomation` send claim.
+///
+/// The durable claim is first-writer-wins, so a second acquisition of the same
+/// obligation must never be able to replay as the first caller's attempt. Every
+/// claim therefore mints a distinct launch nonce from this counter, so the ORS
+/// `HostRequestAttempt` two competing callers present can only be byte-equal
+/// when they are the same attempt. It is process-local identity for a durable
+/// record; it grants no authority and carries no decision of its own.
+static USER_AUTOMATION_SEND_CLAIM_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomationExecutionError {
     UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
@@ -95,8 +116,14 @@ mod store_receipt_gateway;
 /// `WriteReceipt`; a Dreamer commit answers with a ledger projection instead,
 /// so this leg states the same three mandated branches over its own typed
 /// answer and never collapses them into a success or a retry permission.
+///
+/// It is public because it is the recovered outcome its real caller must
+/// distinguish: it travels inside [`DreamerJobGatewayError`], so a
+/// caller-reachable field may not be crate-private. Every arm names the
+/// admitted idempotency key, the exact terminal `UnknownCommitOutcome`, the
+/// receipt evidence digest that proves it, and the obligation that remains.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum DreamerCommitUncertain {
+pub enum DreamerCommitUncertain {
     /// The commit outcome is proven by an exact receipt and this leg
     /// reconciled the durable record with that receipt digest bound as its
     /// terminal evidence. Exactly one canonical operation exists under the
@@ -206,48 +233,48 @@ fn dreamer_pause_refusal(
     identity: &OperationIdentity,
     proof: &DreamerOrderingScopeProof,
     effect: DreamerOperationEffect,
-) -> Option<String> {
+) -> Option<CommitRecoveryError> {
     if effect != DreamerOperationEffect::Mutation {
         return None;
     }
     let key = identity.idempotency_key.as_str();
     let paused = proof.scopes.iter().find_map(|scope| {
-        observed.pausing_key_for(scope, key).map(|pausing_key| {
-            CommitRecoveryError::ScopePaused {
+        observed
+            .pausing_key_for(scope, key)
+            .map(|pausing_key| CommitRecoveryError::ScopePaused {
                 scope: scope.clone(),
                 paused_by_key: pausing_key.to_owned(),
-            }
-            .to_string()
-        })
+            })
     });
     if paused.is_some() {
         return paused;
     }
     if !proof.work_scope_proven && observed.any_open_except(key) {
-        return Some(
-            CommitRecoveryError::OrderingScopeUnresolved {
-                operation: "dreamer-job".to_owned(),
-                detail: format!(
-                    "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
-                     its ledger record is ordered inside, so its coverage by the open \
-                     unknown-commit record set observed at revision {} cannot be proven and \
-                     dependent durable admission stays closed",
-                    proof.rendered(),
-                    observed.binding().revision
-                ),
-            }
-            .to_string(),
-        );
+        return Some(CommitRecoveryError::OrderingScopeUnresolved {
+            operation: "dreamer-job".to_owned(),
+            detail: format!(
+                "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
+                 its ledger record is ordered inside, so its coverage by the open \
+                 unknown-commit record set observed at revision {} cannot be proven and \
+                 dependent durable admission stays closed",
+                proof.rendered(),
+                observed.binding().revision
+            ),
+        });
     }
     None
 }
 
 /// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
-fn ors_unavailable(error: impl std::fmt::Display) -> String {
+///
+/// The value stays typed: the fail-closed refusal is a
+/// [`CommitRecoveryError::OrsUnavailable`], and every caller of this helper
+/// composes it into an error that already carries that type, so no gateway
+/// refusal has to be flattened to text to travel anywhere.
+fn ors_unavailable(error: impl std::fmt::Display) -> CommitRecoveryError {
     CommitRecoveryError::OrsUnavailable {
         detail: error.to_string(),
     }
-    .to_string()
 }
 
 /// Reads back the recorded terminal outcome and evidence digest of one
@@ -272,12 +299,16 @@ fn retained_terminal_evidence(
 
 /// Projects one already-resolved durable record into its typed answer,
 /// preserving the outcome it actually recorded.
+///
+/// The recorded outcome and its evidence digest are returned as the values the
+/// record holds, never as a synthesized success: a `RolledBack` key and a
+/// `Committed` key are different proven facts and the caller is given the one
+/// that actually happened.
 fn dreamer_dispositioned(
     idempotency_key: &str,
     record: &UnknownCommitRecord,
-) -> Result<DreamerCommitUncertain, String> {
-    let (outcome, evidence_receipt_digest) =
-        retained_terminal_evidence(idempotency_key, record).map_err(|error| error.to_string())?;
+) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
+    let (outcome, evidence_receipt_digest) = retained_terminal_evidence(idempotency_key, record)?;
     Ok(DreamerCommitUncertain::AlreadyDispositioned {
         idempotency_key: idempotency_key.to_owned(),
         outcome,
@@ -587,6 +618,39 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
 }
 
 /// Canonical-store gateway bound to the active Kernel generation route.
+/// Governor-issued wire envelope of the `owner/policy` recovery record.
+///
+/// The Governor owns the record bytes; this struct only names the exact shape
+/// the Kernel decoder accepts, with the same deny-unknown-fields closure the
+/// Kernel applies to every typed boundary. It lives beside its single decoder
+/// so no second interpretation of the record can drift in elsewhere.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationPolicyOwnerSnapshotWire {
+    /// Fence under which the Governor issued the record.
+    pub state_fence: StateFence,
+    /// Durable outer revision of the record.
+    pub revision: u64,
+    /// Digest of the canonical snapshot bytes.
+    pub policy_digest: String,
+    /// Complete B-owned config snapshot.
+    pub snapshot: ConfigPolicySnapshot,
+}
+
+/// Refusal of one `RunNow` preflight assembly that preserves whether an owner
+/// was unreadable or simply has no Kernel-side evidence issuer.
+///
+/// The distinction is load-bearing for the transition phases: an unreadable
+/// owner may already have effected the disposition, so it reports unknown;
+/// absent evidence means nothing was sent, so it reports unavailable with the
+/// exact missing owner named.
+enum RunNowPreflightAssembly {
+    /// An owner could not be read; the execution disposition may be effected.
+    Unknown(String),
+    /// Named owner evidence has no issuer at this boundary; nothing was sent.
+    Unavailable(String),
+}
+
 impl KernelStoreGateway {
     /// Constructs the gateway from the Kernel-approved service and Store client.
     #[doc(hidden)]
@@ -672,23 +736,50 @@ impl KernelStoreGateway {
     }
 
     /// Applies one already prepared transition after fixed Kernel admission.
+    ///
+    /// The refusal is the typed [`StoreApplyRefusal`] rather than a flattened
+    /// string, so the I5.19 admission decision this route actually took reaches
+    /// the caller as typed evidence instead of being erased into prose: the
+    /// `not_accepted` decision keeps its submission id, reason codes, and next
+    /// allowed action, while every pre-existing gateway refusal keeps the exact
+    /// text it has always returned.
     pub async fn apply(
         &self,
         context: &RequestMetadata,
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> Result<WriteReceipt, String> {
-        let _flight = self.flight.enter()?;
+    ) -> Result<WriteReceipt, StoreApplyRefusal> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
-        self.refuse_shadow_mutation()?;
+        self.refuse_shadow_mutation()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
         // 1927: authenticate the caller before plan admission (I5.6 step 1),
         // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
-            return Err("transition caller is not the active daemon".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "transition caller is not the active daemon".to_owned(),
+            ));
         }
+        // I5.19: `admit_prepared_transition` is the single decision point for
+        // this route. It returns the typed `staged` decision on its accepted
+        // arm and `Err` on every other outcome, so a `not_accepted` or
+        // `resolved_existing` value can never reach the store send below and no
+        // state re-check is owed here. There is deliberately no second
+        // `admission.state != Staged` guard: that check could not fire, and
+        // claiming it as a live defence against a second canonical transition
+        // for one identity would assert a guarantee the code never performs.
+        // A gate that later resolves an existing receipt must refuse inside
+        // `admit_prepared_transition` (it has no existing-receipt lookup
+        // today) rather than return that decision as a success this route
+        // would then have to re-inspect.
         admit_prepared_transition(
             context,
             &transition,
@@ -697,15 +788,18 @@ impl KernelStoreGateway {
         )?;
 
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            let service = self.service.lock().map_err(|_| {
+                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
-                return Err("Kernel generation is fenced".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "Kernel generation is fenced".to_owned(),
+                ));
             }
             if self.is_fenced() {
-                return Err("canonical-store gateway is fenced for rebind".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "canonical-store gateway is fenced for rebind".to_owned(),
+                ));
             }
             // Canonical route/epoch gate (Implements #64): route currency is
             // the exact-tuple match between the composition-bound route epoch
@@ -716,13 +810,13 @@ impl KernelStoreGateway {
             if !self.route.authority_epoch().is_same_authority(&live_epoch)
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
-                return Err(
+                return Err(StoreApplyRefusal::GatewayRefusal(
                     "canonical-store route is outside the active Kernel generation".to_owned(),
-                );
+                ));
             }
             let lease = service
                 .acquire_admission()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
             // Slices A+B (#65): `apply_prepared` is normal Store work
             // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
             // above holds a Slice A typed normal permit from the disjoint
@@ -734,12 +828,16 @@ impl KernelStoreGateway {
                 .authority_epoch()
                 .is_same_authority(&transition.state_fence.authority_epoch)
             {
-                return Err("canonical-store route authority epoch is stale".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "canonical-store route authority epoch is stale".to_owned(),
+                ));
             }
             lease
         };
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
 
         let identity = transition.identity.clone();
@@ -775,7 +873,7 @@ impl KernelStoreGateway {
             query,
         )
         .await
-        .map_err(|error| error.to_string());
+        .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()));
         drop(lease);
         result
     }
@@ -936,17 +1034,11 @@ impl KernelStoreGateway {
             Err(error) => {
                 // Deterministic refusal: the Store owner proves no effect, so
                 // the still-`Eligible` token releases cleanly and nothing
-                // orphans. `UnknownOperation` is explicit unsupported behavior
-                // from a backend without reserved capability, never a reason
-                // to fall back to unreserved `Apply`.
-                let _ = cancel_before_send(&owner, &sealed.token);
+                // orphans.
+                let refusal =
+                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
                 drop(lease);
-                if matches!(error, StoreError::UnknownOperation) {
-                    return Err(format!(
-                        "reserved write unsupported for operation {operation_id}: Store backend has no reserved-write capability; refusing without unreserved Apply fallback"
-                    ));
-                }
-                Err(error.to_string())
+                Err(refusal)
             }
         }
     }
@@ -1236,10 +1328,7 @@ impl KernelStoreGateway {
         })?;
         let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
         crate::store_write_reservation::reconcile_staged_writes_at_startup(
-            &owner,
-            fence,
-            &self.store,
-            limit,
+            &owner, fence, self, limit,
         )
         .await
         .map_err(|error| error.to_string())
@@ -1578,15 +1667,15 @@ impl KernelStoreGateway {
     /// skip: the caller reports it as an explicit unavailability and issues no
     /// owner effect at all.
     ///
-    /// The one window this durable outbox does not close is a process death
-    /// strictly between handing the request to the owner and recording its
-    /// answer: the record is left `Admitted`, which still proves the owner was
-    /// never handed it, so a later attempt of the same parent operation issues it
-    /// again under the same original owner operation identity. Closing that
-    /// window would need an outbox edge from a routed record back to a
-    /// not-issued state, which `eliot_ors::HostRequestState::transition_to` has
-    /// none of; every *reported* response loss is armed by
-    /// [`Self::mark_user_automation_obligation_unknown`] instead.
+    /// The window between handing the request to the owner and recording its
+    /// answer is closed by [`Self::claim_user_automation_send`], which acquires
+    /// one exclusive durable send claim and persists the monotonic `Routed`
+    /// state before the first transport await (issue #2970). A process death
+    /// after that claim therefore reloads as a reconciling record, never as
+    /// re-issuable `Admitted` work, and a competing caller that loses the claim
+    /// issues nothing. Every *reported* response loss is still armed by
+    /// [`Self::mark_user_automation_obligation_unknown`], and no state is ever
+    /// moved backward out of a possible-effect contour to enable a retry.
     fn retain_user_automation_obligation(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -1657,6 +1746,11 @@ impl KernelStoreGateway {
             &obligation.request_digest,
             &result_digest,
             &result_response,
+            // Issue #1853 W2: a retained owner answer is not an executor
+            // observation and carries no result lineage, so neither is
+            // retained. Absence means nothing was observed or claimed here.
+            None,
+            None,
         )
         .map_err(|error| {
             unretained_answer_reason(
@@ -1672,12 +1766,14 @@ impl KernelStoreGateway {
     ///
     /// `Admitted` is the last state that still proves the owner was never handed
     /// the request, and it is the state the outbox's own answer path continues
-    /// from: persisting a result walks `Admitted -> Routed -> Submitted ->
-    /// ResultReceived` inside one transaction, and an owner that is not available
-    /// leaves the record admitted so a later attempt of the same parent operation
-    /// may still issue it. The outbox has no edge back out of `Routed`, so the
-    /// record is never walked past the point where the effect would become
-    /// irreversible; a lost answer is armed by
+    /// from. This advance is a mechanical, idempotent state projection and
+    /// deliberately grants no ownership: [`Self::claim_user_automation_send`]
+    /// then acquires the exclusive send claim that actually permits the owner
+    /// handoff, and that claim is what persists the monotonic `Routed` state
+    /// before the first transport await. An owner that is not available leaves
+    /// the record admitted, so a later attempt of the same parent operation may
+    /// still claim and issue it; nothing here is ever moved backward out of a
+    /// possible-effect contour, and a lost answer is armed by
     /// [`Self::mark_user_automation_obligation_unknown`] instead.
     fn mark_user_automation_obligation_admitted(
         &self,
@@ -1712,6 +1808,182 @@ impl KernelStoreGateway {
                     .to_owned(),
             )),
         }
+    }
+
+    /// Prepares one retained wake cancellation for its single owner handoff,
+    /// and reports the unresolved phases to return when it cannot.
+    ///
+    /// The durable advance to `Admitted` and the exclusive send claim are two
+    /// separate steps on purpose. The advance is a mechanical, idempotent
+    /// projection that still proves the owner was never handed the request;
+    /// the claim is what actually grants ownership, and it persists the
+    /// monotonic `Routed` state in the same ORS transaction. Issuing the
+    /// request requires both, and neither failure may issue an owner effect,
+    /// so both are reported as an unresolved handoff of the already committed
+    /// retirement under the original owner operation identity.
+    ///
+    /// Returns the phases the caller must return instead, or `None` when the
+    /// cancellation now holds its claim and may reach the owner.
+    fn claim_wake_cancellation_send(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        settled: &mut UserAutomationRuntimeObligation,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+        execution: &UserAutomationExecutionPhase,
+    ) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
+        // The retained record is admitted durably before the request leaves this
+        // boundary. The retirement replayed inside the join is a read of an
+        // already committed fact, so the only effect that request can carry is
+        // the cancellation, and it is the one the record now tracks.
+        if let Err(reason) = self.mark_user_automation_obligation_admitted(settled) {
+            return Some(unresolved_wake_cancellation(
+                settled,
+                obligations,
+                execution,
+                reason,
+            ));
+        }
+        // Exactly one caller may hand this cancellation to the owner. The claim
+        // is acquired before the first transport await and, in the same durable
+        // write, persists the monotonic `Routed` state, so a process death
+        // inside the await window cannot reload as re-issuable `Retained` work
+        // and a competing caller issues nothing at all.
+        self.claim_user_automation_send(sealed, settled)
+            .err()
+            .map(|reason| unresolved_wake_cancellation(settled, obligations, execution, reason))
+    }
+
+    /// Acquires the one exclusive, durable send claim of one retained
+    /// obligation before its owner effect is handed to the transport
+    /// (issue #2970).
+    ///
+    /// This is the existing ORS `HostRequest` claim seam, not a new outbox: the
+    /// claim is a `HostRequestAttempt` on the same row the obligation already
+    /// owns, and [`RedbRecoveryStore::claim_host_request_attempt`] performs the
+    /// whole acquisition in one ORS write transaction. Two guarantees come
+    /// from that single transaction rather than from this caller:
+    ///
+    /// - Acquisition is first-writer-wins. `Admitted` is the last state that
+    ///   still proves the owner was never handed the request, and exactly one
+    ///   caller can move the row out of it with a claimed attempt. A second
+    ///   caller's presented attempt never matches the durable one, so ORS
+    ///   retains the first attempt and fences the operation as `Unknown`
+    ///   instead of reissuing.
+    /// - The monotonic non-reissuable `Routed` state is persisted in that same
+    ///   transaction, before this function returns and therefore before the
+    ///   first transport await. A process death after this point reloads as a
+    ///   reconciling record, never as ordinary `Retained` work, and nothing is
+    ///   ever written between the claim and the routed state because they are
+    ///   one write.
+    ///
+    /// Ownership is then confirmed by CONTENT, not by the mere existence of a
+    /// claimed attempt or by a same-target `Routed` replay: the durable attempt
+    /// is compared against the exact attempt this caller presented, so only
+    /// the claim that actually won proceeds to the transport. A caller that
+    /// loses returns a closed reason and makes zero Host calls, and the
+    /// obligation is left for reconciliation under its original owner operation
+    /// identity instead.
+    fn claim_user_automation_send(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so no \
+                 exclusive send claim can be acquired"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let attempt = self.user_automation_send_claim_attempt(sealed, obligation)?;
+        let claimed = ors
+            .claim_host_request_attempt(&operation_id, &obligation.request_digest, &attempt)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the exclusive send claim could not be acquired: {error}"),
+                )
+            })?;
+        let Some(claimed) = claimed else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the retained obligation record disappeared before its exclusive send claim could \
+                 be acquired"
+                    .to_owned(),
+            ));
+        };
+        // The routed state and this caller's own claim are one durable write;
+        // anything else is a competing attempt, not ownership.
+        if claimed.state != HostRequestState::Routed || claimed.attempt.as_ref() != Some(&attempt) {
+            return Err(format!(
+                "the {} runtime obligation under owner operation identity {} was already claimed by \
+                 another caller, which is durably recorded as {:?} with a different attempt; no \
+                 owner effect was issued from this caller and the claim stays owned by its winner \
+                 for reconciliation",
+                obligation.kind.as_str(),
+                obligation.owner_operation_id,
+                claimed.state
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the exact ORS `HostRequestAttempt` one `UserAutomation` send claim
+    /// presents, bound by content to this obligation and to the live Kernel
+    /// route.
+    ///
+    /// `attempt.fence_digest` is the parent's own State Fence digest, the same
+    /// digest the staged row carries, so ORS's own `attempt.validate` refuses
+    /// a claim that does not belong to the record it is claiming. The owner
+    /// fields name the claiming Kernel generation, its authority session, and
+    /// this claim's unique launch identity, which is what makes two competing
+    /// claims distinguishable instead of interchangeable.
+    fn user_automation_send_claim_attempt(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<HostRequestAttempt, String> {
+        let fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
+        let claim_nonce = USER_AUTOMATION_SEND_CLAIM_NONCE
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .checked_add(1)
+            .ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "this process exhausted its send claim identity space, so a new claim identity \
+                     could not be minted",
+                )
+            })?;
+        let owner_connection_ref = obligation_label(
+            obligation,
+            format!(
+                "{}:{}:{}",
+                self.route.route_scope().as_str(),
+                self.route.active_generation().value(),
+                std::process::id()
+            ),
+        )?;
+        let owner_launch_nonce = obligation_label(
+            obligation,
+            format!("{USER_AUTOMATION_RUNTIME_CHANNEL}:{claim_nonce:016x}"),
+        )?;
+        Ok(HostRequestAttempt {
+            attempt_id: obligation_label(
+                obligation,
+                format!(
+                    "ua-obligation-send-claim:{}:{}:{claim_nonce:016x}",
+                    obligation.owner_operation_id, obligation.request_digest
+                ),
+            )?,
+            generation: sealed.context.state_fence.resource_generation.value(),
+            fence_digest,
+            owner_connection_ref,
+            owner_launch_nonce,
+            owner_session_epoch: self.route.authority_epoch().sequence.get(),
+            phase: HostRequestAttemptPhase::Claimed,
+        })
     }
 
     /// Arms the anti-blind-retry fence of one retained obligation after its owner
@@ -1780,14 +2052,7 @@ impl KernelStoreGateway {
                  non-negative duration",
                 )
             })?;
-        let fence_digest = canonical_json_bytes(&sealed.context.state_fence)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|error| {
-                unretained_obligation_reason(
-                    obligation,
-                    format!("the State Fence of the obligation could not be digested: {error}"),
-                )
-            })?;
+        let fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
         let payload_digest =
             runtime_obligation_payload_digest(&obligation.subject_ids).map_err(|error| {
                 unretained_obligation_reason(
@@ -1861,6 +2126,8 @@ impl KernelStoreGateway {
             attempt: None,
             result_digest: None,
             result_response: None,
+            result_evidence: None,
+            result_lineage: None,
             commit_order: 0,
         })
     }
@@ -1890,6 +2157,482 @@ impl KernelStoreGateway {
         Box::pin(UserAutomationService::new(&store).owner_execution_view(request, automation_id))
             .await
             .map_err(|error| error.to_string())
+    }
+
+    /// Reads the exact retained Governor Policy owner record from Store.
+    ///
+    /// This route deliberately accepts no handshake digest as snapshot data:
+    /// the Store record key, owner schema, canonical bytes, owner revision,
+    /// policy digest, embedded fence, and embedded revision must all correlate.
+    /// It is the single decoder of the `owner/policy` owner record: the daemon
+    /// trigger path calls this method rather than decoding the record a second
+    /// time, so the typed snapshot has one producer.
+    pub async fn read_user_automation_policy_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<ConfigPolicySnapshot, UserAutomationRuntimeError> {
+        let recovery = self
+            .read_user_automation_preflight_owner_snapshot(state_fence)
+            .await?;
+        Self::user_automation_policy_snapshot_from_recovery(&recovery, state_fence)
+    }
+
+    /// Decodes the B-owned complete config snapshot from one validated owner
+    /// recovery snapshot.
+    pub fn user_automation_policy_snapshot_from_recovery(
+        recovery: &StoreRecoverySnapshot,
+        state_fence: &StateFence,
+    ) -> Result<ConfigPolicySnapshot, UserAutomationRuntimeError> {
+        let record = recovery
+            .owner_records
+            .iter()
+            .find(|record| record.namespace == "owner" && record.key == "policy")
+            .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
+        if recovery.state_fence != *state_fence
+            || record.state_fence != *state_fence
+            || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let owner: UserAutomationPolicyOwnerSnapshotWire = serde_json::from_slice(&record.payload)
+            .map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "canonical Policy owner snapshot schema is invalid".to_owned(),
+                )
+            })?;
+        let canonical_owner = canonical_json_bytes(&owner).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot encoding failed: {error}"
+            ))
+        })?;
+        let snapshot_bytes = canonical_json_bytes(&owner.snapshot).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy snapshot encoding failed: {error}"
+            ))
+        })?;
+        owner.snapshot.validate().map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot is invalid: {error}"
+            ))
+        })?;
+        if canonical_owner != record.payload
+            || owner.state_fence != *state_fence
+            || owner.revision != record.revision
+            || owner.revision == 0
+            || owner.snapshot.state_fence != *state_fence
+            || owner.snapshot.revision.value() != owner.revision
+            || owner.policy_digest != sha256_hex(&snapshot_bytes)
+            || owner.policy_digest.len() != 64
+            || !owner
+                .policy_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(owner.snapshot)
+    }
+
+    /// Reads the canonical owner and Durable Job inputs for one `UserAutomation`
+    /// preflight at a single Store State Fence. This remains a mechanical
+    /// Kernel join: payloads stay opaque, but Store record identity, schema,
+    /// canonical bytes, and any embedded fence must agree before the caller
+    /// can use the readback as preflight evidence.
+    async fn read_user_automation_preflight_owner_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<StoreRecoverySnapshot, UserAutomationRuntimeError> {
+        state_fence
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let records = ["config", "policy", "task", "skill", "module_registry"]
+            .into_iter()
+            .map(|key| {
+                RecoveryRecordKey::new("owner", key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_records = records.iter().cloned().collect::<BTreeSet<_>>();
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records,
+            include_receipts: false,
+            include_jobs: true,
+        };
+        let recovery = self
+            .recovery(request)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        recovery
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let observed_records = recovery
+            .owner_records
+            .iter()
+            .map(RecoveryRecord::record_key)
+            .collect::<BTreeSet<_>>();
+        if recovery.state_fence != *state_fence
+            || recovery.canonical_scope.state_fence != *state_fence
+            || recovery.owner_records.len() != expected_records.len()
+            || observed_records != expected_records
+            || !recovery.receipts.is_empty()
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        for record in &recovery.owner_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, true)?;
+        }
+        for record in &recovery.job_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, false)?;
+        }
+        Ok(recovery)
+    }
+
+    /// Validates one preflight recovery record as opaque canonical bytes.
+    ///
+    /// Owner records must additionally carry the Governor owner snapshot
+    /// schema; every record must be canonical JSON and every embedded fence
+    /// must equal the request fence. Payloads are never interpreted here: the
+    /// policy snapshot decoder above is the only typed consumer.
+    fn validate_user_automation_preflight_record(
+        record: &RecoveryRecord,
+        state_fence: &StateFence,
+        owner_record: bool,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        record
+            .validate()
+            .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+        if record.state_fence != *state_fence
+            || (owner_record && record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA)
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&record.payload).map_err(|_| {
+            UserAutomationRuntimeError::Rejected(
+                "canonical UserAutomation preflight owner payload is invalid JSON".to_owned(),
+            )
+        })?;
+        let canonical = canonical_json_bytes(&payload).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical UserAutomation preflight owner encoding failed: {error}"
+            ))
+        })?;
+        if canonical != record.payload {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Self::validate_embedded_user_automation_fences(&payload, state_fence)
+    }
+
+    /// Requires every embedded fence in one owner payload to equal the request
+    /// fence, recursing through arrays and objects.
+    fn validate_embedded_user_automation_fences(
+        value: &serde_json::Value,
+        expected: &StateFence,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(fence_value) = fields.get("state_fence") {
+                    let observed: StateFence = serde_json::from_value(fence_value.clone())
+                        .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                    if &observed != expected {
+                        return Err(UserAutomationRuntimeError::IdentityConflict);
+                    }
+                }
+                for value in fields.values() {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Assembles the complete preflight projection for one committed `RunNow`
+    /// occurrence from its owner members.
+    ///
+    /// Joins the canonical owner revision and live state, the B-owned policy
+    /// snapshot, the committed Store receipt envelope, the complete owner
+    /// execution view, and — when the owner reports `blocked_config` — the last
+    /// owner-issued failure. Live evidence the Governor owners attest in their
+    /// own records (exact Tool Definitions, delivery capability, agent provider
+    /// observation) has no Kernel-side decoder: the Kernel keeps those payloads
+    /// opaque, so their absence is reported as the named missing owner rather
+    /// than synthesized. A paused or retired revision defers without consulting
+    /// that evidence; an active revision stays unadmitted until an owner issues
+    /// it. No model, provider, scheduler, or notification call is reachable
+    /// from this join.
+    async fn assemble_run_now_preflight_projection(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<UserAutomationPreflightProjection, RunNowPreflightAssembly> {
+        let state_fence = &sealed.context.state_fence;
+        if invocation.automation_id != owner.automation_id
+            || invocation.automation_revision != owner.revision.revision
+        {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "committed UserAutomation occurrence does not bind to the current owner revision"
+                    .to_owned(),
+            ));
+        }
+        let config_snapshot = self
+            .read_user_automation_policy_snapshot(state_fence)
+            .await
+            .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        let source_receipt = self
+            .read_run_now_source_envelope(sealed, invocation)
+            .await?;
+        let execution = self
+            .read_user_automation_owner_execution_view(sealed, &owner.automation_id)
+            .await
+            .map_err(RunNowPreflightAssembly::Unknown)?;
+        if execution.history_query_ref != owner.revision.execution_history_query_ref {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "owner execution view does not bind to the current owner revision".to_owned(),
+            ));
+        }
+        let failure = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => Some(
+                self.read_run_now_owner_failure(sealed, owner)
+                    .await?
+                    .ok_or_else(|| {
+                        RunNowPreflightAssembly::Unavailable(
+                            "the current owner configuration state is blocked_config but the \
+                             owner retains no owner-issued failure projection, so no preflight \
+                             decision can be reported"
+                                .to_owned(),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        // Live evidence below the Kernel decoding boundary. The run-now path
+        // issues no provider call before preflight, so the only honest provider
+        // observation here is none; the exact Tool Definitions and the delivery
+        // capability live in Governor-owned records the Kernel keeps opaque, so
+        // they arrive unattested. Assembly refuses an active revision on exactly
+        // those grounds; paused, retired and owner-failed revisions decide
+        // without consulting them.
+        let evidence = UserAutomationPreflightEvidence {
+            observed_provider_fingerprint: None,
+            trusted_tool_definition_refs: Vec::new(),
+            delivery_available: false,
+            failure,
+        };
+        if owner.current_configuration_state == UserAutomationConfigurationState::Active {
+            Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
+        }
+        UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
+            revision: &owner.revision,
+            configuration_state: owner.current_configuration_state,
+            config_snapshot: &config_snapshot,
+            source_receipt: &source_receipt,
+            execution: &execution,
+            invocation,
+            request_metadata: &sealed.context,
+            evidence: &evidence,
+        })
+        .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))
+    }
+
+    /// Requires the complete live evidence set an active revision admits.
+    ///
+    /// Each refusal names the owner that must issue the missing member: the
+    /// exact Tool Definitions and the delivery capability live in
+    /// Governor-owned records the Kernel keeps opaque, the agent provider
+    /// observation needs a provider-route observer this boundary does not have,
+    /// and unresolved prior effects belong to I14.21 reconciliation. The
+    /// deterministic closed world is enforced from the revision itself: no
+    /// provider observation, a deterministic-only policy, a clean capability
+    /// profile, and a non-model work class.
+    fn require_run_now_active_evidence(
+        owner: &UserAutomationOwnerSnapshot,
+        execution: &eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
+        evidence: &UserAutomationPreflightEvidence,
+    ) -> Result<(), RunNowPreflightAssembly> {
+        let revision = &owner.revision;
+        if execution.requires_reconciliation() {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "the committed occurrence has unresolved prior effects: their I14.21 \
+                 disposition belongs to the reconciliation owner, so no new admission is \
+                 attempted and the occurrence stays unadmitted"
+                    .to_owned(),
+            ));
+        }
+        if evidence.trusted_tool_definition_refs.is_empty() {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no owner-issued Tool Definition attestation is readable at the Kernel \
+                 preflight boundary: the exact trusted Tool Definitions live in the \
+                 Governor-owned skill/module records, which the Kernel keeps opaque, so \
+                 the committed occurrence stays unadmitted for a later owner-issued \
+                 submission to admit"
+                    .to_owned(),
+            ));
+        }
+        if !evidence.delivery_available {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no delivery-capability observation is readable at the Kernel preflight \
+                 boundary: whether the declared delivery target is currently capable is \
+                 attested by the notification owner, so the committed occurrence stays \
+                 unadmitted"
+                    .to_owned(),
+            ));
+        }
+        if revision.mode == UserAutomationExecutionMode::DeterministicProcess {
+            if evidence.observed_provider_fingerprint.is_some()
+                || !matches!(
+                    revision.provider_policy,
+                    ProviderFingerprintPolicy::DeterministicOnly
+                )
+                || revision.task.capability_profile.model_access
+                || revision.task.capability_profile.provider_access
+                || revision.task.capability_profile.automation_scheduling
+                || revision.work_class == AutomationWorkClass::ModelJobs
+            {
+                return Err(RunNowPreflightAssembly::Unavailable(
+                    "the revision violates the deterministic closed world: deterministic \
+                     mode admits no provider observation, a deterministic-only policy, a \
+                     capability profile without model, provider or scheduling access, and \
+                     a non-model work class"
+                        .to_owned(),
+                ));
+            }
+        } else if !revision
+            .provider_policy
+            .admits(evidence.observed_provider_fingerprint.as_ref())
+        {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no provider-route observer issues an observed fingerprint at the Kernel \
+                 preflight boundary: the run-now path makes no provider call before \
+                 preflight, so an agent revision whose policy admits only an observed \
+                 compatible set stays unadmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the committed `RunNow` Store receipt envelope that sources one
+    /// occurrence.
+    ///
+    /// The invocation provenance must bind the sealed parent identity exactly;
+    /// the receipt must be committed under the request fence and carry its
+    /// reconciliation envelope. A receipt the owner cannot prove is an unknown
+    /// disposition, never a missing fact.
+    async fn read_run_now_source_envelope(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<eliot_receipts::ReceiptEnvelope, RunNowPreflightAssembly> {
+        let unknown = |reason: &str| RunNowPreflightAssembly::Unknown(reason.to_owned());
+        let provenance = invocation
+            .require_run_now_provenance(&sealed.context.state_fence)
+            .map_err(|error| unknown(&error.to_string()))?;
+        if provenance.operation_id != sealed.identity.operation_id
+            || provenance.idempotency_key != sealed.identity.idempotency_key
+            || provenance.canonical_request_hash != sealed.identity.canonical_request_hash
+        {
+            return Err(unknown(
+                "committed UserAutomation occurrence does not bind to the sealed parent identity",
+            ));
+        }
+        let receipt = self
+            .receipt(
+                &sealed.context.state_fence,
+                sealed.identity.operation_id.clone(),
+            )
+            .await
+            .map_err(RunNowPreflightAssembly::Unknown)?
+            .ok_or_else(|| unknown("canonical UserAutomation Store receipt is not retained"))?;
+        receipt
+            .validate()
+            .map_err(|error| unknown(&error.to_string()))?;
+        if receipt.operation_id != sealed.identity.operation_id
+            || receipt.idempotency_key != sealed.identity.idempotency_key
+            || receipt.canonical_request_hash != sealed.identity.canonical_request_hash
+            || receipt.state_fence != sealed.context.state_fence
+        {
+            return Err(unknown(
+                "canonical UserAutomation Store receipt does not bind to the sealed parent identity",
+            ));
+        }
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(unknown(
+                "canonical UserAutomation Store operation is not committed",
+            ));
+        }
+        receipt
+            .require_reconciliation_envelope()
+            .cloned()
+            .map_err(|error| unknown(&error.to_string()))
+    }
+
+    /// Reads the last owner-issued failure projection for one automation.
+    ///
+    /// The read reuses the sealed parent identity and issues no transition, so
+    /// it mints no canonical identity. A failure the owner cannot prove is an
+    /// unknown disposition; no failure content is synthesized.
+    async fn read_run_now_owner_failure(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+    ) -> Result<
+        Option<eliot_kernel_core::user_automation::UserAutomationFailureProjection>,
+        RunNowPreflightAssembly,
+    > {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let response = Box::pin(UserAutomationService::new(&store).dispatch(
+            UserAutomationServiceRequest {
+                context: sealed.context.clone(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                identity: sealed.identity.clone(),
+                intent: UserAutomationOperatorIntent {
+                    intent_id: format!(
+                        "{}:run-now-preflight-last-failure",
+                        sealed.identity.operation_id.as_str()
+                    ),
+                    principal_ref: sealed.authenticated_principal.clone(),
+                    state_fence: sealed.context.state_fence.clone(),
+                    operation: UserAutomationOperation::InspectLastFailure {
+                        automation_id: owner.automation_id.clone(),
+                    },
+                },
+            },
+        ))
+        .await
+        .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        match response.outcome {
+            UserAutomationStoreOutcome::Read {
+                result:
+                    UserAutomationReadResult::InspectLastFailure {
+                        automation_id,
+                        revision,
+                        failure,
+                    },
+            } => {
+                if revision.revision != owner.revision.revision
+                    || revision.automation_id != owner.automation_id
+                    || automation_id != owner.automation_id
+                {
+                    return Err(RunNowPreflightAssembly::Unknown(
+                        "owner failure read does not bind to the current owner revision".to_owned(),
+                    ));
+                }
+                Ok(failure)
+            }
+            _ => Err(RunNowPreflightAssembly::Unknown(
+                "owner failure read did not return a failure projection".to_owned(),
+            )),
+        }
     }
 
     /// Seals the canonical request hash over the exact prepared transition.
@@ -2634,9 +3377,9 @@ impl KernelStoreGateway {
         .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
     }
 
-    /// Retains, routes and issues the wake cancellation of one committed
-    /// retirement under its durable owner operation identity, and returns the
-    /// wake phase the owner produced.
+    /// Retains, claims, routes and issues the wake cancellation of one
+    /// committed retirement under its durable owner operation identity, and
+    /// returns the wake phase the owner produced.
     ///
     /// The intent is staged under the ORIGINAL owner operation identity before
     /// the request leaves this boundary, so a response loss at the wake owner or
@@ -2645,6 +3388,17 @@ impl KernelStoreGateway {
     /// the earlier read and this staging is the concurrent attempt of the same
     /// parent operation: its retained disposition is honoured and nothing is
     /// issued.
+    ///
+    /// The cancellation is then handed to the owner under ONE exclusive durable
+    /// send claim acquired before the first transport await (issue #2970). That
+    /// claim is what makes the handoff single-owner rather than merely
+    /// single-request: two concurrent attempts of the same parent operation
+    /// yield at most one owner handoff, because the second one fails to acquire
+    /// the claim and issues nothing. The claim also persists the monotonic
+    /// `Routed` state in the same transaction, so a crash anywhere inside the
+    /// await window leaves a non-reissuable reconciling record under the
+    /// ORIGINAL owner operation identity rather than ordinary `Retained` work
+    /// that a later attempt would blindly reissue.
     async fn issue_retirement_cancellation<R>(
         &self,
         handoff: OwnerWakeHandoffKind,
@@ -2674,16 +3428,10 @@ impl KernelStoreGateway {
             obligations.push(settled);
             return Ok(phases);
         }
-        // The retained record is admitted durably before the request leaves this
-        // boundary. The retirement replayed inside the join below is a read of an
-        // already committed fact, so the only effect that request can carry is
-        // the cancellation, and it is the one the record now tracks.
-        if let Err(reason) = self.mark_user_automation_obligation_admitted(&settled) {
-            settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
-                reason: reason.clone(),
-            };
-            obligations.push(settled);
-            return Ok(unresolved_retirement_phases(reason, execution));
+        if let Some(phases) =
+            self.claim_wake_cancellation_send(sealed, &mut settled, obligations, &execution)
+        {
+            return Ok(phases);
         }
         let removal = match self
             .cancel_retirement_wakes(
@@ -2697,44 +3445,14 @@ impl KernelStoreGateway {
             .await
         {
             Ok(removal) => removal,
-            // The retirement is committed and durable, so a refusal at this leg
-            // is an unresolved handoff of a committed fact. It is reported as
-            // such, with the exact refusal, instead of being reported as a failed
-            // retirement or as a cancellation that did not happen. Only a lost
-            // owner answer leaves a possibly issued effect: every other refusal
-            // happened before the cancellation left this boundary, so the
-            // obligation stays re-issuable under its retained identity.
-            Err((error, owner_answered_unknown)) => {
-                if owner_answered_unknown
-                    && let Err(arm) = self.mark_user_automation_obligation_unknown(&settled)
-                {
-                    settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
-                        reason: arm.clone(),
-                    };
-                    obligations.push(settled);
-                    return Ok(unresolved_retirement_phases(arm, execution));
-                }
-                settled.disposition = if owner_answered_unknown {
-                    UserAutomationRuntimeObligationDisposition::Reconciling {
-                        reason: unretained_cancellation_outcome_reason(
-                            &revision.revision,
-                            &settled.owner_operation_id,
-                            &error.to_string(),
-                        ),
-                    }
-                } else {
-                    UserAutomationRuntimeObligationDisposition::Retained
-                };
-                obligations.push(settled);
-                return Ok(unresolved_retirement_phases(
-                    format!(
-                        "revision {} of {} is {}, but its unadmitted wakes were not cancelled from \
-                         the complete owner view: {}; the not-yet-admitted wakes and the exact \
-                         unresolved reconciliation references of this revision are preserved and \
-                         stay open",
-                        revision.revision, revision.automation_id, noun, error
-                    ),
-                    execution,
+            Err(refusal) => {
+                return Ok(self.refused_claimed_cancellation(
+                    refusal,
+                    &revision,
+                    noun,
+                    &mut settled,
+                    obligations,
+                    &execution,
                 ));
             }
         };
@@ -2782,6 +3500,61 @@ impl KernelStoreGateway {
             UserAutomationWakePhase::Cancelled { cancelled_wake_ids },
             execution,
         ))
+    }
+
+    /// Reports one refused wake cancellation that already held the exclusive
+    /// send claim, and returns the phases its caller must return.
+    ///
+    /// The retirement is committed and durable, so a refusal at this leg is an
+    /// unresolved handoff of a committed fact. It is reported as such, with the
+    /// exact refusal, instead of being reported as a failed retirement or as a
+    /// cancellation that did not happen. The exclusive send claim is already
+    /// durable, so no arm here may report the obligation as still re-issuable:
+    /// a claim that survived the attempt to hand the request over can only be
+    /// settled by exact owner reconciliation under the original owner
+    /// operation identity.
+    #[allow(clippy::too_many_arguments)]
+    fn refused_claimed_cancellation(
+        &self,
+        refusal: (UserAutomationExecutionError, bool),
+        revision: &UserAutomationRevision,
+        noun: &str,
+        settled: &mut UserAutomationRuntimeObligation,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+        execution: &UserAutomationExecutionPhase,
+    ) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+        let (error, owner_answered_unknown) = refusal;
+        if owner_answered_unknown
+            && let Err(arm) = self.mark_user_automation_obligation_unknown(settled)
+        {
+            return unresolved_wake_cancellation(settled, obligations, execution, arm);
+        }
+        let reason = if owner_answered_unknown {
+            unretained_cancellation_outcome_reason(
+                &revision.revision,
+                &settled.owner_operation_id,
+                &error.to_string(),
+            )
+        } else {
+            claimed_cancellation_outcome_reason(
+                &revision.revision,
+                &settled.owner_operation_id,
+                &error.to_string(),
+            )
+        };
+        settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+            reason: reason.clone(),
+        };
+        obligations.push(settled.clone());
+        unresolved_retirement_phases(
+            format!(
+                "revision {} of {} is {}, but its unadmitted wakes were not cancelled from the \
+                 complete owner view: {}; the not-yet-admitted wakes and the exact unresolved \
+                 reconciliation references of this revision are preserved and stay open",
+                revision.revision, revision.automation_id, noun, error
+            ),
+            execution.clone(),
+        )
     }
 
     /// Issues the wake cancellation of one committed retirement-like transition
@@ -3213,6 +3986,17 @@ impl KernelStoreGateway {
         }
     }
 
+    fn run_now_defer_reason(
+        state: UserAutomationConfigurationState,
+    ) -> Option<UserAutomationDeferReason> {
+        match state {
+            UserAutomationConfigurationState::Paused => Some(UserAutomationDeferReason::Paused),
+            UserAutomationConfigurationState::Retired => Some(UserAutomationDeferReason::Retired),
+            UserAutomationConfigurationState::Active
+            | UserAutomationConfigurationState::BlockedConfig => None,
+        }
+    }
+
     /// Completes the `RunNow` handoff: exact committed/replayed invocation
     /// readback, current owner projection, and the owner readback of the wake
     /// for that exact occurrence over the authenticated runtime channel.
@@ -3235,18 +4019,136 @@ impl KernelStoreGateway {
         let occurrence_id = invocation
             .occurrence_identity()
             .map_err(|error| error.to_string())?;
-        // Exact committed/replayed invocation readback. The persisted document
-        // is compared with the answer of this very identity, so a replayed Store
-        // mutation resumes the same occurrence and can never mint a second
-        // manual nonce or a second occurrence.
+        let (owner, invocation) = self
+            .read_run_now_owner(
+                sealed,
+                invocation,
+                automation_id,
+                automation_revision,
+                &occurrence_id,
+            )
+            .await?;
+        // The canonical owner can decide paused and retired admissions without
+        // a Host wake or provider observation. Report that real disposition
+        // even when no runtime channel is composed, and leave an admitted job
+        // and its history untouched.
+        let defer_reason = Self::run_now_defer_reason(owner.current_configuration_state);
+        // An active or blocked revision still needs the remaining owner
+        // preflight evidence. The committed configuration phase stays visible
+        // beside that disposition, never as a failed commit.
+        let Some(runtime) = runtime else {
+            return Ok((
+                UserAutomationWakePhase::Unavailable {
+                    reason: unproven_wake_channel_reason(),
+                },
+                match defer_reason {
+                    Some(reason) => UserAutomationExecutionPhase::Deferred { reason },
+                    None => UserAutomationExecutionPhase::Unavailable {
+                        reason: unproven_execution_channel_reason(),
+                    },
+                },
+            ));
+        };
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+            Ok(readback) => UserAutomationWakePhase::Published { readback },
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: error.to_string(),
+            },
+        };
+        if let Some(reason) = defer_reason {
+            return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
+        }
+        // The committed occurrence joins the existing Durable Job execution
+        // path through deterministic preflight: the complete projection is
+        // assembled from the live owners, the service runs the model-free
+        // preflight, and an admitted occurrence reaches the Durable Job owner
+        // over the composed runtime channel. Without a proven pending wake
+        // there is no occurrence to join, so the execution stays unavailable
+        // beside the unresolved wake instead of inventing an admission.
+        let UserAutomationWakePhase::Published { readback } = &wake else {
+            return Ok((
+                wake,
+                UserAutomationExecutionPhase::Unavailable {
+                    reason: unproven_run_now_wake_reason(&occurrence_id),
+                },
+            ));
+        };
+        let wake_intent = readback.intent.clone();
+        let projection = match self
+            .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
+            .await
+        {
+            Ok(projection) => projection,
+            Err(RunNowPreflightAssembly::Unknown(reason)) => return Err(reason),
+            Err(RunNowPreflightAssembly::Unavailable(reason)) => {
+                return Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }));
+            }
+        };
+        // The blocked fingerprint is retained before the execution join moves
+        // the projection: a blocked decision the notification owner cannot be
+        // reached for must still name its deterministic failure class instead
+        // of collapsing into an unattributed error.
+        let blocked_fingerprint = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => projection
+                .failure
+                .as_ref()
+                .map(|failure| failure.failure_fingerprint.clone()),
+            _ => None,
+        };
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let outcome = UserAutomationService::new(&store)
+            .execute_occurrence(
+                UserAutomationExecutionRequest {
+                    context: sealed.context.clone(),
+                    authenticated_principal: sealed.authenticated_principal.clone(),
+                    identity: sealed.identity.clone(),
+                    invocation: invocation.clone(),
+                    projection,
+                    wake_intent,
+                },
+                runtime,
+            )
+            .await;
+        Self::project_run_now_execution_outcome(
+            wake,
+            outcome,
+            owner.current_configuration_state,
+            blocked_fingerprint,
+            &occurrence_id,
+        )
+    }
+
+    /// Re-proves one committed `RunNow` occurrence against the live owner.
+    ///
+    /// The exact committed/replayed invocation readback is compared with the
+    /// answer of this very identity, so a replayed Store mutation resumes the
+    /// same occurrence and can never mint a second manual nonce or a second
+    /// occurrence; the current owner revision must then bind the same
+    /// automation, revision, and authenticated principal.
+    async fn read_run_now_owner(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        committed: &UserAutomationInvocation,
+        automation_id: &str,
+        automation_revision: &str,
+        occurrence_id: &str,
+    ) -> Result<(UserAutomationOwnerSnapshot, UserAutomationInvocation), String> {
         let persisted = self
             .read_user_automation_invocation(
                 &sealed.context.state_fence,
                 automation_id,
-                &occurrence_id,
+                occurrence_id,
             )
             .await?;
-        if persisted != *invocation {
+        if persisted != *committed {
             return Err(
                 "committed UserAutomation occurrence does not match the canonical invocation readback"
                     .to_owned(),
@@ -3269,54 +4171,59 @@ impl KernelStoreGateway {
                     .to_owned(),
             );
         }
-        // The current configuration state is the owner's admission fact. A
-        // paused, retired or blocked owner admits no occurrence, so no wake or
-        // Durable Job owner is asked. The committed configuration phase stays
-        // visible: an unadmitted occurrence is reported as such, never as a
-        // failed commit.
-        if owner.current_configuration_state != UserAutomationConfigurationState::Active {
-            return Ok((
-                UserAutomationWakePhase::NotApplicable {
-                    reason: unadmitted_wake_reason(
-                        automation_id,
-                        automation_revision,
-                        owner.current_configuration_state,
-                    ),
+        Ok((owner, persisted))
+    }
+
+    /// Projects one `RunNow` execution join into its transition phases.
+    ///
+    /// An admitted occurrence reaches the Durable Job owner; a deferred one
+    /// carries its owner reason; a blocked one carries its deterministic
+    /// failure fingerprint. An unreachable runtime owner leaves the occurrence
+    /// unadmitted beside its named reason, except for a blocked decision the
+    /// notification owner cannot be reached for, which stays unknown under its
+    /// failure fingerprint instead of collapsing into an unattributed error.
+    /// Any other join failure is an unknown disposition: an owner may already
+    /// have effected it.
+    fn project_run_now_execution_outcome(
+        wake: UserAutomationWakePhase,
+        outcome: Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>,
+        configuration_state: UserAutomationConfigurationState,
+        blocked_fingerprint: Option<String>,
+        occurrence_id: &str,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
+        match outcome {
+            Ok(UserAutomationExecutionOutcome::Admitted { execution, .. }) => Ok((
+                wake,
+                UserAutomationExecutionPhase::Admitted {
+                    execution: Box::new(execution),
                 },
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unadmitted_execution_reason(
-                        &occurrence_id,
-                        owner.current_configuration_state,
-                    ),
+            )),
+            Ok(UserAutomationExecutionOutcome::Deferred { reason, .. }) => {
+                Ok((wake, UserAutomationExecutionPhase::Deferred { reason }))
+            }
+            Ok(UserAutomationExecutionOutcome::BlockedConfig { failure, .. }) => Ok((
+                wake,
+                UserAutomationExecutionPhase::BlockedConfig {
+                    failure_fingerprint: failure.failure_fingerprint,
                 },
-            ));
+            )),
+            Err(UserAutomationExecutionError::Runtime(
+                UserAutomationRuntimeError::Unavailable(reason),
+            )) => {
+                if configuration_state == UserAutomationConfigurationState::BlockedConfig
+                    && let Some(fingerprint) = blocked_fingerprint
+                {
+                    return Err(format!(
+                        "occurrence {occurrence_id} is blocked_config under failure \
+                         fingerprint {fingerprint}, decided before any model call, but the \
+                         failure-history and notification owners are not reachable from the \
+                         operator route: {reason}"
+                    ));
+                }
+                Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }))
+            }
+            Err(error) => Err(error.to_string()),
         }
-        let Some(runtime) = runtime else {
-            return Ok((
-                UserAutomationWakePhase::Unavailable {
-                    reason: unproven_wake_channel_reason(),
-                },
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unproven_execution_channel_reason(),
-                },
-            ));
-        };
-        let wake_request = run_now_wake_read_request(
-            sealed.context.clone(),
-            sealed.authenticated_principal.clone(),
-            sealed.identity.clone(),
-            invocation.clone(),
-        );
-        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
-            Ok(readback) => UserAutomationWakePhase::Published { readback },
-            Err(error) => UserAutomationWakePhase::UnknownOutcome {
-                reason: error.to_string(),
-            },
-        };
-        let execution = UserAutomationExecutionPhase::Unavailable {
-            reason: unproven_durable_job_material_reason(&occurrence_id, automation_revision),
-        };
-        Ok((wake, execution))
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
@@ -3467,14 +4374,34 @@ impl KernelStoreGateway {
     /// mutation send. The retained record keeps its original operation and
     /// fence data; only the new recovery request is authenticated under
     /// current authority.
+    ///
+    /// ## The typed answer reaches the caller (issue #2764 item 6)
+    ///
+    /// The error type is [`DreamerJobGatewayError`], not `String`. A settled
+    /// recovery leg returns [`DreamerJobGatewayError::Uncertain`] carrying the
+    /// [`DreamerCommitUncertain`] value itself, so the caller receives the
+    /// original operation/key, the exact recorded outcome, the receipt evidence
+    /// digest, and the remaining `Status`/`Reconcile` ledger-read obligation as
+    /// values it can branch on. A `WriteReceipt` proves a mutation disposition,
+    /// never the missing `DurableJobResponse`, so no terminal state is reduced
+    /// to an ambiguous success. Every non-recovery refusal keeps its own variant
+    /// too: [`DreamerJobGatewayError::Commit`] holds the whole
+    /// [`CommitRecoveryError`] set and [`DreamerJobGatewayError::GatewayRefusal`]
+    /// holds this route's pre-existing gate text unchanged, so the only string
+    /// conversion left is the caller's own frame projection.
     pub async fn dreamer_job(
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String> {
-        let _flight = self.flight.enter()?;
+    ) -> Result<DurableJobResponse, DreamerJobGatewayError> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(DreamerJobGatewayError::GatewayRefusal)?;
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
         // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
         // write. The gate reuses this module's own
@@ -3484,86 +4411,28 @@ impl KernelStoreGateway {
         // recovery state is read and before the retained-commit
         // classification, so a shadow candidate cannot stage, classify or
         // reconcile a mutation.
-        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
-            self.refuse_shadow_mutation()?;
-        }
-        context.validate().map_err(|error| error.to_string())?;
-        request.validate().map_err(|error| error.to_string())?;
-        if !request.role.permits(request.operation.kind()) {
-            return Err("dreamer job caller role does not permit the operation".to_owned());
-        }
-        self.validate_active_route(&context.state_fence)?;
-        if request.request_identity.operation.state_fence != context.state_fence {
-            return Err("dreamer job request fence does not match request metadata".to_owned());
-        }
-        // I14.21 (#1690) write-attempt identity: the admitted Dreamer mutation
-        // identity, taken from the stable operation binding only. Fresh
-        // transport correlation never enters it, so a retry under the same
-        // identity always reuses this record.
-        let identity = OperationIdentity {
-            operation_id: request.request_identity.operation.operation_id.clone(),
-            idempotency_key: request.request_identity.operation.idempotency_key.clone(),
-            canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
-        };
-        let scope_proof = dreamer_ordering_scope_proof(&request);
-        let effect = dreamer_operation_effect(&request.operation);
-
-        // Durable recovery state must be available for mutating work even
-        // when the local scope vector is empty (#2763). A permitted read and
-        // the exact receipt lookup stay available: I14.24 keeps read-only
-        // inspection and independent noncanonical work alive.
-        if effect == DreamerOperationEffect::Mutation
-            && let Some(limitation) = self.pause_observation_limitation()
-        {
-            return Err(limitation);
-        }
-
-        // Retained state is classified before new-send admission (#2764).
-        // An unreadable record is not absent: `classify_retained_commit`
-        // returns the typed ORS failure instead.
-        let retained = classify_retained_commit(self.commit_ors.as_deref(), &identity)
-            .map_err(|error| error.to_string())?;
-        let mut retried_under_retained_record = false;
-        if let Some(record) = match &retained {
-            RetainedCommitState::Absent => None,
-            RetainedCommitState::Open { record } | RetainedCommitState::Terminal { record } => {
-                Some(record)
-            }
-        } {
-            match self
-                .reconcile_retained_dreamer_operation(&identity, &scope_proof.scopes, record)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                DreamerRetainedOutcome::Settled(answer) => return Err(answer.to_string()),
-                DreamerRetainedOutcome::SameIdentityRetryPermitted => {
-                    // A proven noncommit whose resubmission policy allows the
-                    // same identity again, observed while the record is still
-                    // open. The record therefore keeps owning this retry: it
-                    // is not resolved first, so the terminal-state invariant
-                    // is not bypassed. Falling through re-enters current
-                    // normal admission and the other-key pause check below
-                    // before exactly one bounded same-identity send, keeping
-                    // the original operation, content, authorized effect and
-                    // retry budget. This leg issued zero mutation sends: the
-                    // receipt query above is a pure read and is not counted
-                    // as another attempt.
-                    retried_under_retained_record = true;
-                }
-            }
-        }
+        let (identity, scope_proof, effect) = self.admit_dreamer_operation(context, &request)?;
+        // `true` means this operation is making its ONE bounded same-identity
+        // retry under a still-open retained record; `false` means no retained
+        // state existed. A retained state that has already been reached and
+        // settled never returns here — that answer leaves as the typed
+        // `DreamerJobGatewayError::Uncertain` instead.
+        let retried_under_retained_record = self
+            .reach_retained_dreamer_recovery(&identity, &scope_proof, effect)
+            .await?;
 
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            let service = self.service.lock().map_err(|_| {
+                DreamerJobGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
-                return Err("Kernel generation is fenced".to_owned());
+                return Err(DreamerJobGatewayError::GatewayRefusal(
+                    "Kernel generation is fenced".to_owned(),
+                ));
             }
             let lease = service
                 .acquire_admission()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
             // Slices A+B (#65): Dreamer-job Store admission rides the typed
             // `NORMAL_WORKLOAD` normal lease; protected work stays on
             // `acquire_protected_control`. See
@@ -3571,12 +4440,16 @@ impl KernelStoreGateway {
             // NOT ride this normal lease, so exhausted normal capacity cannot
             // make an admitted operation's own recovery unreachable.
             if lease.authority_epoch() != context.state_fence.authority_epoch {
-                return Err("dreamer job route authority epoch is stale".to_owned());
+                return Err(DreamerJobGatewayError::GatewayRefusal(
+                    "dreamer job route authority epoch is stale".to_owned(),
+                ));
             }
             lease
         };
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
         // Checked pause gate (#2763). The owner is observed here, after
         // admission and immediately before the send, so a pause published
@@ -3588,11 +4461,11 @@ impl KernelStoreGateway {
         if effect == DreamerOperationEffect::Mutation {
             let observed = self.paused_scopes.observe(self.commit_ors.as_deref());
             if let Some(error) = observed.unavailable_error() {
-                return Err(error.to_string());
+                return Err(error.into());
             }
             if let Some(refusal) = dreamer_pause_refusal(&observed, &identity, &scope_proof, effect)
             {
-                return Err(refusal);
+                return Err(refusal.into());
             }
         }
         let result = match self.store.dreamer_job_recovery(context, request).await {
@@ -3603,18 +4476,25 @@ impl KernelStoreGateway {
                 // A ledger `Status` alone could never settle it.
                 if retried_under_retained_record {
                     self.settle_after_same_identity_retry(&identity, &scope_proof.scopes)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await?;
                 }
                 Ok(response)
             }
-            Err(DreamerCommitEvidence::Refused(error)) => Err(error.to_string()),
-            Err(DreamerCommitEvidence::Reconciled(receipt)) => Err(self
-                .reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?
-                .to_string()),
-            Err(DreamerCommitEvidence::Unknown) => Err(self
-                .preserve_dreamer_operation(&identity, &scope_proof.scopes)?
-                .to_string()),
+            Err(DreamerCommitEvidence::Refused(error)) => {
+                Err(DreamerJobGatewayError::GatewayRefusal(error.to_string()))
+            }
+            // Both arms below answer with the *typed* recovered outcome when the
+            // commit is settled, and `?` carries the typed recovery error when it
+            // is not. Neither the exact disposition nor the failure that kept
+            // it unsettled is rendered to text here.
+            Err(DreamerCommitEvidence::Reconciled(receipt)) => {
+                Err(DreamerJobGatewayError::Uncertain(
+                    self.reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?,
+                ))
+            }
+            Err(DreamerCommitEvidence::Unknown) => Err(DreamerJobGatewayError::Uncertain(
+                self.preserve_dreamer_operation(&identity, &scope_proof.scopes)?,
+            )),
         };
         drop(lease);
         result
@@ -3622,11 +4502,139 @@ impl KernelStoreGateway {
 
     /// Returns the typed refusal when durable recovery state is unavailable,
     /// or `None` when a complete observation is available.
-    fn pause_observation_limitation(&self) -> Option<String> {
+    fn pause_observation_limitation(&self) -> Option<CommitRecoveryError> {
         self.paused_scopes
             .observe(self.commit_ors.as_deref())
             .unavailable_error()
-            .map(|error| error.to_string())
+    }
+
+    /// Runs every Dreamer gate that precedes any retained-state work and
+    /// returns the admitted identity, its proven Ordering Scope set, and its
+    /// owner effect class (issue #2764 items 1 and 6).
+    ///
+    /// The order here is load-bearing. The `shadow_no_authority` refusal, the
+    /// two contract validations, the presented-role projection, the active-route
+    /// check and the fence-equality join all run before anything is read from
+    /// durable state, and the contract-recomputed canonical request hash
+    /// (`verify_dreamer_canonical_request_hash`, I5.27) runs last among them:
+    /// a spelled hash is refused before the retained state is classified,
+    /// before a receipt is queried, and before any send is authorized, so a
+    /// caller-spelled identity can never reach recovery. The digest that leaves
+    /// this function is the contract-derived one, and it is what the identity
+    /// carries into retained-state comparison — not the string the caller
+    /// presented.
+    fn admit_dreamer_operation(
+        &self,
+        context: &RequestMeta,
+        request: &DurableJobRequest,
+    ) -> Result<
+        (
+            OperationIdentity,
+            DreamerOrderingScopeProof,
+            DreamerOperationEffect,
+        ),
+        DreamerJobGatewayError,
+    > {
+        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
+            self.refuse_shadow_mutation()
+                .map_err(DreamerJobGatewayError::GatewayRefusal)?;
+        }
+        context
+            .validate()
+            .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
+        if !request.role.permits(request.operation.kind()) {
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "dreamer job caller role does not permit the operation".to_owned(),
+            ));
+        }
+        self.validate_active_route(&context.state_fence)
+            .map_err(DreamerJobGatewayError::GatewayRefusal)?;
+        if request.request_identity.operation.state_fence != context.state_fence {
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "dreamer job request fence does not match request metadata".to_owned(),
+            ));
+        }
+        // Durable recovery state must be available for mutating work even when
+        // the local scope vector is empty (#2763). A permitted read and the
+        // exact receipt lookup stay available: I14.24 keeps read-only
+        // inspection and independent noncanonical work alive.
+        let effect = dreamer_operation_effect(&request.operation);
+        if effect == DreamerOperationEffect::Mutation
+            && let Some(error) = self.pause_observation_limitation()
+        {
+            return Err(error.into());
+        }
+        // I14.21 (#1690) write-attempt identity: the admitted Dreamer mutation
+        // identity, taken from the stable operation binding only. Fresh
+        // transport correlation never enters it, so a retry under the same
+        // identity always reuses this record. Its canonical request hash is the
+        // contract-recomputed one, not caller spelling (I5.27, #2764 item 1).
+        let identity = OperationIdentity {
+            operation_id: request.request_identity.operation.operation_id.clone(),
+            idempotency_key: request.request_identity.operation.idempotency_key.clone(),
+            canonical_request_hash: verify_dreamer_canonical_request_hash(request)?,
+        };
+        Ok((identity, dreamer_ordering_scope_proof(request), effect))
+    }
+
+    /// Reaches this operation's own retained commit evidence before the
+    /// normal scope-pause gate (issue #2764).
+    ///
+    /// Returns `Ok(true)` when the caller may make its one bounded
+    /// same-identity retry under the still-open retained record, and `Ok(false)`
+    /// when no retained state exists and the new-send path applies. A retained
+    /// state that has been *reached* leaves as the typed
+    /// [`DreamerJobGatewayError::Uncertain`] answer instead, so the caller
+    /// receives the recorded outcome and evidence as values.
+    ///
+    /// An unreadable record is never absent: [`classify_retained_commit`]
+    /// returns the typed ORS failure rather than an empty answer, and the
+    /// comparison runs against the operation's own proven scope set — the exact
+    /// set the record was staged with — so a record that paused a different
+    /// scope set is a conflict at classification time.
+    async fn reach_retained_dreamer_recovery(
+        &self,
+        identity: &OperationIdentity,
+        scope_proof: &DreamerOrderingScopeProof,
+        effect: DreamerOperationEffect,
+    ) -> Result<bool, DreamerJobGatewayError> {
+        let retained =
+            classify_retained_commit(self.commit_ors.as_deref(), identity, &scope_proof.scopes)?;
+        let record = match &retained {
+            RetainedCommitState::Absent => return Ok(false),
+            RetainedCommitState::Open { record } | RetainedCommitState::Terminal { record } => {
+                record
+            }
+        };
+        // The typed answer is the caller-facing report. It travels as itself so
+        // the caller can act on the distinction between a reconciled commit, a
+        // preserved earlier disposition, a disposition whose pause release is
+        // incomplete, and a still-open Problem State. The obligation it names —
+        // a ledger `Status`/`Reconcile` read — is why this can never be
+        // reported as a completed operation.
+        match self
+            .reconcile_retained_dreamer_operation(identity, &scope_proof.scopes, record)
+            .await?
+        {
+            DreamerRetainedOutcome::Settled(answer) => {
+                Err(DreamerJobGatewayError::Uncertain(answer))
+            }
+            // A proven noncommit whose resubmission policy allows the same
+            // identity again, observed while the record is still open. The
+            // record keeps owning this retry: it is not resolved first, so the
+            // terminal-state invariant is not bypassed. Falling through re-enters
+            // current normal admission and the other-key pause check for exactly
+            // one bounded same-identity send, keeping the original operation,
+            // content, authorized effect and retry budget. This leg issued zero
+            // mutation sends: the receipt query is a pure read and is not
+            // counted as another attempt.
+            DreamerRetainedOutcome::SameIdentityRetryPermitted => {
+                Ok(effect == DreamerOperationEffect::Mutation)
+            }
+        }
     }
 
     /// Resolves the still-open record a same-identity retry was made under.
@@ -3910,10 +4918,12 @@ impl KernelStoreGateway {
     /// Commits the durable disposition for a retained operation that has now
     /// reached receipt evidence, and reports the reconciled result.
     ///
-    /// The disposition path renders its own typed variant to text, so the
-    /// conversion at this typed seam is made here, visibly, with that exact
-    /// rendering becoming the cause, rather than through a blanket
-    /// string-to-typed collapse.
+    /// The disposition path reports its own typed variant, so a durable commit
+    /// that cannot be recorded is composed here into the same
+    /// [`CommitRecoveryError::OrsUnavailable`] the other disposition sites use,
+    /// naming the retained key. No blanket `From<String>` conversion is
+    /// introduced for this seam: the reported variant still leaves here as the
+    /// [`DreamerCommitUncertain`] value, not as rendered text.
     fn commit_retained_disposition(
         &self,
         identity: &OperationIdentity,
@@ -3966,14 +4976,14 @@ impl KernelStoreGateway {
         identity: &OperationIdentity,
         ordering_scopes: &[String],
         receipt: &WriteReceipt,
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         // The one full operation/key/hash verifier runs at this adoption. The
         // previous entry compared only the receipt's idempotency key, which let
         // a receipt for a different operation sharing that key reach the
         // durable record; operation id and canonical request hash are compared
         // here too, so another attempt's receipt is never adopted as this
         // operation's evidence however it was observed.
-        verify_receipt_binding(receipt, identity).map_err(|error| error.to_string())?;
+        verify_receipt_binding(receipt, identity)?;
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -3981,15 +4991,17 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
         let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
         if let Some(record) = staged {
             // A retained record is binding-verified before anything else, so a
             // terminal record for a different operation under this key is a
-            // conflict rather than a shortcut to "already dispositioned".
-            verify_retained_binding(&record, identity).map_err(|error| error.to_string())?;
+            // conflict rather than a shortcut to "already dispositioned". The
+            // presented set is this operation's own proven scope set, which is
+            // the set the record was staged with, so a record that paused a
+            // different scope set is a conflict here too.
+            verify_retained_binding(&record, identity, ordering_scopes)?;
             if record.outcome.is_some() {
                 let outcome = match classify_commit_receipt(receipt) {
                     CommitRecoveryClass::Committed => UnknownCommitOutcome::Committed,
@@ -3999,16 +5011,14 @@ impl KernelStoreGateway {
                 let evidence_receipt_digest = receipt_evidence_digest(receipt);
                 // A wrong receipt or a changed terminal digest cannot resolve
                 // the record: it is rejected and the recorded history stands.
-                verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)
-                    .map_err(|error| error.to_string())?;
+                verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)?;
                 return match self.release_dreamer_scopes(&record) {
                     // The terminal disposition stands and the recorded
                     // outcome is preserved; only the pause release is
                     // incomplete, and that is stated rather than hidden.
                     PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
                         let (recorded_outcome, recorded_digest) =
-                            retained_terminal_evidence(key, &record)
-                                .map_err(|error| error.to_string())?;
+                            retained_terminal_evidence(key, &record)?;
                         Ok(DreamerCommitUncertain::ReconciledWithRefreshLimitation {
                             idempotency_key: key.to_owned(),
                             outcome: recorded_outcome,
@@ -4052,7 +5062,7 @@ impl KernelStoreGateway {
         ordering_scopes: &[String],
         outcome: UnknownCommitOutcome,
         evidence_receipt_digest: &str,
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -4060,14 +5070,11 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
-        let record =
-            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        let record = open_record_for(identity, ordering_scopes)?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
-        let resolution = resolve_open_record(ors, key, outcome, evidence_receipt_digest)
-            .map_err(|error| error.to_string())?;
+        let resolution = resolve_open_record(ors, key, outcome, evidence_receipt_digest)?;
         // The durable record is read back through the resolution so the report
         // below is backed by what ORS actually holds, not by what this leg
         // intended to write.
@@ -4128,7 +5135,7 @@ impl KernelStoreGateway {
         &self,
         identity: &OperationIdentity,
         ordering_scopes: &[String],
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -4136,21 +5143,25 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
         let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
         if let Some(record) = staged {
-            verify_retained_binding(&record, identity).map_err(|error| error.to_string())?;
+            // The presented set is this operation's own proven scope set — the
+            // same set the record was staged with — so a record that paused a
+            // different scope set is a conflict, not a shortcut to "already
+            // dispositioned".
+            verify_retained_binding(&record, identity, ordering_scopes)?;
             if record.outcome.is_some() {
                 // A resolved record never reopens: the earlier evidence-backed
                 // disposition stands, so this leg neither restages the record nor
-                // pauses an Ordering Scope for a key that is already closed.
+                // pauses an Ordering Scope for a key that is already closed. The
+                // recorded outcome and its evidence digest are returned as they
+                // were recorded.
                 return dreamer_dispositioned(key, &record);
             }
         }
-        let record =
-            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        let record = open_record_for(identity, ordering_scopes)?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
         // Only a durably staged record marks a scope paused, and the mirror
         // keeps the pausing key with the entry.
@@ -4187,6 +5198,38 @@ impl KernelStoreGateway {
             .map_err(|error| error.to_string())?;
         health.validate().map_err(|error| error.to_string())?;
         Ok(health)
+    }
+}
+
+/// The startup ORS scan reads canonical receipts through this gateway, not
+/// through the raw `CanonicalStoreClient` trait call (issue #1713, item 6).
+///
+/// The one named path is [`KernelStoreGateway::receipt`], so the scan keeps the
+/// flight slot, the fenced-rebind refusal, the fence validation and the
+/// active-route checks before and after the query, and the receipt's own
+/// operation/fence binding check. This impl only names that method and
+/// translates a refusal; it repeats none of those checks. A refusal stays a
+/// failed check, so the scan reports an error rather than an absent receipt or
+/// a safely absent operation.
+impl crate::store_write_reservation::StartupReceiptRoute for KernelStoreGateway {
+    fn observe_receipt<'a>(
+        &'a self,
+        state_fence: &'a StateFence,
+        operation_id: OperationId,
+    ) -> crate::store_write_reservation::StartupReceiptObservation<'a> {
+        Box::pin(async move {
+            self.receipt(state_fence, operation_id.clone())
+                .await
+                .map_err(
+                    |refusal| crate::store_write_reservation::ReservationWriteError::Binding {
+                        operation_id: operation_id.as_str().to_owned(),
+                        detail: format!(
+                            "named authenticated canonical-Store receipt gateway refused the \
+                         observation: {refusal}"
+                        ),
+                    },
+                )
+        })
     }
 }
 
@@ -4237,6 +5280,28 @@ fn unresolved_retirement_phases(
         UserAutomationWakePhase::UnknownOutcome { reason },
         execution,
     )
+}
+
+/// Records one retained wake cancellation as an unresolved handoff of an
+/// already committed retirement, and reports the phases its caller must return.
+///
+/// Both the durable admit and the exclusive send claim refuse without ever
+/// issuing an owner effect, so a caller that cannot take one of them reports
+/// the committed fact exactly like a refusal that reached no owner. The
+/// disposition is `Reconciling` rather than retained work in both cases: a
+/// committed retirement can only be settled by exact owner reconciliation
+/// under its original owner operation identity.
+fn unresolved_wake_cancellation(
+    settled: &mut UserAutomationRuntimeObligation,
+    obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    execution: &UserAutomationExecutionPhase,
+    reason: String,
+) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+    settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+        reason: reason.clone(),
+    };
+    obligations.push(settled.clone());
+    unresolved_retirement_phases(reason, execution.clone())
 }
 
 /// What the composition-bound durable outbox already holds for one runtime
@@ -4592,6 +5657,27 @@ fn user_automation_obligation_operation_id(
     })
 }
 
+/// Digests the State Fence one admitted parent request carries.
+///
+/// The staged durable row and the exclusive send claim that later competes for
+/// that same row both bind the fence through this one derivation, so a claim
+/// can only be recognized as belonging to the record it claims: ORS compares
+/// the claim's fence against the staged row's fence by content and refuses any
+/// other pairing.
+fn user_automation_obligation_fence_digest(
+    sealed: &UserAutomationServiceRequest,
+    obligation: &UserAutomationRuntimeObligation,
+) -> Result<String, String> {
+    canonical_json_bytes(&sealed.context.state_fence)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| {
+            unretained_obligation_reason(
+                obligation,
+                format!("the State Fence of the obligation could not be digested: {error}"),
+            )
+        })
+}
+
 /// Builds one durable outbox label, naming the obligation when the value is not
 /// a well-formed label.
 fn obligation_label(
@@ -4926,31 +6012,6 @@ fn unproven_wake_channel_reason() -> String {
         .to_owned()
 }
 
-/// Wake phase reason for a committed occurrence the current owner does not admit.
-fn unadmitted_wake_reason(
-    automation_id: &str,
-    automation_revision: &str,
-    state: UserAutomationConfigurationState,
-) -> String {
-    format!(
-        "the current owner configuration state of {automation_id}/{automation_revision} is {state:?}, \
-         which admits no wake, so the committed occurrence was not handed to the wake owner"
-    )
-}
-
-/// Execution phase reason for a committed occurrence the current owner does not
-/// admit.
-fn unadmitted_execution_reason(
-    occurrence_id: &str,
-    state: UserAutomationConfigurationState,
-) -> String {
-    format!(
-        "the current owner configuration state for occurrence {occurrence_id} is {state:?}, which \
-         admits no execution, so the Durable Job owner was never asked and the occurrence stays \
-         unadmitted"
-    )
-}
-
 /// Execution phase reason used when no authenticated runtime channel was composed.
 fn unproven_execution_channel_reason() -> String {
     "no authenticated UserAutomation runtime channel was composed for this transition, so the \
@@ -4958,22 +6019,16 @@ fn unproven_execution_channel_reason() -> String {
         .to_owned()
 }
 
-/// Execution phase reason for a committed occurrence with no owner-issued
-/// Durable Job submission material.
+/// Execution phase reason for a committed occurrence whose wake handoff did
+/// not prove a pending wake.
 ///
-/// The existing Durable Job owner admits a complete submission. That submission
-/// carries the qualified artifact content reference and the job admission
-/// receipt; neither is derivable from the canonical Store receipt, and deriving
-/// either would fabricate content evidence and authority. The Durable Job owner
-/// is therefore never asked, so the phase is `Unavailable` rather than a lost
-/// answer: nothing was sent, no job was minted, and the occurrence stays
-/// unadmitted for a later owner-issued submission to admit.
-fn unproven_durable_job_material_reason(occurrence_id: &str, automation_revision: &str) -> String {
+/// The preflight execution join needs the retained pending wake as its
+/// occurrence binding. An unreadable or absent wake proves nothing to join, so
+/// no admission is invented and the Durable Job owner is never asked.
+fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
     format!(
-        "occurrence {occurrence_id} of revision {automation_revision} is committed and its wake is \
-         owner-read, but the Durable Job owner was never asked: no owner-issued submission material \
-         exists for it, because the qualified artifact content reference and the job admission \
-         receipt are issued by that owner and are not derivable from the canonical Store commit"
+        "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
+         so no occurrence joins the Durable Job owner and the occurrence stays unadmitted"
     )
 }
 
@@ -5087,6 +6142,28 @@ fn unretained_cancellation_outcome_reason(
     )
 }
 
+/// Reason used when a wake cancellation held the exclusive send claim and the
+/// owner then refused it, so the request is known to have been handed over but
+/// its answer was not retained as such (issue #2970).
+///
+/// Because the claim is durable before the first transport await, this is never
+/// reported as a re-issuable obligation: the exact owner operation identity has
+/// to be reconciled, and only owner or transport evidence that the request was
+/// never issued may release it.
+fn claimed_cancellation_outcome_reason(
+    automation_revision: &str,
+    owner_operation_id: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "the wake cancellation of retired revision {automation_revision} held the exclusive durable \
+         send claim of owner operation identity {owner_operation_id} before the owner was handed \
+         the request, and the owner refused it without a retained answer: {detail}; that claim \
+         stays owned by its holder and can only be settled by reconciling the exact owner \
+         operation identity, so the cancellation is not reissued from here"
+    )
+}
+
 /// Canonical route/epoch gate shared by every gateway read/write path.
 ///
 /// `validate_active_route` delegates here so the transport-generic named-read
@@ -5118,6 +6195,58 @@ fn validate_route(
     Ok(())
 }
 
+/// Handles one determinate reserved-write refusal (issue #1927, I05-06).
+///
+/// The Store owner has proved no external effect, so the still-`Eligible`
+/// token releases cleanly and nothing orphans. `UnknownOperation` is explicit
+/// unsupported behavior from a backend without reserved capability, never a
+/// reason to fall back to unreserved `Apply`.
+///
+/// A `ManifestMismatch` is the one determinate refusal I05-06 treats as a
+/// PRESERVED plan rather than a discarded one: the plan's recorded operation
+/// manifest is outside current admissible support, so this build refuses to
+/// execute it and must not reinterpret it under newer code. The reserved order
+/// is still released, but the staged plan is first recorded as a visible
+/// durable Recovery Problem keyed by its own operation identity, so it enters
+/// visible recovery instead of vanishing with the release. Recording precedes
+/// the release because the retention reads the staged operation's own epoch,
+/// fence, recovery owner and reservation identity.
+///
+/// A failure to record never discards the refusal itself: the original cause is
+/// reported and the retention failure is appended, so the caller still learns
+/// the plan was refused. In that case the order is still released, so a
+/// recorder fault cannot strand an `Eligible` reservation.
+fn refuse_determinate_reserved_write(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+    error: &StoreError,
+    operation_id: &str,
+) -> String {
+    if matches!(error, StoreError::ManifestMismatch) {
+        let retained = retain_unsupported_prepared_plan(
+            owner,
+            token,
+            "prepared transition outside current operation-manifest support",
+        );
+        if let Err(retained) = retained {
+            let _ = cancel_before_send(owner, token);
+            return format!(
+                "reserved write refused for operation {operation_id}: the staged prepared \
+                 transition is outside current operation-manifest support and could not be \
+                 retained as visible recovery work ({retained}); cause: {error}"
+            );
+        }
+    }
+    let _ = cancel_before_send(owner, token);
+    if matches!(error, StoreError::UnknownOperation) {
+        return format!(
+            "reserved write unsupported for operation {operation_id}: Store backend has no \
+             reserved-write capability; refusing without unreserved Apply fallback"
+        );
+    }
+    error.to_string()
+}
+
 /// Deterministic `PreparedTransition` admission before store execution (1927).
 ///
 /// Guards the unreserved `apply` entry point: identity/shape validation, fence equality, canonical
@@ -5131,39 +6260,76 @@ fn validate_route(
 /// staged transition therefore survives daemon replacement only when the
 /// replacement Kernel explicitly supports its recorded contract digest and
 /// operation manifest.
+///
+/// The gate ORDER is load-bearing and unchanged: every gate below runs before
+/// any store send, and this is the *unreserved* admission point, so a refusal
+/// here has reserved no Ordering Scope sequence and issued no external effect.
+/// That is what lets the refusal be a typed I5.19 `not_accepted`
+/// `WriteSubmission` instead of an erased string: the decision is taken at the
+/// I5.6 steps 1-12 boundary, strictly before I5.6 step 13 stages anything in
+/// ORS. The reserved-write path is a different owner with a different act and
+/// deliberately does not come through here.
+///
+/// The accepted arm returns the typed `staged` decision, and this function has
+/// no existing-receipt lookup in front of it, so it can only ever return
+/// `staged` or refuse. Every non-`staged` decision is therefore converted
+/// into the `Err` arm HERE, which is why the decision point is this function
+/// and not [`KernelStoreGateway::apply`]: there is no second state check
+/// downstream that a `not_accepted` or `resolved_existing` value would have to
+/// be caught by. The refusal is the typed [`StoreApplyRefusal`], whose rendered
+/// line keeps both the typed decision and the gate's own cause, so the
+/// operational response can name the I5.19 decision that was taken and the
+/// specific refusal under it.
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<(), String> {
-    context.validate().map_err(|error| error.to_string())?;
-    transition.validate().map_err(|error| error.to_string())?;
-    if transition.state_fence != context.state_fence {
-        return Err("transition state fence does not match request metadata".to_owned());
+) -> Result<WriteSubmission, StoreApplyRefusal> {
+    let gate: Result<(), StoreError> = (|| {
+        context.validate().map_err(StoreError::Foundation)?;
+        transition.validate()?;
+        if transition.state_fence != context.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        // RECHECK-63 slice B: recompute the canonical request hash from the
+        // exact values about to be executed (context + transition + expected
+        // heads) and reject divergence before any store work. The view is
+        // built from these references — not re-forwarded copies — so a
+        // mutation after admission fails here with the typed mismatch.
+        let view = CanonicalRequestView::from_apply(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        let entries = generated_operation_manifests()?;
+        transition.validate_against_catalogue(&entries)
+    })();
+    // The gate's own typed refusal is kept so the operational response can name
+    // both the typed `not_accepted` decision and the specific cause under it.
+    let gate_cause = gate.as_ref().err().map(ToString::to_string);
+    let submission = match admit_write_submission(transition, gate, None) {
+        Ok(submission) => submission,
+        // A request whose own identity is unnameable has no submission to
+        // report under, so the gate's own typed refusal is reported instead.
+        Err(unnameable) => {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                gate_cause.unwrap_or_else(|| unnameable.to_string()),
+            ));
+        }
+    };
+    if submission.state != WriteSubmissionState::Staged {
+        // The gate ORDER above is load-bearing and this runs before any store
+        // send, so a non-`staged` decision is always produced BY one of those
+        // gates: `gate_cause` is therefore present on every armed
+        // `Admission` refusal and the composed text stays byte-identical to
+        // the single line this arm has always rendered.
+        let cause = gate_cause.unwrap_or_else(|| submission.to_string());
+        return Err(StoreApplyRefusal::admission(submission, cause));
     }
-    // RECHECK-63 slice B: recompute the canonical request hash from the
-    // exact values about to be executed (context + transition + expected
-    // heads) and reject divergence before any store work. The view is
-    // built from these references — not re-forwarded copies — so a
-    // mutation after admission fails here with the typed mismatch.
-    let view = CanonicalRequestView::from_apply(
-        context,
-        transition,
-        expected_revision_heads,
-        expected_ordering_heads,
-    );
-    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
-        .map_err(|error| error.to_string())?;
-    let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
-    transition
-        .validate_against_catalogue(&entries)
-        .map_err(|error| {
-            format!(
-                "unsupported prepared transition; preserve as recovery, do not reinterpret: {error}"
-            )
-        })?;
-    Ok(())
+    Ok(submission)
 }
 
 /// Reserved-write admission gates shared by the gateway entry point.
@@ -5172,10 +6338,14 @@ fn admit_prepared_transition(
 /// caller, fence equality): the caller rule lives at this boundary while the
 /// binding rules live in the reservation module. The canonical request-hash
 /// recompute runs in the entry body before reservation, and manifest support
-/// is enforced at store execution by the bridge catalogue gate, so a staged
-/// plan that the replacement store no longer supports stays staged as
-/// visible recovery work instead of being reinterpreted here. Staging step so
-/// the entry point stays a composition of audited gates.
+/// is enforced at store execution by the bridge catalogue gate.
+///
+/// A staged plan the replacement store no longer supports is therefore NOT
+/// reinterpreted here. On that determinate refusal the reserved order is still
+/// safely released, and the plan is recorded as a visible durable Recovery
+/// Problem keyed by its own operation identity, so it enters visible recovery
+/// instead of vanishing with the release. Staging step so the entry point stays
+/// a composition of audited gates.
 fn apply_reserved_admission(
     context: &RequestMetadata,
     transition: &PreparedTransition,
@@ -5261,6 +6431,71 @@ where
     Ok(response)
 }
 
+/// Closed refusal set for one `Apply` through the Kernel gateway.
+///
+/// Two arms, and they stay separate because they carry different evidence:
+///
+/// - [`StoreApplyRefusal::Admission`] is a real I5.19 admission decision. The
+///   typed [`WriteSubmission`] is kept whole, so the submission id, state,
+///   reason codes, retry-identity rule, next allowed action, and any I5.17
+///   split directive reach the caller as typed evidence instead of being
+///   erased into prose before the response is built. The `cause` is the
+///   preserving gate's own text, carried beside the decision rather than
+///   re-derived from it, and the rendered line is byte-identical to the single
+///   line this refusal has always produced.
+/// - [`StoreApplyRefusal::GatewayRefusal`] is every pre-existing refusal
+///   (flight fence, shadow mutation, route/epoch staleness, unknown-commit
+///   recovery) plus a request whose own identity is too malformed to name a
+///   submission under. Its text is preserved exactly; no message is rewritten,
+///   reworded, or reinterpreted on the way out.
+///
+/// The `Display` of both arms is the operator-visible refusal line, so every
+/// existing consumer that renders the value sees the same message it saw when
+/// this route returned a bare `String`.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreApplyRefusal {
+    /// The I5.19 admission decision refused the submission, composed with the
+    /// specific preserving gate that refused it.
+    #[error("{submission}; cause: {cause}")]
+    Admission {
+        /// The typed admission decision taken by the gate, boxed so a refusal
+        /// value stays small enough to return by value from every entry point.
+        /// The decision itself is unchanged and is handed out as a plain
+        /// borrow by [`StoreApplyRefusal::admission_decision`].
+        submission: Box<WriteSubmission>,
+        /// The preserving gate's own refusal text, preserved unchanged.
+        cause: String,
+    },
+    /// A pre-existing gateway refusal, preserved exactly.
+    #[error("{0}")]
+    GatewayRefusal(String),
+}
+
+impl StoreApplyRefusal {
+    /// Arms the typed admission arm from a decision and its preserving cause.
+    ///
+    /// The cause is taken as given, never re-derived: it is the exact text the
+    /// preserving gate produced, and the rendered line is the same
+    /// `"<decision>; cause: <cause>"` line this refusal has always rendered.
+    pub fn admission(submission: WriteSubmission, cause: String) -> Self {
+        Self::Admission {
+            submission: Box::new(submission),
+            cause,
+        }
+    }
+
+    /// Returns the typed admission decision when this refusal carries one.
+    ///
+    /// `None` is a pre-existing gateway refusal: there is no admission decision
+    /// to report, and a caller must not infer one from the prose.
+    pub fn admission_decision(&self) -> Option<&WriteSubmission> {
+        match self {
+            Self::Admission { submission, .. } => Some(submission.as_ref()),
+            Self::GatewayRefusal(_) => None,
+        }
+    }
+}
+
 /// Closed failure set for one named Store read through the Kernel gateway.
 #[derive(Debug, thiserror::Error)]
 pub enum NamedReadGatewayError {
@@ -5270,6 +6505,60 @@ pub enum NamedReadGatewayError {
     /// Gateway validation, fencing, or route checks refused the read.
     #[error("{0}")]
     GatewayRefusal(String),
+}
+
+/// Closed failure set for one Dreamer ledger operation through the Kernel
+/// gateway (issue #2764 item 6).
+///
+/// This is the minimal carrier the real caller needs, and it exists because the
+/// recovery leg answers with facts a `String` cannot hold. The issue spends
+/// W1-W5 building a typed recovered-outcome: an exact terminal outcome, its
+/// receipt evidence, and the remaining ledger-read obligation. Flattening that
+/// answer to text at the function boundary discarded the distinction the slice
+/// exists to make, and left the caller unable to tell "already committed" from
+/// "reconciled, but the pause release is incomplete" from "outcome still
+/// unknown and the scopes are still paused". The enum arms here keep all of it
+/// addressable, and only the *final* transport edge renders it.
+///
+/// The `Display` of every arm is the operator-visible refusal line the caller
+/// projects, so a consumer that renders the value sees the same sentence it saw
+/// when this route returned a bare `String`. Nothing downstream has to parse it
+/// back apart.
+#[derive(Debug, thiserror::Error)]
+pub enum DreamerJobGatewayError {
+    /// Unknown-commit recovery refused, failed closed, or reported a conflict
+    /// (I14.21, I14.24). The typed [`CommitRecoveryError`] travels whole:
+    /// fence/route/role/validation refusals, an unavailable ORS owner, a paused
+    /// scope, an identity or terminal-evidence conflict, and a determinate
+    /// commit refusal keep their own variants instead of sharing one string.
+    #[error(transparent)]
+    Commit(#[from] CommitRecoveryError),
+    /// The mutation's disposition is proven but the ledger answer is not (or not
+    /// entirely). The typed [`DreamerCommitUncertain`] travels whole, so the
+    /// caller receives the original operation/key, the exact recorded outcome,
+    /// the receipt evidence digest, and the remaining `Status`/`Reconcile`
+    /// ledger-read obligation as addressable values.
+    #[error(transparent)]
+    Uncertain(#[from] DreamerCommitUncertain),
+    /// A pre-existing gateway refusal (flight fence, shadow mutation,
+    /// role/route/epoch staleness, request validation, protected-lane
+    /// unavailability). Its text is preserved exactly; no message is rewritten,
+    /// reworded, or reinterpreted on the way out.
+    #[error("{0}")]
+    GatewayRefusal(String),
+}
+
+impl DreamerJobGatewayError {
+    /// Returns the typed recovered outcome when this refusal carries one.
+    ///
+    /// `None` is a refusal that proves nothing about the mutation's
+    /// disposition, and a caller must not infer one from the prose.
+    pub fn uncertain(&self) -> Option<&DreamerCommitUncertain> {
+        match self {
+            Self::Uncertain(uncertain) => Some(uncertain),
+            Self::Commit(_) | Self::GatewayRefusal(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5404,10 +6693,10 @@ mod tests {
         .unwrap_or_else(|_| unreachable!());
         let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
             Err(error) => error,
-            Ok(()) => unreachable!("unsupported manifest must fail"),
+            Ok(_) => unreachable!("unsupported manifest must fail"),
         };
         assert!(
-            error.contains("recovery"),
+            error.to_string().contains("recovery"),
             "unsupported plan must name recovery, got: {error}"
         );
     }

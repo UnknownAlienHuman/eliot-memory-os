@@ -63,9 +63,10 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
-    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
-    OperationIdentity, OrsError, RedbRecoveryStore,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
+    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
+    HostRequestRetainedSourceRevision, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
+    RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -187,6 +188,21 @@ pub(crate) const AGENT_BRIDGE_EVENT_GAP_OPERATION: &str = "agent_bridge_event_ga
 /// Closed event-ownership/cursor reconciliation entry: reads the bridge-event
 /// tables only, never the host-request ledger.
 pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_event_reconcile";
+/// Version of the Kernel bridge-ingest adapter that admits durable/control
+/// bridge events (issue #1934, I7.23): staged with every event as
+/// `adapter_version` so the durable row answers which adapter admitted it
+/// after restart. Bump when the admit/stage adapter semantics change; it
+/// names this adapter's own revision, never a producer-side version the
+/// Kernel cannot observe.
+const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1";
+/// Closed disclosure verdict the privacy owner emits for a bridge event
+/// (issue #1934, I7.23). The verdict is the OWNER's: the Kernel resolves it
+/// from the owner evidence the live transport carries and never mints an
+/// admission. An owner that has not decided these exact bytes emits the
+/// rejection, which routes the event to the deterministic redacted
+/// representation plus its redaction receipt. This is the same closed
+/// vocabulary `eliot-ors` validates (`admitted` | `rejected`).
+const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -579,6 +595,7 @@ impl KernelComposition {
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(envelope)?;
         self.host_request_service_gate(&descriptor, envelope)?;
         let binding = bridge_process_binding(&descriptor, &receipt, &envelope.connection_id)?;
 
@@ -636,6 +653,11 @@ impl KernelComposition {
                 OrsError::HostRequestLegacyCorrelationUnresolved => {
                     TransportError::LegacyCorrelationUnresolved
                 }
+                // A full logical index sheds fresh stages with typed
+                // backpressure (issue #2571): the agent-facing caller waits
+                // and resubmits the exact bytes instead of observing a stale
+                // fence or a fresh absence.
+                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
                 _ => TransportError::SessionFenced,
             })?;
 
@@ -1508,6 +1530,90 @@ impl KernelComposition {
         Ok((profile.admission, receipt))
     }
 
+    /// Verifies claimed application session/task/scope continuity against the
+    /// exact binding retained from this connection's `Resolved` activation
+    /// (issue #1746).
+    ///
+    /// The connection gate above established transport admission; this gate
+    /// binds the authenticated transport to the activation-derived
+    /// application authority. It is mechanical only: claimed values are
+    /// compared for exact equality against retained values, nothing is
+    /// re-resolved and no task is ever selected here. Absent claims are not
+    /// invented: discovery stays reachable without a task, and whether a
+    /// capability requires a task remains the Governor's semantic decision.
+    ///
+    /// A claim naming a different session, task, scope, or task revision than
+    /// the retained activation binding is `IdentityConflict`: the request must
+    /// re-activate under the new binding, it is never silently rebound or
+    /// rewritten. A claim matching the retained binding whose application
+    /// session is unknown, terminal, epoch-mismatched, never bound to the
+    /// presenting connection, or carries an expired or revoked session-bound
+    /// lease is `SessionFenced`.
+    fn host_request_application_binding_gate_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), TransportError> {
+        if envelope.kind == HostRequestKind::Activation {
+            return Ok(());
+        }
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&envelope.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            state
+                .activated_binding
+                .clone()
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if let Some(claimed) = envelope.identity.session_id.as_deref() {
+            if claimed != retained.session_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            let now = unix_ms();
+            let sessions = self
+                .agent_application_sessions
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let live = sessions.get(claimed).is_some_and(|session| {
+                !session.state().is_terminal()
+                    && session
+                        .authority_epoch()
+                        .is_same_authority(&envelope.state_fence.authority_epoch)
+                    && session
+                        .transport_bindings()
+                        .iter()
+                        .any(|binding| binding.binding_id == envelope.connection_id)
+                    && session
+                        .bound_leases()
+                        .values()
+                        .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+            });
+            if !live {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        if let Some(claimed) = envelope.identity.task_id.as_deref()
+            && claimed != retained.task_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(claimed) = envelope.identity.work_scope_id.as_deref()
+            && claimed != retained.work_scope_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(claimed) = envelope.state_fence.task_revision
+            && claimed != retained.task_revision
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
     /// Applies the service-state rule that mirrors the admission gate: full
     /// admission requires `Ready`, while `Cancellation`, `Status`, and
     /// `Reconciliation` additionally route while `Degraded`. The gate itself
@@ -1966,6 +2072,80 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Revalidates a queued operation's claimed application binding against
+    /// the live session authority and the retained activation binding before
+    /// a daemon claim (issue #1746).
+    ///
+    /// Admission verified the claims; this closes the window between enqueue
+    /// and claim. A pair whose claimed session is unknown, terminal,
+    /// epoch-mismatched, never bound to the presenting connection, or carrying
+    /// an expired or revoked session-bound lease is not claimable, and neither
+    /// is a pair whose claimed task, scope, or task revision drifted from this
+    /// connection's retained `Resolved` activation binding. Pairs without a
+    /// claim carry nothing to revalidate on that leg. An unclaimable pair keeps
+    /// its original identity and is skipped for later reconciliation, never
+    /// refused or rewritten here.
+    fn application_binding_live_for_claim(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.clone())
+        };
+        if let Some(retained) = retained.as_ref() {
+            if envelope
+                .identity
+                .task_id
+                .as_deref()
+                .is_some_and(|claimed| claimed != retained.task_id)
+                || envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != retained.work_scope_id)
+                || envelope
+                    .state_fence
+                    .task_revision
+                    .is_some_and(|claimed| claimed != retained.task_revision)
+            {
+                return Ok(false);
+            }
+        } else if envelope.identity.task_id.is_some()
+            || envelope.identity.work_scope_id.is_some()
+            || envelope.state_fence.task_revision.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(claimed) = envelope.identity.session_id.as_deref() else {
+            return Ok(true);
+        };
+        let now = unix_ms();
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(sessions.get(claimed).is_some_and(|session| {
+            !session.state().is_terminal()
+                && session
+                    .authority_epoch()
+                    .is_same_authority(&envelope.state_fence.authority_epoch)
+                && session
+                    .transport_bindings()
+                    .iter()
+                    .any(|binding| binding.binding_id == envelope.connection_id)
+                && session
+                    .bound_leases()
+                    .values()
+                    .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+        }))
+    }
+
     /// Claims the next admitted local-read pair for the daemon poller under
     /// governed attempt ownership.
     ///
@@ -2011,6 +2191,9 @@ impl KernelComposition {
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if !self.application_binding_live_for_claim(envelope)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -2617,6 +2800,12 @@ impl KernelComposition {
             &body.result_digest,
         );
         let submitted_ok = self.audit_observe(submitted_draft).is_some();
+        // Issue #1853 W2: the executor-observed evidence travels INTO the
+        // authoritative completion, in the same owner transaction as the result
+        // it observes. Before this, `body.evidence` reached no ORS row, so a
+        // replayer reconciling an expired lease had no durable operation/effect
+        // evidence to reconcile against and could only re-execute.
+        let retained = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -2625,6 +2814,8 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained.effect_evidence.as_ref(),
+                retained.result_lineage.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3193,6 +3384,10 @@ impl KernelComposition {
                     position += 1;
                     continue;
                 }
+                if !self.application_binding_live_for_claim(envelope)? {
+                    position += 1;
+                    continue;
+                }
                 if envelope.identity.capability != OBSERVE_CAPABILITY {
                     return Err(TransportError::SessionFenced);
                 }
@@ -3518,6 +3713,9 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Issue #1853 W2: the executor-observed evidence is persisted with the
+        // completion, in the same owner transaction.
+        let retained = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -3526,6 +3724,8 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained.effect_evidence.as_ref(),
+                retained.result_lineage.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3855,6 +4055,85 @@ fn host_request_identity_binding_records(
     ])
 }
 
+/// The ORS-owned durable retention fields one submitted result body
+/// contributes at the Kernel authority boundary (issue #1853 W2).
+///
+/// Both halves are the claims and references the executing leg observed about
+/// the completion, carried in ONE value so the mapping from wire body to
+/// durable state has exactly one owner and cannot drift between the executor
+/// half and the lineage half.
+struct RetainedResultProvenance {
+    /// Executor-observed operation/effect evidence, when the leg observed any.
+    effect_evidence: Option<HostRequestEffectEvidence>,
+    /// Result-side lineage claims and references, when the leg submitted any.
+    result_lineage: Option<HostRequestRetainedLineage>,
+}
+
+/// Projects one submitted result body into the ORS-owned durable evidence and
+/// lineage fields (issue #1853 W2).
+///
+/// This is the only place the wire evidence and lineage are mapped into durable
+/// state, so the authority boundary has exactly one owner for the mapping and
+/// the completion legs cannot each invent their own shape. ORS re-checks both
+/// projections against the row it writes; this function only carries the
+/// observed values across the crate boundary, and it invents nothing — an
+/// absent wire slot stays `None`, and a leg that observed nothing persists
+/// neither field.
+fn retained_result_provenance(
+    body: &HostRequestResultBody,
+) -> Result<RetainedResultProvenance, TransportError> {
+    let effect_evidence = body
+        .evidence
+        .as_ref()
+        .map(|evidence| {
+            OpaqueLabel::new(evidence.operation_id.clone()).map(|operation_id| {
+                HostRequestEffectEvidence {
+                    operation_id,
+                    input_handle: evidence.input_handle.clone(),
+                    output_handle: evidence.output_handle.clone(),
+                    side_effects: evidence.side_effects.clone(),
+                    actual_route: evidence.actual_route.clone(),
+                    invoked_operation: evidence.invoked_operation.clone(),
+                    adapter_identity: evidence.adapter_identity.clone(),
+                    executor_identity: evidence.executor_identity.clone(),
+                }
+            })
+        })
+        .transpose()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let result_lineage = body
+        .lineage
+        .as_ref()
+        .map(|lineage| HostRequestRetainedLineage {
+            output_artifact_ref: lineage.output_artifact_ref.clone(),
+            output_digest: lineage.output_digest.clone(),
+            producer_ref: lineage.producer_ref.clone(),
+            source_revisions: lineage.source_revisions.as_ref().map(|revisions| {
+                revisions
+                    .iter()
+                    .map(|revision| HostRequestRetainedSourceRevision {
+                        key: revision.key.clone(),
+                        revision: revision.revision,
+                        state_fence: revision.state_fence.clone(),
+                    })
+                    .collect()
+            }),
+            source_state_fence: lineage.source_state_fence.clone(),
+            input_refs: lineage.input_refs.clone(),
+            transformation_lineage: lineage.transformation_lineage.clone(),
+            closure_refs: lineage.closure_refs.clone(),
+            policy_fence: lineage.policy_fence.clone(),
+            origin_evidence_refs: lineage.origin_evidence_refs.clone(),
+            proof_ceiling: lineage.proof_ceiling,
+            influence_state: lineage.influence_state,
+            instruction_taint: lineage.instruction_taint,
+        });
+    Ok(RetainedResultProvenance {
+        effect_evidence,
+        result_lineage,
+    })
+}
+
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
@@ -3898,6 +4177,8 @@ pub(crate) fn requested_host_request_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }
@@ -4358,13 +4639,15 @@ impl KernelComposition {
         // re-verifies the presented decision before any durable write. The
         // decision object travels into the durable stage below.
         //
-        // Issue #1934: the ORS owner no longer DECIDES. Disclosure is resolved
-        // by the privacy owner over the `WorkScope` / source / recipient /
-        // provider policy and arrives bound to these exact source bytes, the
-        // scope, and the policy revision it was decided at. A caller that
-        // cannot present such a verdict gets the redacted path, never an
-        // inferred `allowed`: the ORS deny scan stays a conservative detector
-        // that can only deny.
+        // Issue #1934: the ORS owner no longer DECIDES, and neither does this
+        // route. Disclosure is resolved by the privacy owner over the
+        // `WorkScope` / source / recipient / provider policy and must arrive
+        // bound to these exact source bytes, the scope, and the policy revision
+        // it was decided at. No such owner decision reaches this live route
+        // (see [`Self::bridge_event_privacy_authorization`]), so the resolution
+        // is a rejection: the event stages as the deterministic redacted
+        // representation plus its redaction receipt and never as verbatim raw.
+        // The ORS deny scan stays a conservative detector that can only deny.
         let privacy_authorization =
             Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
         let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
@@ -4418,26 +4701,59 @@ impl KernelComposition {
     /// Resolves the privacy owner's disclosure verdict for one bridge event's
     /// exact source bytes (issue #1934, I7.23).
     ///
-    /// The verdict is bound to three things the bytes alone cannot supply: the
-    /// exact source digest, the `WorkScope` scope the owner evaluated the
-    /// bytes under, and the privacy policy revision it decided at. The scope
-    /// is the owner namespace the ORS stage entry is about to bind for this
-    /// stream, so the authorization is checked against the very namespace that
-    /// will be persisted — a verdict reached for one stream cannot authorize
-    /// another.
+    /// I7.23: "Secret values, provider-forbidden hidden reasoning and data
+    /// outside the `WorkScope` privacy boundary are never persisted merely to
+    /// preserve 'rawness'." The decision that answers that belongs to the
+    /// disclosure owner: I5.26 makes `DisclosureDependencyClosure` and
+    /// `DisclosureDecision` Governor-owned canonical state, and this subtree's
+    /// instructions say Kernel "does not reinterpret policy, `WorkScope`,
+    /// task, plan, verifier or finish". This entry is therefore a resolution of
+    /// the owner verdict, never a mint of it.
     ///
-    /// The retained `Session` is the authority for the scope identity (issue
-    /// #2729): the principal, authority lineage, connection, launch nonce and
-    /// session epoch are the same owner legs the stage entry persists, so the
-    /// verdict and the row it authorizes are attributable to the same owner
-    /// read. The policy revision is the session's own binding generation, so a
-    /// verdict made under an older binding cannot authorize bytes under a
-    /// newer one; a replay under a different revision is a different verdict,
-    /// not a duplicate.
+    /// What the live transport does carry, and what this entry therefore binds
+    /// (issue #2729 owner read, unchanged):
     ///
-    /// Failure is closed by construction: a session that cannot be resolved
-    /// into a scope yields a rejected verdict, never an absent one, so no
-    /// caller can reach the verbatim path without a bound owner decision.
+    /// - the immutable source digest of the canonical envelope bytes;
+    /// - the retained `Session`'s owner evidence — principal, authority
+    ///   lineage, connection, launch nonce, session epoch — through
+    ///   [`bridge_owner_evidence`], the same owner legs the stage entry
+    ///   persists;
+    /// - the scope the ORS stage entry is about to bind for this stream,
+    ///   derived through the owner's own namespace digest;
+    /// - the privacy policy revision: the presenting live generation, already
+    ///   required nonzero and equal on the event, its state fence, and the
+    ///   retained session.
+    ///
+    /// What the transport does NOT carry is the positive privacy grant, and it
+    /// was measured rather than assumed. `EventEnvelope`
+    /// (`crates/foundation/eliot-protocol/src/lib.rs`) has no field carrying a
+    /// `WorkScope`, a privacy class, a source/recipient class, or a provider
+    /// retention constraint; the retained agent-bridge `Session` negotiates an
+    /// EMPTY privacy-class grant (`eliot-ipc`'s
+    /// `Session::establish_agent_bridge`, which is the only constructor on this
+    /// route), so there is no recipient-class evidence either; and the
+    /// Governor-owned `DisclosureDecision` has no producer, store, or wire leg
+    /// that reaches this entry. There is consequently no owner that can present
+    /// a positive verdict bound to these exact bytes, this scope, and this
+    /// policy revision.
+    ///
+    /// Absent evidence is UNRESOLVED, never permission. The resolution is
+    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`]:
+    /// [`RedbRecoveryStore::bridge_event_privacy_decision`] takes the
+    /// rejection arm, the event stages as the deterministic redacted
+    /// representation plus its redaction receipt, and the conservative
+    /// seven-token deny scan still runs inside the ORS owner — where it can
+    /// only narrow the recorded reason and classes, never grant. Ingestion
+    /// stays available; no unproven byte is persisted, and the store's
+    /// re-verification of the presented verdict can no longer be satisfied by
+    /// an echo of its own derivation.
+    ///
+    /// The `admitted` arm is deliberately unreachable here and is not a
+    /// placeholder for a future one: emitting it requires an owner decision
+    /// that does not exist on this path, and inventing a substitute grant would
+    /// reintroduce exactly the defect this removes. A caller cannot reach the
+    /// verbatim path at all while this holds, which is the fail-closed answer
+    /// I7.23 requires until the disclosure owner is wired to this route.
     fn bridge_event_privacy_authorization(
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
@@ -4447,7 +4763,7 @@ impl KernelComposition {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
         // The scope is the very owner namespace the ORS stage entry binds for
         // this stream, derived through the owner's own namespace digest so the
-        // verdict and the row it authorizes cannot drift.
+        // recorded verdict and the row it describes cannot drift.
         let evidence = bridge_owner_evidence(session, frame_fence)?;
         let scope = RedbRecoveryStore::bridge_event_privacy_scope(
             &evidence.authority_lineage,
@@ -4456,11 +4772,16 @@ impl KernelComposition {
             &event.stream_id,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        // The retained session's own generation is the policy revision the
-        // verdict was reached under; zero is never an admissible revision.
+        // The retained session's own generation is the privacy policy revision
+        // the verdict is recorded against; zero is never an admissible
+        // revision, and the caller above already refused a zero generation, so
+        // a zero here is a fence failure rather than a silent downgrade.
         let policy_revision = frame_fence.resource_generation.value();
+        if policy_revision == 0 {
+            return Err(TransportError::SessionFenced);
+        }
         Ok(serde_json::json!({
-            "verdict": "admitted",
+            "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
             "source_sha256": source_sha256,
             "scope": scope,
             "policy_revision": policy_revision,
@@ -4546,6 +4867,14 @@ impl KernelComposition {
             // at the policy revision it names. Without it persistence is
             // refused, never inferred.
             "privacy_authorization": privacy_legs.authorization,
+            // Issue #1934: the ingest provenance travels with the decision so
+            // the ORS row answers the I7.23 storage list after restart. The
+            // requested route is the closed wire operation that reached this
+            // entry — the only forward operation that can — and the adapter
+            // version is this adapter's own revision, never a producer-side
+            // version this Kernel cannot observe.
+            "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
+            "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_connection": evidence.connection,
@@ -5397,6 +5726,8 @@ fn watchdog_intent_projection_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }
