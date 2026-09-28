@@ -3566,6 +3566,7 @@ dependencies = [
  "eliot-governor",
  "eliot-improvement",
  "eliot-instrument-api",
+ "eliot-integration-coverage",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",

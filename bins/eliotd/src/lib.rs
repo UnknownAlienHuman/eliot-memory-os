@@ -71,6 +71,7 @@ pub mod external_attach_reconciliation;
 pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
+mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
 pub mod improvement_candidate_route;
@@ -246,6 +247,9 @@ pub use notification_state_emit::{
     AutomationFailureKey, NotificationStateEmit, automation_failure_key,
     emit_blocked_automation_notification, notification_already_recorded,
     read_notification_ordering_head,
+};
+pub use governor_authority_feed::{
+    maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
 };
 pub use owner_feed::{
     KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
@@ -620,6 +624,18 @@ pub struct DaemonComposition {
     /// performs no transport, and is never read on the readiness path: closure
     /// must not block or fail the finish ceremony.
     learning_closure: eliot_governor::LearningClosureService,
+    /// The single live Governor-owned coverage-to-authority derivation
+    /// instance for this daemon (issue #1935 AUD1, I7.16).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`] and owned here for
+    /// the daemon's lifetime, so every projection published across the
+    /// authenticated `publish_governor_authority` boundary derives from one
+    /// revision sequence: a degraded re-derivation publishes a new revision
+    /// that revokes everything issued under the old one. Fed only from
+    /// threaded live host/Watchdog/trace observation through
+    /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed);
+    /// nothing is derived here and no coverage is synthesized.
+    governor_authority: eliot_governor::LiveGovernorAuthority,
     /// Retained ingress record for an attach of an already-running
     /// external agent (issue #1782, I11.11 lines 27-42).
     ///
@@ -906,6 +922,7 @@ impl DaemonComposition {
             capability_admission: GovernorCapabilityAdmission::new(),
             capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
+            governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
         })
     }
@@ -2924,6 +2941,23 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(&mut self.capability_admission)
+    }
+
+    /// Mutably borrows the single live Governor-owned derivation instance
+    /// (issue #1935 AUD1, I7.16).
+    ///
+    /// Mirrors [`Self::capability_admission_mut`]: readiness is checked
+    /// first. Callers feed the held instance from threaded live
+    /// host/Watchdog/trace observation and publish the projection (see
+    /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed));
+    /// derivation semantics stay in the Governor owner.
+    pub fn governor_authority_mut(
+        &mut self,
+    ) -> Result<&mut eliot_governor::LiveGovernorAuthority, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&mut self.governor_authority)
     }
 
     /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).
