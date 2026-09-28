@@ -220,6 +220,7 @@ enum ConsumedOfferDisposition {
 }
 
 /// One exact consumed-frontier offer retained in the transport owner.
+#[derive(Clone, Debug)]
 struct ConsumedFrontierOffer {
     /// Stable identity: `sha256` over the version tag, the presenting
     /// connection, the live generation, and the ordered
@@ -315,14 +316,20 @@ fn project_reconciled_owner_ack_state(
         };
         let prior_identity = owner_identity.get(stream_id);
         let offered_identity = offer_stream_identities.get(stream_id);
-        let replaced = prior_identity.is_some_and(|prior| prior != &identity)
-            || offered_identity.is_some_and(|offered| offered != &identity);
+        // Only a changed adopted identity resets the text-keyed base and
+        // held receipts: the new incarnation starts exactly from its own
+        // owner-confirmed cursor and never inherits the predecessor's. A
+        // retained offer that still names a predecessor identity only
+        // quarantines that offer below; it cannot reset bases or prune
+        // receipts already scoped to this same identity, so a lower
+        // compatible page stays a no-op instead of rolling state backward.
+        let replaced = prior_identity.is_some_and(|prior| prior != &identity);
+        if offered_identity.is_some_and(|offered| offered != &identity) {
+            replaced_offer_streams.push(stream_id.to_owned());
+        }
         if replaced {
             owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
             delivered_sequences.remove(stream_id);
-            if offered_identity.is_some_and(|offered| offered != &identity) {
-                replaced_offer_streams.push(stream_id.to_owned());
-            }
         } else {
             let base = owner_acked
                 .get(stream_id)
@@ -3047,30 +3054,30 @@ impl KernelMcpForwardingPort {
         Ok(())
     }
 
-    /// Retires the retained offer only when this joint-import result proves
-    /// it: the result must echo the exact offered legs (it answers the
-    /// request that carried them — continuation answers carry no echo and
-    /// retire nothing), the window must carry this offer's own
-    /// connection/generation binding (a lower or foreign reply retires
-    /// nothing), and every offered leg must show an owner-confirmed
+    /// Proves the retained offer against this joint-import result without
+    /// touching live state: the result must echo the exact offered legs
+    /// (it answers the request that carried them — continuation answers
+    /// carry no echo and prove nothing), the window must carry this
+    /// offer's own connection/generation binding (a lower or foreign reply
+    /// proves nothing), and every offered leg must show an owner-confirmed
     /// acknowledged cursor at or beyond the offered frontier from a stream
     /// fact proving the exact locally adopted owner tuple. A same-named
     /// successor fact confirms nothing. A lower reply leaves
     /// the offer unresolved; already-advanced bases stay advanced.
-    fn retire_consumed_offer_if_proven(&mut self, result: &ReconciliationPortResult) {
+    ///
+    /// The caller evaluates this before acquiring the mutable owner
+    /// borrow, against the projected adopted identities, and applies a
+    /// positive proof as one field write inside the single joint swap:
+    /// no second borrow may follow the first live mutation on this path.
+    fn consumed_offer_proven_by_import(
+        offer: &ConsumedFrontierOffer,
+        adopted: &BTreeMap<String, OwnerStreamIdentity>,
+        result: &ReconciliationPortResult,
+    ) -> bool {
         let echo = result.consumed_frontiers();
         if echo.is_empty() {
-            return;
+            return false;
         }
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
-            return;
-        };
-        // Plain reborrow so the offer mutation and the adopted-identity
-        // read below borrow disjoint fields, not the whole guard.
-        let owner = &mut *owner;
-        let Some(offer) = owner.consumed_offer.as_mut() else {
-            return;
-        };
         if matches!(
             offer.disposition,
             ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
@@ -3079,22 +3086,21 @@ impl KernelMcpForwardingPort {
                 .iter()
                 .all(|leg| offer.frontiers.get(leg.stream_id()) == Some(&leg.sequence()))
         {
-            return;
+            return false;
         }
         let Some(window) = result.window() else {
-            return;
+            return false;
         };
         if offer.connection_id != window.presenting_connection().as_str()
             || offer.generation != window.live_generation().get()
         {
-            return;
+            return false;
         }
-        let adopted = &owner.owner_identity;
         let candidate_streams = result.recovery_candidate_stream_facts();
         if candidate_streams.is_empty() {
-            return;
+            return false;
         }
-        let proven = offer.frontiers.iter().all(|(stream_id, frontier)| {
+        offer.frontiers.iter().all(|(stream_id, frontier)| {
             candidate_streams
                 .iter()
                 .find(|facts| facts.stream_id() == stream_id)
@@ -3118,10 +3124,7 @@ impl KernelMcpForwardingPort {
                         && offer.stream_identities.get(stream_id) == Some(&identity)
                         && adopted.get(stream_id) == Some(&identity)
                 })
-        });
-        if proven {
-            offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
-        }
+        })
     }
 }
 
@@ -3482,7 +3485,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         if result.is_pure_recovery_read() {
             return Ok(());
         }
-        let (mut owner_acked, mut delivered_sequences, mut owner_identity, offer_stream_identities) = {
+        let (mut owner_acked, mut delivered_sequences, mut owner_identity, offer_snapshot) = {
             let owner = self
                 .shared
                 .try_borrow()
@@ -3491,12 +3494,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 owner.owner_acked.clone(),
                 owner.delivered_sequences.clone(),
                 owner.owner_identity.clone(),
-                owner
-                    .consumed_offer
-                    .as_ref()
-                    .map_or_else(BTreeMap::new, |offer| offer.stream_identities.clone()),
+                owner.consumed_offer.clone(),
             )
         };
+        let offer_stream_identities = offer_snapshot
+            .as_ref()
+            .map_or_else(BTreeMap::new, |offer| offer.stream_identities.clone());
         // Pure projection: every allocation happens before acquiring the
         // mutable owner borrow, preserving the joint import's atomic swap.
         let replaced_offer_streams = project_reconciled_owner_ack_state(
@@ -3506,6 +3509,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             &mut owner_identity,
             &offer_stream_identities,
         );
+        // The offer proof is evaluated here, against the projected adopted
+        // identities, so the commit below applies it inside the same single
+        // borrow: no second borrow may follow the first live mutation.
+        let offer_proven = offer_snapshot.as_ref().is_some_and(|offer| {
+            Self::consumed_offer_proven_by_import(offer, &owner_identity, result)
+        });
         let mut owner = self
             .shared
             .try_borrow_mut()
@@ -3541,6 +3550,19 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         if offer_was_replaced && let Some(offer) = owner.consumed_offer.as_mut() {
             offer.disposition = ConsumedOfferDisposition::Replaced;
         }
+        // A positive pre-borrow proof confirms the retained offer here, in
+        // the same swap: core, ack cache, held receipts, and matching
+        // offer commit together. The live disposition is rechecked so only
+        // an unresolved offer can confirm; a replaced offer never does.
+        if offer_proven
+            && let Some(offer) = owner.consumed_offer.as_mut()
+            && !matches!(
+                offer.disposition,
+                ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
+            )
+        {
+            offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
+        }
         // Rebind the retained offer to this import's window key under the
         // same held borrow (pure field write; cannot fail).
         if let Some(offer) = owner.consumed_offer.as_mut()
@@ -3548,11 +3570,6 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         {
             offer.window_key = Some(window.window_key().to_owned());
         }
-        drop(owner);
-        // Retire the retained offer only on exact owner proof, under its
-        // own borrow after the swap. On conflict the offer stays
-        // unresolved (safe direction; retried by the next import).
-        self.retire_consumed_offer_if_proven(result);
         Ok(())
     }
 }
