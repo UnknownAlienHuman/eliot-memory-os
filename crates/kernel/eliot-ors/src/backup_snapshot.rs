@@ -943,17 +943,6 @@ impl OrsOperationalCursor {
         }
         Ok(())
     }
-    /// Reports whether this cursor still owes rows, i.e. whether its emitted row
-    /// count is below the frozen denominator.
-    ///
-    /// Derived from the identity and never from row presence: "there are rows left"
-    /// is a question about the store, and a page's finality must be a statement
-    /// about the snapshot the store froze, not about a scan that happened to return
-    /// nothing this time.
-    #[must_use]
-    pub fn operational_open(&self) -> bool {
-        self.emitted_rows < self.identity.operational_row_count
-    }
 }
 
 /// Per-page operational continuation state (issue #2967).
@@ -1624,24 +1613,6 @@ pub enum BackupPartialReason {
     /// The declared denominator is empty, so there is nothing to certify.
     EmptyDenominator,
 }
-impl BackupPartialReason {
-    /// The axis this partial disposition is about.
-    ///
-    /// One read point so a caller does not have to enumerate the variants to learn
-    /// which continuation domain is unfinished — and, in particular, so the
-    /// operational axis and a family axis can never be reported as the same thing.
-    #[must_use]
-    pub const fn axis(&self) -> Option<RowFamilyKind> {
-        match self {
-            Self::OperationalContinuationOutstanding { .. } => {
-                Some(RowFamilyKind::OperationalHistory)
-            }
-            Self::FamilyContinuationOutstanding { family, .. }
-            | Self::NoFamilyDenominator { family } => Some(*family),
-            Self::EmptyDenominator => None,
-        }
-    }
-}
 /// Completeness of a backup snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1903,26 +1874,7 @@ impl OrsBackupSnapshot {
             "backup_next_versioned_artifact_cursor",
         )?;
         if matches!(self.completeness, BackupCompleteness::Complete) {
-            if self.process_stream_recovery_family.is_none() {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must carry a process-stream recovery family denominator",
-                });
-            }
-            if self.versioned_artifact_family.is_none() {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must carry a versioned-artifact family denominator",
-                });
-            }
-            if self.next_process_stream_recovery_cursor.is_some()
-                || self.next_versioned_artifact_cursor.is_some()
-            {
-                return Err(OrsError::InvalidField {
-                    field: "backup_completeness",
-                    reason: "a complete snapshot must have no outstanding family continuation",
-                });
-            }
+            check_complete_denominators(self)?;
         }
         if self.pages.is_empty() {
             return Err(OrsError::InvalidField {
@@ -1936,10 +1888,10 @@ impl OrsBackupSnapshot {
                 reason: "snapshot exceeds MAX_BACKUP_PAGES",
             });
         }
-        // The declared operational state against the last page's own operational
-        // continuation. Placed after the empty-page refusal so an empty snapshot is
-        // still named as an empty snapshot rather than as a missing continuation.
+        // The declared operational state against the last page's own continuation,
+        // after the empty-page refusal so an empty snapshot is named as one.
         check_declared_operational(
+            &self.fence,
             &self.operational_history,
             self.next_operational_cursor.as_ref(),
             last_page.map(|page| &page.operational_continuation),
@@ -1993,6 +1945,45 @@ impl OrsBackupSnapshot {
     }
 }
 
+/// Requires a `Complete` snapshot to declare every family denominator and to owe
+/// nothing on either family axis (issue #2967, W8).
+///
+/// The operational half of the same precondition needs no page, so it stays
+/// directly in [`OrsBackupSnapshot::validate`]; these two need the declared family
+/// slots, and splitting them out keeps the whole completeness precondition readable
+/// as one list instead of an arm buried in the middle of a long function.
+///
+/// Each missing denominator is refused by its own name, because the reason they are
+/// required is a compatibility rule and the operator needs to know WHICH family the
+/// snapshot never looked at: a snapshot exported before a family cursor existed
+/// declares no denominator for that family, so it stays `Partial`, can never be
+/// read as a proven complete family, and can never be silently promoted to the
+/// operational-coverage claim either (I05-16: absent coverage means unknown, not
+/// complete).
+fn check_complete_denominators(snapshot: &OrsBackupSnapshot) -> Result<(), OrsError> {
+    if snapshot.process_stream_recovery_family.is_none() {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry a process-stream recovery family denominator",
+        });
+    }
+    if snapshot.versioned_artifact_family.is_none() {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry a versioned-artifact family denominator",
+        });
+    }
+    if snapshot.next_process_stream_recovery_cursor.is_some()
+        || snapshot.next_versioned_artifact_cursor.is_some()
+    {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must have no outstanding family continuation",
+        });
+    }
+    Ok(())
+}
+
 /// Checks the declared operational snapshot state against the last page's own
 /// operational continuation (issue #2967).
 ///
@@ -2009,6 +2000,7 @@ impl OrsBackupSnapshot {
 /// identity's high-water must equal the fence's, and it is the identity — a value
 /// the store measured — that the pages are then counted against.
 fn check_declared_operational(
+    fence: &OrsBackupFence,
     identity: &OrsOperationalSnapshotIdentity,
     declared_next: Option<&OrsOperationalCursor>,
     last: Option<&OrsOperationalContinuation>,
@@ -2019,6 +2011,19 @@ fn check_declared_operational(
                 "backup operational identity schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
                 identity.schema_version
             ),
+        });
+    }
+    // A5, at the snapshot boundary. The store already refuses a request whose
+    // declared high-water is not the one it observed (`check_export_fence`), so a
+    // store-produced snapshot always agrees here; the rule exists for a RECEIVED
+    // snapshot, where the fence is a bare field and the pages are somebody else's
+    // bytes. Without it a snapshot could declare one high-water at the top and
+    // freeze its window at another, and the A5 bound the pages are counted under
+    // would be the one the sender chose rather than the one the fence claims.
+    if identity.high_water_order != fence.high_water_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_history",
+            reason: "the declared operational window is frozen at a different high-water order than the snapshot's own fence claims",
         });
     }
     if identity.lower_order_bound > identity.high_water_order {
@@ -2068,6 +2073,12 @@ fn check_declared_operational(
 ///   because the boundary it must present IS page N's emitted tail. A page after an
 ///   exhausted walk is refused here too, since an exhausted walk has no next cursor
 ///   for the following page to present.
+/// - The first page starts the walk: its in-force cursor must have emitted nothing.
+///   A chain that is exact from page 1 onward can still under-report coverage if
+///   page 0 opens in the middle, which is the same defect as a stride window with a
+///   large offset. A cursor that emitted nothing is already forced to name the
+///   frozen window's lower bound by [`OrsOperationalCursor::validate`], so this is
+///   the whole opening-boundary rule.
 /// - Within a page, operational orders strictly increase, stay above the incoming
 ///   cursor's exclusive bound, and never exceed the frozen high-water. The last rule
 ///   is A5: a row above the high-water belongs to a successor snapshot and cannot
@@ -2096,6 +2107,17 @@ fn check_operational_pages(
             return Err(OrsError::InvalidField {
                 field: "backup_operational_continuation",
                 reason: "a page was read under a different frozen operational snapshot than the snapshot declares",
+            });
+        }
+        if index == 0 && continuation.cursor.emitted_rows != 0 {
+            // The first page of a walk is the walk's start. Without this, an archive
+            // could open mid-walk and still chain every later page correctly: the
+            // chain would be exact and the coverage would silently start in the
+            // middle, which is the same defect as a stride window with a large
+            // offset.
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "the first page must start the walk, not continue one that is already under way",
             });
         }
         let mut previous_order = continuation.cursor.after_order;
