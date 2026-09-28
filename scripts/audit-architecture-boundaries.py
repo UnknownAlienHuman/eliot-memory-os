@@ -2016,7 +2016,7 @@ def _audit_process_launch_gaps(
         return
     key = ("direct_process_launch", relative)
     record = debt.get(key)
-    legacy_hit = _contains_direct_process_launch(production)
+    legacy_hit = _contains_direct_process_launch(_strip_rust_noise(production)[0])
     if legacy_hit and record is None:
         # File is already hard-blocked by the legacy gate; raw sites in the
         # same file add no new disposition.
@@ -2188,7 +2188,7 @@ def audit_source(
                 )
             )
 
-        if _contains_direct_process_launch(production) and not _matches_owner(relative, policy):
+        if _contains_direct_process_launch(_strip_rust_noise(production)[0]) and not _matches_owner(relative, policy):
             key = ("direct_process_launch", relative)
             tracked = debt.get(key)
             if tracked is None:
