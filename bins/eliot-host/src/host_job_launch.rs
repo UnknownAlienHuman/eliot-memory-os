@@ -184,12 +184,11 @@ pub(super) fn planned_store_endpoint(
     canonical_store_arguments: &[PlatformHandle],
 ) -> Option<std::net::SocketAddr> {
     for window in canonical_store_arguments.windows(2) {
-        if window[0].as_str() == "--bind" {
-            if let Ok(addr) = window[1].as_str().parse::<std::net::SocketAddr>() {
-                if addr.port() != 0 {
-                    return Some(addr);
-                }
-            }
+        if window[0].as_str() == "--bind"
+            && let Ok(addr) = window[1].as_str().parse::<std::net::SocketAddr>()
+            && addr.port() != 0
+        {
+            return Some(addr);
         }
     }
     None
