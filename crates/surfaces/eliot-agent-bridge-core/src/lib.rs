@@ -13,22 +13,23 @@ use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::pin::Pin;
 
-// The closed host-event owner (issue #228 A6). `HostEventEnvelope` is the
-// legacy quarantine wire and is admissible only because it carries one of
-// these closed, versioned, bounded observations; every consumer of the wire
-// reads its typed fields from here, never from the wire's generic JSON.
-// Re-exported as a path so downstream bridge fixtures and adapters keep one
-// import root without a second owner.
+// The closed host-event owner (issue #228 A6, collapsed by #1709). The
+// bridge consumes the closed, versioned, bounded observation directly; the
+// legacy generic-payload quarantine wire is gone, so no bridge path can
+// read untyped JSON or a host-chosen kind. Re-exported as a path so
+// downstream bridge fixtures and adapters keep one import root without a
+// second owner.
 pub use eliot_agent_api::host_event;
 pub use eliot_agent_api::{
-    AttemptId, AttemptState, ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
-    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventEnvelope, HostEventKind,
+    AttemptId, AttemptState, ClockReading, ErrorObservation, EventCursor, EventId,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
     HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventReplayDisposition,
     LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
     NormalizedHostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage,
-    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint, SessionId,
-    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
-    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, WorkUnitId,
+    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord,
+    RestrictedRawSourceHandle, RouteFingerprint, SessionId, SessionLifecycleObservation,
+    SessionLifecycleTransition, SessionObservation, TaskId, UnsupportedDisposition,
+    UnsupportedEventObservation, UnsupportedEventReason, WorkUnitId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, RequestMetadata};
 pub use eliot_observation_contracts::{
@@ -805,7 +806,7 @@ pub trait McpForwardingPort {
     fn forward_hook(
         &mut self,
         binding: &AttachBinding,
-        event: &HostEventEnvelope,
+        event: &NormalizedHostEventEnvelope,
     ) -> Result<(), ProviderFailure>;
 
     fn forward_event(
@@ -4138,7 +4139,7 @@ pub struct AgentBridgeCore {
     /// receipts remain authoritative; a later receipt cannot bridge a hole.
     acknowledged_out_of_order: BTreeMap<String, BTreeSet<u64>>,
     cursors: BTreeMap<String, u64>,
-    host_journal: Vec<HostEventEnvelope>,
+    host_journal: Vec<NormalizedHostEventEnvelope>,
     attempt_transitions: Vec<AttemptTransition>,
     recovery_directives: Vec<RecoveryDirective>,
     canonical_refs: CanonicalWriteRefs,
@@ -4990,10 +4991,10 @@ impl AgentBridgeCore {
         })
     }
 
-    pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+    pub fn forward_hook(&mut self, event: &NormalizedHostEventEnvelope) -> Result<(), BridgeError> {
         self.ensure_forwardable()?;
         event
-            .validate()
+            .validate_as_session_observation()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         self.observe_host_event(event)?;
         let binding = self.binding()?.clone();
@@ -5053,30 +5054,23 @@ impl AgentBridgeCore {
 
     /// Admits one validated host event into the transport journal.
     ///
-    /// The route fingerprint passes through untouched, the raw and
-    /// normalized payloads stay paired on the retained envelope, and the
-    /// host sequence must increase so the journal preserves observation
-    /// order. The observation is journaled before port forwarding so a
-    /// forwarding failure still leaves immutable diagnostic history. Error
-    /// events are additionally cited in `error_event_refs` without
+    /// The observation is journaled before port forwarding so a forwarding
+    /// failure still leaves immutable diagnostic history. Error-class typed
+    /// observations are additionally cited in `error_event_refs` without
     /// affecting any other field.
     ///
-    /// #228 A6: the citation is taken from the closed, versioned, bounded
-    /// normalized observation the wire carries, validated by its owner
-    /// (`HostEventEnvelope::normalized`) and never from the host-chosen
-    /// `HostEventKind` or the wire's generic `normalized_payload`. The core
-    /// holds no #361 provider-execution binding and no #369 admitted-route
-    /// receipt, so the only admissible lineage is a session observation: a
-    /// wire carrying an execution-unit payload fails closed here instead of
-    /// driving a terminal-reduction input on its own framing. The only
-    /// error-class typed observation such a wire can carry is a provider
-    /// event the owner quarantined instead of normalizing
+    /// #228 A6 / #1709: the citation is taken from the closed, versioned,
+    /// bounded normalized observation itself, validated by its own owner
+    /// ([`NormalizedHostEventEnvelope::validate_as_session_observation`]).
+    /// There is no host-chosen kind and no generic payload to interpret: the
+    /// only error-class typed observation a session observation can carry is a
+    /// provider event the owner quarantined instead of normalizing
     /// ([`NormalizedHostEventPayload::UnsupportedQuarantined`]), so that is
     /// the only citation this path can make.
-    fn observe_host_event(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
-        let normalized = event
-            .normalized()
-            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+    fn observe_host_event(
+        &mut self,
+        event: &NormalizedHostEventEnvelope,
+    ) -> Result<(), BridgeError> {
         if let Some(previous) = self.host_journal.last()
             && event.sequence <= previous.sequence
         {
@@ -5089,11 +5083,11 @@ impl AgentBridgeCore {
             self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
         }
         if matches!(
-            normalized.payload,
+            event.payload,
             NormalizedHostEventPayload::UnsupportedQuarantined(_)
         ) {
             self.error_event_refs
-                .push(normalized.event_id.as_str().to_owned());
+                .push(event.event_id.as_str().to_owned());
         }
         self.host_journal.push(event.clone());
         Ok(())
@@ -5228,7 +5222,6 @@ impl AgentBridgeCore {
     pub fn terminal_reduction_inputs(&self) -> Option<TerminalReductionInputs> {
         self.active.as_ref().map(|_| {
             TerminalReductionInputs::new(
-                self.host_journal.last().map(|event| event.route.clone()),
                 self.host_journal.clone(),
                 self.attempt_transitions.clone(),
                 self.recovery_directives.clone(),

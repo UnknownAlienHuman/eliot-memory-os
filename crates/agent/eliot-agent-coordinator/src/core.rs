@@ -2225,10 +2225,11 @@ impl AgentCoordinator {
     /// Observes one closed v7 provider host event under the exact recorded
     /// lineage (issue #371 S7).
     ///
-    /// Signature note: the T4 S7 slice text spells the envelope as
+    /// Signature note: the T4 S7 slice text spelled the envelope as
     /// `eliot_agent_api::HostEventEnvelope`, but the landed S6 owner is the
     /// closed `eliot_agent_api::NormalizedHostEventEnvelope`
-    /// (`host-event-v7`). This signature preserves that landed owner; no
+    /// (`host-event-v7`), and #1709 deleted the generic wire entirely. This
+    /// signature preserves that landed owner; no
     /// `Normalized` -> bridge `EventEnvelope` conversion happens here (bridge
     /// wiring is a separate integrator concern).
     ///

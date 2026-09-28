@@ -235,7 +235,8 @@ impl SessionObservation {
 /// Execution-unit observation: an exact binding plus its event cursor.
 ///
 /// `cursor`/`sequence` order observations inside the bound execution unit;
-/// `sequence` follows the [`crate::HostEventEnvelope`] convention and must be
+/// `sequence` follows the
+/// [`crate::host_event::NormalizedHostEventEnvelope`] convention and must be
 /// nonzero. The cursor never creates a binding: it correlates to the binding
 /// carried here.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

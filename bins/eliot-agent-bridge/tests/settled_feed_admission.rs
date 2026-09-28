@@ -16,13 +16,13 @@ use eliot_agent_bridge_core::{
     ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest, ClockReading,
     ConnectionId, CoverageGap, DemandId, EventCursor, EventEnvelope, EventId, EventPortOutcome,
     FencingToken, Generation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
-    HostActivationPort, HostEventDeliveryDisposition, HostEventEnvelope,
-    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, McpForwardingPort,
-    NativeSession, NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, PrincipalId, ProviderFailure, ProviderObservationLineage,
-    ProviderReadiness, QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome,
-    RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation, SessionLifecycleTransition,
-    SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
+    HostActivationPort, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId,
+    ProviderFailure, ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest,
+    RawSourceRecord, ReconciliationPortOutcome, RestrictedRawSourceHandle, SessionId,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+    UnsupportedDisposition, WorkUnitId,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_integration_coverage::{
@@ -54,7 +54,7 @@ impl McpForwardingPort for OkForwarder {
     fn forward_hook(
         &mut self,
         _binding: &AttachBinding,
-        _event: &HostEventEnvelope,
+        _event: &NormalizedHostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
         Ok(())
     }
@@ -132,9 +132,9 @@ fn attached_runner(session: &str) -> BridgeRunner {
     runner
 }
 
-/// #228 A6 fixture seam: the legacy quarantine wire is admissible only while
-/// it carries a closed, versioned, bounded normalized observation bound to the
-/// wire's own identity, cursor, and sequence.
+/// #228 A6 fixture seam: the journal entry is the closed, versioned, bounded
+/// normalized observation itself, sealed against its own identity, cursor and
+/// sequence.
 fn normalized_observation(hook_id: &str) -> Result<NormalizedHostEventEnvelope, String> {
     fn digest(bytes: &[u8]) -> Result<LowercaseSha256, String> {
         serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(bytes)))
@@ -196,38 +196,10 @@ fn normalized_observation(hook_id: &str) -> Result<NormalizedHostEventEnvelope, 
     Ok(envelope)
 }
 
-fn hook_event(hook_id: &str) -> HostEventEnvelope {
-    let mut wire = serde_json::json!({
-        "event_id": hook_id,
-        "attempt_id": "attempt-caller-1",
-        "sequence": 1,
-        "cursor": "cursor-caller-1",
-        "kind": "tool_result",
-        "route": {
-            "host_family": "test",
-            "adapter": "test",
-            "protocol_transport": "stdio",
-            "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "provider": "provider",
-            "model": "model",
-            "auth_billing": "test",
-            "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "reasoning_mode": "test",
-            "continuation_behavior": "fresh",
-            "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        },
-        "raw_payload_digest": "digest-caller-1",
-        "normalized_payload": {},
-        "parent_event_id": null,
-        "observed_at": "2026-09-21T00:00:00Z"
-    });
-    wire["normalized"] = serde_json::to_value(
-        normalized_observation(hook_id).expect("valid normalized observation"),
-    )
-    .expect("normalized observation serializes");
-    serde_json::from_value(wire).expect("valid hook fixture")
+/// #1709: the hook wire is the closed, versioned, bounded normalized
+/// observation itself; there is no generic payload or host-chosen kind.
+fn hook_event(hook_id: &str) -> NormalizedHostEventEnvelope {
+    normalized_observation(hook_id).expect("valid normalized observation")
 }
 
 fn live_derivation() -> GovernorCoverageDerivation {

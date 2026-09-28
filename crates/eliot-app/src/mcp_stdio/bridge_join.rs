@@ -43,7 +43,8 @@
 //! terminal host fact is produced without an owner journal entry behind it.
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, HostEventEnvelope, RouteFingerprint, TransportEdge, TransportEdgeKind,
+    AgentBridgeCore, NormalizedHostEventEnvelope, RouteFingerprint, TransportEdge,
+    TransportEdgeKind,
 };
 
 use super::correlation::{
@@ -64,7 +65,7 @@ use super::host_observation::{
 /// event violates the owner contract.
 pub(crate) fn submit_host_event(
     bridge: &mut AgentBridgeCore,
-    event: &HostEventEnvelope,
+    event: &NormalizedHostEventEnvelope,
 ) -> anyhow::Result<()> {
     Ok(bridge.forward_hook(event)?)
 }
@@ -308,7 +309,7 @@ pub(crate) struct TerminalReconcileRequest<'a> {
     /// Immutable ELIOT-side emission observation being reconciled.
     pub(crate) emission: &'a EliotEmissionObservation,
     /// Owner-nominated candidate host event from the live journal.
-    pub(crate) candidate: &'a HostEventEnvelope,
+    pub(crate) candidate: &'a NormalizedHostEventEnvelope,
     /// Exact join keys the owner attests for the candidate.
     pub(crate) keys: &'a HostEventJoinKeys,
     /// This correlation's own append-only assessment chain.

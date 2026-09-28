@@ -304,7 +304,8 @@ const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
 /// I7.23). One projection per staged event identity, keyed exactly like
 /// [`BRIDGE_EVENT_RECORDS`], and bound to that record by the immutable
 /// transport hash plus the recorded `EventEnvelope` disposition. This is the
-/// I7.23 "normalized `HostEventEnvelope`" item of the storage list: before any
+/// I7.23 "normalized `NormalizedHostEventEnvelope`" item of the storage list:
+/// before any
 /// stream cursor is published, the raw-or-redacted record, this projection,
 /// and the disposition must be durably related (see
 /// [`RedbRecoveryStore::require_bridge_event_relation_in`]). A redacted event
@@ -980,7 +981,7 @@ impl persistence_codec::PersistedValue for BridgeEventRow {
 /// its raw-or-redacted record (issue #1934, I7.23).
 ///
 /// I7.23 requires the storage list to contain BOTH the immutable raw/hash
-/// record AND the normalized `HostEventEnvelope`, and requires cursor
+/// record AND the normalized `NormalizedHostEventEnvelope`, and requires cursor
 /// advancement to be published only after the two are durably related and the
 /// `EventEnvelope` disposition is recorded. [`BridgeEventRow`] alone cannot
 /// carry that second item on the redacted path: its `envelope_bytes` are

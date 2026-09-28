@@ -9,7 +9,7 @@
 //! immutable transport hash;
 //! allowed raw bytes or a deterministic redacted representation;
 //! redaction receipt (when original bytes cannot be retained);
-//! normalized HostEventEnvelope;
+//! normalized NormalizedHostEventEnvelope;
 //! adapter and transformation versions;
 //! sequence/cursor and parent-child lineage;
 //! requested and actual route references;
@@ -246,7 +246,8 @@ impl StoredPayload {
     }
 }
 
-/// Durable phase of one normalized `HostEventEnvelope`, mirroring the I7.2
+/// Durable phase of one normalized `NormalizedHostEventEnvelope`, mirroring
+/// the I7.2
 /// `EventAckReceipt` phases.
 ///
 /// Advancing conditions (declared per cursor/record, enforced by the journal):
@@ -286,7 +287,8 @@ pub enum RecordPhase {
     Applied,
 }
 
-/// Durable disposition of one normalized `HostEventEnvelope`: whether the
+/// Durable disposition of one normalized `NormalizedHostEventEnvelope`: whether
+/// the
 /// raw/hash, envelope, and disposition relation is committed, whether the
 /// linked normalized projection verified at commit time, how many times the
 /// envelope was applied to state, the bound application receipt, and whether

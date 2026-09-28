@@ -7095,8 +7095,9 @@ pub(crate) fn bridge_event_envelope_from_payload(
 
 /// One digest-bound hook observation: the hook identity plus the exact digest
 /// of its canonical bytes. The Kernel binds the digest without interpreting
-/// hook semantics; the typed [`HostEventEnvelope`] contract lives
-/// bridge-side, where it is validated before sending.
+/// hook semantics; the typed closed normalized host-event contract
+/// (`NormalizedHostEventEnvelope`) lives bridge-side, where it is validated
+/// before sending.
 pub(crate) struct BridgeHookObservation {
     pub(crate) event_id: String,
     pub(crate) sequence: u64,

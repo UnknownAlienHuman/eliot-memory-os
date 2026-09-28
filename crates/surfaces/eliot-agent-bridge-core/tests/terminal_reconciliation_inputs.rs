@@ -1,10 +1,12 @@
 //! Issue #9 Slice A: bridge-transport terminal reconciliation inputs.
 //!
-//! The MGR01 half proves the transport carries fingerprint passthrough,
-//! raw/normalized host events with sequences/cursors, attempt transitions,
-//! and keeps stale-UI/error-event evidence independent of the canonical
-//! disposition references until reduction. The terminal reducer itself is
-//! MGR02 land and is deliberately not exercised here.
+//! The MGR01 half proves the transport carries closed, versioned, normalized
+//! host observations with sequences/cursors, attempt transitions, and keeps
+//! stale-UI/error-event evidence independent of the canonical disposition
+//! references until reduction. #1709 removed the generic-payload wire, so a
+//! history entry is the typed observation itself and there is no route
+//! fingerprint to pass through. The terminal reducer itself is MGR02 land and
+//! is deliberately not exercised here.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
@@ -15,26 +17,19 @@ use eliot_agent_bridge_core::{
     AttemptState, BridgeError, ClockReading, ConnectionId, CoverageGap, CursorPolicy, DemandId,
     EventCursor, EventEnvelope, EventId, EventPortOutcome, FencingToken, Generation,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostActivationPort,
-    HostEventDeliveryDisposition, HostEventEnvelope, HostEventKind, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator,
-    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId,
-    ProviderFailure, ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest,
-    RawSourceRecord, ReconciliationPortOutcome, ReconciliationPortResult, RecoveryDirective,
-    RecoveryDirectiveKind, RestrictedRawSourceHandle, RouteFingerprint, SessionId,
-    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
-    TerminalReductionInputs, UnsupportedDisposition, UnsupportedEventObservation,
-    UnsupportedEventReason, WorkUnitId,
+    HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
+    LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId, ProviderFailure,
+    ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest, RawSourceRecord,
+    ReconciliationPortOutcome, ReconciliationPortResult, RecoveryDirective, RecoveryDirectiveKind,
+    RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation, SessionLifecycleTransition,
+    SessionObservation, TaskId, TerminalReductionInputs, UnsupportedDisposition,
+    UnsupportedEventObservation, UnsupportedEventReason, WorkUnitId,
 };
 use eliot_agent_bridge_core::{TransportEdge, TransportEdgeKind};
 use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
-use serde_json::json;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-const RUNTIME_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const ADAPTER_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const SERIALIZER_HASH: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const TOOL_HASH: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-const FLAGS_HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
     Ok(EpochId::new(
@@ -96,7 +91,7 @@ impl McpForwardingPort for ForwardingFixture {
     fn forward_hook(
         &mut self,
         _binding: &AttachBinding,
-        _event: &HostEventEnvelope,
+        _event: &NormalizedHostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
         self.state
             .lock()
@@ -159,27 +154,8 @@ fn bridge() -> Result<AgentBridgeCore, Box<dyn std::error::Error>> {
     ))
 }
 
-fn test_route() -> Result<RouteFingerprint, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_value(json!({
-        "host_family": "antigravity",
-        "adapter": "antigravity-stream",
-        "protocol_transport": "ndjson",
-        "runtime_hash": RUNTIME_HASH,
-        "adapter_hash": ADAPTER_HASH,
-        "provider": "antigravity",
-        "model": "antigravity-1",
-        "auth_billing": "operator",
-        "serializer_hash": SERIALIZER_HASH,
-        "tool_semantics_hash": TOOL_HASH,
-        "reasoning_mode": "default",
-        "continuation_behavior": "fresh",
-        "feature_flags_hash": FLAGS_HASH
-    }))?)
-}
-
-/// #228 A6 fixture seam: the legacy quarantine wire is admissible only while
-/// it carries a closed, versioned, bounded normalized observation, so the
-/// fixture builds and seals one bound to the wire's own identity, cursor, and
+/// #228 A6 fixture seam: the journal entry is the closed, versioned, bounded
+/// normalized observation itself, sealed against its own identity, cursor and
 /// sequence. `quarantined` selects the typed error-class payload the bridge
 /// cites into `error_event_refs`.
 fn normalized_observation(
@@ -256,42 +232,16 @@ fn normalized_observation(
     Ok(envelope)
 }
 
+/// #1709: the journal entry is the closed, versioned, bounded normalized
+/// observation itself. `quarantined` selects the typed error-class payload the
+/// bridge cites into `error_event_refs`; the generic wire's `kind`, generic
+/// `normalized_payload` and `parent_event_id` framing no longer exist.
 fn host_event(
     event_id: &str,
     sequence: u64,
-    kind: &str,
-    normalized: &serde_json::Value,
-    parent: Option<&str>,
-) -> Result<HostEventEnvelope, Box<dyn std::error::Error>> {
-    let mut wire = json!({
-        "event_id": event_id,
-        "attempt_id": "attempt-1",
-        "sequence": sequence,
-        "cursor": format!("cursor-{sequence}"),
-        "kind": kind,
-        "route": {
-            "host_family": "antigravity",
-            "adapter": "antigravity-stream",
-            "protocol_transport": "ndjson",
-            "runtime_hash": RUNTIME_HASH,
-            "adapter_hash": ADAPTER_HASH,
-            "provider": "antigravity",
-            "model": "antigravity-1",
-            "auth_billing": "operator",
-            "serializer_hash": SERIALIZER_HASH,
-            "tool_semantics_hash": TOOL_HASH,
-            "reasoning_mode": "default",
-            "continuation_behavior": "fresh",
-            "feature_flags_hash": FLAGS_HASH
-        },
-        "raw_payload_digest": format!("raw-digest-{event_id}"),
-        "normalized_payload": normalized,
-        "parent_event_id": parent,
-        "observed_at": "2026-09-15T00:00:00Z"
-    });
-    wire["normalized"] =
-        serde_json::to_value(normalized_observation(event_id, sequence, kind == "error")?)?;
-    Ok(serde_json::from_value(wire)?)
+    quarantined: bool,
+) -> Result<NormalizedHostEventEnvelope, Box<dyn std::error::Error>> {
+    normalized_observation(event_id, sequence, quarantined)
 }
 
 fn managed_request() -> Result<AttachRequest, Box<dyn std::error::Error>> {
@@ -308,20 +258,8 @@ fn seeded_recovery_core()
     core.attach(managed_request()?)?;
 
     // Invalid/recoverable call followed by its typed error event.
-    core.forward_hook(&host_event(
-        "tool-call-1",
-        1,
-        "tool_call",
-        &json!({"tool": "write", "args_valid": false}),
-        None,
-    )?)?;
-    core.forward_hook(&host_event(
-        "tool-result-1",
-        2,
-        "error",
-        &json!({"recoverable": true, "code": "INVALID_ARGUMENTS"}),
-        Some("tool-call-1"),
-    )?)?;
+    core.forward_hook(&host_event("tool-call-1", 1, false)?)?;
+    core.forward_hook(&host_event("tool-result-1", 2, true)?)?;
 
     // A directive that reuses the failed identity is rejected: the
     // retry/new-identity rule is structural, not conventional.
@@ -354,20 +292,8 @@ fn seeded_recovery_core()
     )?)?;
 
     // Corrected call under the new identity, then its success result.
-    core.forward_hook(&host_event(
-        "tool-call-2",
-        3,
-        "tool_call",
-        &json!({"tool": "write", "args_valid": true}),
-        None,
-    )?)?;
-    core.forward_hook(&host_event(
-        "tool-result-2",
-        4,
-        "tool_result",
-        &json!({"ok": true}),
-        Some("tool-call-2"),
-    )?)?;
+    core.forward_hook(&host_event("tool-call-2", 3, false)?)?;
+    core.forward_hook(&host_event("tool-result-2", 4, false)?)?;
 
     // Candidate canonical submission/receipt plus the independent exact
     // readback reference.
@@ -397,20 +323,17 @@ fn recoverable_error_then_corrected_call_yields_independent_terminal_inputs()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_core, inputs) = seeded_recovery_core()?;
 
-    // Fingerprint passthrough: the exact host route, untouched.
-    assert_eq!(inputs.fingerprint(), Some(&test_route()?));
-
-    // History keeps the earlier error: four events in observation order
-    // with raw/normalized payloads paired per event.
+    // History keeps the earlier error: four observations in order, and the
+    // error-class entry is still a typed payload on the closed envelope.
     assert_eq!(inputs.history().len(), 4);
-    assert_eq!(inputs.history()[1].kind, HostEventKind::Error);
+    assert_eq!(inputs.history()[1].event_id.as_str(), "tool-result-1");
     assert_eq!(
-        inputs.history()[1].normalized_payload,
-        json!({"recoverable": true, "code": "INVALID_ARGUMENTS"})
+        inputs.history()[1].payload.payload_type_tag(),
+        "UNSUPPORTED_QUARANTINED"
     );
     assert_eq!(
-        inputs.history()[1].raw_payload_digest,
-        "raw-digest-tool-result-1"
+        inputs.history()[1].raw_source.digest.digest,
+        sha256_hex(format!("bridge-host-event-source-{}", "tool-result-1").as_bytes())
     );
     let sequences: Vec<u64> = inputs
         .history()
@@ -453,13 +376,7 @@ fn recoverable_error_then_corrected_call_yields_independent_terminal_inputs()
 fn terminal_edges_stay_independent_without_reduction() -> Result<(), Box<dyn std::error::Error>> {
     let mut core = bridge()?;
     core.attach(managed_request()?)?;
-    core.forward_hook(&host_event(
-        "tool-call-1",
-        1,
-        "tool_call",
-        &json!({"tool": "write"}),
-        None,
-    )?)?;
+    core.forward_hook(&host_event("tool-call-1", 1, false)?)?;
 
     let edges = [
         (
