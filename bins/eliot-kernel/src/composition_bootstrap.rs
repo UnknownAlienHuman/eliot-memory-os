@@ -72,35 +72,22 @@ pub(crate) const DAEMON_FRONT_DOOR_CAPABILITY: &str = "daemon";
 
 /// Exact-owner backup channel clients (issue #962, Writer-D).
 ///
-/// Declared here (rather than in `lib.rs`) so the client-injection turn
-/// touches only this composition file: production assembly binds the actual
-/// Host/Watchdog owner clients over the canonical pipes, with no new pipe
-/// family, no Host/Watchdog implementation dependency, and no behavior
-/// change to any other composition path.
+/// Production assembly binds the actual Host/Watchdog owner clients over the
+/// canonical pipes, with no new pipe family and no Host/Watchdog
+/// implementation dependency, and holds the resulting
+/// [`BackupOwnerClients`] pair on the composition (the `KernelComposition`
+/// field of that name in `lib.rs`). Holding it on the composition is the point:
+/// the injection is a real bound value a caller reaches, not a process-global
+/// marker that records a binding which never happened.
 #[path = "backup_owner_clients.rs"]
 #[allow(
     dead_code,
     reason = "owner-channel surface is exercised per-method across production assembly and the wire test; a single surface-level allow keeps the private-module declaration warning-clean"
 )]
 mod backup_owner_clients;
-pub use backup_owner_clients::{
-    HostBackupOwnerClient, OwnerClientError, WatchdogBackupOwnerClient,
-};
+pub use backup_owner_clients::BackupOwnerClients;
 
 impl KernelComposition {
-    /// Returns a production Host backup owner client bound to the exact
-    /// canonical Host pipe. Fails closed when the canonical binding is
-    /// unavailable; never substitutes a default.
-    pub fn host_backup_owner_client() -> Result<HostBackupOwnerClient, OwnerClientError> {
-        HostBackupOwnerClient::production()
-    }
-
-    /// Returns a production Watchdog backup owner client bound to the exact
-    /// canonical Watchdog pipe. Fails closed; never substitutes a default.
-    pub fn watchdog_backup_owner_client() -> Result<WatchdogBackupOwnerClient, OwnerClientError> {
-        WatchdogBackupOwnerClient::production()
-    }
-
     /// Enforces I3.2 setup completion at the Kernel authority entrypoint.
     ///
     /// Ordinary agent authority — process execution, daemon/worker dispatch,
@@ -1435,17 +1422,15 @@ impl KernelComposition {
         // so no second database is opened here and unrelated Kernel work is
         // unaffected while no restore executes.
         let backup_restore = KernelBackupRestore::bind(work_root.clone());
-        // Issue #962 (Writer-D): bind the exact-owner backup channel
-        // clients in production assembly. Both constructors bind the
-        // actual canonical pipes and fail closed on any fake or
-        // mismatched binding, so a missing binding is never replaced by
-        // a default. The marker records the injection for diagnostics;
-        // no other composition behavior changes.
-        HostBackupOwnerClient::production()
+        // Issue #962 (Writer-D): bind the exact-owner backup channel clients
+        // in production assembly and HOLD them on the composition. Both
+        // constructors bind the actual canonical pipes and fail closed on any
+        // fake or mismatched binding, so a missing binding is never replaced
+        // by a default. The value is stored in `KernelComposition
+        // ::backup_owner_clients`, so a requester reaches the bound clients
+        // through the composition and cannot construct a substitute.
+        let backup_owner_clients = BackupOwnerClients::bind_production()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        WatchdogBackupOwnerClient::production()
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        backup_owner_clients::mark_owner_clients_bound();
         // Issue #959: hold the Kernel-owned cross-owner backup capture
         // coordinator on the composition. It binds the work root only;
         // captures consume already-accepted owner evidence per execution,
@@ -1557,6 +1542,7 @@ impl KernelComposition {
             blob_store: Mutex::new(blob_store),
             backup_restore,
             backup_capture,
+            backup_owner_clients,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]

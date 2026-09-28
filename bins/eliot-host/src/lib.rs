@@ -1534,7 +1534,8 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
-    HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
+    HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
     HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
     UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
@@ -1579,6 +1580,8 @@ use std::io;
 #[cfg(windows)]
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::Arc;
 #[cfg(all(windows, test))]
 type Duration = std::time::Duration;
 #[cfg(windows)]
@@ -5563,6 +5566,104 @@ pub enum BackupDispatchTarget {
     Cutover,
 }
 
+/// The exact closed prepare/cutover dispatch table this Host composition
+/// registers on the canonical Host runtime-control endpoint (#962).
+///
+/// It is the composition's own [`HostComposition::register_backup_dispatch`]
+/// entries expressed in the endpoint's [`AcceptedOwnerMethod`] row type, so
+/// the endpoint admits against one row shape and the routing below stays
+/// load-bearing. `PREPARE_ISOLATED_RESTORE` is the preparation owner
+/// operation and carries no cutover admission; `ADMIT_CUTOVER` is the
+/// separately admitted cutover owner operation. Every other method the
+/// endpoint accepts has no row here and therefore no owner operation.
+#[cfg(windows)]
+const HOST_BACKUP_DISPATCH_REGISTRATION: &[eliot_host_control_endpoint::AcceptedOwnerMethod] = &[
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::PrepareIsolatedRestore,
+        false,
+    ),
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::AdmitCutover,
+        true,
+    ),
+];
+
+/// The registered Host backup owner for the canonical Host runtime-control
+/// pipe (#962).
+///
+/// It owns only the typed dispatch decision: it resolves the admitted
+/// operation through the composition's own
+/// [`HostComposition::backup_dispatch_target`] and
+/// [`HostComposition::backup_dispatch_needs_cutover_admission`] routing and
+/// refuses every operation that has no registered owner row — a rehearsal
+/// completion, a capture or page read, an archive verification, a restore
+/// step, and every accepted method the composition did not register — before
+/// any effect. It opens no pipe, decodes no frame, authenticates no peer,
+/// admits no capability, and computes no digest.
+///
+/// The owner effect for the resolved target is
+/// [`HostComposition::backup_dispatch_prepare`] and
+/// [`HostComposition::backup_dispatch_cutover`]. Both need an owner-issued
+/// admitted body that the closed `#954`
+/// [`BackupRuntimeControlRequest`] envelope does not carry and that this
+/// composition does not retain, so this owner refuses them with a bounded
+/// typed refusal instead of fabricating an owner-issued body from a payload
+/// claim. That refusal is the honest pre-effect answer; the admitted bodies
+/// are the stitching phase's input.
+#[cfg(windows)]
+pub struct HostBackupDispatchOwner;
+
+#[cfg(windows)]
+impl HostBackupDispatchOwner {
+    /// Binds the owner to the exact closed prepare/cutover dispatch table.
+    #[must_use]
+    pub fn accepted() -> Self {
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
+    fn dispatch_backup_operation(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), eliot_host_control_endpoint::BackupDispatchRefusal> {
+        use eliot_host_control_endpoint::BackupDispatchRefusal;
+        let operation = request.operation;
+        let refusal = |reason: &'static str| BackupDispatchRefusal::new(operation, reason);
+        // Rehearsal completion resolves to no cutover admission, so it can
+        // never select the cutover owner operation. The assertion pins the
+        // excluded-rehearsal contract on the real routing path.
+        debug_assert!(!eliot_host_control_endpoint::rehearsal_resolves_cutover());
+        // The type-checked routing is the decision: a table marker string is
+        // never followed.
+        let Some(target) = HostComposition::backup_dispatch_target(operation) else {
+            return Err(refusal(
+                "no Host backup owner operation is registered for this method",
+            ));
+        };
+        // The routing's cutover-admission bit and the endpoint's own closed
+        // accepted table must agree; divergence is a stale registration and
+        // fails before effects rather than running an operation the endpoint
+        // did not admit.
+        if HostComposition::backup_dispatch_needs_cutover_admission(operation)
+            != eliot_host_control_endpoint::backup::requires_cutover_admission(operation)
+        {
+            return Err(refusal(
+                "registered cutover admission diverges from the accepted Host backup table",
+            ));
+        }
+        Err(refusal(match target {
+            BackupDispatchTarget::Prepare => {
+                "no owner-issued admitted isolated-restore preparation is retained by this Host"
+            }
+            BackupDispatchTarget::Cutover => {
+                "no separately admitted cutover body is retained by this Host"
+            }
+        }))
+    }
+}
+
 impl HostComposition {
     /// Opens one short-lived installation-registry handle below the retained
     /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
@@ -5662,6 +5763,44 @@ impl HostComposition {
         // wiring-only, no backup operation runs here.
         Self::validate_backup_dispatch_prepare_routing(dispatch);
         dispatch
+    }
+
+    /// Builds the registered Host backup owner for the canonical Host
+    /// runtime-control endpoint (#962).
+    ///
+    /// The owner carries the exact closed prepare/cutover dispatch table in
+    /// the endpoint's own [`AcceptedOwnerMethod`] row type, so the endpoint
+    /// admits against one table shape and the composition's routing stays
+    /// load-bearing. Construction cross-checks that table against
+    /// [`HostComposition::register_backup_dispatch`] and against the
+    /// endpoint's own accepted Host backup table, so a registration that
+    /// diverges from the routing refuses instead of serving a stale table.
+    /// Registration only: no pipe is opened, no task is started, and no
+    /// backup effect runs here.
+    #[cfg(windows)]
+    fn backup_owner_registration() -> HostBackupOwnerRegistration {
+        use eliot_host_control_endpoint::backup;
+        for (operation, _, needs_cutover_admission) in Self::register_backup_dispatch() {
+            let Some(row) = backup::accepted_host_backup_methods()
+                .iter()
+                .find(|row| row.op == operation)
+            else {
+                continue;
+            };
+            assert_eq!(
+                row.needs_cutover_admission, needs_cutover_admission,
+                "registered backup dispatch diverges from the accepted Host backup table"
+            );
+            assert_eq!(
+                row.wire_id,
+                operation.wire_id(),
+                "registered backup dispatch carries a drifted wire identity"
+            );
+        }
+        HostBackupOwnerRegistration::new(
+            HOST_BACKUP_DISPATCH_REGISTRATION,
+            Arc::new(HostBackupDispatchOwner::accepted()),
+        )
     }
 
     /// Validates the accepted backup dispatch routing shared by
@@ -7101,7 +7240,12 @@ impl HostComposition {
             std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
         )
-        .map_err(HostError::Platform)?;
+        .map_err(HostError::Platform)?
+        // Register the accepted prepare/cutover backup dispatch on the
+        // endpoint that already serves the canonical Host runtime-control
+        // pipe (#962). Registration only: it starts no task and opens no
+        // second pipe, so it cannot delay readiness.
+        .with_backup_owner(Self::backup_owner_registration());
         host_terminal.disarm();
         host_lifecycle_observe_scm(BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
         Ok(control)

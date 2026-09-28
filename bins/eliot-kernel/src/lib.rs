@@ -123,6 +123,7 @@ pub use blob_store_controller::{
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
     BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
 };
+pub use composition_bootstrap::BackupOwnerClients;
 pub use kernel_audit::{
     AuditAnchor, AuditAnchorBinding, AuditAssuranceClass, AuditCaptureMode, AuditEventDraft,
     AuditEventKind, AuditLineage, AuditRecord, ChainVerification, KernelAuditChain,
@@ -635,6 +636,13 @@ pub struct KernelComposition {
     /// Holds the work root only; every capture consumes already-accepted
     /// owner evidence and publishes once through the admitted owner port.
     backup_capture: KernelBackupCapture,
+    /// The exact-owner backup channel clients bound in production assembly
+    /// (issue #962). Held on the composition, not in process-global state: the
+    /// actual Host and Watchdog clients are constructed once here and every
+    /// requester reaches *these* clients through
+    /// [`KernelComposition::backup_owner_clients`], so a fresh or fake client
+    /// can never stand in for the bound pair.
+    backup_owner_clients: BackupOwnerClients,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -747,6 +755,20 @@ impl KernelComposition {
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
         &self.backup_capture
+    }
+
+    /// Returns the exact-owner backup channel clients bound in production
+    /// assembly (issue #962).
+    ///
+    /// These are the actual bound clients, not freshly constructed ones: the
+    /// composition owns them, so a caller cannot reach a differently-bound,
+    /// fake or no-op owner. Which owner serves a given operation is resolved by
+    /// [`BackupOwnerClients::route`] from the *authenticated* requester, never
+    /// from the payload, because `RestoreStatus` and `ReconcileRestore` are
+    /// served by both owners.
+    #[must_use]
+    pub const fn backup_owner_clients(&self) -> &BackupOwnerClients {
+        &self.backup_owner_clients
     }
 
     /// Runs one isolated restore on the composition-owned durable ORS journal
