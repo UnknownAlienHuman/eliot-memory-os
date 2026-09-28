@@ -113,9 +113,9 @@ use eliot_ors::{
     EpochLineage, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
     OperationalCurrentRecoveryCursor, OperationalPhase, OperationalRecoveryStore,
     RecoveryInboxDisposition, RecoveryInboxRecoveryCursor, RecoveryInventorySnapshot,
-    RecoveryInventorySource, RecoveryProblem, RecoveryProblemRecoveryCursor,
-    RedbRecoveryStore, ReservationRecord, ReservationState, StateFenceSnapshot,
-    WriteIdempotencyRecoveryCursor, WriteReservationRecoveryCursor, WriterReservationToken,
+    RecoveryInventorySource, RecoveryProblem, RecoveryProblemRecoveryCursor, RedbRecoveryStore,
+    ReservationRecord, ReservationState, StateFenceSnapshot, WriteIdempotencyRecoveryCursor,
+    WriteReservationRecoveryCursor, WriterReservationToken,
 };
 use eliot_receipts::{ReceiptDispositionKind, ReceiptKind};
 use eliot_store_api::{
@@ -1056,11 +1056,14 @@ fn check_receipt_token_binding(
             "receipt envelope operation does not match the reservation operation",
         ));
     }
-    let write_binding = token.write_binding.as_ref().ok_or_else(|| {
-        binding("reservation has no retained versioned write binding")
-    })?;
+    let write_binding = token
+        .write_binding
+        .as_ref()
+        .ok_or_else(|| binding("reservation has no retained versioned write binding"))?;
     write_binding.validate().map_err(|error| {
-        binding(&format!("retained versioned write binding is invalid: {error}"))
+        binding(&format!(
+            "retained versioned write binding is invalid: {error}"
+        ))
     })?;
     if write_binding.operation_id.as_str() != operation_id
         || write_binding.operation_id != token.operation_id
@@ -1497,11 +1500,14 @@ pub struct StartupUnknownOperation {
 pub enum StartupReconciliationReadiness {
     /// The reservation and control obligation checks are exhausted, the
     /// revision-bound inventory covered all five ORS sources, and there is no
-    /// unresolved reservation. Higher-level control-plane prerequisites still
-    /// decide which individual scopes and capabilities may reopen.
+    /// unresolved reservation or active control obligation.
     Ready,
-    /// A reservation remains unresolved, or either bounded scan did not reach
-    /// exhaustion, or a cursor coverage field disagrees with the rows observed.
+    /// A reservation or active control obligation remains unresolved, a
+    /// bounded scan did not reach exhaustion, or cursor coverage disagrees
+    /// with the rows observed. Since ORS does not yet provide a typed mapping
+    /// from checkpoint/inbox subjects to affected scopes, any such obligation
+    /// conservatively keeps dependent normal writes behind step 6; the
+    /// independent recovery control path remains available.
     Blocked,
 }
 
@@ -1519,18 +1525,36 @@ pub enum StartupReconciliationReadiness {
 pub struct StartupReconciliation {
     /// Live fence the scan ran under; Kernel matches it exactly.
     pub fence: StateFence,
-    /// Digest over the fence, both scan sources, every cursor coverage field
-    /// and every returned reservation identity/outcome and control obligation
-    /// reference.
+    /// Digest over the fence, bounded lookup trace, final inventory coverage,
+    /// reservation outcomes, and control-obligation sample/counts.
     pub digest: String,
     /// Revision-bound coverage of every ORS startup inventory source.
     pub inventory_coverage: StartupRecoveryInventoryCoverage,
-    /// Number of nonterminal reservation rows returned and examined across the
-    /// complete reservation source.
+    /// Number of active reservation rows actually processed by the partial
+    /// keyset lookup. Full-source coverage is recorded separately in
+    /// `inventory_coverage`.
     pub scanned: u64,
-    /// Active rows found behind the reconciliation key marker that were not
-    /// represented by a previously reported pending/unknown operation.
-    pub unaccounted_reservation_count: u64,
+    /// Exhaustive five-source preflight coverage established before any
+    /// receipt-driven ORS mutation.
+    pub preflight_inventory_coverage: StartupRecoveryInventoryCoverage,
+    /// Number of bounded reservation pages consumed by the partial keyset
+    /// lookup; this is not a full-inventory page count.
+    pub reservation_lookup_page_count: u64,
+    /// Number of primary reservation rows returned by the partial keyset
+    /// lookup, including terminal rows and rows seen before own mutations.
+    pub reservation_lookup_record_count: u64,
+    /// Rolling digest over each partial lookup page, its snapshot, opaque
+    /// cursor, reservation identities, and explicit continuation.
+    pub reservation_lookup_digest: String,
+    /// Whether the final partial keyset suffix reached explicit exhaustion.
+    /// This field never establishes full-source coverage.
+    pub reservation_lookup_suffix_exhausted: bool,
+    /// Absolute difference between final active-row and reported unresolved
+    /// counts. Identity equality is reported separately.
+    pub unresolved_count_delta: u64,
+    /// Whether the ordered unresolved outcome identity stream matches the
+    /// independent full-inventory active reservation stream.
+    pub unresolved_identity_match: bool,
     /// Exact number of active checkpoint records in the frozen inventory.
     pub job_checkpoint_record_count: u64,
     /// Sorted sample of active checkpoint subjects, capped at `page_size`.
@@ -1568,16 +1592,25 @@ pub struct StartupReconciliation {
 impl StartupReconciliation {
     /// Returns the verdict for this report: `Ready` requires every ORS source
     /// to have complete cursor coverage under one final-revalidated snapshot,
-    /// a valid page size, and no pending or unknown reservation. A control
-    /// obligation that is present remains visible in the report; its presence
-    /// does not erase proof of source coverage.
+    /// an exhausted partial lookup, matching unresolved/active identity
+    /// streams, a valid page size, and no pending, unknown, active reservation
+    /// or unresolved retained problem. Any active checkpoint, delivery-cursor,
+    /// or imported inbox obligation also blocks the dependent normal-write
+    /// gate. ORS does not yet expose subject-to-scope mapping, so this is a
+    /// conservative global step-6 gate; per-scope reopening remains partial.
     pub fn readiness(&self) -> StartupReconciliationReadiness {
         if self.inventory_coverage.is_complete()
+            && self.preflight_inventory_coverage.is_complete()
             && self.page_size > 0
-            && self.unaccounted_reservation_count == 0
+            && self.reservation_lookup_suffix_exhausted
+            && self.unresolved_count_delta == 0
+            && self.unresolved_identity_match
             && self.active_reservation_count == 0
             && self.pending_count == 0
             && self.unknown_count == 0
+            && self.job_checkpoint_record_count == 0
+            && self.delivery_cursor_record_count == 0
+            && self.recovery_inbox_record_count == 0
             && self.unresolved_retained_problem_count == 0
         {
             StartupReconciliationReadiness::Ready
@@ -1622,7 +1655,9 @@ async fn reconcile_one_record(
             reason: "missing retained write binding".to_owned(),
         });
     };
-    write_binding.validate().map_err(ReservationWriteError::Ors)?;
+    write_binding
+        .validate()
+        .map_err(ReservationWriteError::Ors)?;
     // Same-authority rule: only tokens minted under the bound writer
     // epoch are eligible here. Anything else (restart under a new
     // epoch, foreign writer) is reported pending and never touched.
@@ -1731,6 +1766,13 @@ fn append_startup_digest_field(encoded: &mut String, value: &str) {
     encoded.push_str(value);
 }
 
+fn extend_startup_digest_chain(previous_sha256: &str, entry: &str) -> String {
+    let mut material = String::new();
+    append_startup_digest_field(&mut material, previous_sha256);
+    append_startup_digest_field(&mut material, entry);
+    sha256_hex(material.as_bytes())
+}
+
 fn startup_scan_integrity_error(
     record_type: &'static str,
     reason: impl Into<String>,
@@ -1743,10 +1785,8 @@ fn startup_scan_integrity_error(
 
 struct StartupRecoveryInventoryScan {
     coverage: StartupRecoveryInventoryCoverage,
-    nonterminal_reservation_count: u64,
-    next_active_reservation: Option<ReservationRecord>,
-    unaccounted_active_reservation_count: u64,
-    unaccounted_active_reservation: Option<ReservationRecord>,
+    active_reservation_count: u64,
+    active_identity_sha256: String,
     job_checkpoint_record_count: u64,
     job_checkpoint_ref_sample: Vec<String>,
     delivery_cursor_record_count: u64,
@@ -1758,6 +1798,8 @@ struct StartupRecoveryInventoryScan {
     unresolved_retained_problem_count: u64,
 }
 
+/// Keeps a sorted sample whose resident set never exceeds the page-size cap;
+/// exact source totals are counted separately while scanning.
 fn add_bounded_reference_sample(sample: &mut BTreeSet<String>, value: &str, limit: u16) {
     if sample.contains(value) || sample.len() < usize::from(limit) {
         sample.insert(value.to_owned());
@@ -1783,15 +1825,145 @@ struct StartupRecoverySourceCoverageBuilder {
     start_cursor_sha256: Option<String>,
     expected_cursor_sha256: Option<String>,
     terminal_cursor_sha256: Option<String>,
-    chain: String,
+    chain_sha256: String,
     complete: bool,
+}
+
+/// Trace of the mutable, partial reservation lookup used to reconcile rows.
+/// It records exact page/row counts and a rolling page digest while retaining
+/// only the opaque continuation needed for the current bounded sweep.
+struct StartupReservationLookupTrace {
+    page_count: u64,
+    record_count: u64,
+    chain_sha256: String,
+    expected_cursor_sha256: Option<String>,
+    last_reservation_id: Option<String>,
+}
+
+impl StartupReservationLookupTrace {
+    fn new() -> Self {
+        Self {
+            page_count: 0,
+            record_count: 0,
+            chain_sha256: sha256_hex(b"eliot.kernel.startup-reservation-lookup.v1"),
+            expected_cursor_sha256: None,
+            last_reservation_id: None,
+        }
+    }
+
+    fn observe_page(
+        &mut self,
+        snapshot: &RecoveryInventorySnapshot,
+        cursor_sha256: &str,
+        page: &eliot_ors::WriteReservationRecoveryPage,
+        limit: u16,
+    ) -> Result<(), ReservationWriteError> {
+        if page.coverage != eliot_ors::WriteReservationRecoveryCoverage::PrimaryRowsFromStartAfter
+            || page.source_revision != snapshot.reservation_revision
+            || page.snapshot_sha256 != snapshot.snapshot_sha256
+            || page.records.len() > usize::from(limit)
+            || page.complete != page.next_cursor.is_none()
+        {
+            return Err(startup_scan_integrity_error(
+                "startup_reservation_lookup_page",
+                "partial reservation lookup page metadata disagrees with its snapshot or cursor",
+            ));
+        }
+        if let Some(expected) = &self.expected_cursor_sha256
+            && expected != cursor_sha256
+        {
+            return Err(startup_scan_integrity_error(
+                "startup_reservation_lookup_cursor",
+                "partial reservation continuation differs from the prior page",
+            ));
+        }
+        if page.records.is_empty() && !page.complete {
+            return Err(startup_scan_integrity_error(
+                "startup_reservation_lookup_cursor",
+                "partial reservation page made no primary-key progress",
+            ));
+        }
+        for record in &page.records {
+            let reservation_id = record.token.reservation_id.as_str();
+            if self
+                .last_reservation_id
+                .as_deref()
+                .is_some_and(|last| reservation_id <= last)
+            {
+                return Err(startup_scan_integrity_error(
+                    "startup_reservation_lookup_cursor",
+                    "partial reservation rows repeated or moved behind the exclusive keyset cursor",
+                ));
+            }
+            self.last_reservation_id = Some(reservation_id.to_owned());
+        }
+        let next_cursor_sha256 = page
+            .next_cursor
+            .as_ref()
+            .map(|cursor| startup_serialized_sha256(cursor, "startup_reservation_lookup_cursor"))
+            .transpose()?;
+        if next_cursor_sha256.as_deref() == Some(cursor_sha256) {
+            return Err(startup_scan_integrity_error(
+                "startup_reservation_lookup_cursor",
+                "partial reservation cursor did not advance",
+            ));
+        }
+        let page_records_sha256 =
+            startup_serialized_sha256(&page.records, "startup_reservation_lookup_records")?;
+        let row_count = u64::try_from(page.records.len()).map_err(|_| {
+            startup_scan_integrity_error(
+                "startup_reservation_lookup_page",
+                "partial reservation page row count exceeds its coverage counter",
+            )
+        })?;
+        self.page_count = self.page_count.checked_add(1).ok_or_else(|| {
+            startup_scan_integrity_error(
+                "startup_reservation_lookup_page",
+                "partial reservation page count overflowed",
+            )
+        })?;
+        self.record_count = self.record_count.checked_add(row_count).ok_or_else(|| {
+            startup_scan_integrity_error(
+                "startup_reservation_lookup_page",
+                "partial reservation row count overflowed",
+            )
+        })?;
+        let mut page_material = String::new();
+        for field in [
+            "primary_rows_from_start_after".to_owned(),
+            snapshot.snapshot_sha256.clone(),
+            page.source_revision.to_string(),
+            cursor_sha256.to_owned(),
+            row_count.to_string(),
+            page_records_sha256,
+            page.complete.to_string(),
+            next_cursor_sha256
+                .clone()
+                .unwrap_or_else(|| "complete".to_owned()),
+        ] {
+            append_startup_digest_field(&mut page_material, &field);
+        }
+        self.chain_sha256 = extend_startup_digest_chain(&self.chain_sha256, &page_material);
+        self.expected_cursor_sha256 = next_cursor_sha256;
+        Ok(())
+    }
+
+    fn restart_after_owner_mutation(&mut self) {
+        // The prior opaque cursor belongs to a revision that an owner mutation
+        // just changed. A fresh snapshot starts after the last returned key.
+        self.expected_cursor_sha256 = None;
+    }
 }
 
 impl StartupRecoverySourceCoverageBuilder {
     fn new(source: &'static str, source_revision: u64, snapshot_sha256: &str) -> Self {
-        let mut chain = String::from("eliot.kernel.startup-recovery-source.v1\n");
-        for field in [source.to_owned(), source_revision.to_string(), snapshot_sha256.to_owned()] {
-            append_startup_digest_field(&mut chain, &field);
+        let mut seed = String::from("eliot.kernel.startup-recovery-source.v1\n");
+        for field in [
+            source.to_owned(),
+            source_revision.to_string(),
+            snapshot_sha256.to_owned(),
+        ] {
+            append_startup_digest_field(&mut seed, &field);
         }
         Self {
             source,
@@ -1802,7 +1974,7 @@ impl StartupRecoverySourceCoverageBuilder {
             start_cursor_sha256: None,
             expected_cursor_sha256: None,
             terminal_cursor_sha256: None,
-            chain,
+            chain_sha256: sha256_hex(seed.as_bytes()),
             complete: false,
         }
     }
@@ -1826,13 +1998,19 @@ impl StartupRecoverySourceCoverageBuilder {
         {
             return Err(startup_scan_integrity_error(
                 "startup_recovery_inventory_page",
-                format!("{} page metadata or row count disagrees with its snapshot", self.source),
+                format!(
+                    "{} page metadata or row count disagrees with its snapshot",
+                    self.source
+                ),
             ));
         }
         if complete != next_cursor.is_none() {
             return Err(startup_scan_integrity_error(
                 "startup_recovery_inventory_cursor",
-                format!("{} page completion disagrees with its continuation", self.source),
+                format!(
+                    "{} page completion disagrees with its continuation",
+                    self.source
+                ),
             ));
         }
         if let Some(expected) = &self.expected_cursor_sha256
@@ -1840,7 +2018,10 @@ impl StartupRecoverySourceCoverageBuilder {
         {
             return Err(startup_scan_integrity_error(
                 "startup_recovery_inventory_cursor",
-                format!("{} continuation did not match the prior page cursor", self.source),
+                format!(
+                    "{} continuation did not match the prior page cursor",
+                    self.source
+                ),
             ));
         }
         if self.page_count == 0 {
@@ -1854,17 +2035,21 @@ impl StartupRecoverySourceCoverageBuilder {
         {
             return Err(startup_scan_integrity_error(
                 "startup_recovery_inventory_cursor",
-                format!("{} continuation did not advance its opaque cursor", self.source),
+                format!(
+                    "{} continuation did not advance its opaque cursor",
+                    self.source
+                ),
             ));
         }
-        let records_sha256 = startup_serialized_sha256(
-            &records,
-            "startup_recovery_inventory_records",
-        )?;
+        let records_sha256 =
+            startup_serialized_sha256(&records, "startup_recovery_inventory_records")?;
         let row_count = u64::try_from(records.len()).map_err(|_| {
             startup_scan_integrity_error(
                 "startup_recovery_inventory_page",
-                format!("{} page row count exceeds its coverage counter", self.source),
+                format!(
+                    "{} page row count exceeds its coverage counter",
+                    self.source
+                ),
             )
         })?;
         self.page_count = self.page_count.checked_add(1).ok_or_else(|| {
@@ -1879,6 +2064,7 @@ impl StartupRecoverySourceCoverageBuilder {
                 format!("{} record count overflowed", self.source),
             )
         })?;
+        let mut page_material = String::new();
         for field in [
             cursor_sha256.clone(),
             row_count.to_string(),
@@ -1888,8 +2074,12 @@ impl StartupRecoverySourceCoverageBuilder {
                 .clone()
                 .unwrap_or_else(|| "complete".to_owned()),
         ] {
-            append_startup_digest_field(&mut self.chain, &field);
+            append_startup_digest_field(&mut page_material, &field);
         }
+        let mut next_chain_material = String::new();
+        append_startup_digest_field(&mut next_chain_material, &self.chain_sha256);
+        append_startup_digest_field(&mut next_chain_material, &page_material);
+        self.chain_sha256 = sha256_hex(next_chain_material.as_bytes());
         self.expected_cursor_sha256 = next_cursor_sha256;
         self.terminal_cursor_sha256 = Some(cursor_sha256);
         self.complete = complete;
@@ -1915,7 +2105,7 @@ impl StartupRecoverySourceCoverageBuilder {
             record_count: self.record_count,
             start_cursor_sha256: self.start_cursor_sha256.expect("checked above"),
             terminal_cursor_sha256: self.terminal_cursor_sha256.expect("checked above"),
-            coverage_sha256: sha256_hex(self.chain.as_bytes()),
+            coverage_sha256: self.chain_sha256,
             complete: self.complete,
         })
     }
@@ -1937,7 +2127,10 @@ fn startup_serialized_sha256<T: serde::Serialize>(
     record_type: &'static str,
 ) -> Result<String, ReservationWriteError> {
     let encoded = serde_json::to_vec(value).map_err(|error| {
-        startup_scan_integrity_error(record_type, format!("safe inventory data failed encoding: {error}"))
+        startup_scan_integrity_error(
+            record_type,
+            format!("safe inventory data failed encoding: {error}"),
+        )
     })?;
     Ok(sha256_hex(&encoded))
 }
@@ -1951,17 +2144,12 @@ fn startup_serialized_sha256<T: serde::Serialize>(
 fn scan_startup_recovery_inventory(
     ors: &RedbRecoveryStore,
     limit: u16,
-    after_reservation_id: Option<&str>,
-    known_unresolved_operation_ids: &BTreeSet<String>,
-    verify_all_active_against_known: bool,
 ) -> Result<StartupRecoveryInventoryScan, ReservationWriteError> {
     let snapshot = ors.begin_recovery_inventory_snapshot()?;
     snapshot.validate()?;
     let mut coverage = Vec::with_capacity(STARTUP_RECOVERY_INVENTORY_SOURCES.len());
-    let mut nonterminal_reservation_count = 0_u64;
-    let mut next_active_reservation = None;
-    let mut unaccounted_active_reservation_count = 0_u64;
-    let mut unaccounted_active_reservation = None;
+    let mut active_reservation_count = 0_u64;
+    let mut active_identity_sha256 = sha256_hex(b"eliot.kernel.startup-reservation-identities.v1");
     let mut job_checkpoint_refs = BTreeSet::new();
     let mut job_checkpoint_record_count = 0_u64;
     let mut delivery_cursor_refs = BTreeSet::new();
@@ -1979,11 +2167,15 @@ fn scan_startup_recovery_inventory(
         &snapshot.snapshot_sha256,
     );
     loop {
-        let cursor_sha256 = startup_serialized_sha256(
-            &reservation_cursor,
-            "startup_recovery_inventory_cursor",
-        )?;
+        let cursor_sha256 =
+            startup_serialized_sha256(&reservation_cursor, "startup_recovery_inventory_cursor")?;
         let page = ors.scan_write_reservations(reservation_cursor)?;
+        if page.coverage != eliot_ors::WriteReservationRecoveryCoverage::FullInventory {
+            return Err(startup_scan_integrity_error(
+                "startup_recovery_inventory_coverage",
+                "full startup scan received a partial reservation suffix page",
+            ));
+        }
         reservation_coverage.observe_page(
             &snapshot,
             cursor_sha256,
@@ -1998,56 +2190,17 @@ fn scan_startup_recovery_inventory(
             if record.state.is_terminal() {
                 continue;
             }
-            nonterminal_reservation_count = nonterminal_reservation_count
-                .checked_add(1)
-                .ok_or_else(|| {
+            active_reservation_count =
+                active_reservation_count.checked_add(1).ok_or_else(|| {
                     startup_scan_integrity_error(
                         "startup_reservation_coverage",
-                        "nonterminal reservation count overflowed",
+                        "active reservation count overflowed",
                     )
-            })?;
-            let reservation_id = record.token.reservation_id.as_str();
-            if verify_all_active_against_known {
-                if !known_unresolved_operation_ids.contains(record.token.operation_id.as_str()) {
-                    unaccounted_active_reservation_count =
-                        unaccounted_active_reservation_count
-                            .checked_add(1)
-                            .ok_or_else(|| {
-                                startup_scan_integrity_error(
-                                    "startup_reservation_coverage",
-                                    "unaccounted reservation count overflowed",
-                                )
-                            })?;
-                    if unaccounted_active_reservation.is_none() {
-                        unaccounted_active_reservation = Some(record.clone());
-                    }
-                }
-            } else {
-                match after_reservation_id {
-                Some(after) if reservation_id <= after => {
-                    if !known_unresolved_operation_ids
-                        .contains(record.token.operation_id.as_str())
-                    {
-                        unaccounted_active_reservation_count =
-                            unaccounted_active_reservation_count
-                                .checked_add(1)
-                                .ok_or_else(|| {
-                                    startup_scan_integrity_error(
-                                        "startup_reservation_coverage",
-                                        "unaccounted reservation count overflowed",
-                                    )
-                                })?;
-                        if unaccounted_active_reservation.is_none() {
-                            unaccounted_active_reservation = Some(record.clone());
-                        }
-                    }
-                }
-                _ if next_active_reservation.is_none() => {
-                    next_active_reservation = Some(record.clone());
-                }
-                _ => {}
-                }
-            }
+                })?;
+            let identity =
+                startup_reservation_scan_entry(&record.token, record.state, "unresolved");
+            active_identity_sha256 =
+                extend_startup_digest_chain(&active_identity_sha256, &identity);
         }
         let complete = page.complete;
         if complete {
@@ -2062,18 +2215,15 @@ fn scan_startup_recovery_inventory(
     }
     coverage.push(reservation_coverage.finish()?);
 
-    let mut operational_cursor =
-        OperationalCurrentRecoveryCursor::start(snapshot.clone(), limit)?;
+    let mut operational_cursor = OperationalCurrentRecoveryCursor::start(snapshot.clone(), limit)?;
     let mut operational_coverage = StartupRecoverySourceCoverageBuilder::new(
         STARTUP_RECOVERY_INVENTORY_SOURCES[1],
         snapshot.operational_current_revision,
         &snapshot.snapshot_sha256,
     );
     loop {
-        let cursor_sha256 = startup_serialized_sha256(
-            &operational_cursor,
-            "startup_recovery_inventory_cursor",
-        )?;
+        let cursor_sha256 =
+            startup_serialized_sha256(&operational_cursor, "startup_recovery_inventory_cursor")?;
         let page = ors.scan_operational_current(operational_cursor)?;
         operational_coverage.observe_page(
             &snapshot,
@@ -2228,10 +2378,8 @@ fn scan_startup_recovery_inventory(
         &snapshot.snapshot_sha256,
     );
     loop {
-        let cursor_sha256 = startup_serialized_sha256(
-            &idempotency_cursor,
-            "startup_recovery_inventory_cursor",
-        )?;
+        let cursor_sha256 =
+            startup_serialized_sha256(&idempotency_cursor, "startup_recovery_inventory_cursor")?;
         let page = ors.scan_write_idempotency(idempotency_cursor)?;
         idempotency_coverage.observe_page(
             &snapshot,
@@ -2263,10 +2411,8 @@ fn scan_startup_recovery_inventory(
             sources: coverage,
             snapshot_revalidated: true,
         },
-        nonterminal_reservation_count,
-        next_active_reservation,
-        unaccounted_active_reservation_count,
-        unaccounted_active_reservation,
+        active_reservation_count,
+        active_identity_sha256,
         job_checkpoint_record_count,
         job_checkpoint_ref_sample: job_checkpoint_refs.into_iter().collect(),
         delivery_cursor_record_count,
@@ -2298,12 +2444,14 @@ fn scan_startup_recovery_inventory(
 /// reported honestly: unknown outcomes stay unresolved, and a failed
 /// check is an error, never a synthetic empty report.
 ///
-/// `limit` is the per-page row bound. Each of the five typed cursors continues
-/// until its page returns `complete=true`, including the reservation cursor's
-/// empty order-index and operation-index phases. No whole-store ceiling is
-/// inferred from a short page. ORS corruption, source movement, a malformed or
-/// missing continuation, or failed final revision validation returns an error
-/// and cannot be interpreted as zero rows.
+/// `limit` is the per-page row bound. An exhaustive five-source preflight runs
+/// before receipt effects; a separate primary-row suffix lookup then resumes
+/// after each page whose active rows may have changed ORS. The suffix trace is
+/// diagnostic only. A second exhaustive five-source scan from the beginning
+/// validates final readiness, including both reservation index phases. No
+/// whole-store ceiling is inferred from a short page. ORS corruption, source
+/// movement, a malformed or missing continuation, or failed final revision
+/// validation returns an error and cannot be interpreted as zero rows.
 pub async fn reconcile_pending_at_startup(
     owner: &CompositionReservation,
     fence: &StateFence,
@@ -2330,183 +2478,210 @@ async fn reconcile_pending_at_startup_inner(
     limit: u16,
     mut staged_projection: Option<&mut StartupStagedProjection>,
 ) -> Result<StartupReconciliation, ReservationWriteError> {
+    // Establish an exhaustive, revision-stable preflight before any receipt
+    // lookup can mutate ORS. The mutable reservation lookup below is a
+    // separate primary-row suffix traversal; it cannot mint this coverage.
+    let preflight_inventory_coverage = {
+        let preflight_inventory = scan_startup_recovery_inventory(&owner.ors, limit)?;
+        preflight_inventory.coverage
+    };
+
     let mut pending = Vec::new();
     let mut pending_count = 0_u64;
     let mut unknown = Vec::new();
     let mut unknown_count = 0_u64;
-    let mut known_unresolved_operation_ids = BTreeSet::new();
     let mut after_reservation_id: Option<String> = None;
     let mut scanned = 0_u64;
     let mut outcome_chain = sha256_hex(b"eliot.kernel.startup-reservation-outcomes.v1");
-    let final_inventory = loop {
-        // Each pass exhausts all five sources under one snapshot before any
-        // possible ORS mutation. After one reservation is reconciled, its
-        // revision may advance, so the next pass starts a fresh snapshot and
-        // continues after the last processed primary reservation key.
-        let inventory = scan_startup_recovery_inventory(
-            &owner.ors,
-            limit,
-            after_reservation_id.as_deref(),
-            &known_unresolved_operation_ids,
-            false,
-        )?;
-        if inventory.unaccounted_active_reservation_count > 0 {
-            break inventory;
+    let mut unresolved_identity_sha256 =
+        sha256_hex(b"eliot.kernel.startup-reservation-identities.v1");
+    let mut lookup = StartupReservationLookupTrace::new();
+    let mut after_page_snapshot: Option<RecoveryInventorySnapshot> = None;
+    let mut reservation_cursor: Option<WriteReservationRecoveryCursor> = None;
+    let mut reservation_lookup_suffix_exhausted = false;
+
+    loop {
+        if reservation_cursor.is_none() {
+            let snapshot = owner.ors.begin_recovery_inventory_snapshot()?;
+            snapshot.validate()?;
+            reservation_cursor = Some(WriteReservationRecoveryCursor::start_after(
+                snapshot.clone(),
+                after_reservation_id.as_deref(),
+                limit,
+            )?);
+            after_page_snapshot = Some(snapshot);
         }
-        let Some(record) = inventory.next_active_reservation.as_ref() else {
-            break inventory;
-        };
-        let token = &record.token;
-        let operation_id = token.operation_id.as_str().to_owned();
-        let reservation_id = token.reservation_id.as_str().to_owned();
-        if after_reservation_id
-            .as_deref()
-            .is_some_and(|after| reservation_id.as_str() <= after)
-        {
-            return Err(startup_scan_integrity_error(
-                "startup_reservation_cursor",
-                "next active reservation did not advance the exclusive primary-key marker",
-            ));
-        }
-        let mut scopes: Vec<String> = token
-            .scopes
-            .iter()
-            .map(|scope| scope.scope.as_str().to_owned())
-            .collect();
-        scopes.sort_unstable();
-        let recovery_owner = token.recovery_owner.as_str().to_owned();
-        let entry = reconcile_one_record(owner, route, record).await?;
-        let outcome_for_digest = match &entry {
-            StartupRecordOutcome::Resolved => "resolved".to_owned(),
-            StartupRecordOutcome::Pending { reason } => format!("pending:{reason}"),
-            StartupRecordOutcome::Unknown { reason } => format!("unknown:{reason}"),
-        };
-        let mut outcome_input = String::new();
-        append_startup_digest_field(&mut outcome_input, &outcome_chain);
-        append_startup_digest_field(
-            &mut outcome_input,
-            &inventory.coverage.snapshot_sha256,
-        );
-        append_startup_digest_field(
-            &mut outcome_input,
-            &startup_reservation_scan_entry(token, record.state, &outcome_for_digest),
-        );
-        outcome_chain = sha256_hex(outcome_input.as_bytes());
-        scanned = scanned.checked_add(1).ok_or_else(|| {
+        let cursor = reservation_cursor.take().ok_or_else(|| {
             startup_scan_integrity_error(
-                "startup_reservation_coverage",
-                "reconciled reservation count overflowed",
+                "startup_reservation_lookup_cursor",
+                "partial reservation lookup omitted its cursor",
             )
         })?;
-        after_reservation_id = Some(reservation_id);
-        match entry {
-            StartupRecordOutcome::Resolved => {}
-            StartupRecordOutcome::Pending { reason } => {
-                known_unresolved_operation_ids.insert(operation_id.clone());
-                pending_count = pending_count.checked_add(1).ok_or_else(|| {
-                    startup_scan_integrity_error(
-                        "startup_reservation_coverage",
-                        "pending reservation count overflowed",
-                    )
-                })?;
-                if let Some(projection) = staged_projection.as_deref_mut() {
-                    record_staged_obligation(
-                        owner,
-                        projection,
-                        &operation_id,
-                        &reservation_id,
-                        token.reservation_order,
-                        record.state,
-                        limit,
-                    )?;
-                }
-                if pending.len() < usize::from(limit) {
-                    pending.push(StartupPendingOperation {
-                    operation_id,
-                    reservation_id: token.reservation_id.as_str().to_owned(),
-                    reservation_order: token.reservation_order,
-                    scopes,
-                    state: record.state,
-                    recovery_owner,
-                    reason,
-                    });
-                }
+        let snapshot = after_page_snapshot.as_ref().ok_or_else(|| {
+            startup_scan_integrity_error(
+                "startup_reservation_lookup_snapshot",
+                "partial reservation lookup omitted its snapshot",
+            )
+        })?;
+        let cursor_sha256 =
+            startup_serialized_sha256(&cursor, "startup_reservation_lookup_cursor")?;
+        let page = owner.ors.scan_write_reservations(cursor)?;
+        lookup.observe_page(snapshot, &cursor_sha256, &page, limit)?;
+        let page_has_active_rows = page
+            .records
+            .iter()
+            .any(|record| !record.state.is_terminal());
+        let page_last_reservation_id = page
+            .records
+            .last()
+            .map(|record| record.token.reservation_id.as_str().to_owned());
+
+        for record in &page.records {
+            if record.state.is_terminal() {
+                continue;
             }
-            StartupRecordOutcome::Unknown { reason } => {
-                known_unresolved_operation_ids.insert(operation_id.clone());
-                unknown_count = unknown_count.checked_add(1).ok_or_else(|| {
-                    startup_scan_integrity_error(
-                        "startup_reservation_coverage",
-                        "unknown reservation count overflowed",
-                    )
-                })?;
-                if let Some(projection) = staged_projection.as_deref_mut() {
-                    record_staged_obligation(
-                        owner,
-                        projection,
-                        &operation_id,
-                        &reservation_id,
-                        token.reservation_order,
-                        record.state,
-                        limit,
-                    )?;
+            let token = &record.token;
+            let operation_id = token.operation_id.as_str().to_owned();
+            let reservation_id = token.reservation_id.as_str().to_owned();
+            let mut scopes: Vec<String> = token
+                .scopes
+                .iter()
+                .map(|scope| scope.scope.as_str().to_owned())
+                .collect();
+            scopes.sort_unstable();
+            let recovery_owner = token.recovery_owner.as_str().to_owned();
+            let entry = reconcile_one_record(owner, route, record).await?;
+            let outcome_for_digest = match &entry {
+                StartupRecordOutcome::Resolved => "resolved".to_owned(),
+                StartupRecordOutcome::Pending { reason } => format!("pending:{reason}"),
+                StartupRecordOutcome::Unknown { reason } => format!("unknown:{reason}"),
+            };
+            let mut outcome_entry = String::new();
+            append_startup_digest_field(&mut outcome_entry, &snapshot.snapshot_sha256);
+            append_startup_digest_field(
+                &mut outcome_entry,
+                &startup_reservation_scan_entry(token, record.state, &outcome_for_digest),
+            );
+            outcome_chain = extend_startup_digest_chain(&outcome_chain, &outcome_entry);
+            scanned = scanned.checked_add(1).ok_or_else(|| {
+                startup_scan_integrity_error(
+                    "startup_reservation_coverage",
+                    "reconciled reservation count overflowed",
+                )
+            })?;
+            match entry {
+                StartupRecordOutcome::Resolved => {}
+                StartupRecordOutcome::Pending { reason } => {
+                    pending_count = pending_count.checked_add(1).ok_or_else(|| {
+                        startup_scan_integrity_error(
+                            "startup_reservation_coverage",
+                            "pending reservation count overflowed",
+                        )
+                    })?;
+                    let identity =
+                        startup_reservation_scan_entry(token, record.state, "unresolved");
+                    unresolved_identity_sha256 =
+                        extend_startup_digest_chain(&unresolved_identity_sha256, &identity);
+                    if let Some(projection) = staged_projection.as_deref_mut() {
+                        record_staged_obligation(
+                            owner,
+                            projection,
+                            &operation_id,
+                            &reservation_id,
+                            token.reservation_order,
+                            record.state,
+                            limit,
+                        )?;
+                    }
+                    if pending.len() < usize::from(limit) {
+                        pending.push(StartupPendingOperation {
+                            operation_id,
+                            reservation_id: token.reservation_id.as_str().to_owned(),
+                            reservation_order: token.reservation_order,
+                            scopes,
+                            state: record.state,
+                            recovery_owner,
+                            reason,
+                        });
+                    }
                 }
-                if unknown.len() < usize::from(limit) {
-                    unknown.push(StartupUnknownOperation {
-                    operation_id,
-                    reservation_id: token.reservation_id.as_str().to_owned(),
-                    reservation_order: token.reservation_order,
-                    scopes,
-                    state: record.state,
-                    recovery_owner,
-                    reason,
-                    });
+                StartupRecordOutcome::Unknown { reason } => {
+                    unknown_count = unknown_count.checked_add(1).ok_or_else(|| {
+                        startup_scan_integrity_error(
+                            "startup_reservation_coverage",
+                            "unknown reservation count overflowed",
+                        )
+                    })?;
+                    let identity =
+                        startup_reservation_scan_entry(token, record.state, "unresolved");
+                    unresolved_identity_sha256 =
+                        extend_startup_digest_chain(&unresolved_identity_sha256, &identity);
+                    if let Some(projection) = staged_projection.as_deref_mut() {
+                        record_staged_obligation(
+                            owner,
+                            projection,
+                            &operation_id,
+                            &reservation_id,
+                            token.reservation_order,
+                            record.state,
+                            limit,
+                        )?;
+                    }
+                    if unknown.len() < usize::from(limit) {
+                        unknown.push(StartupUnknownOperation {
+                            operation_id,
+                            reservation_id: token.reservation_id.as_str().to_owned(),
+                            reservation_order: token.reservation_order,
+                            scopes,
+                            state: record.state,
+                            recovery_owner,
+                            reason,
+                        });
+                    }
                 }
             }
         }
-    };
-    let reported_unresolved = pending_count.checked_add(unknown_count).ok_or_else(|| {
-        startup_scan_integrity_error(
-            "startup_reservation_coverage",
-            "reported unresolved reservation count exceeds its coverage counter",
-        )
-    })?;
-    let active_reservation_count = final_inventory.nonterminal_reservation_count;
-    let newly_unaccounted_count = final_inventory.unaccounted_active_reservation_count;
-    unknown_count = unknown_count.checked_add(newly_unaccounted_count).ok_or_else(|| {
-        startup_scan_integrity_error(
-            "startup_reservation_coverage",
-            "unaccounted reservation count overflowed",
-        )
-    })?;
-    if let Some(record) = final_inventory.unaccounted_active_reservation.as_ref()
-        && !known_unresolved_operation_ids.contains(record.token.operation_id.as_str())
-        && unknown.len() < usize::from(limit)
-    {
-        let token = &record.token;
-        let mut scopes: Vec<String> = token
-            .scopes
-            .iter()
-            .map(|scope| scope.scope.as_str().to_owned())
-            .collect();
-        scopes.sort_unstable();
-        unknown.push(StartupUnknownOperation {
-            operation_id: token.operation_id.as_str().to_owned(),
-            reservation_id: token.reservation_id.as_str().to_owned(),
-            reservation_order: token.reservation_order,
-            scopes,
-            state: record.state,
-            recovery_owner: token.recovery_owner.as_str().to_owned(),
-            reason: "active reservation is not represented by a prior recovery outcome".to_owned(),
-        });
+
+        if page.complete {
+            reservation_lookup_suffix_exhausted = true;
+            break;
+        }
+        if page_has_active_rows {
+            after_reservation_id = page_last_reservation_id;
+            if after_reservation_id.is_none() {
+                return Err(startup_scan_integrity_error(
+                    "startup_reservation_lookup_cursor",
+                    "active page has no final primary reservation key",
+                ));
+            }
+            lookup.restart_after_owner_mutation();
+            after_page_snapshot = None;
+        } else {
+            reservation_cursor = page.next_cursor;
+            if reservation_cursor.is_none() {
+                return Err(startup_scan_integrity_error(
+                    "startup_reservation_lookup_cursor",
+                    "incomplete partial reservation page omitted its continuation",
+                ));
+            }
+        }
     }
+
+    // This second exhaustive scan is the only post-reconciliation inventory
+    // used for readiness. Its from-start cursor covers the whole reservation
+    // table and both indexes independently of the partial lookup trace.
+    let final_inventory = scan_startup_recovery_inventory(&owner.ors, limit)?;
     let reported_unresolved = pending_count.checked_add(unknown_count).ok_or_else(|| {
         startup_scan_integrity_error(
             "startup_reservation_coverage",
             "reported unresolved reservation count exceeds its coverage counter",
         )
     })?;
-    let unaccounted_reservation_count = active_reservation_count.abs_diff(reported_unresolved);
+    let unresolved_count_delta = final_inventory
+        .active_reservation_count
+        .abs_diff(reported_unresolved);
+    let unresolved_identity_match = unresolved_count_delta == 0
+        && unresolved_identity_sha256 == final_inventory.active_identity_sha256;
     let mut digest_input = String::new();
     for field in [
         "ors.startup_recovery_inventory.v1".to_owned(),
@@ -2516,13 +2691,25 @@ async fn reconcile_pending_at_startup_inner(
         scanned.to_string(),
         limit.to_string(),
         outcome_chain,
-        final_inventory.nonterminal_reservation_count.to_string(),
+        lookup.page_count.to_string(),
+        lookup.record_count.to_string(),
+        lookup.chain_sha256.clone(),
+        reservation_lookup_suffix_exhausted.to_string(),
+        final_inventory.active_reservation_count.to_string(),
         pending_count.to_string(),
         unknown_count.to_string(),
-        unaccounted_reservation_count.to_string(),
+        unresolved_count_delta.to_string(),
+        unresolved_identity_match.to_string(),
     ] {
         append_startup_digest_field(&mut digest_input, &field);
     }
+    append_startup_digest_field(
+        &mut digest_input,
+        &startup_serialized_sha256(
+            &preflight_inventory_coverage,
+            "startup_recovery_preflight_coverage",
+        )?,
+    );
     append_startup_digest_field(
         &mut digest_input,
         &startup_serialized_sha256(
@@ -2556,7 +2743,13 @@ async fn reconcile_pending_at_startup_inner(
         digest,
         inventory_coverage: final_inventory.coverage,
         scanned,
-        unaccounted_reservation_count,
+        preflight_inventory_coverage,
+        reservation_lookup_page_count: lookup.page_count,
+        reservation_lookup_record_count: lookup.record_count,
+        reservation_lookup_digest: lookup.chain_sha256,
+        reservation_lookup_suffix_exhausted,
+        unresolved_count_delta,
+        unresolved_identity_match,
         job_checkpoint_record_count: final_inventory.job_checkpoint_record_count,
         job_checkpoint_ref_sample: final_inventory.job_checkpoint_ref_sample,
         delivery_cursor_record_count: final_inventory.delivery_cursor_record_count,
@@ -2568,7 +2761,7 @@ async fn reconcile_pending_at_startup_inner(
         pending_count,
         unknown,
         unknown_count,
-        active_reservation_count,
+        active_reservation_count: final_inventory.active_reservation_count,
         retained_problem_sample: final_inventory.retained_problem_sample,
         retained_problem_count: final_inventory.retained_problem_count,
         unresolved_retained_problem_count: final_inventory.unresolved_retained_problem_count,
@@ -2747,10 +2940,10 @@ pub enum StagedWriteReadiness {
     /// Every enumerated staged envelope validated by hash, every reservation
     /// reached its canonical receipt, and no Recovery Problem is retained.
     Ready,
-    /// A reservation is unresolved, a staged envelope failed validation, a
-    /// Recovery Problem is retained, or the bounded scan did not reach
-    /// exhaustion. Normal writes stay gated until exact reconciliation or an
-    /// explicit disposition.
+    /// A reservation/control obligation is unresolved, a staged envelope
+    /// failed validation, a Recovery Problem is unresolved, or the bounded
+    /// scan did not reach exhaustion. Normal writes stay gated until exact
+    /// reconciliation or an explicit disposition.
     Blocked,
 }
 
@@ -2815,17 +3008,20 @@ impl StagedWriteRecovery {
 /// Enumerates and reconciles the durable staged write envelopes at startup
 /// (issue #1925, I1.11 step 6, I5.2/I5.6).
 ///
-/// One complete revision-bound ORS inventory and the exact Store receipt route:
+/// An exhaustive preflight and final revision-bound inventory, the partial
+/// reservation lookup trace, and the exact Store receipt route:
 ///
 /// ```text
-/// inventory before receipt effects -> five source pages share a frozen
+/// preflight inventory                -> five source pages share a frozen
 ///                                      revision and are fully revalidated;
-/// reconcile_pending_at_startup     -> each unresolved reservation is observed
+/// partial reservation lookup         -> bounded primary-key pages resume after
+///                                      pages whose active rows may mutate ORS;
+/// receipt reconciliation             -> each active reservation is observed
 ///                                      by exact identity and receipt evidence;
-/// verify_staged_envelope           -> each still-unresolved envelope is owner
+/// verify_staged_envelope              -> each unresolved envelope is owner
 ///                                      validated, with failures retained;
-/// final inventory                   -> a fresh five-source snapshot proves the
-///                                      post-reconciliation state exhaustively.
+/// final inventory                    -> fresh full-from-start five-source
+///                                      coverage proves post-reconciliation state.
 /// ```
 ///
 /// A failed check is an error, never a synthetic empty report: an unreadable
@@ -2849,14 +3045,9 @@ pub async fn reconcile_staged_writes_at_startup(
     limit: u16,
 ) -> Result<StagedWriteRecovery, ReservationWriteError> {
     let mut projection = StartupStagedProjection::default();
-    let reservations = reconcile_pending_at_startup_inner(
-        owner,
-        fence,
-        route,
-        limit,
-        Some(&mut projection),
-    )
-    .await?;
+    let reservations =
+        reconcile_pending_at_startup_inner(owner, fence, route, limit, Some(&mut projection))
+            .await?;
     let inventory_coverage = reservations.inventory_coverage.clone();
     let retained_problems = reservations.retained_problem_sample.clone();
     let retained_problem_count = reservations.retained_problem_count;

@@ -29009,6 +29009,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 reason: "continuing reservation page has no exclusive continuation".to_owned(),
             })?;
             (Some(cursor.continue_after(last)), false)
+        } else if cursor.coverage
+            == crate::WriteReservationRecoveryCoverage::PrimaryRowsFromStartAfter
+        {
+            (None, true)
         } else {
             match cursor.phase {
                 crate::WriteReservationRecoveryPhase::Reservations => (
@@ -29029,6 +29033,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Ok(WriteReservationRecoveryPage {
             source_revision: cursor.source_revision,
             snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            coverage: cursor.coverage,
             records,
             next_cursor,
             complete,

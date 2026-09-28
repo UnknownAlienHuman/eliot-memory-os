@@ -6189,10 +6189,12 @@ impl KernelComposition {
                 // reconciliation over the composition-bound ORS, revalidates
                 // every reported staged envelope through its owner, and reports
                 // the durable Recovery Problems a corrupted or unreadable staged
-                // payload leaves behind. Step 6 is recorded only when that scan
-                // is exhaustive and clean; an unresolved reservation, a retained
-                // problem, or a truncated scan keeps normal writes gated, and
-                // nothing is retried, decoded, or dropped to reach readiness.
+                // payload leaves behind. Step 6 is recorded only when the
+                // preflight and final full inventories are complete and clean;
+                // unresolved reservations, active control obligations, retained
+                // problems, or moved/incomplete source coverage keep dependent
+                // normal writes gated, and nothing is retried, decoded, or
+                // dropped to reach readiness.
                 let staged = match gateway
                     .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
                     .await
@@ -6418,10 +6420,11 @@ impl KernelComposition {
         // limits are available, so this route must not reserve, send, or
         // report ACCEPTED_PENDING. Preserve the exact request and no-effect
         // state in a typed refusal instead of collapsing it into generic text.
-        let refusal = eliot_canonical::write_envelope::VersionedWriteRefusal::missing_staging_owners(
-            &operation.submission,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let refusal =
+            eliot_canonical::write_envelope::VersionedWriteRefusal::missing_staging_owners(
+                &operation.submission,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
             "status": "known",
             "value": {
@@ -9024,27 +9027,35 @@ fn staged_write_recovery_view(
                 .reservation_id
                 .as_ref()
                 .map(eliot_ors::OpaqueLabel::as_str);
-            let detail = problem.detail.as_str();
             let recovery_owner = problem.recovery_owner.as_str();
+            // `RecoveryProblem.detail` is an owner-recorded error string and
+            // may include provider/storage text. The fixed kind code is the
+            // safe caller-visible reason; retain the exact typed record in
+            // ORS without echoing that free-form detail over the daemon wire.
             serde_json::json!({
                 "operation_id": operation_id,
                 "reservation_id": reservation_id,
                 "kind": recovery_problem_kind_label(problem.kind),
-                "detail": detail,
                 "payload_sha256": problem.payload_sha256,
                 "envelope_sha256": problem.envelope_sha256,
                 "recovery_owner": recovery_owner,
                 "resolved": problem.is_resolved(),
             })
-    })
-    .collect();
+        })
+        .collect();
     serde_json::json!({
         "fence": reservations.fence,
         "digest": reservations.digest,
         "scanned": reservations.scanned,
         "page_size": reservations.page_size,
         "active_reservation_count": reservations.active_reservation_count,
-        "unaccounted_reservation_count": reservations.unaccounted_reservation_count,
+        "reservation_lookup_page_count": reservations.reservation_lookup_page_count,
+        "reservation_lookup_record_count": reservations.reservation_lookup_record_count,
+        "reservation_lookup_digest": reservations.reservation_lookup_digest,
+        "reservation_lookup_suffix_exhausted": reservations.reservation_lookup_suffix_exhausted,
+        "unresolved_count_delta": reservations.unresolved_count_delta,
+        "unresolved_identity_match": reservations.unresolved_identity_match,
+        "preflight_inventory_coverage": reservations.preflight_inventory_coverage,
         "inventory_coverage": staged.inventory_coverage,
         "job_checkpoint_record_count": reservations.job_checkpoint_record_count,
         "job_checkpoint_ref_sample": reservations.job_checkpoint_ref_sample,

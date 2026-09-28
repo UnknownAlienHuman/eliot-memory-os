@@ -2521,12 +2521,26 @@ pub enum WriteReservationRecoveryPhase {
     Operations,
 }
 
+/// Declares whether a reservation page participates in exhaustive inventory
+/// coverage or is only a primary-row lookup after a keyset cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteReservationRecoveryCoverage {
+    /// Full traversal, including primary rows and both secondary indexes.
+    FullInventory,
+    /// Primary reservation rows at/after a keyset start only. This scope is
+    /// useful for bounded continuation after owner mutations and never proves
+    /// that the skipped prefix or secondary indexes were covered.
+    PrimaryRowsFromStartAfter,
+}
+
 /// Typed continuation across the primary reservation rows and their durable
 /// order/operation indexes. `after` is exclusive within the selected phase.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WriteReservationRecoveryCursor {
     pub(crate) source: RecoveryInventorySource,
     pub(crate) phase: WriteReservationRecoveryPhase,
+    pub(crate) coverage: WriteReservationRecoveryCoverage,
     pub(crate) after: Option<OpaqueLabel>,
     pub(crate) source_revision: u64,
     pub(crate) snapshot: RecoveryInventorySnapshot,
@@ -2538,7 +2552,31 @@ impl WriteReservationRecoveryCursor {
         let value = Self {
             source: RecoveryInventorySource::Reservations,
             phase: WriteReservationRecoveryPhase::Reservations,
+            coverage: WriteReservationRecoveryCoverage::FullInventory,
             after: None,
+            source_revision: snapshot.reservation_revision,
+            snapshot,
+            limit,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Starts a bounded primary-row lookup under a fresh full inventory
+    /// snapshot. `after_reservation_id` is exclusive. Completion proves only
+    /// exhaustion of this suffix in the primary table; callers must still run
+    /// [`Self::start`] from the beginning to establish full reservation/index
+    /// coverage before using startup readiness.
+    pub fn start_after(
+        snapshot: RecoveryInventorySnapshot,
+        after_reservation_id: Option<&str>,
+        limit: u16,
+    ) -> Result<Self, OrsError> {
+        let value = Self {
+            source: RecoveryInventorySource::Reservations,
+            phase: WriteReservationRecoveryPhase::Reservations,
+            coverage: WriteReservationRecoveryCoverage::PrimaryRowsFromStartAfter,
+            after: after_reservation_id.map(OpaqueLabel::new).transpose()?,
             source_revision: snapshot.reservation_revision,
             snapshot,
             limit,
@@ -2551,6 +2589,7 @@ impl WriteReservationRecoveryCursor {
         Self {
             source: self.source,
             phase: self.phase,
+            coverage: self.coverage,
             after: Some(after),
             source_revision: self.source_revision,
             snapshot: self.snapshot.clone(),
@@ -2562,6 +2601,7 @@ impl WriteReservationRecoveryCursor {
         Self {
             source: self.source,
             phase,
+            coverage: self.coverage,
             after: None,
             source_revision: self.source_revision,
             snapshot: self.snapshot.clone(),
@@ -2573,6 +2613,8 @@ impl WriteReservationRecoveryCursor {
         self.snapshot.validate()?;
         if self.source != RecoveryInventorySource::Reservations
             || self.source_revision != self.snapshot.reservation_revision
+            || (self.coverage == WriteReservationRecoveryCoverage::PrimaryRowsFromStartAfter
+                && self.phase != WriteReservationRecoveryPhase::Reservations)
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: "recovery_inventory_cursor",
@@ -2651,11 +2693,18 @@ macro_rules! define_recovery_inventory_page {
     };
 }
 
-define_recovery_inventory_page!(
-    WriteReservationRecoveryPage,
-    WriteReservationRecoveryCursor,
-    ReservationRecord
-);
+/// Reservation page whose `coverage` makes full-inventory traversal distinct
+/// from a partial primary-row suffix lookup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WriteReservationRecoveryPage {
+    pub source_revision: u64,
+    pub snapshot_sha256: String,
+    pub coverage: WriteReservationRecoveryCoverage,
+    pub records: Vec<ReservationRecord>,
+    pub next_cursor: Option<WriteReservationRecoveryCursor>,
+    pub complete: bool,
+}
+
 define_recovery_inventory_page!(
     OperationalCurrentRecoveryPage,
     OperationalCurrentRecoveryCursor,
