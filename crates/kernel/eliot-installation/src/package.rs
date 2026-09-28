@@ -15,8 +15,9 @@ use super::{
     CandidateManifest, InstallationCreateDisposition, InstallationEffectAction,
     InstallationEffectDisposition, InstallationEffectExecution, InstallationEffectObservation,
     InstallationEffectRequest, InstallationError, InstallationSecretLifecycle, InstallerEffectPlan,
-    PackageArtifactDigest, PlatformHandle, candidate_manifest_digest, handle, platform_error,
-    same_windows_root, sha256_handle, sha256_hex,
+    PackageArtifactDigest, PlatformHandle, candidate_manifest_digest, handle, is_lower_sha256,
+    is_typed_package_staging_reference, platform_error, same_windows_root, sha256_handle,
+    sha256_hex,
 };
 
 pub(super) fn package_plan_error(error: &PackageStagingError) -> InstallationError {
@@ -569,6 +570,106 @@ fn package_staging_error_reference(error: &PackageStagingError) -> PlatformHandl
     };
     PlatformHandle::new(format!("stage-package-error-v1:{semantic}"))
         .unwrap_or_else(|_| unreachable!())
+}
+
+/// Prefix for a request-correlated `StagePackage` unknown reference.
+///
+/// Issue #1352 (X1): the per-class extension of the service-registration
+/// unknown scheme to staging. The reference carries the initiating
+/// [`InstallationEffectRequest::intent_digest`] ahead of the exact
+/// `<stage>:<code>` native cause the uncorrelated `stage-package-win32-v1`
+/// grammar carries, so a post-effect staging unknown stays reconcilable under
+/// its original operation. Only native Win32 failures are correlated: semantic
+/// staging errors already prove a conflicting property and keep the existing
+/// uncorrelated projection.
+const STAGE_PACKAGE_UNKNOWN_REFERENCE_PREFIX: &str = "stage-package-unknown-v1:";
+
+/// Accepts only the exact request-correlated staging unknown grammar: the
+/// request identity digest, then the same `<stage>:<code>` cause the
+/// uncorrelated staging grammar carries.
+pub(super) fn is_typed_package_staging_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(STAGE_PACKAGE_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let Some((digest, cause)) = rest.split_once(':') else {
+        return false;
+    };
+    if !is_lower_sha256(digest) {
+        return false;
+    }
+    is_typed_package_staging_reference(&format!("stage-package-win32-v1:{cause}"))
+}
+
+/// Whether `reference` is the typed staging unknown reference that was
+/// published for exactly `intent_digest`.
+///
+/// Same binding shape as the service-registration correlation predicate: the
+/// grammar check alone proves only well-formedness; the embedded
+/// request-identity field must equal the intent digest the durable transaction
+/// holds. The digest is compared, never recomputed.
+pub(super) fn is_request_correlated_package_staging_unknown(
+    reference: &str,
+    intent_digest: &PlatformHandle,
+) -> bool {
+    is_typed_package_staging_unknown_reference(reference)
+        && reference
+            .strip_prefix(STAGE_PACKAGE_UNKNOWN_REFERENCE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            == Some(intent_digest.as_str())
+}
+
+/// Projects one observed native staging failure into the request-correlated
+/// unknown reference.
+///
+/// The mint runs in the immediate continuation of this operation's own
+/// reconcile readback. A request that cannot form its own canonical identity
+/// cannot carry a request-correlated reference; that is a deterministic
+/// contract rejection, never a synthesized digest and never a published
+/// mismatch.
+fn package_staging_unknown_reference(
+    request: &InstallationEffectRequest,
+    stage: PackageStagingStage,
+    code: u32,
+) -> Result<PlatformHandle, PortError> {
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let reference = format!(
+        "{STAGE_PACKAGE_UNKNOWN_REFERENCE_PREFIX}{}:{}:{code:08x}",
+        intent_digest.as_str(),
+        package_staging_stage_name(stage),
+    );
+    if !is_typed_package_staging_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: STAGE_PACKAGE_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// Maps one `StagePackage` reconcile failure to its port error.
+///
+/// Issue #1352 (X1): a native Win32 failure observed while reconciling a
+/// committed staging intent keeps the request-correlated unknown reference,
+/// so the unresolved staging read stays attributable to its original
+/// operation and a later drive can reconcile it again. Every other staging
+/// failure keeps the existing [`package_port_error`] projection unchanged.
+pub(super) fn package_staging_unknown_port_error(
+    request: &InstallationEffectRequest,
+    error: &PackageStagingError,
+) -> PortError {
+    if let PackageStagingError::Win32 { stage, code } = error {
+        if let Ok(reference) = package_staging_unknown_reference(request, *stage, *code) {
+            return PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference,
+            };
+        }
+    }
+    package_port_error(error)
 }
 
 fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
