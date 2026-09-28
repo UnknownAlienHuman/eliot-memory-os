@@ -180,6 +180,29 @@ impl SemanticIndex {
         self.bump()
     }
 
+    /// Admits a batch of already-normalized instrument evidence atomically:
+    /// every item is validated before any item is indexed, so one invalid
+    /// observation can never leave a partially admitted index behind.
+    /// Validation failure reports the first offending item; no evidence is
+    /// rerun, reparsed, or re-observed here - the caller supplies normalized
+    /// evidence the owning instrument already produced (I10.8.10: `CodeCortex`
+    /// consumes existing instrument evidence and does not rerun diagnostics
+    /// privately).
+    pub fn admit_evidence_batch(
+        &mut self,
+        evidence: Vec<NormalizedEvidence>,
+    ) -> Result<GraphRevision, CodeCortexError> {
+        for item in &evidence {
+            item.validate()
+                .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        }
+        let mut revision = self.revision()?;
+        for item in evidence {
+            revision = self.admit_evidence(item)?;
+        }
+        Ok(revision)
+    }
+
     pub fn snapshot(&self) -> IndexSnapshot {
         let revision = self
             .revision()
@@ -207,6 +230,19 @@ pub struct CodeCortexService {
 impl CodeCortexService {
     pub fn new(index: SemanticIndex) -> Self {
         Self { index }
+    }
+
+    /// Builds a service over caller-supplied normalized instrument evidence.
+    ///
+    /// This is the consumption seam the diagnostics bridge feeds: the caller
+    /// hands over evidence the owning instruments already normalized, and the
+    /// service indexes it without spawning a process, reading a tool stream,
+    /// or re-observing anything. An invalid batch fails closed with an empty
+    /// index rather than a partially supplied one.
+    pub fn with_evidence(evidence: Vec<NormalizedEvidence>) -> Result<Self, CodeCortexError> {
+        let mut index = SemanticIndex::new();
+        index.admit_evidence_batch(evidence)?;
+        Ok(Self { index })
     }
 
     pub fn index(&self) -> &SemanticIndex {

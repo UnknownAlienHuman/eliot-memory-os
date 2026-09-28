@@ -15,13 +15,23 @@
 //! present; a partial slice never closes #1813/#1814 and grants no
 //! Product/Release proof.
 
-use eliot_contracts::sha256_hex;
-use eliot_instrument_api::InstrumentKind;
+use eliot_contracts::{ArtifactId, sha256_hex};
+use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentKind, VerificationOutcome};
+use eliot_process::ProcessExecutor;
 use eliot_test_selection::{FrozenDisposition, FrozenSelection, TestSelectionReceipt};
 use thiserror::Error;
 
+use crate::InstrumentRunner;
 use crate::profile::{InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError};
-use crate::profile_run::{AggregateStatus, ProfileAggregate, StageOrchestrator, StagePlan};
+use crate::profile_run::{
+    AggregateStatus, InstrumentRun, ProfileAggregate, RetainedExitOutcome, RetainedToolIdentity,
+    StageEvidence, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
+    TestExecutionPlaneRoute,
+};
+use crate::registry::SupplyChainReceipt;
+use crate::verification_profile::{
+    ParityVerdict, VerificationProfileReceipt, verify_profile_parity,
+};
 
 /// Canonical `dev-fast` profile name (I18.6).
 pub const DEV_FAST_PROFILE: &str = "dev-fast";
@@ -108,10 +118,27 @@ pub enum DevFastError {
     /// The dev-fast admission or registry build failed.
     #[error("dev-fast admission failed: {0}")]
     Admission(String),
+    /// A retained stage capture is not a well-formed message stream of the
+    /// stage's admitted parser, so no normalized outcome exists for it.
+    #[error("stage '{stage}' capture is not well-formed {parser} output: {detail}")]
+    StageParse {
+        /// Stage whose capture failed to parse.
+        stage: String,
+        /// Admitted parser the capture was offered to.
+        parser: &'static str,
+        /// Owning-parser detail text (evidence, never control flow).
+        detail: String,
+    },
 }
 
 impl From<ProfileError> for DevFastError {
     fn from(error: ProfileError) -> Self {
+        Self::Admission(error.to_string())
+    }
+}
+
+impl From<crate::profile_run::ProfileRunError> for DevFastError {
+    fn from(error: crate::profile_run::ProfileRunError) -> Self {
         Self::Admission(error.to_string())
     }
 }
@@ -837,6 +864,254 @@ pub fn dev_fast_caller_plan(
     plan.bind_candidate_identity(candidate.digest())
         .map_err(|error| DevFastError::Admission(error.to_string()))?;
     Ok(plan)
+}
+
+/// Normalized outcome of one retained `dev-fast` stage capture.
+///
+/// The outcome is the admitted parser's reading of real tool output only:
+/// it never synthesizes a result, and anything the parser cannot answer
+/// stays [`DevFastStageOutcome::Unknown`], never a pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevFastStageOutcome {
+    /// The admitted parser read real tool output as a pass.
+    Pass,
+    /// The admitted parser read real tool output as a failure.
+    Fail,
+    /// The admitted parser read real tool output with no passing verdict
+    /// (empty, truncated, or cancelled stream).
+    Unknown,
+}
+
+/// Normalizes one retained `dev-fast` stage capture through the stage's
+/// admitted real-output parser (issue #1852 W3).
+///
+/// Every `dev-fast` stage has exactly one owner per fact: discovery through
+/// the nextest inventory parser, affected diagnostics through the Clippy lint
+/// parser plus the Cargo build projection over the same stream (Cargo owns
+/// the build facts, Clippy owns the lint facts — never two normalizers over
+/// one fact), selected execution through the nextest run-event parser, and
+/// the format check through the rustfmt parser. The raw bytes stay retained
+/// under the caller's artifact handle; this projection adds no verdict of
+/// its own beyond the parser's reading.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::InvalidText`] for an undeclared stage identity
+/// and [`DevFastError::StageParse`] when the capture is not a well-formed
+/// stream of the admitted parser.
+pub fn normalize_dev_fast_stage_bytes(
+    stage_id: &str,
+    bytes: &[u8],
+    exit: RetainedExitOutcome,
+) -> Result<DevFastStageOutcome, DevFastError> {
+    if stage_id == DEV_FAST_STAGE_LIST {
+        let inventory = eliot_instrument_nextest::parse_list_json(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "nextest-list",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(if inventory.is_empty() {
+            DevFastStageOutcome::Unknown
+        } else {
+            DevFastStageOutcome::Pass
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_CLIPPY {
+        let build = eliot_instrument_cargo::parse_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "cargo-build",
+                detail: error.to_string(),
+            }
+        })?;
+        let lints = eliot_instrument_rustc::parse_clippy_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "clippy-lint",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(match (build.outcome(), lints.outcome()) {
+            (VerificationOutcome::Fail, _) | (_, VerificationOutcome::Fail) => {
+                DevFastStageOutcome::Fail
+            }
+            (VerificationOutcome::Pass, VerificationOutcome::Pass) => DevFastStageOutcome::Pass,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_RUN {
+        let report = eliot_instrument_nextest::parse_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "nextest-run",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(match report.outcome() {
+            VerificationOutcome::Pass => DevFastStageOutcome::Pass,
+            VerificationOutcome::Fail => DevFastStageOutcome::Fail,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_RUSTFMT {
+        let report = eliot_instrument_rustfmt::parse_output(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "rustfmt-check",
+                detail: error.to_string(),
+            }
+        })?;
+        // `RetainedExitOutcome::sealed` admits only a completed exit with a
+        // code or an unknown outcome without one; cancellation is never a
+        // retained dev-fast capture, so `cancelled` stays false here.
+        let outcome = report.outcome(exit.code, false);
+        return Ok(match outcome {
+            VerificationOutcome::Pass => DevFastStageOutcome::Pass,
+            VerificationOutcome::Fail => DevFastStageOutcome::Fail,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    Err(DevFastError::InvalidText { field: "stage_id" })
+}
+
+/// Finalizes one launched `dev-fast` stage whose supervising lane retained
+/// the exact raw bytes under an immutable artifact handle (issue #1852 W2).
+///
+/// The sealed tool identity is bound here, at finalization, from the
+/// executable, argument vector, environment projection digest, and terminal
+/// exit outcome the lane observed — never reconstructed later from the
+/// bytes. The returned run is the first production constructor of
+/// [`StageEvidence::Retained`](crate::profile_run::StageEvidence).
+///
+/// # Errors
+///
+/// Returns [`DevFastError::Admission`] when the tool identity, the operation
+/// binding, or the executable digest is not an observed sealed value.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_dev_fast_stage(
+    route: &TestExecutionPlaneRoute,
+    operation_id: String,
+    grant: &InstrumentAdmissionGrant,
+    target_layout: Option<StageTargetLayout>,
+    artifact: ArtifactId,
+    byte_len: u64,
+    executable: &str,
+    arguments: &[String],
+    environment_digest: &str,
+    exit: RetainedExitOutcome,
+    executable_digest: String,
+) -> Result<InstrumentRun, DevFastError> {
+    let tool = RetainedToolIdentity::sealed(executable, arguments, environment_digest, exit)?;
+    Ok(InstrumentRun::finalize_retained(
+        route,
+        operation_id,
+        grant,
+        target_layout,
+        artifact,
+        byte_len,
+        tool,
+        executable_digest,
+    )?)
+}
+
+/// Runs the closed versioned `dev-fast` profile end to end through the one
+/// shared [`InstrumentRunner`]/[`ProcessExecutor`] path (issue #1852 W1).
+///
+/// Every caller — local verify, agent verifier requests, Justfile wrappers,
+/// CI, `FinishService` — reaches the same admitted revision, the same
+/// candidate-bound stage plan, and the same aggregate shape through this one
+/// function; there is no second admission path (I10.8.4: no fifth
+/// verification path). The owning composition root supplies the runner
+/// around the production process executor and the [`StageLauncher`] that
+/// turns the admitted plan into launches; transports differ only in how they
+/// provision those two values, never in which profile they run.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::Admission`] when the registry, the compilation,
+/// or the candidate binding fails. Launch, admission, and invocation
+/// failures of individual stages never surface here: they become explicit
+/// missing runs inside the returned aggregate.
+pub async fn run_dev_fast_profile<E: ProcessExecutor + 'static>(
+    runner: &InstrumentRunner<E>,
+    generation: u64,
+    receipts: Vec<SupplyChainReceipt>,
+    candidate: &DevFastCandidate,
+    launcher: &dyn StageLauncher,
+) -> Result<ProfileAggregate, DevFastError> {
+    let registry = dev_fast_registry(generation, receipts)?;
+    let plan = dev_fast_caller_plan(&registry, candidate)?;
+    let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+    Ok(ProfileAggregate::assemble(&plan, runs))
+}
+
+/// Confirms one `dev-fast` run as the canonical finish input: real tool
+/// failures block, nothing else passes (issue #1852 A2).
+///
+/// [`dev_fast_disposition`] reads the aggregate the shared runner assembled
+/// over retained stage evidence plus the frozen selection and its receipt;
+/// an intentionally introduced Clippy, nextest, or rustfmt failure surfaces
+/// here as a failed or missing mandatory stage and is refused. Only a passed
+/// disposition assembles the persisted [`VerificationProfileRun`], whose raw
+/// references are derived from the aggregate's own retained artifact
+/// handles — never invented. Persistence still never upgrades a failed
+/// aggregate into a pass.
+///
+/// # Errors
+///
+/// Returns the [`dev_fast_disposition`] refusal when the run is not the
+/// admitted revision, a mandatory stage did not succeed, the receipt does
+/// not bind the frozen selection and candidate identity, or execution was
+/// incomplete.
+pub fn confirm_dev_fast_finish(
+    candidate: &DevFastCandidate,
+    aggregate: &ProfileAggregate,
+    receipt: &TestSelectionReceipt,
+    frozen: &FrozenSelection,
+) -> Result<VerificationProfileRun, DevFastError> {
+    dev_fast_disposition(aggregate, receipt, candidate, frozen)?;
+    let raw_refs = aggregate
+        .runs
+        .iter()
+        .filter_map(|run| match &run.evidence {
+            StageEvidence::Retained { artifact, .. } => Some(artifact.as_str().to_owned()),
+            StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    VerificationProfileRun::assemble(
+        candidate,
+        aggregate,
+        receipt,
+        raw_refs,
+        DEV_FAST_SLICE_PARTIAL,
+    )
+}
+
+/// Requires local/CI parity over one named `dev-fast` profile run (issue
+/// #1852 A1).
+///
+/// Both receipts must record the same profile name, revision, definition and
+/// stage-graph digests, tool identities, and aggregate shape through the one
+/// shared receipt schema; any divergence — including a CI verifier command
+/// the local receipt never declared — refuses parity instead of passing
+/// silently. A non-PASS normalized outcome on either side is never parity.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::ReceiptMismatch`] when either receipt is
+/// internally inconsistent or the two receipts diverge.
+pub fn require_dev_fast_parity(
+    local: &VerificationProfileReceipt,
+    ci: &VerificationProfileReceipt,
+) -> Result<(), DevFastError> {
+    let verdict = verify_profile_parity(local, ci)
+        .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+    match verdict {
+        ParityVerdict::Pass { .. } => Ok(()),
+        ParityVerdict::NonPass { reason } => Err(DevFastError::ReceiptMismatch(reason)),
+    }
 }
 
 /// One persisted dev-fast profile run bound to its aggregate, receipt,
