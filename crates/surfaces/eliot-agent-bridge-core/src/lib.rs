@@ -839,7 +839,8 @@ pub trait McpForwardingPort {
     ///
     /// Every implementation must state how it commits those effects. The
     /// production Kernel forwarding port swaps the exact proposed owner ack
-    /// bases and only owner-confirmed held-sequence pruning; fixtures with
+    /// bases, only owner-confirmed held-sequence pruning, and the retained
+    /// offer disposition proved by this same import; fixtures with
     /// no process-local cursor cache implement this as an explicit no-op.
     /// A borrow conflict or stale continuity commits nothing and returns a
     /// typed retry/recovery refusal; silent success after a skipped update
@@ -4092,28 +4093,12 @@ impl AgentBridgeCore {
         } else {
             None
         };
-        let mut import_result = result.clone();
-        if let (false, Some((Some(candidate), _))) = (result.is_pure_recovery_read(), &prepared) {
-            import_result = import_result
-                .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
-        }
-        // Joint commit (issue #2799): the production adapter swaps its
-        // process-local ack-cache replacement first; only then does the core
-        // window publish below through infallible field moves. A borrow
-        // conflict or stale continuity fails here with both halves
-        // untouched. Reversing this order would strand a published core
-        // window next to an uncommitted transport cache.
-        if prepared.is_some() {
-            self.forwarder()?
-                .reconciliation_imported(&binding, &import_result)
-                .map_err(BridgeError::from_forwarding_failure)?;
-        }
-        if let Some((candidate, disposition)) = prepared {
-            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-            active.recovery = candidate;
-            if reconciliation_required && disposition == RecoveryDisposition::Complete {
-                active.reconciliation_required = false;
-            }
+        let disposition = self.import_reconciliation_page(&binding, &result, prepared)?;
+        if reconciliation_required && disposition == Some(RecoveryDisposition::Complete) {
+            self.active
+                .as_mut()
+                .ok_or(BridgeError::NotAttached)?
+                .reconciliation_required = false;
         }
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
@@ -4210,25 +4195,53 @@ impl AgentBridgeCore {
             )?;
             (candidate, disposition)
         };
+        let disposition = self.import_reconciliation_page(&binding, &result, Some(prepared))?;
+        if disposition == Some(RecoveryDisposition::Complete) {
+            self.active
+                .as_mut()
+                .ok_or(BridgeError::NotAttached)?
+                .reconciliation_required = false;
+        }
+        self.recovery_view().ok_or(BridgeError::NotAttached)
+    }
+
+    /// Imports one fully validated reconciliation page through the single
+    /// joint commit cut (issue #2799).
+    ///
+    /// Both the initial reconcile and every continuation page prepare their
+    /// candidate recovery window off to the side and then commit through
+    /// this one writer: the transport ack-cache half swaps first, and only
+    /// then does the candidate core window publish through infallible field
+    /// moves. A borrow conflict or stale continuity fails here with both
+    /// halves untouched; reversing the order would strand a published core
+    /// window next to an uncommitted transport cache. Returns the import
+    /// disposition, or `None` when the answer carried no window to import.
+    #[allow(clippy::result_large_err)]
+    fn import_reconciliation_page(
+        &mut self,
+        binding: &AttachBinding,
+        result: &ReconciliationPortResult,
+        prepared: Option<(Option<RecoveryWindow>, RecoveryDisposition)>,
+    ) -> Result<Option<RecoveryDisposition>, BridgeError> {
         let mut import_result = result.clone();
-        if let (false, Some(candidate)) = (result.is_pure_recovery_read(), prepared.0.as_ref()) {
+        if let (false, Some((Some(candidate), _))) = (result.is_pure_recovery_read(), &prepared) {
             import_result = import_result
                 .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
         }
         // Joint commit (issue #2799): the transport half swaps first; the
         // core half below publishes through infallible field moves, so a
         // failure here leaves both halves untouched.
-        self.forwarder()?
-            .reconciliation_imported(&binding, &import_result)
-            .map_err(BridgeError::from_forwarding_failure)?;
-        {
-            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-            active.recovery = prepared.0;
-            if prepared.1 == RecoveryDisposition::Complete {
-                active.reconciliation_required = false;
-            }
+        if prepared.is_some() {
+            self.forwarder()?
+                .reconciliation_imported(binding, &import_result)
+                .map_err(BridgeError::from_forwarding_failure)?;
         }
-        self.recovery_view().ok_or(BridgeError::NotAttached)
+        if let Some((candidate, disposition)) = prepared {
+            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            active.recovery = candidate;
+            return Ok(Some(disposition));
+        }
+        Ok(None)
     }
 
     /// Returns the read-only progress of the declared recovery window, if any.
