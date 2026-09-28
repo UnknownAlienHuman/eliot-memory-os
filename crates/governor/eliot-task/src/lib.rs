@@ -22,8 +22,10 @@ pub use professional_execution::{
     ProfessionalArtifactEntry, ProfessionalArtifactManifest, ProfessionalAttempt,
     ProfessionalAttemptOutcome, ProfessionalCompletionEvidence, ProfessionalEvaluationOutcome,
     ProfessionalEvaluatorResult, ProfessionalExecutionContract, ProfessionalExecutionError,
-    ProfessionalExecutionState, ProfessionalRequirement, ProfessionalRequirementKind,
-    ProfessionalRoleOwners, TaskControllerDisposition,
+    ProfessionalExecutionState, ProfessionalIsolationPrincipal, ProfessionalIsolationRoute,
+    ProfessionalPrincipalVisibility, ProfessionalReferenceIsolationReceipt,
+    ProfessionalRequirement, ProfessionalRequirementKind, ProfessionalRoleOwners,
+    ProfessionalWorkerPacket, TaskControllerDisposition,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.task_lifecycle";
