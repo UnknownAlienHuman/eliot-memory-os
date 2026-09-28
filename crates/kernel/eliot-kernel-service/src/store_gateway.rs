@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{
-    HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata, StateFence,
-    canonical_json_bytes, sha256_hex,
+    HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
+    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
@@ -546,15 +546,31 @@ impl std::fmt::Debug for KernelStoreGateway {
 /// verbatim. It owns no client, connection, cache, or state and adds no second
 /// write path: every call lands on the same authenticated generation-routed
 /// client the gateway itself uses.
+///
+/// Because it reaches the retained client directly, it is exactly the contour
+/// that could have served a generation the durable `canonical_store` route no
+/// longer names. Every method therefore re-checks the same route gate as the
+/// gateway's own entry points through `require_active_generation`, so the claim
+/// above is enforced by the borrow rather than asserted in this doc.
 pub struct BorrowedCanonicalStoreClient<'a> {
-    client: &'a EbpCanonicalStoreClient<NamedPipeTransport>,
+    gateway: &'a KernelStoreGateway,
 }
 
 impl<'a> BorrowedCanonicalStoreClient<'a> {
-    /// Borrows the already-composed canonical Store client.
+    /// Borrows the gateway that owns the retained canonical Store client.
     #[must_use]
-    pub const fn new(client: &'a EbpCanonicalStoreClient<NamedPipeTransport>) -> Self {
-        Self { client }
+    pub const fn new(gateway: &'a KernelStoreGateway) -> Self {
+        Self { gateway }
+    }
+
+    /// Refuses a borrowed-client call unless this gateway's generation is the
+    /// durable `canonical_store` route's active generation.
+    ///
+    /// The refusal is the same typed [`StoreError::FenceMismatch`] the gateway
+    /// uses, so a cut-over-to-a-newer-generation reads identically on this
+    /// contour and on the gateway's own methods.
+    fn require_active_generation(&self) -> Result<(), StoreError> {
+        self.gateway.require_active_store_generation()
     }
 }
 
@@ -566,7 +582,9 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
-        self.client
+        self.require_active_generation()?;
+        self.gateway
+            .store
             .apply_prepared(
                 ctx,
                 transition,
@@ -577,43 +595,50 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
-        self.client.receipt(operation_id).await
+        self.require_active_generation()?;
+        self.gateway.store.receipt(operation_id).await
     }
 
     async fn revision_heads(
         &self,
         keys: Vec<RevisionKey>,
     ) -> Result<Vec<RevisionHead>, StoreError> {
-        self.client.revision_heads(keys).await
+        self.require_active_generation()?;
+        self.gateway.store.revision_heads(keys).await
     }
 
     async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
-        self.client.validation_snapshot().await
+        self.require_active_generation()?;
+        self.gateway.store.validation_snapshot().await
     }
 
     async fn scope_revision_view(
         &self,
         scope_id: ScopeId,
     ) -> Result<ScopeRevisionView, StoreError> {
-        self.client.scope_revision_view(scope_id).await
+        self.require_active_generation()?;
+        self.gateway.store.scope_revision_view(scope_id).await
     }
 
     async fn ordering_heads(
         &self,
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
-        self.client.ordering_heads(scopes).await
+        self.require_active_generation()?;
+        self.gateway.store.ordering_heads(scopes).await
     }
 
     async fn execute_named(
         &self,
         query: NamedReadRequest,
     ) -> Result<NamedReadResponse, StoreError> {
-        self.client.execute_named(query).await
+        self.require_active_generation()?;
+        self.gateway.store.execute_named(query).await
     }
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
-        self.client.health().await
+        self.require_active_generation()?;
+        self.gateway.store.health().await
     }
 }
 
@@ -761,6 +786,11 @@ impl KernelStoreGateway {
         }
         self.refuse_shadow_mutation()
             .map_err(StoreApplyRefusal::GatewayRefusal)?;
+        // The durable route read below is an ORS transaction, so it is taken
+        // before the Kernel service lock rather than inside it: the service
+        // lock is never held across ORS work anywhere in this module.
+        self.require_active_store_generation()
+            .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
         // 1927: authenticate the caller before plan admission (I5.6 step 1),
         // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
@@ -805,7 +835,8 @@ impl KernelStoreGateway {
             // the exact-tuple match between the composition-bound route epoch
             // and live authority — never a scalar `sequence.get()` coercion.
             // Cross-lineage same-sequence routes never authorize: the route
-            // carries its own lineage.
+            // carries its own lineage. The durable active-generation gate ran
+            // above, before this lock.
             let live_epoch = service.authority_epoch();
             if !self.route.authority_epoch().is_same_authority(&live_epoch)
                 || self.route.active_generation() != transition.state_fence.resource_generation
@@ -1077,6 +1108,11 @@ impl KernelStoreGateway {
         commit_ors: &Arc<RedbRecoveryStore>,
         fence: &StateFence,
     ) -> Result<CompositionReservation, String> {
+        // The durable route read below is an ORS transaction, so it is taken
+        // before the Kernel service lock rather than inside it: the service
+        // lock is never held across ORS work anywhere in this module.
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
         let service = self
             .service
             .lock()
@@ -1385,6 +1421,8 @@ impl KernelStoreGateway {
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, String> {
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
         execute_named_via(
             &self.flight,
             &self.service,
@@ -1401,6 +1439,8 @@ impl KernelStoreGateway {
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, NamedReadGatewayError> {
+        self.require_active_store_generation()
+            .map_err(NamedReadGatewayError::Store)?;
         execute_named_via_with_error(
             &self.flight,
             &self.service,
@@ -1528,9 +1568,7 @@ impl KernelStoreGateway {
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
         Self::validate_user_automation_request(&request)?;
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
-            self.store.as_ref(),
-        ));
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         let sealed = self
             .seal_user_automation_operation(&store, request)
             .await
@@ -2149,9 +2187,7 @@ impl KernelStoreGateway {
         request: &UserAutomationServiceRequest,
         automation_id: &str,
     ) -> Result<UserAutomationExecutionProjection, String> {
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
-            self.store.as_ref(),
-        ));
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The `Status` join carries the whole read projection and its response
         // across the await, so it is pinned rather than held inline; the pinned
         // form is the same production Store path the operator route uses.
@@ -2588,9 +2624,7 @@ impl KernelStoreGateway {
         Option<eliot_kernel_core::user_automation::UserAutomationFailureProjection>,
         RunNowPreflightAssembly,
     > {
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
-            self.store.as_ref(),
-        ));
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         let response = Box::pin(UserAutomationService::new(&store).dispatch(
             UserAutomationServiceRequest {
                 context: sealed.context.clone(),
@@ -3580,9 +3614,7 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
-            self.store.as_ref(),
-        ));
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         let service = UserAutomationService::new(&store);
         // Each join is awaited in its own arm: the three joins are different
         // future types, so they cannot share one match value.
@@ -4102,9 +4134,7 @@ impl KernelStoreGateway {
                 .map(|failure| failure.failure_fingerprint.clone()),
             _ => None,
         };
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
-            self.store.as_ref(),
-        ));
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         let outcome = UserAutomationService::new(&store)
             .execute_occurrence(
                 UserAutomationExecutionRequest {
@@ -4404,6 +4434,11 @@ impl KernelStoreGateway {
                 "canonical-store gateway is fenced for rebind".to_owned(),
             ));
         }
+        // The retained-recovery leg below reaches the Store before the
+        // transition's own route check, so the active-generation gate has to
+        // precede the whole method rather than the send.
+        self.require_active_store_generation()
+            .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
         // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
         // write. The gate reuses this module's own
         // [`dreamer_operation_effect`] classification, so a permitted
@@ -5174,11 +5209,18 @@ impl KernelStoreGateway {
     }
 
     /// Reads one Host-bound canonical validation snapshot.
+    ///
+    /// This read carries no caller fence, so the caller's generation is not
+    /// available to compare; the active-generation gate is what admits it, and
+    /// a gateway for a generation the durable `canonical_store` route no longer
+    /// names is refused here exactly as it is on the fenced reads.
     pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, String> {
         let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
         self.store
             .validation_snapshot()
             .await
@@ -5186,12 +5228,72 @@ impl KernelStoreGateway {
     }
 
     fn validate_active_route(&self, state_fence: &StateFence) -> Result<(), String> {
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
         validate_route(&self.service, &self.route, state_fence)
     }
 
+    /// The store generation that currently owns the durable `canonical_store`
+    /// capability route.
+    ///
+    /// [`crate::active_canonical_store_generation`] reads the same ORS
+    /// `CUTOVER_OWNERSHIP` owner the `I5.11` stage-8 cutover commits through,
+    /// so the answer survives a restart and cannot be a composition-local flag.
+    /// A composition with no ORS handle, or a route no committed cutover has
+    /// ever switched, keeps the generation its own route was pinned to at
+    /// composition, which is the behaviour that existed before this gate and is
+    /// reachable only where no cutover could exist to contradict it.
+    fn active_store_generation(&self) -> Result<Option<ResourceGeneration>, StoreError> {
+        let Some(commit_ors) = self.commit_ors.as_deref() else {
+            return Ok(None);
+        };
+        // An unreadable durable route owner is unavailability, not a mismatch:
+        // the active generation is then unproven and nothing may be admitted on
+        // its behalf. `StoreError` has no refusal-with-reason variant, so the
+        // typed ORS class stops here rather than being re-invented.
+        crate::active_canonical_store_generation(commit_ors)
+            .map_err(|_error| StoreError::Unavailable)
+    }
+
+    /// Refuses any Store read or write unless this gateway's generation is the
+    /// durable `canonical_store` route's active generation.
+    ///
+    /// This is the `I5.11` stage-10 rollback window enforced from the Kernel
+    /// side. `self.route` is a composition-fixed snapshot of the generation this
+    /// gateway was built for, so before this gate a completed stage-8 cutover
+    /// changed nothing here: the incumbent kept serving reads and writes and the
+    /// candidate could not serve either. Resolving the active generation from
+    /// the durable cutover ownership table instead makes the governed Store path
+    /// follow the route, so from the commit onward the incumbent generation is
+    /// not the active one and every Store operation reaching this gateway —
+    /// fenced or unfenced, direct or through the borrowed client — is refused.
+    ///
+    /// `I5.11` says "keep old store read-only for rollback window" and names no
+    /// mechanism, and nothing in this process can fence another process's reader
+    /// of the retired store. The reading implemented here is the strictest one
+    /// the Kernel can enforce on its own path: from the cutover onward the
+    /// incumbent generation is admitted by nobody, and `I14.14`'s "rollback is
+    /// another cutover with a newer epoch" is the only way it is served again —
+    /// which is exactly what the window exists to make possible.
+    fn require_active_store_generation(&self) -> Result<(), StoreError> {
+        let Some(active) = self.active_store_generation()? else {
+            return Ok(());
+        };
+        if active != self.route.active_generation() {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(())
+    }
+
     /// Reads and validates the retained canonical Store health observation.
+    ///
+    /// Like [`Self::validation_snapshot`] this read carries no caller fence, so
+    /// the active-generation gate is the only thing that can tell this
+    /// generation from a cut-over one.
     pub async fn health(&self) -> Result<StoreHealth, String> {
         let _flight = self.flight.enter()?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
         let health = self
             .store
             .health()
