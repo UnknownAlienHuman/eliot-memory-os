@@ -23,9 +23,7 @@ use eliot_observation::ObservationAdmissionReceipt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{
-    FacadeError, LEGACY_KIND_SPELLINGS, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration,
-};
+use crate::{FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,7 +222,8 @@ pub(crate) fn parse_bound_v1_snapshot(
 
 /// Decodes one frozen legacy v1 kind spelling to the owner vocabulary.
 ///
-/// Accepts exactly [`LEGACY_KIND_SPELLINGS`]. Recognized non-canonical
+/// Accepts exactly [`LEGACY_KIND_SPELLINGS`](crate::LEGACY_KIND_SPELLINGS).
+/// Recognized non-canonical
 /// aliases (CamelCase, `SCREAMING_SNAKE`, kebab-case, spaced) are refused as
 /// aliases — they never decode — and everything else is unknown.
 pub fn decode_legacy_kind(value: &str) -> Result<eliot_cue_contracts::CueKind, FacadeError> {
@@ -725,17 +724,4 @@ pub fn request_legacy_delivery(
         target: row.target.clone(),
         reason: "legacy delivery requires the owner handoff; the facade fabricates no completion",
     })
-}
-
-/// Proves the frozen spelling table and the decoder agree in both
-/// directions: every frozen spelling decodes, and every decodable
-/// spelling is frozen. Used by the facade denominator test so the two
-/// can never drift apart silently.
-pub fn frozen_spellings_round_trip() -> bool {
-    if LEGACY_KIND_SPELLINGS.len() != 10 {
-        return false;
-    }
-    LEGACY_KIND_SPELLINGS
-        .iter()
-        .all(|spelling| decode_legacy_kind(spelling).is_ok())
 }

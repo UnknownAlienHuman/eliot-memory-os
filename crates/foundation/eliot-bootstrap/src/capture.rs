@@ -318,6 +318,11 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
     // UNKNOWN, except runtime which is explicitly NOT_RUNNING. The adapter
     // supplies these attributed observations and never decides support.
     let observed_at_ms = git_head_time_ms(&discovered_root)?;
+    // The single declared evaluation boundary of this validation unit is the
+    // same exact HEAD commit time the coverage rows are anchored to. It is an
+    // owner-declared Git observation, not a wall clock, and it is one boundary
+    // for the whole unit rather than a per-row maximum.
+    let evaluated_at_ms = observed_at_ms;
     let domain_coverage = capture_domain_coverage(&source_head, observed_at_ms);
 
     let mut records = vec![
@@ -360,6 +365,7 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
         source_head.clone(),
         CurrentSystemEvidenceSource {
             normative_pair,
+            evaluated_at_ms,
             selected_repository_root: discovered_root.display().to_string(),
             selected_source_head: source_head,
             dirty_delta_artifact_ref,

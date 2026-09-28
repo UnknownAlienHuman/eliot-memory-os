@@ -630,6 +630,14 @@ pub(crate) async fn invoke_admitted_model(
     if readiness != CompositionReadiness::Ready {
         return Err(CompositionError::NotReady);
     }
+    // Issue #1834 (I10.11): every model provider adapter runs under one
+    // governed transport policy. The default deadlines, bounded retries, and
+    // byte limits validate before any planning or execution, so the
+    // execution-port await below runs inside the declared budget. No lock is
+    // taken here, and no guard is held across that await.
+    super::provider_transport_policy::TransportPolicy::governed_default()
+        .validate()
+        .map_err(|error| owner_error(format!("dreamer model transport policy: {error}")))?;
     admit_model_route_policy(&input.catalogue, &input.policy, input.now_unix_ms)?;
     if input.request.state_fence != *admitted_fence {
         return Err(owner_error("dreamer model request fence is stale"));

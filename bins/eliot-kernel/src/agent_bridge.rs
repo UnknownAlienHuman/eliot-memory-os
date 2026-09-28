@@ -1656,7 +1656,13 @@ impl KernelComposition {
         match &result.disposition {
             AgentActivationResolutionDisposition::Resolved { binding } => self
                 .with_current_activation_owner(pending, result, binding, || {
-                    self.resolved_result_response_frame(connection_id, original, pending, binding)
+                    self.resolved_result_response_frame(
+                        connection_id,
+                        original,
+                        pending,
+                        result,
+                        binding,
+                    )
                 }),
             AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
             | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
@@ -1692,9 +1698,37 @@ impl KernelComposition {
     /// continuity (issue #1746). The revision must be the canonical
     /// decimal `TaskRevision`; anything else fails closed here, before any
     /// retained state is mutated.
+    ///
+    /// The retained record is the A12.2 application binding: the
+    /// activation-owner `principal_id`, the semantic session, the
+    /// Governor-selected task/`WorkScope`/`TaskContract` revision, the authority
+    /// epoch and resource generation the activation fence carried, and the exact
+    /// ticket/result correlation that produced it. The bridge peer identity is
+    /// never consulted: identity is what the activation owner resolved, not what
+    /// the authenticated pipe peer is (I7.8 step 1, A12.2). A blank principal
+    /// cannot identify anyone, and a principal equal to the bridge's own module
+    /// identity would be the transport process posing as the end user, so both
+    /// fail closed before any state is retained.
     fn activated_application_binding(
         binding: &AgentActivationResolvedBinding,
+        pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        connection_id: &str,
     ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        pending
+            .ticket
+            .validate_against(&pending.request, receipt)
+            .map_err(|_| TransportError::SessionFenced)?;
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if pending.ticket.connection_id != connection_id
+            || receipt.connection_id != connection_id
+            || result.resolved_binding() != Some(binding)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let task_revision = binding
             .task_revision
             .parse::<u64>()
@@ -1702,11 +1736,56 @@ impl KernelComposition {
             .filter(|revision| revision.to_string() == binding.task_revision)
             .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
             .ok_or(TransportError::SessionFenced)?;
+        let principal_id = binding.principal_id.trim();
+        if principal_id.is_empty()
+            || principal_id.chars().any(char::is_control)
+            || principal_id == eliot_protocol::AGENT_BRIDGE_MODULE_ID
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let owner_evidence = result
+            .owner_evidence
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let owner_readback = pending
+            .owner_readback
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let kernel_owner = owner_readback
+            .kernel_owner
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        owner_readback
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        owner_readback
+            .validate_against_binding(binding, &pending.ticket.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if owner_readback.evidence.owner_id != owner_evidence.owner_id
+            || owner_readback.evidence.owner_revision < owner_evidence.owner_revision
+            || owner_readback.evidence.state_fence != owner_evidence.state_fence
+            || owner_readback.evidence.binding != owner_evidence.binding
+            || owner_evidence.binding.as_ref() != binding
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         Ok(super::ActivatedApplicationBinding {
+            principal_id: principal_id.to_owned(),
             session_id: binding.session_id.clone(),
             task_id: binding.task_id.clone(),
             work_scope_id: binding.work_scope_id.clone(),
             task_revision,
+            authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
+            activation_generation: pending.ticket.state_fence.resource_generation,
+            activation_ticket_id: pending.ticket.ticket_id.clone(),
+            activation_ticket_sha256: pending.ticket.ticket_sha256.clone(),
+            activation_request_id: pending.ticket.activation_request_id.as_str().to_owned(),
+            activation_request_sha256: pending.ticket.activation_request_sha256.clone(),
+            peer_admission_receipt_sha256: pending.ticket.peer_admission_receipt_sha256.clone(),
+            resolution_result_sha256: result.result_sha256.clone(),
+            resolved_binding: binding.clone(),
+            kernel_owner_revision: kernel_owner.revision,
+            kernel_owner_bundle_sha256: kernel_owner.bundle_sha256.clone(),
         })
     }
 
@@ -1715,6 +1794,7 @@ impl KernelComposition {
         connection_id: &str,
         original: &Frame,
         pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
         binding: &AgentActivationResolvedBinding,
     ) -> Result<Frame, TransportError> {
         let session_nonce = fresh_activation_nonce_material()
@@ -1735,6 +1815,7 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?
             .clone();
+        let receipt = accepted.admission_receipt().clone();
         let session = Session::establish_agent_bridge(
             connection_id,
             accepted.peer().clone(),
@@ -1801,7 +1882,8 @@ impl KernelComposition {
         // Retain the exact Resolved task/scope binding for later dispatch
         // continuity (issue #1746); fails closed here, before any retained
         // state is mutated.
-        let activated_binding = Self::activated_application_binding(binding)?;
+        let activated_binding =
+            Self::activated_application_binding(binding, pending, result, &receipt, connection_id)?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.

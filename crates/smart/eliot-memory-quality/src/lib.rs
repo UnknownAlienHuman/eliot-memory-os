@@ -484,10 +484,11 @@ pub struct RuleCount {
 /// The [`rule_name`] match is exhaustive over [`ExclusionReason`]; this list
 /// mirrors it so serialized validation rejects invented rules without
 /// relying on a silent default.
-const CLOSED_RULES: [&str; 11] = [
+const CLOSED_RULES: [&str; 12] = [
     "CONFLICTED",
     "EPISTEMICALLY_UNKNOWN",
     "FENCE_MISMATCH",
+    "INFLUENCE_INELIGIBLE",
     "LIFECYCLE_INACTIVE",
     "NEGATIVE_MEMORY",
     "PRECONDITION_FAILED",
@@ -792,6 +793,7 @@ fn rule_name(reason: &ExclusionReason) -> &'static str {
         ExclusionReason::Rejected => "REJECTED",
         ExclusionReason::EpistemicallyUnknown => "EPISTEMICALLY_UNKNOWN",
         ExclusionReason::Protected => "PROTECTED",
+        ExclusionReason::InfluenceIneligible => "INFLUENCE_INELIGIBLE",
         ExclusionReason::NegativeMemory => "NEGATIVE_MEMORY",
         ExclusionReason::PreconditionFailed { .. } => "PRECONDITION_FAILED",
         ExclusionReason::PreconditionUnassessed { .. } => "PRECONDITION_UNASSESSED",

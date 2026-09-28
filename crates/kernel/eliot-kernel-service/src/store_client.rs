@@ -495,9 +495,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await
         {
             Ok(receipt) => Err(DreamerCommitEvidence::Reconciled(Box::new(receipt))),
-            Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
-                Err(DreamerCommitEvidence::Unknown)
-            }
+            Err(
+                StoreError::MissingReceiptEnvelope
+                | StoreError::UnknownOutcome { .. }
+                | StoreError::Unavailable,
+            ) => Err(DreamerCommitEvidence::Unknown),
             Err(error) => Err(DreamerCommitEvidence::Refused(error)),
         }
     }

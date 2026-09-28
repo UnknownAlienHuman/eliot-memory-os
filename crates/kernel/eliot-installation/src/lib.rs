@@ -4202,7 +4202,14 @@ impl WindowsInstallationEffectPort {
                     {
                         PortOutcome::Known(*receipt)
                     }
-                    Ok(_) | Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
+                        PortOutcome::Error(phase_b_unknown_port_error(request, &pending_ref))
+                    }
+                    Ok(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Err(PortError::Provider(provider)) if provider.retryable => {
+                        PortOutcome::Unknown(UnknownReason::Indeterminate)
+                    }
+                    Err(error) => PortOutcome::Error(error),
                 }
             }
             Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
