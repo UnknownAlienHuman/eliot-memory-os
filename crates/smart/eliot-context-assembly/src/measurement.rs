@@ -1,13 +1,15 @@
 //! Canonical rendered payload bytes and measurement closure.
 
 use eliot_context_contracts::{
-    ActiveUnderstandingView, CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding,
-    ContextError, MeasurementStatus, RenderedAtom, SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, CONTEXT_CONTRACT_VERSION, CapacityLimits,
+    ContextBinding, ContextError, ContextRecipe, MeasurementStatus, QualityScorecard, RenderedAtom,
+    SerializedContextMeasurement,
 };
+use eliot_context_measurement::{MeasurementParams, measure_exact_utf8};
 use eliot_contracts::{ContractVersion, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 
-use crate::AssemblyError;
+use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view};
 
 #[derive(Serialize)]
 struct CanonicalRenderedPayload<'a> {
@@ -87,6 +89,44 @@ pub(crate) fn verify(
         return Err(AssemblyError::Contract(ContextError::CapacityExceeded));
     }
     Ok(measurement)
+}
+
+/// Assemble one admitted set by invoking the sole #704 measurement owner.
+///
+/// This is the declared consumer edge from `eliot-context-measurement` to
+/// this crate: it is the composition that forms the canonical
+/// `|bytes| measure_exact_utf8(bytes, &params)` callback, so a route no
+/// longer supplies a hand-rolled byte/3 fallback or a fabricated tokenizer
+/// observation. Every load-bearing value stays caller-owned and arrives
+/// through `params`; nothing here synthesizes an identity, digest, capacity
+/// number, revision or timestamp.
+///
+/// The returned measurement is still bound to the canonical rendered payload
+/// by this module's `verify` - unchanged and still authoritative - and a
+/// `ContextError` from the owner stays typed as [`AssemblyError::Contract`]
+/// rather than being collapsed into a string or a generic code.
+///
+/// [`assemble_active_view`] itself is not modified, but this entry is not
+/// ceiling-equivalent to it. `AssemblyPolicy::validate` rejects only a zero
+/// `max_serialized_bytes`, so the injected-callback path bounds the payload
+/// by the policy alone. The owner additionally refuses a payload above its
+/// own `MAX_MEASUREMENT_BYTES` (16 MiB) and above
+/// `params.max_serialized_bytes`, so the effective ceiling here is
+/// `min(policy.max_serialized_bytes, params.max_serialized_bytes,
+/// 16 MiB)` and a payload admitted under a larger policy bound can be
+/// refused here as `ContextError::Bounds`. A caller must keep
+/// `params.max_serialized_bytes` consistent with its policy; this is a
+/// narrowing, never a widening, and no check is skipped to reach it.
+pub fn assemble_active_view_with_measurement(
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+    quality: QualityScorecard,
+    policy: &AssemblyPolicy,
+    params: &MeasurementParams,
+) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
+    assemble_active_view(admitted, recipe, quality, policy, |bytes| {
+        measure_exact_utf8(bytes, params)
+    })
 }
 
 pub(crate) fn canonical_matches(
