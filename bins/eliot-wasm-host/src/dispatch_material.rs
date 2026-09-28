@@ -2223,12 +2223,18 @@ pub struct RetainedResultStream {
 
 /// The one result content a served-result record retains.
 ///
-/// Exactly one variant is stored. `TerminalFrame` is the #2786 v1 payload and
-/// remains readable as an explicitly incomplete prefix: its predecessors are
-/// never synthesized on readback. `Stream` is the #2787 v2 payload.
+/// Exactly one variant is stored. This is the type a writer names and the
+/// type a reader classifies, so the two can never disagree about what a
+/// stored record is: a `Stream` is what current code writes, and a
+/// `TerminalFrame` is the #2786 v1 shape that earlier code wrote and that
+/// readback therefore still has to be able to see. `TerminalFrame` remains
+/// readable as an explicitly incomplete prefix: its predecessors are never
+/// synthesized on readback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServedResultPayload {
-    /// #2786 v1: only the terminal frame was retained.
+    /// #2786 v1: only the terminal frame was retained. No current writer
+    /// emits this; it exists so the readback of a record written before the
+    /// stream shape existed is a shape the classifier actually receives.
     TerminalFrame {
         /// Exact retained terminal frame JSON.
         frame: serde_json::Value,

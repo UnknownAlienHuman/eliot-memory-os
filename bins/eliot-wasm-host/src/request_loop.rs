@@ -3664,14 +3664,23 @@ impl ObservedResultRetention {
 
 /// How the ordinary request loop ended, together with the execution, cleanup,
 /// and delivery dispositions it reached (#2787 audit defect 2).
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The served disposition carries no frame of its own. The terminal event is
+/// the last event of the retained sequence the report already holds — it is
+/// always appended to that sequence before it is published — so naming it
+/// again beside the sequence would duplicate a whole result frame, and a
+/// duplicate is exactly the drift this handoff exists to prevent: a served
+/// report can no longer describe a terminal other than the one in its own
+/// sequence. It also keeps this type free of any heap allocation, so no
+/// disposition depends on a `Box` that aborts the process when an allocation
+/// fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoopCompletion {
     /// The loop published one terminal frame and closed its own execution,
-    /// cleanup, and delivery accounting.
-    Served {
-        /// The exact terminal frame the loop published.
-        terminal: OrdinaryOutcome,
-    },
+    /// cleanup, and delivery accounting. That terminal is the last event of
+    /// the report's retained sequence; read it with
+    /// [`RequestLoopReport::served_terminal`].
+    Served,
     /// The loop failed. The failure is never returned alone: an observation
     /// this loop made may be the only copy of a guest result, and discarding
     /// it because something later failed would destroy the only record of it.
@@ -3710,12 +3719,28 @@ impl RequestLoopReport {
         &self.completion
     }
 
+    /// The exact terminal frame the loop published, or `None` when the loop
+    /// failed.
+    ///
+    /// It is a borrow of the last event of the sequence this report already
+    /// carries, so reading it copies nothing and cannot disagree with the
+    /// sequence. `None` here means the loop failed, not that the result was
+    /// lost: a failure still carries every observation through
+    /// [`Self::retained`].
+    #[must_use]
+    pub fn served_terminal(&self) -> Option<&OrdinaryOutcome> {
+        match &self.completion {
+            LoopCompletion::Served => self.retained.last(),
+            LoopCompletion::Failed { .. } => None,
+        }
+    }
+
     /// The report for a loop that published a terminal frame.
     #[must_use]
-    fn served(retained: Vec<OrdinaryOutcome>, terminal: OrdinaryOutcome) -> Self {
+    fn served(retained: Vec<OrdinaryOutcome>) -> Self {
         Self {
             retained,
-            completion: LoopCompletion::Served { terminal },
+            completion: LoopCompletion::Served,
         }
     }
 
@@ -3970,9 +3995,13 @@ fn drain_and_shutdown_request_worker(
             },
         );
     }
-    match state.published().cloned() {
-        Some(terminal) => RequestLoopReport::served(state.retained_sequence(), terminal),
-        None => return failed_loop_report(state, denied("no-request")),
+    // A loop that published a terminal always appended it to the retained
+    // sequence first, so the served report names that terminal as its own
+    // last event. The `None` arm keeps the exact refusal this loop has always
+    // reported for a terminal it cannot name, rather than inventing a new one.
+    match state.published() {
+        Some(_) => RequestLoopReport::served(state.retained_sequence()),
+        None => failed_loop_report(state, denied("no-request")),
     }
 }
 
@@ -4799,16 +4828,29 @@ fn read_back_served_result(
     directory: &std::path::Path,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
 ) -> ServedResultReadback {
-    let record = match crate::dispatch_material::read_served_result(directory) {
-        Ok(Some(record)) => record,
-        Ok(None) | Err(_) => return ServedResultReadback::Unavailable,
+    // An absent record, an unreadable or oversize one, and a malformed one
+    // all answer the same typed state: this identity has no usable retained
+    // result. That mapping is unchanged by reading it as a `let ... else`.
+    let Ok(Some(record)) = crate::dispatch_material::read_served_result(directory) else {
+        return ServedResultReadback::Unavailable;
     };
     if !record.names(identity) {
         return ServedResultReadback::Conflict;
     }
     let crate::dispatch_material::ServedResultRecord { frame, stream, .. } = record;
     match stream {
-        None => read_back_terminal_only_record(frame.as_ref(), identity),
+        // The legacy terminal-only payload is reconstructed into the very
+        // payload type a writer names, from the value this read already owns,
+        // so the v1 case is a shape the classifier really sees rather than a
+        // branch that can never be reached. Nothing is copied to do it, and
+        // the reader has already proved exactly one payload is present.
+        None => match frame {
+            Some(frame) => read_back_terminal_only_record(
+                crate::dispatch_material::ServedResultPayload::TerminalFrame { frame },
+                identity,
+            ),
+            None => ServedResultReadback::Unavailable,
+        },
         Some(stream) => read_back_retained_result_stream(&stream, identity),
     }
 }
@@ -4820,13 +4862,17 @@ fn read_back_served_result(
 /// names predecessors was never retained together with them, so the record
 /// stays explicitly incomplete and those events are never synthesized.
 fn read_back_terminal_only_record(
-    frame: Option<&serde_json::Value>,
+    payload: crate::dispatch_material::ServedResultPayload,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
 ) -> ServedResultReadback {
-    let Some(recorded) = frame else {
-        return ServedResultReadback::Unavailable;
+    // A record without a stream cannot present any other payload shape, so
+    // this arm is unreachable; a mismatched shape is reported as the
+    // contradiction it is rather than being read as a terminal frame.
+    let crate::dispatch_material::ServedResultPayload::TerminalFrame { frame: recorded } = payload
+    else {
+        return ServedResultReadback::Conflict;
     };
-    let Ok(frame) = decode_recorded_frame(recorded) else {
+    let Ok(frame) = decode_recorded_frame(&recorded) else {
         return ServedResultReadback::Conflict;
     };
     if !frame_binds_to_identity(&frame, identity) || validate_frame(&frame).is_err() {
@@ -5045,13 +5091,15 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         seal_inflight_claim(&directory, &claim, edge_now_ms())?;
         // The claim-bound result owner is threaded into the loop itself, so
         // each observed event is durable before it can be exposed and the
-        // whole observed sequence comes back with the loop's disposition.
+        // whole observed sequence comes back with the loop's disposition. The
+        // sequence is borrowed from that report for the whole arm below, so
+        // the drive never seals or returns a copy that could differ from the
+        // one the loop actually observed.
         let report = run_request_loop(
             runtime,
             &material,
             ObservedResultRetention::new(&directory, &claim),
         );
-        let retained = report.retained().to_vec();
         // The delivery set is one-shot: a published terminal outcome reclaims
         // exactly the claimed generation, so a leftover is a fresh-drive
         // signal rather than a silent reuse. Unknown execution, failed
@@ -5060,7 +5108,15 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // in-memory retention of the sequence below is the readback path,
         // not a second execution.
         match report.completion() {
-            LoopCompletion::Served { terminal } => {
+            LoopCompletion::Served => {
+                // The served terminal is the last event of the sequence this
+                // same report carries, so the frame sealed below and the frame
+                // returned below cannot be a different observation. A served
+                // report without one is the exact refusal the loop has always
+                // reported for a terminal it cannot name.
+                let Some(terminal) = report.served_terminal() else {
+                    return Err(OrdinaryDriveError::Loop(denied("no-request")));
+                };
                 // Containment evidence is the loop's own terminal condition:
                 // it only reports served once the operation's effect is
                 // attested as settled, so reclaiming here never races an
@@ -5070,7 +5126,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // durably before physical reclaim, so restart reconciles
                 // terminal-unacknowledged state by republishing the original
                 // sequence instead of re-executing.
-                seal_served_outcome(&directory, &claim, &retained, edge_now_ms())?;
+                seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
                 let reclamation = consume_delivery_set(&claim);
                 // The served marker is now durable, so the pre-execution
                 // InFlight evidence is redundant: drop it best-effort. A
