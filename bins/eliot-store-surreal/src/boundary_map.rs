@@ -277,7 +277,8 @@ const STORE_ROOTS: &[StoreRootBoundary] = &[
     StoreRootBoundary {
         root: "eliot_installation::RuntimeStateRoots::store_data_root",
         leased_by: StoreBoundaryContour::StoreBridge,
-        provider_binding: "the surrealkv:// argument of SurrealAdapterConfig::expected_provider_arguments",
+        provider_binding: "the surrealkv:// argument of \
+             SurrealAdapterConfig::expected_provider_arguments",
         evidence: BoundaryEvidence::SourceDeclaration,
     },
     StoreRootBoundary {
@@ -300,8 +301,9 @@ const STORE_ROOTS: &[StoreRootBoundary] = &[
 const NAMED_PIPE_CALLER: NamedPipeCallerBoundary = NamedPipeCallerBoundary {
     contour: StoreBoundaryContour::BridgeClient,
     peer_expectation_source: "StoreLaunchConfig::expected_client_sid / \
-         expected_client_session_id, admitted by eliot_platform_windows::NamedPipePeerExpectation::new \
-         in bins/eliot-store-surreal/src/main.rs::serve_handshake_loop and enforced by \
+         expected_client_session_id, admitted by \
+         eliot_platform_windows::NamedPipePeerExpectation::new in \
+         bins/eliot-store-surreal/src/main.rs::serve_handshake_loop and enforced by \
          eliot_platform_windows::NamedPipeServer::create",
     admitted_surface: "closed typed store requests only; the isolated health/admin lane admits \
          exactly store.health and store.readiness \

@@ -400,14 +400,19 @@ pub(super) fn require_unchanged_identity(
     Ok(())
 }
 
-/// Environment name the pinned `SurrealDB` provider reads its bootstrap
-/// identity from. This is the same fixed channel the integration provider
-/// harness uses (`scripts/integration/IntegrationHarness.Store.psm1`).
+/// Environment name the pinned `SurrealDB` provider reads its initial root-level
+/// user from.
+///
+/// This is the fixed channel the integration provider harness already uses for
+/// this exact purpose against the pinned provider build
+/// (`scripts/integration/IntegrationHarness.Store.psm1`,
+/// `$Script:StoreCredentialUserEnv`), so the admitted channel is the one already
+/// named for this provider rather than a newly invented one.
 pub(super) const PROVIDER_BOOTSTRAP_USER_ENV: &str = "SURREAL_USER";
 
-/// Environment name the pinned `SurrealDB` provider reads its bootstrap secret
-/// from. It is delivered only inside the fresh child-only block, never in argv,
-/// never serialized, and never sourced from the parent environment.
+/// Environment name the pinned `SurrealDB` provider reads its initial root-level
+/// password from. It is delivered only inside the fresh child-only block, never
+/// in argv, never serialized, and never sourced from the parent environment.
 pub(super) const PROVIDER_BOOTSTRAP_PASSWORD_ENV: &str = "SURREAL_PASS";
 
 pub(super) struct ProviderEnvironment {
@@ -415,23 +420,28 @@ pub(super) struct ProviderEnvironment {
 }
 
 /// Builds the provider child's own fresh environment block from a closed
-/// allowlist (I15.4: the Host-managed `surreal.exe` "receives a fresh
-/// child-only environment block ... immediately before process creation", and
-/// "child receives only needed secret via protected handle/pipe").
+/// allowlist. I15.4 (`docs/architecture/I15-04-secrets.md`) admits exactly this
+/// channel for the `surreal.exe` dependency: "Host materializes a fresh
+/// child-only environment block ... immediately before process creation; secret
+/// values are never placed in argv, HostStateJournal, Module Catalog, crash
+/// command text or reusable environment snapshots."
 ///
-/// The allowlist is the literal below: Windows roots plus the store temp root
-/// plus the provider's OWN bootstrap/admin identity under the pinned provider's
-/// two bootstrap environment names. Nothing else can appear, because
+/// The allowlist is the literal below: the two Windows roots, the store temp
+/// root, and the provider's OWN bootstrap/admin identity under the two fixed
+/// names the pinned provider reads. Nothing else can appear, because
 /// [`configure_provider_command`] calls `clear_environment()` before
-/// `environment()`, so the parent's environment — and any database secret a
-/// parent contour may be holding — is never inherited. The ordinary client
-/// credential of this launch is not a member of the block because the two
-/// identities are distinct, which [`SurrealAdapterConfig::validate`] proves by
-/// comparing the original values this configuration holds; this function does
-/// not re-derive that separation by string-matching the block against them.
+/// `environment()`, so no parent environment and no database secret another
+/// contour may be holding is ever inherited.
 ///
-/// A missing bootstrap credential is terminal here rather than at use: the
-/// provider would otherwise start as an unauthenticated/default-admin server.
+/// The ordinary client credential of this launch is absent from the block
+/// because the block is closed, not because this function compares strings: it
+/// only ever reads [`SurrealAdapterConfig::provider_bootstrap_password`], the
+/// value resolved from the reserved provider bootstrap reference. The ordinary
+/// client credential is delivered to no child contour at all — it is used by
+/// this process's own `signin` only.
+///
+/// A missing bootstrap credential is terminal here, immediately before process
+/// creation: the provider would otherwise start as an unauthenticated server.
 pub(super) fn provider_environment(
     config: &SurrealAdapterConfig,
 ) -> Result<ProviderEnvironment, AdapterError> {

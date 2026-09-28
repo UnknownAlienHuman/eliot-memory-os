@@ -15,8 +15,8 @@ use eliot_installation::{
     RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
     SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
-    agent_bridge_source_plan_from_observed_kernel, provider_bootstrap_credential_target_for_store_target,
-    source_bundle_publication_operation_id,
+    agent_bridge_source_plan_from_observed_kernel,
+    provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
@@ -977,23 +977,20 @@ fn build_typed_bundle(
     }
     .with_computed_digest()
     .map_err(|error| MaterializeError::Contract(format!("runtime launch: {error}")))?;
-    let credential_ref = runtime_launch.store_credential_target.as_str().to_owned();
+    let admitted_store_target = &runtime_launch.store_credential_target;
+    let credential_ref = admitted_store_target.as_str().to_owned();
     // I15.4 requires the provider bootstrap/admin credential to be a separate,
     // independently rotatable reference from the ordinary client credential.
     // The installation secret-provisioning owner derives it from the exact
     // Store locator, in its own reserved namespace, so no value and no second
     // derivation rule exists in this composition root.
     let provider_bootstrap_credential_ref =
-        provider_bootstrap_credential_target_for_store_target(
-            &runtime_launch.store_credential_target,
-        )
-        .map_err(|error| {
-            MaterializeError::Contract(format!(
-                "provider bootstrap credential target: {error}"
-            ))
-        })?
-        .as_str()
-        .to_owned();
+        provider_bootstrap_credential_target_for_store_target(admitted_store_target)
+            .map_err(|error| {
+                MaterializeError::Contract(format!("provider bootstrap target: {error}"))
+            })?
+            .as_str()
+            .to_owned();
     let mut store_config = StoreLaunchConfig {
         store_pipe: format!(r"\\.\pipe\eliot\store-{credential_token}"),
         launch_nonce: format!("store:{credential_token}"),
