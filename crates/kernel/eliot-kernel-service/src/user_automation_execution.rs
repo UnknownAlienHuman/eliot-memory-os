@@ -3707,7 +3707,7 @@ mod tests {
                 // binding for it and the revision requires re-normalization.
                 // Empty evidence can never satisfy the required binding, so the
                 // fixture stays refused instead of becoming admitted.
-                normalization_receipt:
+                normalization_receipt: Box::new(
                     eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
                         receipt_id: String::new(),
                         normalizer_authority: String::new(),
@@ -3717,6 +3717,7 @@ mod tests {
                                 .to_owned(),
                         occurrences_digest: String::new(),
                     },
+                ),
             },
             mode: UserAutomationExecutionMode::DeterministicProcess,
             task: AutomationTaskBinding {
