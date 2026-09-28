@@ -62,9 +62,9 @@ pub use notify_fallback_ensure::{
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
-    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyLaunchStage, VerifiedLaunchRef,
-    admit_notify_request, request_names_notify_image, resolve_broker_notify_launch,
-    stage_normal_notify_launch,
+    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyLaunchStage,
+    VerifiedLaunchRef, admit_notify_request, render_notify_acknowledge_line,
+    request_names_notify_image, resolve_broker_notify_launch, stage_normal_notify_launch,
 };
 use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
@@ -678,7 +678,13 @@ struct LocalProcessPort {
     executor: WindowsProcessExecutor,
     runtime: tokio::runtime::Runtime,
     evidence: Arc<Mutex<Vec<ProcessEvidence>>>,
-    pending_requests: BTreeMap<OperationId, ProcessRequest>,
+    /// Sealed request and the exact one-shot standard-input bytes retained from
+    /// `prepare_start`. The bytes live here, not in the sealed `ProcessRequest`
+    /// (which is Kernel-signed P-03 effect material and must not grow a
+    /// request-content field), and they are read at the start boundary rather
+    /// than accepted again there, so the payload written to the child is the
+    /// payload the durably committed request digest was computed from.
+    pending_requests: BTreeMap<OperationId, (ProcessRequest, Option<Vec<u8>>)>,
     identity_issuer: Option<IssuerHandle>,
 }
 
@@ -799,6 +805,7 @@ impl ProcessPort for LocalProcessPort {
         &mut self,
         grant: &LaunchGrant,
         _registration: &RegistrationReceipt,
+        stdin_payload: Option<&str>,
     ) -> Result<String, PortError> {
         let request = self.request_from_grant(grant)?;
         let operation_id = request.operation_id().clone();
@@ -813,7 +820,13 @@ impl ProcessPort for LocalProcessPort {
         );
         if self
             .pending_requests
-            .insert(operation_id, request)
+            .insert(
+                operation_id,
+                (
+                    request,
+                    stdin_payload.map(<str>::as_bytes).map(<[u8]>::to_vec),
+                ),
+            )
             .is_some()
         {
             return Err(PortError::Invalid(
@@ -829,10 +842,10 @@ impl ProcessPort for LocalProcessPort {
         _registration: &RegistrationReceipt,
         expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError> {
-        let request = self
-            .pending_requests
-            .remove(&grant.approved.operation_id)
-            .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
+        let (request, stdin_payload) =
+            self.pending_requests
+                .remove(&grant.approved.operation_id)
+                .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
         let request_digest = request.invocation_digest().to_owned();
         if request_digest != expected_request_digest {
             return Err(PortError::Invalid(
@@ -842,7 +855,18 @@ impl ProcessPort for LocalProcessPort {
         let sink = Arc::new(BrokerEvidenceSink {
             records: self.evidence.clone(),
         });
-        match self.runtime.block_on(self.executor.start(request, sink)) {
+        // The payload is the one retained at preparation, never one supplied at
+        // the start boundary, so the bytes the child reads are the bytes the
+        // durably committed request digest covers. `None` takes the same path
+        // `start_with_stdin` takes with no payload: the pipe is created, never
+        // written, and closed.
+        // `start_with_stdin` is the synchronous physical start, the same driver
+        // the async `ProcessExecutor::start` method reaches, so it is driven on
+        // this single-threaded runtime through `ready` rather than spawned.
+        let start = self
+            .executor
+            .start_with_stdin(request, sink, stdin_payload.as_deref());
+        match self.runtime.block_on(std::future::ready(start)) {
             Ok(receipt) => Ok(ProcessStartOutcome::Started {
                 request_digest,
                 receipt,
@@ -1572,6 +1596,58 @@ impl BrokerComposition {
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
         self.broker.launch(request).map_err(Self::classify)
+    }
+
+    /// Spawns the per-user notification adapter to record one authenticated
+    /// Human acknowledgement (issue #1780, A2).
+    ///
+    /// This is the composition's production entry to the acknowledgement leg,
+    /// and the reason `eliot-notify`'s acknowledgement line has a caller: the
+    /// broker is the only admitted spawner (I11.6:7, "canonical notification →
+    /// User Broker → native toast → authenticated local UI"), so the broker is
+    /// what composes the line the adapter serves
+    /// ([`notify_launch_callin::render_notify_acknowledge_line`]).
+    ///
+    /// The same three independent gates as [`Self::launch_notify`] apply — the
+    /// protected launch lease, the retained verified launch reference, and the
+    /// request naming exactly those bytes — plus one more: a caller-supplied
+    /// `stdin_payload` is refused, so the bytes handed to the child are always
+    /// the line this composition rendered and never caller text.
+    ///
+    /// The acknowledgement is a Human role action (I11.3:13) and it is not a
+    /// resolution (I11.7:5): the principal travels as record data, the
+    /// transition is applied and re-validated on the admitted Kernel route
+    /// inside the adapter, and the record stays unresolved.
+    ///
+    /// `principal` is the authenticated principal this broker admitted for the
+    /// request. It is never taken from the request line: it is the identity
+    /// `admit_human_state_change` proved against the live registration, so the
+    /// canonical record can name no actor but the admitted Human.
+    pub fn launch_notify_acknowledge(
+        &mut self,
+        request: LaunchRequest,
+        acknowledgement: &NotifyAcknowledge,
+        principal: &str,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        // This gate also refuses a caller-supplied `stdin_payload`, so the bytes
+        // bound below are the only bytes this launch can ever carry.
+        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+            |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
+        )?;
+        let line = notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
+            .map_err(|error| {
+                CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+            })?;
+        // The rendered line becomes the admitted request's own standard-input
+        // bytes, so it is inside `digest(&request)`: this operation identity is
+        // bound to exactly this acknowledgement, and a replay carrying different
+        // bytes is a `ReplayConflict` rather than a second effect.
+        let request = LaunchRequest {
+            stdin_payload: Some(line),
+            ..request
+        };
+        self.launch(request)
     }
 
     /// The composition's production entry to the owner-issued, single-use

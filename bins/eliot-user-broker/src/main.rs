@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use eliot_process::OperationId;
 use eliot_user_broker::{
-    BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, OperatorClientBinding,
-    canonical_root, request_names_notify_image,
+    BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, NotifyAcknowledge,
+    OperatorClientBinding, canonical_root, request_names_notify_image,
 };
 use eliot_user_broker_core::{
     CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OperatorEndpoint,
@@ -47,6 +47,47 @@ enum Request {
     /// notification adapter: the generic `Launch` operation refuses that image.
     NotifyLaunch {
         request: LaunchRequest,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
+    },
+    /// Spawns the notification adapter to record one authenticated Human
+    /// acknowledgement of one canonical notification (issue #1780, A2).
+    ///
+    /// This is the production initiator of the acknowledgement leg. It is a
+    /// separate operation, not a flag on `NotifyLaunch`, because the two
+    /// differ in what the child receives: delivery launches the adapter with
+    /// no standard input, while this operation composes the exact
+    /// acknowledgement line and hands it to the child (I11.6:7 — the broker is
+    /// the only admitted spawner, and the broker composes what the adapter
+    /// serves). A delivery request may not smuggle bytes onto this path; the
+    /// composition refuses any caller-supplied `stdin_payload` and renders the
+    /// line itself.
+    ///
+    /// The acknowledging act is a Human role action (I11.3:13) and the
+    /// principal is record data, not authority: the transition is applied and
+    /// re-validated on the admitted Kernel route inside the adapter, and the
+    /// record stays unresolved (I11.7:5). The same `admit_human_state_change`
+    /// and the same notify-image binding gate as delivery apply before
+    /// anything is dispatched.
+    ///
+    /// The acknowledged record's identity travels as typed fields and never as
+    /// caller bytes: the acknowledged principal is deliberately NOT a wire
+    /// field here — [`NotifyAcknowledge`] names only the record — and the line
+    /// the child reads is composed by this broker from the principal it
+    /// admitted. A `stdin_payload` on the inbound request is refused by the
+    /// notify admission gate before anything is dispatched, and the payload
+    /// this request is finally launched with is the broker's own rendered line.
+    /// Together with the generic `Launch` operation refusing the notify image
+    /// at all, this makes the acknowledgement the only request shape that can
+    /// put bytes on a Notify child's standard input.
+    ///
+    /// Acknowledgement suppresses repeated toast, not the problem: the record
+    /// stays unresolved and a critical item stays on the board
+    /// (I11.7:5-6), and the admitted Kernel route re-validates the transition
+    /// before the store applies it.
+    NotifyAcknowledge {
+        request: LaunchRequest,
+        acknowledgement: NotifyAcknowledge,
         #[serde(default)]
         authority: Option<HumanStateAuthority>,
     },
@@ -432,6 +473,25 @@ fn dispatch(
                 Ok(()) => dispatch_launch(composition.launch_notify(request)),
             }
         }
+        Request::NotifyAcknowledge {
+            request,
+            acknowledgement,
+            authority,
+        } => {
+            // I11.3:13 — the acknowledging act belongs to an authorized Human
+            // role, so the authenticated Human authority is admitted here
+            // exactly as it is for delivery and before anything is dispatched.
+            // The generic `Launch` refusal is unnecessary: this arm already
+            // requires the notify image, which `launch_notify_acknowledge`
+            // re-proves against the broker's retained verified bytes.
+            let operation_key = request.approved.idempotency_key.clone();
+            match admit_authenticated_human(composition, authority.as_ref(), &operation_key) {
+                Err(message) => message,
+                Ok(principal) => dispatch_launch(
+                    composition.launch_notify_acknowledge(request, &acknowledgement, &principal),
+                ),
+            }
+        }
         Request::Cancel {
             operation_id,
             authority,
@@ -520,6 +580,31 @@ fn dispatch_operator_pipe(
                 },
             ),
     }
+}
+
+/// Admits one state-changing request and returns the authenticated Human
+/// principal it was admitted for.
+///
+/// The returned principal is the identity [`BrokerComposition::admit_human_state_change`]
+/// proved against the live registration, so a canonical record that names it
+/// names the admitted Human and never caller-supplied text. A request with no
+/// authority at all is refused here with the same stable code the composition
+/// itself uses, so the wire behaviour is identical to the composition's.
+fn admit_authenticated_human(
+    composition: &mut BrokerComposition,
+    authority: Option<&HumanStateAuthority>,
+    operation_key: &str,
+) -> Result<String, Message> {
+    let Some(authority) = authority else {
+        return Err(Message::Error {
+            code: eliot_user_broker::BrokerAdmissionRefusal::HumanPrincipalRequired.code(),
+            detail: "state-changing request carries no authenticated Human principal".to_owned(),
+        });
+    };
+    composition
+        .admit_human_state_change(Some(authority), operation_key)
+        .map_err(|error| composition_rejection(&error))?;
+    Ok(authority.principal.clone())
 }
 
 fn operator_pipe_rejection(error: &CompositionError) -> OperatorPipeMessage {
