@@ -304,7 +304,7 @@ const NAMED_PIPE_CALLER: NamedPipeCallerBoundary = NamedPipeCallerBoundary {
          expected_client_session_id, admitted by \
          eliot_platform_windows::NamedPipePeerExpectation::new in \
          bins/eliot-store-surreal/src/main.rs::serve_handshake_loop and enforced by \
-         eliot_platform_windows::NamedPipeServer::create",
+         eliot_ipc::NamedPipeServer::create",
     admitted_surface: "closed typed store requests only; the isolated health/admin lane admits \
          exactly store.health and store.readiness \
          (connection_manager::HealthAdminAdmission::bridge_default)",

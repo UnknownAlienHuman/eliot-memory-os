@@ -65,9 +65,9 @@ use thiserror::Error;
 pub mod boundary_map;
 mod launch_config;
 pub use boundary_map::{
-    BoundaryEvidence, ContourBoundary, CredentialIssuer, MaintenanceCallerBoundary,
-    NamedPipeCallerBoundary, StoreBoundaryContour, StoreBoundaryMap, StoreCredentialRole,
-    WatchdogSensorBoundary,
+    BoundaryEvidence, ContourBoundary, CredentialIssuer, CredentialReferenceBoundary,
+    MaintenanceCallerBoundary, NamedPipeCallerBoundary, StoreBoundaryContour, StoreBoundaryMap,
+    StoreCredentialRole, StoreRootBoundary, WatchdogSensorBoundary,
 };
 #[cfg(test)]
 pub(crate) use launch_config::{LEGACY_PHASE_B_ZERO_DIGEST, parse_config_bytes};

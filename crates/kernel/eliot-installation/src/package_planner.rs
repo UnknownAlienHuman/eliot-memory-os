@@ -20,7 +20,9 @@ use crate::{
     RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
     StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate, select_profile_roots, supervision_key_slot_for_scope_id,
+    phase_b_static_template_for_candidate,
+    provider_bootstrap_credential_target_for_store_target, select_profile_roots,
+    supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -210,6 +212,16 @@ struct PlannerStoreLaunchConfig {
     blob_root: String,
     instance_id: String,
     credential_ref: String,
+    /// Exact typed mirror of the bridge `StoreLaunchConfig` provider bootstrap
+    /// credential reference field. I15.4 requires the server bootstrap/admin and
+    /// the normal application credential to be distinct, independently
+    /// rotatable references, so this field is part of the launch declaration and
+    /// therefore part of the approved-digest projection. `deny_unknown_fields`
+    /// above makes omitting it here a hard parse failure, not a silent default.
+    provider_bootstrap_credential_ref: String,
+    /// Exact typed mirror of the bridge `StoreLaunchConfig` provider bootstrap
+    /// identity field, for the same reason.
+    provider_bootstrap_username: String,
     runtime_launch: RuntimeLaunchDescriptor,
 }
 
@@ -236,6 +248,8 @@ struct PlannerOperationalConfig<'a> {
     blob_root: &'a str,
     instance_id: &'a str,
     credential_ref: &'a str,
+    provider_bootstrap_credential_ref: &'a str,
+    provider_bootstrap_username: &'a str,
     runtime_launch: &'a RuntimeLaunchDescriptor,
 }
 
@@ -299,6 +313,8 @@ fn validate_source_store_config(
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
         credential_ref: &config.credential_ref,
+        provider_bootstrap_credential_ref: &config.provider_bootstrap_credential_ref,
+        provider_bootstrap_username: &config.provider_bootstrap_username,
         runtime_launch: &config.runtime_launch,
     };
     let digest = hex_digest(&serde_json::to_vec(&operational).map_err(|error| {
@@ -3584,6 +3600,8 @@ mod tests {
             blob_root: &config.blob_root,
             instance_id: &config.instance_id,
             credential_ref: &config.credential_ref,
+            provider_bootstrap_credential_ref: &config.provider_bootstrap_credential_ref,
+            provider_bootstrap_username: &config.provider_bootstrap_username,
             runtime_launch: &config.runtime_launch,
         };
         hex_digest(&serde_json::to_vec(&operational).unwrap())
@@ -3610,6 +3628,8 @@ mod tests {
             "blob_root": &config.blob_root,
             "instance_id": &config.instance_id,
             "credential_ref": &config.credential_ref,
+            "provider_bootstrap_credential_ref": &config.provider_bootstrap_credential_ref,
+            "provider_bootstrap_username": &config.provider_bootstrap_username,
             "runtime_launch": &config.runtime_launch,
         });
         if let Some(limit) = config.store_transaction_limit {
@@ -3653,6 +3673,14 @@ mod tests {
                 .into_owned(),
             instance_id: "store-candidate".to_owned(),
             credential_ref: launch.store_credential_target.as_str().to_owned(),
+            provider_bootstrap_credential_ref:
+                provider_bootstrap_credential_target_for_store_target(
+                    &launch.store_credential_target,
+                )
+                .unwrap()
+                .as_str()
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap".to_owned(),
             runtime_launch: launch,
         };
         config.approved_config_hash = planner_store_config_digest(&config);
@@ -3726,6 +3754,14 @@ mod tests {
                 .into_owned(),
             instance_id: "store-candidate".to_owned(),
             credential_ref: launch.store_credential_target.as_str().to_owned(),
+            provider_bootstrap_credential_ref:
+                provider_bootstrap_credential_target_for_store_target(
+                    &launch.store_credential_target,
+                )
+                .unwrap()
+                .as_str()
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap".to_owned(),
             runtime_launch: launch,
         };
         // Legacy: an unset knob is omitted on the wire, parses to default,
