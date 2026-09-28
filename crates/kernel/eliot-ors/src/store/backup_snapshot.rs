@@ -2402,6 +2402,16 @@ fn resolve_operational_cursor(
     if cursor.identity.high_water_order != request.fence.high_water_order {
         return Err(operational_moved_error());
     }
+    // The declared walk start is re-checked here and not only in
+    // `OrsBackupRequest::with_operational_cursor`, because that setter is a
+    // convenience, not the only way the field can be populated: the store is the
+    // boundary an unvalidated request crosses and must judge it itself.
+    if cursor.identity.lower_order_bound != request.after_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "the operational cursor is frozen for a different walk start than this request declares",
+        });
+    }
     Ok(cursor.clone())
 }
 
@@ -2409,9 +2419,10 @@ fn resolve_operational_cursor(
 ///
 /// The operational counterpart of [`family_page`], and it runs FIRST so the
 /// remaining row and byte admission every family segment is charged from is what
-/// the walk actually spent. `row_budget` and `byte_budget` are this page's whole
-/// remaining admission; the walk does not get a private allowance, so paging it can
-/// never raise the per-page ceiling.
+/// the walk actually spent. It is given this page's WHOLE admission, because nothing
+/// has been charged yet on this page; the walk does not get a private allowance, so
+/// paging it can never raise the per-page ceiling, and it is charged first precisely
+/// so it can never take more than the page's ceiling either.
 fn operational_page(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -2612,7 +2623,11 @@ fn attach_family_cursor(
 /// through [`OrsBackupRequest::with_operational_cursor`]. Calling this with
 /// `page_index > 0` and no declared operational cursor is refused rather than
 /// answered with a count-stride guess, because a guess over a sparse order domain
-/// is how rows were duplicated in the first place.
+/// is how rows were duplicated in the first place. The mirror rule holds at
+/// `page_index == 0`: a declared cursor that has already emitted rows is refused
+/// there too, because a page 0 that opens mid-walk is a page
+/// [`OrsBackupSnapshot::validate`] will not accept, and this crate must not
+/// manufacture a page its own validator rejects.
 ///
 /// Callers building a snapshot should use [`export_snapshot`], which holds ONE
 /// transaction across the whole page loop; pages taken from repeated calls to this
@@ -2704,6 +2719,28 @@ fn export_page_in(
         return Err(OrsError::InvalidField {
             field: "backup.page_index",
             reason: "a page beyond the first requires the owner-issued operational continuation from the previous page",
+        });
+    }
+    if page_index == 0
+        && request
+            .operational_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.emitted_rows != 0)
+    {
+        // The mirror of the rule above, and the exact reason a snapshot always
+        // opens its operational axis at the walk's declared start: pages must be
+        // continuous from zero, and `check_operational_pages` refuses a page 0
+        // that opens mid-walk, so a snapshot built here would be one this crate's
+        // own validator rejects. Continuation therefore goes the way
+        // `after_order` is documented to work — a truncated walk is resumed by
+        // opening a NEW window at the outstanding cursor's `after_order`, and that
+        // window is a snapshot in its own right, complete over exactly the window
+        // it declares. Appending a suffix to a frozen identity is refused here
+        // rather than answered, because its declared denominator covers rows the
+        // pages could never carry.
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "a snapshot opens the operational walk at its declared start; resume a truncated walk by opening a new window at the outstanding cursor's after_order",
         });
     }
     // The token binds the owner-observed fence, not only the caller's claim
@@ -2808,6 +2845,7 @@ fn export_pages_in(
             .checked_add(page.entries.len() as u64)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
         let next_operational = page.operational_continuation.next.clone();
+        let in_force_operational = page.operational_continuation.cursor.clone();
         let next_recovery = page
             .family_continuation
             .as_ref()
@@ -2823,6 +2861,14 @@ fn export_pages_in(
         }
         if let Some(next) = next_operational {
             continuing = continuing.with_operational_cursor(next)?;
+        } else {
+            // The operational axis always carries a cursor forward, even when the
+            // walk is already exhausted, because an exhausted walk is still a real
+            // boundary and the next page is a family page. Dropping the cursor here
+            // would leave the request with none, and the page function would have to
+            // refuse a page it can answer exactly - re-reading an exhausted window
+            // yields the same empty segment, at the cost of one seek.
+            continuing = continuing.with_operational_cursor(in_force_operational)?;
         }
         if let Some(next) = next_recovery {
             continuing = attach_family_cursor(continuing, next)?;
@@ -2880,7 +2926,6 @@ fn export_pages_in(
 /// itself exhausted and the last page was final, yet the aggregate is empty, and
 /// that combination is a contradiction rather than a truncated walk. Reporting it as
 /// a partial would state a reason the snapshot does not have.
-#[allow(clippy::too_many_arguments)]
 fn snapshot_completeness(
     operational_history: &OrsOperationalSnapshotIdentity,
     outstanding_operational: Option<&OrsOperationalCursor>,
