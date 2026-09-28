@@ -693,11 +693,20 @@ fn resolved_binding(resolved: &ResolvedProfile) -> ResolvedBindingReport {
 }
 
 /// Projects one evidence state to its report pair.
+///
+/// A retained state projects its tool identity digest alongside the artifact
+/// handle, so a persisted stage record states which invocation produced the
+/// retained bytes instead of only which bytes were kept.
 fn project_evidence(evidence: &StageEvidence) -> (&'static str, String) {
     match evidence {
-        StageEvidence::Retained { artifact, byte_len } => {
-            ("retained", format!("{}:{byte_len}", artifact.as_str()))
-        }
+        StageEvidence::Retained {
+            artifact,
+            byte_len,
+            tool,
+        } => (
+            "retained",
+            format!("{}:{byte_len}:{}", artifact.as_str(), tool.digest()),
+        ),
         StageEvidence::Omitted { reason } => ("omitted", reason.clone()),
         StageEvidence::Missing { reason } => ("missing", reason.clone()),
     }
