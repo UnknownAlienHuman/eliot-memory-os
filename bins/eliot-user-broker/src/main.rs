@@ -74,10 +74,12 @@ enum Request {
     /// caller bytes: the acknowledged principal is deliberately NOT a wire
     /// field here — [`NotifyAcknowledge`] names only the record — and the line
     /// the child reads is composed by this broker from the principal it
-    /// admitted. `request.stdin_payload` on the inbound request is REPLACED by
-    /// that line, and the generic `Launch` and `NotifyLaunch` operations both
-    /// refuse a caller-supplied payload, so this is the only request shape
-    /// that can put bytes on a Notify child's standard input.
+    /// admitted. A `stdin_payload` on the inbound request is refused by the
+    /// notify admission gate before anything is dispatched, and the payload
+    /// this request is finally launched with is the broker's own rendered line.
+    /// Together with the generic `Launch` operation refusing the notify image
+    /// at all, this makes the acknowledgement the only request shape that can
+    /// put bytes on a Notify child's standard input.
     ///
     /// Acknowledgement suppresses repeated toast, not the problem: the record
     /// stays unresolved and a critical item stays on the board
