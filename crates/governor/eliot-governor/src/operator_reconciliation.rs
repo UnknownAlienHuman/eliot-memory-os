@@ -642,6 +642,21 @@ mod tests {
             })
         }
 
+        fn apply_versioned_submission<'a>(
+            &'a self,
+            _identity: &RequestIdentity,
+            _submission: crate::VersionedWriteSubmission,
+            _transition: PreparedTransition,
+            _expected_revision_heads: Vec<RevisionHeadExpectation>,
+            _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        ) -> KernelPortFuture<'a, crate::KernelVersionedWriteOutcome> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "test gateway does not accept versioned submissions".to_owned(),
+                ))
+            })
+        }
+
         fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
             Box::pin(async move {
                 Ok(self

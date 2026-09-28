@@ -563,6 +563,21 @@ mod tests {
             })
         }
 
+        fn apply_versioned_submission<'a>(
+            &'a self,
+            _identity: &eliot_protocol::RequestIdentity,
+            _submission: eliot_governor::VersionedWriteSubmission,
+            _transition: PreparedTransition,
+            _expected_revision_heads: Vec<RevisionHeadExpectation>,
+            _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        ) -> KernelPortFuture<'a, eliot_governor::KernelVersionedWriteOutcome> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "genesis kernel does not accept versioned submissions".to_owned(),
+                ))
+            })
+        }
+
         fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
             Box::pin(async move {
                 Ok(self

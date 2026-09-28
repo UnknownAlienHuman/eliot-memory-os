@@ -10,8 +10,11 @@
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
+use eliot_canonical::WriteResponseMode;
 use eliot_governor::{
-    KernelPortError, KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
+    KernelPortError, KernelPortFuture, KernelTransitionPort, KernelVersionedWriteOutcome,
+    TaskControllerCampaignSourceHeads, VersionedWriteRefusal, VersionedWriteSubmission,
+    validate_accepted_pending_binding,
 };
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignSourceRole, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -287,6 +290,136 @@ impl KernelTransitionPort for DaemonKernelClient {
                     receipt.operation_id.as_str(),
                 );
                 Ok(receipt)
+            }
+            .instrument(span),
+        )
+    }
+
+    fn apply_versioned_submission<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        submission: VersionedWriteSubmission,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, KernelVersionedWriteOutcome> {
+        let identity = identity.clone();
+        let response_mode = submission.response_mode;
+        let expected_submission = submission.clone();
+        let span = tracing::info_span!(
+            "eliotd.versioned_transition_handoff",
+            operation = %super::diagnostics::sanitize_identity(submission.operation_id().as_str())
+        );
+        Box::pin(
+            async move {
+                submission
+                    .validate_prepared_transition(
+                        &transition,
+                        &expected_revision_heads,
+                        &expected_ordering_heads,
+                    )
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                if submission.envelope.request != identity.request.metadata
+                    || submission.idempotency_key() != identity.idempotency_key
+                {
+                    return Err(KernelPortError::Contract(
+                        "versioned submission does not match the admitted request identity"
+                            .to_owned(),
+                    ));
+                }
+                check_identity_binding(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
+                let _ = super::diagnostics::emit_handoff(
+                    super::diagnostics::HandoffKind::Prepared,
+                    identity.idempotency_key.as_str(),
+                    identity.request.metadata.request_id.as_str(),
+                );
+                let expected_transition = transition.clone();
+                let value = self
+                    .transact_async_with_identity(
+                        "apply_versioned_submission",
+                        serde_json::json!({
+                            "context": identity.request.metadata.clone(),
+                            "submission": submission,
+                            "transition": transition,
+                            "expected_revision_heads": expected_revision_heads,
+                            "expected_ordering_heads": expected_ordering_heads,
+                        }),
+                        identity.clone(),
+                    )
+                    .await
+                    .map_err(kernel_port_error)?;
+                match value.get("kind").and_then(serde_json::Value::as_str) {
+                    Some("versioned_write_refusal") => {
+                        let value = kind_value(&value, "versioned_write_refusal")?;
+                        let refusal: VersionedWriteRefusal = serde_json::from_value(value)
+                            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                        refusal
+                            .validate_for_submission(&expected_submission)
+                            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                        return Ok(KernelVersionedWriteOutcome::Refused { refusal });
+                    }
+                    Some("versioned_write_outcome") => {}
+                    _ => {
+                        return Err(KernelPortError::Contract(
+                            "Kernel returned an unknown versioned-write result kind".to_owned(),
+                        ));
+                    }
+                }
+                let value = kind_value(&value, "versioned_write_outcome")?;
+                let outcome: KernelVersionedWriteOutcome = serde_json::from_value(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                match &outcome {
+                    KernelVersionedWriteOutcome::Committed {
+                        requested_mode,
+                        receipt,
+                    } => {
+                        if *requested_mode != response_mode
+                            || response_mode == WriteResponseMode::AcceptAfterStage
+                        {
+                            return Err(KernelPortError::Contract(
+                                "Kernel returned a committed result for an incompatible response mode"
+                                    .to_owned(),
+                            ));
+                        }
+                        validate_store_receipt_envelope(
+                            &identity.request.metadata,
+                            &expected_transition,
+                            receipt,
+                        )
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                        let _ = super::diagnostics::emit_handoff(
+                            super::diagnostics::HandoffKind::Committed,
+                            identity.idempotency_key.as_str(),
+                            receipt.operation_id.as_str(),
+                        );
+                    }
+                    KernelVersionedWriteOutcome::AcceptedPending {
+                        requested_mode,
+                        staging,
+                        handle,
+                    } => {
+                        validate_accepted_pending_binding(
+                            &expected_submission,
+                            &expected_transition,
+                            *requested_mode,
+                            staging,
+                            handle,
+                        )
+                        .map_err(KernelPortError::Contract)?;
+                    }
+                    KernelVersionedWriteOutcome::Refused { .. } => {
+                        return Err(KernelPortError::Contract(
+                            "Kernel used the outcome discriminator for a typed refusal"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                Ok(outcome)
             }
             .instrument(span),
         )

@@ -44,7 +44,12 @@ use eliot_authority::{
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
     AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
+    WriteResponseMode,
 };
+pub use eliot_canonical::write_envelope::{
+    AcceptAfterStageHandle, VersionedWriteRefusal, VersionedWriteSubmission,
+};
+use eliot_canonical::write_envelope::accept_after_stage_handle;
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
@@ -160,6 +165,20 @@ pub trait KernelTransitionPort: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
+    /// Applies one fully bound versioned submission through the authenticated
+    /// Kernel boundary. The submission retains the original Canonical
+    /// envelope, protocol version, stable intent and caller response mode;
+    /// implementations must mechanically bind it to `transition` and both
+    /// CAS-head sets before any reservation or Store effect.
+    fn apply_versioned_submission<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        submission: VersionedWriteSubmission,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, KernelVersionedWriteOutcome>;
+
     /// Reconciles one operation by its exact canonical identity.
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
@@ -182,6 +201,113 @@ pub trait KernelTransitionPort: Send + Sync {
             ))
         })
     }
+}
+
+/// Typed result of one versioned Kernel write request.
+///
+/// `requested_mode` is retained independently from the observed outcome: a
+/// `wait_for_commit` request can become `ACCEPTED_PENDING` only after ORS
+/// proves complete durable staging under the same operation binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum KernelVersionedWriteOutcome {
+    /// Canonical Store receipt returned for the exact prepared operation.
+    Committed {
+        requested_mode: WriteResponseMode,
+        receipt: WriteReceipt,
+    },
+    /// Exact ORS owner evidence that the full operation is durably staged.
+    AcceptedPending {
+        requested_mode: WriteResponseMode,
+        staging: eliot_ors::AcceptedPending,
+        handle: AcceptAfterStageHandle,
+    },
+    /// Typed, request-bound refusal before staging, ORS, or Store effect.
+    Refused {
+        refusal: VersionedWriteRefusal,
+    },
+}
+
+/// Validates the durable identity returned for one staged versioned write.
+///
+/// The request-derived identity is compared field by field before Governor
+/// accepts the outcome. The ORS staging path validates the complete retained
+/// envelope against its write binding before returning `AcceptedPending`; this
+/// boundary validates the returned binding shape, then compares every field
+/// derivable from the authenticated submission and prepared transition. The
+/// submission carries only the currently fenced epoch, so the predecessor edge
+/// is validated within the ORS-owned lineage but cannot be compared against a
+/// caller lineage this boundary does not possess.
+pub fn validate_accepted_pending_binding(
+    submission: &VersionedWriteSubmission,
+    transition: &PreparedTransition,
+    requested_mode: WriteResponseMode,
+    staging: &eliot_ors::AcceptedPending,
+    handle: &AcceptAfterStageHandle,
+) -> Result<(), String> {
+    submission
+        .validate_prepared_transition(
+            transition,
+            &submission.envelope.expected_revision_heads,
+            &submission.envelope.expected_ordering_heads,
+        )
+        .map_err(|error| error.to_string())?;
+    staging.validate().map_err(|error| error.to_string())?;
+    let expected_digest = eliot_store_api::prepared_transition_digest(transition)
+        .map_err(|error| error.to_string())?;
+    let expected_handle =
+        accept_after_stage_handle(&transition.identity.operation_id, true)
+    .map_err(|error| error.to_string())?;
+    let binding = &staging.write_binding;
+    binding
+        .authority_epoch
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let mut expected_scopes: Vec<_> = transition
+        .ordering_scopes
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect();
+    let mut bound_scopes: Vec<_> = binding
+        .ordering_scopes
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect();
+    expected_scopes.sort_unstable();
+    bound_scopes.sort_unstable();
+    let state_fence = &submission.envelope.request.state_fence;
+    let expected_fence = eliot_ors::StateFenceSnapshot::capture(
+        state_fence,
+        state_fence.authority_epoch.sequence.get(),
+    )
+    .map_err(|error| error.to_string())?;
+    if requested_mode != submission.response_mode
+        || staging.operation_id.operation_id.as_str() != submission.operation_id().as_str()
+        || staging.prepared_transition_sha256 != expected_digest
+        || binding.write_envelope_protocol_version != submission.protocol_version
+        || binding.operation_id.operation_id.as_str() != submission.operation_id().as_str()
+        || binding.write_intent_id.as_str() != submission.write_intent_id.as_str()
+        || binding.idempotency_key.as_str() != submission.idempotency_key()
+        || binding.canonical_request_sha256.as_str()
+            != submission.canonical_request_hash.as_str()
+        || binding.prepared_transition_sha256 != expected_digest
+        || bound_scopes != expected_scopes
+        || binding.admission_contract_set_digest.as_str()
+            != transition.admission_contract_set_digest.as_str()
+        || binding.operation_manifest_digest.as_str()
+            != transition.operation_manifest_digest.as_str()
+        || binding.state_fence != expected_fence
+        || binding.authority_epoch.current.lineage_id.as_str()
+            != state_fence.authority_epoch.lineage_id.as_str()
+        || binding.authority_epoch.current.epoch != state_fence.authority_epoch.sequence.get()
+        || handle != &expected_handle
+    {
+        return Err(
+            "ORS staging binding does not match the exact versioned submission, prepared transition, fence, and poll handle"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Object-safe future returned by a neutral Kernel transition port.
@@ -2767,6 +2893,99 @@ impl CanonicalAdmissionOwner {
                 expected_ordering_heads,
             )
             .await?)
+    }
+
+    /// Applies one versioned submission after mechanically binding its full
+    /// Canonical envelope to the prepared transition and CAS heads.
+    pub(crate) async fn commit_versioned<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+        identity: &RequestIdentity,
+        submission: VersionedWriteSubmission,
+    ) -> Result<KernelVersionedWriteOutcome, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if submission.envelope.request != identity.request.metadata {
+            return Err(CompositionError::Provider(
+                "admitted request binding does not match the versioned Canonical envelope"
+                    .to_owned(),
+            ));
+        }
+        if submission.idempotency_key() != identity.idempotency_key {
+            return Err(CompositionError::Provider(
+                "admitted idempotency key does not match the versioned Canonical envelope"
+                    .to_owned(),
+            ));
+        }
+        let expected_revision_heads = submission.envelope.expected_revision_heads.clone();
+        let expected_ordering_heads = submission.envelope.expected_ordering_heads.clone();
+        let transition = self.prepare(&submission.envelope)?;
+        submission.validate_prepared_transition(
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
+        if transition.identity.idempotency_key != identity.idempotency_key
+            || transition.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "prepared transition does not match the admitted versioned submission"
+                    .to_owned(),
+            ));
+        }
+        let expected_response_mode = submission.response_mode;
+        let expected_submission = submission.clone();
+        let outcome = port
+            .apply_versioned_submission(
+                identity,
+                submission,
+                transition.clone(),
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await?;
+        match &outcome {
+            KernelVersionedWriteOutcome::Committed {
+                requested_mode,
+                receipt,
+            } => {
+                if *requested_mode != expected_response_mode
+                    || expected_response_mode == WriteResponseMode::AcceptAfterStage
+                {
+                    return Err(CompositionError::Provider(
+                        "Kernel returned a commit for a response mode that requires staged acceptance"
+                            .to_owned(),
+                    ));
+                }
+                eliot_store_api::validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &transition,
+                    receipt,
+                )
+                .map_err(|error| CompositionError::Provider(error.to_string()))?;
+            }
+            KernelVersionedWriteOutcome::AcceptedPending {
+                requested_mode,
+                staging,
+                handle,
+            } => {
+                validate_accepted_pending_binding(
+                    &expected_submission,
+                    &transition,
+                    *requested_mode,
+                    staging,
+                    handle,
+                )
+                .map_err(CompositionError::Provider)?;
+            }
+            KernelVersionedWriteOutcome::Refused { refusal } => {
+                refusal
+                    .validate_for_submission(&expected_submission)
+                    .map_err(|error| CompositionError::Provider(error.to_string()))?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Returns the active fence without exposing mutable canonical state.
@@ -6231,6 +6450,38 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.commit_canonical(identity, envelope).await
     }
 
+    /// Applies one explicit versioned submission through the retained Kernel
+    /// port. The caller supplies the admitted write intent and response mode;
+    /// neither is inferred from the flat request identity. Agent submissions
+    /// use the closed `wait_for_commit` / `accept_after_stage` vocabulary.
+    pub async fn commit_canonical_submission(
+        &self,
+        identity: &RequestIdentity,
+        submission: VersionedWriteSubmission,
+    ) -> Result<KernelVersionedWriteOutcome, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        submission.validate()?;
+        if submission.envelope.task_id.is_some() {
+            let scope = require_fresh_matched_binding(
+                self.owners.work_scope.as_ref(),
+                &submission.envelope.request.state_fence,
+                "canonical write work scope is not freshly matched",
+            )?;
+            if scope.binding.scope.scope_ref != submission.envelope.scope_id.as_str() {
+                return Err(CompositionError::Recovery(
+                    "canonical write addresses a different WorkScope than the bound scope"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.owners
+            .canonical
+            .commit_versioned(self.kernel.as_ref(), identity, submission)
+            .await
+    }
+
     /// Admits one scope-sensitive effect under material readiness
     /// (issue #1789, readiness-gate production caller).
     ///
@@ -8469,6 +8720,21 @@ mod tests {
                 *self.apply_calls.lock().expect("apply call lock") += 1;
                 committed.insert(operation_id, (identity, receipt.clone()));
                 Ok(receipt)
+            })
+        }
+
+        fn apply_versioned_submission<'a>(
+            &'a self,
+            _identity: &RequestIdentity,
+            _submission: VersionedWriteSubmission,
+            _transition: PreparedTransition,
+            _expected_revision_heads: Vec<RevisionHeadExpectation>,
+            _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        ) -> KernelPortFuture<'a, KernelVersionedWriteOutcome> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "fake gateway does not accept versioned submissions".to_owned(),
+                ))
             })
         }
 

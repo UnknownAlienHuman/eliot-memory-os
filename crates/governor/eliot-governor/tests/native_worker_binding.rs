@@ -69,6 +69,21 @@ impl KernelTransitionPort for TestKernel {
         })
     }
 
+    fn apply_versioned_submission<'a>(
+        &'a self,
+        _identity: &RequestIdentity,
+        _submission: eliot_governor::VersionedWriteSubmission,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, eliot_governor::KernelVersionedWriteOutcome> {
+        Box::pin(async move {
+            Err(KernelPortError::NotAdmitted(
+                "test port never accepts versioned submissions".to_owned(),
+            ))
+        })
+    }
+
     fn receipt(
         &self,
         _operation_id: eliot_contracts::OperationId,

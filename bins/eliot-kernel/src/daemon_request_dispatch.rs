@@ -487,6 +487,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
         "apply_prepared" => "apply_prepared",
+        "apply_versioned_submission" => "apply_versioned_submission",
         "receipt" => "receipt",
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
@@ -1287,6 +1288,16 @@ struct StoreInitializeGenesisOperation {
 #[serde(deny_unknown_fields)]
 struct StoreApplyOperation {
     context: RequestMeta,
+    transition: PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreApplyVersionedOperation {
+    context: RequestMeta,
+    submission: eliot_canonical::write_envelope::VersionedWriteSubmission,
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
@@ -2169,6 +2180,14 @@ impl KernelComposition {
             "apply_prepared" => {
                 Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
                     .await
+            }
+            "apply_versioned_submission" => {
+                Box::pin(self.store_apply_versioned_operation(
+                    session,
+                    request_id.clone(),
+                    payload.clone(),
+                ))
+                .await
             }
             NOTIFICATION_STATE_MUTATION_OPERATION => {
                 Box::pin(self.notification_state_operation(
@@ -6360,6 +6379,71 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    async fn store_apply_versioned_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreApplyVersionedOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        if operation.context.request_id != request_id
+            || operation.context.source_id.as_str() != ACTIVE_DAEMON_CALLER
+            || session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_store_session_fence(session, &operation.context.state_fence)?;
+        operation
+            .submission
+            .validate_prepared_transition(
+                &operation.transition,
+                &operation.expected_revision_heads,
+                &operation.expected_ordering_heads,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        if operation.submission.envelope.request != operation.context
+            || operation.submission.idempotency_key()
+                != operation.transition.identity.idempotency_key
+            || operation.submission.operation_id() != &operation.transition.identity.operation_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        // The request mode has crossed the authenticated port and the full
+        // Canonical envelope, prepared transition, operation identity, and
+        // compare-and-swap heads are now checked. No live installation-owned
+        // arbitrary-payload protector or canonical-write item/byte/in-flight
+        // limits are available, so this route must not reserve, send, or
+        // report ACCEPTED_PENDING. Preserve the exact request and no-effect
+        // state in a typed refusal instead of collapsing it into generic text.
+        let refusal = eliot_canonical::write_envelope::VersionedWriteRefusal::missing_staging_owners(
+            &operation.submission,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": "versioned_write_refusal",
+                "value": refusal,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(not(windows))]
+    async fn store_apply_versioned_operation(
+        &self,
+        _session: &Session,
+        _request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "the authenticated store admission path retains the complete prepared-transition and source-publication checks"
@@ -8923,8 +9007,9 @@ fn staged_write_recovery_view(
         .map(|problem| {
             serde_json::json!({
                 "operation_id": problem.operation_id,
+                "reservation_id": problem.reservation_id,
                 "reservation_order": problem.reservation_order,
-                "reason": problem.reason,
+                "cause": startup_envelope_problem_cause_view(&problem.cause),
             })
         })
         .collect();
@@ -8951,31 +9036,33 @@ fn staged_write_recovery_view(
                 "recovery_owner": recovery_owner,
                 "resolved": problem.is_resolved(),
             })
-        })
-        .collect();
+    })
+    .collect();
     serde_json::json!({
-        "scan_source": reservations.scan_source,
         "fence": reservations.fence,
         "digest": reservations.digest,
         "scanned": reservations.scanned,
-        "scan_limit": reservations.scan_limit,
-        "cursor_start_after_order": reservations.cursor_start_after_order,
-        "last_reservation_order": reservations.last_reservation_order,
-        "next_after_order": reservations.next_after_order,
-        "truncated": reservations.truncated,
-        "control_scan_source": reservations.control_scan_source,
-        "control_scanned": reservations.control_scanned,
-        "control_cursor_start_after_order": reservations.control_cursor_start_after_order,
-        "control_next_after_order": reservations.control_next_after_order,
-        "control_truncated": reservations.control_truncated,
-        "job_checkpoint_refs": reservations.job_checkpoint_refs,
-        "delivery_cursor_refs": reservations.delivery_cursor_refs,
-        "recovery_inbox_refs": reservations.recovery_inbox_refs,
+        "page_size": reservations.page_size,
+        "active_reservation_count": reservations.active_reservation_count,
+        "unaccounted_reservation_count": reservations.unaccounted_reservation_count,
+        "inventory_coverage": staged.inventory_coverage,
+        "job_checkpoint_record_count": reservations.job_checkpoint_record_count,
+        "job_checkpoint_ref_sample": reservations.job_checkpoint_ref_sample,
+        "delivery_cursor_record_count": reservations.delivery_cursor_record_count,
+        "delivery_cursor_ref_sample": reservations.delivery_cursor_ref_sample,
+        "recovery_inbox_record_count": reservations.recovery_inbox_record_count,
+        "recovery_inbox_ref_sample": reservations.recovery_inbox_ref_sample,
+        "pending_count": reservations.pending_count,
         "pending": reservations.pending.iter().map(startup_pending_view).collect::<Vec<_>>(),
+        "unknown_count": reservations.unknown_count,
         "unknown": reservations.unknown.iter().map(startup_unknown_view).collect::<Vec<_>>(),
+        "envelope_count": staged.envelope_count,
         "envelopes": envelopes,
+        "problem_count": staged.problem_count,
         "envelope_problems": problems,
         "retained_problems": retained_problems,
+        "retained_problem_count": staged.retained_problem_count,
+        "unresolved_retained_problem_count": staged.unresolved_retained_problem_count,
         "readiness": match staged.readiness() {
             eliot_kernel_service::StagedWriteReadiness::Ready => "ready",
             eliot_kernel_service::StagedWriteReadiness::Blocked => "blocked",
@@ -9013,6 +9100,7 @@ fn startup_pending_view(
 ) -> serde_json::Value {
     serde_json::json!({
         "operation_id": operation.operation_id,
+        "reservation_id": operation.reservation_id,
         "reservation_order": operation.reservation_order,
         "scopes": operation.scopes,
         "state": reservation_state_label(operation.state),
@@ -9026,12 +9114,37 @@ fn startup_unknown_view(
 ) -> serde_json::Value {
     serde_json::json!({
         "operation_id": operation.operation_id,
+        "reservation_id": operation.reservation_id,
         "reservation_order": operation.reservation_order,
         "scopes": operation.scopes,
         "state": reservation_state_label(operation.state),
         "recovery_owner": operation.recovery_owner,
         "reason": operation.reason,
     })
+}
+
+fn startup_envelope_problem_cause_view(
+    cause: &eliot_kernel_service::StartupEnvelopeProblemCause,
+) -> serde_json::Value {
+    match cause {
+        eliot_kernel_service::StartupEnvelopeProblemCause::RecoveryProblemRetained {
+            reported_operation_id,
+        } => serde_json::json!({
+            "kind": "recovery_problem_retained",
+            "reported_operation_id": reported_operation_id.as_str(),
+        }),
+        eliot_kernel_service::StartupEnvelopeProblemCause::RecoveryProblemRecordFailed {
+            reported_operation_id,
+            reported_reservation_id,
+            ..
+        } => serde_json::json!({
+            "kind": "recovery_problem_record_failed",
+            "reported_operation_id": reported_operation_id.as_str(),
+            "reported_reservation_id": reported_reservation_id.as_str(),
+            "original_cause_class": "ors_staged_envelope_validation",
+            "recorder_cause_class": "ors_recovery_problem_persistence",
+        }),
+    }
 }
 
 fn store_genesis_response(receipt: &WriteReceipt) -> serde_json::Value {

@@ -35,7 +35,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::OperationId;
+use eliot_contracts::{OperationId, StateFence};
+use eliot_store_api::{OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation};
+use serde::{Deserialize, Serialize};
 
 use super::{CanonicalError, CanonicalWriteEnvelope, WriteResponseMode};
 
@@ -94,7 +96,8 @@ pub fn validate_write_intent_id(value: &str) -> Result<(), CanonicalError> {
 /// The canonical request hash is computed at bind time over the immutable
 /// request identity and stored alongside the idempotency key so retries can
 /// be decided without reinterpreting the envelope.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VersionedWriteSubmission {
     /// Admitted envelope protocol version (always 1 here).
     pub protocol_version: u32,
@@ -147,6 +150,56 @@ impl VersionedWriteSubmission {
             canonical_request_hash,
             response_mode,
         })
+    }
+
+    /// Revalidates the transported envelope and request hash.
+    ///
+    /// Deserialization alone is not admission: protocol version, write intent,
+    /// canonical envelope and its request hash are recomputed before a caller
+    /// can forward this value to Kernel.
+    pub fn validate(&self) -> Result<(), CanonicalError> {
+        let rebound = Self::bind(
+            self.protocol_version,
+            self.write_intent_id.clone(),
+            self.envelope.clone(),
+            self.response_mode,
+        )?;
+        if rebound.canonical_request_hash != self.canonical_request_hash {
+            return Err(CanonicalError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "transported request hash does not match the canonical envelope",
+            });
+        }
+        Ok(())
+    }
+
+    /// Proves the complete Canonical envelope and prepared plan are the same
+    /// submission before the neutral Kernel port is called.
+    ///
+    /// This comparison includes the canonical operation/idempotency identity,
+    /// complete ordering scopes and both CAS-head sets. It does not infer or
+    /// repair missing bindings.
+    pub fn validate_prepared_transition(
+        &self,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<(), CanonicalError> {
+        self.validate()?;
+        let prepared = self.envelope.prepare()?;
+        if prepared != *transition
+            || transition.identity.operation_id != self.envelope.operation_id
+            || transition.identity.idempotency_key != self.envelope.idempotency_key
+            || transition.identity.canonical_request_hash != self.canonical_request_hash
+            || expected_revision_heads != self.envelope.expected_revision_heads
+            || expected_ordering_heads != self.envelope.expected_ordering_heads
+        {
+            return Err(CanonicalError::InvalidField {
+                field: "prepared_transition",
+                reason: "prepared plan or compare-and-swap heads do not match the versioned envelope",
+            });
+        }
+        Ok(())
     }
 
     /// Globally unique operation identity of this submission attempt.
@@ -316,7 +369,8 @@ pub fn resolve_wait_for_commit(
 /// Returned only after complete ORS staging. The caller polls/subscribes by
 /// operation identity and must not retry: a retry under the same idempotency
 /// key replays the same staged identity instead of creating new work.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptAfterStageHandle {
     /// Staged operation identity to poll/subscribe by.
     pub operation_id: OperationId,
@@ -324,6 +378,106 @@ pub struct AcceptAfterStageHandle {
     pub pollable: bool,
     /// Always true: the caller must not retry this submission.
     pub must_not_retry: bool,
+}
+
+/// Fixed owner blockers reported before versioned-write staging.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionedWriteRefusalCode {
+    /// No installation-owned arbitrary-payload protector is available.
+    InstallationPayloadProtectorUnavailable,
+    /// No canonical-write item/byte/in-flight admission bounds are available.
+    CanonicalWriteAdmissionLimitsUnavailable,
+}
+
+/// Evidence that a versioned write was refused before any effect attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionedWriteAttemptState {
+    /// No staging, ORS mutation, or Store mutation was attempted.
+    NotAttempted,
+}
+
+/// Closed, request-bound refusal returned while staging owner prerequisites
+/// are unavailable.
+///
+/// The exact Canonical identity is echoed so the daemon can reject foreign or
+/// stale refusal frames. The three effect fields are fixed owner evidence, not
+/// caller-selected status: they only admit the `not_attempted` state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedWriteRefusal {
+    /// Exact operation identity from the validated envelope.
+    pub operation_id: OperationId,
+    /// Exact stable user/agent intent identity from the submission.
+    pub write_intent_id: String,
+    /// Exact idempotency identity from the envelope.
+    pub idempotency_key: String,
+    /// Exact canonical-request digest from the validated submission.
+    pub canonical_request_hash: String,
+    /// Exact fence from the Canonical request.
+    pub state_fence: StateFence,
+    /// Fixed missing-owner contract set.
+    pub blockers: Vec<VersionedWriteRefusalCode>,
+    /// Whether staging began.
+    pub staging: VersionedWriteAttemptState,
+    /// Whether an ORS mutation began.
+    pub ors: VersionedWriteAttemptState,
+    /// Whether a canonical Store mutation began.
+    pub store: VersionedWriteAttemptState,
+}
+
+impl VersionedWriteRefusal {
+    /// Builds the exact refusal for the currently missing W3 prerequisites.
+    pub fn missing_staging_owners(
+        submission: &VersionedWriteSubmission,
+    ) -> Result<Self, CanonicalError> {
+        submission.validate()?;
+        let refusal = Self {
+            operation_id: submission.operation_id().clone(),
+            write_intent_id: submission.write_intent_id.clone(),
+            idempotency_key: submission.idempotency_key().to_owned(),
+            canonical_request_hash: submission.canonical_request_hash.clone(),
+            state_fence: submission.envelope.request.state_fence.clone(),
+            blockers: vec![
+                VersionedWriteRefusalCode::InstallationPayloadProtectorUnavailable,
+                VersionedWriteRefusalCode::CanonicalWriteAdmissionLimitsUnavailable,
+            ],
+            staging: VersionedWriteAttemptState::NotAttempted,
+            ors: VersionedWriteAttemptState::NotAttempted,
+            store: VersionedWriteAttemptState::NotAttempted,
+        };
+        refusal.validate_for_submission(submission)?;
+        Ok(refusal)
+    }
+
+    /// Validates this refusal against the exact submitted Canonical identity.
+    pub fn validate_for_submission(
+        &self,
+        submission: &VersionedWriteSubmission,
+    ) -> Result<(), CanonicalError> {
+        submission.validate()?;
+        let exact_blockers = [
+            VersionedWriteRefusalCode::InstallationPayloadProtectorUnavailable,
+            VersionedWriteRefusalCode::CanonicalWriteAdmissionLimitsUnavailable,
+        ];
+        if &self.operation_id != submission.operation_id()
+            || self.write_intent_id.as_str() != submission.write_intent_id
+            || self.idempotency_key.as_str() != submission.idempotency_key()
+            || self.canonical_request_hash.as_str() != submission.canonical_request_hash
+            || self.state_fence != submission.envelope.request.state_fence
+            || self.blockers.as_slice() != exact_blockers.as_slice()
+            || self.staging != VersionedWriteAttemptState::NotAttempted
+            || self.ors != VersionedWriteAttemptState::NotAttempted
+            || self.store != VersionedWriteAttemptState::NotAttempted
+        {
+            return Err(CanonicalError::InvalidField {
+                field: "versioned_write_refusal",
+                reason: "refusal does not bind the exact request and no-effect state",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Publishes the pollable operation identity for `accept_after_stage`.

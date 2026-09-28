@@ -362,12 +362,49 @@ impl KernelComposition {
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
-            if let Err(error) = self
+            let gateway = match self
                 .connect_canonical_store(Duration::from_millis(handoff.requirement.timeout_ms()))
                 .await
             {
-                let _ = error;
-                return Err(TransportError::SessionFenced.into());
+                Ok(gateway) => gateway,
+                Err(_) => return Err(TransportError::SessionFenced.into()),
+            };
+            // I1.11 step 6 cannot be inferred from a connected Store. Before
+            // BootstrapStore returns, attempt bounded enumeration and
+            // reconciliation of the durable ORS obligations under this
+            // authenticated control request's exact epoch/generation fence.
+            // Only owner-proven complete coverage can report Ready. A partial,
+            // unknown, corrupt, truncated, or inaccessible scan leaves step 6
+            // unrecorded, so dependent normal writes remain gated while this
+            // independent control path stays available for recovery
+            // inspection/retry.
+            if self.startup_status(GovernanceProfile::minimal()).completed_step < 6 {
+                let recovery_fence =
+                    StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+                match gateway
+                    .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
+                    .await
+                {
+                    Ok(recovery)
+                        if recovery.readiness()
+                            == eliot_kernel_service::StagedWriteReadiness::Ready =>
+                    {
+                        self.record_startup_evidence(6)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        observe_entrypoint_with_detail(
+                            EntrypointStage::StoreBootstrap,
+                            "kernel.store.startup_ors_recovery_ready",
+                        );
+                    }
+                    Ok(_) => observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.store.startup_ors_recovery_blocked:normal_writes_gated",
+                    ),
+                    Err(_) => observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.store.startup_ors_recovery_unavailable:normal_writes_gated",
+                    ),
+                }
             }
         }
         // I14.23 wake/attach race: a new activation arriving before the
