@@ -2355,7 +2355,6 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
- "eliot-memory-curation",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2516,8 +2515,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-contracts",
- "eliot-epistemic",
- "eliot-evidence",
  "eliot-memory-curation-contracts",
  "eliot-memory-curation-screen",
  "schemars",
