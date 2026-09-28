@@ -7987,8 +7987,9 @@ impl RedbRecoveryStore {
             | crate::HostRequestState::Cancelled
             | crate::HostRequestState::Expired
             | crate::HostRequestState::Conflicted
-            | crate::HostRequestState::Terminal => parent.state,
-            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling => parent.state,
+            | crate::HostRequestState::Terminal
+            | crate::HostRequestState::Unknown
+            | crate::HostRequestState::Reconciling => parent.state,
             crate::HostRequestState::Requested
             | crate::HostRequestState::Submitted
             | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
