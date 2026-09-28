@@ -62,7 +62,13 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+pub mod boundary_map;
 mod launch_config;
+pub use boundary_map::{
+    BoundaryEvidence, ContourBoundary, CredentialIssuer, MaintenanceCallerBoundary,
+    NamedPipeCallerBoundary, StoreBoundaryContour, StoreBoundaryMap, StoreCredentialRole,
+    WatchdogSensorBoundary,
+};
 #[cfg(test)]
 pub(crate) use launch_config::{LEGACY_PHASE_B_ZERO_DIGEST, parse_config_bytes};
 pub use launch_config::{
@@ -119,7 +125,7 @@ pub use connection_manager::{
 };
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
-use adapter_materialization::resolve_credential;
+use adapter_materialization::{resolve_credential, resolve_provider_bootstrap_credential};
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -319,6 +325,14 @@ impl StoreComposition {
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
+        // The provider child's bootstrap/admin credential is a separate
+        // reference resolved here, once, for this launch. A missing or
+        // unreadable second reference stops composition instead of leaving the
+        // provider to start without one.
+        let provider_bootstrap_password = resolve_provider_bootstrap_credential(
+            &platform,
+            &config.provider_bootstrap_credential_ref,
+        )?;
         let roots = &config.runtime_launch.runtime_state_roots;
         let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
             .map_err(|error| format!("validate runtime-root provider: {error}"))?;
@@ -347,7 +361,7 @@ impl StoreComposition {
             .validate()
             .map_err(|error| format!("invalid Store state fence: {error}"))?;
         let store = SurrealStoreAdapter::new(
-            materialize_adapter_config(config, password)?,
+            materialize_adapter_config(config, password, provider_bootstrap_password)?,
             provider_process_lease,
         )
         .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
@@ -2056,6 +2070,9 @@ mod tests {
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),
             credential_ref: "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
+            provider_bootstrap_credential_ref: "eliot/provider/v1/fedcba9876543210fedcba9876543210"
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
             runtime_launch: runtime_launch(),
         };
         config.approved_config_hash = launch_config_digest(&config).expect("config digest");

@@ -807,6 +807,21 @@ fn build_typed_bundle(
         format!("eliot/store/v1/{}", &credential_token[..32]),
         "Store credential target",
     )?;
+    // I15.4 requires the provider bootstrap/admin credential to be a separate,
+    // independently rotatable reference from the ordinary client credential.
+    // It is a sibling target in its own reserved namespace, derived from the
+    // same per-transaction template entropy so the two differ.
+    let provider_bootstrap_target_token = sha256_hex(
+        format!(
+            "eliot-provider-credential:phase-a-template:{}:{}:{}",
+            input.installation_epoch.installation.as_str(),
+            input.generation.as_str(),
+            template_digest.as_str()
+        )
+        .as_bytes(),
+    );
+    let provider_bootstrap_credential_ref =
+        format!("eliot/provider/v1/{}", &provider_bootstrap_target_token[..32]);
     let authority_generation = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     let authority_epoch = materializer_genesis_epoch()?;
@@ -1001,6 +1016,8 @@ fn build_typed_bundle(
             .into_owned(),
         instance_id: format!("store-{}", input.generation.as_str()),
         credential_ref,
+        provider_bootstrap_credential_ref,
+        provider_bootstrap_username: "provider-bootstrap".to_owned(),
         runtime_launch: runtime_launch.clone(),
     };
     store_config.approved_config_hash = launch_config_digest(&store_config)

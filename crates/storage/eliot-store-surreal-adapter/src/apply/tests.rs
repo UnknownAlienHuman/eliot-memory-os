@@ -125,6 +125,10 @@ fn genesis_sql_guards_all_absent_state_and_advances_only_commit_sequence() {
             database: "db".to_owned(),
             username: "user".to_owned(),
             password: secrecy::SecretString::new("password".to_owned().into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: secrecy::SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: "127.0.0.1:18000".to_owned(),
             installation_id: "install".to_owned(),
             installation_profile: "portable_dev".to_owned(),

@@ -99,6 +99,8 @@ fn configuration(sandbox: &Sandbox) -> ProofResult<SurrealAdapterConfig> {
         // authentication requires text, so preserve an explicit text prefix.
         username: "epistemic-test".to_owned(),
         password: SecretString::new(format!("epistemic-fixture-{}", uuid::Uuid::new_v4()).into()),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+        provider_bootstrap_password: SecretString::new("provider-bootstrap-fixture-secret".into()),
         provider_bind_address: bind,
         installation_id: "epistemic-provider-test".to_owned(),
         installation_profile: "portable_dev".to_owned(),

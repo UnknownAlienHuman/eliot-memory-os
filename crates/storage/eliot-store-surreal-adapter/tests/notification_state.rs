@@ -387,6 +387,8 @@ fn adapter_config(
         database: "notification_1780".to_owned(),
         username: "notify-test".to_owned(),
         password: SecretString::new("notify-test-secret".into()),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+        provider_bootstrap_password: SecretString::new("provider-bootstrap-fixture-secret".into()),
         provider_bind_address: bind,
         installation_id: "installation-test-1780".to_owned(),
         installation_profile: "portable_dev".to_owned(),

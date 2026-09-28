@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::AdapterError;
 
@@ -76,6 +76,22 @@ pub struct SurrealAdapterConfig {
     pub username: String,
     /// `SurrealDB` password credential, held opaque and redacted.
     pub password: SecretString,
+    /// `SurrealDB` username whose credential the provider child consumes to
+    /// bootstrap its own server identity.
+    ///
+    /// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets): "Server
+    /// bootstrap/admin and normal application credentials are distinct,
+    /// independently rotatable references." This identity is therefore a
+    /// different `SurrealDB` user from [`Self::username`], and
+    /// [`Self::validate`] refuses a configuration that aliases the two.
+    pub provider_bootstrap_username: String,
+    /// `SurrealDB` provider bootstrap/admin password, held opaque and redacted.
+    ///
+    /// It is materialized into the provider child's own fresh environment block
+    /// immediately before process creation (see
+    /// `client::provider_owner::provider_environment`) and never into argv,
+    /// a serialized form, or the ordinary client credential set.
+    pub provider_bootstrap_password: SecretString,
     /// Exact loopback address owned by this adapter's provider child.
     pub provider_bind_address: String,
     /// Canonical installation identity that owns the provider roots.
@@ -116,6 +132,8 @@ impl fmt::Debug for SurrealAdapterConfig {
             .field("database", &self.database)
             .field("username", &"[REDACTED]")
             .field("password", &"[REDACTED]")
+            .field("provider_bootstrap_username", &"[REDACTED]")
+            .field("provider_bootstrap_password", &"[REDACTED]")
             .field("provider_bind_address", &self.provider_bind_address)
             .field("installation_id", &self.installation_id)
             .field("installation_profile", &self.installation_profile)
@@ -152,6 +170,30 @@ impl SurrealAdapterConfig {
         validate_name(&self.namespace, "namespace")?;
         validate_name(&self.database, "database")?;
         validate_name(&self.username, "username")?;
+        validate_name(
+            &self.provider_bootstrap_username,
+            "provider_bootstrap_username",
+        )?;
+        // I15.4 requires the server bootstrap/admin identity and the ordinary
+        // application identity to be distinct, independently rotatable
+        // references. Two references resolving to one `SurrealDB` user, or
+        // carrying one secret, would make the bootstrap credential an ordinary
+        // client credential — which is exactly what the separation forbids, and
+        // which would also mean the two references cannot be rotated apart.
+        //
+        // This compares the ORIGINAL values this configuration holds. It is not
+        // a shape check on the reference strings, and it is not inferred from
+        // `SecretString` debug redaction.
+        if self.provider_bootstrap_password.expose_secret().is_empty() {
+            return Err(ConfigError::InvalidField {
+                field: "provider_bootstrap_password",
+            });
+        }
+        if self.provider_bootstrap_username == self.username
+            || self.provider_bootstrap_password.expose_secret() == self.password.expose_secret()
+        {
+            return Err(ConfigError::AliasedProviderCredentials);
+        }
         validate_name(&self.installation_id, "installation_id")?;
         if !matches!(
             self.installation_profile.as_str(),
@@ -768,6 +810,8 @@ pub enum ConfigError {
     InvalidField { field: &'static str },
     #[error("Store data, work, and temp roots must be distinct")]
     AliasedRuntimeRoots,
+    #[error("provider bootstrap/admin and normal client credentials must be distinct identities")]
+    AliasedProviderCredentials,
 }
 
 #[cfg(test)]
@@ -785,6 +829,10 @@ mod tests {
             database: "eliot".to_owned(),
             username: "provider-user".to_owned(),
             password: SecretString::new("test-secret".into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: "127.0.0.1:18000".to_owned(),
             installation_id: "installation-test".to_owned(),
             installation_profile: "portable_dev".to_owned(),

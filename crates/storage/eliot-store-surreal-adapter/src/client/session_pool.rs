@@ -664,6 +664,10 @@ mod pool_behavior_tests {
                 database: "selected987".into(),
                 username: "pool987-user".into(),
                 password: SecretString::new(format!("test-{}", Uuid::new_v4()).into()),
+                provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+                provider_bootstrap_password: SecretString::new(
+                    "provider-bootstrap-fixture-secret".into(),
+                ),
                 provider_bind_address: bind,
                 installation_id: "pool987".into(),
                 installation_profile: "portable_dev".into(),

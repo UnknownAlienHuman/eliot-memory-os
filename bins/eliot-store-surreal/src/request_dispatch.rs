@@ -1309,6 +1309,10 @@ mod dreamer_dispatch_tests {
             database: "dreamer_s2_dispatch".to_owned(),
             username: "dreamer-test".to_owned(),
             password: secrecy::SecretString::new("dreamer-test-secret".into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: secrecy::SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: bind,
             installation_id: "installation-test-s2".to_owned(),
             installation_profile: "portable_dev".to_owned(),

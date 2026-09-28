@@ -62,6 +62,8 @@ fn isolated_config(root: &Path) -> (SurrealAdapterConfig, PathBuf) {
         database: "selected987".into(),
         username: "pool987-user".into(),
         password: SecretString::new("redacted-987".into()),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+        provider_bootstrap_password: SecretString::new("provider-bootstrap-fixture-secret".into()),
         provider_bind_address: bind.into(),
         installation_id: "pool987".into(),
         installation_profile: "portable_dev".into(),

@@ -678,6 +678,8 @@ fn adapter_config(
         database: "dreamer_775".to_owned(),
         username: "dreamer-test".to_owned(),
         password: SecretString::new("dreamer-test-secret".into()),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+        provider_bootstrap_password: SecretString::new("provider-bootstrap-fixture-secret".into()),
         provider_bind_address: bind,
         installation_id: "installation-test-775".to_owned(),
         installation_profile: "portable_dev".to_owned(),
