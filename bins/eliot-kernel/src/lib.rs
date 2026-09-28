@@ -780,6 +780,27 @@ struct AgentBridgeProfile {
     declaration: AgentBridgeClientDeclaration,
 }
 
+/// Semantic binding retained from the exact `Resolved` activation result that
+/// completed one connection's activation (issue #1746).
+///
+/// Mechanical continuity only: the host-request admission gate compares later
+/// claimed session/task/scope/revision values against these exact retained
+/// values instead of trusting caller claims. Selection currency against live
+/// Governor state stays the Governor's; a claim naming another task or scope
+/// fails as a conflict and must re-activate, it is never silently rebound.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ActivatedApplicationBinding {
+    /// Application session resolved by Governor for this activation.
+    session_id: String,
+    /// Governor-owned task selected at activation time.
+    task_id: String,
+    /// Governor-owned `WorkScope` selected at activation time.
+    work_scope_id: String,
+    /// `TaskContract` revision selected at activation time.
+    task_revision: eliot_contracts::TaskRevision,
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct AgentBridgeConnectionState {
@@ -790,6 +811,11 @@ struct AgentBridgeConnectionState {
     /// Kernel-owned transport Session retained after successful activation.
     session: Option<Session>,
     activation_completed: bool,
+    /// Semantic binding retained from the `Resolved` activation result, if any.
+    ///
+    /// `None` until activation completes with `Resolved`; denials retain
+    /// nothing. Removed with the connection on disconnect.
+    activated_binding: Option<ActivatedApplicationBinding>,
 }
 
 #[cfg(windows)]

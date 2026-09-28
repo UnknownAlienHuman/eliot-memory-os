@@ -587,6 +587,7 @@ impl KernelComposition {
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(envelope)?;
         self.host_request_service_gate(&descriptor, envelope)?;
         let binding = bridge_process_binding(&descriptor, &receipt, &envelope.connection_id)?;
 
@@ -1516,6 +1517,90 @@ impl KernelComposition {
         Ok((profile.admission, receipt))
     }
 
+    /// Verifies claimed application session/task/scope continuity against the
+    /// exact binding retained from this connection's `Resolved` activation
+    /// (issue #1746).
+    ///
+    /// The connection gate above established transport admission; this gate
+    /// binds the authenticated transport to the activation-derived
+    /// application authority. It is mechanical only: claimed values are
+    /// compared for exact equality against retained values, nothing is
+    /// re-resolved and no task is ever selected here. Absent claims are not
+    /// invented: discovery stays reachable without a task, and whether a
+    /// capability requires a task remains the Governor's semantic decision.
+    ///
+    /// A claim naming a different session, task, scope, or task revision than
+    /// the retained activation binding is `IdentityConflict`: the request must
+    /// re-activate under the new binding, it is never silently rebound or
+    /// rewritten. A claim matching the retained binding whose application
+    /// session is unknown, terminal, epoch-mismatched, never bound to the
+    /// presenting connection, or carries an expired or revoked session-bound
+    /// lease is `SessionFenced`.
+    fn host_request_application_binding_gate_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), TransportError> {
+        if envelope.kind == HostRequestKind::Activation {
+            return Ok(());
+        }
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&envelope.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            state
+                .activated_binding
+                .clone()
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if let Some(claimed) = envelope.identity.session_id.as_deref() {
+            if claimed != retained.session_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            let now = unix_ms();
+            let sessions = self
+                .agent_application_sessions
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let live = sessions.get(claimed).is_some_and(|session| {
+                !session.state().is_terminal()
+                    && session
+                        .authority_epoch()
+                        .is_same_authority(&envelope.state_fence.authority_epoch)
+                    && session
+                        .transport_bindings()
+                        .iter()
+                        .any(|binding| binding.binding_id == envelope.connection_id)
+                    && session
+                        .bound_leases()
+                        .values()
+                        .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+            });
+            if !live {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        if let Some(claimed) = envelope.identity.task_id.as_deref()
+            && claimed != retained.task_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(claimed) = envelope.identity.work_scope_id.as_deref()
+            && claimed != retained.work_scope_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(claimed) = envelope.state_fence.task_revision
+            && claimed != retained.task_revision
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
     /// Applies the service-state rule that mirrors the admission gate: full
     /// admission requires `Ready`, while `Cancellation`, `Status`, and
     /// `Reconciliation` additionally route while `Degraded`. The gate itself
@@ -1974,6 +2059,80 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Revalidates a queued operation's claimed application binding against
+    /// the live session authority and the retained activation binding before
+    /// a daemon claim (issue #1746).
+    ///
+    /// Admission verified the claims; this closes the window between enqueue
+    /// and claim. A pair whose claimed session is unknown, terminal,
+    /// epoch-mismatched, never bound to the presenting connection, or carrying
+    /// an expired or revoked session-bound lease is not claimable, and neither
+    /// is a pair whose claimed task, scope, or task revision drifted from this
+    /// connection's retained `Resolved` activation binding. Pairs without a
+    /// claim carry nothing to revalidate on that leg. An unclaimable pair keeps
+    /// its original identity and is skipped for later reconciliation, never
+    /// refused or rewritten here.
+    fn application_binding_live_for_claim(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.clone())
+        };
+        if let Some(retained) = retained.as_ref() {
+            if envelope
+                .identity
+                .task_id
+                .as_deref()
+                .is_some_and(|claimed| claimed != retained.task_id)
+                || envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != retained.work_scope_id)
+                || envelope
+                    .state_fence
+                    .task_revision
+                    .is_some_and(|claimed| claimed != retained.task_revision)
+            {
+                return Ok(false);
+            }
+        } else if envelope.identity.task_id.is_some()
+            || envelope.identity.work_scope_id.is_some()
+            || envelope.state_fence.task_revision.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(claimed) = envelope.identity.session_id.as_deref() else {
+            return Ok(true);
+        };
+        let now = unix_ms();
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(sessions.get(claimed).is_some_and(|session| {
+            !session.state().is_terminal()
+                && session
+                    .authority_epoch()
+                    .is_same_authority(&envelope.state_fence.authority_epoch)
+                && session
+                    .transport_bindings()
+                    .iter()
+                    .any(|binding| binding.binding_id == envelope.connection_id)
+                && session
+                    .bound_leases()
+                    .values()
+                    .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
+        }))
+    }
+
     /// Claims the next admitted local-read pair for the daemon poller under
     /// governed attempt ownership.
     ///
@@ -2019,6 +2178,9 @@ impl KernelComposition {
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if !self.application_binding_live_for_claim(envelope)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -3206,6 +3368,10 @@ impl KernelComposition {
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    position += 1;
+                    continue;
+                }
+                if !self.application_binding_live_for_claim(envelope)? {
                     position += 1;
                     continue;
                 }
