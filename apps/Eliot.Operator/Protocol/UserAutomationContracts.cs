@@ -500,63 +500,6 @@ public sealed record UserAutomationRevision(
     }
 }
 
-/// The owner-issued evidence binding one occurrence set to the compiled result
-/// of a schedule's declared expression and calendar.
-/// <remarks>
-/// <para>
-/// <b>It is evidence the Operator round-trips, not evidence it derives.</b> The
-/// expression language is owned elsewhere, so the Operator never reparses
-/// <c>expression</c> and never decides which occurrences it selects, and it
-/// cannot recompute <c>occurrences_digest</c> or <c>source_digest</c>: both are
-/// SHA-256 over a Rust canonical JSON tuple the Operator does not own. It
-/// therefore checks bounded wire shape and nothing else, and the owner's own
-/// validator remains the only thing that can compare them.
-/// </para>
-/// <para>
-/// <b>Why the wire member is named <c>normalization_binding</c> here.</b> The
-/// JSON property is the owner's <c>normalization_receipt</c> and must stay
-/// exactly that, because the owner side is <c>deny_unknown_fields</c>. The C#
-/// member cannot keep the same name: <c>UserAutomationNormalizedSchedule</c>
-/// already exposes a <c>NormalizationReceipt()</c> METHOD that projects the
-/// parsed owner schedule, and C# forbids a property and a method sharing one
-/// name in a type. Renaming the property would not change the wire contract and
-/// would have forced three call sites in files this change does not own.
-/// </para>
-/// <para>
-/// The member is REQUIRED and has no default, which is deliberate. A revision
-/// stored before contract 1.2.0 has no such member and is undecodable by the
-/// owner, so it can never be re-serialized here into something that looks
-/// certified under the stronger contract; it must be re-normalized into a new
-/// immutable revision by the owning calendar adapter.
-/// </para>
-/// </remarks>
-public sealed record UserAutomationScheduleNormalizationReceipt(
-    [property: JsonPropertyName("receipt_id")] string ReceiptId,
-    [property: JsonPropertyName("normalizer_authority")] string NormalizerAuthority,
-    [property: JsonPropertyName("source_digest")] string SourceDigest,
-    [property: JsonPropertyName("zone_database_revision")] string ZoneDatabaseRevision,
-    [property: JsonPropertyName("occurrences_digest")] string OccurrencesDigest)
-{
-    /// <summary>
-    /// Checks the bounded wire shape of the owner-issued evidence.
-    /// </summary>
-    /// <remarks>
-    /// This deliberately proves no relationship between the receipt and the
-    /// occurrence set. Only the owner can recompute
-    /// <see cref="OccurrencesDigest"/>, so a caller that satisfies every check
-    /// here can still be refused by the owner; that direction of failure is safe.
-    /// The reverse would not be, which is why nothing here is treated as proof.
-    /// </remarks>
-    public void Validate()
-    {
-        UserAutomationContract.RequireText(ReceiptId, "schedule.normalization_receipt.receipt_id");
-        UserAutomationContract.RequireText(NormalizerAuthority, "schedule.normalization_receipt.normalizer_authority");
-        UserAutomationContract.RequireText(SourceDigest, "schedule.normalization_receipt.source_digest");
-        UserAutomationContract.RequireText(ZoneDatabaseRevision, "schedule.normalization_receipt.zone_database_revision");
-        UserAutomationContract.RequireText(OccurrencesDigest, "schedule.normalization_receipt.occurrences_digest");
-    }
-}
-
 public sealed record UserAutomationNormalizedSchedule(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("expression")] string Expression,
@@ -628,7 +571,6 @@ public sealed record UserAutomationNormalizedSchedule(
         NormalizationBinding.Validate();
         UserAutomationScheduleMirror.ReadOwnerSchedule(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
-        NormalizationReceipt.Validate();
     }
 
     /// <summary>
@@ -667,6 +609,16 @@ public sealed record UserAutomationNormalizedSchedule(
 /// set, not an Operator claim about it.
 /// </para>
 /// <para>
+/// <b>Why the C# member on the schedule is named <c>NormalizationBinding</c>
+/// while the JSON name is <c>normalization_receipt</c>.</b>
+/// <c>UserAutomationNormalizedSchedule</c> already exposes a
+/// <c>NormalizationReceipt()</c> METHOD that projects the parsed owner schedule,
+/// and C# forbids a property and a method sharing one name in a type. The JSON
+/// property name is what the wire contract depends on, so it stays exactly
+/// <c>normalization_receipt</c>; only the C# identifier is renamed, and no call
+/// site in another file has to move.
+/// </para>
+/// <para>
 /// Every member below is checked for closed shape ONLY. The two digests are
 /// SHA-256 values over the owner's canonical JSON encoding of an expression
 /// language this surface does not own, and the receipt id is the identity of a
@@ -699,12 +651,6 @@ public sealed record UserAutomationScheduleNormalizationReceipt(
     /// </remarks>
     public void Validate()
     {
-        if (NormalizationReceipt is null)
-        {
-            throw new InvalidOperationException(
-                "schedule.normalization_receipt must be present; the owner requires owner-issued "
-                + "normalization evidence on every normalized revision.");
-        }
         UserAutomationContract.RequireText(ReceiptId, "schedule.normalization_receipt.receipt_id");
         UserAutomationContract.RequireText(
             NormalizerAuthority, "schedule.normalization_receipt.normalizer_authority");
