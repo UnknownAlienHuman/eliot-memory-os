@@ -114,10 +114,13 @@
 //!   consulting this module. What the route gate closes is the consequence: a
 //!   gateway composed for a generation the durable `canonical_store` route does
 //!   not name is refused every read and write, so a rebind to a candidate that
-//!   has no committed cutover cannot serve as a second canonical writer. What it
-//!   does **not** do is stop such a gateway from being constructed; proving
-//!   there is exactly one construction path is `KernelComposition`'s own
-//!   composition-ordering argument, not this module's.
+//!   has no committed cutover cannot serve as a second canonical writer *once a
+//!   cutover exists*. What it does **not** do is stop such a gateway from being
+//!   constructed, and while no cutover has ever been committed for this route
+//!   the durable owner names no active generation at all, so the gate imposes
+//!   nothing and the composition's own ordering argument is still what keeps the
+//!   initial generation the one served. Telling those two apart is the
+//!   composition root's own decision, not this module's.
 //! - A cutover is still *committed* by the Kernel Generation Registry's owner,
 //!   which writes the ORS `CUTOVER_OWNERSHIP` row. This coordinator stages,
 //!   orders and proves the replacement and re-derives its receipt from that
@@ -153,28 +156,29 @@
 //! [`StorageReplacement::rollback_disposition`] is a pure classifier over the
 //! recorded irreversible effects. [`StorageReplacement::request_rollback`]
 //! enforces it, and it does not decide from that ledger alone: it reloads the
-//! ORS-committed cutover ownership row its own receipt names and requires the
-//! row's `migration` decision to name forward repair exactly when the ledger is
-//! non-empty, so the durable record of irreversibility is the authority and the
-//! caller cannot obtain a permitted generation rollback by declining to record
-//! an effect. While no irreversible effect is recorded the generation rollback
-//! is admitted (and the route switch itself is another committed cutover with a
-//! newer epoch, never a local flag flip); once one is recorded the request is
-//! refused as [`KernelServiceError::GenerationFenced`] and only the explicit
-//! forward-repair path follows. A post-cutover irreversible effect is not yet in
-//! the committed row and the ledger does not survive a restart; that residual
-//! gap is stated on [`StorageReplacement::request_rollback`] and named there as
-//! the `I5.14` durable-effect-ledger owner's, because inventing a second durable
-//! store for it here would be a second canonical path beside the one that
-//! already exists.
+//! ORS-committed cutover ownership row its own receipt names, and a row that
+//! already records a forward-repair-required state migration refuses the request
+//! even when the in-process ledger is silent, so the durable record of
+//! irreversibility is the authority and the caller cannot obtain a permitted
+//! generation rollback by declining to record an effect. While no irreversible
+//! effect is recorded the generation rollback is admitted (and the route switch
+//! itself is another committed cutover with a newer epoch, never a local flag
+//! flip); once one is recorded the request is refused as
+//! [`KernelServiceError::GenerationFenced`] and only the explicit forward-repair
+//! path follows. A post-cutover irreversible effect is not yet in the committed
+//! row and the ledger does not survive a restart; that residual gap is stated on
+//! [`StorageReplacement::request_rollback`] and named there as the `I5.14`
+//! durable-effect-ledger owner's, because inventing a second durable store for
+//! it here would be a second canonical path beside the one that already exists.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use eliot_contracts::ResourceGeneration;
 use eliot_ors::{
-    CapabilityRouteScope, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
-    MAX_RECOVERY_PAGE, OrsError, RedbRecoveryStore, StateMigrationDecision,
+    CapabilityRouteScope, CutoverRouteSnapshot, GenerationCutoverOwnership,
+    GenerationCutoverOwnershipReceipt, MAX_RECOVERY_PAGE, OrsError, RedbRecoveryStore,
+    StateMigrationDecision,
 };
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
@@ -233,16 +237,18 @@ pub fn canonical_store_route_scope() -> Result<CapabilityRouteScope, KernelServi
 /// Resolves the store generation that currently owns the pinned
 /// `canonical_store` capability route.
 ///
-/// This is the read side of the `I5.11` stage-8 cutover, and it reads the same
-/// admitted owner the cutover receipt is re-derived from: the durable ORS
-/// `CUTOVER_OWNERSHIP` table through
-/// [`RedbRecoveryStore::latest_committed_cutover_ownership`], whose rows are
-/// already returned in durable operation order with staged candidates excluded.
-/// The last committed row for the pinned route-scope hash therefore names the
-/// generation that owns the route now, and a pre-commit `Armed` candidate can
-/// never be returned. `None` means no committed cutover has ever switched this
-/// route, so the composition's own route is still the active one and this
-/// module imposes nothing.
+/// This is the read side of the `I5.11` stage-8 cutover. It answers through the
+/// *existing* admitted owner rather than a rule of its own: the committed ORS
+/// `CUTOVER_OWNERSHIP` rows are handed to [`CutoverRouteSnapshot::rebuild`], the
+/// same reconstruction the Kernel's own recovery performs
+/// (`bins/eliot-kernel/src/generation_recovery.rs::recover_cutover_routes`), and
+/// the active generation is read back from that snapshot's entry for the pinned
+/// route-scope hash. The strictly newest committed epoch therefore wins, exactly
+/// as `I14.14` requires ("rollback is another cutover with a newer epoch; an old
+/// epoch is never reactivated"), and a pre-commit `Armed` candidate cannot
+/// appear because the listing itself returns committed rows only. `None` means
+/// no committed cutover has ever switched this route, so the composition's own
+/// route is still the active one and this module imposes nothing.
 ///
 /// Every Store read and write is admitted against this answer rather than a
 /// composition-fixed route snapshot. After a committed cutover the incumbent
@@ -261,14 +267,58 @@ pub fn active_canonical_store_generation(
     ors: &RedbRecoveryStore,
 ) -> Result<Option<ResourceGeneration>, KernelServiceError> {
     let scope = canonical_store_route_scope()?;
-    let committed = ors
-        .latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)
-        .map_err(|error| ors_refusal(&error))?;
+    let committed = committed_canonical_store_cutovers(ors, &scope)?;
+    Ok(CutoverRouteSnapshot::rebuild(&committed)
+        .map_err(|error| ors_refusal(&error))?
+        .entry(&scope.route_scope_hash)
+        .map(|entry| entry.active_generation))
+}
+
+/// Committed cutover ownership rows that belong to exactly the pinned
+/// `canonical_store` route scope.
+///
+/// Rows of other capability routes are dropped before the snapshot is rebuilt,
+/// so another module's committed cutover can neither answer this route's
+/// question nor close this gate; the winner rule stays the snapshot's.
+///
+/// An ORS database written before the optional `CUTOVER_OWNERSHIP` table
+/// existed reports the absence through [`OrsError::Storage`] rather than an
+/// empty listing. Absence is a fact about the database, not about a route: the
+/// table is created by the first staged cutover, so an absent one means no
+/// cutover has ever been committed and therefore that no candidate generation
+/// can own this route. This is the same compatibility reading the Kernel's own
+/// recovery boundary makes (`bins/eliot-kernel/src/generation_recovery.rs`),
+/// which notes that ORS exposes the absence only as a typed storage message and
+/// therefore keeps the test at its own boundary; it is repeated here for the
+/// same stated reason and is not a second rule. Any other storage refusal, and
+/// every typed ORS class, still reaches the caller unchanged.
+fn committed_canonical_store_cutovers(
+    ors: &RedbRecoveryStore,
+    scope: &CapabilityRouteScope,
+) -> Result<Vec<GenerationCutoverOwnership>, KernelServiceError> {
+    let committed = match ors.latest_committed_cutover_ownership(MAX_RECOVERY_PAGE) {
+        Ok(committed) => committed,
+        Err(error) if is_absent_cutover_ownership_table(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(ors_refusal(&error)),
+    };
     Ok(committed
-        .iter()
+        .into_iter()
         .filter(|record| record.scope.route_scope_hash == scope.route_scope_hash)
-        .map(|record| record.new_generation)
-        .last())
+        .collect())
+}
+
+/// Whether an ORS refusal is only the absence of the optional cutover
+/// ownership table in a database that predates it.
+///
+/// ORS exposes the absence through its typed storage text and no other class,
+/// so the message is matched exactly. A present table whose contents fail
+/// validation is not this, and stays a refusal.
+fn is_absent_cutover_ownership_table(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::Storage(message)
+            if message.contains("Table 'ors_cutover_ownership_v1' does not exist")
+    )
 }
 
 /// One recorded `I5.10` exchange into the candidate store.
@@ -617,13 +667,11 @@ impl StorageReplacement {
                 reason: "a replacement must select a distinct candidate store generation",
             });
         }
-        let committed = ors
-            .latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)
-            .map_err(|error| ors_refusal(&error))?;
-        if committed.iter().any(|record| {
-            record.scope.route_scope_hash == scope.route_scope_hash
-                && record.new_generation == candidate_generation
-        }) {
+        let committed = committed_canonical_store_cutovers(ors, &scope)?;
+        if committed
+            .iter()
+            .any(|record| record.new_generation == candidate_generation)
+        {
             return Err(KernelServiceError::InvalidField {
                 field: "storage_replacement_candidate_generation",
                 reason: "the candidate generation already owns the canonical_store route through a committed cutover, so the replacement must be resumed from its durable cutover receipt",
@@ -953,9 +1001,9 @@ impl StorageReplacement {
     ///
     /// This is the pure form of the `I5.11` rule; it reads only the recorded
     /// irreversible effects. It is a projection, not the decision:
-    /// [`Self::request_rollback`] additionally requires the durable ORS
-    /// cutover ownership row to agree, so a caller cannot obtain a permitted
-    /// generation rollback by simply declining to record an effect.
+    /// [`Self::request_rollback`] also consults the durable ORS cutover
+    /// ownership row, so a caller cannot obtain a permitted generation rollback
+    /// by simply declining to record an effect.
     #[must_use]
     pub fn rollback_disposition(&self) -> StorageRollbackDisposition {
         if self.irreversible_effects.is_empty() {
@@ -972,19 +1020,22 @@ impl StorageReplacement {
     /// The decision is anchored to a durable record written *before* rollback is
     /// ever offered, not to the caller's own bookkeeping. The ORS-committed
     /// [`GenerationCutoverOwnership`] row this replacement's receipt names is
-    /// reloaded by cutover identity and re-derived; its `migration` decision
-    /// must be [`StateMigrationDecision::ForwardRepairRequired`] exactly when an
-    /// irreversible effect is recorded, and a missing or mismatched row is
-    /// refused rather than treated as an absence of irreversible effect. So a
-    /// generation rollback is admitted only when a durable committed record says
-    /// the state is compatible and the coordinator's ledger agrees with it; and
-    /// the rollback itself is another committed cutover with a newer epoch, never
-    /// a local flag flip.
+    /// reloaded by cutover identity and re-derived, so a rollback can only be
+    /// admitted against the very record the cutover receipt was built from. When
+    /// the coordinator's ledger records no irreversible effect, that durable
+    /// row's `migration` decision is the authority: a row that already names
+    /// [`StateMigrationDecision::ForwardRepairRequired`] refuses the request
+    /// even though the in-process ledger is silent, so a caller cannot obtain a
+    /// permitted generation rollback by declining to record an effect. Any other
+    /// mismatch between the row and the receipt is refused rather than read as
+    /// an absence of irreversible effect.
     ///
     /// Once an irreversible effect is recorded — by the ledger or by the durable
     /// row — the request is refused as a generation rollback with
     /// [`KernelServiceError::GenerationFenced`] and only the forward-repair path
-    /// named by [`Self::rollback_disposition`] follows.
+    /// named by [`Self::rollback_disposition`] follows. The rollback itself, when
+    /// admitted, is another committed cutover with a newer epoch, never a local
+    /// flag flip.
     ///
     /// A post-cutover irreversible effect is the one case this cannot prove: it
     /// is not yet in the committed row, and the `I5.11` documents name no
@@ -1012,12 +1063,10 @@ impl StorageReplacement {
                     field: "storage_replacement_cutover_receipt_binding",
                 });
             }
-            if (record.migration == StateMigrationDecision::ForwardRepairRequired)
-                == self.irreversible_effects.is_empty()
+            if self.irreversible_effects.is_empty()
+                && record.migration == StateMigrationDecision::ForwardRepairRequired
             {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "storage_replacement_migration",
-                });
+                return Err(KernelServiceError::GenerationFenced);
             }
         }
         match self.rollback_disposition() {
