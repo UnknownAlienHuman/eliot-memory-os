@@ -1435,7 +1435,32 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding))
+        self.start_inner(request, sink, Some(outer_binding), None)
+    }
+
+    /// Starts one Kernel child with the exact one-shot standard-input bytes the
+    /// admitted launch carries.
+    ///
+    /// `stdin_payload` is the same material the suspended-launch spec already
+    /// models (`SuspendedLaunchSpec::with_stdin`): it is written to the child's
+    /// standard input and the sole parent writer is closed before the child is
+    /// resumed, so a per-user one-shot adapter receives exactly this line and
+    /// then observes deterministic EOF. It is deliberately NOT part of
+    /// `ProcessRequest` and therefore not part of `invocation_digest`:
+    /// `ProcessRequest` is the Kernel-signed P-03 effect material, and this
+    /// payload is the request content an admitted launcher supplies at the
+    /// P-04 boundary. The broker that mints it binds the exact bytes into its
+    /// own durable launch request digest before the start boundary.
+    ///
+    /// `None` is the default for every other caller: the pipe is created,
+    /// never written, and closed, exactly as before.
+    pub fn start_with_stdin(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        stdin_payload: Option<&[u8]>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(request, sink, None, stdin_payload)
     }
 
     /// Creates one executor around the P-07 authority composition.
@@ -1977,6 +2002,7 @@ impl WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: Option<KernelOuterJobBinding>,
+        stdin_payload: Option<&[u8]>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
         if self.kernel_outer_binding_required && outer_binding.is_none() {
@@ -1989,7 +2015,7 @@ impl WindowsProcessExecutor {
 
         #[cfg(not(windows))]
         {
-            let _ = (request, sink, outer_binding);
+            let _ = (request, sink, outer_binding, stdin_payload);
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
             ));
@@ -2022,6 +2048,10 @@ impl WindowsProcessExecutor {
                 environment,
             )
             .map_err(unavailable)?;
+            let spec = match stdin_payload {
+                None => spec,
+                Some(payload) => spec.with_stdin(payload.to_vec()).map_err(unavailable)?,
+            };
             let active_limit = request
                 .resource_limits()
                 .max_descendants()
@@ -2715,7 +2745,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None)
+        self.start_inner(request, sink, None, None)
     }
 
     async fn inspect(
