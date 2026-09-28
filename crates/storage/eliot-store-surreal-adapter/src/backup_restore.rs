@@ -2343,6 +2343,13 @@ async fn resolve_archive_members(
 ) -> Result<Vec<Option<ResolvedArchiveMember>>, StoreError> {
     let mut resolved = Vec::with_capacity(batch.members.len());
     for (index, member) in batch.members.iter().enumerate() {
+        // A reference edge names a canonical object; it is not one. Resolving it
+        // to a payload of its own would let the import mint a destination record
+        // for an edge, so no carrier row is read for it.
+        if member.member_type == SnapshotMemberType::Reference {
+            resolved.push(None);
+            continue;
+        }
         let Some(carrier) = read_archive_member(transport, config, batch, member).await? else {
             resolved.push(None);
             continue;
@@ -3610,8 +3617,11 @@ impl SurrealStoreAdapter {
         let imports: Vec<&ResolvedArchiveMember> = if scope_disposition
             == MemberDisposition::Restored
         {
-            let imports: Vec<&ResolvedArchiveMember> =
-                resolved.iter().filter_map(Option::as_ref).collect();
+            let imports: Vec<&ResolvedArchiveMember> = resolved
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|import| import.member.member_type != SnapshotMemberType::Reference)
+                .collect();
             // Each resolved payload must still be the batch member it was
             // resolved for. Resolution is positional, so this re-proves the
             // binding rather than assuming it: a payload that is not equal to
@@ -3644,13 +3654,23 @@ impl SurrealStoreAdapter {
             .members
             .iter()
             .enumerate()
-            .map(|(index, _)| match scope_disposition {
+            .map(|(index, member)| match scope_disposition {
                 MemberDisposition::Suppressed => MemberDisposition::Suppressed,
                 MemberDisposition::Unresolved => MemberDisposition::Unresolved,
-                MemberDisposition::Restored => match resolved.get(index) {
-                    Some(Some(_)) => MemberDisposition::Restored,
-                    _ => MemberDisposition::Unresolved,
-                },
+                // A reference edge is never a record the import can write, so it
+                // is rejected as a row, not left unresolved. Its closure was
+                // already proved against the resolved payloads above.
+                MemberDisposition::Restored => {
+                    if member.member_type == SnapshotMemberType::Reference {
+                        MemberDisposition::Rejected
+                    } else {
+                        match resolved.get(index) {
+                            Some(Some(_)) => MemberDisposition::Restored,
+                            _ => MemberDisposition::Unresolved,
+                        }
+                    }
+                }
+                MemberDisposition::Rejected => MemberDisposition::Rejected,
             })
             .collect();
         let denominator = denominator_of(&dispositions);
