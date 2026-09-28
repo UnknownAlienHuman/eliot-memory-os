@@ -20,8 +20,8 @@
 //!   never derived from `Debug` formatting.
 
 use eliot_contracts::{
-    CapabilityCellRegistry, EXPECTED_NORMATIVE_PAIR_KEY, ProductPulse, ProofCeiling,
-    RegistryDiagnostic, RegistryValidationError,
+    CapabilityCellRegistry, CapsuleDisposition, EXPECTED_NORMATIVE_PAIR_KEY, ProductPulse,
+    ProofCeiling, RegistryDiagnostic, RegistryValidationError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,14 @@ pub struct GenerationCellResolution {
     pub not_applicable_reason: Option<String>,
     /// Freshness binding: digest of the exact registry value read.
     pub registry_digest: String,
+    /// Supported-execution disposition from the bound record's executable
+    /// capsule binding (issue #1804), in stable wire spelling. `None` on
+    /// records emitted before the binding existed.
+    pub capsule_disposition: Option<String>,
+    /// Digest of the bound executable capsule revision. Present exactly for
+    /// executable dispositions; `None` otherwise or when the record carries
+    /// no binding.
+    pub capsule_digest: Option<String>,
 }
 
 /// Fail-closed readback failure. Any variant refuses the resolution instead
@@ -136,6 +144,16 @@ fn proof_ceiling_name(ceiling: ProofCeiling) -> &'static str {
     }
 }
 
+fn capsule_disposition_name(disposition: CapsuleDisposition) -> &'static str {
+    match disposition {
+        CapsuleDisposition::Production => "PRODUCTION",
+        CapsuleDisposition::ExternallyScheduled => "EXTERNALLY_SCHEDULED",
+        CapsuleDisposition::TestToolingOnly => "TEST_TOOLING_ONLY",
+        CapsuleDisposition::Excluded => "EXCLUDED",
+        CapsuleDisposition::Unresolved => "UNRESOLVED",
+    }
+}
+
 /// Resolves one installed process generation to its capability cell,
 /// contract digest, proof entrypoint, and Product Pulse via the registry.
 ///
@@ -207,6 +225,16 @@ pub fn resolve_generation_via_registry(
             .map_err(|error| CellReadbackError::DigestFailed {
                 detail: error.to_string(),
             })?;
+    let (capsule_disposition, capsule_digest) = match &record.executable_capsule {
+        Some(binding) => (
+            Some(capsule_disposition_name(binding.disposition).to_owned()),
+            binding
+                .capsule_digest
+                .as_ref()
+                .map(|digest| digest.as_str().to_owned()),
+        ),
+        None => (None, None),
+    };
     Ok(GenerationCellResolution {
         generation: generation.to_owned(),
         cell: record.cell.as_str().to_owned(),
@@ -218,5 +246,7 @@ pub fn resolve_generation_via_registry(
         product_pulse,
         not_applicable_reason,
         registry_digest,
+        capsule_disposition,
+        capsule_digest,
     })
 }
