@@ -1472,14 +1472,16 @@ pub struct WorkClassSelectionReport {
     pub infeasible_items: usize,
 }
 
-/// Published claim state of one deliverable (mutation scope) that currently
-/// holds admitted work.
+/// Published claim state of one deliverable (mutation scope) that currently has
+/// a live writer.
 ///
 /// This is published state for the caller, not a gate: the one-writer property
 /// is enforced at the owning transition (`plan`, `admit`, `reassign`) on the
 /// Work/Action lease identity, so a second concurrent holder of one scope is
-/// rejected there and `ready_items` above one is unreachable. What this
-/// publishes is the identity and state of the current holder.
+/// rejected there. What this record answers is which attempt holds the
+/// deliverable and in what state, which is what tells a caller why the scope is
+/// not available. There is deliberately no count of waiting items: a second
+/// holder is rejected on admission, so such a count could only ever be one.
 ///
 /// `writer_holders` is rebuilt by replaying this coordinator's own admissions,
 /// so the exclusion it reflects holds only within one snapshot lineage; it is
@@ -1488,11 +1490,12 @@ pub struct WorkClassSelectionReport {
 #[serde(deny_unknown_fields)]
 pub struct DeliverableClaim {
     pub mutation_scope: String,
-    pub holder_attempt_id: Option<AttemptId>,
-    pub holder_state: Option<CoordinatedAttemptState>,
-    /// Admitted items declaring this scope, including the holder. Always one
-    /// today, because the owning transition rejects a second holder.
-    pub ready_items: usize,
+    /// Always present: a claim is only published for a scope that has a holder.
+    pub holder_attempt_id: AttemptId,
+    /// The holder's state: `Admitted`, `Running` or `CancellationRequested`. A
+    /// terminal holder releases the scope in the same transition that makes it
+    /// terminal, so no terminal state appears here.
+    pub holder_state: CoordinatedAttemptState,
 }
 
 /// Exact outcome of one fair pull (issue #1683 W7).

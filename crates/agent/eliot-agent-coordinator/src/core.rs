@@ -351,12 +351,20 @@ impl ClassPullView<'_> {
 /// Why one admitted item could not be offered by a pull, with the exact
 /// observed value and limit of the capacity dimension that closed it.
 ///
-/// `dimension` is `None` for a block that is not a capacity closure: a deadline
+/// `closure` is `None` for a block that is not a capacity closure: a deadline
 /// ceiling mismatch is a property of the item, not of a saturated class, so it
 /// publishes no capacity deferral.
 struct ItemBlock {
     reason: ReadyItemSkipReason,
-    dimension: Option<CapacityLimitDimension>,
+    /// Present only when a capacity dimension is what closed the item. There is
+    /// no placeholder value: a deadline mismatch has no observed/limit pair to
+    /// report and therefore carries none.
+    closure: Option<CapacityClosure>,
+}
+
+/// The exact capacity measurement behind one refusal.
+struct CapacityClosure {
+    dimension: CapacityLimitDimension,
     observed: u64,
     limit: u64,
 }
@@ -365,9 +373,7 @@ impl ItemBlock {
     const fn unclosed(reason: ReadyItemSkipReason) -> Self {
         Self {
             reason,
-            dimension: None,
-            observed: 0,
-            limit: 0,
+            closure: None,
         }
     }
 
@@ -379,9 +385,11 @@ impl ItemBlock {
     ) -> Self {
         Self {
             reason,
-            dimension: Some(dimension),
-            observed,
-            limit,
+            closure: Some(CapacityClosure {
+                dimension,
+                observed,
+                limit,
+            }),
         }
     }
 }
@@ -504,19 +512,21 @@ fn offer_class_head(
         if block.reason == ReadyItemSkipReason::ClassDeadlineCeiling {
             view.infeasible += 1;
         }
-        if view.capacity_closure.is_none() && block.dimension.is_some() {
+        if view.capacity_closure.is_none() && block.closure.is_some() {
             view.capacity_closure = Some(block);
         }
     }
     view.skip_reason = Some(ClassSkipReason::AllReadyItemsSkipped);
-    if let Some(block) = &view.capacity_closure
-        && let Some(dimension) = block.dimension
+    if let Some(closure) = view
+        .capacity_closure
+        .as_ref()
+        .and_then(|block| block.closure.as_ref())
     {
         view.deferral = Some(CapacityDeferral::new(
             work_class,
-            dimension,
-            block.observed,
-            block.limit,
+            closure.dimension,
+            closure.observed,
+            closure.limit,
             reset_source,
         ));
     }
@@ -622,34 +632,27 @@ fn choose_fair_head<'a, 'profile>(
     (views[winner].head, virtual_time, credits)
 }
 
-/// Published claim state of every deliverable that currently holds admitted
-/// work.
+/// Published claim state of every deliverable that currently has a live writer.
+///
+/// Reads `writer_holders`, the structure that actually enforces one writer per
+/// deliverable, rather than re-deriving holders from the attempt list. An entry
+/// whose attempt record is absent is skipped: the holder and its record are
+/// written together, so the pair cannot diverge.
 fn deliverable_claims(
     attempts: &BTreeMap<AttemptId, AttemptRecord>,
     writer_holders: &BTreeMap<String, AttemptId>,
 ) -> Vec<DeliverableClaim> {
-    let mut claims: BTreeMap<String, DeliverableClaim> = BTreeMap::new();
-    for attempt in attempts.values() {
-        let Some(scope) = &attempt.mutation_scope else {
-            continue;
-        };
-        if attempt.state != CoordinatedAttemptState::Admitted {
-            continue;
-        }
-        let holder = writer_holders.get(scope);
-        let claim = claims
-            .entry(scope.clone())
-            .or_insert_with(|| DeliverableClaim {
+    writer_holders
+        .iter()
+        .filter_map(|(scope, attempt_id)| {
+            let holder = attempts.get(attempt_id)?;
+            Some(DeliverableClaim {
                 mutation_scope: scope.clone(),
-                holder_attempt_id: holder.cloned(),
-                holder_state: holder
-                    .and_then(|attempt_id| attempts.get(attempt_id))
-                    .map(|holder| holder.state),
-                ready_items: 0,
-            });
-        claim.ready_items = claim.ready_items.saturating_add(1);
-    }
-    claims.into_values().collect()
+                holder_attempt_id: attempt_id.clone(),
+                holder_state: holder.state,
+            })
+        })
+        .collect()
 }
 
 /// Deterministic A-02 execution projection. It owns no provider admission,
