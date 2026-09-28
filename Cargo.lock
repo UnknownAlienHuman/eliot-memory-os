@@ -1962,6 +1962,7 @@ dependencies = [
  "eliot-cue-index",
  "eliot-diagnostic",
  "eliot-doctor-core",
+ "eliot-dreamer-failure",
  "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evaluation-contracts",

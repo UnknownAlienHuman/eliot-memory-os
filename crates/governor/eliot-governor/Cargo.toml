@@ -20,6 +20,14 @@ eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts", version = "0.1
 eliot-cue-index = { path = "../../smart/eliot-cue-index", version = "0.1.0" }
 eliot-doctor-core.workspace = true
 eliot-diagnostic = { path = "../../instrument/eliot-diagnostic", version = "0.1.0" }
+# Issue #1731 W3/W4: the Governor is the semantic owner that admits a
+# negative-memory action policy and that runs the bounded pure matcher over an
+# owner-resolved rule snapshot. This crate owns neither the durable record
+# (`NegativeMemoryFingerprint`, `NegativeMemoryActionPolicy`) nor the matcher
+# (`match_negative_memory`); it is not a runtime root, so this Smart edge is
+# the same provider direction the existing `eliot-epistemic*` / `eliot-cue-*`
+# edges use. Kernel does not depend on it and never will (AGENTS.md 56-58).
+eliot-dreamer-failure = { path = "../../smart/eliot-dreamer-failure", version = "0.1.0" }
 eliot-instrument-nextest = { path = "../../instrument/eliot-instrument-nextest", version = "0.1.0" }
 eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
