@@ -242,7 +242,7 @@ pub fn canonical_store_route_scope() -> Result<CapabilityRouteScope, KernelServi
 /// *existing* admitted owner rather than a rule of its own: the committed ORS
 /// `CUTOVER_OWNERSHIP` rows are handed to [`CutoverRouteSnapshot::rebuild`], the
 /// same reconstruction the Kernel's own recovery performs
-/// (`bins/eliot-kernel/src/generation_recovery.rs::recover_cutover_routes`), and
+/// (`bins/eliot-kernel/src/generation_recovery.rs::recover_cutover_ownership`), and
 /// the active generation is read back from that snapshot's entry for the pinned
 /// route-scope hash. The strictly newest committed epoch therefore wins, exactly
 /// as `I14.14` requires ("rollback is another cutover with a newer epoch; an old
