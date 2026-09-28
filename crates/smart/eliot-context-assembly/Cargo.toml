@@ -24,6 +24,10 @@ agent_order = 18
 eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
 eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
 eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+# Sole #704 measurement owner. Assembly names it as a declared provider so a
+# route composes the canonical `measure_exact_utf8` callback instead of
+# hand-rolling a local byte/3 fallback or a fabricated tokenizer observation.
+eliot-context-measurement = { path = "../eliot-context-measurement", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 

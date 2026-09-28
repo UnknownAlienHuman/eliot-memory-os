@@ -1,13 +1,15 @@
 //! Canonical rendered payload bytes and measurement closure.
 
 use eliot_context_contracts::{
-    ActiveUnderstandingView, CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding,
-    ContextError, MeasurementStatus, RenderedAtom, SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, CONTEXT_CONTRACT_VERSION, CapacityLimits,
+    ContextBinding, ContextError, ContextRecipe, MeasurementStatus, QualityScorecard, RenderedAtom,
+    SerializedContextMeasurement,
 };
+use eliot_context_measurement::{MeasurementParams, measure_exact_utf8};
 use eliot_contracts::{ContractVersion, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 
-use crate::AssemblyError;
+use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view};
 
 #[derive(Serialize)]
 struct CanonicalRenderedPayload<'a> {
@@ -87,6 +89,32 @@ pub(crate) fn verify(
         return Err(AssemblyError::Contract(ContextError::CapacityExceeded));
     }
     Ok(measurement)
+}
+
+/// Assemble one admitted set by invoking the sole #704 measurement owner.
+///
+/// This is the declared consumer edge from `eliot-context-measurement` to
+/// this crate: it is the composition that forms the canonical
+/// `|bytes| measure_exact_utf8(bytes, &params)` callback, so a route no
+/// longer supplies a hand-rolled byte/3 fallback or a fabricated tokenizer
+/// observation. Every load-bearing value stays caller-owned and arrives
+/// through `params`; nothing here synthesizes an identity, digest, capacity
+/// number, revision or timestamp.
+///
+/// Assembly itself is unchanged: the returned measurement is still bound to
+/// the canonical rendered payload by this module's `verify`, and a
+/// `ContextError` from the owner stays typed as [`AssemblyError::Contract`]
+/// rather than being collapsed into a string or a generic code.
+pub fn assemble_active_view_with_measurement(
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+    quality: QualityScorecard,
+    policy: &AssemblyPolicy,
+    params: &MeasurementParams,
+) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
+    assemble_active_view(admitted, recipe, quality, policy, |bytes| {
+        measure_exact_utf8(bytes, params)
+    })
 }
 
 pub(crate) fn canonical_matches(

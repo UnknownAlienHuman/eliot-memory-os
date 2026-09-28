@@ -1151,6 +1151,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
  "eliot-context-contracts",
+ "eliot-context-measurement",
  "eliot-contracts",
  "eliot-evidence",
  "eliot-governor",
