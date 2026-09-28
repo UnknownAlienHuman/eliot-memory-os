@@ -1397,6 +1397,21 @@ fn same_ordering_scopes(retained: &[String], presented: &[String]) -> bool {
 /// either way; this check rewrites no operation or fence data to today's
 /// epoch.
 ///
+/// `Reconcile` is exempt, and that exemption is the contract's own, not a
+/// local relaxation. [`DurableJobRequest::validate`] applies exactly the
+/// same two arms: for a `Reconcile` it requires the mutation's operation and
+/// canonical request hash to equal the identity's, and for every other kind
+/// it recomputes the digest. A reconciler legitimately presents the ORIGINAL
+/// operation's contract digest, not a digest of its own envelope, so
+/// recomputing over the reconcile payload would refuse every valid
+/// reconciliation and accuse it of caller spelling when it is carrying the
+/// owning contract's own value. This function mirrors the contract's arms
+/// rather than introducing a second rule, so a request the protocol accepts
+/// is never refused here for the hash alone. For a non-`Reconcile` request
+/// the returned value is the contract-recomputed digest; for `Reconcile` it
+/// is the identity's own hash, which the contract has already proven equals
+/// the mutation's.
+///
 /// # Errors
 ///
 /// Returns [`CommitRecoveryError::CommitRefused`] when the request's own
@@ -1406,6 +1421,14 @@ pub(crate) fn verify_dreamer_canonical_request_hash(
     request: &DurableJobRequest,
 ) -> Result<String, CommitRecoveryError> {
     let identity = &request.request_identity;
+    if let eliot_protocol::dreamer_job::JobOperation::Reconcile { mutation } = &request.operation {
+        // The reconciler carries the original operation's digest by contract.
+        // `DurableJobRequest::validate` has already proven it equals the
+        // mutation's own hash, so it is a contract-derived value, not caller
+        // spelling, and it is exactly the value a retained record for the
+        // original operation is bound to.
+        return Ok(mutation.canonical_request_hash.clone());
+    }
     let recomputed = DurableRequestIdentity::digest_for(
         &identity.operation,
         &identity.request,

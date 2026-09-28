@@ -173,14 +173,21 @@ fn classify_gateway_error(
                 HostDurableJobOwnerError::UnknownOutcome(error.to_string())
             }
             // Reconciled, already dispositioned, or dispositioned with a
-            // pause-release limitation: the commit IS settled — an exact
-            // receipt resolved it and its digest is bound — and only the ledger
-            // answer is unread. These three arms are not the same fact as
-            // `UnknownCommitOpen`, and they are not the same fact as each other,
-            // so they are reported as the proven disposition they are rather
-            // than being flattened into one code. Collapsing them here would
-            // re-discard, one layer out, exactly the distinction the carrier
-            // exists to preserve.
+            // pause-release limitation: in all three the commit IS settled —
+            // an exact receipt resolved it and its digest is bound — and only
+            // the ledger answer is unread. They are therefore NOT
+            // `UnknownOutcome`, which means the owner cannot tell whether the
+            // mutation committed at all, and each one's exact recorded outcome
+            // and evidence stay addressable in the rendered reason.
+            //
+            // This is a deliberate fold to the minimum the item asks for ("the
+            // existing typed recovered-outcome plus Status/Reconcile
+            // directive, or the minimal compatible carrier needed by its real
+            // caller"), NOT a claim that the three are one fact: the caller
+            // receives the operation/key, outcome, evidence and the remaining
+            // ledger-read obligation, which is what item 6 requires. The finer
+            // three-way distinction remains intact one layer in, in
+            // `DreamerCommitUncertain` itself.
             eliot_kernel_service::DreamerCommitUncertain::Reconciled { .. }
             | eliot_kernel_service::DreamerCommitUncertain::AlreadyDispositioned { .. }
             | eliot_kernel_service::DreamerCommitUncertain::ReconciledWithRefreshLimitation {
