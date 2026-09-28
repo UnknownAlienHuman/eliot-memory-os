@@ -5258,17 +5258,23 @@ impl KernelStoreGateway {
     /// Refuses any Store read or write unless this gateway's generation is the
     /// durable `canonical_store` route's active generation.
     ///
-    /// This is the `I5.11` stage-10 read-only window enforced from the Kernel
+    /// This is the `I5.11` stage-10 rollback window enforced from the Kernel
     /// side. `self.route` is a composition-fixed snapshot of the generation this
     /// gateway was built for, so before this gate a completed stage-8 cutover
-    /// changed nothing here: the incumbent kept serving reads and writes and
-    /// the candidate could not serve either. Resolving the active generation
-    /// from the durable cutover ownership table instead makes the governed
-    /// Store path follow the route, so the moment a cutover is committed the
-    /// incumbent is no longer the active generation and every Store operation
-    /// reaching this gateway — fenced or unfenced, direct or through the
-    /// borrowed client — is refused, leaving the old store readable only by its
-    /// own read-only retention for the rollback window.
+    /// changed nothing here: the incumbent kept serving reads and writes and the
+    /// candidate could not serve either. Resolving the active generation from
+    /// the durable cutover ownership table instead makes the governed Store path
+    /// follow the route, so from the commit onward the incumbent generation is
+    /// not the active one and every Store operation reaching this gateway —
+    /// fenced or unfenced, direct or through the borrowed client — is refused.
+    ///
+    /// `I5.11` says "keep old store read-only for rollback window" and names no
+    /// mechanism, and nothing in this process can fence another process's reader
+    /// of the retired store. The reading implemented here is the strictest one
+    /// the Kernel can enforce on its own path: from the cutover onward the
+    /// incumbent generation is admitted by nobody, and `I14.14`'s "rollback is
+    /// another cutover with a newer epoch" is the only way it is served again —
+    /// which is exactly what the window exists to make possible.
     fn require_active_store_generation(&self) -> Result<(), StoreError> {
         let Some(active) = self.active_store_generation()? else {
             return Ok(());

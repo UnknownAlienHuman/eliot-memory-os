@@ -102,7 +102,8 @@
 //!   this gateway's generation *is* the durable route's active generation. A
 //!   gateway for a non-active generation can therefore be built and retained by
 //!   any composition path, but it is not a writer or a reader of the canonical
-//!   store, so the incumbent stays read-only for the `I5.11` stage-10 window.
+//!   store, so the incumbent is served by nobody while the `I5.11` stage-10
+//!   window is open, and only another committed cutover can serve it again.
 //!
 //! **Not** established by this module, and stated here so no reader mistakes
 //! this file for a safety net it is not:
