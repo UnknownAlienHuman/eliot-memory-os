@@ -3890,6 +3890,11 @@ impl BootstrapSnapshot {
                 ..
             } if task_ref.as_str() == binding.task_binding().task_id().as_str()
                 && task_revision.to_string() == binding.task_binding().task_revision() => Ok(()),
+            eliot_workscope::TaskBindingState::None_
+            | eliot_workscope::TaskBindingState::Ambiguous { .. } => Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_SELECTION_REQUIRED",
+                detail: "compiled owner surface has no unique task binding for the live attach; refusing to store an unusable bootstrap".to_owned(),
+            }),
             _ => Err(mismatch()),
         }
     }
@@ -4471,8 +4476,9 @@ impl BridgeRunner {
     /// producer, validate a stored receipt digest, or bind separately supplied
     /// coverage/governance snapshots to the surface's opaque profile refs;
     /// those facts remain dependent on the live authenticated #8 producer.
-    /// A no-task or ambiguous diagnostic surface can be retained while
-    /// detached, but cannot be matched to the concrete task in a live attach.
+    /// A no-task or ambiguous surface cannot be delivered through this
+    /// attach-bound route: it needs an authenticated preselection transport
+    /// before a snapshot can be retained or served.
     ///
     /// # Live status
     ///
@@ -4508,6 +4514,13 @@ impl BridgeRunner {
         next_safe_expansion: String,
     ) -> Result<(), BootstrapError> {
         validate_task_inputs_match_surface(surface, &tasks)?;
+        let Some(binding) = self.attach_view().map(|view| view.binding().clone()) else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_ATTACH_REQUIRED",
+                detail: "compiled owner surface requires a live authenticated attach before it can be retained for retrieval".to_owned(),
+            });
+        };
+        BootstrapSnapshot::owner_surface_matches_binding(surface, &binding)?;
         let governance = GovernanceEvidence::from_owner_profiles(coverage, governance_profile)?;
         let context = BootstrapContext::from_compiled_surface(
             surface,
@@ -4530,9 +4543,6 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
-        if let Some(binding) = self.attach_view().map(|view| view.binding().clone()) {
-            BootstrapSnapshot::owner_surface_matches_binding(surface, &binding)?;
-        }
         self.note_owner_snapshot(context, tasks)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
