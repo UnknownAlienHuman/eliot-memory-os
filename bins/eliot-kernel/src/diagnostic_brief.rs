@@ -1153,3 +1153,93 @@ fn observation_gaps(
     }
     gaps
 }
+
+/// Caller-declared maximum canonical audit records one brief may read.
+///
+/// I16.7 names no window cap and the compiler takes its bound from the
+/// caller, so this production caller declares one: the trigger record plus
+/// its bounded predecessors. The causal timeline stays small however long
+/// the retained chain grows (I16.9: telemetry costs what it observes),
+/// while still covering recurrence, repair, and generation-change evidence.
+const DIAGNOSTIC_BRIEF_WINDOW_LEN: u64 = 32;
+
+impl crate::KernelComposition {
+    /// Compiles and retains one Diagnostic Brief for an observed problem
+    /// trigger (issue #1844; I16.7).
+    ///
+    /// This is the single trigger registration: the canonical
+    /// problem/failure/no-progress owners call it after appending their
+    /// trigger record (lease expiry, daemon degraded/failed, launch
+    /// failure, stale quarantine, orphan fencing). The bounded audit
+    /// window comes from the existing evidence owner
+    /// ([`crate::KernelComposition::audit_chain_records`]); no second
+    /// evidence store is read and no rolling log content is copied.
+    ///
+    /// No bounded operational-log capture owner exists
+    /// (`kernel_diagnostics` emits to `tracing`/stderr and keeps no
+    /// queryable stream), so no log window can honestly be supplied: the
+    /// problem carries none and the brief reports the specified
+    /// [`ObservationGapCode::LogWindowAbsent`] gap with its requested
+    /// observation instead of inventing one (I16.7, I16.9).
+    ///
+    /// Best-effort like every observation: `None` when the chain is
+    /// unreadable, when no record of the trigger class exists (the two
+    /// classes without a canonical event never match), or when the
+    /// compiler refuses the evidence. A refusal retains nothing and
+    /// disturbs no previously retained brief; the trigger record itself
+    /// is already durable evidence.
+    pub(crate) fn observe_diagnostic_problem(
+        &self,
+        trigger: DiagnosticTrigger,
+    ) -> Option<DiagnosticBrief> {
+        let records = self.audit_chain_records().ok()?;
+        let trigger_seq = records
+            .iter()
+            .rev()
+            .find(|record| DiagnosticTrigger::from_audit_kind(&record.kind) == Some(trigger))?
+            .seq;
+        let problem = DiagnosticProblem {
+            trigger,
+            window: DiagnosticWindow {
+                first_audit_seq: trigger_seq
+                    .saturating_sub(DIAGNOSTIC_BRIEF_WINDOW_LEN - 1)
+                    .max(1),
+                last_audit_seq: trigger_seq,
+            },
+            log_windows: Vec::new(),
+        };
+        let brief = compile_diagnostic_brief(&records, &problem).ok()?;
+        self.diagnostic_brief.lock().ok()?.replace(brief.clone());
+        Some(brief)
+    }
+
+    /// Returns the retained brief while its State Fence still authorizes it.
+    ///
+    /// The brief is retained under its invalidation condition (I16.7): a
+    /// superseding authority epoch, an advanced audit head, or an
+    /// unretained log window drops it and reads `None`, so a stale brief
+    /// is never served as current. Log-window retention is vacuously true
+    /// here because this wiring retains no log windows to lose (see
+    /// [`Self::observe_diagnostic_problem`]). An unreadable policy or
+    /// audit head fails closed to `None` without dropping the retained
+    /// brief; only an observed invalidation clears it, and only when the
+    /// slot still holds that same brief.
+    pub(crate) fn retained_diagnostic_brief(&self) -> Option<DiagnosticBrief> {
+        let retained = self.diagnostic_brief.lock().ok()?.clone()?;
+        let current = self.current_state_fence()?;
+        let (head_seq, _) = self.audit_head()?;
+        if retained
+            .fence
+            .observe_invalidation(&current, head_seq, true)
+            .is_some()
+        {
+            if let Ok(mut slot) = self.diagnostic_brief.lock()
+                && slot.as_ref() == Some(&retained)
+            {
+                slot.take();
+            }
+            return None;
+        }
+        Some(retained)
+    }
+}

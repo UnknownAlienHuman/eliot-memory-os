@@ -52,6 +52,7 @@
 //! ticket, parent, or operation is `UnknownRequest`; an elapsed absolute
 //! deadline is `Timeout`. No error prose drives routing.
 
+use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::AuditEventDraft;
 use super::trace_manifest::TraceManifest;
 use super::{
@@ -1459,7 +1460,11 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::orphan_connection_fenced(
             connection_id,
             outstanding.len(),
+            self.current_state_fence().as_ref(),
         ));
+        // Issue #1844: an orphan fencing is a security/integration gap;
+        // compile its brief.
+        self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
     }
 
     /// Verifies the envelope arrives on a currently retained bridge
@@ -2630,6 +2635,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::OwnerMismatch.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2658,6 +2666,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::Superseded.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2679,6 +2690,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Superseded.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2699,6 +2713,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Unclaimed.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -3585,6 +3602,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::OwnerMismatch.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -3609,6 +3629,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::Superseded.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -3630,6 +3653,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Superseded.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -3650,6 +3676,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Unclaimed.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),

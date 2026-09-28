@@ -729,6 +729,14 @@ pub struct KernelComposition {
     /// acquires no other Kernel lock. Opened once at assembly over the
     /// audit-spool directory; failed appends retain through it.
     pub(crate) audit_fallback: Mutex<KernelAuditFallback>,
+    /// The latest retained Diagnostic Brief (issue #1844; I16.7).
+    /// Leaf lock: problem owners retain through
+    /// [`KernelComposition::observe_diagnostic_problem`] and the health
+    /// view reads through [`KernelComposition::retained_diagnostic_brief`];
+    /// neither path holds this lock while acquiring another Kernel lock.
+    /// Process-local only, never canonical state: the brief carries
+    /// references, never rolling log content (I16.7).
+    pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
 }
 
 impl KernelComposition {

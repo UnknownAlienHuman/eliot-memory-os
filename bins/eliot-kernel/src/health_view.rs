@@ -398,6 +398,28 @@ impl KernelComposition {
         })
     }
 
+    /// Projects the latest retained Diagnostic Brief (issue #1844; I16.7).
+    ///
+    /// View-only: serves the brief the problem owners retained while its
+    /// State Fence still authorizes it, else `unknown` — a missing or
+    /// invalidated brief never reads as a healthy system (I16.11). The
+    /// brief carries exact references, explicit gaps, and one next step
+    /// under its fence and invalidation condition (I16.14); it never
+    /// carries rolling log content or an assigned cause (I16.7). Consumed
+    /// by future health dispatch wiring like
+    /// [`Self::daemon_route_metrics_projection`]; the dispatch wiring
+    /// itself is owned there.
+    #[must_use]
+    pub fn diagnostic_brief_projection(&self) -> serde_json::Value {
+        if let Some(brief) = self.retained_diagnostic_brief() {
+            observe_health("kernel.health.diagnostic_brief_projected", "success");
+            serde_json::to_value(&brief).unwrap_or(serde_json::json!({"status": "unknown"}))
+        } else {
+            observe_health("kernel.health.diagnostic_brief_projected", "unknown");
+            serde_json::json!({"status": "unknown"})
+        }
+    }
+
     /// Projects the restricted Recovery View for surviving Host/Watchdog
     /// interactions while the Kernel is unavailable (I1.13).
     ///
