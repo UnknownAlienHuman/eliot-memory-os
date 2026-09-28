@@ -22,15 +22,18 @@
 
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::user_automation::{
-    AutomationExecutionReference, UserAutomationConfigurationState, UserAutomationDeferReason,
+    AutomationExecutionReference, AutomationOccurrenceIdentity, DstFoldPolicy, DstGapPolicy,
+    ScheduleKind, UserAutomationConfigurationState, UserAutomationDeferReason,
+    UserAutomationTrigger,
 };
-use eliot_store_api::{OperationIdentity, WriteReceipt};
+use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use super::user_automation::{
-    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationStoreOutcome,
+    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationServiceRequest,
+    UserAutomationStoreOutcome,
 };
 use super::user_automation_execution::{
     UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
@@ -51,6 +54,628 @@ use super::user_automation_orchestration::{
 pub const USER_AUTOMATION_TRANSITION_WIRE_ID: &str = "eliot.kernel.user-automation.transition";
 /// Current semantic revision of the post-commit orchestration transition.
 pub const USER_AUTOMATION_TRANSITION_WIRE_VERSION: u16 = 1;
+
+/// Stable public identity of one Operator result envelope.
+pub const USER_AUTOMATION_RESULT_WIRE_ID: &str = "eliot.kernel.user-automation.operator-result";
+/// Current version of the result envelope and its closed payload union.
+pub const USER_AUTOMATION_RESULT_WIRE_VERSION: u16 = 1;
+
+/// The submitted operation correlation echoed beside every UserAutomation
+/// result. This is distinct from the JSON-RPC transport identifier, which the
+/// current Operator client does not expose.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationResultCorrelation {
+    /// Semantic operation identity derived from the submitted idempotency key.
+    pub operation_id: String,
+    /// Exact retry key present in the submitted Operator request.
+    pub idempotency_key: String,
+}
+
+/// Disposition of a versioned UserAutomation Operator result.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserAutomationOperatorResultStatus {
+    /// Every required owner phase is settled.
+    Known,
+    /// At least one owner phase needs reconciliation or is unavailable.
+    Unknown,
+}
+
+/// Recovery obligation in the public result envelope.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum UserAutomationOperatorResultRecovery {
+    /// A required owner is not currently reachable.
+    Unavailable { reason: String },
+    /// A required owner may have acted and must be reconciled.
+    UnknownOutcome { reason: String },
+    /// Commit is proven; only the ledger readback remains owed.
+    LedgerReadOwed { reason: String },
+}
+
+/// Result value committed to one operation and one current State Fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum UserAutomationOperatorResultValue {
+    /// Full canonical transition plus its deterministic inspection projection.
+    Transition(UserAutomationOperatorTransitionValue),
+    /// Typed refusal before the canonical Store was called.
+    AttemptRefusal(UserAutomationAttemptRefusalValue),
+    /// Proven absence in an owner readback.
+    NotRetained(UserAutomationNotRetainedValue),
+    /// The owner could not be reached.
+    Unavailable(UserAutomationUnavailableValue),
+    /// The owner answer may have been lost after an effect.
+    UnknownOutcome(UserAutomationUnknownOutcomeValue),
+    /// A commit is proven while a separate ledger read remains owed.
+    OutcomeSettled(UserAutomationOutcomeSettledValue),
+    /// The owner refused the attempt before Store.
+    Rejected(UserAutomationRejectedValue),
+    /// The operation or current fence did not match the authenticated request.
+    IdentityConflict(UserAutomationIdentityConflictValue),
+}
+
+impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("UserAutomation result value is not an object"))?;
+        if object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("user_automation_refusal")
+        {
+            return serde_json::from_value(value)
+                .map(Self::AttemptRefusal)
+                .map_err(D::Error::custom);
+        }
+
+        let variant = match object.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("not_retained") => "not_retained",
+            Some("unavailable") => "unavailable",
+            Some("unknown_outcome") => "unknown_outcome",
+            Some("outcome_settled") => "outcome_settled",
+            Some("rejected") => "rejected",
+            Some("identity_conflict") => "identity_conflict",
+            _ if object.contains_key("transition") => "transition",
+            _ => {
+                return Err(D::Error::custom(
+                    "UserAutomation result value has no supported discriminator",
+                ));
+            }
+        };
+
+        match variant {
+            "transition" => serde_json::from_value(value)
+                .map(Self::Transition)
+                .map_err(D::Error::custom),
+            "not_retained" => serde_json::from_value(value)
+                .map(Self::NotRetained)
+                .map_err(D::Error::custom),
+            "unavailable" => serde_json::from_value(value)
+                .map(Self::Unavailable)
+                .map_err(D::Error::custom),
+            "unknown_outcome" => serde_json::from_value(value)
+                .map(Self::UnknownOutcome)
+                .map_err(D::Error::custom),
+            "outcome_settled" => serde_json::from_value(value)
+                .map(Self::OutcomeSettled)
+                .map_err(D::Error::custom),
+            "rejected" => serde_json::from_value(value)
+                .map(Self::Rejected)
+                .map_err(D::Error::custom),
+            "identity_conflict" => serde_json::from_value(value)
+                .map(Self::IdentityConflict)
+                .map_err(D::Error::custom),
+            _ => Err(D::Error::custom("UserAutomation result value is unsupported")),
+        }
+    }
+}
+
+/// Versioned transition payload. The nested transition retains its own wire
+/// identity/version; the result envelope commits the projection and recovery
+/// fields around it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOperatorTransitionValue {
+    /// Closed typed transition including its own wire identity and version.
+    pub transition: UserAutomationOperatorTransition,
+    /// Deterministic read projection paired with the exact transition.
+    pub occurrences: Vec<UserAutomationScheduleInspectionProjection>,
+}
+
+/// Bounded, typed schedule projection emitted only for the revisions returned
+/// by this read transition. Its fields are inspection data; they carry no
+/// normalization receipt or provenance claim.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationScheduleInspectionProjection {
+    pub automation_id: String,
+    pub revision: String,
+    pub kind: ScheduleKind,
+    pub expression: String,
+    pub calendar: String,
+    pub timezone: String,
+    pub dst_fold: DstFoldPolicy,
+    pub dst_gap: DstGapPolicy,
+    pub start_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_at: Option<String>,
+    pub next_occurrences: Vec<String>,
+    pub configuration_state: UserAutomationConfigurationState,
+    pub occurrences: Vec<UserAutomationOccurrenceInspectionProjection>,
+}
+
+/// One compiled occurrence and the deterministic successor resolved by the
+/// same immutable revision compiler.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOccurrenceInspectionProjection {
+    pub identity: AutomationOccurrenceIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_occurrence: Option<String>,
+}
+
+/// Owner-authored pre-Store refusal with the original request correlation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationAttemptRefusalValue {
+    pub kind: String,
+    pub schema_version: u16,
+    pub operation: UserAutomationAttemptOperationIdentity,
+    pub state_fence: StateFence,
+    pub attempt_state: String,
+    pub refusal: UserAutomationRefusalDetails,
+}
+
+/// Operation identity carried by an attempt refusal.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationAttemptOperationIdentity {
+    pub operation_id: String,
+    pub request_id: String,
+    pub idempotency_key: String,
+}
+
+/// Closed semantic details of a typed pre-Store refusal.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationRefusalDetails {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_seconds: Option<i32>,
+}
+
+/// Closed outcome value for a proven negative owner readback.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationNotRetainedValue {
+    pub accepted: bool,
+    pub outcome: String,
+    pub reason: String,
+}
+
+/// Closed outcome value for an unavailable owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationUnavailableValue {
+    pub outcome: String,
+}
+
+/// Closed outcome value for an uncertain owner answer.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationUnknownOutcomeValue {
+    pub outcome: String,
+}
+
+/// Closed outcome value for a proven commit with a remaining ledger read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOutcomeSettledValue {
+    pub accepted: bool,
+    pub outcome: String,
+    pub reason: String,
+}
+
+/// Closed outcome value for a pre-Store rejection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationRejectedValue {
+    pub accepted: bool,
+    pub outcome: String,
+    pub reason: String,
+}
+
+/// Closed outcome value for an operation/fence conflict.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationIdentityConflictValue {
+    pub accepted: bool,
+    pub outcome: String,
+}
+
+/// Public versioned result envelope shared by known, unknown, and refusal
+/// outcomes. The payload union is closed and every envelope echoes the exact
+/// request correlation and authenticated current State Fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOperatorResultEnvelope {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub status: UserAutomationOperatorResultStatus,
+    pub correlation: UserAutomationResultCorrelation,
+    pub state_fence: StateFence,
+    pub value: UserAutomationOperatorResultValue,
+    pub recovery: Option<UserAutomationOperatorResultRecovery>,
+}
+
+impl UserAutomationOperatorResultEnvelope {
+    /// Binds a transition and inspection projection to the exact submitted
+    /// operation and its authenticated current fence before serialization.
+    pub fn from_transition(
+        request: &UserAutomationServiceRequest,
+        transition: UserAutomationOperatorTransition,
+    ) -> Result<Self, String> {
+        transition.validate_for_request(request)?;
+        let occurrences = user_automation_inspection_occurrences(&transition)?;
+        validate_schedule_inspection_projections(&transition, &occurrences)?;
+        let recovery = transition.recovery().map(result_recovery_from_phase);
+        let status = if recovery.is_none() {
+            UserAutomationOperatorResultStatus::Known
+        } else {
+            UserAutomationOperatorResultStatus::Unknown
+        };
+        let envelope = Self {
+            wire_id: USER_AUTOMATION_RESULT_WIRE_ID.to_owned(),
+            wire_version: USER_AUTOMATION_RESULT_WIRE_VERSION,
+            status,
+            correlation: result_correlation(request),
+            state_fence: request.context.state_fence.clone(),
+            value: UserAutomationOperatorResultValue::Transition(
+                UserAutomationOperatorTransitionValue {
+                    transition,
+                    occurrences,
+                },
+            ),
+            recovery,
+        };
+        envelope.validate_for_request(request)?;
+        Ok(envelope)
+    }
+
+    /// Converts one legacy internal error projection into the same closed,
+    /// versioned public envelope. Legacy JSON never crosses this boundary.
+    pub fn bind_internal_response(
+        request: &UserAutomationServiceRequest,
+        response: serde_json::Value,
+    ) -> Result<Self, String> {
+        let object = response
+            .as_object()
+            .ok_or_else(|| "internal UserAutomation response is not an object".to_owned())?;
+        if object.len() != 3
+            || !object.contains_key("status")
+            || !object.contains_key("value")
+            || !object.contains_key("recovery")
+        {
+            return Err("internal UserAutomation response has an unsupported shape".to_owned());
+        }
+        let status = match object.get("status").and_then(serde_json::Value::as_str) {
+            Some("known") => UserAutomationOperatorResultStatus::Known,
+            Some("unknown") => UserAutomationOperatorResultStatus::Unknown,
+            _ => return Err("internal UserAutomation response status is unsupported".to_owned()),
+        };
+        let value = parse_result_value(
+            object
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "internal UserAutomation response has no value".to_owned())?,
+        )?;
+        let recovery = if object.get("recovery").is_some_and(serde_json::Value::is_null) {
+            None
+        } else {
+            Some(
+                serde_json::from_value(
+                    object
+                        .get("recovery")
+                        .cloned()
+                        .ok_or_else(|| "internal UserAutomation response has no recovery".to_owned())?,
+                )
+                .map_err(|_| "internal UserAutomation recovery is not a closed variant".to_owned())?,
+            )
+        };
+        let envelope = Self {
+            wire_id: USER_AUTOMATION_RESULT_WIRE_ID.to_owned(),
+            wire_version: USER_AUTOMATION_RESULT_WIRE_VERSION,
+            status,
+            correlation: result_correlation(request),
+            state_fence: request.context.state_fence.clone(),
+            value,
+            recovery,
+        };
+        envelope.validate_for_request(request)?;
+        Ok(envelope)
+    }
+
+    /// Validates the complete envelope against the request the authenticated
+    /// route actually admitted. This is the only constructor-independent gate.
+    pub fn validate_for_request(&self, request: &UserAutomationServiceRequest) -> Result<(), String> {
+        if self.wire_id != USER_AUTOMATION_RESULT_WIRE_ID
+            || self.wire_version != USER_AUTOMATION_RESULT_WIRE_VERSION
+            || self.correlation != result_correlation(request)
+            || self.state_fence != request.context.state_fence
+        {
+            return Err("UserAutomation result envelope is not bound to the submitted operation and fence".to_owned());
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| error.to_string())?;
+        match &self.value {
+            UserAutomationOperatorResultValue::Transition(value) => {
+                value.transition.validate_for_request(request)?;
+                validate_schedule_inspection_projections(&value.transition, &value.occurrences)?;
+                if self.recovery.as_ref().is_some_and(|recovery| {
+                    matches!(recovery, UserAutomationOperatorResultRecovery::LedgerReadOwed { .. })
+                }) {
+                    return Err("transition cannot carry a non-transition recovery kind".to_owned());
+                }
+                if value.transition.state_fence != self.state_fence
+                    || self.recovery.as_ref().and_then(recovery_to_phase)
+                        != value.transition.recovery()
+                    || self.status
+                        != if self.recovery.is_none() {
+                            UserAutomationOperatorResultStatus::Known
+                        } else {
+                            UserAutomationOperatorResultStatus::Unknown
+                        }
+                {
+                    return Err("UserAutomation transition status/recovery does not join its phases".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::AttemptRefusal(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Unknown
+                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
+                        recovery,
+                        UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
+                    ))
+                    || value.kind != "user_automation_refusal"
+                    || value.schema_version != 1
+                    || value.operation.operation_id != self.correlation.operation_id
+                    || value.operation.request_id != request.context.request_id.to_string()
+                    || value.operation.idempotency_key != self.correlation.idempotency_key
+                    || value.state_fence != self.state_fence
+                    || value.attempt_state != "store_not_called"
+                    || value.refusal.code.trim().is_empty()
+                {
+                    return Err("UserAutomation refusal is not bound to the current attempt".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::NotRetained(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || self.recovery.is_some()
+                    || value.accepted
+                    || value.outcome != "not_retained"
+                    || value.reason.trim().is_empty()
+                {
+                    return Err("UserAutomation not-retained result has an invalid disposition".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::Unavailable(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Unknown
+                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
+                        recovery,
+                        UserAutomationOperatorResultRecovery::Unavailable { .. }
+                    ))
+                    || value.outcome != "unavailable"
+                {
+                    return Err("UserAutomation unavailable result has an invalid disposition".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::UnknownOutcome(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Unknown
+                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
+                        recovery,
+                        UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
+                    ))
+                    || value.outcome != "unknown_outcome"
+                {
+                    return Err("UserAutomation unknown result has an invalid disposition".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::OutcomeSettled(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
+                        recovery,
+                        UserAutomationOperatorResultRecovery::LedgerReadOwed { .. }
+                    ))
+                    || !value.accepted
+                    || value.outcome != "outcome_settled"
+                    || value.reason.trim().is_empty()
+                {
+                    return Err("UserAutomation settled result has an invalid disposition".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::Rejected(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || self.recovery.is_some()
+                    || value.accepted
+                    || value.outcome != "rejected"
+                    || value.reason.trim().is_empty()
+                {
+                    return Err("UserAutomation rejection result has an invalid disposition".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::IdentityConflict(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || self.recovery.is_some()
+                    || value.accepted
+                    || value.outcome != "identity_conflict"
+                {
+                    return Err("UserAutomation identity conflict has an invalid disposition".to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn user_automation_inspection_occurrences(
+    transition: &UserAutomationOperatorTransition,
+) -> Result<Vec<UserAutomationScheduleInspectionProjection>, String> {
+    let UserAutomationConfigurationPhase::Read { result } = &transition.configuration else {
+        return Ok(Vec::new());
+    };
+    let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result.as_ref() {
+        UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
+        UserAutomationReadResult::Status { revision, .. }
+        | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
+        UserAutomationReadResult::History { .. } => Vec::new(),
+    };
+    let mut projections = Vec::with_capacity(revisions.len());
+    for revision in revisions {
+        revision.validate().map_err(|error| error.to_string())?;
+        let identities = revision
+            .compile_occurrence_identities()
+            .map_err(|error| error.to_string())?;
+        let mut occurrences = Vec::with_capacity(identities.len());
+        for identity in identities {
+            let occurrence_key = match &identity.trigger {
+                UserAutomationTrigger::Scheduled { occurrence_key } => occurrence_key.as_str(),
+                UserAutomationTrigger::Manual { .. } => {
+                    return Err(
+                        "compiled UserAutomation schedule identity is unexpectedly manual".to_owned(),
+                    );
+                }
+            };
+            let next_occurrence = revision
+                .next_occurrence_after(occurrence_key)
+                .map_err(|error| error.to_string())?;
+            occurrences.push(UserAutomationOccurrenceInspectionProjection {
+                identity,
+                next_occurrence,
+            });
+        }
+        projections.push(UserAutomationScheduleInspectionProjection {
+            automation_id: revision.automation_id.clone(),
+            revision: revision.revision.clone(),
+            kind: revision.schedule.kind,
+            expression: revision.schedule.expression.clone(),
+            calendar: revision.schedule.calendar.clone(),
+            timezone: revision.schedule.timezone.clone(),
+            dst_fold: revision.schedule.dst_fold,
+            dst_gap: revision.schedule.dst_gap,
+            start_at: revision.schedule.start_at.clone(),
+            end_at: revision.schedule.end_at.clone(),
+            next_occurrences: revision.schedule.next_occurrences.clone(),
+            configuration_state: revision.configuration_state,
+            occurrences,
+        });
+    }
+    Ok(projections)
+}
+
+fn validate_schedule_inspection_projections(
+    transition: &UserAutomationOperatorTransition,
+    projections: &[UserAutomationScheduleInspectionProjection],
+) -> Result<(), String> {
+    let expected = user_automation_inspection_occurrences(transition)?;
+    if projections != expected {
+        return Err(
+            "UserAutomation schedule projection does not exactly match its owner transition".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn result_correlation(request: &UserAutomationServiceRequest) -> UserAutomationResultCorrelation {
+    UserAutomationResultCorrelation {
+        operation_id: request.identity.operation_id.to_string(),
+        idempotency_key: request.identity.idempotency_key.clone(),
+    }
+}
+
+fn parse_result_value(
+    value: serde_json::Value,
+) -> Result<UserAutomationOperatorResultValue, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "UserAutomation result value is not an object".to_owned())?;
+    if object.contains_key("transition") {
+        return serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::Transition)
+            .map_err(|_| "UserAutomation transition result is not closed".to_owned());
+    }
+    if object.get("kind").and_then(serde_json::Value::as_str)
+        == Some("user_automation_refusal")
+    {
+        return serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::AttemptRefusal)
+            .map_err(|_| "UserAutomation attempt refusal is not closed".to_owned());
+    }
+    let outcome = object
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "UserAutomation outcome value has no closed discriminator".to_owned())?;
+    match outcome {
+        "not_retained" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::NotRetained)
+            .map_err(|_| "UserAutomation not-retained value is not closed".to_owned()),
+        "unavailable" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::Unavailable)
+            .map_err(|_| "UserAutomation unavailable value is not closed".to_owned()),
+        "unknown_outcome" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::UnknownOutcome)
+            .map_err(|_| "UserAutomation unknown value is not closed".to_owned()),
+        "outcome_settled" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::OutcomeSettled)
+            .map_err(|_| "UserAutomation settled value is not closed".to_owned()),
+        "rejected" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::Rejected)
+            .map_err(|_| "UserAutomation rejection value is not closed".to_owned()),
+        "identity_conflict" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::IdentityConflict)
+            .map_err(|_| "UserAutomation identity conflict value is not closed".to_owned()),
+        _ => Err("UserAutomation result outcome is unsupported".to_owned()),
+    }
+}
+
+fn result_recovery_from_phase(
+    recovery: UserAutomationRecoveryPhase,
+) -> UserAutomationOperatorResultRecovery {
+    match recovery {
+        UserAutomationRecoveryPhase::Unavailable { reason } => {
+            UserAutomationOperatorResultRecovery::Unavailable { reason }
+        }
+        UserAutomationRecoveryPhase::UnknownOutcome { reason } => {
+            UserAutomationOperatorResultRecovery::UnknownOutcome { reason }
+        }
+    }
+}
+
+fn recovery_to_phase(
+    recovery: &UserAutomationOperatorResultRecovery,
+) -> Option<UserAutomationRecoveryPhase> {
+    match recovery {
+        UserAutomationOperatorResultRecovery::Unavailable { reason } => {
+            Some(UserAutomationRecoveryPhase::Unavailable { reason: reason.clone() })
+        }
+        UserAutomationOperatorResultRecovery::UnknownOutcome { reason } => {
+            Some(UserAutomationRecoveryPhase::UnknownOutcome { reason: reason.clone() })
+        }
+        UserAutomationOperatorResultRecovery::LedgerReadOwed { .. } => None,
+    }
+}
 
 /// Canonical Store configuration phase of one parent operation.
 ///
@@ -562,6 +1187,7 @@ impl UserAutomationOperatorTransition {
                 );
             }
         }
+        self.validate_phase_joins()?;
         for reason in [
             match &self.wake {
                 UserAutomationWakePhase::NotApplicable { reason }
@@ -584,6 +1210,147 @@ impl UserAutomationOperatorTransition {
         {
             if reason.trim().is_empty() {
                 return Err("an unresolved UserAutomation phase needs a named reason".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates parent identity/fence and exact phase joins against the
+    /// authenticated request the Kernel route admitted. The request's
+    /// canonical hash is intentionally not compared with the Store hash: the
+    /// caller commits the closed operation through its idempotency key, while
+    /// the Store mints a distinct metadata-bound canonical request hash.
+    pub fn validate_for_request(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), String> {
+        request
+            .context
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if request.intent.state_fence != request.context.state_fence
+            || self.identity.operation_id != request.identity.operation_id
+            || self.identity.idempotency_key != request.identity.idempotency_key
+            || self.state_fence != request.context.state_fence
+        {
+            return Err("UserAutomation transition belongs to another request or State Fence".to_owned());
+        }
+        self.validate()
+    }
+
+    fn validate_phase_joins(&self) -> Result<(), String> {
+        match &self.configuration {
+            UserAutomationConfigurationPhase::Read { .. } => {
+                if self.horizon.is_some()
+                    || self.orchestration.is_some()
+                    || !matches!(&self.wake, UserAutomationWakePhase::NotApplicable { .. })
+                    || !matches!(&self.execution, UserAutomationExecutionPhase::NotApplicable { .. })
+                {
+                    return Err("a read-only UserAutomation result carries mutation phases".to_owned());
+                }
+            }
+            UserAutomationConfigurationPhase::Committed { receipt, result }
+            | UserAutomationConfigurationPhase::Replayed { receipt, result } => {
+                receipt.validate().map_err(|error| error.to_string())?;
+                if receipt.operation_id != self.identity.operation_id
+                    || receipt.idempotency_key != self.identity.idempotency_key
+                    || receipt.canonical_request_hash != self.identity.canonical_request_hash
+                    || receipt.state_fence != self.state_fence
+                    || receipt.status != WriteReceiptStatus::Committed
+                {
+                    return Err("UserAutomation configuration receipt is not bound to its parent".to_owned());
+                }
+                receipt
+                    .require_reconciliation_envelope()
+                    .map_err(|error| error.to_string())?;
+                match result.as_ref() {
+                    UserAutomationMutationResult::Revision {
+                        revision,
+                        cancelled_wake_ids,
+                    } => {
+                        revision.validate().map_err(|error| error.to_string())?;
+                        if !matches!(&self.execution, UserAutomationExecutionPhase::NotApplicable { .. }) {
+                            return Err("a revision mutation carries a foreign execution phase".to_owned());
+                        }
+                        match &self.wake {
+                            UserAutomationWakePhase::Cancelled { cancelled_wake_ids: observed }
+                                if observed == cancelled_wake_ids => {}
+                            UserAutomationWakePhase::NotApplicable { .. }
+                                if cancelled_wake_ids.is_empty() => {}
+                            UserAutomationWakePhase::UnknownOutcome { .. }
+                            | UserAutomationWakePhase::Unavailable { .. } => {}
+                            _ => {
+                                return Err("UserAutomation wake phase does not join its mutation".to_owned());
+                            }
+                        }
+                        if let Some(horizon) = &self.horizon {
+                            if horizon.automation_id != revision.automation_id
+                                || horizon.automation_revision != revision.revision
+                                || horizon.revision_digest
+                                    != revision.digest().map_err(|error| error.to_string())?
+                            {
+                                return Err("UserAutomation horizon belongs to another committed revision".to_owned());
+                            }
+                        }
+                        if let Some(orchestration) = &self.orchestration {
+                            let expected_receipt_digest =
+                                crate::commit_recovery::receipt_evidence_digest(receipt);
+                            if orchestration.automation_id != revision.automation_id
+                                || orchestration.automation_revision != revision.revision
+                                || orchestration.revision_digest
+                                    != revision.digest().map_err(|error| error.to_string())?
+                                || orchestration.committed_receipt_digest != expected_receipt_digest
+                            {
+                                return Err("UserAutomation orchestration is not bound to its committed revision and receipt".to_owned());
+                            }
+                        }
+                    }
+                    UserAutomationMutationResult::RunNow { invocation, wake_intent } => {
+                        invocation.validate().map_err(|error| error.to_string())?;
+                        wake_intent.validate().map_err(|error| error.to_string())?;
+                        if wake_intent.state_fence != self.state_fence
+                            || self.horizon.is_some()
+                            || self.orchestration.is_some()
+                        {
+                            return Err("RunNow phases are not bound to the committed occurrence".to_owned());
+                        }
+                        match &self.wake {
+                            UserAutomationWakePhase::Published { readback }
+                                if readback.intent == *wake_intent
+                                    && !readback.operation_id.trim().is_empty()
+                                    && !readback.idempotency_key.trim().is_empty()
+                                    && !readback.record_checksum.trim().is_empty() => {}
+                            UserAutomationWakePhase::UnknownOutcome { .. }
+                            | UserAutomationWakePhase::Unavailable { .. } => {}
+                            _ => return Err("RunNow wake phase does not join the committed wake intent".to_owned()),
+                        }
+                        let occurrence_id = invocation
+                            .occurrence_identity()
+                            .map_err(|error| error.to_string())?;
+                        match &self.execution {
+                            UserAutomationExecutionPhase::Admitted { execution }
+                                if execution.occurrence_id == occurrence_id
+                                    && matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
+                            UserAutomationExecutionPhase::Deferred { reason }
+                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. })
+                                    || (matches!(
+                                        &self.wake,
+                                        UserAutomationWakePhase::UnknownOutcome { .. }
+                                            | UserAutomationWakePhase::Unavailable { .. }
+                                    ) && matches!(
+                                        reason,
+                                        UserAutomationDeferReason::Paused
+                                            | UserAutomationDeferReason::Retired
+                                    )) => {}
+                            UserAutomationExecutionPhase::BlockedConfig { .. }
+                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
+                            UserAutomationExecutionPhase::UnknownOutcome { .. }
+                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
+                            UserAutomationExecutionPhase::Unavailable { .. } => {}
+                            _ => return Err("RunNow execution phase does not join its committed occurrence".to_owned()),
+                        }
+                    }
+                }
             }
         }
         Ok(())

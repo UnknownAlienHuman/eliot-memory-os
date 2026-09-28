@@ -45,6 +45,16 @@ from dataclasses import dataclass
 
 USER_AUTOMATION_RS = "crates/kernel/eliot-kernel-core/src/user_automation.rs"
 USER_AUTOMATION_ZONES_RS = "crates/kernel/eliot-kernel-core/src/user_automation_zones.rs"
+USER_AUTOMATION_TRANSITION_RS = "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs"
+USER_AUTOMATION_SERVICE_RS = "crates/kernel/eliot-kernel-service/src/user_automation.rs"
+USER_AUTOMATION_EXECUTION_RS = "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs"
+USER_AUTOMATION_ORCHESTRATION_RS = "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs"
+STORE_API_RS = "crates/storage/eliot-store-api/src/lib.rs"
+RUNTIME_CONTRACTS_RS = "crates/foundation/eliot-runtime-contracts/src/lib.rs"
+EPOCH_IDENTITY_RS = "crates/foundation/eliot-contracts/src/epoch_identity.rs"
+JOB_STATE_RS = "crates/foundation/eliot-protocol/src/dreamer_job.rs"
+NOTIFICATION_STATE_RS = "crates/kernel/eliot-kernel-core/src/module/notification_state.rs"
+OPERATOR_RESULT_DECODER_CS = "apps/Eliot.Operator/Protocol/UserAutomationScheduleContract.cs"
 
 ARTEFACT = "apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs"
 
@@ -55,6 +65,16 @@ ARTEFACT = "apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs
 SOURCE_FILES = (
     "crates/kernel/eliot-kernel-core/src/user_automation.rs",
     "crates/kernel/eliot-kernel-core/src/user_automation_zones.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs",
+    "crates/foundation/eliot-contracts/src/lib.rs",
+    "crates/foundation/eliot-contracts/src/epoch_identity.rs",
+    "crates/foundation/eliot-runtime-contracts/src/lib.rs",
+    "crates/foundation/eliot-protocol/src/dreamer_job.rs",
+    "crates/storage/eliot-store-api/src/lib.rs",
+    "crates/kernel/eliot-kernel-core/src/module/notification_state.rs",
 )
 
 #: Constants the mirror needs as C# constants, in the order they are emitted.
@@ -89,7 +109,181 @@ PINNED_CONSTANTS = (
     # The only zone database release this build admits, and the token every
     # owner occurrence record must carry verbatim.
     ("PINNED_ZONE_DATABASE_RELEASE", USER_AUTOMATION_ZONES_RS, "string"),
+    ("USER_AUTOMATION_RESULT_WIRE_ID", USER_AUTOMATION_TRANSITION_RS, "string"),
+    ("USER_AUTOMATION_RESULT_WIRE_VERSION", USER_AUTOMATION_TRANSITION_RS, "int"),
+    ("USER_AUTOMATION_TRANSITION_WIRE_ID", USER_AUTOMATION_TRANSITION_RS, "string"),
+    ("USER_AUTOMATION_TRANSITION_WIRE_VERSION", USER_AUTOMATION_TRANSITION_RS, "int"),
+    ("MAX_TEXT_BYTES", USER_AUTOMATION_RS, "int"),
+    ("MAX_REFERENCES", USER_AUTOMATION_RS, "int"),
 )
+
+# Public Rust result structs mirrored by the strict Operator decoder. Required
+# and optional field sets are generated from each struct's serde attributes and
+# field types; a schema change is also checked against the explicit C# decoder
+# pin below, so regenerating the artefact alone cannot silently admit it.
+RESULT_SCHEMA_STRUCTS = (
+    ("UserAutomationOperatorResultEnvelope", "USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS"),
+    ("UserAutomationResultCorrelation", "USER_AUTOMATION_RESULT_CORRELATION_MEMBERS"),
+    ("UserAutomationOperatorTransitionValue", "USER_AUTOMATION_TRANSITION_VALUE_MEMBERS"),
+    ("UserAutomationScheduleInspectionProjection", "USER_AUTOMATION_SCHEDULE_PROJECTION_MEMBERS"),
+    ("UserAutomationOccurrenceInspectionProjection", "USER_AUTOMATION_OCCURRENCE_PROJECTION_MEMBERS"),
+    ("UserAutomationOperatorTransition", "USER_AUTOMATION_TRANSITION_MEMBERS"),
+    ("AutomationOccurrenceIdentity", "USER_AUTOMATION_OCCURRENCE_IDENTITY_MEMBERS"),
+    ("UserAutomationHorizonPhase", "USER_AUTOMATION_HORIZON_PHASE_MEMBERS"),
+    ("UserAutomationOrchestrationRecord", "USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS"),
+    ("UserAutomationRuntimeObligation", "USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS"),
+    ("OperationIdentity", "USER_AUTOMATION_OPERATION_IDENTITY_MEMBERS"),
+    ("StateFence", "USER_AUTOMATION_STATE_FENCE_MEMBERS"),
+    ("EpochId", "USER_AUTOMATION_EPOCH_ID_MEMBERS"),
+    ("WriteReceipt", "USER_AUTOMATION_WRITE_RECEIPT_MEMBERS"),
+    ("UserAutomationRevision", "USER_AUTOMATION_REVISION_MEMBERS"),
+    ("UserAutomationWakeReadback", "USER_AUTOMATION_WAKE_READBACK_MEMBERS"),
+    ("WakeIntent", "USER_AUTOMATION_WAKE_INTENT_MEMBERS"),
+    ("AutomationExecutionReference", "USER_AUTOMATION_EXECUTION_REFERENCE_MEMBERS"),
+    ("UserAutomationInvocation", "USER_AUTOMATION_INVOCATION_MEMBERS"),
+    ("UserAutomationExecutionProjection", "USER_AUTOMATION_EXECUTION_PROJECTION_MEMBERS"),
+    ("UserAutomationFailureProjection", "USER_AUTOMATION_FAILURE_PROJECTION_MEMBERS"),
+    ("UserAutomationInvocationProvenance", "USER_AUTOMATION_INVOCATION_PROVENANCE_MEMBERS"),
+    ("AutomationReconciliationReference", "USER_AUTOMATION_RECONCILIATION_REFERENCE_MEMBERS"),
+    ("NormalizedSchedule", "USER_AUTOMATION_NORMALIZED_SCHEDULE_MEMBERS"),
+    ("AutomationWorkScope", "USER_AUTOMATION_WORK_SCOPE_MEMBERS"),
+    ("AutomationTaskBinding", "USER_AUTOMATION_TASK_BINDING_MEMBERS"),
+    ("AutomationCapabilityProfile", "USER_AUTOMATION_CAPABILITY_PROFILE_MEMBERS"),
+    ("ProviderFingerprint", "USER_AUTOMATION_PROVIDER_FINGERPRINT_MEMBERS"),
+    ("RouteCostPolicy", "USER_AUTOMATION_ROUTE_COST_POLICY_MEMBERS"),
+    ("AutomationDeliveryTarget", "USER_AUTOMATION_DELIVERY_TARGET_MEMBERS"),
+    ("AutomationResourceCeiling", "USER_AUTOMATION_RESOURCE_CEILING_MEMBERS"),
+    ("RecursionPolicy", "USER_AUTOMATION_RECURSION_POLICY_MEMBERS"),
+    ("RevisionDelta", "USER_AUTOMATION_REVISION_DELTA_MEMBERS"),
+    ("OrderingHead", "USER_AUTOMATION_ORDERING_HEAD_MEMBERS"),
+    ("PolicyConfigSchemaVersions", "USER_AUTOMATION_POLICY_SCHEMA_MEMBERS"),
+)
+
+# Owner enum wire tags whose closed values are checked before the Operator
+# describes a transition. These arrays are generated from serde rename rules.
+RESULT_SCHEMA_ENUMS = (
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultStatus", "USER_AUTOMATION_RESULT_STATUS_VALUES"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultRecovery", "USER_AUTOMATION_RESULT_RECOVERY_KINDS"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationConfigurationPhase", "USER_AUTOMATION_CONFIGURATION_PHASE_KINDS"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationHorizonOutcome", "USER_AUTOMATION_HORIZON_OUTCOME_KINDS"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationWakePhase", "USER_AUTOMATION_WAKE_PHASE_KINDS"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationExecutionPhase", "USER_AUTOMATION_EXECUTION_PHASE_KINDS"),
+    (STORE_API_RS, "WriteReceiptStatus", "USER_AUTOMATION_WRITE_RECEIPT_STATUS_VALUES"),
+    (RUNTIME_CONTRACTS_RS, "WakeIntentState", "USER_AUTOMATION_WAKE_INTENT_STATE_VALUES"),
+    (JOB_STATE_RS, "JobState", "USER_AUTOMATION_EXECUTION_STATE_VALUES"),
+    (USER_AUTOMATION_EXECUTION_RS, "UserAutomationHorizonTrigger", "USER_AUTOMATION_HORIZON_TRIGGER_VALUES"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationKind", "USER_AUTOMATION_RUNTIME_OBLIGATION_KINDS"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationAnswer", "USER_AUTOMATION_RUNTIME_OBLIGATION_ANSWER_KINDS"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationDisposition", "USER_AUTOMATION_RUNTIME_OBLIGATION_DISPOSITION_KINDS"),
+    (USER_AUTOMATION_SERVICE_RS, "UserAutomationReadResult", "USER_AUTOMATION_READ_RESULT_KINDS"),
+    (USER_AUTOMATION_SERVICE_RS, "UserAutomationMutationResult", "USER_AUTOMATION_MUTATION_RESULT_KINDS"),
+    (USER_AUTOMATION_RS, "UserAutomationConfigurationState", "USER_AUTOMATION_CONFIGURATION_STATES"),
+    (USER_AUTOMATION_RS, "ScheduleKind", "USER_AUTOMATION_SCHEDULE_KINDS"),
+    (USER_AUTOMATION_RS, "DstFoldPolicy", "USER_AUTOMATION_DST_FOLD_POLICIES"),
+    (USER_AUTOMATION_RS, "DstGapPolicy", "USER_AUTOMATION_DST_GAP_POLICIES"),
+    (USER_AUTOMATION_RS, "UserAutomationTrigger", "USER_AUTOMATION_TRIGGER_KINDS"),
+    (USER_AUTOMATION_RS, "UserAutomationExecutionMode", "USER_AUTOMATION_EXECUTION_MODES"),
+    (USER_AUTOMATION_RS, "UserAutomationTriggerOrigin", "USER_AUTOMATION_TRIGGER_ORIGINS"),
+    (USER_AUTOMATION_RS, "AutomationTaskKind", "USER_AUTOMATION_TASK_KINDS"),
+    (USER_AUTOMATION_RS, "AutomationWorkClass", "USER_AUTOMATION_WORK_CLASSES"),
+    (USER_AUTOMATION_RS, "ProviderFingerprintPolicy", "USER_AUTOMATION_PROVIDER_POLICY_KINDS"),
+    (USER_AUTOMATION_RS, "OverlapPolicy", "USER_AUTOMATION_OVERLAP_POLICIES"),
+    (USER_AUTOMATION_RS, "AutomationReconciliationCause", "USER_AUTOMATION_RECONCILIATION_CAUSES"),
+    (USER_AUTOMATION_RS, "UserAutomationFailureReason", "USER_AUTOMATION_FAILURE_REASON_KINDS"),
+    (NOTIFICATION_STATE_RS, "DeliveryChannel", "USER_AUTOMATION_DELIVERY_CHANNELS"),
+    (STORE_API_RS, "TransitionClass", "USER_AUTOMATION_TRANSITION_CLASSES"),
+    (STORE_API_RS, "Resubmission", "USER_AUTOMATION_RESUBMISSION_VALUES"),
+    ("crates/foundation/eliot-contracts/src/lib.rs", "ErrorCode", "USER_AUTOMATION_ERROR_CODE_VALUES"),
+    (USER_AUTOMATION_RS, "UserAutomationDeferReason", "USER_AUTOMATION_DEFER_REASONS"),
+)
+
+# Fingerprint the full serde declarations in the closed result union and the
+# phase DTO graph it contains. This includes enum variant tags, nested payload
+# fields, serde renames/defaults and optional wire behavior, not only the flat
+# fields of the four member arrays emitted below.
+RESULT_SCHEMA_DECLARATIONS = (
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationResultCorrelation"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultStatus"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultRecovery"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorTransitionValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationScheduleInspectionProjection"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOccurrenceInspectionProjection"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationAttemptRefusalValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationAttemptOperationIdentity"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationRefusalDetails"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationNotRetainedValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationUnavailableValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationUnknownOutcomeValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOutcomeSettledValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationRejectedValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationIdentityConflictValue"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorResultEnvelope"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationConfigurationPhase"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationHorizonOutcome"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationHorizonPhase"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationWakePhase"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationExecutionPhase"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationRecoveryPhase"),
+    (USER_AUTOMATION_TRANSITION_RS, "UserAutomationOperatorTransition"),
+    (USER_AUTOMATION_RS, "UserAutomationConfigurationState"),
+    (USER_AUTOMATION_RS, "ScheduleKind"),
+    (USER_AUTOMATION_RS, "DstFoldPolicy"),
+    (USER_AUTOMATION_RS, "DstGapPolicy"),
+    (USER_AUTOMATION_RS, "UserAutomationTrigger"),
+    (USER_AUTOMATION_RS, "AutomationOccurrenceIdentity"),
+    (USER_AUTOMATION_RS, "UserAutomationDeferReason"),
+    (USER_AUTOMATION_EXECUTION_RS, "UserAutomationHorizonTrigger"),
+    (USER_AUTOMATION_EXECUTION_RS, "UserAutomationWakeReadback"),
+    (USER_AUTOMATION_SERVICE_RS, "UserAutomationReadResult"),
+    (USER_AUTOMATION_SERVICE_RS, "UserAutomationMutationResult"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationKind"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationAnswer"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationDisposition"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligation"),
+    (USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationOrchestrationRecord"),
+    ("crates/foundation/eliot-contracts/src/lib.rs", "StateFence"),
+    (STORE_API_RS, "OperationIdentity"),
+    (STORE_API_RS, "WriteReceipt"),
+    (STORE_API_RS, "WriteReceiptStatus"),
+    (USER_AUTOMATION_RS, "UserAutomationRevision"),
+    (USER_AUTOMATION_RS, "UserAutomationInvocation"),
+    (USER_AUTOMATION_RS, "UserAutomationInvocationProvenance"),
+    (USER_AUTOMATION_RS, "AutomationExecutionReference"),
+    (USER_AUTOMATION_RS, "UserAutomationExecutionProjection"),
+    (USER_AUTOMATION_RS, "UserAutomationFailureProjection"),
+    (USER_AUTOMATION_RS, "AutomationReconciliationReference"),
+    (USER_AUTOMATION_RS, "NormalizedSchedule"),
+    (USER_AUTOMATION_RS, "AutomationWorkScope"),
+    (USER_AUTOMATION_RS, "AutomationTaskBinding"),
+    (USER_AUTOMATION_RS, "AutomationCapabilityProfile"),
+    (USER_AUTOMATION_RS, "ProviderFingerprint"),
+    (USER_AUTOMATION_RS, "RouteCostPolicy"),
+    (USER_AUTOMATION_RS, "AutomationDeliveryTarget"),
+    (USER_AUTOMATION_RS, "AutomationResourceCeiling"),
+    (USER_AUTOMATION_RS, "RecursionPolicy"),
+    (STORE_API_RS, "RevisionDelta"),
+    (STORE_API_RS, "OrderingHead"),
+    (STORE_API_RS, "PolicyConfigSchemaVersions"),
+    (USER_AUTOMATION_RS, "AutomationReconciliationCause"),
+    (USER_AUTOMATION_RS, "UserAutomationExecutionMode"),
+    (USER_AUTOMATION_RS, "UserAutomationTriggerOrigin"),
+    (USER_AUTOMATION_RS, "AutomationTaskKind"),
+    (USER_AUTOMATION_RS, "AutomationWorkClass"),
+    (USER_AUTOMATION_RS, "ProviderFingerprintPolicy"),
+    (USER_AUTOMATION_RS, "OverlapPolicy"),
+    (USER_AUTOMATION_RS, "UserAutomationFailureReason"),
+    (NOTIFICATION_STATE_RS, "DeliveryChannel"),
+    (RUNTIME_CONTRACTS_RS, "WakeIntent"),
+    (RUNTIME_CONTRACTS_RS, "WakeIntentState"),
+    (JOB_STATE_RS, "JobState"),
+    (EPOCH_IDENTITY_RS, "EpochId"),
+    (STORE_API_RS, "TransitionClass"),
+    (STORE_API_RS, "Resubmission"),
+    ("crates/foundation/eliot-contracts/src/lib.rs", "ErrorCode"),
+    (NOTIFICATION_STATE_RS, "DeliveryChannel"),
+)
+RESULT_SCHEMA_DECODER_PIN = "SupportedUserAutomationResultSchemaSha256"
 
 #: Values the Rust owner spells as an inline expression over a pinned constant.
 #: They are resolved here from the same Rust declarations rather than re-typed,
@@ -380,6 +574,25 @@ class RustRefusal:
     display: str
 
 
+@dataclass(frozen=True)
+class RustResultField:
+    name: str
+    rust_type: str
+    required: bool
+
+
+@dataclass(frozen=True)
+class RustResultStruct:
+    name: str
+    fields: tuple[RustResultField, ...]
+
+
+@dataclass(frozen=True)
+class RustResultEnum:
+    name: str
+    variants: tuple[str, ...]
+
+
 def collapse(text: str) -> str:
     return " ".join(text.split())
 
@@ -443,6 +656,145 @@ def collect_constants(lines: list[str]) -> dict[str, RustConstant]:
         )
         index = end + 1
     return found
+
+
+def collect_result_struct(lines: list[str], name: str) -> RustResultStruct:
+    """Extract one flat public result struct and its serde-required fields."""
+    start = None
+    header = re.compile(rf"^\s*pub\s+struct\s+{re.escape(name)}\s*\{{\s*$")
+    for index, line in enumerate(lines):
+        if header.match(line):
+            start = index + 1
+            break
+    if start is None:
+        raise Refused(f"result schema struct {name!r} is absent")
+
+    fields: list[RustResultField] = []
+    pending_serde = ""
+    field_re = re.compile(r"^\s*pub\s+([a-zA-Z0-9_]+)\s*:\s*(.+),\s*$")
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped == "}":
+            break
+        if stripped.startswith("#[serde("):
+            pending_serde += stripped
+            continue
+        match = field_re.match(line)
+        if match is None:
+            if stripped.startswith("pub "):
+                raise Refused(f"result schema field in {name!r} is not a one-line field")
+            continue
+        field_name = match.group(1)
+        rust_type = collapse(match.group(2))
+        required = "skip_serializing_if" not in pending_serde
+        fields.append(RustResultField(field_name, rust_type, required))
+        pending_serde = ""
+    else:
+        raise Refused(f"result schema struct {name!r} has no closing brace")
+    if not fields:
+        raise Refused(f"result schema struct {name!r} has no public fields")
+    return RustResultStruct(name, tuple(fields))
+
+
+def collect_result_declaration(lines: list[str], name: str) -> str:
+    """Collect one serde type declaration, including its attributes and variants."""
+    header = re.compile(rf"^\s*pub\s+(?:struct|enum)\s+{re.escape(name)}\b")
+    for index, line in enumerate(lines):
+        if header.match(line) is None:
+            continue
+        first = index
+        while first > 0 and lines[first - 1].strip().startswith("#["):
+            first -= 1
+        depth = 0
+        opened = False
+        declaration: list[str] = []
+        for candidate in lines[index:]:
+            declaration.append(candidate)
+            code = candidate.split("//", 1)[0]
+            depth += code.count("{") - code.count("}")
+            opened |= "{" in code
+            if opened and depth == 0:
+                return "\n".join(lines[first:index] + declaration)
+        raise Refused(f"result schema declaration {name!r} has no closing brace")
+    raise Refused(f"result schema declaration {name!r} is absent")
+
+
+def collect_result_deserializer(lines: list[str], name: str) -> str:
+    """Collect the custom discriminator-aware Deserialize implementation for one result type."""
+    header = re.compile(
+        rf"^\s*impl\s*<\s*'de\s*>\s+Deserialize\s*<\s*'de\s*>\s+for\s+{re.escape(name)}\s*\{{\s*$"
+    )
+    for index, line in enumerate(lines):
+        if header.match(line) is None:
+            continue
+        depth = 0
+        opened = False
+        declaration: list[str] = []
+        for candidate in lines[index:]:
+            declaration.append(candidate)
+            code = candidate.split("//", 1)[0]
+            depth += code.count("{") - code.count("}")
+            opened |= "{" in code
+            if opened and depth == 0:
+                return "\n".join(declaration)
+        raise Refused(f"result deserializer {name!r} has no closing brace")
+    raise Refused(f"result deserializer {name!r} is absent")
+
+
+def collect_result_enum(lines: list[str], name: str) -> RustResultEnum:
+    """Collect enum variants using the serde rename rule on the owner type."""
+    header = re.compile(rf"^\s*pub\s+enum\s+{re.escape(name)}\b")
+    for index, line in enumerate(lines):
+        if header.match(line) is None:
+            continue
+        attribute_start = index
+        while attribute_start > 0 and lines[attribute_start - 1].strip().startswith("#["):
+            attribute_start -= 1
+        attributes = "\n".join(lines[attribute_start:index])
+        rename_match = re.search(r'rename_all\s*=\s*"([^"]+)"', attributes)
+        rename_rule = rename_match.group(1) if rename_match else ""
+
+        def wire_name(variant: str) -> str:
+            explicit_rename = re.search(
+                rf"#\[serde\([^\]]*rename\s*=\s*\"([^\"]+)\"[^\]]*\)\]\s*{re.escape(variant)}\b",
+                "\n".join(lines[index + 1 :]),
+            )
+            if explicit_rename is not None:
+                return explicit_rename.group(1)
+            if rename_rule == "lowercase":
+                return variant.lower()
+            snake = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", variant)
+            snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", snake).lower()
+            if rename_rule == "SCREAMING_SNAKE_CASE":
+                return snake.upper()
+            if rename_rule == "kebab-case":
+                return snake.replace("_", "-")
+            if rename_rule in {"snake_case", ""}:
+                return snake
+            raise Refused(f"enum {name!r} uses unsupported serde rename rule {rename_rule!r}")
+
+        variant_names: list[str] = []
+        depth = 0
+        opened = False
+        variant_re = re.compile(r"^\s*([A-Z][a-zA-Z0-9_]*)\s*(?:[,({]|$)")
+        for candidate in lines[index:]:
+            code = candidate.split("//", 1)[0]
+            if not opened:
+                if "{" in code:
+                    opened = True
+                    depth = code.count("{") - code.count("}")
+                continue
+            if depth == 1:
+                match = variant_re.match(candidate)
+                if match is not None:
+                    variant_names.append(wire_name(match.group(1)))
+            depth += code.count("{") - code.count("}")
+            if depth == 0:
+                if not variant_names:
+                    raise Refused(f"result schema enum {name!r} has no variants")
+                return RustResultEnum(name, tuple(variant_names))
+        raise Refused(f"result schema enum {name!r} has no closing brace")
+    raise Refused(f"result schema enum {name!r} is absent")
 
 
 def collect_functions(lines: list[str], name: str) -> RustFunction:
@@ -539,6 +891,8 @@ def render_artefact(
     dispositions: list[str],
     refusals: list[RustRefusal],
     functions: list[RustFunction],
+    result_structs: list[tuple[str, str, RustResultStruct]],
+    result_enums: list[tuple[str, str, RustResultEnum]],
     digests: dict[str, str],
 ) -> str:
     lines: list[str] = []
@@ -565,6 +919,7 @@ def render_artefact(
     add(f"// dispositions_source_sha256: {digests['dispositions']}")
     add(f"// refusals_source_sha256: {digests['refusals']}")
     add(f"// grammar_source_sha256: {digests['grammar']}")
+    add(f"// user_automation_result_schema_sha256: {digests['result_schema']}")
     add("//")
     add("// Stated boundary of this mirror. The Operator validates the bounded wire")
     add("// shape, the exact supported contract version and the self-consistency of the")
@@ -630,6 +985,45 @@ def render_artefact(
             raise Refused(f"constant {constant.name!r} resolved to an unsupported type")
         add(f"    /// <summary>`{constant.source}`</summary>")
         add(f"    {rendered}")
+        add("")
+    add("    /// <summary>")
+    add("    /// Digest of the closed result envelope and transition field/type census.")
+    add("    /// The C# decoder source pins this value separately; changing only the")
+    add("    /// generated artefact cannot widen the decoder.")
+    add("    /// </summary>")
+    add(
+        "    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "
+        + csharp_string(digests["result_schema"])
+        + ";"
+    )
+    add("")
+    for _struct_name, member_constant, schema in result_structs:
+        add(f"    /// <summary>Generated public members of `{schema.name}`.</summary>")
+        add(f"    public static readonly string[] {member_constant} =")
+        add("    [")
+        for field in schema.fields:
+            add(f"        {csharp_string(field.name)},")
+        add("    ];")
+        add("")
+        if any(field.required for field in schema.fields) and any(
+            not field.required for field in schema.fields
+        ):
+            required_constant = member_constant.replace("_MEMBERS", "_REQUIRED_MEMBERS")
+            add(f"    /// <summary>Required serialized members of `{schema.name}`.</summary>")
+            add(f"    public static readonly string[] {required_constant} =")
+            add("    [")
+            for field in schema.fields:
+                if field.required:
+                    add(f"        {csharp_string(field.name)},")
+            add("    ];")
+            add("")
+    for _enum_name, value_constant, schema in result_enums:
+        add(f"    /// <summary>Generated serialized variants of `{schema.name}`.</summary>")
+        add(f"    public static readonly string[] {value_constant} =")
+        add("    [")
+        for variant in schema.variants:
+            add(f"        {csharp_string(variant)},")
+        add("    ];")
         add("")
     add("    /// <summary>")
     add("    /// The closed fold/gap disposition vocabulary, enumerated from the owner's")
@@ -714,6 +1108,89 @@ def build(root: str) -> tuple[str, dict[str, int]]:
             )
         )
 
+    result_struct_sources = {
+        "AutomationOccurrenceIdentity": USER_AUTOMATION_RS,
+        "AutomationExecutionReference": USER_AUTOMATION_RS,
+        "UserAutomationRevision": USER_AUTOMATION_RS,
+        "UserAutomationInvocation": USER_AUTOMATION_RS,
+        "UserAutomationInvocationProvenance": USER_AUTOMATION_RS,
+        "UserAutomationExecutionProjection": USER_AUTOMATION_RS,
+        "UserAutomationFailureProjection": USER_AUTOMATION_RS,
+        "AutomationReconciliationReference": USER_AUTOMATION_RS,
+        "NormalizedSchedule": USER_AUTOMATION_RS,
+        "AutomationWorkScope": USER_AUTOMATION_RS,
+        "AutomationTaskBinding": USER_AUTOMATION_RS,
+        "AutomationCapabilityProfile": USER_AUTOMATION_RS,
+        "ProviderFingerprint": USER_AUTOMATION_RS,
+        "RouteCostPolicy": USER_AUTOMATION_RS,
+        "AutomationDeliveryTarget": USER_AUTOMATION_RS,
+        "AutomationResourceCeiling": USER_AUTOMATION_RS,
+        "RecursionPolicy": USER_AUTOMATION_RS,
+        "RevisionDelta": STORE_API_RS,
+        "OrderingHead": STORE_API_RS,
+        "PolicyConfigSchemaVersions": STORE_API_RS,
+        "UserAutomationRuntimeObligation": USER_AUTOMATION_ORCHESTRATION_RS,
+        "UserAutomationOrchestrationRecord": USER_AUTOMATION_ORCHESTRATION_RS,
+        "UserAutomationWakeReadback": USER_AUTOMATION_EXECUTION_RS,
+        "OperationIdentity": STORE_API_RS,
+        "WriteReceipt": STORE_API_RS,
+        "StateFence": "crates/foundation/eliot-contracts/src/lib.rs",
+        "EpochId": EPOCH_IDENTITY_RS,
+        "WakeIntent": RUNTIME_CONTRACTS_RS,
+    }
+    result_structs = [
+        (
+            name,
+            member_constant,
+            collect_result_struct(
+                sources[result_struct_sources.get(name, USER_AUTOMATION_TRANSITION_RS)],
+                name,
+            ),
+        )
+        for name, member_constant in RESULT_SCHEMA_STRUCTS
+    ]
+    result_declarations = [
+        (
+            path,
+            name,
+            collect_result_declaration(sources[path], name),
+        )
+        for path, name in RESULT_SCHEMA_DECLARATIONS
+    ]
+    result_schema_lines = [
+        f"{path}\t{name}\n{declaration}"
+        for path, name, declaration in result_declarations
+    ]
+    result_schema_lines.append(
+        f"{USER_AUTOMATION_TRANSITION_RS}\tUserAutomationOperatorResultValue::Deserialize\n"
+        + collect_result_deserializer(
+            sources[USER_AUTOMATION_TRANSITION_RS],
+            "UserAutomationOperatorResultValue",
+        )
+    )
+    result_schema_digest = hashlib.sha256(
+        "\n".join(result_schema_lines).encode("utf-8")
+    ).hexdigest()
+    result_enums = [
+        (name, value_constant, collect_result_enum(sources[path], name))
+        for path, name, value_constant in RESULT_SCHEMA_ENUMS
+    ]
+    decoder_lines = read_source(os.path.join(root, OPERATOR_RESULT_DECODER_CS))
+    decoder_source = "\n".join(decoder_lines)
+    pin_pattern = re.compile(
+        rf"\bconst\s+string\s+{re.escape(RESULT_SCHEMA_DECODER_PIN)}\s*=\s*\"([0-9a-f]{{64}})\""
+    )
+    pin_match = pin_pattern.search(decoder_source)
+    if pin_match is None:
+        raise Refused(
+            f"Operator decoder pin {RESULT_SCHEMA_DECODER_PIN!r} is absent from {OPERATOR_RESULT_DECODER_CS}"
+        )
+    if pin_match.group(1) != result_schema_digest:
+        raise Refused(
+            "Rust UserAutomation result schema changed; update the C# decoder and its explicit schema pin "
+            f"({pin_match.group(1)} != {result_schema_digest})"
+        )
+
     constants_digest = hashlib.sha256(
         "".join(f"{c.source}\n" for c in rendered).encode("utf-8")
     ).hexdigest()
@@ -749,20 +1226,31 @@ def build(root: str) -> tuple[str, dict[str, int]]:
         "dispositions": dispositions_digest,
         "refusals": refusals_digest,
         "grammar": grammar_digest,
+        "result_schema": result_schema_digest,
     }
     digests.update(function_digests)
     digests["contract"] = hashlib.sha256(
         "".join(
             f"{key}\t{digests[key]}\n"
-            for key in ("constants", "dispositions", "refusals", "grammar")
+            for key in ("constants", "dispositions", "refusals", "grammar", "result_schema")
         ).encode("utf-8")
     ).hexdigest()
 
-    return render_artefact(rendered, dispositions, refusals, functions, digests), {
+    return render_artefact(
+        rendered,
+        dispositions,
+        refusals,
+        functions,
+        result_structs,
+        result_enums,
+        digests,
+    ), {
         "constants": len(rendered),
         "dispositions": len(dispositions),
         "refusals": len(refusals),
         "grammar_functions": len(functions),
+        "result_schema_fields": sum(len(schema.fields) for _, _, schema in result_structs),
+        "result_schema_enums": len(result_enums),
     }
 
 

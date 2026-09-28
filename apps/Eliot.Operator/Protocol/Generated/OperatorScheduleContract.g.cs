@@ -14,11 +14,22 @@
 // Source of truth:
 //   crates/kernel/eliot-kernel-core/src/user_automation.rs
 //   crates/kernel/eliot-kernel-core/src/user_automation_zones.rs
-// contract_source_sha256: f60b648de9d6ceb841d531f2714aaaeba5d6300670d37090d1d5a009ef8acd24
-// constants_source_sha256: ca0abcd46126deaad6db7ccea413e1c74c4d11ab3cf0e82200f43068d95fd429
+//   crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs
+//   crates/kernel/eliot-kernel-service/src/user_automation.rs
+//   crates/kernel/eliot-kernel-service/src/user_automation_execution.rs
+//   crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs
+//   crates/foundation/eliot-contracts/src/lib.rs
+//   crates/foundation/eliot-contracts/src/epoch_identity.rs
+//   crates/foundation/eliot-runtime-contracts/src/lib.rs
+//   crates/foundation/eliot-protocol/src/dreamer_job.rs
+//   crates/storage/eliot-store-api/src/lib.rs
+//   crates/kernel/eliot-kernel-core/src/module/notification_state.rs
+// contract_source_sha256: 207651c88151b69d6d922087225ef8ad2d334cbd8588ca4b27d30c1e36b4252e
+// constants_source_sha256: ea50e5435dd673fd0db560e3dbee5830f8b8382bde9ba9f41061ff5c1666a511
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
 // refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
 // grammar_source_sha256: 0283a4fe812976c36ae4e22821c8b445c3b9881b516600b6727820381cb8c5a6
+// user_automation_result_schema_sha256: a4d89da9b0ebfe6474b7a39b293a104749804bf42f4d81d72ff7d51a2e47b8d9
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -76,6 +87,12 @@ public static class OperatorScheduleContract
         "MAX_CIVIL_YEAR\tu32\t9999",
         "USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION\t&str\t\"eliot.user-automation.preflight.v1\"",
         "PINNED_ZONE_DATABASE_RELEASE\t&str\t\"2026c\"",
+        "USER_AUTOMATION_RESULT_WIRE_ID\t&str\t\"eliot.kernel.user-automation.operator-result\"",
+        "USER_AUTOMATION_RESULT_WIRE_VERSION\tu16\t1",
+        "USER_AUTOMATION_TRANSITION_WIRE_ID\t&str\t\"eliot.kernel.user-automation.transition\"",
+        "USER_AUTOMATION_TRANSITION_WIRE_VERSION\tu16\t1",
+        "MAX_TEXT_BYTES\tusize\t16384",
+        "MAX_REFERENCES\tusize\t256",
         "LEGACY_OCCURRENCE_INSTANT_BYTES\tderived\tUTC_INSTANT_BYTES = 20",
         "LEGACY_OCCURRENCE_OFFSET_BYTES\tderived\tCIVIL_WALL_CLOCK_BYTES + UTC_OFFSET_BYTES = 25",
     ];
@@ -155,11 +172,765 @@ public static class OperatorScheduleContract
     /// <summary>`PINNED_ZONE_DATABASE_RELEASE	&str	"2026c"`</summary>
     public const string PINNED_ZONE_DATABASE_RELEASE = "2026c";
 
+    /// <summary>`USER_AUTOMATION_RESULT_WIRE_ID	&str	"eliot.kernel.user-automation.operator-result"`</summary>
+    public const string USER_AUTOMATION_RESULT_WIRE_ID = "eliot.kernel.user-automation.operator-result";
+
+    /// <summary>`USER_AUTOMATION_RESULT_WIRE_VERSION	u16	1`</summary>
+    public const int USER_AUTOMATION_RESULT_WIRE_VERSION = 1;
+
+    /// <summary>`USER_AUTOMATION_TRANSITION_WIRE_ID	&str	"eliot.kernel.user-automation.transition"`</summary>
+    public const string USER_AUTOMATION_TRANSITION_WIRE_ID = "eliot.kernel.user-automation.transition";
+
+    /// <summary>`USER_AUTOMATION_TRANSITION_WIRE_VERSION	u16	1`</summary>
+    public const int USER_AUTOMATION_TRANSITION_WIRE_VERSION = 1;
+
+    /// <summary>`MAX_TEXT_BYTES	usize	16384`</summary>
+    public const int MAX_TEXT_BYTES = 16384;
+
+    /// <summary>`MAX_REFERENCES	usize	256`</summary>
+    public const int MAX_REFERENCES = 256;
+
     /// <summary>`LEGACY_OCCURRENCE_INSTANT_BYTES	derived	UTC_INSTANT_BYTES = 20`</summary>
     public const int LEGACY_OCCURRENCE_INSTANT_BYTES = 20;
 
     /// <summary>`LEGACY_OCCURRENCE_OFFSET_BYTES	derived	CIVIL_WALL_CLOCK_BYTES + UTC_OFFSET_BYTES = 25`</summary>
     public const int LEGACY_OCCURRENCE_OFFSET_BYTES = 25;
+
+    /// <summary>
+    /// Digest of the closed result envelope and transition field/type census.
+    /// The C# decoder source pins this value separately; changing only the
+    /// generated artefact cannot widen the decoder.
+    /// </summary>
+    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "a4d89da9b0ebfe6474b7a39b293a104749804bf42f4d81d72ff7d51a2e47b8d9";
+
+    /// <summary>Generated public members of `UserAutomationOperatorResultEnvelope`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS =
+    [
+        "wire_id",
+        "wire_version",
+        "status",
+        "correlation",
+        "state_fence",
+        "value",
+        "recovery",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationResultCorrelation`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESULT_CORRELATION_MEMBERS =
+    [
+        "operation_id",
+        "idempotency_key",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationOperatorTransitionValue`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRANSITION_VALUE_MEMBERS =
+    [
+        "transition",
+        "occurrences",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationScheduleInspectionProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_SCHEDULE_PROJECTION_MEMBERS =
+    [
+        "automation_id",
+        "revision",
+        "kind",
+        "expression",
+        "calendar",
+        "timezone",
+        "dst_fold",
+        "dst_gap",
+        "start_at",
+        "end_at",
+        "next_occurrences",
+        "configuration_state",
+        "occurrences",
+    ];
+
+    /// <summary>Required serialized members of `UserAutomationScheduleInspectionProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_SCHEDULE_PROJECTION_REQUIRED_MEMBERS =
+    [
+        "automation_id",
+        "revision",
+        "kind",
+        "expression",
+        "calendar",
+        "timezone",
+        "dst_fold",
+        "dst_gap",
+        "start_at",
+        "next_occurrences",
+        "configuration_state",
+        "occurrences",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationOccurrenceInspectionProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_OCCURRENCE_PROJECTION_MEMBERS =
+    [
+        "identity",
+        "next_occurrence",
+    ];
+
+    /// <summary>Required serialized members of `UserAutomationOccurrenceInspectionProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_OCCURRENCE_PROJECTION_REQUIRED_MEMBERS =
+    [
+        "identity",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationOperatorTransition`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRANSITION_MEMBERS =
+    [
+        "wire_id",
+        "wire_version",
+        "identity",
+        "state_fence",
+        "configuration",
+        "wake",
+        "execution",
+        "horizon",
+        "orchestration",
+    ];
+
+    /// <summary>Required serialized members of `UserAutomationOperatorTransition`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRANSITION_REQUIRED_MEMBERS =
+    [
+        "wire_id",
+        "wire_version",
+        "identity",
+        "state_fence",
+        "configuration",
+        "wake",
+        "execution",
+    ];
+
+    /// <summary>Generated public members of `AutomationOccurrenceIdentity`.</summary>
+    public static readonly string[] USER_AUTOMATION_OCCURRENCE_IDENTITY_MEMBERS =
+    [
+        "automation_id",
+        "revision",
+        "trigger",
+        "occurrence_id",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationHorizonPhase`.</summary>
+    public static readonly string[] USER_AUTOMATION_HORIZON_PHASE_MEMBERS =
+    [
+        "trigger",
+        "automation_id",
+        "automation_revision",
+        "revision_digest",
+        "requested_occurrence_ids",
+        "remaining_occurrence_ids",
+        "retry_handle",
+        "outcome",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationOrchestrationRecord`.</summary>
+    public static readonly string[] USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS =
+    [
+        "parent",
+        "state_fence",
+        "automation_id",
+        "automation_revision",
+        "revision_digest",
+        "committed_receipt_digest",
+        "obligations",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationRuntimeObligation`.</summary>
+    public static readonly string[] USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS =
+    [
+        "kind",
+        "owner_operation_id",
+        "request_digest",
+        "subject_ids",
+        "wake_enumeration_receipt",
+        "disposition",
+    ];
+
+    /// <summary>Generated public members of `OperationIdentity`.</summary>
+    public static readonly string[] USER_AUTOMATION_OPERATION_IDENTITY_MEMBERS =
+    [
+        "operation_id",
+        "idempotency_key",
+        "canonical_request_hash",
+    ];
+
+    /// <summary>Generated public members of `StateFence`.</summary>
+    public static readonly string[] USER_AUTOMATION_STATE_FENCE_MEMBERS =
+    [
+        "authority_epoch",
+        "resource_generation",
+        "task_revision",
+        "policy_revision",
+        "integration_revision",
+    ];
+
+    /// <summary>Generated public members of `EpochId`.</summary>
+    public static readonly string[] USER_AUTOMATION_EPOCH_ID_MEMBERS =
+    [
+        "lineage_id",
+        "sequence",
+    ];
+
+    /// <summary>Generated public members of `WriteReceipt`.</summary>
+    public static readonly string[] USER_AUTOMATION_WRITE_RECEIPT_MEMBERS =
+    [
+        "operation_id",
+        "idempotency_key",
+        "canonical_request_hash",
+        "transition_class",
+        "status",
+        "commit_id",
+        "state_fence",
+        "ordering_sequences",
+        "revision_before_after",
+        "applied_command_ids",
+        "emitted_event_ids",
+        "projection_refs",
+        "outbox_refs",
+        "operation_manifest_digest",
+        "admission_digest",
+        "mutation_plan_digest",
+        "semantic_source_revisions",
+        "policy_config_schema_versions",
+        "error_code",
+        "resubmission",
+        "committed_at",
+        "envelope",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationRevision`.</summary>
+    public static readonly string[] USER_AUTOMATION_REVISION_MEMBERS =
+    [
+        "automation_id",
+        "revision",
+        "supersedes",
+        "owner_principal",
+        "work_scope",
+        "natural_language_intent",
+        "schedule",
+        "mode",
+        "task",
+        "portable_skill_package_revision_refs",
+        "workdir_ref",
+        "route_cost_policy",
+        "provider_policy",
+        "delivery_target",
+        "preflight_contract_revision",
+        "resource_ceiling",
+        "overlap_policy",
+        "recursion_policy",
+        "configuration_state",
+        "work_class",
+        "current_execution_refs",
+        "execution_history_query_ref",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationWakeReadback`.</summary>
+    public static readonly string[] USER_AUTOMATION_WAKE_READBACK_MEMBERS =
+    [
+        "intent",
+        "operation_id",
+        "idempotency_key",
+        "record_checksum",
+    ];
+
+    /// <summary>Generated public members of `WakeIntent`.</summary>
+    public static readonly string[] USER_AUTOMATION_WAKE_INTENT_MEMBERS =
+    [
+        "wake_id",
+        "reason",
+        "state_fence",
+        "state",
+    ];
+
+    /// <summary>Generated public members of `AutomationExecutionReference`.</summary>
+    public static readonly string[] USER_AUTOMATION_EXECUTION_REFERENCE_MEMBERS =
+    [
+        "occurrence_id",
+        "durable_job_ref",
+        "state",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationInvocation`.</summary>
+    public static readonly string[] USER_AUTOMATION_INVOCATION_MEMBERS =
+    [
+        "automation_id",
+        "automation_revision",
+        "trigger",
+        "mode",
+        "principal_ref",
+        "work_scope_ref",
+        "workdir_ref",
+        "trigger_origin",
+        "child_depth",
+        "provenance",
+    ];
+
+    /// <summary>Required serialized members of `UserAutomationInvocation`.</summary>
+    public static readonly string[] USER_AUTOMATION_INVOCATION_REQUIRED_MEMBERS =
+    [
+        "automation_id",
+        "automation_revision",
+        "trigger",
+        "mode",
+        "principal_ref",
+        "work_scope_ref",
+        "workdir_ref",
+        "trigger_origin",
+        "child_depth",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationExecutionProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_EXECUTION_PROJECTION_MEMBERS =
+    [
+        "current_execution_refs",
+        "unresolved_reconciliation_refs",
+        "history_query_ref",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationFailureProjection`.</summary>
+    public static readonly string[] USER_AUTOMATION_FAILURE_PROJECTION_MEMBERS =
+    [
+        "failure_fingerprint",
+        "reason",
+        "notification",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationInvocationProvenance`.</summary>
+    public static readonly string[] USER_AUTOMATION_INVOCATION_PROVENANCE_MEMBERS =
+    [
+        "request_metadata",
+        "source_operation",
+        "operation_id",
+        "idempotency_key",
+        "canonical_request_hash",
+    ];
+
+    /// <summary>Generated public members of `AutomationReconciliationReference`.</summary>
+    public static readonly string[] USER_AUTOMATION_RECONCILIATION_REFERENCE_MEMBERS =
+    [
+        "occurrence_id",
+        "operation_ref",
+        "cause",
+        "read_revision",
+        "denominator_query_ref",
+    ];
+
+    /// <summary>Generated public members of `NormalizedSchedule`.</summary>
+    public static readonly string[] USER_AUTOMATION_NORMALIZED_SCHEDULE_MEMBERS =
+    [
+        "kind",
+        "expression",
+        "calendar",
+        "timezone",
+        "dst_fold",
+        "dst_gap",
+        "start_at",
+        "end_at",
+        "next_occurrences",
+    ];
+
+    /// <summary>Generated public members of `AutomationWorkScope`.</summary>
+    public static readonly string[] USER_AUTOMATION_WORK_SCOPE_MEMBERS =
+    [
+        "scope_id",
+        "product_id",
+        "workdir_ref",
+    ];
+
+    /// <summary>Generated public members of `AutomationTaskBinding`.</summary>
+    public static readonly string[] USER_AUTOMATION_TASK_BINDING_MEMBERS =
+    [
+        "qualified_ref",
+        "kind",
+        "capability_profile",
+    ];
+
+    /// <summary>Generated public members of `AutomationCapabilityProfile`.</summary>
+    public static readonly string[] USER_AUTOMATION_CAPABILITY_PROFILE_MEMBERS =
+    [
+        "model_access",
+        "provider_access",
+        "automation_scheduling",
+    ];
+
+    /// <summary>Generated public members of `ProviderFingerprint`.</summary>
+    public static readonly string[] USER_AUTOMATION_PROVIDER_FINGERPRINT_MEMBERS =
+    [
+        "provider",
+        "model",
+        "adapter",
+        "fingerprint",
+    ];
+
+    /// <summary>Generated public members of `RouteCostPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_ROUTE_COST_POLICY_MEMBERS =
+    [
+        "route_ref",
+        "max_cost_units",
+        "max_duration_ms",
+        "policy_revision",
+    ];
+
+    /// <summary>Generated public members of `AutomationDeliveryTarget`.</summary>
+    public static readonly string[] USER_AUTOMATION_DELIVERY_TARGET_MEMBERS =
+    [
+        "target_ref",
+        "channels",
+        "recipient_refs",
+    ];
+
+    /// <summary>Generated public members of `AutomationResourceCeiling`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESOURCE_CEILING_MEMBERS =
+    [
+        "max_runtime_ms",
+        "max_output_bytes",
+        "max_child_count",
+    ];
+
+    /// <summary>Generated public members of `RecursionPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_RECURSION_POLICY_MEMBERS =
+    [
+        "allow_child_automation",
+        "max_child_depth",
+    ];
+
+    /// <summary>Generated public members of `RevisionDelta`.</summary>
+    public static readonly string[] USER_AUTOMATION_REVISION_DELTA_MEMBERS =
+    [
+        "key",
+        "before",
+        "after",
+    ];
+
+    /// <summary>Generated public members of `OrderingHead`.</summary>
+    public static readonly string[] USER_AUTOMATION_ORDERING_HEAD_MEMBERS =
+    [
+        "scope",
+        "sequence",
+        "state_fence",
+    ];
+
+    /// <summary>Generated public members of `PolicyConfigSchemaVersions`.</summary>
+    public static readonly string[] USER_AUTOMATION_POLICY_SCHEMA_MEMBERS =
+    [
+        "policy_revision",
+        "config_profile",
+        "schema_revision",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationOperatorResultStatus`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESULT_STATUS_VALUES =
+    [
+        "known",
+        "unknown",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationOperatorResultRecovery`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESULT_RECOVERY_KINDS =
+    [
+        "unavailable",
+        "unknown_outcome",
+        "ledger_read_owed",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationConfigurationPhase`.</summary>
+    public static readonly string[] USER_AUTOMATION_CONFIGURATION_PHASE_KINDS =
+    [
+        "read",
+        "committed",
+        "replayed",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationHorizonOutcome`.</summary>
+    public static readonly string[] USER_AUTOMATION_HORIZON_OUTCOME_KINDS =
+    [
+        "published",
+        "partial",
+        "unavailable",
+        "unknown_outcome",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationWakePhase`.</summary>
+    public static readonly string[] USER_AUTOMATION_WAKE_PHASE_KINDS =
+    [
+        "not_applicable",
+        "published",
+        "cancelled",
+        "unknown_outcome",
+        "unavailable",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationExecutionPhase`.</summary>
+    public static readonly string[] USER_AUTOMATION_EXECUTION_PHASE_KINDS =
+    [
+        "not_applicable",
+        "admitted",
+        "deferred",
+        "blocked_config",
+        "unknown_outcome",
+        "unavailable",
+    ];
+
+    /// <summary>Generated serialized variants of `WriteReceiptStatus`.</summary>
+    public static readonly string[] USER_AUTOMATION_WRITE_RECEIPT_STATUS_VALUES =
+    [
+        "committed",
+        "rejected",
+        "dead_letter",
+        "cancelled",
+    ];
+
+    /// <summary>Generated serialized variants of `WakeIntentState`.</summary>
+    public static readonly string[] USER_AUTOMATION_WAKE_INTENT_STATE_VALUES =
+    [
+        "PENDING",
+        "CLAIMED",
+        "STARTED",
+        "SATISFIED",
+        "CANCELLED",
+        "EXPIRED",
+        "FAILED",
+    ];
+
+    /// <summary>Generated serialized variants of `JobState`.</summary>
+    public static readonly string[] USER_AUTOMATION_EXECUTION_STATE_VALUES =
+    [
+        "NOT_STARTED",
+        "QUEUED",
+        "LEASED",
+        "RUNNING",
+        "CHECKPOINTED",
+        "VERIFYING",
+        "COMPLETED",
+        "PARTIAL",
+        "FAILED",
+        "CANCELLED",
+        "UNKNOWN_OUTCOME",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationHorizonTrigger`.</summary>
+    public static readonly string[] USER_AUTOMATION_HORIZON_TRIGGER_VALUES =
+    [
+        "ACCEPTED_REVISION",
+        "SUPERSEDING_EDIT",
+        "RESUMED_REVISION",
+        "DISPOSITION_ADVANCE",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationRuntimeObligationKind`.</summary>
+    public static readonly string[] USER_AUTOMATION_RUNTIME_OBLIGATION_KINDS =
+    [
+        "wake_horizon_publication",
+        "wake_cancellation",
+        "wake_target_enumeration_receipt",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationRuntimeObligationAnswer`.</summary>
+    public static readonly string[] USER_AUTOMATION_RUNTIME_OBLIGATION_ANSWER_KINDS =
+    [
+        "wake_horizon_publication",
+        "wake_cancellation",
+        "wake_target_enumeration_receipt",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationRuntimeObligationDisposition`.</summary>
+    public static readonly string[] USER_AUTOMATION_RUNTIME_OBLIGATION_DISPOSITION_KINDS =
+    [
+        "retained",
+        "reconciling",
+        "answered",
+        "unavailable",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationReadResult`.</summary>
+    public static readonly string[] USER_AUTOMATION_READ_RESULT_KINDS =
+    [
+        "list",
+        "status",
+        "history",
+        "inspect_last_failure",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationMutationResult`.</summary>
+    public static readonly string[] USER_AUTOMATION_MUTATION_RESULT_KINDS =
+    [
+        "revision",
+        "run_now",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationConfigurationState`.</summary>
+    public static readonly string[] USER_AUTOMATION_CONFIGURATION_STATES =
+    [
+        "ACTIVE",
+        "PAUSED",
+        "BLOCKED_CONFIG",
+        "RETIRED",
+    ];
+
+    /// <summary>Generated serialized variants of `ScheduleKind`.</summary>
+    public static readonly string[] USER_AUTOMATION_SCHEDULE_KINDS =
+    [
+        "ONE_SHOT",
+        "RECURRING",
+    ];
+
+    /// <summary>Generated serialized variants of `DstFoldPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_DST_FOLD_POLICIES =
+    [
+        "FIRST",
+        "SECOND",
+        "REJECT",
+    ];
+
+    /// <summary>Generated serialized variants of `DstGapPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_DST_GAP_POLICIES =
+    [
+        "SHIFT_FORWARD",
+        "REJECT",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationTrigger`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRIGGER_KINDS =
+    [
+        "scheduled",
+        "manual",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationExecutionMode`.</summary>
+    public static readonly string[] USER_AUTOMATION_EXECUTION_MODES =
+    [
+        "AGENT",
+        "DETERMINISTIC_PROCESS",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationTriggerOrigin`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRIGGER_ORIGINS =
+    [
+        "HUMAN",
+        "SCHEDULED_WAKE",
+        "AUTOMATION_CHILD",
+    ];
+
+    /// <summary>Generated serialized variants of `AutomationTaskKind`.</summary>
+    public static readonly string[] USER_AUTOMATION_TASK_KINDS =
+    [
+        "AGENT_TASK",
+        "QUALIFIED_SCRIPT",
+    ];
+
+    /// <summary>Generated serialized variants of `AutomationWorkClass`.</summary>
+    public static readonly string[] USER_AUTOMATION_WORK_CLASSES =
+    [
+        "CONTROL",
+        "INTERACTIVE",
+        "VERIFICATION",
+        "CANONICAL_WRITE",
+        "NORMAL_BACKGROUND",
+        "MODEL_JOBS",
+        "SWARM",
+        "REPORTING",
+        "MAINTENANCE",
+    ];
+
+    /// <summary>Generated serialized variants of `ProviderFingerprintPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_PROVIDER_POLICY_KINDS =
+    [
+        "allowed",
+        "deterministic_only",
+    ];
+
+    /// <summary>Generated serialized variants of `OverlapPolicy`.</summary>
+    public static readonly string[] USER_AUTOMATION_OVERLAP_POLICIES =
+    [
+        "FORBID_OVERLAP",
+        "QUEUE_ONE",
+        "COALESCE_LATEST",
+    ];
+
+    /// <summary>Generated serialized variants of `AutomationReconciliationCause`.</summary>
+    public static readonly string[] USER_AUTOMATION_RECONCILIATION_CAUSES =
+    [
+        "UNRESOLVED_OPERATION",
+        "MISSING_INVOCATION_EVIDENCE",
+        "MISSING_INVOCATION_PROVENANCE",
+        "RECEIPT_EVIDENCE_UNAVAILABLE",
+        "INCOMPLETE_DENOMINATOR",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationFailureReason`.</summary>
+    public static readonly string[] USER_AUTOMATION_FAILURE_REASON_KINDS =
+    [
+        "canonical_blocked_config",
+        "provider_fingerprint_mismatch",
+        "deterministic_model_access",
+        "skill_revision_mismatch",
+        "tool_definition_mismatch",
+        "delivery_unavailable",
+        "overlap_forbidden",
+        "recursion_denied",
+        "reconciliation_required",
+    ];
+
+    /// <summary>Generated serialized variants of `DeliveryChannel`.</summary>
+    public static readonly string[] USER_AUTOMATION_DELIVERY_CHANNELS =
+    [
+        "CONTROL_BOARD",
+        "NATIVE_TOAST",
+        "WINDOWS_EVENT_LOG",
+        "RECOVERY_FALLBACK",
+    ];
+
+    /// <summary>Generated serialized variants of `TransitionClass`.</summary>
+    public static readonly string[] USER_AUTOMATION_TRANSITION_CLASSES =
+    [
+        "capture_candidate",
+        "epistemic",
+        "task_control",
+        "lifecycle_policy",
+        "recovery_schema",
+        "erasure",
+        "notification_state",
+        "reactive_state",
+        "user_automation",
+        "instrument_registry",
+    ];
+
+    /// <summary>Generated serialized variants of `Resubmission`.</summary>
+    public static readonly string[] USER_AUTOMATION_RESUBMISSION_VALUES =
+    [
+        "none",
+        "new_identity_after_condition",
+    ];
+
+    /// <summary>Generated serialized variants of `ErrorCode`.</summary>
+    public static readonly string[] USER_AUTOMATION_ERROR_CODE_VALUES =
+    [
+        "INVALID_REQUEST",
+        "INVALID_IDENTITY",
+        "STALE_EPOCH",
+        "STALE_REVISION",
+        "FENCE_MISMATCH",
+        "CONFLICT",
+        "NOT_FOUND",
+        "UNAVAILABLE",
+        "TIMEOUT",
+        "CANCELLED",
+        "UNKNOWN_OUTCOME",
+        "INTERNAL",
+    ];
+
+    /// <summary>Generated serialized variants of `UserAutomationDeferReason`.</summary>
+    public static readonly string[] USER_AUTOMATION_DEFER_REASONS =
+    [
+        "PAUSED",
+        "RETIRED",
+        "QUEUE_ONE",
+        "COALESCED_LATEST",
+        "RECONCILIATION_REQUIRED",
+    ];
 
     /// <summary>
     /// The closed fold/gap disposition vocabulary, enumerated from the owner's
