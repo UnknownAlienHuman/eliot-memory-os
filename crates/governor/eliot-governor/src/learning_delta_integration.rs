@@ -16,14 +16,14 @@
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_learning_activation_assessment::{
     ActivationAssessmentError, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
+    ObservedAdherence, ObservedDelivery, ObservedRetrieval, ObservedUse,
     assess_learning_activation,
 };
 use eliot_learning_contracts::{
-    ActivationSection, AdherenceSection, AgentAttemptId, AttemptLearningDeltaCandidate,
-    AttemptLearningOutcome, CampaignHarnessOverlayCandidate, CampaignId, CampaignLearningStateView,
-    ContractBinding, DeliverySection, DimensionAssessment, HarnessActivationReceiptCandidate,
-    LearningStateViewRecipe, MetricObservation, OverlayId, RetrievalSection, StageObservation,
-    TargetId,
+    AgentAttemptId, AttemptLearningDeltaCandidate, AttemptLearningOutcome,
+    CampaignHarnessOverlayCandidate, CampaignId, CampaignLearningStateView, ContractBinding,
+    DimensionAssessment, HarnessActivationReceiptCandidate, LearningStateViewRecipe,
+    MetricObservation, OverlayId, StageObservation, TargetId,
 };
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, AttemptEvidence, AttemptStatus,
@@ -360,22 +360,26 @@ pub enum AttemptCloseError {
 /// adherence or benefit. It does not grant authority, schedule an attempt,
 /// promote a candidate, or infer causal benefit.
 ///
-/// Retrieval, delivery, observable activation, adherence and outcome stay
-/// orthogonal (I12.24 l256): the fields are not a success ladder, so every
-/// section arrives as an explicit caller-supplied param and is passed through
-/// to [`assess_learning_activation`] unchanged. In particular:
-/// - `first_qualifying_observable_use_ref` is the caller's; nothing is
-///   fabricated here. An acknowledgement is a delivery/attention signal only
-///   and never substitutes for the qualifying use ref (enforced by assess).
-/// - Delivery packet facts (position, digest, bytes, tokens) arrive as params
-///   from the Context Compiler owner; nothing is synthesized here.
-/// - Missing or inconclusive observability arrives as `UNKNOWN`/`NOT_ASSESSED`
-///   statuses from the caller; nothing defaults to compliance.
+/// Retrieval, delivery, observable activation and adherence stay orthogonal
+/// (I12.24 l256) because they are not a success ladder: the receipt sections
+/// are DERIVED inside [`assess_learning_activation`] from the observations the
+/// Context Compiler and observability owners recorded, never from a
+/// caller-supplied status. The four `Observed*` params are therefore passed
+/// through unchanged and the Governor invents no evidence of its own. In
+/// particular:
+/// - `ObservedUse::observed_any` / `first_qualifying_use_ref` are the
+///   observability owner's; nothing is fabricated here. An acknowledgement is a
+///   delivery/attention signal only and never substitutes for the qualifying
+///   use ref (enforced by assess).
+/// - Delivery packet facts (position, digest, bytes, tokens) arrive inside
+///   `ObservedDelivery` from the Context Compiler owner; nothing is synthesized
+///   here, and an attempt that never attempted delivery stays `NOT_DELIVERED`.
+/// - Missing or inconclusive observability arrives as `observed_any = false` or
+///   `observable = false`; nothing defaults to compliance.
 ///
 /// The caller is the Task-Controller attempt-close path, which supplies the
 /// compiled view/delta/overlay refs, the compiler and render revisions, and
-/// the retrieval/delivery/activation/adherence sections from the Context
-/// Compiler and observability owners. On the `Candidate` arm the constructed
+/// the four owner observation records. On the `Candidate` arm the constructed
 /// [`HarnessActivationReceiptCandidate`] is returned; on the `Incomplete` arm
 /// (caller omitted mandatory receipt identities) an error is returned and no
 /// receipt is fabricated.
@@ -408,11 +412,10 @@ pub fn emit_activation_receipt_at_attempt_close(
     memory_refs: &[ArtifactId],
     procedure_refs: &[ArtifactId],
     preserved_success_ref: Option<&ArtifactId>,
-    eligibility_and_retrieval_reason: Option<&str>,
-    retrieval: &RetrievalSection,
-    delivery: &DeliverySection,
-    activation: &ActivationSection,
-    adherence: &AdherenceSection,
+    retrieval: ObservedRetrieval<'_>,
+    delivery: ObservedDelivery<'_>,
+    observable_use: ObservedUse<'_>,
+    adherence: ObservedAdherence<'_>,
     conflicts_suppression_or_compaction_loss: &[ArtifactId],
     downstream_refs: &[ArtifactId],
     receipt_completeness_and_missing_fields: &[String],
@@ -446,10 +449,9 @@ pub fn emit_activation_receipt_at_attempt_close(
         memory_refs,
         procedure_refs,
         preserved_success_ref,
-        eligibility_and_retrieval_reason,
         retrieval,
         delivery,
-        activation,
+        observable_use,
         adherence,
         conflicts_suppression_or_compaction_loss,
         downstream_refs,
@@ -509,11 +511,10 @@ pub fn close_attempt_with_activation_receipt(
     memory_refs: &[ArtifactId],
     procedure_refs: &[ArtifactId],
     preserved_success_ref: Option<&ArtifactId>,
-    eligibility_and_retrieval_reason: Option<&str>,
-    retrieval: &RetrievalSection,
-    delivery: &DeliverySection,
-    activation: &ActivationSection,
-    adherence: &AdherenceSection,
+    retrieval: ObservedRetrieval<'_>,
+    delivery: ObservedDelivery<'_>,
+    observable_use: ObservedUse<'_>,
+    adherence: ObservedAdherence<'_>,
     conflicts_suppression_or_compaction_loss: &[ArtifactId],
     downstream_refs: &[ArtifactId],
     receipt_completeness_and_missing_fields: &[String],
@@ -548,10 +549,9 @@ pub fn close_attempt_with_activation_receipt(
         memory_refs,
         procedure_refs,
         preserved_success_ref,
-        eligibility_and_retrieval_reason,
         retrieval,
         delivery,
-        activation,
+        observable_use,
         adherence,
         conflicts_suppression_or_compaction_loss,
         downstream_refs,

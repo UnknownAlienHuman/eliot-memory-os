@@ -67,7 +67,8 @@ fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDispositi
             AgentResponseDisposition::RecoveryRequired,
             "RECOVERY_REQUIRED",
         ),
-        FinishAttemptError::UnreconciledMaterialChange => (
+        FinishAttemptError::UnreconciledMaterialChange
+        | FinishAttemptError::UnverifiedChangeHint => (
             AgentResponseDisposition::RecoveryRequired,
             "OBSERVATION_GAP",
         ),

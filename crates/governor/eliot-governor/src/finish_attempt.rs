@@ -59,6 +59,9 @@ pub enum FinishAttemptError {
     /// An unreconciled unknown-origin material change blocks governed acceptance.
     #[error("finish acceptance is blocked by an unreconciled unknown-origin material change")]
     UnreconciledMaterialChange,
+    /// A host/filesystem hint has not completed its Git/content re-read.
+    #[error("finish acceptance is blocked by an unverified host/filesystem change hint")]
+    UnverifiedChangeHint,
     /// The canonical owner or composition rejected the operation.
     #[error("finish composition rejected the attempt: {0}")]
     Composition(#[from] CompositionError),
@@ -941,6 +944,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// scratch clone — so the whole derivation completes with no composition
     /// borrow held across a Kernel exchange. A retained decision replays with
     /// no exchange owed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "finish admission keeps its canonical evidence and change-monitor gates together"
+    )]
     pub fn prepare_finish_decision(
         &self,
         identity: &RequestIdentity,
@@ -1000,6 +1007,9 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "finish owner revision is absent; finish persistence is unavailable".to_owned(),
             )));
+        }
+        if self.change_monitor.has_pending_hints() {
+            return Err(FinishAttemptError::UnverifiedChangeHint);
         }
         if self.change_monitor.has_unknown_material_change() {
             return Err(FinishAttemptError::UnreconciledMaterialChange);

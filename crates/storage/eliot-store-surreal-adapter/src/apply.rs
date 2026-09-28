@@ -916,6 +916,7 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
             | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
             StoreError::Serialization(_) => AttemptOutcome::Cancelled,
             StoreError::MissingReceiptEnvelope
+            | StoreError::UnknownOutcome { .. }
             | StoreError::Unavailable
             | StoreError::SnapshotClosePending { .. } => {
                 AttemptOutcome::Unknown { retry_after_ms: 0 }

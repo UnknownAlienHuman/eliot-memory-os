@@ -64,13 +64,9 @@ pub(crate) async fn dispatch_backup(
             .await
             .map(|receipt| StoreBackupResponse::Restored { receipt }),
         // The accepted #952 validation backend proves a restore batch
-        // without applying it and reports `RestoreValidationReceipt`; that
-        // is the receipt this arm projects. It cannot be honestly
-        // converted into the `SnapshotValidationReceipt` currently named
-        // by the `Validation` response variant (a snapshot handle plus its
-        // authoritative member denominator are not carried by the batch and
-        // must not be invented), so this arm stays pinned to the backend
-        // truth until the wire variant carries the restore receipt.
+        // without applying it and reports `RestoreValidationReceipt`; the
+        // closed `Validation` response variant carries that same receipt
+        // type verbatim, without inventing snapshot fields.
         StoreBackupOperation::Validate(batch) => composition
             .backup_validate(&request.context, batch)
             .await

@@ -174,14 +174,12 @@ fn failure_context_for_operation(
 /// Builds the typed-failure identity context for one admitted backup
 /// envelope (issue #975).
 ///
-/// The stable mutation identity comes from the operation payload itself:
-/// capture/restore/reconcile operations carry their `OperationIdentity`,
-/// page/close carry the owner-issued handle identity, and status carries
-/// the queried operation. Isolated-destination preparation carries no
-/// mutation identity by construction, so the destination digest stands in
-/// as the correlation ref — mirroring `failure_context_for_recovery` —
-/// with `operation_id` left `None`. The fence always comes from the
-/// admitted envelope context, never from payload mirrors.
+/// The stable mutation identity comes from the operation payload when it is
+/// present: capture/restore/reconcile operations carry their
+/// `OperationIdentity`, page/close carry the owner-issued handle identity, and
+/// status carries the queried operation. Isolated-destination preparation has
+/// no payload identity, so it uses the admitted envelope identity. The fence
+/// always comes from the admitted envelope context, never from payload mirrors.
 pub(crate) fn failure_context_for_backup(
     request: &StoreBackupRequest,
 ) -> StoreFailureIdentityContext {
@@ -194,11 +192,9 @@ pub(crate) fn failure_context_for_backup(
             Some(handle.operation_id.clone()),
             Some(handle.idempotency_key.clone()),
         ),
-        StoreBackupOperation::PrepareDestination(destination) => (
-            None,
-            canonical_json_bytes(destination)
-                .ok()
-                .map(|bytes| sha256_hex(&bytes)),
+        StoreBackupOperation::PrepareDestination(_) => (
+            Some(request.identity.operation_id.clone()),
+            Some(request.identity.idempotency_key.clone()),
         ),
         StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => (
             Some(batch.operation.operation_id.clone()),

@@ -1828,6 +1828,46 @@ fn parse_capture_point(
     })
 }
 
+/// Refuses a request whose claimed source is not this adapter's own admitted
+/// store, before any protected read happens.
+///
+/// These two quarters need no observation at all: the active store and
+/// installation identities are pure configuration
+/// (`active_store_identity` returns `(config.database, config.installation_id)`).
+/// They are therefore decidable from the adapter's own config alone, and I5.6
+/// admission step 2 ("validate schema, envelope, size and canonical request
+/// identity") together with step 7 ("normalize paths/resources and
+/// privacy/source visibility") requires them to be *refused*, not detected after
+/// the fact. Leaving them to run only after the canonical member batch would let
+/// all nine member classes be read from the provider and materialised in memory
+/// before a request naming a foreign database is refused — a real but late
+/// refusal, late by exactly one protected read.
+///
+/// [`bind_source_identity`] calls this as its first step, so the rule has one
+/// owner: the two comparisons are not restated there, and the observed quarters
+/// (schema generation and state fence) still run after the capture point exists,
+/// because only a live observation can decide those.
+fn check_active_source_identity(
+    adapter: &SurrealStoreAdapter,
+    request: &SnapshotBeginRequest,
+) -> Result<(), StoreError> {
+    let (active_store, active_installation) =
+        crate::backup_restore::active_store_identity(&adapter.config);
+    if request.source.installation_id != active_installation {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.installation_id",
+            reason: "source is not this installation",
+        });
+    }
+    if request.source.store_id != active_store {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.store_id",
+            reason: "source is not the active store database",
+        });
+    }
+    Ok(())
+}
+
 /// Binds the caller's claimed source identity to the admitted store identity.
 ///
 /// I5.6 steps 2 and 5: validate the envelope and canonical request identity,
@@ -1860,20 +1900,7 @@ fn bind_source_identity(
     point: &CapturePoint,
     request: &SnapshotBeginRequest,
 ) -> Result<(), StoreError> {
-    let (active_store, active_installation) =
-        crate::backup_restore::active_store_identity(&adapter.config);
-    if request.source.installation_id != active_installation {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.installation_id",
-            reason: "source is not this installation",
-        });
-    }
-    if request.source.store_id != active_store {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.store_id",
-            reason: "source is not the active store database",
-        });
-    }
+    check_active_source_identity(adapter, request)?;
     if request.source.schema != point.schema_generation {
         return Err(StoreError::InvalidField {
             field: "snapshot.schema",
@@ -3643,6 +3670,12 @@ pub(crate) async fn begin_snapshot(
     refuse_unservable_window(adapter, &request, started_at_ms)?;
     // The acting principal is named, not assumed, before any protected read.
     bind_capture_principal(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION)?;
+    // A request naming a foreign installation or store is refused here, before
+    // the canonical member batch is read. The remaining source quarters need the
+    // live capture point and are bound after enumeration, in
+    // `reconcile_observation` -> `bind_source_identity`, which re-runs this same
+    // check as its first step.
+    check_active_source_identity(adapter, &request)?;
     verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
     // Bounded opportunistic maintenance: `begin` is the one path a client that
     // never pages and never closes still reaches, so expiry progresses on

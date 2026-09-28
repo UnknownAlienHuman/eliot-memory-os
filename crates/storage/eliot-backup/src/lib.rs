@@ -18,7 +18,7 @@ use eliot_blob_api::{
     BlobError, BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor,
 };
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_security_contracts::PurgeLedgerEntry;
+use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StoreError, WriteReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1984,15 +1984,55 @@ fn refuse_erasure_rehydration(
     bundle: &BackupBundle,
     intent: &RestoreIntent,
 ) -> Result<(), BackupError> {
-    if let RestorePhase::ImportReceipt { operation_id } = &intent.phase {
-        let receipt = bundle
-            .receipts
-            .iter()
-            .find(|receipt| receipt.operation_id.to_string() == *operation_id)
-            .ok_or(BackupError::PlanMismatch)?;
-        receipt
-            .refuse_rehydration_from_erasure()
-            .map_err(BackupError::Store)?;
+    match &intent.phase {
+        RestorePhase::ImportReceipt { operation_id } => {
+            let receipt = bundle
+                .receipts
+                .iter()
+                .find(|receipt| receipt.operation_id.to_string() == *operation_id)
+                .ok_or(BackupError::PlanMismatch)?;
+            receipt
+                .refuse_rehydration_from_erasure()
+                .map_err(BackupError::Store)?;
+        }
+        RestorePhase::ImportSealedBlob { .. } => {
+            refuse_purged_blob_rehydration(bundle)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Refuses a sealed-blob import while the bundle carries a TERMINAL purge
+/// obligation over blob payload (issue #1873; I5.14: "Restore refuses to
+/// resurrect purged payload").
+///
+/// The receipt arm above was the whole of the previous guard, so a bundle whose
+/// erasure evidence is entirely in its purge ledger could still import sealed
+/// blobs — the one phase that actually writes payload bytes into the
+/// destination. `restore_phases` runs `ApplyPurgeLedger` immediately before the
+/// blob imports, so a terminal obligation is already in force at exactly the
+/// point a sealed blob would land.
+///
+/// The obligation is matched by LOCATION, not by digest: a `PurgeLedgerEntry`
+/// names the locations its erasure covers, and the ledger carries no binding
+/// from `subject_ref` to a blob's `locator.hash`. Deciding which single digest
+/// is purged would mean inventing that binding, so this refuses the whole
+/// sealed-blob phase while such an obligation exists. That is the fail-closed
+/// direction and it is the honest one: an obligation nobody can resolve to a
+/// digest is not an obligation the restore may wave through.
+fn refuse_purged_blob_rehydration(bundle: &BackupBundle) -> Result<(), BackupError> {
+    let purged = bundle.purge_ledger.iter().any(|entry| {
+        entry.state == PurgeState::Purged
+            && entry.purged_locations.iter().any(|location| {
+                matches!(
+                    location,
+                    PurgeLocation::Blob | PurgeLocation::BackupRestorePath
+                )
+            })
+    });
+    if purged {
+        return Err(BackupError::Store(StoreError::InvalidReceipt));
     }
     Ok(())
 }

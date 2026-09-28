@@ -45,6 +45,11 @@
 //! | 29 | `require_reobservation` | `AdapterEntry` | typed refusal with exact owner/revision pointer |
 //! | 30 | `request_legacy_delivery` | `InertHandoff` | validates envelope, names handoff, no completion |
 //!
+//! `frozen_spellings_round_trip` was a 31st public item with an empty caller
+//! set; it was removed in #1143 work item 4 because
+//! `tests/legacy_facade.rs` case 26 already proves the same
+//! table/decoder agreement over all ten frozen spellings.
+//!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
 //! copies, `CueKey` constructors/comparison, `CueRecord` construction and

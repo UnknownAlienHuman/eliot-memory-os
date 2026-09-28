@@ -1109,11 +1109,53 @@ impl PinnedRuntimeFile {
     }
 }
 
+/// Upper bound for the single standard-input payload one suspended launch may
+/// carry.
+///
+/// The child is still suspended when the parent writes the payload, so nothing
+/// is draining the pipe yet: a payload larger than the pipe buffer would block
+/// the spawning thread forever with no reader. [`stdin_pipe_buffer_bytes`]
+/// therefore sizes the pipe this launch uses, and this ceiling stays far below
+/// that size, so a conforming payload is always accepted whole without blocking.
+/// An over-limit payload is refused here rather than deadlocking the spawn.
+/// This is a mechanics bound, not a policy: what an admitted launch may put on
+/// the wire is decided by its own owner.
+#[cfg(windows)]
+pub const SUSPENDED_LAUNCH_STDIN_LIMIT: usize = 8 * 1024;
+
+/// Reserved capacity of the standard-input pipe of a launch that carries a
+/// payload.
+///
+/// A zero size would leave the pipe at the system default, which for an
+/// anonymous pipe is small enough that a realistic one-shot request line could
+/// not be written before the child is resumed. The reservation is paid only by
+/// the launches that actually carry a payload; a launch without one still asks
+/// for the default buffer, so its previous behaviour is unchanged.
+#[cfg(windows)]
+const STDIN_PAYLOAD_PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
+/// Returns the reserved standard-input pipe capacity for this launch.
+///
+/// `0` means "system default" and is what a launch without a payload gets, so
+/// that path is byte-for-byte the previous behaviour.
+#[cfg(windows)]
+fn stdin_pipe_buffer_bytes(spec: &SuspendedLaunchSpec) -> u32 {
+    if spec.stdin_payload.is_some() {
+        STDIN_PAYLOAD_PIPE_BUFFER_BYTES
+    } else {
+        0
+    }
+}
+
 /// Complete deterministic input to the Windows suspended-launch primitive.
 ///
 /// This value contains mechanics only. It is not a dispatch permit and carries
 /// no authority. Environment inheritance is intentionally unavailable: callers
 /// must supply the complete child environment explicitly.
+///
+/// The standard-input payload is optional and absent by default, so a launch
+/// that needs no input keeps exactly the previous four-field behaviour: the
+/// pipe is created, never written, and closed.
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuspendedLaunchSpec {
@@ -1121,6 +1163,7 @@ pub struct SuspendedLaunchSpec {
     arguments: Vec<std::ffi::OsString>,
     working_directory: PathBuf,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    stdin_payload: Option<Vec<u8>>,
 }
 
 #[cfg(windows)]
@@ -1155,7 +1198,41 @@ impl SuspendedLaunchSpec {
             arguments,
             working_directory,
             environment,
+            stdin_payload: None,
         })
+    }
+
+    /// Attaches the exact one-shot standard-input bytes this launch hands the
+    /// child.
+    ///
+    /// The bytes are written to the child's standard input and the sole parent
+    /// writer is closed immediately afterwards, so the child reads exactly
+    /// these bytes and then observes deterministic EOF instead of inherited
+    /// console input or a writer that never closes. This is the only channel
+    /// by which a per-user one-shot adapter receives its request line
+    /// (I11.6:3, "Normal delivery is launched through the authorized User
+    /// Broker").
+    ///
+    /// `None` is the default and keeps the previous behaviour exactly: the
+    /// pipe is created, never written, and closed.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for an empty or over-limit payload, and never
+    /// accepts one the suspended child could not drain before the parent
+    /// closed its writer.
+    pub fn with_stdin(mut self, payload: Vec<u8>) -> Result<Self, WindowsAdapterError> {
+        if payload.is_empty() || payload.len() > SUSPENDED_LAUNCH_STDIN_LIMIT {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.stdin_payload = Some(payload);
+        Ok(self)
+    }
+
+    /// Returns the exact one-shot standard-input bytes, if this launch carries
+    /// them.
+    #[must_use]
+    pub fn stdin_payload(&self) -> Option<&[u8]> {
+        self.stdin_payload.as_deref()
     }
 
     #[must_use]
@@ -1677,6 +1754,20 @@ impl Drop for ProcThreadAttributeList {
 
 #[cfg(windows)]
 fn inheritable_pipe() -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsAdapterError> {
+    inheritable_pipe_with_buffer(0)
+}
+
+/// Creates one inheritable anonymous pipe pair with an explicit reserved
+/// capacity.
+///
+/// A `buffer_bytes` of `0` asks for the system default, which is the historical
+/// behaviour of every launch. A non-zero value is used only by the standard
+/// input of a launch that carries a one-shot payload, so that payload fits
+/// before the suspended child is resumed (see [`stdin_pipe_buffer_bytes`]).
+#[cfg(windows)]
+fn inheritable_pipe_with_buffer(
+    buffer_bytes: u32,
+) -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsAdapterError> {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Pipes::CreatePipe;
     let mut read = std::ptr::null_mut();
@@ -1688,7 +1779,15 @@ fn inheritable_pipe() -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsA
         bInheritHandle: 1,
     };
     // SAFETY: output pointers and security attributes are valid for the call.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) } == 0 {
+    if unsafe {
+        CreatePipe(
+            &raw mut read,
+            &raw mut write,
+            &raw const attributes,
+            buffer_bytes,
+        )
+    } == 0
+    {
         return Err(last_windows_adapter_error());
     }
     Ok((
@@ -1708,6 +1807,57 @@ fn make_non_inheritable(
     } else {
         Ok(())
     }
+}
+
+/// Writes the launch's one-shot standard-input payload to the child's stdin
+/// pipe.
+///
+/// Absent payload is a no-op, so a launch that needs no input keeps the exact
+/// previous behaviour and the comment at the call sites stays true. A present
+/// payload is written whole or not at all: an anonymous pipe `WriteFile` either
+/// accepts all `nLength` bytes or fails, so a short write is treated as a
+/// mechanics failure rather than a partial record the child would act on. The
+/// write happens while the parent still holds the sole writer, and the caller
+/// closes that writer immediately afterwards, so the child reads these exact
+/// bytes and then observes deterministic EOF.
+///
+/// The caller must have already bounded the payload by
+/// [`SUSPENDED_LAUNCH_STDIN_LIMIT`]: the child is still suspended here, so a
+/// larger write would block the parent instead of returning.
+#[cfg(windows)]
+fn deliver_stdin_payload(
+    writer: &OwnedKernelHandle,
+    payload: Option<&[u8]>,
+) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    if payload.is_empty() || payload.len() > SUSPENDED_LAUNCH_STDIN_LIMIT {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let expected = u32::try_from(payload.len()).map_err(|_| WindowsAdapterError::InvalidInput)?;
+    let mut written: u32 = 0;
+    // SAFETY: `writer` is the live, non-inheritable write end of the child's
+    // stdin pipe; `payload` is a live slice of exactly `expected` bytes;
+    // `written` is a live exclusive local; a null OVERLAPPED requests the
+    // synchronous call, so no event, iocp, or completion path is used.
+    let accepted = unsafe {
+        WriteFile(
+            writer.0,
+            payload.as_ptr(),
+            expected,
+            &raw mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    if accepted == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    if written != expected {
+        return Err(WindowsAdapterError::Failed);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1997,7 +2147,7 @@ fn spawn_existing_job_member(
     let mut environment = command_environment(&spec.environment);
     let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
         .map_err(|error| windows_adapter_from_io(&error))?;
-    let (stdin_read, stdin_write) = inheritable_pipe()?;
+    let (stdin_read, stdin_write) = inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
     let (stdout_read, stdout_write) = inheritable_pipe()?;
     let (stderr_read, stderr_write) = inheritable_pipe()?;
     make_non_inheritable(stdin_write.0)?;
@@ -2065,6 +2215,11 @@ fn spawn_existing_job_member(
         }
         return Err(WindowsAdapterError::Failed);
     }
+    // Parent keeps only the read sides. The one-shot request line, when the
+    // admitted launch carried one, is written before the sole parent stdin
+    // writer is closed, so the child reads that exact line and then observes
+    // deterministic EOF instead of inherited input.
+    let stdin_delivery = deliver_stdin_payload(&stdin_write, spec.stdin_payload.as_deref());
     drop(stdin_read);
     drop(stdin_write);
     drop(stdout_write);
@@ -2075,6 +2230,7 @@ fn spawn_existing_job_member(
         process: process.0,
         armed: true,
     };
+    stdin_delivery?;
     let spawn_identity = inspect_process_handle(information.dwProcessId, process.0)
         .map_err(|error| windows_adapter_from_io(&error))?;
     let mut inner = ExistingJobMemberHandles {
@@ -2662,7 +2818,8 @@ impl SuspendedJobChild {
         let mut environment = command_environment(&spec.environment);
         let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
             .map_err(|error| windows_adapter_from_io(&error))?;
-        let (stdin_read, stdin_write) = inheritable_pipe()?;
+        let (stdin_read, stdin_write) =
+            inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
         let (stdout_read, stdout_write) = inheritable_pipe()?;
         let (stderr_read, stderr_write) = inheritable_pipe()?;
         make_non_inheritable(stdin_write.0)?;
@@ -2740,8 +2897,13 @@ impl SuspendedJobChild {
             }
             return Err(WindowsAdapterError::Failed);
         }
-        // Parent keeps only the read sides. Closing the sole parent stdin
-        // writer gives the child deterministic EOF instead of inherited input.
+        // Parent keeps only the read sides. When the admitted launch carried a
+        // one-shot request line it is written to the child's stdin first;
+        // closing the sole parent stdin writer then gives the child that exact
+        // line followed by deterministic EOF instead of inherited input. The
+        // delivery outcome is surfaced only after the kill-on-reap guard below
+        // is armed, so a failed write can never leave an unresumed child.
+        let stdin_delivery = deliver_stdin_payload(&stdin_write, spec.stdin_payload.as_deref());
         drop(stdin_read);
         drop(stdin_write);
         drop(stdout_write);
@@ -2752,6 +2914,7 @@ impl SuspendedJobChild {
             process: process.0,
             armed: true,
         };
+        stdin_delivery?;
         let spawn_identity = inspect_process_handle(information.dwProcessId, process.0)
             .map_err(|error| windows_adapter_from_io(&error))?;
         let inner = JobChildHandles {
