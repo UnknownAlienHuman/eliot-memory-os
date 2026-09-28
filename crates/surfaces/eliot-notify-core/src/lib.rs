@@ -9,12 +9,17 @@
 #![forbid(unsafe_code)]
 
 mod notify_declaration;
+mod telegram_experiment;
 mod user_automation;
 
 pub use notify_declaration::{
     FallbackVerificationDeclaration, NOTIFY_FALLBACK_VERIFIER_RELATIVE, NotifyDeclarationError,
     NotifyDeclarationInputs, RenderedNotifyDeclaration, decode_fallback_key_hex,
     render_notify_fallback_declaration, validate_fallback_declaration,
+};
+pub use telegram_experiment::{
+    AdapterLifecycle, PromotionError, PromotionEvidence, TELEGRAM_ADAPTER_ID, TelegramExperiment,
+    adapter_promotion_status, promote_adapter_to_default,
 };
 pub use user_automation::{
     UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
