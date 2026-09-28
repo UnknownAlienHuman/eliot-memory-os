@@ -3395,7 +3395,7 @@ struct MaintenanceTriggerPageCursorState {
     has_more: bool,
     served: bool,
     #[serde(default)]
-    gap_cursor_v2: bool,
+    gap_cursor_version: Option<u8>,
     #[serde(default)]
     gap_after_key: Option<String>,
     #[serde(default)]
@@ -3411,7 +3411,30 @@ struct MaintenanceTriggerPageCursorState {
 }
 
 impl MaintenanceTriggerPageCursorState {
+    fn uses_gap_cursor_v2(&self) -> bool {
+        self.gap_cursor_version == Some(2)
+    }
+
     fn validate(&self) -> Result<(), OrsError> {
+        self.validate_shape()?;
+        if self.uses_gap_cursor_v2() {
+            validate_maintenance_trigger_gap_cursor_state(self)?;
+        }
+        if self.request_continuation.is_some()
+            && !maintenance_trigger_page_cursor_request_matches(self)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_page_cursor",
+                reason: "request continuation does not bind its stored page window".to_owned(),
+            });
+        }
+        if self.uses_gap_cursor_v2() {
+            return validate_maintenance_trigger_page_cursor_continuation_v2(self);
+        }
+        self.validate_legacy_next_continuation()
+    }
+
+    fn validate_shape(&self) -> Result<(), OrsError> {
         if self.contract_version != crate::CONTRACT_VERSION
             || validate_text(&self.cursor_id, "maintenance_trigger_page_cursor_id").is_err()
             || validate_text(
@@ -3436,7 +3459,8 @@ impl MaintenanceTriggerPageCursorState {
             || (self.active_only
                 && (self.active_member_start > self.active_member_end
                     || self.active_member_end > self.active_member_count))
-            || (!self.gap_cursor_v2
+            || self.gap_cursor_version.is_some_and(|version| version != 2)
+            || (!self.uses_gap_cursor_v2()
                 && (self.gap_after_key.is_some()
                     || self.gap_page_end_key.is_some()
                     || self.gap_high_water_key.is_some()
@@ -3449,48 +3473,10 @@ impl MaintenanceTriggerPageCursorState {
                 reason: "durable cursor fields are malformed".to_owned(),
             });
         }
-        if self.gap_cursor_v2 {
-            validate_maintenance_trigger_gap_cursor_state(self)?;
-        }
-        if let Some(request) = self.request_continuation.as_deref() {
-            let (start, end) = if self.gap_cursor_v2 {
-                (self.window_start_exclusive, self.window_end_inclusive)
-            } else if self.active_only {
-                (self.active_member_start, self.active_member_end)
-            } else {
-                (self.window_start_exclusive, self.window_end_inclusive)
-            };
-            let expected_request = if self.gap_cursor_v2 {
-                maintenance_trigger_page_continuation_v2(
-                    &self.cursor_id,
-                    self.high_water_sequence,
-                    start,
-                    end,
-                    self.limit,
-                    self.gap_after_key.as_deref(),
-                    self.gap_high_water_key.as_deref(),
-                    self.gap_snapshot_count.as_deref().unwrap_or_default(),
-                    self.gap_scanned_before,
-                )
-            } else {
-                maintenance_trigger_page_continuation(
-                    &self.cursor_id,
-                    self.high_water_sequence,
-                    start,
-                    end,
-                    self.limit,
-                )
-            };
-            if request != expected_request {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "maintenance_trigger_page_cursor",
-                    reason: "request continuation does not bind its stored page window".to_owned(),
-                });
-            }
-        }
-        if self.gap_cursor_v2 {
-            return validate_maintenance_trigger_page_cursor_continuation_v2(self);
-        }
+        Ok(())
+    }
+
+    fn validate_legacy_next_continuation(&self) -> Result<(), OrsError> {
         let expected_next = if self.has_more {
             let (start, end) = if self.active_only {
                 let next_end = self
@@ -3523,6 +3509,39 @@ impl MaintenanceTriggerPageCursorState {
         }
         Ok(())
     }
+}
+
+fn maintenance_trigger_page_cursor_request_matches(
+    state: &MaintenanceTriggerPageCursorState,
+) -> bool {
+    let Some(request) = state.request_continuation.as_deref() else {
+        return true;
+    };
+    let (start, end) = if state.uses_gap_cursor_v2() {
+        (state.window_start_exclusive, state.window_end_inclusive)
+    } else if state.active_only {
+        (state.active_member_start, state.active_member_end)
+    } else {
+        (state.window_start_exclusive, state.window_end_inclusive)
+    };
+    let expected = if state.uses_gap_cursor_v2() {
+        maintenance_trigger_page_continuation_v2(
+            state,
+            start,
+            end,
+            state.gap_after_key.as_deref(),
+            state.gap_scanned_before,
+        )
+    } else {
+        maintenance_trigger_page_continuation(
+            &state.cursor_id,
+            state.high_water_sequence,
+            start,
+            end,
+            state.limit,
+        )
+    };
+    request == expected
 }
 
 fn validate_maintenance_trigger_gap_cursor_state(
@@ -3644,14 +3663,10 @@ fn validate_maintenance_trigger_page_cursor_continuation_v2(
     let expected_more = lifecycle_has_more || gap_has_more;
     let expected_next = expected_more.then(|| {
         maintenance_trigger_page_continuation_v2(
-            &state.cursor_id,
-            state.high_water_sequence,
+            state,
             next_start,
             next_end,
-            state.limit,
             next_gap_after,
-            state.gap_high_water_key.as_deref(),
-            state.gap_snapshot_count.as_deref().unwrap_or_default(),
             state.gap_scanned_after,
         )
     });
@@ -4012,26 +4027,24 @@ fn maintenance_trigger_page_continuation(
 }
 
 fn maintenance_trigger_page_continuation_v2(
-    cursor_id: &str,
-    high_water_sequence: u64,
+    state: &MaintenanceTriggerPageCursorState,
     after_sequence: u64,
     end_sequence: u64,
-    limit: u16,
     gap_after_key: Option<&str>,
-    gap_high_water_key: Option<&str>,
-    gap_snapshot_count: &str,
     gap_scanned_before: u64,
 ) -> String {
     let gap_after = gap_after_key.map_or_else(
         || "none".to_owned(),
         |key| format!("some:{}", crate::model::sha256_hex(key.as_bytes())),
     );
-    let gap_high_water = gap_high_water_key.map_or_else(
+    let gap_high_water = state.gap_high_water_key.as_deref().map_or_else(
         || "none".to_owned(),
         |key| format!("some:{}", crate::model::sha256_hex(key.as_bytes())),
     );
+    let gap_snapshot_count = state.gap_snapshot_count.as_deref().unwrap_or_default();
     let material = format!(
-        "eliot.ors.maintenance-trigger-page.v2\0{cursor_id}\0{high_water_sequence}\0{after_sequence}\0{end_sequence}\0{limit}\0{gap_after}\0{gap_high_water}\0{gap_snapshot_count}\0{gap_scanned_before}"
+        "eliot.ors.maintenance-trigger-page.v2\0{}\0{}\0{after_sequence}\0{end_sequence}\0{}\0{gap_after}\0{gap_high_water}\0{gap_snapshot_count}\0{gap_scanned_before}",
+        state.cursor_id, state.high_water_sequence, state.limit,
     );
     crate::model::sha256_hex(material.as_bytes())
 }
@@ -5026,50 +5039,69 @@ fn build_maintenance_trigger_page_cursor(
     if state.limit == 0 || state.limit > crate::MAX_MAINTENANCE_TRIGGER_PAGE {
         return Err(OrsError::InvalidCursorLimit);
     }
-    if state.gap_cursor_v2 {
-        if state.window_start_exclusive > state.high_water_sequence {
-            return Err(OrsError::InvalidTransition);
-        }
-        state.window_end_inclusive = state
-            .window_start_exclusive
+    state.validate_shape()?;
+    match state.gap_cursor_version {
+        Some(2) => build_maintenance_trigger_page_cursor_v2(&mut state)?,
+        None => build_legacy_maintenance_trigger_page_cursor(&mut state)?,
+        Some(_) => return Err(OrsError::DuplicateConflict),
+    }
+    if state.request_continuation.is_some()
+        && !maintenance_trigger_page_cursor_request_matches(&state)
+    {
+        return Err(OrsError::DuplicateConflict);
+    }
+    state.validate()?;
+    Ok(state)
+}
+
+fn build_maintenance_trigger_page_cursor_v2(
+    state: &mut MaintenanceTriggerPageCursorState,
+) -> Result<(), OrsError> {
+    if state.window_start_exclusive > state.high_water_sequence {
+        return Err(OrsError::InvalidTransition);
+    }
+    state.window_end_inclusive = state
+        .window_start_exclusive
+        .saturating_add(u64::from(state.limit))
+        .min(state.high_water_sequence);
+    let lifecycle_has_more = state.window_end_inclusive < state.high_water_sequence;
+    let next_start = if lifecycle_has_more {
+        state.window_end_inclusive
+    } else {
+        state.high_water_sequence
+    };
+    let next_end = if lifecycle_has_more {
+        next_start
             .saturating_add(u64::from(state.limit))
-            .min(state.high_water_sequence);
-        let lifecycle_has_more = state.window_end_inclusive < state.high_water_sequence;
-        let next_start = if lifecycle_has_more {
-            state.window_end_inclusive
-        } else {
-            state.high_water_sequence
-        };
-        let next_end = if lifecycle_has_more {
-            next_start
-                .saturating_add(u64::from(state.limit))
-                .min(state.high_water_sequence)
-        } else {
-            state.high_water_sequence
-        };
-        let next_gap_after = state
-            .gap_page_end_key
-            .as_deref()
-            .or(state.gap_after_key.as_deref());
-        let gap_has_more = state
-            .gap_high_water_key
-            .as_deref()
-            .is_some_and(|high| next_gap_after.is_none_or(|after| after < high));
-        state.has_more = lifecycle_has_more || gap_has_more;
-        state.next_continuation = state.has_more.then(|| {
-            maintenance_trigger_page_continuation_v2(
-                &state.cursor_id,
-                state.high_water_sequence,
-                next_start,
-                next_end,
-                state.limit,
-                next_gap_after,
-                state.gap_high_water_key.as_deref(),
-                state.gap_snapshot_count.as_deref().unwrap_or_default(),
-                state.gap_scanned_after,
-            )
-        });
-    } else if state.active_only {
+            .min(state.high_water_sequence)
+    } else {
+        state.high_water_sequence
+    };
+    let next_gap_after = state
+        .gap_page_end_key
+        .as_deref()
+        .or(state.gap_after_key.as_deref());
+    let gap_has_more = state
+        .gap_high_water_key
+        .as_deref()
+        .is_some_and(|high| next_gap_after.is_none_or(|after| after < high));
+    state.has_more = lifecycle_has_more || gap_has_more;
+    state.next_continuation = state.has_more.then(|| {
+        maintenance_trigger_page_continuation_v2(
+            state,
+            next_start,
+            next_end,
+            next_gap_after,
+            state.gap_scanned_after,
+        )
+    });
+    Ok(())
+}
+
+fn build_legacy_maintenance_trigger_page_cursor(
+    state: &mut MaintenanceTriggerPageCursorState,
+) -> Result<(), OrsError> {
+    if state.active_only {
         if state.active_member_start > state.active_member_count {
             return Err(OrsError::InvalidTransition);
         }
@@ -5116,41 +5148,7 @@ fn build_maintenance_trigger_page_cursor(
             )
         });
     }
-    if let Some(request) = state.request_continuation.as_deref() {
-        let (start, end) = if state.gap_cursor_v2 {
-            (state.window_start_exclusive, state.window_end_inclusive)
-        } else if state.active_only {
-            (state.active_member_start, state.active_member_end)
-        } else {
-            (state.window_start_exclusive, state.window_end_inclusive)
-        };
-        let expected_request = if state.gap_cursor_v2 {
-            maintenance_trigger_page_continuation_v2(
-                &state.cursor_id,
-                state.high_water_sequence,
-                start,
-                end,
-                state.limit,
-                state.gap_after_key.as_deref(),
-                state.gap_high_water_key.as_deref(),
-                state.gap_snapshot_count.as_deref().unwrap_or_default(),
-                state.gap_scanned_before,
-            )
-        } else {
-            maintenance_trigger_page_continuation(
-                &state.cursor_id,
-                state.high_water_sequence,
-                start,
-                end,
-                state.limit,
-            )
-        };
-        if request != expected_request {
-            return Err(OrsError::DuplicateConflict);
-        }
-    }
-    state.validate()?;
-    Ok(state)
+    Ok(())
 }
 
 fn next_maintenance_trigger_page_cursor(
@@ -5164,7 +5162,7 @@ fn next_maintenance_trigger_page_cursor(
     let mut next = state.clone();
     next.request_continuation = Some(continuation.clone());
     next.served = false;
-    if state.gap_cursor_v2 {
+    if state.uses_gap_cursor_v2() {
         next.window_start_exclusive = if state.window_end_inclusive < state.high_water_sequence {
             state.window_end_inclusive
         } else {
@@ -5194,7 +5192,7 @@ fn prepare_maintenance_trigger_page_cursor(
     write: &redb::WriteTransaction,
     mut state: MaintenanceTriggerPageCursorState,
 ) -> Result<MaintenanceTriggerPageCursorState, OrsError> {
-    if !state.gap_cursor_v2 {
+    if !state.uses_gap_cursor_v2() {
         return build_maintenance_trigger_page_cursor(state);
     }
     state.window_end_inclusive = state
@@ -5293,7 +5291,7 @@ fn resolve_maintenance_trigger_page_cursor(
         {
             return Err(OrsError::DuplicateConflict);
         }
-        if state.gap_cursor_v2 {
+        if state.uses_gap_cursor_v2() {
             validate_maintenance_trigger_page_index_counts(write, state.high_water_sequence)?;
             validate_maintenance_trigger_gap_snapshot(write, &state)?;
         }
@@ -5331,7 +5329,7 @@ fn resolve_maintenance_trigger_page_cursor(
             next_continuation: None,
             has_more: false,
             served: true,
-            gap_cursor_v2: true,
+            gap_cursor_version: Some(2),
             gap_after_key: None,
             gap_page_end_key: None,
             gap_high_water_key,
@@ -5415,7 +5413,7 @@ fn persist_maintenance_trigger_following_page_cursor(
         {
             return Err(OrsError::DuplicateConflict);
         }
-        if existing.gap_cursor_v2 {
+        if existing.uses_gap_cursor_v2() {
             validate_maintenance_trigger_gap_snapshot(write, &existing)?;
         }
         return Ok(());
@@ -5445,7 +5443,7 @@ fn resolve_maintenance_trigger_recovery_cursor(
         {
             return Err(OrsError::DuplicateConflict);
         }
-        if state.gap_cursor_v2 {
+        if state.uses_gap_cursor_v2() {
             validate_maintenance_trigger_page_index_counts(write, state.high_water_sequence)?;
             validate_maintenance_trigger_gap_snapshot(write, &state)?;
         }
@@ -5484,7 +5482,7 @@ fn resolve_maintenance_trigger_recovery_cursor(
             next_continuation: None,
             has_more: false,
             served: true,
-            gap_cursor_v2: true,
+            gap_cursor_version: Some(2),
             gap_after_key: None,
             gap_page_end_key: None,
             gap_high_water_key,
@@ -5610,7 +5608,7 @@ fn maintenance_trigger_page_member_sequences(
     state: &MaintenanceTriggerPageCursorState,
 ) -> Result<Vec<u64>, OrsError> {
     let mut member_sequences = Vec::new();
-    if state.gap_cursor_v2 && state.active_only {
+    if state.uses_gap_cursor_v2() && state.active_only {
         let members = write
             .open_table(MAINTENANCE_TRIGGER_RECOVERY_PAGE_MEMBERS)
             .map_err(storage)?;
@@ -5740,7 +5738,7 @@ fn maintenance_trigger_page_gap_projection(
     write: &redb::WriteTransaction,
     state: &MaintenanceTriggerPageCursorState,
 ) -> Result<Vec<MaintenanceTriggerGapStorageRecord>, OrsError> {
-    if state.gap_cursor_v2 {
+    if state.uses_gap_cursor_v2() {
         return Ok(maintenance_trigger_page_gap_records(write, state)?
             .into_iter()
             .map(|(_, gap)| gap)
@@ -5813,7 +5811,7 @@ fn validate_maintenance_trigger_gap_snapshot(
     write: &redb::WriteTransaction,
     state: &MaintenanceTriggerPageCursorState,
 ) -> Result<(), OrsError> {
-    if !state.gap_cursor_v2 {
+    if !state.uses_gap_cursor_v2() {
         return Err(OrsError::DuplicateConflict);
     }
     let gap_count = write
@@ -5907,7 +5905,7 @@ fn maintenance_trigger_page_gap_records(
         return Ok(Vec::new());
     }
     let sequence_keys = {
-        let mut index = write
+        let index = write
             .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
             .map_err(storage)?;
         let range = match state.gap_after_key.as_deref() {
@@ -6165,8 +6163,7 @@ fn validate_maintenance_trigger_page_index_counts(
             reason: "current sequence high-water precedes a frozen page cursor".to_owned(),
         });
     }
-    let expected_count =
-        usize::try_from(current_high_water).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let expected_count = current_high_water;
     let lifecycle_count = write
         .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
         .map_err(storage)?
