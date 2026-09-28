@@ -1009,11 +1009,11 @@ impl BridgeEventHandoffRow {
         Ok(())
     }
 
-    /// Reports whether this row carries a complete receiving-owner receipt
-    /// (issue #2731, item 1): the reconciled state with the full presented
-    /// triple (covering frontier plus admitting revision/incarnation).
-    /// Ownerless rows and rows reconciled before the receipt existed report
-    /// false — their old state string alone is never receiver evidence.
+    /// Checks the persisted reconcile tuple. Despite this helper's legacy
+    /// name, the tuple is recorded from the presenting producer's frontier
+    /// and owner snapshot; it is not proof of receiving-owner durable
+    /// acceptance. Ownerless rows and rows reconciled before the tuple existed
+    /// report false.
     fn has_receiver_receipt(&self) -> bool {
         self.state == BRIDGE_EVENT_HANDOFF_RECONCILED
             && !self.owner_namespace.is_empty()
@@ -1023,21 +1023,13 @@ impl BridgeEventHandoffRow {
             && self.reconcile_owner_incarnation != 0
     }
 
-    /// Reports whether this row may retire once its payload is gone (issue
-    /// #2731, items 1, 4 and 5). A receipt-complete row covered by the
-    /// receiver's acked cursor is eligible even above the retained
-    /// compacted boundary: the boundary advances only past the retained
-    /// 512-row acked window, so a stream that stops producing at or below
-    /// the window would otherwise hold its receipt-complete charges
-    /// against the table-global budget forever — the exact quiet-stream
-    /// lifetime quota item 4 forbids. Otherwise the admitted terminal
-    /// disposition still applies: still `handed_off` but covered by the
-    /// receiver's acked cursor at or below the retained compacted
-    /// boundary, whose missing row answers the explicit retired
-    /// disposition instead of a fresh event. Pending rows (above the
-    /// boundary without the exact receipt) and ownerless legacy rows never
-    /// report true: unknown and pending work is never evicted to admit new
-    /// work.
+    /// Reports the current eligibility decision (issue #2731). The existing
+    /// reconcile tuple is only producer-presented frontier/owner data, not a
+    /// receiver's durable receipt, so this predicate does not establish the
+    /// complete handoff terminal condition. This edit only rejects a
+    /// `handed_off` row without that tuple after producer acknowledgement and
+    /// compaction pass it. The pre-existing tuple-based path remains
+    /// unproven; the full receiving-owner disposition contract is unresolved.
     fn retirement_eligible(&self, acked_cursor: u64, compacted_boundary: u64) -> bool {
         if self.owner_namespace.is_empty() || self.sequence == 0 {
             return false;
@@ -1051,7 +1043,7 @@ impl BridgeEventHandoffRow {
         if self.has_receiver_receipt() {
             return true;
         }
-        self.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF && self.sequence <= acked_cursor
+        self.has_receiver_receipt()
     }
 }
 
@@ -13742,13 +13734,13 @@ impl RedbRecoveryStore {
     /// Retires one namespace's eligible handoffs inside the recovery
     /// transaction (issue #2731, items 4 and 5). Eligibility is evaluated
     /// per row by [`BridgeEventHandoffRow::retirement_eligible`] against
-    /// the current acked cursor and compacted boundary; a receipt-complete
-    /// row covered by the acked cursor is eligible even above the compacted
-    /// boundary, so quiet streams that stop producing at or below the
-    /// retained acked window still release their charges instead of holding
-    /// the table-global budget forever. An eligible row with no live
-    /// payload deletes by exact key. An eligible receipt-complete row whose
-    /// payload is still retained terminalizes: its #2730 replay commitment
+    /// the current acked cursor and compacted boundary. Its existing
+    /// `has_receiver_receipt` predicate is producer-presented frontier/owner
+    /// data, not a receiving-owner durable receipt; tuple-based retirement
+    /// therefore remains unproven. An eligible row with no live payload
+    /// deletes by exact key under the current predicate. An eligible row
+    /// matching that producer-presented tuple whose payload is still retained
+    /// terminalizes: its #2730 replay commitment
     /// is written first — the identical evidence window-driven compaction
     /// retains, under the same per-stream and total pressure bounds — then
     /// the payload record and the handoff row delete together and the
@@ -13756,10 +13748,13 @@ impl RedbRecoveryStore {
     /// exact replays keep answering duplicate from the commitment, old
     /// occurrences below the boundary keep answering retired, and the
     /// repair step (which restores handoffs only for retained records)
-    /// never resurrects them. Rows with a live payload but no receiver
-    /// receipt are never touched: unknown or pending work is never evicted
-    /// to admit new work, and a torn record/handoff identity mismatch fails
-    /// closed by skipping the row instead of guessing. Deletes are by exact
+    /// never resurrects them. Rows with a live payload but without the
+    /// persisted producer-presented tuple are never touched; this only blocks
+    /// the separate `handed_off` plus acked/compacted fallback and does not
+    /// make tuple-based retirement safe. The producer tuple's downstream
+    /// disposition is not verified here; torn record/handoff identity
+    /// mismatches fail closed by skipping the row instead of guessing. Deletes are by
+    /// exact
     /// key, so the charge releases exactly once. At most `budget` rows
     /// delete or terminalize per call; `retirement_continuation` reports
     /// whether eligible rows remain for the next legitimate recovery entry.
