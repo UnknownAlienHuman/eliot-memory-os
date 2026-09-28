@@ -78,18 +78,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use eliot_build_test_graph::{
-    BuildFingerprint, BuildFlight, BuildTestGraph, CacheLookup, ChangeImpactDirective, ChangeSet,
-    GraphError, ModuleTestCapsuleRevision, PublicContractDigest, ResourceKind,
-    SingleFlightBuildRegistry,
+    BuildFingerprint, BuildFlight, BuildTestGraph, CacheLookup, CandidateIdentity,
+    ChangeImpactDirective, ChangeSet, GovernedWorkEnvelope, GraphError, ModuleTestCapsuleRevision,
+    PublicContractDigest, ResourceKind, RuntimeEnvironmentLease, SingleFlightBuildRegistry,
+    WorkEnvelopeError,
 };
 use eliot_instrument_api::ExecutionStatus;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::RawEvidence;
-use crate::work_envelope::{
-    CandidateIdentity, GovernedWorkEnvelope, RuntimeEnvironmentLease, WorkEnvelopeError,
-};
 
 /// Cargo subcommand the projection emits for both change classes. I18.26
 /// line 10 names `cargo check -p` as the private-change shape, and line 13

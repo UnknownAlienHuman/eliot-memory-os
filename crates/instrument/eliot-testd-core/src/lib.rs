@@ -7,6 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_build_test_graph::{
+    CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+};
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
 };
@@ -1391,6 +1394,12 @@ pub struct TestJob {
     /// rows admitted without a layout; it never selects a fallback root.
     #[serde(default)]
     pub target_layout: Option<TargetLayoutBinding>,
+    /// Governed work-execution envelope allocated at submission (issue
+    /// #1897): worktree, fingerprint, mode, namespace inputs, claims, and
+    /// leases. `None` preserves the pre-lane authority for rows admitted
+    /// without a lane; it never selects fallback identity.
+    #[serde(default)]
+    pub work_envelope: Option<GovernedWorkEnvelope>,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Declared job class. The class, not the raw `priority` integer, is the
@@ -1827,6 +1836,13 @@ pub struct TestdVerifierJobSubmission {
     /// submitting owner derived them from a workspace/checkout/class layout.
     #[serde(default)]
     pub target_layout: Option<TargetLayoutBinding>,
+    /// Lane identity the work item is allocated in (issue #1897). The store
+    /// allocates the governed envelope from this identity plus the declared
+    /// resource claims in `metadata` and persists it on the job; `None`
+    /// preserves the pre-lane authority for submissions whose lane producer
+    /// does not exist yet.
+    #[serde(default)]
+    pub lane: Option<LaneIdentity>,
     pub priority: i32,
     /// Declared class and resource requirements for this verification job.
     /// A submission that omits it is a verification job with the default
@@ -2545,6 +2561,12 @@ pub struct VerificationReceipt {
     /// receipts; populated additively without changing legacy handle lineage.
     #[serde(default)]
     pub typed_evidence: Vec<TestdProcessEvidenceBundle>,
+    /// Lane identity the emitting work item was allocated in (issue #1897):
+    /// build fingerprint digest, candidate, and contract revision. `None`
+    /// preserves the pre-lane authority for receipts of jobs admitted
+    /// without a lane; it never stands in for an allocated identity.
+    #[serde(default)]
+    pub lane_identity: Option<CandidateIdentity>,
 }
 
 /// Evaluates the admitted TestD profile after the process observation has
@@ -2637,6 +2659,23 @@ impl VerificationReceipt {
         }
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
+        // Issue #1897 (W5): the emitted result carries the exact lane
+        // identity of the work item that produced it. An enveloped job
+        // without an identity, a forged identity without a lane, and an
+        // identity that disagrees with the lane all refuse; bare presence
+        // is never enough, the content is compared.
+        match (job.work_envelope.as_ref(), self.lane_identity.as_ref()) {
+            (Some(envelope), Some(identity)) => {
+                let expected = envelope
+                    .candidate_identity()
+                    .map_err(|_| TestdError::InvalidBinding)?;
+                if identity != &expected {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => return Err(TestdError::InvalidBinding),
+            (None, None) => {}
+        }
         self.started_at
             .validate()
             .map_err(|_| TestdError::InvalidBinding)?;
@@ -2913,6 +2952,15 @@ impl EvidenceCollector {
             raw_artifacts,
             normalized,
             typed_evidence: self.typed_bundles(),
+            // Issue #1897 (W5): attach the allocated lane identity to the
+            // emitted result. The envelope was validated when the job row
+            // committed, so identity derivation fails only on a corrupt
+            // row; that failure still refuses loudly at `finish` instead
+            // of emitting an unattributed result for an enveloped job.
+            lane_identity: job
+                .work_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.candidate_identity().ok()),
         }
     }
 }
@@ -3763,6 +3811,7 @@ impl TestdStore {
             permit,
             target_roots,
             None,
+            None,
             priority,
             metadata,
             at_ms,
@@ -3794,6 +3843,7 @@ impl TestdStore {
             permit,
             target_roots,
             Some(target_layout),
+            None,
             priority,
             metadata,
             at_ms,
@@ -3813,6 +3863,7 @@ impl TestdStore {
         permit: ProcessAdmissionPermit,
         target_roots: TargetRoots,
         target_layout: Option<TargetLayoutBinding>,
+        lane: Option<LaneIdentity>,
         priority: i32,
         metadata: JobSubmissionMetadata,
         at_ms: u64,
@@ -3898,6 +3949,35 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        // Issue #1897 (W1): allocate the governed work-execution envelope
+        // for the productive submission path. The claims are the job's own
+        // declared exclusive resources — the submission carries no second
+        // claim set, so the tuple cannot disagree with the scheduler's
+        // declaration — and the leases stay empty until `claim_next`
+        // grants them.
+        let work_envelope = lane
+            .map(|identity| {
+                GovernedWorkEnvelope::allocate(
+                    identity,
+                    resource_profile.exclusive_resources.clone(),
+                    Vec::new(),
+                )
+            })
+            .transpose()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if let (Some(envelope), Some(layout)) = (work_envelope.as_ref(), target_layout.as_ref())
+            && let Some(expected) = layout.build_fingerprint.as_deref()
+        {
+            // The layout binding names the exact fingerprint its bound
+            // output must satisfy; an allocated lane that disagrees with
+            // it is refused rather than persisted beside it.
+            let digest = envelope
+                .normalized_fingerprint()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if expected != digest {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
@@ -3911,6 +3991,7 @@ impl TestdStore {
             priority,
             job_class,
             &resource_profile,
+            work_envelope.as_ref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4011,6 +4092,7 @@ impl TestdStore {
             process,
             target_roots,
             target_layout,
+            work_envelope,
             priority,
             job_class,
             resource_profile,
@@ -4089,6 +4171,7 @@ impl TestdStore {
             permit,
             submission.target_roots,
             submission.target_layout,
+            submission.lane,
             submission.priority,
             submission.metadata,
             now,
@@ -4170,6 +4253,25 @@ impl TestdStore {
             scheduling_decision(job.job_class, &job.resource_profile, leases)
                 .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
         );
+        // Issue #1897 (W1): record the granted leases on the allocated
+        // envelope, so the persisted work item keeps the leases it was
+        // admitted with. The scheduler's allocate-or-refuse above stays the
+        // enforced claims gate: a parallel declaration with no exclusive
+        // claim is legitimate, so the envelope-level non-empty admission
+        // gate is not the claim gate.
+        if let (Some(envelope), Some(decision)) =
+            (job.work_envelope.as_mut(), job.scheduling.as_ref())
+        {
+            envelope.runtime_leases = decision
+                .leases
+                .iter()
+                .map(|lease| RuntimeEnvironmentLease {
+                    kind: lease.kind,
+                    resource: lease.resource.clone(),
+                    holder: lease.holder.clone(),
+                })
+                .collect();
+        }
         job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
         job.execution = Some(ExecutionStatus::Running);
@@ -4729,6 +4831,7 @@ fn payload_digest(
     priority: i32,
     job_class: JobClass,
     resource_profile: &TestResourceProfile,
+    work_envelope: Option<&GovernedWorkEnvelope>,
 ) -> Result<String, TestdError> {
     let bytes = serde_json::to_vec(&(
         invocation,
@@ -4737,6 +4840,7 @@ fn payload_digest(
         priority,
         job_class,
         resource_profile,
+        work_envelope,
     ))
     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())

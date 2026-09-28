@@ -1480,6 +1480,15 @@ pub(crate) async fn submit_testd_owner_job(
         invocation: request.submission.invocation.clone(),
         target_roots,
         target_layout: Some(target_layout),
+        // Issue #1897 (W1): no lane is allocated here. A lane identity
+        // needs the work item's BuildFingerprint, candidate, and contract
+        // revision, and no productive owner computes them for a testd
+        // submission today: the only fingerprint constructor is the dev
+        // CLI receipt check, and the work-item declaration that must
+        // carry them (issue #1902) has no productive driver. The Kernel
+        // does not invent them; the store allocates and persists the
+        // envelope for submissions whose lane producer exists.
+        lane: None,
         priority: 0,
         // This is the Kernel's productive verifier launch: the job class is
         // verification, so it is ordered ahead of every background lane and
