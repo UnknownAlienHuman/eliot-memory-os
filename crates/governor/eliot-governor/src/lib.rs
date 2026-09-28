@@ -98,8 +98,10 @@ pub use canonical_projections::{
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
-    EvidenceRelationError, MAX_CAPABILITY_EVIDENCE_RECORDS, RouteScopeFingerprint,
-    ScopeDependencySelector, SkillStanding,
+    EvidenceRelationError, EvidenceRevisionError, InvalidationCause,
+    LEGACY_DECLARED_OWNER_REVISION, MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision,
+    RetainedCapabilityEvidence, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
+    is_evidence_ref,
 };
 pub use composition::*;
 pub use controlboard_projection::{

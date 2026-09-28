@@ -2875,10 +2875,22 @@ impl DaemonComposition {
         now: u64,
     ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
         let view = self.capability_admission_mut()?;
-        let staled = view.apply_scope_change(
-            observed_scope,
-            eliot_governor::ScopeDependencySelector::all(),
-        );
+        // The applied-change invalidation is retained under the exact
+        // owner-issued reference of the observed behaviour scope, so only a
+        // fresh requalification that names that reference — and is strictly
+        // newer than the owner-issued revision of the evidence it staled — can
+        // clear it.
+        let staled = view
+            .apply_scope_change(
+                observed_scope,
+                eliot_governor::ScopeDependencySelector::all(),
+                &observed_scope.reference_digest(),
+            )
+            .map_err(|error| {
+                DaemonError::Composition(CompositionError::Owner(format!(
+                    "capability evidence scope change is not owner-referenced: {error}"
+                )))
+            })?;
         if staled > 0 {
             tracing::warn!(
                 target: "eliotd::capability_evidence",

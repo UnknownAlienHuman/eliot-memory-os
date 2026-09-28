@@ -1101,8 +1101,9 @@ impl CapabilityRouteRegistry {
             .map(|prior| prior.diverging_layers(&requested_fingerprint))
             .unwrap_or_default();
         let retained: Vec<&CapabilityEvidenceRecord> = evidence
-            .records()
+            .retained()
             .iter()
+            .map(|retained| &retained.record)
             .filter(|record| record.skill_id == capability)
             .collect();
         let summaries: Vec<RouteEvidenceSummary> =

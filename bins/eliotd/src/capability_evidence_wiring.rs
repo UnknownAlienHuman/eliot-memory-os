@@ -98,7 +98,7 @@ use eliot_config::legacy_capability_import::{
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, MAX_CAPABILITY_EVIDENCE_RECORDS,
-    RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
+    OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
@@ -168,9 +168,17 @@ impl GovernorCapabilityAdmission {
         self.registry.is_empty()
     }
 
-    /// Inserts one canonical evidence record (probe/observation path).
-    pub fn insert(&mut self, record: CapabilityEvidenceRecord) -> bool {
-        self.registry.insert(record)
+    /// Inserts one canonical evidence record under the immutable owner-issued
+    /// revision the canonical store issued for it (probe/observation path).
+    ///
+    /// The revision is the only supersession authority the registry accepts;
+    /// no semantic rule lives here.
+    pub fn insert(
+        &mut self,
+        record: CapabilityEvidenceRecord,
+        revision: OwnerEvidenceRevision,
+    ) -> bool {
+        self.registry.insert(record, revision)
     }
 
     /// Imports one legacy declaration as `declared/imported_legacy`.
@@ -187,11 +195,16 @@ impl GovernorCapabilityAdmission {
         let imported =
             import_legacy_declaration(declaration).map_err(|_| EvidenceBridgeError::BlankSkill)?;
         let record = CapabilityEvidenceRecord::from(&imported);
-        let already_retained = self.registry.records().iter().any(|retained| {
-            retained.skill_id == record.skill_id
-                && retained.scope_fingerprint == record.scope_fingerprint
+        // A legacy declaration is not evidence and no store arbitrates a
+        // revision for it, so it is retained at the reserved floor: it can
+        // never displace, reorder, or requalify verified evidence.
+        let already_retained = self.registry.retained().iter().any(|retained| {
+            retained.record.skill_id == record.skill_id
+                && retained.record.scope_fingerprint == record.scope_fingerprint
         });
-        let inserted = self.registry.insert(record);
+        let inserted = self
+            .registry
+            .insert(record, OwnerEvidenceRevision::legacy_declared());
         if !inserted && !already_retained && self.registry.len() >= MAX_CAPABILITY_EVIDENCE_RECORDS
         {
             return Err(EvidenceBridgeError::CapacityExceeded);
@@ -230,14 +243,23 @@ impl GovernorCapabilityAdmission {
         self.registry.admit_production_route(skill_id, scope, now)
     }
 
-    /// Stales dependent evidence after a narrowed dependency change.
-    /// Returns the count of newly staled records.
+    /// Stales dependent evidence after a narrowed dependency change, retaining
+    /// the owner-issued cause each invalidated scope must be requalified
+    /// against. Returns the count of newly staled records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceRevisionError`](eliot_governor::EvidenceRevisionError)
+    /// when the applied-change reference is not one hex SHA-256 digest;
+    /// nothing is staled in that case.
     pub fn apply_scope_change(
         &mut self,
         current: &RouteScopeFingerprint,
         changed: ScopeDependencySelector,
-    ) -> usize {
-        self.registry.apply_scope_change(current, changed)
+        blocking_evidence_ref: &str,
+    ) -> Result<usize, eliot_governor::EvidenceRevisionError> {
+        self.registry
+            .apply_scope_change(current, changed, blocking_evidence_ref)
     }
 
     /// Hydrates the held view from one canonical evidence-read response.
