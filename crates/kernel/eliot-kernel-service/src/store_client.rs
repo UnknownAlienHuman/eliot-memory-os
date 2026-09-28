@@ -253,10 +253,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .validate()
             .map_err(|error| StoreClientError::Contract(error.to_string()))?;
         transport.ensure_authenticated(&requirement)?;
-        let hello = client_hello(&requirement)?;
         let limits = TransportLimits::default();
-        let hello_frame =
-            eliot_ipc::client_hello_frame(requirement.connection_id.as_str(), &hello)?;
+        // The full `ClientHello` carries the immutable I6.4 `ModuleContract`
+        // inline. It is encoded here and released before the first `.await`,
+        // so the handshake declaration never becomes part of this future's
+        // storage and the enclosing `rebind_store` chain keeps its size
+        // independent of how many declaration fields the contract carries.
+        let hello_frame = {
+            let hello = client_hello(&requirement)?;
+            eliot_ipc::client_hello_frame(requirement.connection_id.as_str(), &hello)?
+        };
         let outcome = transport.send_frame(&hello_frame, limits).await?;
         if outcome != DeliveryOutcome::Delivered {
             return Err(StoreClientError::Transport(
