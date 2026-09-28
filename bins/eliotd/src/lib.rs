@@ -87,6 +87,7 @@ mod observation_adapters;
 mod owner_feed;
 mod process_origin;
 mod reactive_feed;
+mod route_execution_identity;
 mod route_receipts;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
@@ -249,6 +250,10 @@ pub use process_origin::{
     ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
 };
 pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
+pub use route_execution_identity::{
+    DeclaredRoute, ExecutionIdentity, LaunchAuthority, RouteIdentityError, admit_declared_launch,
+    declared_continuity, declared_route_key,
+};
 pub use route_receipts::{
     GovernorRouteAttempt, RouteAdmissionVisibility, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
