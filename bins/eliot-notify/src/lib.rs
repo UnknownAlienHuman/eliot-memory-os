@@ -76,10 +76,15 @@ impl std::error::Error for NotifyBuildError {}
 /// The complete A-10 composition. Verification and replay authority are
 /// supplied by the owning control plane; this process owns only the P-01
 /// adapter binding and the A-10 coordinator.
+///
+/// The Telegram messaging experiment (I10.23) is held as an optional slot
+/// that defaults to absent. Canonical delivery never requires it: every
+/// `deliver*` path runs unchanged when the slot is `None` or detached.
 pub struct NotificationComposition {
     core: NotifyCore<NotificationPlatform>,
     quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
     messaging_bridge: Option<eliot_messaging_bridge::MessagingBridge>,
+    telegram: Option<eliot_notify_core::TelegramExperiment>,
 }
 
 struct NotificationPlatform {
@@ -401,6 +406,7 @@ impl NotificationComposition {
             core: NotifyCore::new(NotificationPlatform::recovery_banner(platform), ports),
             quiet_hours: None,
             messaging_bridge: None,
+            telegram: None,
         })
     }
 
@@ -423,7 +429,47 @@ impl NotificationComposition {
                 .with_popup_selector(select_popup),
             quiet_hours,
             messaging_bridge: None,
+            telegram: None,
         }
+    }
+
+    /// Attaches the experiment-scoped Telegram adapter to this composition.
+    ///
+    /// Attachment is explicit opt-in and never promotes on its own: the
+    /// lifecycle stays experimental until the attached Product Proof record
+    /// validates under the common promotion gate.
+    pub fn attach_telegram(&mut self, experiment: eliot_notify_core::TelegramExperiment) {
+        self.telegram = Some(experiment);
+    }
+
+    /// Detaches the Telegram experiment. Canonical delivery is unaffected.
+    pub fn detach_telegram(&mut self) {
+        self.telegram = None;
+    }
+
+    /// Returns true only while an attached Telegram experiment is present.
+    ///
+    /// Canonical delivery never consults this flag; local UI/CLI operation
+    /// remains available when it is false.
+    #[must_use]
+    pub fn is_telegram_attached(&self) -> bool {
+        self.telegram
+            .as_ref()
+            .is_some_and(eliot_notify_core::TelegramExperiment::is_attached)
+    }
+
+    /// Reports the Telegram lifecycle under the common promotion gate.
+    ///
+    /// An absent or detached experiment is always experimental. An attached
+    /// experiment reaches default only with the six complete, well-formed
+    /// Product Proof receipts; promotion is never inferred from the
+    /// attached configuration alone.
+    #[must_use]
+    pub fn telegram_lifecycle(&self) -> eliot_notify_core::AdapterLifecycle {
+        self.telegram.as_ref().map_or(
+            eliot_notify_core::AdapterLifecycle::Experimental,
+            eliot_notify_core::TelegramExperiment::lifecycle,
+        )
     }
 
     /// Delivers a normal G-08 notification through the governed core.
