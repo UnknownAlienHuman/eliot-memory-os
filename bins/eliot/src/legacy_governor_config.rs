@@ -24,14 +24,20 @@
 //!   adopted from this file here.
 //! - `control_wal.path`, `blob_store.root`: deleted (Host-managed roots).
 //! - `supervision`, `ul` / `ul.activation`: deleted dead policy (no consumer).
-//! - `delegation_calibration`: deleted here; its policy semantics need a
-//!   Kernel surface that does not exist yet (handoff to the Kernel owner,
-//!   #1687 follow-up). This module does not invent one.
+//! - `delegation_calibration`: deleted here and still adopted nowhere. The
+//!   Kernel runtime profile surface added for #1687 W2 is the I14.2 queue and
+//!   admission capacity surface only; I14.2 fixes no delegation-calibration
+//!   value, so that surface does not and must not absorb these policy
+//!   semantics. This module records the residual gap; it does not invent an
+//!   owner for it.
 //! - `DbMode`, `CredentialProviderKind`, `ConfigError`, defaults, validators,
 //!   collision helpers: deleted with the structs above.
 //!
-//! No `runtime.toml` exists in-tree; the Appendix C candidate is FORBIDDEN to
-//! load or create here (handoff to the Kernel owner).
+//! `runtime.toml` now exists in-tree as the Kernel-owned configuration surface
+//! (`eliot_agent_coordinator::runtime_profile`, issue #1687 W2): it is the
+//! canonical replacement for the queue and admission half of this file. The
+//! Appendix C candidate remains FORBIDDEN to load or create here — this
+//! binary creates and loads no `runtime.toml`; the Kernel owner decodes it.
 //!
 //! Canonical replacement (#1966, I3.9): the Governor-owned typed precedence
 //! surface `eliotd::canonical_config_precedence` resolves the proven
@@ -67,7 +73,7 @@ use std::path::Path;
 /// redirect receipt. Production effects stay on the manifest-bound
 /// installation/canary path; typed Governor policy resolves only through
 /// `eliotd::canonical_config_precedence`.
-pub(super) const LEGACY_GOVERNOR_CANONICAL_ROUTE: &str = "eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)";
+pub(super) const LEGACY_GOVERNOR_CANONICAL_ROUTE: &str = "eliot setup through the Kernel canonical configuration surface: the Kernel-owned runtime.toml queue/admission profile (eliot_agent_coordinator::runtime_profile) plus the Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence";
 
 /// Stable machine-readable cutover code: the retired legacy Governor config
 /// file is present and was refused without adoption.
@@ -84,7 +90,7 @@ pub(super) const LEGACY_GOVERNOR_OBSERVATION_UNKNOWN: &str = "LEGACY_GOVERNOR_OB
 /// Kernel canonical surface.
 #[must_use]
 pub(super) fn migration_action() -> &'static str {
-    "Migration action: delete LocalAppData\\Eliot\\config\\governor.toml and configure queue/admission/durable state only through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest / durable transaction store; Governor operates only as outbound-only eliotd polling Kernel). Typed Governor policy resolves only through eliotd::canonical_config_precedence (seven-layer TOML/JSON precedence with generated schema; lower layers narrow unless a higher layer delegates the exact expansion; scripts are invalid policy). delegation_calibration policy has no Kernel surface yet (handoff to the Kernel owner, #1687 follow-up); no runtime.toml exists in-tree and must not be created or loaded (Appendix C candidate FORBIDDEN). File lifecycle: workstreams/legacy/retirement-1189.toml (T7-S1 ledger, S9 integrator-owned); adjacent root config/: #1219. Remove the legacy file and retry with no legacy config."
+    "Migration action: delete LocalAppData\\Eliot\\config\\governor.toml. Queue and admission capacity is configured only in the Kernel canonical configuration surface: the Kernel-owned runtime.toml decoded by eliot_agent_coordinator::runtime_profile into the I14.2 nine-class SchedulingProfile (fail closed on any unreadable, malformed, unknown-field or incomplete document; the four I14.2 classes with no documented item ceiling, and the byte ceiling of all nine, are required there and never defaulted). Durable state remains the Host-managed StoreLaunchConfig bound to the installation manifest, and the Governor operates only as outbound-only eliotd polling Kernel. Typed Governor policy resolves only through eliotd::canonical_config_precedence (seven-layer TOML/JSON precedence with generated schema; lower layers narrow unless a higher layer delegates the exact expansion; scripts are invalid policy). This binary creates and loads no runtime.toml (the Kernel owner does), and it never adopts a legacy byte as authority. File lifecycle: workstreams/legacy/retirement-1189.toml (T7-S1 ledger, S9 integrator-owned); adjacent root config/: #1219. Remove the legacy file and retry with no legacy config."
 }
 
 /// Detects which retired legacy sections/keys a decoded text mentions, in

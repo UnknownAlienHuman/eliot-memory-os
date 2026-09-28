@@ -922,6 +922,13 @@ pub enum CoordinatorError {
     LegacyResultWire(LegacyResultWireKind),
     #[error("serialization failed: {0}")]
     Serialization(String),
+    /// The Kernel runtime configuration surface refused its input. Used only
+    /// by the `runtime_profile` loader (#1687 W2); it exists because the
+    /// existing field-level variants cannot express a file that is absent,
+    /// unreadable or not a valid runtime profile document, and a second error
+    /// enum for the same crate boundary would be a second authority.
+    #[error(transparent)]
+    RuntimeProfileRejected(#[from] crate::runtime_profile::RuntimeProfileRejection),
 }
 
 /// Classifies a persisted or presented result wire that predates the
@@ -1325,8 +1332,11 @@ impl SchedulingProfile {
     ///
     /// This is not a second configuration source. It reads no file, no
     /// environment variable and no working directory; the Kernel runtime
-    /// profile loader that produces these values is a separate owner
-    /// (#1679 item 2, #1687) and is not wired here.
+    /// profile loader that produces these values is
+    /// [`crate::runtime_profile`] (#1679 item 2, #1687), which decodes the
+    /// Kernel-owned `runtime.toml` into exactly this `Option` contract. That
+    /// loader is not wired into a production composition yet; see its module
+    /// documentation for the measured reason.
     pub fn i14_2_initial(
         profile_revision: impl Into<String>,
         policy: &[PolicyBoundClassLimits],
