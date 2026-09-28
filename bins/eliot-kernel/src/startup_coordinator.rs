@@ -199,8 +199,11 @@ impl GovernanceProfile {
 
     /// Full profile: independently observed, enforced, independently
     /// supervised. The only profile that permits Critical.
+    ///
+    /// Minting is crate-local: production gates admit only the recorded
+    /// Governor-issued projection, never a caller-minted profile.
     #[must_use]
-    pub const fn full() -> Self {
+    pub(crate) const fn full() -> Self {
         Self {
             observation: GovernanceObservation::IndependentlyObserved,
             enforcement: GovernanceEnforcement::Enforced,
@@ -210,8 +213,11 @@ impl GovernanceProfile {
 
     /// Material-grade profile: host-observed, interceptable,
     /// watchdog-observed. Permits Material but never Critical.
+    ///
+    /// Minting is crate-local: production gates admit only the recorded
+    /// Governor-issued projection, never a caller-minted profile.
     #[must_use]
-    pub const fn material_grade() -> Self {
+    pub(crate) const fn material_grade() -> Self {
         Self {
             observation: GovernanceObservation::HostObserved,
             enforcement: GovernanceEnforcement::Interceptable,
@@ -237,6 +243,33 @@ impl GovernanceProfile {
             ) => AuthorityCeiling::Material,
             _ => AuthorityCeiling::LowImpact,
         }
+    }
+}
+
+/// Maps the Governor owner's exact authorization axes to this crate's
+/// existing three-axis profile (I7.16, #1935 AUD1).
+///
+/// No third vocabulary is introduced: the inputs name the owner's
+/// `GovernanceProfile::authorizes` axes exactly, and the output is the
+/// existing [`GovernanceProfile`] vector. The ladder is fail-closed: only a
+/// verified profile authorizing both enforcement and complete-coverage
+/// operations projects to [`GovernanceProfile::full`]; verified enforcement
+/// without complete coverage projects to
+/// [`GovernanceProfile::material_grade`]; anything weaker (unverified,
+/// observed-but-unenforced, incomplete) projects to
+/// [`GovernanceProfile::minimal`], so observed-but-unenforced coverage can
+/// never admit Material authority.
+fn governor_authorization_axes_to_profile(
+    verified: bool,
+    authorizes_enforcement: bool,
+    authorizes_complete_coverage_ops: bool,
+) -> GovernanceProfile {
+    if verified && authorizes_enforcement && authorizes_complete_coverage_ops {
+        GovernanceProfile::full()
+    } else if verified && authorizes_enforcement {
+        GovernanceProfile::material_grade()
+    } else {
+        GovernanceProfile::minimal()
     }
 }
 
@@ -657,10 +690,10 @@ impl StartupCoordinator {
     /// Records the live Governor-owned derivation projection (I7.16, #1935
     /// AUD1).
     ///
-    /// Designated producer: the Governor coverage feed binding the owner
-    /// bundle revision across the authenticated boundary (STITCH: the
-    /// host-side feed transport lives outside this issue's file scope; until
-    /// it records, every Material/Critical gate refuses). The revision must
+    /// Designated producer: the authenticated `publish_governor_authority`
+    /// daemon operation projecting the owner's exact revision, fingerprint,
+    /// and authorization axes across the boundary; until it records, every
+    /// Material/Critical gate refuses. The revision must
     /// start at one and strictly advance: replaying the current or an older
     /// revision is rejected, so revoked authority can never be resurrected
     /// by re-presenting superseded bytes. Recording a degraded profile
@@ -1109,6 +1142,45 @@ impl super::KernelComposition {
             ));
         }
         Ok(())
+    }
+
+    /// Records one Governor-issued coverage projection published across the
+    /// authenticated daemon boundary (I7.16, #1935 AUD1).
+    ///
+    /// Designated producer: the `publish_governor_authority` daemon operation.
+    /// The owner revision, exact active fingerprint, and exact authorization
+    /// axes arrive in the owner's own vocabulary (no third profile is
+    /// introduced); the axes map to this crate's existing three-axis
+    /// [`GovernanceProfile`] and record under the existing strictly-advancing
+    /// revision rule, so a newer degraded projection revokes everything
+    /// issued under the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the startup gate lock is poisoned, and
+    /// the fixed-shape reason when the revision does not strictly advance or
+    /// the fingerprint does not name the exact active fingerprint.
+    pub(crate) fn record_governor_issued_coverage_projection(
+        &self,
+        revision: u64,
+        fingerprint: String,
+        verified: bool,
+        authorizes_enforcement: bool,
+        authorizes_complete_coverage_ops: bool,
+    ) -> Result<(), eliot_kernel_service::KernelServiceError> {
+        let profile = governor_authorization_axes_to_profile(
+            verified,
+            authorizes_enforcement,
+            authorizes_complete_coverage_ops,
+        );
+        let mut coordinator = self.startup_coordinator.lock().map_err(|_| {
+            eliot_kernel_service::KernelServiceError::Platform(
+                "startup gate lock poisoned".to_owned(),
+            )
+        })?;
+        coordinator
+            .record_governor_derived_authority(revision, fingerprint, profile)
+            .map_err(eliot_kernel_service::KernelServiceError::Platform)
     }
 }
 
