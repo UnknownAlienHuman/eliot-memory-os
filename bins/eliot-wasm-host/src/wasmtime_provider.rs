@@ -40,8 +40,22 @@ wasmtime::component::bindgen!({
 struct StoreState {
     limits: StoreLimits,
     peak_memory_bytes: Option<u64>,
+    pending_memory_bytes: Option<u64>,
     table_elements: Option<u32>,
+    pending_table_elements: Option<u32>,
     limit_hit: Option<ResourceLimitHit>,
+}
+
+impl StoreState {
+    fn finish_measurements(&mut self) -> (Option<u64>, Option<u32>) {
+        if let Some(bytes) = self.pending_memory_bytes.take() {
+            self.peak_memory_bytes = Some(self.peak_memory_bytes.unwrap_or(0).max(bytes));
+        }
+        if let Some(elements) = self.pending_table_elements.take() {
+            self.table_elements = Some(self.table_elements.unwrap_or(0).max(elements));
+        }
+        (self.peak_memory_bytes, self.table_elements)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -57,16 +71,21 @@ impl ResourceLimiter for StoreState {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
-        self.peak_memory_bytes = Some(
-            self.peak_memory_bytes
-                .unwrap_or(current as u64)
-                .max(desired as u64),
-        );
+        self.peak_memory_bytes = Some(self.peak_memory_bytes.unwrap_or(0).max(current as u64));
+        self.pending_memory_bytes = None;
         let allowed = self.limits.memory_growing(current, desired, maximum)?;
-        if !allowed {
+        if allowed {
+            self.pending_memory_bytes = Some(desired as u64);
+        } else {
             self.limit_hit = Some(ResourceLimitHit::Memory);
         }
         Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> Result<(), wasmtime::Error> {
+        self.pending_memory_bytes = None;
+        self.limit_hit = Some(ResourceLimitHit::Memory);
+        Ok(())
     }
 
     fn table_growing(
@@ -77,14 +96,23 @@ impl ResourceLimiter for StoreState {
     ) -> Result<bool, wasmtime::Error> {
         self.table_elements = Some(
             self.table_elements
-                .unwrap_or(u32::try_from(current).unwrap_or(u32::MAX))
-                .max(u32::try_from(desired).unwrap_or(u32::MAX)),
+                .unwrap_or(0)
+                .max(u32::try_from(current).unwrap_or(u32::MAX)),
         );
+        self.pending_table_elements = None;
         let allowed = self.limits.table_growing(current, desired, maximum)?;
-        if !allowed {
+        if allowed {
+            self.pending_table_elements = Some(u32::try_from(desired).unwrap_or(u32::MAX));
+        } else {
             self.limit_hit = Some(ResourceLimitHit::Table);
         }
         Ok(allowed)
+    }
+
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> Result<(), wasmtime::Error> {
+        self.pending_table_elements = None;
+        self.limit_hit = Some(ResourceLimitHit::Table);
+        Ok(())
     }
 
     fn instances(&self) -> usize {
@@ -380,8 +408,10 @@ impl WasmtimeComponentEngine {
                     )
                     .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                     .build(),
-                peak_memory_bytes: Some(0),
-                table_elements: Some(0),
+                peak_memory_bytes: None,
+                pending_memory_bytes: None,
+                table_elements: None,
+                pending_table_elements: None,
                 limit_hit: None,
             },
         );
@@ -464,6 +494,17 @@ impl WasmtimeComponentEngine {
                 0,
             )
         };
+        // A guest may handle a failed memory/table grow and return normally.
+        // The resource violation still cannot become a successful receipt.
+        let (termination, output) = if matches!(&termination, EngineTermination::Completed) {
+            match store.data().limit_hit {
+                Some(ResourceLimitHit::Memory) => (EngineTermination::MemoryLimit, Vec::new()),
+                Some(ResourceLimitHit::Table) => (EngineTermination::TableLimit, Vec::new()),
+                None => (termination, output),
+            }
+        } else {
+            (termination, output)
+        };
         let epoch_observation = epoch_driver.finish();
         debug_assert!(
             epoch_observation
@@ -471,8 +512,7 @@ impl WasmtimeComponentEngine {
                 .starts_with(EPOCH_DRIVER_THREAD_PREFIX)
         );
         let remaining_fuel = store.get_fuel().unwrap_or(0);
-        let peak_memory_bytes = store.data().peak_memory_bytes;
-        let table_elements = store.data().table_elements;
+        let (peak_memory_bytes, table_elements) = store.data_mut().finish_measurements();
         drop(store);
         let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let fuel_consumed = if matches!(

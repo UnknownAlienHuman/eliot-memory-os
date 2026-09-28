@@ -81,16 +81,14 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingProfile => formatter.write_str("MISSING_PROFILE"),
-            Self::UnsupportedProfile(profile) => write!(formatter, "UNSUPPORTED_PROFILE:{profile}"),
-            Self::MalformedArgument(argument) => write!(formatter, "MALFORMED_ARGUMENT:{argument}"),
-            Self::RemoteTransportForbidden(transport) => {
-                write!(formatter, "REMOTE_TRANSPORT_FORBIDDEN:{transport}")
-            }
+            Self::UnsupportedProfile(_) => formatter.write_str("UNSUPPORTED_PROFILE"),
+            Self::MalformedArgument(_) => formatter.write_str("MALFORMED_ARGUMENT"),
+            Self::RemoteTransportForbidden(_) => formatter.write_str("REMOTE_TRANSPORT_FORBIDDEN"),
             Self::MissingExperimentalComponent => {
                 formatter.write_str("MISSING_EXPERIMENTAL_COMPONENT")
             }
             Self::MissingExperimentalWorld => formatter.write_str("MISSING_EXPERIMENTAL_WORLD"),
-            Self::UnknownWorld(world) => write!(formatter, "UNKNOWN_WORLD:{world}"),
+            Self::UnknownWorld(_) => formatter.write_str("UNKNOWN_WORLD"),
         }
     }
 }
@@ -399,6 +397,11 @@ where
     } else {
         None
     };
+    if guest_exec.is_some() && experimental_typed_component.is_some() {
+        return Err(CliError::MalformedArgument(
+            "guest execution and typed experimental selection are mutually exclusive".to_owned(),
+        ));
+    }
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,

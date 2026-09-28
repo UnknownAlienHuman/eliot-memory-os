@@ -1,13 +1,15 @@
 //! Bounded artifact acquisition and preflight for typed components.
 //!
-//! Reads exact immutable component bytes once into a bounded buffer,
-//! rejects reparse/escape/source/hash/length/signature mismatch, and
-//! distinguishes malformed core modules from components before any
-//! compile/instantiate. No network, registry, discovery, URL, credential,
-//! provider, or Kernel access.
+//! Performs pre-open reparse-component checks, then reads one opened regular-file
+//! handle into a bounded buffer and checks its length and WebAssembly preamble/core
+//! marker. The digest describes that same buffer. Path checks are subject to races
+//! and do not establish retained-root, source, or signature authorization. No
+//! network, registry, discovery, URL, credential, provider, or Kernel access.
 
 use std::fmt;
-use std::path::Path;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use eliot_wasm_runtime::Sha256Digest;
 
@@ -35,6 +37,12 @@ pub enum PreflightError {
     Empty,
     /// Artifact exceeds the bounded ceiling.
     TooLarge { actual: u64, max: u64 },
+    /// Path names a symbolic link or reparse point.
+    ReparsePoint,
+    /// Path does not name a regular file.
+    NotAFile,
+    /// File length changed after its opened-handle metadata was observed.
+    LengthChanged,
     /// Bytes do not start with the WebAssembly magic.
     MalformedPreamble,
     /// Bytes are a core module, not a component.
@@ -50,6 +58,9 @@ impl fmt::Display for PreflightError {
             Self::TooLarge { actual, max } => {
                 write!(formatter, "PREFLIGHT_TOO_LARGE:actual={actual}:max={max}")
             }
+            Self::ReparsePoint => formatter.write_str("PREFLIGHT_REPARSE_POINT"),
+            Self::NotAFile => formatter.write_str("PREFLIGHT_NOT_A_FILE"),
+            Self::LengthChanged => formatter.write_str("PREFLIGHT_LENGTH_CHANGED"),
             Self::MalformedPreamble => formatter.write_str("PREFLIGHT_MALFORMED_PREAMBLE"),
             Self::CoreModuleRejected => formatter.write_str("PREFLIGHT_CORE_MODULE_REJECTED"),
             Self::Unreadable(kind) => write!(formatter, "PREFLIGHT_UNREADABLE:{kind}"),
@@ -91,8 +102,19 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Preflight, PreflightError> {
 /// No environment, registry, discovery, URL, or credential lookup.
 /// The returned bytes and [`Preflight`] digest describe the same buffer.
 pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), PreflightError> {
-    let metadata = std::fs::metadata(path)
+    let path = absolute_artifact_path(path)?;
+    reject_reparse_components(&path)?;
+    let file = open_artifact_file(&path)
         .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    if metadata_is_reparse_point(&metadata) {
+        return Err(PreflightError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(PreflightError::NotAFile);
+    }
     let declared = metadata.len();
     if declared == 0 {
         return Err(PreflightError::Empty);
@@ -103,14 +125,84 @@ pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), Prefli
             max: MAX_ARTIFACT_BYTES,
         });
     }
-    let bytes = std::fs::read(path)
+    // The handle is the only source of artifact bytes. `take` bounds allocation
+    // even if the file grows after its length was observed.
+    let mut bytes = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
-    let preflight = preflight_bytes(&bytes)?;
-    if preflight.byte_len != declared && metadata.is_file() {
-        // Length changed between metadata and read: fail closed, no reparse.
-        return Err(PreflightError::Unreadable("length-changed".to_owned()));
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_ARTIFACT_BYTES {
+        return Err(PreflightError::TooLarge {
+            actual,
+            max: MAX_ARTIFACT_BYTES,
+        });
     }
+    if actual != declared {
+        return Err(PreflightError::LengthChanged);
+    }
+    let preflight = preflight_bytes(&bytes)?;
     Ok((bytes, preflight))
+}
+
+fn absolute_artifact_path(path: &Path) -> Result<PathBuf, PreflightError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))
+    }
+}
+
+fn reject_reparse_components(path: &Path) -> Result<(), PreflightError> {
+    for component in path
+        .ancestors()
+        .filter(|component| !component.as_os_str().is_empty())
+    {
+        let metadata = std::fs::symlink_metadata(component)
+            .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+        if metadata_is_reparse_point(&metadata) {
+            return Err(PreflightError::ReparsePoint);
+        }
+    }
+    Ok(())
+}
+
+fn open_artifact_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Open the final path component itself so a final reparse point is
+        // inspected and rejected instead of being followed to another file.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
