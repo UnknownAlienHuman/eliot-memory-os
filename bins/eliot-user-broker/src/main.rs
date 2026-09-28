@@ -585,11 +585,16 @@ fn dispatch_operator_pipe(
 /// Admits one state-changing request and returns the authenticated Human
 /// principal it was admitted for.
 ///
-/// The returned principal is the identity [`BrokerComposition::admit_human_state_change`]
-/// proved against the live registration, so a canonical record that names it
-/// names the admitted Human and never caller-supplied text. A request with no
-/// authority at all is refused here with the same stable code the composition
-/// itself uses, so the wire behaviour is identical to the composition's.
+/// The string returned is the request's own `authority.principal`, so it IS
+/// caller-supplied text, and it is returned only because
+/// [`BrokerComposition::admit_human_state_change`] has just proved it equal to
+/// the retained launch binding's `windows_sid` for this registration and
+/// session, and proved a redeemed operator session binding for that same
+/// identity. A principal that is not the admitted Human therefore never reaches
+/// the canonical record: admission refuses it before this value is handed on. A
+/// request with no authority at all is refused here with the same stable code
+/// the composition itself uses, so the wire behaviour is identical to the
+/// composition's.
 fn admit_authenticated_human(
     composition: &mut BrokerComposition,
     authority: Option<&HumanStateAuthority>,
