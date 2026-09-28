@@ -31,6 +31,47 @@ pub struct IntegrationExpectation {
     pub expected_hook_events: Vec<String>,
 }
 
+/// Installation status as the delivery itself recorded it in the install
+/// receipt (`status`, `code`, `completed`).
+///
+/// This is a fact about the install *attempt* — whether the delivery says it
+/// ran the installation — and is deliberately a separate fact from the
+/// runtime-liveness and capability evidence this crate gathers by readback.
+/// Installation success is not runtime liveness (I3.7), and an install that
+/// never ran is not an installation whose bytes happen to be on disk.
+///
+/// The values are the receipt's own fields, read and compared. Nothing here
+/// is recomputed, re-derived, or synthesised: a record that carries no
+/// install status yields no `InstallStatus` at all, never a filled-in one.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct InstallStatus {
+    /// Receipt `status`, verbatim (e.g. `INSTALL_NOT_ATTEMPTED`).
+    pub status: String,
+    /// Receipt `code`, verbatim (e.g. `PLAN_GAP`).
+    pub code: String,
+    /// Receipt `completed`: the delivery's own completion flag. This is the
+    /// value the `installed` verdict is gated on.
+    pub completed: bool,
+}
+
+/// An expectation together with the installation status its own source record
+/// carried.
+///
+/// `install_status` is `Some` only for a record carrying the
+/// [`INSTALL_RECEIPT_CONTRACT`], and `None` for a plain
+/// [`IntegrationExpectation`] record, which states no install status of its
+/// own. Absence is carried through to the report as absence
+/// (`"installation": null`); it is never filled in with a synthesised status,
+/// and it is never read as a failed or a successful installation.
+#[derive(Clone, Debug)]
+pub struct LoadedExpectation {
+    /// The verified expectation the report is computed against.
+    pub expectation: IntegrationExpectation,
+    /// Installation status read from the install receipt, when the record is
+    /// one. `None` when the record states no installation status.
+    pub install_status: Option<InstallStatus>,
+}
+
 /// Observed integration state supplied by the caller for verification.
 ///
 /// Every field below is a caller claim, not evidence. The verification gate
