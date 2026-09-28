@@ -1866,7 +1866,7 @@ impl AgentFabric {
     /// dispatch. The `staffing_plan_receipted` ledger event precedes
     /// `definition_validated`.
     ///
-    /// Definition is the first of the four steps an admitted Task-Controller
+    /// Definition is the first step of the chain an admitted Task-Controller
     /// production operation must drive ([`Self::define_and_plan`] →
     /// [`Self::stage_reservation`] → [`Self::commit_admission`] →
     /// [`Self::activate`] → [`Self::dispatch`]). That operation is not wired
