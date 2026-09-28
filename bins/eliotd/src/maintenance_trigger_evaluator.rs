@@ -33,7 +33,10 @@
 #![forbid(unsafe_code)]
 
 use eliot_maintenance::{
-    AutomationTriggerDecision, MaintenanceFamily, MaintenanceTrigger, MaintenanceTriggerInput,
+    AutomationTriggerDecision, MaintenanceBrokerEvidence, MaintenanceBudgetEvidence,
+    MaintenanceFamily, MaintenancePolicyEvidence, MaintenanceRouteEvidence,
+    MaintenanceSafetyEvidence, MaintenanceScheduleEvidence, MaintenanceTrigger,
+    MaintenanceTriggerInput,
 };
 
 use super::DaemonComposition;
@@ -190,31 +193,57 @@ impl DaemonComposition {
             observation.origin.as_str(),
             observation.family
         );
-        let input = MaintenanceTriggerInput {
-            trigger_id,
-            evidence_refs: observation.evidence_refs,
-            family: observation.family,
-            scope_ref,
-            // Fail-closed, and now sourced from the registered catalog rather
-            // than repeated here: no Human maintenance-policy owner exists yet
-            // (`UNRESOLVED_AUTHORITIES`, and the table above). See the
-            // module-level table.
-            mode: entry.mode,
-            trigger: observation.origin.maintenance_trigger(),
-            explicit_request: false,
-            // The one gate read from a real observation.
-            idle: !observation.activation_in_flight,
-            scheduled_window: false,
-            route_available: false,
-            budget_available: false,
-            // Observed, not claimed: the validated Kernel-issued owner session
-            // this composition already retains, or the unadmitted gap.
-            user_session_available: self.owner_session.is_some(),
-            user_session_required: false,
-            safety_required: false,
-            now_ms: crate::unix_ms_i64(),
-            expires_at_ms: None,
-            active_job_id: None,
+        let input = {
+            // Owner evidence for every gate (I14.22/I14.24, issue #1692). Each
+            // value is derived from a Governor-owned evidence owner or held at
+            // its fail-closed value because the owning authority does not
+            // exist yet (`UNRESOLVED_AUTHORITIES`, and the module-level
+            // table); no caller-supplied flag enters the input, so a forged
+            // mode/safety/session flag grants nothing. The Human policy owner
+            // is unpublished, so the policy evidence records unpublished
+            // provenance (no revision/digest, no override provenance, no
+            // separate `interactive_maintenance` permission, no effect/budget
+            // ceilings) around the registry-selected mode, which is `Off` for
+            // every family while no publisher exists; the mode value itself
+            // comes from the registered catalog, so no second mode source is
+            // invented. The five non-Off modes are enforced by
+            // `MaintenanceController::evaluate_trigger` and become reachable
+            // only when a publisher appears. The transport session this
+            // composition retains is explicitly not User Broker evidence.
+            let policy = MaintenancePolicyEvidence::unpublished(
+                entry.mode,
+                observation.family,
+                scope_ref.clone(),
+            );
+            let route = MaintenanceRouteEvidence::unpublished();
+            let budget = MaintenanceBudgetEvidence::unpublished();
+            let schedule = MaintenanceScheduleEvidence::unpublished();
+            let broker = MaintenanceBrokerEvidence::transport_only(self.owner_session.is_some());
+            let safety = MaintenanceSafetyEvidence::unpublished();
+            MaintenanceTriggerInput {
+                trigger_id,
+                evidence_refs: observation.evidence_refs,
+                family: observation.family,
+                scope_ref,
+                mode: policy.mode(),
+                trigger: observation.origin.maintenance_trigger(),
+                explicit_request: false,
+                // The one gate read from a real observation.
+                idle: !observation.activation_in_flight,
+                scheduled_window: schedule.is_current_window(),
+                route_available: route.is_service_safe(),
+                budget_available: budget.has_budget(),
+                // Observed, not claimed: transport presence carried by the
+                // broker evidence type, which never promotes it to broker
+                // admission; the separate interactive permission above stays
+                // denied.
+                user_session_available: broker.transport_present(),
+                user_session_required: policy.requires_interactive_session(),
+                safety_required: safety.is_required(),
+                now_ms: crate::unix_ms_i64(),
+                expires_at_ms: None,
+                active_job_id: None,
+            }
         };
         let decision = self
             .governor
