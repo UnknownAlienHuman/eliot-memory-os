@@ -717,16 +717,30 @@ impl ProfessionalExecutionState {
         Ok(())
     }
 
+    /// Admits completion only when recorded evidence satisfies the contract:
+    /// an artifact manifest in the declared output workspace covering the
+    /// expected deliverables with checksums, plus the applicable bound
+    /// evaluator result while the contract carries a Verifier requirement.
+    /// Recorded values are revalidated with the admission checks, so
+    /// prose-only completion keeps the boundary unresolved.
     pub fn require_evaluator_result(&self) -> Result<(), ProfessionalExecutionError> {
-        if self
+        if !self
             .contract
             .requirements
             .iter()
             .any(|requirement| requirement.kind == ProfessionalRequirementKind::Verifier)
         {
-            return Err(ProfessionalExecutionError::EvaluatorBoundaryUnresolved);
+            return Ok(());
         }
-        Ok(())
+        let satisfied = self.completion_evidence.iter().any(|evidence| {
+            evidence.evaluator_result.is_some()
+                && self.validate_completion_evidence(evidence).is_ok()
+        });
+        if satisfied {
+            Ok(())
+        } else {
+            Err(ProfessionalExecutionError::EvaluatorBoundaryUnresolved)
+        }
     }
 
     /// Stores structurally valid evidence without treating caller claims as
@@ -734,6 +748,20 @@ impl ProfessionalExecutionState {
     pub fn record_completion_evidence(
         &mut self,
         evidence: ProfessionalCompletionEvidence,
+    ) -> Result<(), ProfessionalExecutionError> {
+        self.validate_completion_evidence(&evidence)?;
+        self.completion_evidence.push(evidence);
+        Ok(())
+    }
+
+    /// Admission checks shared by the record path and the completion gate:
+    /// the manifest is bound to this exact contract revision and declared
+    /// output workspace, every expected deliverable is observed exactly once
+    /// with a checksum, and any evaluator result is bound to the manifest,
+    /// contract revision, evaluator owner and artifact evaluator.
+    fn validate_completion_evidence(
+        &self,
+        evidence: &ProfessionalCompletionEvidence,
     ) -> Result<(), ProfessionalExecutionError> {
         let manifest = &evidence.artifact_manifest;
         required_text(&manifest.manifest_ref, "manifest_ref")?;
@@ -783,7 +811,6 @@ impl ProfessionalExecutionState {
                 ));
             }
         }
-        self.completion_evidence.push(evidence);
         Ok(())
     }
 
