@@ -390,7 +390,9 @@ impl PreStageIdentityCache {
     pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
         Self::validate_snapshot(&snapshot)?;
         for (key, record) in &snapshot.entries {
-            if let Some(held) = self.entries.get(key) && held != record {
+            if let Some(held) = self.entries.get(key)
+                && held != record
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.entries",
                     reason: "a retained idempotency key already holds a different rejection",
@@ -398,7 +400,9 @@ impl PreStageIdentityCache {
             }
         }
         for (key, record) in &snapshot.issued_corrections {
-            if let Some(held) = self.issued_corrections.get(key) && held != record {
+            if let Some(held) = self.issued_corrections.get(key)
+                && held != record
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.issued_corrections",
                     reason: "a retained corrected identity already holds a different refusal",
@@ -427,7 +431,8 @@ impl PreStageIdentityCache {
     fn validate_snapshot(snapshot: &PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
         for (key, (stored_hash, rejection)) in &snapshot.entries {
             rejection.validate()?;
-            if key != &rejection.idempotency_key || stored_hash != &rejection.canonical_request_hash {
+            if key != &rejection.idempotency_key || stored_hash != &rejection.canonical_request_hash
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.entries",
                     reason: "a retained entry must be keyed and hashed by the recorded rejection",
@@ -561,10 +566,8 @@ impl PreStageIdentityCache {
     ) {
         self.refused_operations
             .insert(proposed_operation_id.to_owned());
-        self.issued_corrections.insert(
-            rejection.corrected_operation_id.clone(),
-            rejection.clone(),
-        );
+        self.issued_corrections
+            .insert(rejection.corrected_operation_id.clone(), rejection.clone());
         // Every retain is owed to the durable journal until its exact save is
         // acknowledged: the daemon persists the snapshot write-ahead of the
         // commit this refusal authorizes, so the lineage survives a restart
