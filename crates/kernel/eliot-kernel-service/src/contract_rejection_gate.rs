@@ -304,25 +304,26 @@ impl PreStageIdentityCache {
     /// entry: a changed-bytes `IDENTITY_CONFLICT` refusal must never overwrite
     /// the stored rejection for that key.
     ///
-    /// The first refusal of an operation identity is the one retained, so the
-    /// corrected identity issued for that operation never changes.
+    /// Every refusal's correction is retained, not only the first: each
+    /// corrected identity is unique to its refusal (derived from the rejected
+    /// operation identity plus the rejection identity), so following any
+    /// refusal's correction links to the right parent. Keeping only the first
+    /// would drop a later refusal's correction and commit its follower
+    /// unlinked (issue #1796 verifier refutation).
     fn retain_refused_operation(
         &mut self,
         proposed_operation_id: &str,
         rejection: &PreStageRejection,
     ) {
-        if self
-            .refused_operations
-            .insert(proposed_operation_id.to_owned())
-        {
-            self.issued_corrections.insert(
-                rejection.corrected_operation_id.clone(),
-                IssuedCorrection {
-                    rejected_operation_id: proposed_operation_id.to_owned(),
-                    rejection_id: rejection.rejection_id.clone(),
-                },
-            );
-        }
+        self.refused_operations
+            .insert(proposed_operation_id.to_owned());
+        self.issued_corrections.insert(
+            rejection.corrected_operation_id.clone(),
+            IssuedCorrection {
+                rejected_operation_id: proposed_operation_id.to_owned(),
+                rejection_id: rejection.rejection_id.clone(),
+            },
+        );
     }
 
     /// Verifies a presented operation identity against this cache's own record.
