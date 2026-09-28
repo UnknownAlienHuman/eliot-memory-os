@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use super::kernel_audit::AuditEventKind;
 use super::kernel_unavailability::{
     KernelAvailability, RecoveryDeferral, RecoveryView, semantic_task_recovery_deferral,
 };
@@ -371,8 +372,20 @@ impl KernelComposition {
         let (cumulative, chain, outcome) = match self.audit_chain_records() {
             Ok(records) => {
                 let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+                // Issue #1839: distinguish the raw presentation from the
+                // normalized cursor advance (I16.4) so readers can observe
+                // event gaps and cursor lag against the chain head.
+                let mut raw_appended = 0_u64;
+                let mut cursor_advanced = 0_u64;
+                let mut last_cursor_advance_seq: Option<u64> = None;
                 for record in &records {
                     *by_kind.entry(record.kind.as_str()).or_default() += 1;
+                    if record.kind.as_str() == AuditEventKind::RESULT_NATIVE_RAW_APPENDED {
+                        raw_appended += 1;
+                    } else if record.kind.as_str() == AuditEventKind::RESULT_CURSOR_ADVANCED {
+                        cursor_advanced += 1;
+                        last_cursor_advance_seq = Some(record.seq);
+                    }
                 }
                 let head_seq = records.last().map(|record| record.seq);
                 (
@@ -380,6 +393,11 @@ impl KernelComposition {
                     serde_json::json!({
                         "records": records.len(),
                         "head_seq": head_seq,
+                        "cursor": {
+                            "raw_appended": raw_appended,
+                            "cursor_advanced": cursor_advanced,
+                            "last_advance_seq": last_cursor_advance_seq,
+                        },
                     }),
                     "success",
                 )

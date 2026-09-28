@@ -398,6 +398,14 @@ impl AuditEventKind {
     pub const RESULT_DAEMON_SUBMITTED: &'static str = "result.daemon_submitted";
     /// The Kernel bound a daemon result to its operation (ORS persist).
     pub const RESULT_KERNEL_BOUND: &'static str = "result.kernel_bound";
+    /// The daemon-presented native result body as produced by the read-port
+    /// adapter, recorded before Kernel validation and normalization (issue
+    /// #1839; I16.4 native raw-event append).
+    pub const RESULT_NATIVE_RAW_APPENDED: &'static str = "result.native_raw_appended";
+    /// The normalized chain cursor advance sealed for one bound result,
+    /// emitted independently of the raw presentation (issue #1839; I16.4
+    /// normalized cursor advance).
+    pub const RESULT_CURSOR_ADVANCED: &'static str = "result.cursor_advanced";
     /// The Kernel sealed the canonical replayable trace manifest for one
     /// bound result (issue #1838; I16.12).
     pub const TRACE_MANIFEST_SEALED: &'static str = "trace.manifest_sealed";
@@ -460,6 +468,8 @@ impl AuditEventKind {
         Self::DISPATCH_DAEMON_CLAIM,
         Self::RESULT_DAEMON_SUBMITTED,
         Self::RESULT_KERNEL_BOUND,
+        Self::RESULT_NATIVE_RAW_APPENDED,
+        Self::RESULT_CURSOR_ADVANCED,
         Self::TRACE_MANIFEST_SEALED,
         Self::RESULT_STALE_QUARANTINED,
         Self::DEFER_CLAIM_DEFERRED,
@@ -1285,6 +1295,91 @@ impl AuditEventDraft {
                 "lane": lane,
                 "request_digest": body.request_sha256,
                 "result_digest": body.result_digest,
+                "durable_state": format!("{:?}", persisted.state),
+            }),
+        }
+    }
+
+    /// Returns the native-raw-appended draft for one presented result body.
+    ///
+    /// Issue #1839 (I16.4 native raw-event append). This records the
+    /// adapter-produced native presentation before Kernel validation and
+    /// normalization: digest/identity-only detail, never the response
+    /// payload. The semantic qualification of the body is a separate later
+    /// step, so acceptance here is `not_assessed` and normalization is
+    /// `not_normalized`, exactly like the submission leg it precedes.
+    #[must_use]
+    pub fn result_native_raw_appended(
+        session: &Session,
+        body: &HostRequestResultBody,
+        stored: &HostRequestRecord,
+        envelope: Option<&HostRequestEnvelope>,
+        lane: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        if let Some(envelope) = envelope {
+            lineage.fill_envelope(envelope);
+        }
+        lineage.fill_stored(stored);
+        lineage.fill_daemon_leg(session);
+        if let Some(attempt) = body.attempt.as_ref() {
+            lineage.fill_attempt(attempt);
+        }
+        let operation_authorization = body.attempt.as_ref().map_or_else(
+            || serde_json::json!("not_carried_on_submission"),
+            |attempt| admitted_operation_authorization(attempt, "admitted_attempt_identity"),
+        );
+        Self {
+            kind: AuditEventKind::RESULT_NATIVE_RAW_APPENDED,
+            lineage,
+            body: serde_json::json!({
+                "lane": lane,
+                "request_digest": body.request_sha256,
+                "result_digest": body.result_digest,
+                "fence_digest": stored.fence_digest,
+                "presentation": "native_adapter_presentation",
+                "transport_authentication": "observed_at_result_boundary",
+                "operation_authorization": operation_authorization,
+                "semantic_result_acceptance": "not_assessed",
+                "normalization": "not_normalized",
+            }),
+        }
+    }
+
+    /// Returns the cursor-advanced draft sealing one normalized binding.
+    ///
+    /// Issue #1839 (I16.4 normalized cursor advance). Emitted independently
+    /// of the raw presentation, downstream of the Kernel binding it
+    /// describes: `advanced_to_seq` is the chain sequence the normalized
+    /// binding occupies, so readers can observe event gaps and cursor lag
+    /// against the chain head without confusing raw and normalized events.
+    #[must_use]
+    pub fn result_cursor_advanced(
+        session: &Session,
+        body: &HostRequestResultBody,
+        persisted: &HostRequestRecord,
+        envelope: Option<&HostRequestEnvelope>,
+        lane: &'static str,
+        advanced_to_seq: u64,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        if let Some(envelope) = envelope {
+            lineage.fill_envelope(envelope);
+        }
+        lineage.fill_stored(persisted);
+        lineage.fill_daemon_leg(session);
+        if let Some(attempt) = body.attempt.as_ref() {
+            lineage.fill_attempt(attempt);
+        }
+        Self {
+            kind: AuditEventKind::RESULT_CURSOR_ADVANCED,
+            lineage,
+            body: serde_json::json!({
+                "lane": lane,
+                "request_digest": body.request_sha256,
+                "result_digest": body.result_digest,
+                "advanced_to_seq": advanced_to_seq,
+                "cursor": "normalized_chain_cursor",
                 "durable_state": format!("{:?}", persisted.state),
             }),
         }

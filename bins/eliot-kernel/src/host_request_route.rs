@@ -3064,6 +3064,13 @@ impl KernelComposition {
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
+        // Issue #1839: record the adapter-produced native presentation
+        // before Kernel validation and normalization. The routed lane and
+        // the stored record are known here; the submission validation and
+        // the ORS persist below are the normalization this precedes.
+        self.audit_observe(AuditEventDraft::result_native_raw_appended(
+            session, body, &stored, None, lane,
+        ));
         if capability == "eliot.query" {
             body.validate_local_read_submission()
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -3323,15 +3330,27 @@ impl KernelComposition {
         // record evidences the persisted completion above, so it must follow
         // it; a failed persist leaves submission evidence without binding,
         // which is the accurate history.
-        let bound_ok = self
-            .audit_observe(AuditEventDraft::result_kernel_bound(
+        let bound_record = self.audit_observe(AuditEventDraft::result_kernel_bound(
+            session,
+            body,
+            &persisted,
+            queued_envelope.as_ref(),
+            lane,
+        ));
+        let bound_ok = bound_record.is_some();
+        // Issue #1839: the normalized cursor advance is independent of the
+        // raw presentation above. It seals the chain cursor the binding
+        // advanced to, so only a sealed binding advances the cursor.
+        if let Some(bound) = bound_record.as_ref() {
+            self.audit_observe(AuditEventDraft::result_cursor_advanced(
                 session,
                 body,
                 &persisted,
                 queued_envelope.as_ref(),
                 lane,
-            ))
-            .is_some();
+                bound.seq,
+            ));
+        }
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
@@ -4116,6 +4135,12 @@ impl KernelComposition {
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
+        // Issue #1839: record the adapter-produced native presentation
+        // before Kernel validation and normalization, as on the claim
+        // submit leg above.
+        self.audit_observe(AuditEventDraft::result_native_raw_appended(
+            session, body, &stored, None, lane,
+        ));
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
@@ -4319,13 +4344,27 @@ impl KernelComposition {
             queued_envelope.as_ref(),
             lane,
         ));
-        self.audit_observe(AuditEventDraft::result_kernel_bound(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-        ));
+        // Issue #1839: the normalized cursor advance is independent of the
+        // raw presentation above; only a sealed binding advances the cursor.
+        if let Some(bound) = self
+            .audit_observe(AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+            ))
+            .as_ref()
+        {
+            self.audit_observe(AuditEventDraft::result_cursor_advanced(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+                bound.seq,
+            ));
+        }
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain.
         let manifest =
