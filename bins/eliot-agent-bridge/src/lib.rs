@@ -18,10 +18,10 @@ use eliot_agent_bridge_core::{
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
-    RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective,
-    RecoveryProjectionPage, RecoveryReadRequest, RecoveryResponseSelector, RecoveryStreamCut,
-    RecoveryUnscopedGapCursor, RecoveryView, RecoveryWindowStatus, TerminalReductionInputs,
-    TransportEdge,
+    RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryCandidateStreamFacts,
+    RecoveryDirective, RecoveryProjectionPage, RecoveryReadRequest, RecoveryResponseSelector,
+    RecoveryStreamCut, RecoveryUnscopedGapCursor, RecoveryView, RecoveryWindowStatus,
+    TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -164,25 +164,21 @@ struct KernelTransportOwner {
     limits: eliot_ipc::TransportLimits,
     activated_session: Option<String>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
-    /// Bridge-held digest-verified durable sequences per stream: the exact
-    /// contiguous set justified by the receiving owner's receipts.
-    /// Out-of-order receipts stay retained above their holes; only the
-    /// contiguous run above the owner-confirmed base is ever offered as
-    /// the consumed frontier, so pagination or reordering can never
-    /// acknowledge a hole or an unseen page. Carried as the reconcile
-    /// consumed frontier so the Kernel can advance its acked cursors;
-    /// process memory only, bounded below, never a reconciliation log.
-    delivered_sequences: BTreeMap<String, BTreeSet<u64>>,
-    /// Owner-confirmed acked base per stream learned from verified
-    /// reconcile replies. Held sequences at or below the base are pruned
-    /// as owner-confirmed; the contiguous run always starts above it.
+    /// Bridge-held digest-verified durable event receipts per stream.
+    /// Receipts remain unbound until an exact owner recovery page matches
+    /// their event identity and adopts the stream incarnation/revision.
+    /// Only the contiguous run bound to that exact identity is offered as
+    /// the consumed frontier. Process memory only and bounded below.
+    delivered_sequences: BTreeMap<String, BTreeMap<u64, DeliveredEventReceipt>>,
+    /// Owner-confirmed acked base per stream under the adopted identity.
+    /// It changes only from exact recovery facts for that same identity, or
+    /// resets from exact successor facts after a proved replacement.
     owner_acked: BTreeMap<String, u64>,
-    /// Owner-confirmed `(producer, incarnation)` identity per stream,
-    /// adopted from the first confirming reply. A same-named successor
-    /// incarnation cannot advance the base or prune predecessor evidence;
-    /// successor adoption is core-owned (#2798), never inferred here.
-    /// Bounded by the same stream eviction as the held sequences.
-    owner_identity: BTreeMap<String, (String, u64)>,
+    /// Owner-confirmed `(namespace, producer, incarnation, owner revision)`
+    /// identity per stream, adopted only from verified recovery facts. It scopes the
+    /// text-keyed base, held receipts, and consumed offers. Bounded by the
+    /// same stream eviction as the held receipts.
+    owner_identity: BTreeMap<String, OwnerStreamIdentity>,
     /// At most one outstanding consumed-frontier offer (issue #2800).
     /// While it is unresolved, every reconcile re-offers its exact bytes
     /// under its exact identity; changed frontiers wait (deferred with
@@ -203,7 +199,9 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// joint core/cache import moves an offer to `OwnerConfirmed`, and only
 /// after a fully validated owner reply proves the offer binding, the exact
 /// offered frontier, and acknowledged cursors at or beyond the accepted
-/// prefix. Transport custody (`Delivered`) never confirms.
+/// prefix. A proved successor marks its predecessor `Replaced`; that offer
+/// is never replayed under the successor. Transport custody (`Delivered`)
+/// never confirms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsumedOfferDisposition {
     /// Prepared from a local snapshot; not yet handed to the transport.
@@ -214,8 +212,17 @@ enum ConsumedOfferDisposition {
     /// Send failure, missing reply, or rejected answer; retryable under the
     /// same identity. Unconfirmed.
     OutcomeUnknown,
+    /// The owner returned the exact committed acknowledgement receipt, but
+    /// a follow-up read or handoff mutation remains unresolved. Keep replaying
+    /// this same offer until a later import proves its cursor; mutation
+    /// receipts are not read-completion evidence.
+    AckCommittedFollowupUnknown,
     /// Terminal: confirmed inside the joint core/cache import.
     OwnerConfirmed,
+    /// Terminal: an exact successor owner proof replaced at least one
+    /// stream identity in this offer; its bytes must never be replayed under
+    /// the successor.
+    Replaced,
 }
 
 /// One exact consumed-frontier offer retained in the transport owner.
@@ -228,6 +235,9 @@ struct ConsumedFrontierOffer {
     content_digest: String,
     /// Exact stream-to-frontier legs carried by the offer, already bounded.
     frontiers: BTreeMap<String, u64>,
+    /// Exact owner stream identity for each offered text key. A stream name
+    /// alone cannot carry this frontier across a successor incarnation.
+    stream_identities: BTreeMap<String, OwnerStreamIdentity>,
     /// Presenting connection the offer was prepared under.
     connection_id: String,
     /// Live attach generation the offer was prepared under.
@@ -242,6 +252,9 @@ struct ConsumedFrontierOffer {
     window_key: Option<String>,
     /// Current [`ConsumedOfferDisposition`] of the retained offer.
     disposition: ConsumedOfferDisposition,
+    /// Exact authenticated mutation receipt returned when acknowledgement
+    /// committed but the separate owner read was unavailable.
+    acknowledgement_receipt: Option<serde_json::Value>,
     /// Identity of the immediately preceding resolved offer, if any: the
     /// bounded predecessor/replay relation. The single outstanding slot
     /// bounds the chain to one live link; the successor-install path below
@@ -251,6 +264,146 @@ struct ConsumedFrontierOffer {
     predecessor: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerStreamIdentity {
+    owner_namespace: String,
+    producer_id: String,
+    incarnation: u64,
+    owner_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeliveredEventReceipt {
+    event_id: String,
+    producer_id: String,
+    producer_generation: u64,
+    /// Set only after an exact recovery page binds this receipt to the
+    /// currently adopted stream identity.
+    owner_identity: Option<OwnerStreamIdentity>,
+}
+
+impl OwnerStreamIdentity {
+    fn from_facts(stream: &RecoveredStreamFacts) -> Option<Self> {
+        let (producer_id, incarnation) = stream.owner_identity()?;
+        let owner_revision = stream.recovery_cut()?.owner_revision();
+        Some(Self {
+            owner_namespace: stream.owner_namespace()?.to_owned(),
+            producer_id: producer_id.to_owned(),
+            incarnation,
+            owner_revision,
+        })
+    }
+}
+
+fn project_reconciled_owner_ack_state(
+    window: &RecoveryView,
+    candidate_streams: &[RecoveryCandidateStreamFacts],
+    owner_acked: &mut BTreeMap<String, u64>,
+    delivered_sequences: &mut BTreeMap<String, BTreeMap<u64, DeliveredEventReceipt>>,
+    owner_identity: &mut BTreeMap<String, OwnerStreamIdentity>,
+    offer_stream_identities: &BTreeMap<String, OwnerStreamIdentity>,
+) -> Vec<String> {
+    let mut replaced_offer_streams = Vec::new();
+    for stream in window.stream_facts() {
+        let Some(identity) = OwnerStreamIdentity::from_facts(stream) else {
+            continue;
+        };
+        let stream_id = stream.stream_id();
+        let prior_identity = owner_identity.get(stream_id);
+        let offered_identity = offer_stream_identities.get(stream_id);
+        let replaced = prior_identity.is_some_and(|prior| prior != &identity)
+            || offered_identity.is_some_and(|offered| offered != &identity);
+        if replaced {
+            // Exact active owner facts prove the successor. Reset the
+            // predecessor's local base and held receipts instead of carrying
+            // either across the reused stream text.
+            owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
+            delivered_sequences.remove(stream_id);
+            if offered_identity.is_some_and(|offered| offered != &identity) {
+                replaced_offer_streams.push(stream_id.to_owned());
+            }
+        } else {
+            let known = owner_acked.get(stream_id).copied().unwrap_or(0);
+            let base = known.max(stream.acked_cursor());
+            owner_acked.insert(stream_id.to_owned(), base);
+            if let Some(held) = delivered_sequences.get_mut(stream_id) {
+                let confirmed: Vec<u64> =
+                    held.range(..=base).map(|(sequence, _)| *sequence).collect();
+                for sequence in confirmed {
+                    held.remove(&sequence);
+                }
+                if held.is_empty() {
+                    delivered_sequences.remove(stream_id);
+                }
+            }
+            if let Some(held) = delivered_sequences.get_mut(stream_id) {
+                for (sequence, receipt) in held.iter_mut() {
+                    if stream.events().iter().any(|fact| {
+                        fact.sequence() == *sequence
+                            && fact.event_id() == receipt.event_id
+                            && fact.producer_id() == receipt.producer_id
+                            && fact.producer_generation() == receipt.producer_generation
+                    }) {
+                        receipt.owner_identity = Some(identity.clone());
+                    }
+                }
+            }
+        }
+        owner_identity.insert(stream_id.to_owned(), identity);
+    }
+    // A later non-pure reconciliation receives the aggregate facts that Core
+    // staged from earlier pure continuation pages. Bind only exact delivered
+    // event identities here, after pagination itself returned without any
+    // acknowledgement-cache mutation.
+    for stream in candidate_streams {
+        let stream_id = stream.stream_id();
+        let identity = OwnerStreamIdentity {
+            owner_namespace: stream.owner_namespace().to_owned(),
+            producer_id: stream.producer_id().to_owned(),
+            incarnation: stream.owner_incarnation(),
+            owner_revision: stream.owner_revision(),
+        };
+        let prior_identity = owner_identity.get(stream_id);
+        let offered_identity = offer_stream_identities.get(stream_id);
+        let replaced = prior_identity.is_some_and(|prior| prior != &identity)
+            || offered_identity.is_some_and(|offered| offered != &identity);
+        if replaced {
+            owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
+            delivered_sequences.remove(stream_id);
+            if offered_identity.is_some_and(|offered| offered != &identity) {
+                replaced_offer_streams.push(stream_id.to_owned());
+            }
+        } else {
+            let base = owner_acked
+                .get(stream_id)
+                .copied()
+                .unwrap_or(0)
+                .max(stream.acked_cursor());
+            owner_acked.insert(stream_id.to_owned(), base);
+            if let Some(held) = delivered_sequences.get_mut(stream_id) {
+                held.retain(|sequence, _| *sequence > base);
+                if held.is_empty() {
+                    delivered_sequences.remove(stream_id);
+                }
+            }
+        }
+        if let Some(held) = delivered_sequences.get_mut(stream_id) {
+            for (sequence, receipt) in held.iter_mut() {
+                if stream.events().iter().any(|fact| {
+                    fact.sequence() == *sequence
+                        && fact.event_id() == receipt.event_id
+                        && fact.producer_id() == receipt.producer_id
+                        && fact.producer_generation() == receipt.producer_generation
+                }) {
+                    receipt.owner_identity = Some(identity.clone());
+                }
+            }
+        }
+        owner_identity.insert(stream_id.to_owned(), identity);
+    }
+    replaced_offer_streams
+}
+
 /// Builds the stable identity for one consumed-frontier offer: `sha256`
 /// over the version tag, the presenting connection, the live generation,
 /// and the ordered stream-to-frontier legs.
@@ -258,16 +411,33 @@ fn consumed_offer_identity(
     connection_id: &str,
     generation: u64,
     frontiers: &BTreeMap<String, u64>,
+    stream_identities: &BTreeMap<String, OwnerStreamIdentity>,
 ) -> String {
-    let mut preimage = String::from("consumed-offer/v1:");
+    let mut preimage = String::from("consumed-offer/v3:");
     preimage.push_str(connection_id);
     preimage.push(':');
     preimage.push_str(&generation.to_string());
     for (stream_id, sequence) in frontiers {
         preimage.push(':');
+        preimage.push_str(&stream_id.len().to_string());
+        preimage.push(':');
         preimage.push_str(stream_id);
         preimage.push('=');
         preimage.push_str(&sequence.to_string());
+        if let Some(identity) = stream_identities.get(stream_id) {
+            preimage.push(':');
+            preimage.push_str(&identity.owner_namespace.len().to_string());
+            preimage.push(':');
+            preimage.push_str(&identity.owner_namespace);
+            preimage.push(':');
+            preimage.push_str(&identity.producer_id.len().to_string());
+            preimage.push(':');
+            preimage.push_str(&identity.producer_id);
+            preimage.push(':');
+            preimage.push_str(&identity.incarnation.to_string());
+            preimage.push(':');
+            preimage.push_str(&identity.owner_revision.to_string());
+        }
     }
     sha256_hex(preimage.as_bytes())
 }
@@ -298,6 +468,116 @@ fn consumed_payload_digest(payload: &[serde_json::Value]) -> Result<String, Prov
     let bytes =
         canonical_json_bytes(&serde_json::json!(payload)).map_err(|_| event_transport_failure())?;
     Ok(sha256_hex(&bytes))
+}
+
+/// Validates and retains a Kernel acknowledgement receipt against the exact
+/// frontier and owner tuple held by the unresolved offer. The receipt remains
+/// write evidence only; its independent read has not completed.
+fn validate_acknowledgement_receipt(
+    receipt: &serde_json::Value,
+    offer: &ConsumedFrontierOffer,
+) -> Result<(), ProviderFailure> {
+    let invalid = || {
+        event_shape_failure(
+            "reconciliation refused: acknowledgement receipt does not bind the retained offer",
+        )
+    };
+    if receipt.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || receipt.get("kind").and_then(serde_json::Value::as_str) != Some("bridge-event-ack")
+        || receipt.get("status").and_then(serde_json::Value::as_str) != Some("committed")
+    {
+        return Err(invalid());
+    }
+    let request = receipt.get("request").ok_or_else(invalid)?;
+    let request_items = request
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid)?;
+    if request_items.len() != offer.frontiers.len() {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    let mut requested_namespaces = BTreeMap::new();
+    for item in request_items {
+        let stream_id = recovery_text(item, "stream_id")?;
+        let sequence = recovery_cursor(item, "sequence")?;
+        let namespace = recovery_digest(item, "namespace")?;
+        let identity = offer
+            .stream_identities
+            .get(&stream_id)
+            .ok_or_else(invalid)?;
+        if !seen.insert(stream_id.clone())
+            || offer.frontiers.get(&stream_id) != Some(&sequence)
+            || namespace != identity.owner_namespace
+            || recovery_cursor(item, "expected_revision")? != identity.owner_revision
+            || recovery_cursor(item, "expected_incarnation")? != identity.incarnation
+            || requested_namespaces.insert(namespace, sequence).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    if seen.len() != offer.frontiers.len() {
+        return Err(invalid());
+    }
+    let request_bytes = canonical_json_bytes(request).map_err(|_| event_transport_failure())?;
+    let request_sha256 = sha256_hex(&request_bytes);
+    let operation_material = serde_json::json!({
+        "kind": "bridge-event-ack",
+        "request_sha256": request_sha256,
+    });
+    let operation_bytes =
+        canonical_json_bytes(&operation_material).map_err(|_| event_transport_failure())?;
+    let operation_sha256 = sha256_hex(&operation_bytes);
+    let operation_id = format!("bridge-event-ack:operation:{operation_sha256}");
+    let outcome = receipt.get("outcome").ok_or_else(invalid)?;
+    let outcome_bytes = canonical_json_bytes(outcome).map_err(|_| event_transport_failure())?;
+    let outcome_sha256 = sha256_hex(&outcome_bytes);
+    let receipt_material = serde_json::json!({
+        "operation_id": operation_id,
+        "outcome": outcome,
+    });
+    let receipt_bytes =
+        canonical_json_bytes(&receipt_material).map_err(|_| event_transport_failure())?;
+    let receipt_sha256 = sha256_hex(&receipt_bytes);
+    let outcome_streams = outcome
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid)?;
+    if outcome_streams.len() != requested_namespaces.len() {
+        return Err(invalid());
+    }
+    let mut seen_outcome_namespaces = BTreeSet::new();
+    for stream in outcome_streams {
+        let namespace = recovery_digest(stream, "namespace")?;
+        let expected_sequence = requested_namespaces
+            .get(&namespace)
+            .copied()
+            .ok_or_else(invalid)?;
+        let durable_cursor = recovery_cursor(stream, "durable_cursor")?;
+        let acked_cursor = recovery_cursor(stream, "acked_cursor")?;
+        if !seen_outcome_namespaces.insert(namespace)
+            || acked_cursor < expected_sequence
+            || durable_cursor < acked_cursor
+        {
+            return Err(invalid());
+        }
+    }
+    if recovery_digest(receipt, "request_sha256")? != request_sha256
+        || recovery_digest(receipt, "operation_sha256")? != operation_sha256
+        || recovery_digest(receipt, "outcome_sha256")? != outcome_sha256
+        || recovery_digest(receipt, "receipt_sha256")? != receipt_sha256
+        || receipt
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id.as_str())
+        || receipt
+            .get("receipt_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(format!("bridge-event-ack:receipt:{receipt_sha256}").as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Typed local-state-unavailable failure for the consumed-frontier path.
@@ -772,7 +1052,7 @@ fn decode_durable_outcome(
         EventDisposition::Accepted | EventDisposition::Duplicate
     ) && owner_phase_satisfies_cursor_policy(event.delivery_class, phase)
     {
-        port.note_delivered(&event.stream_id, event.sequence);
+        port.note_delivered(event);
     }
     Ok(outcome)
 }
@@ -958,6 +1238,39 @@ fn verify_reconcile_key(reconciliation: &serde_json::Value) -> Result<String, Pr
     Ok(key)
 }
 
+/// Reads Kernel's out-of-commitment mutation status legs. Unknown mutation
+/// status cannot be inferred complete from a verified read page.
+fn has_unresolved_handoff_mutation(value: &serde_json::Value) -> Result<bool, ProviderFailure> {
+    let read_status = value
+        .get("reconciliation_status")
+        .and_then(serde_json::Value::as_str);
+    if read_status != Some("known") {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner read status is not known",
+        ));
+    }
+    let handoff_status = value
+        .get("handoff_reconciliation_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: handoff mutation status is absent")
+        })?;
+    let maintenance_status = value
+        .get("handoff_maintenance_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: handoff maintenance status is absent")
+        })?;
+    if !matches!(handoff_status, "known" | "unknown" | "not_run")
+        || !matches!(maintenance_status, "known" | "unknown" | "not_run")
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: malformed handoff mutation status",
+        ));
+    }
+    Ok(handoff_status == "unknown" || maintenance_status == "unknown")
+}
+
 /// Decodes one owner gap fact: scoped under its stream, or unscoped at top
 /// level. Shape only — interval coherence against the walk window is
 /// enforced by the core on import. Gap identities are bare keys (never
@@ -965,14 +1278,16 @@ fn verify_reconcile_key(reconciliation: &serde_json::Value) -> Result<String, Pr
 fn decode_recovery_gap(
     gap: &serde_json::Value,
     stream_id: &str,
+    gap_owner_scope: &str,
 ) -> Result<RecoveredGapFact, ProviderFailure> {
     let gap_id = recovery_text(gap, "gap_id")?;
     let start_sequence = recovery_sequence(gap, "start_sequence")?;
     let end_sequence = recovery_sequence(gap, "end_sequence")?;
     let reason_ref = recovery_text(gap, "reason_ref")?;
-    RecoveredGapFact::checked(
+    RecoveredGapFact::checked_with_owner_scope(
         gap_id,
         stream_id.to_owned(),
+        gap_owner_scope.to_owned(),
         start_sequence,
         end_sequence,
         reason_ref,
@@ -1111,6 +1426,11 @@ fn decode_recovery_unscoped_gap_coverage(
         .get("unscoped_gaps")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
+    if gaps.len() as u64 > total {
+        return Err(event_shape_failure(
+            "reconciliation refused: unscoped gap facts exceed the owner denominator",
+        ));
+    }
     validate_recovery_continuation_proof(
         proof.as_deref(),
         continuation.is_some(),
@@ -1231,6 +1551,7 @@ fn decode_recovery_stream(
     let (stream_id, durable_cursor, acked_cursor, page) =
         decode_stream_snapshot(stream, live_generation)?;
     let producer_id = recovery_text(stream, "producer_id")?;
+    let owner_namespace = recovery_digest(stream, "owner_namespace")?;
     let owner_incarnation = recovery_sequence(stream, "owner_incarnation")?;
     let owner_revision = recovery_sequence(stream, "owner_revision")?;
     let events = decode_page_events(&stream_id, &producer_id, page, live_generation, budget)?;
@@ -1286,6 +1607,8 @@ fn decode_recovery_stream(
     })?
     .with_owner_identity(producer_id, owner_incarnation)
     .map_err(|_| event_shape_failure("reconciliation refused: invalid owner stream identity"))?
+    .with_owner_namespace(owner_namespace)
+    .map_err(|_| event_shape_failure("reconciliation refused: invalid owner namespace"))?
     .with_recovery_cut(cut)
     .map_err(|_| event_shape_failure("reconciliation refused: page exceeds finite owner cut"))?
     .with_gap_continuation(gap_continuation)
@@ -1449,7 +1772,7 @@ fn decode_stream_gaps(
     }
     let mut gaps = Vec::with_capacity(gaps_array.len());
     for gap in gaps_array {
-        gaps.push(decode_recovery_gap(gap, stream_id)?);
+        gaps.push(decode_recovery_gap(gap, stream_id, "")?);
     }
     Ok(gaps)
 }
@@ -1601,6 +1924,11 @@ fn decode_reconciliation_outcome(
     if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
         return Err(event_transport_failure());
     }
+    if has_unresolved_handoff_mutation(value)? {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff mutation outcome is unresolved",
+        ));
+    }
     let reconciliation = value
         .get("reconciliation")
         .ok_or_else(event_transport_failure)?;
@@ -1645,7 +1973,7 @@ fn decode_reconciliation_outcome(
         .ok_or_else(|| {
             event_shape_failure("reconciliation refused: owner answer without handoff receipt")
         })?;
-    check_recovery_page_ordinals(reconciliation, expected, coverage.unscoped_gap_total)?;
+    check_recovery_page_ordinals(reconciliation, expected)?;
     check_expected_continuation(reconciliation, &stream_facts, expected)?;
     let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
         .map_err(|_| {
@@ -1798,7 +2126,8 @@ fn decode_unscoped_gaps(
     }
     let mut unscoped_gaps = Vec::with_capacity(unscoped_array.len());
     for gap in unscoped_array {
-        unscoped_gaps.push(decode_recovery_gap(gap, "")?);
+        let gap_owner_scope = recovery_digest(gap, "gap_owner_scope")?;
+        unscoped_gaps.push(decode_recovery_gap(gap, "", &gap_owner_scope)?);
     }
     Ok(unscoped_gaps)
 }
@@ -2066,7 +2395,6 @@ fn check_finite_page_end(
 fn check_recovery_page_ordinals(
     reconciliation: &serde_json::Value,
     expected: Option<&RecoveryReadRequest>,
-    unscoped_gap_total: u64,
 ) -> Result<(), ProviderFailure> {
     let streams = reconciliation
         .get("streams")
@@ -2107,11 +2435,9 @@ fn check_recovery_page_ordinals(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
     let mut prior: Option<(u64, u64, String)> = None;
-    let mut seen_gap_owner_scopes = BTreeSet::new();
     for gap in gaps {
         let scope = recovery_digest(gap, "gap_owner_scope")?;
         let position = recovery_sequence(gap, "gap_owner_position")?;
-        seen_gap_owner_scopes.insert(scope.clone());
         let offset = recovery_cursor(gap, "gap_offset")?;
         if let Some((old_position, old_offset, old_scope)) = prior
             && (position < old_position
@@ -2131,11 +2457,6 @@ fn check_recovery_page_ordinals(
             ));
         }
         prior = Some((position, offset, scope));
-    }
-    if seen_gap_owner_scopes.len() as u64 > unscoped_gap_total {
-        return Err(event_shape_failure(
-            "reconciliation refused: distinct gap owners exceed the owner denominator",
-        ));
     }
     Ok(())
 }
@@ -2444,18 +2765,19 @@ impl KernelMcpForwardingPort {
         })
     }
 
-    /// Records one digest-verified durable receipt for the exact contiguous
-    /// acknowledgement set.
+    /// Records one digest-verified durable event receipt.
     ///
     /// The receipt joins the stream's held durable sequences; out-of-order
     /// receipts stay retained above their holes without advancing anything.
     /// Process-local routing aid for the reconcile consumed frontier (like
     /// the byte-identity replay cache): it dies with this connection, is
     /// bounded, and is never a reconciliation log — reconciliation reads the
-    /// ORS-owned cursors. Owner-confirmed prefixes are pruned on every
-    /// verified reply; overflow and eviction only defer ack advancement
-    /// (safe direction); nothing is lost and no cursor resets.
-    fn note_delivered(&mut self, stream_id: &str, sequence: u64) {
+    /// ORS-owned cursors. A receipt is not eligible for an offer until exact
+    /// recovered event facts bind it to the adopted owner tuple. Receipts
+    /// discarded after a proved successor may need redelivery before ack.
+    fn note_delivered(&mut self, event: &EventEnvelope) {
+        let stream_id = &event.stream_id;
+        let sequence = event.sequence;
         if sequence == 0 {
             return;
         }
@@ -2470,22 +2792,20 @@ impl KernelMcpForwardingPort {
             owner.owner_acked.remove(&oldest);
             owner.owner_identity.remove(&oldest);
         }
-        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let held = owner
             .delivered_sequences
             .entry(stream_id.to_owned())
             .or_default();
-        loop {
-            let confirmed = match held.first() {
-                Some(first) if *first <= base => *first,
-                _ => break,
-            };
-            held.remove(&confirmed);
-        }
         if held.len() >= MAX_DELIVERED_SEQUENCES_PER_STREAM {
             return;
         }
-        held.insert(sequence);
+        held.entry(sequence)
+            .or_insert_with(|| DeliveredEventReceipt {
+                event_id: event.event_id.clone(),
+                producer_id: event.producer_id.clone(),
+                producer_generation: event.producer_generation.get(),
+                owner_identity: None,
+            });
     }
 
     /// Prepares (or reuses) the one outstanding consumed-frontier offer.
@@ -2514,28 +2834,49 @@ impl KernelMcpForwardingPort {
         if let Some(offer) = owner.consumed_offer.as_ref() {
             let binding_matches =
                 offer.connection_id == connection_id && offer.generation == generation;
-            let satisfied = offer.frontiers.iter().all(|(stream_id, frontier)| {
-                owner.owner_acked.get(stream_id).copied().unwrap_or(0) >= *frontier
-            });
             if binding_matches
-                && offer.disposition != ConsumedOfferDisposition::OwnerConfirmed
-                && !satisfied
+                && !matches!(
+                    offer.disposition,
+                    ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
+                )
             {
-                let (payload, confirmations) = consumed_offer_payload(&offer.frontiers);
-                if let Ok(redigest) = consumed_payload_digest(&payload) {
-                    debug_assert_eq!(
-                        redigest, offer.content_digest,
-                        "retained offer must re-offer byte-identical payloads",
-                    );
+                let identity_matches =
+                    offer.stream_identities.iter().all(|(stream_id, identity)| {
+                        owner.owner_identity.get(stream_id) == Some(identity)
+                    });
+                if !identity_matches {
+                    return Err(ProviderFailure::new(
+                        "eliot-kernel-front-door",
+                        "reconciliation refused: unresolved consumed offer belongs to a different owner stream identity; its bytes are quarantined until exact owner proof resolves the predecessor",
+                    ));
                 }
-                return Ok((payload, confirmations));
+                let satisfied = offer.frontiers.iter().all(|(stream_id, frontier)| {
+                    owner.owner_acked.get(stream_id).copied().unwrap_or(0) >= *frontier
+                });
+                if !satisfied {
+                    let (payload, confirmations) = consumed_offer_payload(&offer.frontiers);
+                    if let Ok(redigest) = consumed_payload_digest(&payload) {
+                        debug_assert_eq!(
+                            redigest, offer.content_digest,
+                            "retained offer must re-offer byte-identical payloads",
+                        );
+                    }
+                    return Ok((payload, confirmations));
+                }
             }
         }
         let mut frontiers = BTreeMap::new();
+        let mut stream_identities = BTreeMap::new();
         for (stream_id, held) in &owner.delivered_sequences {
+            let Some(identity) = owner.owner_identity.get(stream_id) else {
+                continue;
+            };
             let acked = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
             let mut frontier = acked;
-            while held.contains(&frontier.saturating_add(1)) {
+            while held
+                .get(&frontier.saturating_add(1))
+                .is_some_and(|receipt| receipt.owner_identity.as_ref() == Some(identity))
+            {
                 frontier = frontier.saturating_add(1);
                 if frontier == u64::MAX {
                     break;
@@ -2543,26 +2884,32 @@ impl KernelMcpForwardingPort {
             }
             if frontier > acked {
                 frontiers.insert(stream_id.clone(), frontier);
+                stream_identities.insert(stream_id.clone(), identity.clone());
             }
         }
         while frontiers.len() > MAX_RECONCILE_CONSUMED_ENTRIES {
-            frontiers.pop_last();
+            if let Some((stream_id, _)) = frontiers.pop_last() {
+                stream_identities.remove(&stream_id);
+            }
         }
-        let predecessor = owner.consumed_offer.take().map(|old| old.identity);
         if frontiers.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let predecessor = owner.consumed_offer.take().map(|old| old.identity);
         let (payload, confirmations) = consumed_offer_payload(&frontiers);
         let content_digest = consumed_payload_digest(&payload)?;
-        let identity = consumed_offer_identity(connection_id, generation, &frontiers);
+        let identity =
+            consumed_offer_identity(connection_id, generation, &frontiers, &stream_identities);
         owner.consumed_offer = Some(ConsumedFrontierOffer {
             identity,
             content_digest,
             frontiers,
+            stream_identities,
             connection_id: connection_id.to_owned(),
             generation,
             window_key: None,
             disposition: ConsumedOfferDisposition::Prepared,
+            acknowledgement_receipt: None,
             predecessor,
         });
         debug_assert!(
@@ -2596,10 +2943,97 @@ impl KernelMcpForwardingPort {
         let Some(offer) = owner.consumed_offer.as_mut() else {
             return;
         };
-        if offer.disposition == ConsumedOfferDisposition::OwnerConfirmed {
+        if matches!(
+            offer.disposition,
+            ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
+        ) {
+            return;
+        }
+        if offer.disposition == ConsumedOfferDisposition::AckCommittedFollowupUnknown
+            && disposition != ConsumedOfferDisposition::OwnerConfirmed
+        {
             return;
         }
         offer.disposition = disposition;
+    }
+
+    /// Retains the exact Kernel mutation receipt when its acknowledgement
+    /// committed but the subsequent owner read failed. This records only the
+    /// write receipt: no page facts, cursor proofs, or read commitment exist
+    /// in that response, so the offer remains unresolved and idempotently
+    /// replayable under its original identity.
+    fn retain_acknowledgement_read_unknown(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<(), ProviderFailure> {
+        if value
+            .get("reconciliation_status")
+            .and_then(serde_json::Value::as_str)
+            != Some("unknown")
+            || value
+                .get("handoff_reconciliation_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("not_run")
+            || value
+                .get("handoff_maintenance_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("not_run")
+            || !value
+                .get("reconciliation")
+                .is_some_and(serde_json::Value::is_null)
+            || !value
+                .get("handoff_receipts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: unknown owner read carried read or handoff facts",
+            ));
+        }
+        self.retain_acknowledgement_receipt(value, true)
+    }
+
+    /// Preserves a committed acknowledgement receipt independently from the
+    /// owner read and handoff mutation outcomes. `required` is true only for
+    /// the Kernel's ack-committed/read-unknown envelope.
+    fn retain_acknowledgement_receipt(
+        &mut self,
+        value: &serde_json::Value,
+        required: bool,
+    ) -> Result<(), ProviderFailure> {
+        let Some(receipt) = value
+            .get("acknowledgement")
+            .filter(|receipt| !receipt.is_null())
+        else {
+            if required {
+                return Err(event_shape_failure(
+                    "reconciliation refused: unknown owner read omitted its committed acknowledgement receipt",
+                ));
+            }
+            return Ok(());
+        };
+        let mut owner = self
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| local_state_failure())?;
+        let offer = owner.consumed_offer.as_mut().ok_or_else(|| {
+            event_shape_failure(
+                "reconciliation refused: acknowledgement receipt has no retained consumed offer",
+            )
+        })?;
+        if !matches!(
+            offer.disposition,
+            ConsumedOfferDisposition::HandedToTransport
+                | ConsumedOfferDisposition::AckCommittedFollowupUnknown
+        ) {
+            return Err(event_shape_failure(
+                "reconciliation refused: acknowledgement receipt does not match transport custody",
+            ));
+        }
+        validate_acknowledgement_receipt(receipt, offer)?;
+        offer.acknowledgement_receipt = Some(receipt.clone());
+        offer.disposition = ConsumedOfferDisposition::AckCommittedFollowupUnknown;
+        Ok(())
     }
 
     /// Retires the retained offer only when this joint-import result proves
@@ -2609,8 +3043,8 @@ impl KernelMcpForwardingPort {
     /// connection/generation binding (a lower or foreign reply retires
     /// nothing), and every offered leg must show an owner-confirmed
     /// acknowledged cursor at or beyond the offered frontier from a stream
-    /// fact proving the locally adopted (producer, incarnation) identity —
-    /// a same-named successor fact confirms nothing. A lower reply leaves
+    /// fact proving the exact locally adopted owner tuple. A same-named
+    /// successor fact confirms nothing. A lower reply leaves
     /// the offer unresolved; already-advanced bases stay advanced.
     fn retire_consumed_offer_if_proven(&mut self, result: &ReconciliationPortResult) {
         let echo = result.consumed_frontiers();
@@ -2626,8 +3060,10 @@ impl KernelMcpForwardingPort {
         let Some(offer) = owner.consumed_offer.as_mut() else {
             return;
         };
-        if offer.disposition == ConsumedOfferDisposition::OwnerConfirmed
-            || echo.len() != offer.frontiers.len()
+        if matches!(
+            offer.disposition,
+            ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
+        ) || echo.len() != offer.frontiers.len()
             || !echo
                 .iter()
                 .all(|leg| offer.frontiers.get(leg.stream_id()) == Some(&leg.sequence()))
@@ -2649,17 +3085,12 @@ impl KernelMcpForwardingPort {
                 .iter()
                 .find(|facts| facts.stream_id() == stream_id)
                 .is_some_and(|facts| {
+                    let Some(identity) = OwnerStreamIdentity::from_facts(facts) else {
+                        return false;
+                    };
                     facts.acked_cursor() >= *frontier
-                        && facts
-                            .owner_identity()
-                            .is_some_and(|(producer, incarnation)| {
-                                adopted.get(stream_id).is_some_and(
-                                    |(known_producer, known_incarnation)| {
-                                        known_producer == producer
-                                            && *known_incarnation == incarnation
-                                    },
-                                )
-                            })
+                        && offer.stream_identities.get(stream_id) == Some(&identity)
+                        && adopted.get(stream_id) == Some(&identity)
                 })
         });
         if proven {
@@ -2854,6 +3285,43 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 return Err(error);
             }
         };
+        if value
+            .get("reconciliation_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown")
+        {
+            return match self.retain_acknowledgement_read_unknown(&value) {
+                Ok(()) => Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "owner acknowledgement committed with an exact receipt, but the follow-up read is unknown; no read facts or page commitment were returned, and the same offer remains retained for reconciliation",
+                )),
+                Err(error) => {
+                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                    Err(error)
+                }
+            };
+        }
+        match has_unresolved_handoff_mutation(&value) {
+            Ok(true) => {
+                return match self.retain_acknowledgement_receipt(&value, false) {
+                    Ok(()) => Err(ProviderFailure::new(
+                        "eliot-kernel-front-door",
+                        "owner read facts may be valid, but a handoff mutation outcome is unknown; its read page was not imported, no handoff completion was reported, and the next reconcile must recover the unresolved mutation",
+                    )),
+                    Err(error) => {
+                        self.mark_consumed_offer_disposition(
+                            ConsumedOfferDisposition::OutcomeUnknown,
+                        );
+                        Err(error)
+                    }
+                };
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        }
         match decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
@@ -2949,16 +3417,14 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// moved/expired window or a foreign connection/generation commits
     /// nothing and returns success with both halves untouched (the core
     /// still publishes its own candidate, exactly as the pre-joint flow).
-    /// Each advancing stream must prove its adopted (producer, incarnation)
-    /// identity, so a same-named successor incarnation can neither advance
-    /// the predecessor base nor prune predecessor evidence.
+    /// Each advancing stream proves its adopted namespace/producer/incarnation/
+    /// revision tuple. A proved successor resets the old text-keyed base and held
+    /// receipts, which may require redelivery before ack.
     ///
     /// A borrow conflict or stale continuity commits nothing and returns a
     /// typed refusal naming the preserved state and the retry/recovery
-    /// directive. Ack bases stay keyed by stream text here (BLOCKED-BY
-    /// #2798: owner/window/revision/incarnation namespacing must land
-    /// before a same-named replacement stream stops inheriting the
-    /// predecessor cursor).
+    /// directive. Text-keyed caches remain paired with their adopted owner
+    /// tuple and reset only when exact successor facts arrive.
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
@@ -2986,7 +3452,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         if result.is_pure_recovery_read() {
             return Ok(());
         }
-        let (mut owner_acked, mut delivered_sequences, mut owner_identity) = {
+        let (mut owner_acked, mut delivered_sequences, mut owner_identity, offer_stream_identities) = {
             let owner = self
                 .shared
                 .try_borrow()
@@ -2995,44 +3461,22 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 owner.owner_acked.clone(),
                 owner.delivered_sequences.clone(),
                 owner.owner_identity.clone(),
+                owner
+                    .consumed_offer
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |offer| offer.stream_identities.clone()),
             )
         };
-        // Pure projection from the immutable snapshot (#2799 joint commit +
-        // #2800 identity proof): every allocation on this path happens here,
-        // before the owner is acquired for commit. A stream advances only
-        // when its confirming fact proves its owner (producer, incarnation)
-        // identity; a same-named successor incarnation cannot advance the
-        // predecessor base or prune predecessor evidence.
-        for stream in window.stream_facts() {
-            let Some((producer, incarnation)) = stream.owner_identity() else {
-                continue;
-            };
-            if owner_identity.get(stream.stream_id()).is_some_and(
-                |(known_producer, known_incarnation)| {
-                    known_producer != producer || *known_incarnation != incarnation
-                },
-            ) {
-                continue;
-            }
-            owner_identity.insert(
-                stream.stream_id().to_owned(),
-                (producer.to_owned(), incarnation),
-            );
-            let known = owner_acked.get(stream.stream_id()).copied().unwrap_or(0);
-            let base = known.max(stream.acked_cursor());
-            if base != known {
-                owner_acked.insert(stream.stream_id().to_owned(), base);
-            }
-            if let Some(held) = delivered_sequences.get_mut(stream.stream_id()) {
-                let confirmed: Vec<u64> = held.range(..=base).copied().collect();
-                for sequence in confirmed {
-                    held.remove(&sequence);
-                }
-                if held.is_empty() {
-                    delivered_sequences.remove(stream.stream_id());
-                }
-            }
-        }
+        // Pure projection: every allocation happens before acquiring the
+        // mutable owner borrow, preserving the joint import's atomic swap.
+        let replaced_offer_streams = project_reconciled_owner_ack_state(
+            window,
+            result.recovery_candidate_stream_facts(),
+            &mut owner_acked,
+            &mut delivered_sequences,
+            &mut owner_identity,
+            &offer_stream_identities,
+        );
         let mut owner = self
             .shared
             .try_borrow_mut()
@@ -3056,6 +3500,17 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         owner.owner_acked = owner_acked;
         owner.delivered_sequences = delivered_sequences;
         owner.owner_identity = owner_identity;
+        if let Some(offer) = owner.consumed_offer.as_mut() {
+            if replaced_offer_streams.iter().any(|stream_id| {
+                offer
+                    .stream_identities
+                    .get(stream_id)
+                    .zip(owner.owner_identity.get(stream_id))
+                    .is_some_and(|(offered, current)| offered != current)
+            }) {
+                offer.disposition = ConsumedOfferDisposition::Replaced;
+            }
+        }
         // Rebind the retained offer to this import's window key under the
         // same held borrow (pure field write; cannot fail).
         if let Some(offer) = owner.consumed_offer.as_mut()

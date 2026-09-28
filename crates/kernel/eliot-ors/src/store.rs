@@ -1720,13 +1720,20 @@ impl BridgeEventRecoveryWindowRow {
                 reason: "recovery window expiry must follow its creation time",
             });
         }
-        // A denominator is a count of owner rows inside the window's finite
-        // cutoff, so it can never exceed that cutoff.
-        if self.stream_list_total > self.owner_cutoff || self.unscoped_gap_total > self.owner_cutoff
+        // The stream denominator counts owner rows inside the window's finite
+        // cutoff and the bounded owner inventory. Each authenticated
+        // unscoped-gap owner can contribute up to the bounded gap-row limit,
+        // so its denominator is bounded by the whole owner inventory.
+        let max_unscoped_gap_total = (MAX_BRIDGE_STREAM_OWNERS as u64)
+            .checked_mul(MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if self.stream_list_total > self.owner_cutoff
+            || self.stream_list_total > MAX_BRIDGE_STREAM_OWNERS as u64
+            || self.unscoped_gap_total > max_unscoped_gap_total
         {
             return Err(OrsError::InvalidField {
                 field: "recovery_window.denominator",
-                reason: "window denominators must fit the finite owner cutoff",
+                reason: "window denominators must fit the finite owner and gap-row bounds",
             });
         }
         if self.stream_list_complete && self.stream_list_continuation.is_some() {
@@ -10077,55 +10084,130 @@ impl RedbRecoveryStore {
     }
 
     /// Counts the two enumeration denominators the window declares at open
-    /// time: how many stream owners and how many unscoped-gap owners the
-    /// window's finite cutoff covers under its exact owner scope.
+    /// time: how many stream owners and how many bounded unscoped-gap rows the
+    /// window's finite cutoff covers under its exact authenticated owner scope.
     ///
-    /// They are counted here, from the index the same walk pages, rather than
-    /// inferred from any returned page. Overflow of the bounded owner set
-    /// fails closed instead of yielding a denominator that is a guess.
+    /// The stream count comes from the owner index the same walk pages. Gap
+    /// owners are first authenticated through that index and then their gap
+    /// rows are counted from the gap table, rather than inferred from any
+    /// returned page. Overflow of either bounded set fails closed instead of
+    /// yielding a denominator that is a guess.
     fn bridge_recovery_window_denominators_in(
         write: &redb::WriteTransaction,
         scope: &str,
         owner_cutoff: u64,
     ) -> Result<(u64, u64), OrsError> {
+        crate::model::validate_digest(scope, "owner_scope_digest")?;
         let mut stream_list_total = 0_u64;
-        let mut unscoped_gap_total = 0_u64;
-        for (kind, counter) in [
-            (BRIDGE_STREAM_OWNER_KIND_STREAM, &mut stream_list_total),
-            (
-                BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
-                &mut unscoped_gap_total,
-            ),
-        ] {
-            let prefix = Self::bridge_owner_list_index_prefix(scope, kind);
-            let end = Self::bridge_owner_list_index_key(scope, kind, owner_cutoff);
+        let unscoped_gap_owners: BTreeSet<String> = {
             let index = write
                 .open_table(BRIDGE_STREAM_OWNER_LIST_INDEX)
                 .map_err(storage)?;
-            for entry in index
+            let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+            let mut gap_owners = BTreeSet::new();
+            for kind in [
+                BRIDGE_STREAM_OWNER_KIND_STREAM,
+                BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
+            ] {
+                let prefix = Self::bridge_owner_list_index_prefix(scope, kind);
+                let end = Self::bridge_owner_list_index_key(scope, kind, owner_cutoff);
+                let mut owner_count = 0_u64;
+                for entry in index
+                    .range(prefix.as_str()..=end.as_str())
+                    .map_err(storage)?
+                    .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
+                {
+                    let (key, value) = entry.map_err(storage)?;
+                    let sequence = key
+                        .value()
+                        .strip_prefix(prefix.as_str())
+                        .and_then(|suffix| suffix.parse::<u64>().ok())
+                        .ok_or(OrsError::IntegrityProblem {
+                            record_type: "bridge_stream_owner_list_index",
+                            reason: "owner-list key carries a malformed sequence".to_owned(),
+                        })?;
+                    if sequence == 0 || sequence > owner_cutoff {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_stream_owner_list_index",
+                            reason: "owner-list key escaped the finite window cutoff".to_owned(),
+                        });
+                    }
+                    if key.value() != Self::bridge_owner_list_index_key(scope, kind, sequence) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_stream_owner_list_index",
+                            reason: "owner-list key is not in canonical sequence form".to_owned(),
+                        });
+                    }
+                    owner_count = owner_count
+                        .checked_add(1)
+                        .ok_or(OrsError::ProjectionLimitExceeded)?;
+                    if owner_count > MAX_BRIDGE_STREAM_OWNERS as u64 {
+                        return Err(OrsError::ProjectionLimitExceeded);
+                    }
+                    let namespace = Self::decode_bridge_owner_index_namespace(value.value())?;
+                    let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
+                        return Err(OrsError::RecoveryOwnerMismatch);
+                    };
+                    let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
+                    owner.validate()?;
+                    if owner.namespace != namespace
+                        || owner.kind != kind
+                        || Self::bridge_owner_scope_digest(
+                            &owner.authority_lineage,
+                            &owner.principal,
+                        )? != scope
+                    {
+                        return Err(OrsError::RecoveryOwnerMismatch);
+                    }
+                    if kind == BRIDGE_STREAM_OWNER_KIND_STREAM {
+                        stream_list_total = owner_count;
+                    } else if !gap_owners.insert(namespace) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_stream_owner_list_index",
+                            reason: "unscoped-gap owner is indexed more than once".to_owned(),
+                        });
+                    }
+                }
+            }
+            gap_owners
+        };
+        let max_unscoped_gap_total = (unscoped_gap_owners.len() as u64)
+            .checked_mul(MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let mut unscoped_gap_total = 0_u64;
+        let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        for namespace in unscoped_gap_owners {
+            let prefix = format!("{namespace}::");
+            let end = format!("{prefix}\u{10ffff}");
+            let mut owner_gap_total = 0_u64;
+            for entry in gaps
                 .range(prefix.as_str()..=end.as_str())
                 .map_err(storage)?
-                .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
             {
-                let (key, _) = entry.map_err(storage)?;
-                let sequence = key
-                    .value()
-                    .strip_prefix(prefix.as_str())
-                    .and_then(|suffix| suffix.parse::<u64>().ok())
-                    .ok_or(OrsError::IntegrityProblem {
-                        record_type: "bridge_stream_owner_list_index",
-                        reason: "owner-list key carries a malformed sequence".to_owned(),
-                    })?;
-                if sequence == 0 || sequence > owner_cutoff {
+                let (key, value) = entry.map_err(storage)?;
+                let gap: BridgeEventGapRow = decode(value.value())?;
+                gap.validate()?;
+                if gap.owner_namespace != namespace
+                    || !gap.stream_id.is_empty()
+                    || key.value() != format!("{namespace}::{}", gap.gap_id)
+                {
                     return Err(OrsError::IntegrityProblem {
-                        record_type: "bridge_stream_owner_list_index",
-                        reason: "owner-list key escaped the finite window cutoff".to_owned(),
+                        record_type: "bridge_event_gap",
+                        reason: "unscoped gap key, owner, and stream identity disagree".to_owned(),
                     });
                 }
-                *counter = counter.saturating_add(1);
-            }
-            if *counter > MAX_BRIDGE_STREAM_OWNERS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                owner_gap_total = owner_gap_total
+                    .checked_add(1)
+                    .ok_or(OrsError::ProjectionLimitExceeded)?;
+                if owner_gap_total > MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64 {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                unscoped_gap_total = unscoped_gap_total
+                    .checked_add(1)
+                    .ok_or(OrsError::ProjectionLimitExceeded)?;
+                if unscoped_gap_total > max_unscoped_gap_total {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
             }
         }
         Ok((stream_list_total, unscoped_gap_total))
@@ -11167,6 +11249,7 @@ impl RedbRecoveryStore {
             || last_event_sequence >= cut.upper_sequence
             || suffix_covered_by_gap;
         let page = json!({
+            "owner_namespace": owner.namespace,
             "stream_id": owner.local_stream,
             "owner_list_position": owner_list_position,
             "durable_cursor": cut.durable_cursor,
