@@ -13,14 +13,27 @@
 //!
 //! Durable state: a private namespace inside the admitted recovery registry
 //! table (the same physical table the Dreamer ledger uses, under the private
-//! `client::backup_restore` seam). Four keyed row families carry it: the
+//! `client::backup_restore` seam). Five keyed row families carry it: the
 //! destination fence row, the per-operation record row (members, per-phase
 //! receipts and the exact restored/rejected/suppressed/unresolved denominator),
-//! the archive-placement exclusivity row, and the current purge-ledger rows. No
-//! new table, DDL, schema generation or second client exists; the unique
+//! the archive-placement exclusivity row, the archive-member carrier rows the
+//! archive/artifact owner publishes, and the current purge-ledger rows. No new
+//! table, DDL, schema generation or second client exists; the unique
 //! `(namespace, key)` index supplies insert-if-absent exclusion, exact replay
 //! and changed-content conflict, and the destination fence compare-and-set
 //! serializes concurrent restores of one destination.
+//!
+//! Where the canonical bytes come from: a batch's [`SnapshotMember`] list
+//! supplies identities, digests and residency metadata, and is never a payload
+//! source. Each importable member's canonical logical payload is resolved
+//! through the archive/artifact owner's own carrier row, keyed by that batch's
+//! archive member digest and the member's domain-qualified logical identity, and
+//! every field of the carrier is compared against the batch's own member before
+//! the payload is used — including the owner's attested payload digest, which is
+//! validated against the bytes the carrier actually holds. An absent carrier is
+//! an unresolved member, never a member with empty content. The resolved
+//! payloads stay private to this execution path and are re-read out of the
+//! destination before any receipt reports a member restored.
 //!
 //! Evidence discipline: the current purge policy, the destination admission, the
 //! isolation fence, the build/schema identity and the source binding are read
@@ -1663,19 +1676,23 @@ fn validate_reference_closure_against(
         {
             continue;
         }
-        let reference = member.reference_digest.as_deref().ok_or(StoreError::InvalidField {
-            field: "restore.reference_digest",
-            reason: "reference member requires a reference digest",
-        })?;
-        let resolved_target = batch
-            .members
-            .iter()
-            .zip(dispositions)
-            .any(|(target, target_disposition)| {
-                *target_disposition == MemberDisposition::Restored
-                    && target.content_digest == reference
-                    && target.residency.domain == member.residency.domain
-            });
+        let reference = member
+            .reference_digest
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "restore.reference_digest",
+                reason: "reference member requires a reference digest",
+            })?;
+        let resolved_target =
+            batch
+                .members
+                .iter()
+                .zip(dispositions)
+                .any(|(target, target_disposition)| {
+                    *target_disposition == MemberDisposition::Restored
+                        && target.content_digest == reference
+                        && target.residency.domain == member.residency.domain
+                });
         if !resolved_target {
             return Err(StoreError::IdentityConflict);
         }
@@ -3946,19 +3963,13 @@ impl SurrealStoreAdapter {
                             reason: "unknown canonical class token",
                         }
                     })?;
-                    read_imported_member(
-                        transport,
-                        &self.config,
-                        class,
-                        record_id,
-                        expected_digest,
-                    )
-                    .await?
-                    .map(|digest| ImportedMemberEvidence {
-                        record_id: record_id.to_owned(),
-                        class_token: class.token(),
-                        digest,
-                    })
+                    read_imported_member(transport, &self.config, class, record_id, expected_digest)
+                        .await?
+                        .map(|digest| ImportedMemberEvidence {
+                            record_id: record_id.to_owned(),
+                            class_token: class.token(),
+                            digest,
+                        })
                 }
                 _ => None,
             };
@@ -4016,7 +4027,9 @@ fn imported_payload_bytes(imports: &[&ResolvedArchiveMember]) -> Result<u64, Sto
     for member in imports {
         let bytes = u64::try_from(canonical_digest_bytes(&member.payload)?.len())
             .map_err(|_| StoreError::PayloadTooLarge)?;
-        total = total.checked_add(bytes).ok_or(StoreError::PayloadTooLarge)?;
+        total = total
+            .checked_add(bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
     }
     Ok(total)
 }
