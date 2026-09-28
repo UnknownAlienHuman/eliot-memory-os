@@ -23,7 +23,7 @@ use thiserror::Error;
 /// Stable identity of this Governor projection contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.change-monitor";
 /// Current wire revision of this contract.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 
 /// Typed failures for observation admission and anchor resolution.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -63,6 +63,20 @@ pub enum ChangeMonitorError {
     /// A reconciliation did not identify admitted observations that prove the same change.
     #[error("unknown-change reconciliation evidence is invalid")]
     InvalidReconciliation,
+    /// A host/filesystem hint is malformed or uses a producer-only origin.
+    #[error("change hint is invalid")]
+    InvalidHint,
+    /// A hint verification lacks matching content, Git, or re-read evidence.
+    #[error("change hint verification is invalid")]
+    InvalidHintVerification,
+    /// A governed tool mutation lacks exact attempt, operation, diff, revision,
+    /// or State Fence invalidation evidence.
+    #[error("governed tool mutation receipt is incomplete or inconsistent")]
+    InvalidGovernedMutationReceipt,
+    /// Material evidence reached the generic observation ingress instead of
+    /// an owner-specific admission path.
+    #[error("material change requires a trusted owner admission path")]
+    UntrustedMaterialIngress,
     /// A resolver candidate did not carry a valid public anchor.
     #[error("invalid anchor candidate")]
     InvalidAnchor,
@@ -92,6 +106,31 @@ fn text(value: &str, field: &'static str) -> Result<(), ChangeMonitorError> {
     Ok(())
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_relative_path(value: &str, field: &'static str) -> Result<(), ChangeMonitorError> {
+    text(value, field)?;
+    if value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || value.contains(':')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ChangeMonitorError::InvalidField {
+            field,
+            reason: "must be a normalized repository-relative path",
+        });
+    }
+    Ok(())
+}
+
 fn unique<T: Ord>(
     values: impl IntoIterator<Item = T>,
     field: &'static str,
@@ -108,6 +147,88 @@ fn is_material_mutation(kind: ChangeKind) -> bool {
         kind,
         ChangeKind::Created | ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Renamed
     )
+}
+
+fn validate_governed_tool_mutation(
+    observation: &ChangeObservation,
+) -> Result<(), ChangeMonitorError> {
+    observation.validate()?;
+    let Some(attempt_receipt_ref) = observation.origin_ref.as_deref() else {
+        return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+    };
+    let Some(operation_ref) = observation.operation_ref.as_deref() else {
+        return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+    };
+    let Some(diff_ref) = observation.diff_or_artifact_ref.as_deref() else {
+        return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+    };
+    text(attempt_receipt_ref, "governed_mutation.attempt_receipt")?;
+    text(operation_ref, "governed_mutation.operation_ref")?;
+    text(diff_ref, "governed_mutation.diff_ref")?;
+
+    if observation.origin != ChangeOrigin::ProcessToolReceipt
+        || !is_material_mutation(observation.kind)
+        || observation.unknown_origin
+        || !matches!(
+            observation.attribution,
+            Attribution::Exact | Attribution::ReceiptLinked
+        )
+    {
+        return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+    }
+
+    let (resource, expected_kind) = match (&observation.before, &observation.after) {
+        (None, Some(after)) => (after, ChangeKind::Created),
+        (Some(before), None) => (before, ChangeKind::Deleted),
+        (Some(before), Some(after)) if before.resource_ref == after.resource_ref => {
+            if before.revision == after.revision {
+                return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+            }
+            let kind = if before.path == after.path {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Renamed
+            };
+            (after, kind)
+        }
+        _ => return Err(ChangeMonitorError::InvalidGovernedMutationReceipt),
+    };
+    for snapshot in [&observation.before, &observation.after]
+        .into_iter()
+        .flatten()
+    {
+        if snapshot
+            .content_digest
+            .as_deref()
+            .is_none_or(|digest| !is_sha256_hex(digest))
+        {
+            return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+        }
+    }
+    if observation.kind != expected_kind
+        || !observation.invalidations.iter().any(|invalidation| {
+            invalidation.dependency == format!("resource:{}", resource.resource_ref)
+                && invalidation.state_fence == observation.state_fence
+                && invalidation.reason_ref == attempt_receipt_ref
+        })
+    {
+        return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+    }
+    Ok(())
+}
+
+fn hint_observation_id(
+    role: &str,
+    hint: &ChangeHint,
+    verification: &ChangeHintVerification,
+) -> Result<String, ChangeMonitorError> {
+    let bytes = canonical_json_bytes(&(role, hint, verification)).map_err(|_| {
+        ChangeMonitorError::InvalidField {
+            field: "hint_verification",
+            reason: "cannot serialize verification identity",
+        }
+    })?;
+    Ok(format!("change-hint:{role}:{}", sha256_hex(&bytes)))
 }
 
 /// Origin route for one host/tool observation.
@@ -362,11 +483,21 @@ pub struct ObservedChangeRecord {
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeMonitorSnapshot {
-    /// Immutable observation records by change identity.
+    /// Immutable observations in accepted insertion order. This sequence is
+    /// required to rebuild the current-resource projection after repeated
+    /// mutations to the same resource.
     pub observations: Vec<ObservedChangeRecord>,
     /// Explicit links from unknown-origin material changes to admitted evidence.
     #[serde(default)]
     pub reconciliations: Vec<UnknownChangeReconciliation>,
+    /// Host/filesystem hints and their verified content/Git readbacks.
+    ///
+    /// A pending hint is not itself a material observation, but it blocks
+    /// governed acceptance until verified. A verified material result adds an
+    /// unknown-origin observation and a separate Git evidence observation;
+    /// the latter does not reconcile the former automatically.
+    #[serde(default)]
+    pub hints: Vec<ChangeHintRecord>,
     /// Current resource projection by stable resource identity.
     pub current_resources: Vec<ResourceSnapshot>,
     /// Dependencies observed invalidated by any included change.
@@ -385,25 +516,490 @@ pub struct UnknownChangeReconciliation {
     pub evidence_change_id: String,
 }
 
+/// Untrusted host/filesystem event supplied to the monitor as a re-check hint.
+///
+/// Hints do not assert that a material change occurred. The adapter must read
+/// the resource, collect Git evidence, and re-read its content before the
+/// monitor emits a material observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeHint {
+    /// Idempotent host-event identity.
+    pub hint_id: String,
+    /// State Fence at which the adapter received the event.
+    pub state_fence: StateFence,
+    /// Stable identity of the hinted resource.
+    pub resource_ref: String,
+    /// Canonical repository-relative path supplied by the adapter.
+    pub path: String,
+    /// Host event or filesystem notification route.
+    pub origin: ChangeOrigin,
+    /// Exact host event/notification receipt, when available.
+    pub origin_ref: Option<String>,
+}
+
+impl ChangeHint {
+    /// Validates the untrusted event identity and its narrow source route.
+    pub fn validate(&self) -> Result<(), ChangeMonitorError> {
+        text(&self.hint_id, "hint_id")?;
+        self.state_fence.validate()?;
+        text(&self.resource_ref, "hint.resource_ref")?;
+        validate_relative_path(&self.path, "hint.path")?;
+        if !matches!(
+            self.origin,
+            ChangeOrigin::HostEvent | ChangeOrigin::FilesystemNotification
+        ) {
+            return Err(ChangeMonitorError::InvalidHint);
+        }
+        if let Some(origin_ref) = &self.origin_ref {
+            text(origin_ref, "hint.origin_ref")?;
+        }
+        Ok(())
+    }
+}
+
+/// Presence/digest result from one direct content read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContentReadState {
+    /// The path existed and the exact bytes hashed to this SHA-256 digest.
+    Present { sha256: String },
+    /// The path was absent when read (used for a confirmed deletion).
+    Absent,
+}
+
+impl ContentReadState {
+    fn validate(&self) -> Result<(), ChangeMonitorError> {
+        if let Self::Present { sha256 } = self
+            && !is_sha256_hex(sha256)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        Ok(())
+    }
+}
+
+/// Bounded Git status/diff evidence from the trusted Kernel readback adapter.
+///
+/// Host request payloads must never deserialize into this value. The adapter
+/// constructs it only from successful read-only Git invocations and binds its
+/// changed-path list to the same direct content reads as the verification.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitChangeEvidence {
+    /// Stable repository identity/root handle.
+    pub repository_ref: String,
+    /// Repository HEAD observed before the first direct content read.
+    pub head_before: String,
+    /// Repository HEAD observed after the independent content re-read.
+    pub head_after: String,
+    /// Exact read-only Git status receipt captured before the first read.
+    pub status_before_ref: String,
+    /// SHA-256 of the exact status bytes captured before the first read.
+    pub status_before_sha256: String,
+    /// Exact read-only Git status receipt captured after the re-read.
+    pub status_ref: String,
+    /// SHA-256 of the exact status bytes captured after the re-read.
+    pub status_sha256: String,
+    /// Previously admitted resource revision bound to the first status read.
+    pub before_resource_revision: Option<String>,
+    /// Re-read resource revision bound to the second status read.
+    pub after_resource_revision: Option<String>,
+    /// Exact material diff/artifact handle, when Git reports a change.
+    pub diff_ref: Option<String>,
+    /// Canonical repository-relative paths reported by Git as changed.
+    pub changed_paths: Vec<String>,
+    /// Exact Git rename pairs reported by the same status/diff readback.
+    pub renames: Vec<GitPathRename>,
+}
+
+impl GitChangeEvidence {
+    fn validate(&self) -> Result<(), ChangeMonitorError> {
+        for (value, field) in [
+            (&self.repository_ref, "git.repository_ref"),
+            (&self.head_before, "git.head_before"),
+            (&self.head_after, "git.head_after"),
+            (&self.status_before_ref, "git.status_before_ref"),
+            (&self.status_ref, "git.status_ref"),
+        ] {
+            text(value, field)?;
+        }
+        if self.status_before_ref == self.status_ref
+            || !is_sha256_hex(&self.status_before_sha256)
+            || !is_sha256_hex(&self.status_sha256)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        for revision in [
+            &self.before_resource_revision,
+            &self.after_resource_revision,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text(revision, "git.resource_revision")?;
+        }
+        if let Some(diff_ref) = &self.diff_ref {
+            text(diff_ref, "git.diff_ref")?;
+        }
+        unique(self.changed_paths.iter().cloned(), "git.changed_paths")?;
+        for path in &self.changed_paths {
+            validate_relative_path(path, "git.changed_path")?;
+        }
+        unique(
+            self.renames.iter().map(|rename| rename.old_path.clone()),
+            "git.renames.old_path",
+        )?;
+        unique(
+            self.renames.iter().map(|rename| rename.new_path.clone()),
+            "git.renames.new_path",
+        )?;
+        for rename in &self.renames {
+            rename.validate()?;
+            if !self.changed_paths.contains(&rename.old_path)
+                || !self.changed_paths.contains(&rename.new_path)
+            {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One exact old/new path pair reported by Git rename detection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitPathRename {
+    /// Former repository-relative path.
+    pub old_path: String,
+    /// New repository-relative path.
+    pub new_path: String,
+}
+
+impl GitPathRename {
+    fn validate(&self) -> Result<(), ChangeMonitorError> {
+        validate_relative_path(&self.old_path, "git.rename.old_path")?;
+        validate_relative_path(&self.new_path, "git.rename.new_path")?;
+        if self.old_path == self.new_path {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        Ok(())
+    }
+}
+
+/// Exact content and Git readbacks used to promote one hint into observations.
+///
+/// This is an internal adapter result, not a caller-supplied event payload.
+/// A trusted owner-side adapter must construct it from actual file reads and
+/// read-only Git receipts. Host transport routes must accept only
+/// [`ChangeHint`] and must not deserialize user payloads into this type.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeHintVerification {
+    /// Previously admitted state, when the producer has one.
+    pub before: Option<ResourceSnapshot>,
+    /// State observed by the first post-hint content read.
+    pub after: Option<ResourceSnapshot>,
+    /// Repository-relative path read by the first direct content read.
+    pub first_read_path: String,
+    /// First read result at `first_read_path`.
+    pub first_read: ContentReadState,
+    /// Receipt for the first direct file read.
+    pub first_read_ref: String,
+    /// Repository-relative path read by the independent content re-read.
+    pub reread_path: String,
+    /// Independent re-read result; must equal `first_read` and `after`.
+    pub reread: ContentReadState,
+    /// Receipt for the independent direct file re-read.
+    pub reread_ref: String,
+    /// Git read-only status/diff evidence over the same hinted path.
+    pub git: GitChangeEvidence,
+}
+
+impl ChangeHintVerification {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one readback must validate its complete bound evidence before classification"
+    )]
+    fn kind_for(&self, hint: &ChangeHint) -> Result<Option<ChangeKind>, ChangeMonitorError> {
+        self.first_read.validate()?;
+        self.reread.validate()?;
+        self.git.validate()?;
+        validate_relative_path(&self.first_read_path, "hint.first_read_path")?;
+        validate_relative_path(&self.reread_path, "hint.reread_path")?;
+        text(&self.first_read_ref, "hint.first_read_ref")?;
+        text(&self.reread_ref, "hint.reread_ref")?;
+        if self.first_read_ref == self.reread_ref
+            || self.first_read_path != self.reread_path
+            || self.first_read != self.reread
+            || self.git.head_before != self.git.head_after
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        if let Some(before) = &self.before {
+            before.validate()?;
+            let Some(path) = before.path.as_deref() else {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            };
+            validate_relative_path(path, "before.path")?;
+            if before.resource_ref != hint.resource_ref
+                || before
+                    .content_digest
+                    .as_deref()
+                    .is_none_or(|digest| !is_sha256_hex(digest))
+                || self.git.before_resource_revision.as_deref() != Some(before.revision.as_str())
+            {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            }
+        } else if self.git.before_resource_revision.is_some() {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        if let Some(after) = &self.after {
+            after.validate()?;
+            let Some(path) = after.path.as_deref() else {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            };
+            validate_relative_path(path, "after.path")?;
+            if after.resource_ref != hint.resource_ref
+                || after
+                    .content_digest
+                    .as_deref()
+                    .is_none_or(|digest| !is_sha256_hex(digest))
+                || self.first_read
+                    != (ContentReadState::Present {
+                        sha256: after.content_digest.clone().unwrap_or_default(),
+                    })
+                || self.git.after_resource_revision.as_deref() != Some(after.revision.as_str())
+                || self.first_read_path != path
+            {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            }
+        } else if self.first_read != ContentReadState::Absent
+            || self.git.after_resource_revision.is_some()
+            || self.first_read_path
+                != self
+                    .before
+                    .as_ref()
+                    .and_then(|resource| resource.path.as_deref())
+                    .unwrap_or_default()
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+
+        let kind = match (&self.before, &self.after) {
+            (None, None) => None,
+            (None, Some(_)) => Some(ChangeKind::Created),
+            (Some(_), None) => Some(ChangeKind::Deleted),
+            (Some(before), Some(after)) if before == after => None,
+            (Some(before), Some(after)) if before.path != after.path => Some(ChangeKind::Renamed),
+            (Some(_), Some(_)) => Some(ChangeKind::Modified),
+        };
+        let before_path = self
+            .before
+            .as_ref()
+            .and_then(|resource| resource.path.as_ref());
+        let after_path = self
+            .after
+            .as_ref()
+            .and_then(|resource| resource.path.as_ref());
+        if before_path.is_none_or(|path| path != &hint.path)
+            && after_path.is_none_or(|path| path != &hint.path)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        if kind.is_none() && self.before.is_none() && self.after.is_none() {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        let mut affected_paths = BTreeSet::new();
+        if let Some(path) = before_path {
+            validate_relative_path(path, "before.path")?;
+            affected_paths.insert(path.as_str());
+        }
+        if let Some(path) = after_path {
+            validate_relative_path(path, "after.path")?;
+            affected_paths.insert(path.as_str());
+        }
+        let reported_paths: BTreeSet<&str> =
+            self.git.changed_paths.iter().map(String::as_str).collect();
+        let git_reports_change = affected_paths
+            .iter()
+            .any(|path| reported_paths.contains(*path));
+        if (kind.is_some()
+            && (affected_paths
+                .iter()
+                .any(|path| !reported_paths.contains(*path))
+                || !git_reports_change
+                || self.git.diff_ref.is_none()))
+            || (kind.is_none() && git_reports_change)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        if kind == Some(ChangeKind::Renamed) {
+            let before_path = before_path.ok_or(ChangeMonitorError::InvalidHintVerification)?;
+            let after_path = after_path.ok_or(ChangeMonitorError::InvalidHintVerification)?;
+            if !self
+                .git
+                .renames
+                .iter()
+                .any(|rename| rename.old_path == *before_path && rename.new_path == *after_path)
+            {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            }
+        }
+        Ok(kind)
+    }
+}
+
+/// Persisted hint and, once present, the evidence that resolved it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeHintRecord {
+    /// Original host/filesystem hint.
+    pub hint: ChangeHint,
+    /// Missing while the adapter has not completed its content/Git readback.
+    pub verification: Option<ChangeHintVerification>,
+}
+
+/// Result of admitting a host/filesystem hint.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeHintAdmission {
+    /// Hint identity.
+    pub hint_id: String,
+    /// Whether this is the first admission or an identical replay.
+    pub disposition: IngestDisposition,
+    /// Whether any pending hint or unknown material change still blocks
+    /// governed acceptance.
+    pub acceptance_blocked: bool,
+}
+
+/// Result of verifying one admitted hint.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeHintConfirmation {
+    /// Hint identity.
+    pub hint_id: String,
+    /// `true` when the verified resource state is unchanged.
+    pub unchanged: bool,
+    /// Unknown-origin material observation, present only for a changed file.
+    pub unknown_change_id: Option<String>,
+    /// Separate Git-only state evidence; it cannot attribute the change or
+    /// clear the unknown-origin blocker by itself.
+    pub evidence_change_id: Option<String>,
+    /// Whether the acceptance gate remains closed after this operation.
+    pub acceptance_blocked: bool,
+}
+
 /// In-memory rebuildable projection over immutable observations.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeMonitor {
     observations: BTreeMap<String, ObservedChangeRecord>,
+    observation_order: Vec<String>,
     reconciliations: BTreeMap<String, UnknownChangeReconciliation>,
+    hints: BTreeMap<String, ChangeHintRecord>,
+    hint_order: Vec<String>,
     current_resources: BTreeMap<String, ResourceSnapshot>,
     invalidated_dependencies: BTreeSet<String>,
 }
 
 impl ChangeMonitor {
     /// Rebuilds the monitor from canonical immutable observations.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "preserve the published owned snapshot rebuild API"
+    )]
     pub fn from_snapshot(snapshot: ChangeMonitorSnapshot) -> Result<Self, ChangeMonitorError> {
         let mut monitor = Self::default();
-        for record in snapshot.observations {
+        for record in &snapshot.hints {
+            monitor.ingest_hint(record.hint.clone())?;
+        }
+        let mut hint_material_ids = BTreeMap::new();
+        for record in &snapshot.hints {
+            if let Some(verification) = &record.verification
+                && verification.kind_for(&record.hint)?.is_some()
+            {
+                for role in ["unknown", "git"] {
+                    let change_id = hint_observation_id(role, &record.hint, verification)?;
+                    if hint_material_ids
+                        .insert(change_id, record.hint.hint_id.clone())
+                        .is_some()
+                    {
+                        return Err(ChangeMonitorError::IdentityConflict);
+                    }
+                }
+            }
+        }
+        let mut replayed_hint_confirmations = BTreeSet::new();
+        for record in &snapshot.observations {
             let observed = record.observation.clone();
             if observed.digest()? != record.observation_digest {
                 return Err(ChangeMonitorError::IdentityConflict);
             }
-            monitor.ingest(observed)?;
+            if is_material_mutation(observed.kind)
+                && matches!(
+                    observed.origin,
+                    ChangeOrigin::HostEvent
+                        | ChangeOrigin::FilesystemNotification
+                        | ChangeOrigin::GitReconciliation
+                )
+            {
+                // Only material rows regenerated from a persisted verified
+                // hint are accepted. Triggering regeneration at the first
+                // matching row preserves the original cross-origin effect
+                // order; raw host/Git rows cannot seed the projection.
+                let hint_id = hint_material_ids
+                    .get(&observed.change_id)
+                    .ok_or(ChangeMonitorError::InvalidHintVerification)?
+                    .clone();
+                if replayed_hint_confirmations.insert(hint_id.clone()) {
+                    let verification = snapshot
+                        .hints
+                        .iter()
+                        .find(|record| record.hint.hint_id == hint_id)
+                        .and_then(|record| record.verification.clone())
+                        .ok_or(ChangeMonitorError::InvalidHintVerification)?;
+                    monitor.confirm_hint_inner(&hint_id, &verification, true)?;
+                }
+                let regenerated = monitor
+                    .observations
+                    .get(&observed.change_id)
+                    .ok_or(ChangeMonitorError::InvalidHintVerification)?;
+                if regenerated.observation != observed
+                    || regenerated.observation_digest != record.observation_digest
+                {
+                    return Err(ChangeMonitorError::IdentityConflict);
+                }
+                continue;
+            }
+            if is_material_mutation(observed.kind)
+                && observed.origin == ChangeOrigin::ProcessToolReceipt
+            {
+                // Retained rows cross the same narrow evidence-shape boundary
+                // as live governed mutations, including the projected
+                // preimage at their retained insertion position.
+                validate_governed_tool_mutation(&observed)?;
+            } else if is_material_mutation(observed.kind) {
+                // Material rows enter through a verified host hint or the
+                // narrow governed-tool owner path. Do not let persisted
+                // ArtifactScan/Git/other rows self-assert admission or clear
+                // an unknown-origin blocker during rebuild.
+                return Err(ChangeMonitorError::UntrustedMaterialIngress);
+            }
+            monitor.ingest_observation(observed, true, true, true)?;
+        }
+        for record in &snapshot.hints {
+            if let Some(verification) = &record.verification
+                && !replayed_hint_confirmations.contains(&record.hint.hint_id)
+            {
+                // No-change confirmations do not alter the resource
+                // projection and have no place in observation order. Their
+                // readback remains retained; changed confirmations must have
+                // appeared at their ordered material rows above.
+                if verification.kind_for(&record.hint)?.is_some() {
+                    return Err(ChangeMonitorError::InvalidHintVerification);
+                }
+                monitor.confirm_hint_inner(&record.hint.hint_id, verification, false)?;
+            }
         }
         for reconciliation in &snapshot.reconciliations {
             monitor.reconcile_unknown_change(
@@ -411,20 +1007,60 @@ impl ChangeMonitor {
                 &reconciliation.evidence_change_id,
             )?;
         }
-        if monitor.snapshot().current_resources != snapshot.current_resources
+        let rebuilt = monitor.snapshot();
+        if rebuilt.observations != snapshot.observations
+            || rebuilt.current_resources != snapshot.current_resources
             || monitor.snapshot().invalidated_dependencies != snapshot.invalidated_dependencies
             || monitor.snapshot().reconciliations != snapshot.reconciliations
+            || rebuilt.hints != snapshot.hints
         {
             return Err(ChangeMonitorError::IdentityConflict);
         }
         Ok(monitor)
     }
 
-    /// Ingests one observation, treating an identical replay as idempotent.
+    /// Ingests one non-material observation, treating an identical replay as
+    /// idempotent. Material changes require their origin-specific owner path;
+    /// a well-formed reference string is not readback or attribution proof.
     pub fn ingest(
         &mut self,
         observation: ChangeObservation,
     ) -> Result<ObservationAdmission, ChangeMonitorError> {
+        if is_material_mutation(observation.kind) {
+            return Err(ChangeMonitorError::UntrustedMaterialIngress);
+        }
+        self.ingest_observation(observation, false, false, true)
+    }
+
+    fn ingest_observation(
+        &mut self,
+        observation: ChangeObservation,
+        from_verified_hint: bool,
+        from_governed_mutation: bool,
+        require_projected_preimage: bool,
+    ) -> Result<ObservationAdmission, ChangeMonitorError> {
+        if is_material_mutation(observation.kind)
+            && matches!(
+                observation.origin,
+                ChangeOrigin::HostEvent | ChangeOrigin::FilesystemNotification
+            )
+            && !from_verified_hint
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        if is_material_mutation(observation.kind)
+            && observation.origin == ChangeOrigin::ProcessToolReceipt
+            && !from_governed_mutation
+        {
+            return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+        }
+        if require_projected_preimage
+            && is_material_mutation(observation.kind)
+            && observation.origin == ChangeOrigin::ProcessToolReceipt
+            && observation.before.as_ref() != self.current_resources.get(observation.resource_ref())
+        {
+            return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+        }
         let digest = observation.digest()?;
         let change_id = observation.change_id.clone();
         if let Some(existing) = self.observations.get(&change_id) {
@@ -435,7 +1071,7 @@ impl ChangeMonitor {
                 change_id,
                 observation_digest: digest,
                 disposition: IngestDisposition::Replayed,
-                acceptance_blocked: self.has_unknown_material_change(),
+                acceptance_blocked: self.blocks_acceptance(),
                 invalidation_dependencies: existing
                     .observation
                     .invalidations
@@ -466,7 +1102,8 @@ impl ChangeMonitor {
                 observation_digest: digest.clone(),
             },
         );
-        let acceptance_blocked = self.has_unknown_material_change();
+        self.observation_order.push(change_id.clone());
+        let acceptance_blocked = self.blocks_acceptance();
         Ok(ObservationAdmission {
             change_id,
             observation_digest: digest,
@@ -476,11 +1113,202 @@ impl ChangeMonitor {
         })
     }
 
+    /// Admits a material change proven by one exact governed tool attempt.
+    ///
+    /// The receipt handle identifies the attempt; `operation_ref` identifies
+    /// the exact tool operation and `diff_or_artifact_ref` binds its output.
+    /// Before/after resource revisions remain on the observation, while the
+    /// invalidation must bind this exact State Fence and attempt receipt. This
+    /// narrow path is for a Governor owner after independent content/Git
+    /// readback; host payloads never call it. The first mutation of a resource
+    /// cannot pass until that owner has admitted a verified baseline.
+    pub fn ingest_governed_tool_mutation(
+        &mut self,
+        observation: ChangeObservation,
+    ) -> Result<ObservationAdmission, ChangeMonitorError> {
+        validate_governed_tool_mutation(&observation)?;
+        if observation.before.as_ref() != self.current_resources.get(observation.resource_ref()) {
+            return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
+        }
+        self.ingest_observation(observation, false, true, true)
+    }
+
+    /// Admits an untrusted host/filesystem event as a pending re-check hint.
+    ///
+    /// Pending hints block governed acceptance until a verified no-change
+    /// readback or a material transition is reconciled explicitly.
+    pub fn ingest_hint(
+        &mut self,
+        hint: ChangeHint,
+    ) -> Result<ChangeHintAdmission, ChangeMonitorError> {
+        hint.validate()?;
+        let hint_id = hint.hint_id.clone();
+        if let Some(existing) = self.hints.get(&hint_id) {
+            if existing.hint != hint {
+                return Err(ChangeMonitorError::IdentityConflict);
+            }
+            return Ok(ChangeHintAdmission {
+                hint_id,
+                disposition: IngestDisposition::Replayed,
+                acceptance_blocked: self.blocks_acceptance(),
+            });
+        }
+        self.hints.insert(
+            hint_id.clone(),
+            ChangeHintRecord {
+                hint,
+                verification: None,
+            },
+        );
+        self.hint_order.push(hint_id.clone());
+        Ok(ChangeHintAdmission {
+            hint_id,
+            disposition: IngestDisposition::Accepted,
+            acceptance_blocked: self.blocks_acceptance(),
+        })
+    }
+
+    fn confirm_hint_inner(
+        &mut self,
+        hint_id: &str,
+        verification: &ChangeHintVerification,
+        require_projected_before: bool,
+    ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
+        text(hint_id, "hint_id")?;
+        let record = self
+            .hints
+            .get(hint_id)
+            .ok_or(ChangeMonitorError::InvalidHint)?;
+        let hint = record.hint.clone();
+        let kind = verification.kind_for(&hint)?;
+        if let Some(existing) = &record.verification {
+            if existing != verification {
+                return Err(ChangeMonitorError::IdentityConflict);
+            }
+            return self.hint_confirmation(&hint, verification, kind);
+        }
+        // A missing projection is not evidence that the path was absent. The
+        // trusted producer must first admit an owner-verified baseline for an
+        // existing file before a first external mutation can be classified.
+        if require_projected_before
+            && verification.before.as_ref() != self.current_resources.get(&hint.resource_ref)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+
+        if let Some(kind) = kind {
+            let unknown_change_id = hint_observation_id("unknown", &hint, verification)?;
+            let evidence_change_id = hint_observation_id("git", &hint, verification)?;
+            let reason_ref = format!("change-hint:{}", hint.hint_id);
+            let unknown_observation = ChangeObservation {
+                change_id: unknown_change_id.clone(),
+                state_fence: hint.state_fence.clone(),
+                kind,
+                before: verification.before.clone(),
+                after: verification.after.clone(),
+                origin: hint.origin,
+                attribution: Attribution::Unknown,
+                origin_ref: Some(
+                    hint.origin_ref
+                        .clone()
+                        .unwrap_or_else(|| format!("host-hint:{}", hint.hint_id)),
+                ),
+                session_ref: None,
+                action_lease_ref: None,
+                operation_ref: None,
+                diff_or_artifact_ref: None,
+                unknown_origin: true,
+                invalidations: vec![FenceInvalidation {
+                    dependency: format!("resource:{}", hint.resource_ref),
+                    state_fence: hint.state_fence.clone(),
+                    reason_ref,
+                }],
+            };
+            let evidence_observation = ChangeObservation {
+                change_id: evidence_change_id.clone(),
+                state_fence: hint.state_fence.clone(),
+                kind,
+                before: verification.before.clone(),
+                after: verification.after.clone(),
+                origin: ChangeOrigin::GitReconciliation,
+                // This row records observed bytes and Git state only; it says
+                // nothing about which actor caused the transition.
+                attribution: Attribution::Unknown,
+                origin_ref: Some(verification.git.status_ref.clone()),
+                session_ref: None,
+                action_lease_ref: None,
+                operation_ref: None,
+                diff_or_artifact_ref: verification.git.diff_ref.clone(),
+                unknown_origin: false,
+                invalidations: Vec::new(),
+            };
+            let unknown_digest = unknown_observation.digest()?;
+            let evidence_digest = evidence_observation.digest()?;
+            let pair_already_admitted = match (
+                self.observations.get(&unknown_change_id),
+                self.observations.get(&evidence_change_id),
+            ) {
+                (None, None) => false,
+                (Some(unknown), Some(evidence))
+                    if unknown.observation_digest == unknown_digest
+                        && evidence.observation_digest == evidence_digest =>
+                {
+                    true
+                }
+                _ => return Err(ChangeMonitorError::IdentityConflict),
+            };
+            if !pair_already_admitted {
+                // Both rows and identities have been validated before either
+                // can mutate the projection, preventing a half-admitted pair
+                // if the second ID is already occupied or malformed.
+                self.ingest_observation(unknown_observation, true, false, false)?;
+                self.ingest_observation(evidence_observation, false, false, false)?;
+            }
+        }
+        self.hints
+            .get_mut(hint_id)
+            .ok_or(ChangeMonitorError::InvalidHint)?
+            .verification = Some(verification.clone());
+        self.hint_confirmation(&hint, verification, kind)
+    }
+
+    fn hint_confirmation(
+        &self,
+        hint: &ChangeHint,
+        verification: &ChangeHintVerification,
+        kind: Option<ChangeKind>,
+    ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
+        let (unknown_change_id, evidence_change_id) = if kind.is_some() {
+            (
+                Some(hint_observation_id("unknown", hint, verification)?),
+                Some(hint_observation_id("git", hint, verification)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(ChangeHintConfirmation {
+            hint_id: hint.hint_id.clone(),
+            unchanged: kind.is_none(),
+            unknown_change_id,
+            evidence_change_id,
+            acceptance_blocked: self.blocks_acceptance(),
+        })
+    }
+
     /// Returns a deterministic snapshot suitable for rebuilding consumers.
     pub fn snapshot(&self) -> ChangeMonitorSnapshot {
         ChangeMonitorSnapshot {
-            observations: self.observations.values().cloned().collect(),
+            observations: self
+                .observation_order
+                .iter()
+                .filter_map(|change_id| self.observations.get(change_id).cloned())
+                .collect(),
             reconciliations: self.reconciliations.values().cloned().collect(),
+            hints: self
+                .hint_order
+                .iter()
+                .filter_map(|hint_id| self.hints.get(hint_id).cloned())
+                .collect(),
             current_resources: self.current_resources.values().cloned().collect(),
             invalidated_dependencies: self.invalidated_dependencies.iter().cloned().collect(),
         }
@@ -488,11 +1316,12 @@ impl ChangeMonitor {
 
     /// Reconciles an unknown-origin material change against a separate
     /// admitted observation only when both prove the exact same before/after
-    /// resource snapshots under the same State Fence. The separate evidence
-    /// must be a Git reconciliation, process/tool receipt, or artifact scan
-    /// carrying an operation or diff/artifact handle and attributable evidence.
-    /// This conservative projection does not treat a host event, human
-    /// observation, or filesystem notification alone as confirmation.
+    /// resource snapshots under the same State Fence. Git status/diff evidence
+    /// confirms content state but cannot establish who caused the mutation;
+    /// the clearing evidence must be an attributable process/tool receipt or
+    /// artifact scan carrying an operation or diff/artifact handle. This
+    /// conservative projection does not treat a host event, human observation,
+    /// or filesystem notification alone as confirmation.
     /// Repeated exact links are idempotent; a conflicting link is rejected.
     /// This projection creates no canonical history or acceptance authority;
     /// callers must supply admitted canonical observations.
@@ -517,13 +1346,11 @@ impl ChangeMonitor {
             || evidence.observation.unknown_origin
             || !matches!(
                 evidence.observation.origin,
-                ChangeOrigin::GitReconciliation
-                    | ChangeOrigin::ProcessToolReceipt
-                    | ChangeOrigin::ArtifactScan
+                ChangeOrigin::ProcessToolReceipt | ChangeOrigin::ArtifactScan
             )
             || !matches!(
                 evidence.observation.attribution,
-                Attribution::Exact | Attribution::ReceiptLinked | Attribution::Correlated
+                Attribution::Exact | Attribution::ReceiptLinked
             )
             || evidence.observation.origin_ref.is_none()
             || (evidence.observation.operation_ref.is_none()
@@ -532,6 +1359,8 @@ impl ChangeMonitor {
             || evidence.observation.state_fence != unknown.observation.state_fence
             || evidence.observation.before != unknown.observation.before
             || evidence.observation.after != unknown.observation.after
+            || (evidence.observation.origin == ChangeOrigin::ProcessToolReceipt
+                && validate_governed_tool_mutation(&evidence.observation).is_err())
         {
             return Err(ChangeMonitorError::InvalidReconciliation);
         }
@@ -564,6 +1393,20 @@ impl ChangeMonitor {
         self.observations
             .keys()
             .any(|change_id| self.has_unresolved_unknown_change(change_id))
+    }
+
+    /// Returns whether unverified hints or unreconciled material changes
+    /// currently block governed acceptance.
+    pub fn blocks_acceptance(&self) -> bool {
+        self.has_pending_hints() || self.has_unknown_material_change()
+    }
+
+    /// Returns whether a host/filesystem hint still needs a verified
+    /// content/Git readback.
+    pub fn has_pending_hints(&self) -> bool {
+        self.hints
+            .values()
+            .any(|record| record.verification.is_none())
     }
 }
 
