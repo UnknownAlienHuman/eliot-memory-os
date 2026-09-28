@@ -21,9 +21,10 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, ToolRequest, ToolSchema,
-    TypedRejection, bind_act_owner_inputs, bind_list_surface_budget, canonical_tool_schemas,
-    classify_tool_request, decode_protected_request_bytes, published_mcp_tool_surface,
+    McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, SemanticRegistry,
+    TaskSurfaceConditions, ToolRequest, ToolSchema, TypedRejection, bind_act_owner_inputs,
+    bind_list_surface_budget, canonical_tool_schemas, classify_tool_request,
+    compile_task_relative_surface, decode_protected_request_bytes, published_mcp_tool_surface,
     reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
 };
 
@@ -2350,6 +2351,31 @@ pub fn tools_list_result_for_permitted_surface(
     surface: &PermittedTaskSurface,
 ) -> Result<Value, WireRejection> {
     render_tool_list_surface(&surface.permitted)
+}
+
+/// Builds a task-relative `tools/list` result from owner-supplied conditions.
+///
+/// Compiles the #1745 decision over the live semantic owner, derives the
+/// permitted subset from the generated descriptors with validated owner
+/// bindings, then projects only the permitted descriptors through the single
+/// list envelope. Hidden, forbidden, and unavailable methods stay absent
+/// from the published bytes; they are never warned about in prose. The
+/// conditions arrive from the Governor/Kernel owners: this entry validates
+/// shape only and never mints task, role, grant, or capability facts.
+pub fn task_relative_tools_list_result(
+    registry: &SemanticRegistry,
+    conditions: &TaskSurfaceConditions,
+) -> Result<Value, WireRejection> {
+    let surface = compile_task_relative_surface(registry, conditions).map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "task-relative tool surface is unavailable",
+        )
+    })?;
+    tools_list_result_for_permitted_surface(&PermittedTaskSurface {
+        permitted: surface.permitted,
+        withheld: surface.withheld,
+    })
 }
 
 /// Rejects a blank string wire identity before typed projection.
