@@ -97,6 +97,19 @@ pub enum ProjectionError {
         field: &'static str,
         obligation: &'static str,
     },
+    /// A forensic audit note claims restored active authority (case 958/3).
+    ///
+    /// The typed non-authoritative ceiling. A `HostStateAuditFence` is forensic
+    /// evidence and nothing else, so a note asserting that active authority was
+    /// restored is exactly the claim I5.13 forbids the fence from carrying. The
+    /// refusal is a distinct typed variant rather than a digest/identity shape
+    /// error, because the offending value is a well-formed `true` and only the
+    /// ceiling rejects it: collapsing it into [`Self::InvalidDigest`] or
+    /// [`Self::InvalidIdentity`] would hide which guarantee failed.
+    #[error("forensic audit note in field {field} asserts restored active authority: a \
+             HostStateAuditFence is forensic only and never a lease, grant, or current-state \
+             assertion")]
+    ActiveAuthorityInAuditFence { field: &'static str },
 }
 
 // F-LOG-HOST-8 (#983) backup configuration diagnostics: observation-only helpers.
@@ -165,6 +178,9 @@ fn projection_error_category(error: &ProjectionError) -> (&'static str, &'static
         ProjectionError::StaleEvidence { field } => ("stale_evidence", field),
         ProjectionError::OwnerEvidenceUnavailable { field, .. } => {
             ("owner_evidence_unavailable", field)
+        }
+        ProjectionError::ActiveAuthorityInAuditFence { field } => {
+            ("active_authority_in_audit_fence", field)
         }
     }
 }
@@ -286,9 +302,19 @@ pub struct BackupConfigRequest {
     /// Owner lease reference the requester claims.
     ///
     /// Refused on the owner-bound production path: no owner here issues a lease
-    /// reference, so any presented value is uncorroborated. Lease issuance
-    /// belongs to the #954 control contracts, which are open. The snapshot
-    /// variant still compares it against its [`AuthoritySnapshot`].
+    /// reference, so any presented value is uncorroborated. #954 is **not** the
+    /// open item: it merged (`5e71386a`, PR #2572) and its contract lives in
+    /// `crates/foundation/eliot-protocol/src/backup.rs`, where
+    /// `BackupAdmissionRef` is a per-operation external admission reference and
+    /// is documented never to grant a role on its own — it is not a standing
+    /// owner lease, and presenting one in this shape would substitute a
+    /// different object for the named guarantee. What is missing is a Host
+    /// owner that *issues* lease-reference text:
+    /// `eliot_platform_windows::HostOwnerLease` exposes only
+    /// `is_for_installation` and `activation_capability`, and no installation
+    /// record, approved generation or commit fence carries a lease reference.
+    /// The snapshot variant still compares it against its
+    /// [`AuthoritySnapshot`].
     pub owner_lease_ref: String,
     /// Generation the requester claims as approved. On the owner-bound
     /// production path this is refused unless it equals the owner-issued
@@ -319,7 +345,18 @@ pub struct BackupConfigRequest {
 /// Carries a digest plus observed dispositions only. There is deliberately NO
 /// constructor, conversion, or method that turns this into a lease, grant,
 /// or current-state assertion; [`describe_audit_fence`] renders the note
-/// with its ceiling stated.
+/// with its ceiling stated, and [`AuditFenceNote::validate`] ENFORCES that
+/// ceiling rather than only describing it.
+///
+/// [`active_authority_restored`] is the ceiling made representable. Before it
+/// existed, a note had no field in which a restored-authority claim could even
+/// be stated, so the "never a lease, grant, or current-state assertion"
+/// guarantee was documentation rather than a decision any code made. The same
+/// flag exists on the owner's own fence type
+/// (`eliot_backup::HostStateAuditFence::active_authority_restored`), so this
+/// note is the projection of that recorded value and not a local invention;
+/// the field defaults to `false` on read because a note that omits the claim
+/// makes no restored-authority assertion.
 ///
 /// Nothing on the owner-bound production path issues or corroborates such a
 /// note, so [`project_backup_config_owner_bound`] refuses a presented one and
@@ -331,6 +368,44 @@ pub struct AuditFenceNote {
     pub note_digest: String,
     /// Observed dispositions (bounded text each).
     pub observed_dispositions: Vec<String>,
+    /// Typed non-authoritative ceiling: whether this note claims active
+    /// authority was restored. Always `false` for an admissible note.
+    ///
+    /// `#[serde(default)]` is not a default grant: `false` is the absence of a
+    /// restored-authority *claim*, and a note that states the claim is refused
+    /// by [`AuditFenceNote::validate`] with
+    /// [`ProjectionError::ActiveAuthorityInAuditFence`].
+    #[serde(default)]
+    pub active_authority_restored: bool,
+}
+
+impl AuditFenceNote {
+    /// Enforces the note's shape and its typed non-authoritative ceiling.
+    ///
+    /// Order is the ceiling first, then shape. A note that both claims
+    /// restored active authority and carries a malformed digest is a ceiling
+    /// violation, and reporting the digest instead would let the authority
+    /// claim be "fixed" by re-digesting the note.
+    ///
+    /// This is a complete gate for one note: there is no shape check for an
+    /// audit note anywhere else in this module, so a note that reaches
+    /// [`BackupConfigProjection::projection_digest`] has passed the ceiling.
+    pub fn validate(&self) -> Result<(), ProjectionError> {
+        if self.active_authority_restored {
+            return Err(ProjectionError::ActiveAuthorityInAuditFence {
+                field: "audit.active_authority_restored",
+            });
+        }
+        check_digest(&self.note_digest, "audit.note_digest")
+            .map_err(|error| note_config_error("audit", error))?;
+        check_bounded_list(&self.observed_dispositions, "audit.observed_dispositions")
+            .map_err(|error| note_config_error("audit", error))?;
+        for disposition in &self.observed_dispositions {
+            check_identity(disposition, "audit.observed_dispositions[]")
+                .map_err(|error| note_config_error("audit", error))?;
+        }
+        Ok(())
+    }
 }
 
 /// Bounded owner-issued logical projection of backup configuration evidence.
@@ -360,9 +435,12 @@ pub struct BackupConfigProjection {
     /// Owner lease reference. Always **empty** on the owner-bound production
     /// path: no owner issues a lease reference there, so a presented one is
     /// refused with [`ProjectionError::OwnerEvidenceUnavailable`] rather than
-    /// copied, and the record states the absence instead. Lease issuance
-    /// belongs to the #954 control contracts, which are open. The snapshot
-    /// variant fills this from its [`AuthoritySnapshot`].
+    /// copied, and the record states the absence instead. #954 merged
+    /// (`5e71386a`, PR #2572) and does not supply one — its
+    /// `BackupAdmissionRef` is a per-operation admission reference, not a
+    /// standing owner lease. The missing owner is a Host owner that issues
+    /// lease-reference text; see [`BackupConfigRequest::owner_lease_ref`]. The
+    /// snapshot variant fills this from its [`AuthoritySnapshot`].
     pub owner_lease_ref: String,
     /// Approved generation, refused unless it equals the owner-issued
     /// authority generation of the active approved record on the production
@@ -449,6 +527,18 @@ fn hash_audit_note(hasher: &mut Sha256, audit: Option<&AuditFenceNote>) {
         return;
     };
     hash_field(hasher, b"audit", b"present");
+    // The ceiling flag is bound as its enforced value, not omitted. I5.27
+    // forbids silently omitting a field that affects authority in either
+    // direction, and this one decides whether a note may be a current-state
+    // assertion at all. `AuditFenceNote::validate` has already refused any
+    // `true`, so the byte written here is the ceiling that was proved, and a
+    // future relaxation of that gate is visible as a digest change rather
+    // than as two byte-identical digests over different ceilings.
+    hash_field(
+        hasher,
+        b"audit.active_authority_restored",
+        &(u8::from(note.active_authority_restored)).to_le_bytes(),
+    );
     hash_field(
         hasher,
         b"audit.disposition_count",
@@ -493,6 +583,13 @@ fn check_bounded_list(values: &[String], field: &'static str) -> Result<(), Proj
 /// (case 958/3). The returned text is evidence only and can never act as a
 /// lease, grant, or current-state assertion.
 ///
+/// The ceiling is not only stated here, it is enforced: a note whose
+/// [`AuditFenceNote::active_authority_restored`] is set is refused by
+/// [`AuditFenceNote::validate`] with
+/// [`ProjectionError::ActiveAuthorityInAuditFence`] before any projection is
+/// built, so no rendered text can describe a note that claims restored active
+/// authority.
+///
 /// The note it renders is **caller-authored**, and the owner-bound production
 /// path therefore refuses a presented note
 /// ([`project_backup_config_owner_bound`]): no owner here compares the note
@@ -504,8 +601,10 @@ fn check_bounded_list(values: &[String], field: &'static str) -> Result<(), Proj
 #[must_use]
 pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
     format!(
-        "forensic audit note {} (non-authoritative: not a lease, grant, or current-state assertion; dispositions: {})",
+        "forensic audit note {} (non-authoritative: not a lease, grant, or current-state \
+         assertion; active_authority_restored={}; dispositions: {})",
         note.note_digest,
+        note.active_authority_restored,
         note.observed_dispositions.join(",")
     )
 }
@@ -527,7 +626,7 @@ pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
 /// against the owner-issued generation, configuration digest and artifact
 /// digests of the active approved record. Its digest domain separator is
 /// therefore distinct from this function's, because the two constructions bind
-/// different fields.
+/// different fields: this path is `snapshot.v3`, the owner-bound path is `v4`.
 ///
 /// Validates shapes and bounds, then requires field-for-field equality with
 /// the supplied snapshot. Any stale or mixed field fails with
@@ -555,14 +654,13 @@ pub fn project_backup_config(
             .map_err(|error| note_config_error("project", error))?;
     }
     if let Some(audit) = &request.audit {
-        check_digest(&audit.note_digest, "audit.note_digest")
+        // The complete gate for the note, including its typed
+        // non-authoritative ceiling. The snapshot variant is the only
+        // projector that admits a note at all, so this is the only place a
+        // ceiling can be enforced for a note that reaches a projection digest.
+        audit
+            .validate()
             .map_err(|error| note_config_error("project", error))?;
-        check_bounded_list(&audit.observed_dispositions, "audit.observed_dispositions")
-            .map_err(|error| note_config_error("project", error))?;
-        for disposition in &audit.observed_dispositions {
-            check_identity(disposition, "audit.observed_dispositions[]")
-                .map_err(|error| note_config_error("project", error))?;
-        }
     }
     if request.owner_lease_ref != current.owner_lease_ref {
         return Err(note_config_error(
@@ -605,7 +703,13 @@ pub fn project_backup_config(
         ));
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"eliot.backup.config-projection.v2\0");
+    // `snapshot.v3`, not the earlier `v2`: v2 did not bind the forensic note's
+    // typed non-authoritative ceiling, so a stored v2 digest must not silently
+    // match a digest over a note whose ceiling is now a proved field (I5.27).
+    // The `snapshot.` infix also keeps this path's revision sequence disjoint
+    // from the owner-bound path's (`v3` retired, `v4` current): the two paths
+    // bind different fields and must never be read as one revision series.
+    hasher.update(b"eliot.backup.config-projection.snapshot.v3\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
     hash_field(
         &mut hasher,
@@ -810,13 +914,19 @@ pub fn bind_approved_build(
 /// [`ProjectionError::OwnerEvidenceUnavailable`] rather than compared against
 /// the caller's own value or carried into an owner-issued record:
 ///
-/// - a non-empty `owner_lease_ref` — lease issuance belongs to the #954
-///   control contracts, which are open;
+/// - a non-empty `owner_lease_ref` — no Host owner issues lease-reference
+///   text. #954 merged (`5e71386a`, PR #2572) and its `BackupAdmissionRef` is
+///   a per-operation admission reference, not a standing owner lease;
 /// - a non-zero `purge_ledger_revision` — purge-ledger authority is owned
-///   outside Host backup preparation and no owner observed here issues one;
+///   outside Host backup preparation (the ORS owner) and no owner observed here
+///   issues one;
 /// - any `audit` note — the note is caller-authored and nothing here compares
 ///   its digest or observed dispositions to Host state, so binding it would
-///   carry unverified disposition claims into an owner-issued receipt.
+///   carry unverified disposition claims into an owner-issued receipt. The
+///   note's own typed non-authoritative ceiling
+///   ([`AuditFenceNote::validate`]) is enforced where a note is admissible at
+///   all; the refusal here is stronger, because no owner corroborates the
+///   note's lineage in the first place.
 ///
 /// Each refusal names the exact owner obligation that is missing. With no claim
 /// presented, the record states the absence and the digest binds that absence
@@ -826,8 +936,8 @@ pub fn bind_approved_build(
 /// owner-issued authority generation and the owner-issued configuration digest
 /// in addition to the presented fields, so a receipt cannot migrate across
 /// authority generations. Its domain separator is `v4`, distinct from
-/// [`project_backup_config`]'s `v2` and from this path's own earlier `v3`:
-/// `v3` still hashed the caller's lease reference and purge-ledger revision as
+/// [`project_backup_config`]'s `snapshot.v3` and from this path's own earlier
+/// `v3`: `v3` still hashed the caller's lease reference and purge-ledger revision as
 /// if they were evidence, and a stored `v3` receipt must not silently match a
 /// `v4` digest over the same logical input (I5.27). `CONFIG_PROJECTION_VERSION`
 /// is the serialized record schema version, not the digest revision, and does
@@ -881,8 +991,10 @@ pub fn project_backup_config_owner_bound(
             "project_owner_bound",
             ProjectionError::OwnerEvidenceUnavailable {
                 field: "owner_lease_ref",
-                obligation: "an owner-issued lease reference must come from the #954 caller-control \
-                     contracts, which are open; no installation record observed here issues one",
+                obligation: "an owner-issued lease reference must be issued by a Host owner; no \
+                     installation record, approved generation or commit fence observed here carries \
+                     one, and the #954 per-operation admission reference is not a standing owner \
+                     lease",
             },
         ));
     }
