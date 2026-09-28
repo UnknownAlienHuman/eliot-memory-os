@@ -33,9 +33,11 @@
 //! ```text
 //! admit_intake → Pending → issue_claim → Claimed → record_decision
 //! → DecisionRecorded → acknowledge → Acknowledged (sink)
-//! claim timeout → Pending (same identity) · ambiguous commit → Reconciling
-//! → Claimed | DecisionRecorded · expiry/supersession → Expired | Superseded
-//! (sinks, identity and evidence preserved)
+//! claim timeout → Pending (same identity) · timeout or revocation after a
+//! recorded decision → Reconciling (receipt preserved) → Claimed (fresh
+//! finite claim) → acknowledge reuses the same receipt · ambiguous commit
+//! → Reconciling → Claimed | DecisionRecorded · expiry/supersession
+//! → Expired | Superseded (sinks, identity and evidence preserved)
 //! ```
 
 use std::collections::BTreeMap;
@@ -237,6 +239,42 @@ impl MaintenanceTriggerDeliveryLedger {
             if let Some(receipt) = &row.decision_receipt {
                 receipt.matches_trigger(&row.record)?;
             }
+            if matches!(
+                row.disposition,
+                MaintenanceTriggerDisposition::DecisionRecorded
+                    | MaintenanceTriggerDisposition::Acknowledged
+            ) && row.decision_receipt.is_none()
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_delivery.decision_receipt",
+                    reason: "a decided row must carry its committed receipt",
+                }
+                .into());
+            }
+            if matches!(
+                row.disposition,
+                MaintenanceTriggerDisposition::Expired | MaintenanceTriggerDisposition::Superseded
+            ) && row.terminal.is_none()
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_delivery.terminal",
+                    reason: "a terminal row must carry its terminal disposition",
+                }
+                .into());
+            }
+            if matches!(
+                row.disposition,
+                MaintenanceTriggerDisposition::Acknowledged
+                    | MaintenanceTriggerDisposition::Expired
+                    | MaintenanceTriggerDisposition::Superseded
+            ) && row.claim.is_some()
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_delivery.claim",
+                    reason: "a settled row must not carry a live claim",
+                }
+                .into());
+            }
             if let Some(terminal) = &row.terminal {
                 terminal.validate()?;
             }
@@ -376,10 +414,14 @@ impl MaintenanceTriggerDeliveryLedger {
         Ok(candidate)
     }
 
-    /// Releases an expired claim back to `Pending` under the same identity.
+    /// Releases an expired claim back under the same identity.
     ///
-    /// The trigger keeps its identity and revision; redelivery needs a fresh
-    /// finite claim, never a new trigger ID.
+    /// A timed-out `Claimed` row returns to `Pending`; a `DecisionRecorded`
+    /// row with a lapsed claim moves to `Reconciling` with its committed
+    /// receipt preserved, so the owner reconciles by receipt lookup instead
+    /// of repeating the downstream effect. A `Reconciling` row keeps its
+    /// disposition. Redelivery always needs a fresh finite claim, never a
+    /// new trigger ID.
     pub fn release_expired(
         &mut self,
         trigger_id: &str,
@@ -400,12 +442,31 @@ impl MaintenanceTriggerDeliveryLedger {
             }
             .into());
         }
-        MaintenanceTriggerDisposition::validate_advance(
-            row.disposition,
-            MaintenanceTriggerDisposition::Pending,
-        )?;
+        match row.disposition {
+            MaintenanceTriggerDisposition::Claimed => {
+                MaintenanceTriggerDisposition::validate_advance(
+                    row.disposition,
+                    MaintenanceTriggerDisposition::Pending,
+                )?;
+                row.disposition = MaintenanceTriggerDisposition::Pending;
+            }
+            MaintenanceTriggerDisposition::DecisionRecorded => {
+                MaintenanceTriggerDisposition::validate_advance(
+                    row.disposition,
+                    MaintenanceTriggerDisposition::Reconciling,
+                )?;
+                row.disposition = MaintenanceTriggerDisposition::Reconciling;
+            }
+            MaintenanceTriggerDisposition::Reconciling => {}
+            _ => {
+                return Err(ProtocolError::InvalidField {
+                    field: "maintenance_trigger.disposition",
+                    reason: "only an open row carries a releasable claim",
+                }
+                .into());
+            }
+        }
         row.claim = None;
-        row.disposition = MaintenanceTriggerDisposition::Pending;
         Ok(())
     }
 
@@ -483,6 +544,31 @@ impl MaintenanceTriggerDeliveryLedger {
         }
         // `more` fires only on an unresolved row that was not listed, so a
         // further page always follows under the last listed identity.
+        // A scan that lists nothing yields no certifiable complete-empty
+        // set: the wire refuses an empty gapless page, so the page closes
+        // with an explicit gap naming the cursor. The consumer must resume
+        // or reconcile; it must not treat the absence as proof of nothing
+        // pending. Row gaps ride only with their listed row (all or nothing
+        // per row, so a row's gap list never reads as a partial projection);
+        // the full per-trigger gap lists stay readable on the row itself.
+        if members.is_empty() {
+            gaps.push(MaintenanceTriggerGap {
+                gap_id: match continuation {
+                    Some(cursor) => format!("page:{cursor}:no-further-listed"),
+                    None => "page:start:no-further-listed".to_owned(),
+                },
+                trigger_id: None,
+                kind: MaintenanceTriggerGapKind::IncompleteEnumeration,
+                detail: match continuation {
+                    Some(cursor) => format!(
+                        "no unresolved rows listed past continuation {cursor}; not a certified-complete set"
+                    ),
+                    None => "no unresolved rows listed from the start; not a certified-complete set"
+                        .to_owned(),
+                },
+                recorded_at_unix_ms: now_unix_ms,
+            });
+        }
         let page = MaintenanceTriggerPage {
             wire_id: MAINTENANCE_TRIGGER_PAGE_WIRE_ID.to_owned(),
             wire_version: MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION,
@@ -662,12 +748,15 @@ impl MaintenanceTriggerDeliveryLedger {
 
     /// Revokes one daemon generation/session's trigger-consumer authority.
     ///
-    /// Pending claims under the revoked identity are retained as `Pending`
-    /// rows under the same identity and revision so the replacement
-    /// generation can reclaim them; their old consumer authority is gone.
-    /// Old-generation responses fail after this revocation because every
-    /// claim and ack is checked against the revocation list and the current
-    /// fence.
+    /// A revoked `Claimed` row returns to `Pending` under the same identity
+    /// and revision so the replacement generation can reclaim it. A revoked
+    /// `DecisionRecorded` row moves to `Reconciling` with its committed
+    /// receipt preserved, so the replacement reconciles by receipt lookup
+    /// and acknowledges the same receipt without repeating the downstream
+    /// effect. A revoked `Reconciling` row keeps its disposition. In every
+    /// case the old consumer authority is gone: every claim and ack is
+    /// checked against the revocation list and the current fence, so
+    /// old-generation responses fail after this revocation.
     pub fn revoke_consumer(
         &mut self,
         revocation: MaintenanceTriggerRevocation,
@@ -678,14 +767,34 @@ impl MaintenanceTriggerDeliveryLedger {
                 claim.daemon_fence == revocation.daemon_fence
                     && claim.daemon_session == revocation.daemon_session
             });
-            if matches {
-                MaintenanceTriggerDisposition::validate_advance(
-                    row.disposition,
-                    MaintenanceTriggerDisposition::Pending,
-                )?;
-                row.claim = None;
-                row.disposition = MaintenanceTriggerDisposition::Pending;
+            if !matches {
+                continue;
             }
+            match row.disposition {
+                MaintenanceTriggerDisposition::Claimed => {
+                    MaintenanceTriggerDisposition::validate_advance(
+                        row.disposition,
+                        MaintenanceTriggerDisposition::Pending,
+                    )?;
+                    row.disposition = MaintenanceTriggerDisposition::Pending;
+                }
+                MaintenanceTriggerDisposition::DecisionRecorded => {
+                    MaintenanceTriggerDisposition::validate_advance(
+                        row.disposition,
+                        MaintenanceTriggerDisposition::Reconciling,
+                    )?;
+                    row.disposition = MaintenanceTriggerDisposition::Reconciling;
+                }
+                MaintenanceTriggerDisposition::Reconciling => {}
+                _ => {
+                    return Err(ProtocolError::InvalidField {
+                        field: "maintenance_trigger.disposition",
+                        reason: "only an open row carries a revocable claim",
+                    }
+                    .into());
+                }
+            }
+            row.claim = None;
         }
         self.revocations.push(revocation);
         Ok(())
