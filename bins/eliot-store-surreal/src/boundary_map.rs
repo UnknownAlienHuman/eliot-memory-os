@@ -62,6 +62,13 @@ pub enum StoreCredentialRole {
     NormalClient,
 }
 
+impl StoreCredentialRole {
+    /// Every role this boundary admits. The roster is closed: a launch that
+    /// needed a third credential role would have to extend this enum, which is
+    /// the intended way to make a new secret-bearing edge visible.
+    const ALL: [Self; 2] = [Self::ProviderBootstrapAdmin, Self::NormalClient];
+}
+
 /// Issuer of every credential reference in this boundary.
 ///
 /// I15.4: "Windows Credential Manager/DPAPI-protected `SecretRef` values behind
@@ -418,7 +425,7 @@ impl StoreBoundaryMap {
         // one contour, the provider endpoint has exactly one owner, and each
         // credential reference is delivered to exactly one contour. These are
         // checked against the map's OWN rows, not against a second copy of them.
-        for role in [StoreCredentialRole::NormalClient, StoreCredentialRole::ProviderBootstrapAdmin] {
+        for role in StoreCredentialRole::ALL {
             let holders = self.contours_holding(role);
             if holders.len() != 1 {
                 return Err(format!(
@@ -434,11 +441,23 @@ impl StoreBoundaryMap {
                     .to_owned(),
             );
         }
-        let delivered = self.contours_receiving_a_credential();
-        if delivered.len() != self.credential_references().len() {
-            return Err(
-                "every credential reference must be delivered to exactly one contour".to_owned(),
-            );
+        // Each role's reference must reach its own contour. Two references
+        // delivered to one contour would put both secrets in one process; a
+        // reference delivered to a contour holding no role would put a secret
+        // where the map admits none.
+        for reference in self.credential_references() {
+            let holder = self
+                .rows
+                .iter()
+                .find(|row| row.credential_role == Some(reference.role))
+                .map(|row| row.contour);
+            if holder != Some(reference.delivered_to) {
+                return Err(format!(
+                    "the {:?} credential reference must be delivered to the contour the map \
+                     admits to that role",
+                    reference.role
+                ));
+            }
         }
         if NAMED_PIPE_CALLER.contour == MAINTENANCE_CALLER.contour {
             return Err(
@@ -513,22 +532,5 @@ impl StoreBoundaryMap {
             .filter(|row| row.owns_provider_endpoint)
             .map(|row| row.contour)
             .collect()
-    }
-
-    /// The contours that receive a credential value, across the reference rows.
-    ///
-    /// A duplicate contour here would put one launch's secret into two
-    /// processes, and an unlisted reference would leave a secret-bearing edge
-    /// with no declared delivery contour; both are refused rather than
-    /// tolerated.
-    fn contours_receiving_a_credential(&self) -> Vec<StoreBoundaryContour> {
-        let mut delivered: Vec<StoreBoundaryContour> = self
-            .credential_references()
-            .iter()
-            .map(|reference| reference.delivered_to)
-            .collect();
-        delivered.sort_by_key(|contour| format!("{contour:?}"));
-        delivered.dedup();
-        delivered
     }
 }
