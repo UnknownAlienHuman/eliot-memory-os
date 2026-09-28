@@ -100,8 +100,7 @@ fn valid_revision(
                     normalizer_authority: String::new(),
                     source_digest: String::new(),
                     zone_database_revision:
-                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION
-                            .to_owned(),
+                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
                     occurrences_digest: String::new(),
                 },
         },

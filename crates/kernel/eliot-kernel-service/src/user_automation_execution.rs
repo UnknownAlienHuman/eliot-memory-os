@@ -3707,14 +3707,16 @@ mod tests {
                 // binding for it and the revision requires re-normalization.
                 // Empty evidence can never satisfy the required binding, so the
                 // fixture stays refused instead of becoming admitted.
-                normalization_receipt: eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
-                    receipt_id: String::new(),
-                    normalizer_authority: String::new(),
-                    source_digest: String::new(),
-                    zone_database_revision:
-                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
-                    occurrences_digest: String::new(),
-                },
+                normalization_receipt:
+                    eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
+                        receipt_id: String::new(),
+                        normalizer_authority: String::new(),
+                        source_digest: String::new(),
+                        zone_database_revision:
+                            eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION
+                                .to_owned(),
+                        occurrences_digest: String::new(),
+                    },
             },
             mode: UserAutomationExecutionMode::DeterministicProcess,
             task: AutomationTaskBinding {
