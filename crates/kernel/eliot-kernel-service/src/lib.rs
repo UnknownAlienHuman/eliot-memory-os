@@ -34,6 +34,7 @@ mod lifecycle;
 mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
+mod maintenance_trigger_delivery;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
@@ -104,6 +105,11 @@ pub use lifecycle_persist::{
     LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
     LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
     build_persist_transitions, handle_lifecycle_persist_request,
+};
+pub use maintenance_trigger_delivery::{
+    MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS, MaintenanceTriggerClaimRequest,
+    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger,
+    MaintenanceTriggerDeliveryRow, MaintenanceTriggerRecoveryCounts,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
