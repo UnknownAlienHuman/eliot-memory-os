@@ -29,6 +29,16 @@
 //! `const`s, so no compile-time link exists between the two lists; a body
 //! added to [`crate::schema`] without an entry here is the silent omission
 //! this module exists to prevent.
+//!
+//! The same invariant is enforced against the legacy roots at run time, not by
+//! a list: [`census_legacy_schema_objects`] reads the declared legacy DDL bytes
+//! and [`validate_legacy_table_mapping`] compares that census against
+//! [`LEGACY_TABLE_MAPPINGS`] in both directions. Because the expected set comes
+//! from the legacy bytes rather than from the roster or from any caller, a
+//! legacy table, index or field nobody mapped is a refusal, and so is a row
+//! naming an object the legacy DDL no longer declares. The mapping runs as a
+//! gate on the migration admission path, because the declared legacy roots may
+//! leave the tree only once the mapping closes.
 
 use std::fmt;
 
