@@ -17,6 +17,11 @@
 //! `unavailable`: missing evidence limits replay and is never silently
 //! treated as success.
 //!
+//! The executor observation is not a second copy: it is projected from the
+//! durable ORS provenance retained with the completion (issue #1853 W2), so
+//! the ORS store is the single owner and this manifest is only its replayable
+//! read model.
+//!
 //! Persistence reuses the single #1837 audit chain: the manifest seals as one
 //! [`AuditEventKind::TRACE_MANIFEST_SEALED`](crate::kernel_audit::AuditEventKind::TRACE_MANIFEST_SEALED)
 //! record through the composition's one [`KernelAuditChain`](crate::kernel_audit::KernelAuditChain)
@@ -41,7 +46,7 @@
 
 use eliot_contracts::StateFence;
 use eliot_ipc::Session;
-use eliot_ors::HostRequestRecord;
+use eliot_ors::{HostRequestEffectEvidence, HostRequestRecord};
 use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
 use serde::{Deserialize, Serialize};
 
@@ -199,12 +204,21 @@ impl TraceManifest {
     /// Seals the manifest for one persisted result.
     ///
     /// Binds the admitted envelope (or, when queue memory already retired
-    /// it, the durable record), the presenting session, the submitted
-    /// execution evidence, and the persisted receipt. Required slots without
+    /// it, the durable record), the presenting session, the executor-observed
+    /// evidence as it was RETAINED on the durable record, and the persisted
+    /// receipt. Required slots without
     /// a value land in `missing_parts` and force
     /// [`TraceFinish::DegradedNoProof`]; anything else seals
     /// [`TraceFinish::VerifiedComplete`]. Call sites run only after the ORS
     /// persist, so the seal never precedes the binding it describes.
+    ///
+    /// The evidence is read back from durable ORS retention, not from the
+    /// submitted body (issue #1853 W2). The manifest is a projection of the
+    /// durable record, and the ORS store is the single owner of the
+    /// observation: a manifest can therefore never claim an executor
+    /// observation that recovery cannot also read back from the store, and
+    /// the sealed body and the durable retention can never disagree about
+    /// what was observed.
     #[must_use]
     pub fn seal(
         session: &Session,
@@ -212,6 +226,7 @@ impl TraceManifest {
         persisted: &HostRequestRecord,
         envelope: Option<&HostRequestEnvelope>,
         lane: &'static str,
+        retained_evidence: Option<&HostRequestEffectEvidence>,
     ) -> Self {
         let capability = envelope
             .map(|envelope| envelope.identity.capability.clone())
@@ -230,7 +245,7 @@ impl TraceManifest {
                     .as_ref()
                     .map(|session| session.as_str().to_owned())
             });
-        let evidence = body.evidence.as_ref();
+        let evidence = retained_evidence;
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
             fence
                 .policy_revision

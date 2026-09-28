@@ -63,8 +63,9 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
-    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
+    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestResultProvenance,
+    HostRequestRetainedLineage, HostRequestRetainedSourceRevision, HostRequestState, OpaqueLabel,
     OperationIdentity, OrsError, RedbRecoveryStore,
 };
 use eliot_protocol::{
@@ -2624,6 +2625,14 @@ impl KernelComposition {
             &body.result_digest,
         );
         let submitted_ok = self.audit_observe(submitted_draft).is_some();
+        // Issue #1853 W2: the executor-observed evidence travels INTO durable
+        // retention with the authoritative completion. Before this,
+        // `body.evidence` reached no ORS row, so a replayer reconciling an
+        // expired lease had no durable operation/effect evidence to reconcile
+        // against and could only re-execute. The projection is validated here,
+        // before the persist, so misbound evidence fails the submit instead
+        // of reaching durable state.
+        let provenance = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -2638,6 +2647,14 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1853 W2: retain the observed provenance beside the completed
+        // row and read back the durable winner for the seal below.
+        let sealed_evidence = retain_and_read_back_result_provenance(
+            &self.generation_gateway.ors,
+            &operation_id,
+            &body.request_sha256,
+            provenance.as_ref(),
+        )?;
         // Issue #1837: durable audit evidence for the Kernel binding. This
         // record evidences the persisted completion above, so it must follow
         // it; a failed persist leaves submission evidence without binding,
@@ -2656,7 +2673,14 @@ impl KernelComposition {
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
         self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
+            &TraceManifest::seal(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+                sealed_evidence.as_ref(),
+            ),
         ));
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
@@ -3525,6 +3549,10 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Issue #1853 W2: the executor-observed evidence is validated and
+        // projected into durable retention with the completion, exactly as on
+        // the local-read leg above.
+        let provenance = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -3539,6 +3567,14 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1853 W2: retain the observed provenance beside the completed
+        // row and read back the durable winner for the seal below.
+        let sealed_evidence = retain_and_read_back_result_provenance(
+            &self.generation_gateway.ors,
+            &operation_id,
+            &body.request_sha256,
+            provenance.as_ref(),
+        )?;
         // Issue #1837: durable audit evidence for the daemon result leg
         // and the Kernel binding.
         self.audit_observe(AuditEventDraft::result_daemon_submitted(
@@ -3558,7 +3594,14 @@ impl KernelComposition {
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain.
         self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
+            &TraceManifest::seal(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+                sealed_evidence.as_ref(),
+            ),
         ));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
@@ -3860,6 +3903,115 @@ fn host_request_identity_binding_records(
             requested.cancellation_id.as_str(),
         )?,
     ])
+}
+
+/// Projects one submitted result body into the ORS-owned durable result
+/// provenance (issue #1853 W2).
+///
+/// This is the only place the wire evidence and lineage are mapped into durable
+/// state, so the authority boundary has exactly one owner for the mapping and
+/// the completion legs cannot each invent their own shape. The envelope is
+/// validated here — before the ORS persist — so misbound evidence (an
+/// observation that does not name this operation and this result) fails the
+/// submit instead of reaching durable state; ORS re-checks the projection
+/// against the row it writes. This function only carries the observed values
+/// across the crate boundary, and it invents nothing — an absent wire slot
+/// stays `None`, and a leg that observed nothing yields no envelope at all.
+fn retained_result_provenance(
+    body: &HostRequestResultBody,
+) -> Result<Option<HostRequestResultProvenance>, TransportError> {
+    let effect_evidence = body
+        .evidence
+        .as_ref()
+        .map(|evidence| {
+            OpaqueLabel::new(evidence.operation_id.clone()).map(|operation_id| {
+                HostRequestEffectEvidence {
+                    operation_id,
+                    input_handle: evidence.input_handle.clone(),
+                    output_handle: evidence.output_handle.clone(),
+                    side_effects: evidence.side_effects.clone(),
+                    actual_route: evidence.actual_route.clone(),
+                    invoked_operation: evidence.invoked_operation.clone(),
+                    adapter_identity: evidence.adapter_identity.clone(),
+                    executor_identity: evidence.executor_identity.clone(),
+                }
+            })
+        })
+        .transpose()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let result_lineage = body
+        .lineage
+        .as_ref()
+        .map(|lineage| HostRequestRetainedLineage {
+            output_artifact_ref: lineage.output_artifact_ref.clone(),
+            output_digest: lineage.output_digest.clone(),
+            producer_ref: lineage.producer_ref.clone(),
+            source_revisions: lineage.source_revisions.as_ref().map(|revisions| {
+                revisions
+                    .iter()
+                    .map(|revision| HostRequestRetainedSourceRevision {
+                        key: revision.key.clone(),
+                        revision: revision.revision,
+                        state_fence: revision.state_fence.clone(),
+                    })
+                    .collect()
+            }),
+            source_state_fence: lineage.source_state_fence.clone(),
+            input_refs: lineage.input_refs.clone(),
+            transformation_lineage: lineage.transformation_lineage.clone(),
+            closure_refs: lineage.closure_refs.clone(),
+            policy_fence: lineage.policy_fence.clone(),
+            origin_evidence_refs: lineage.origin_evidence_refs.clone(),
+            proof_ceiling: lineage.proof_ceiling,
+            influence_state: lineage.influence_state,
+            instruction_taint: lineage.instruction_taint,
+        });
+    if effect_evidence.is_none() && result_lineage.is_none() {
+        return Ok(None);
+    }
+    let operation_id = OperationIdentity::new(body.operation_id.clone())
+        .map_err(|_| TransportError::SessionFenced)?;
+    let provenance = HostRequestResultProvenance {
+        contract_version: ORS_CONTRACT_VERSION,
+        operation_id,
+        request_digest: body.request_sha256.clone(),
+        result_digest: body.result_digest.clone(),
+        effect_evidence,
+        result_lineage,
+    };
+    provenance
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(Some(provenance))
+}
+
+/// Retains one completion's result provenance and reads back the durable
+/// winner for the trace-manifest seal (issue #1853 W2).
+///
+/// Runs after the ORS result persist: a `None` candidate means the leg
+/// observed nothing and retains nothing, while a submitted envelope is
+/// retained write-once and then READ BACK from the store, so the seal projects
+/// exactly what recovery can also read — never what this process merely
+/// submitted. The readback re-validates and re-joins against the operation
+/// row; any durable contradiction fails the submit closed instead of sealing
+/// an unproven observation.
+fn retain_and_read_back_result_provenance(
+    ors: &RedbRecoveryStore,
+    operation_id: &OperationIdentity,
+    request_digest: &str,
+    candidate: Option<&HostRequestResultProvenance>,
+) -> Result<Option<HostRequestEffectEvidence>, TransportError> {
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    ors.retain_host_request_result_provenance(candidate)
+        .map_err(|_| TransportError::SessionFenced)?
+        .ok_or(TransportError::SessionFenced)?;
+    let readback = ors
+        .load_host_request_result_provenance(operation_id, request_digest)
+        .map_err(|_| TransportError::SessionFenced)?
+        .ok_or(TransportError::SessionFenced)?;
+    Ok(readback.effect_evidence)
 }
 
 /// Builds the `Requested` ORS record for one validated envelope.

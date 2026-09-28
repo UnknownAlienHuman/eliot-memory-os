@@ -70,26 +70,26 @@ use crate::{
     GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
-    GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
-    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
-    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceReadback, ProcessEvidenceRecord, ProcessStartReplayAbort,
-    ProcessStartReplayRecord, ProcessStartReplayState, ProcessStreamRecoveryFence,
-    ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
-    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
-    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
-    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestResultProvenance,
+    HostRequestState, JobCheckpoint, KernelAuthoritySnapshot,
+    LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
+    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome,
+    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OperationalMutationReceipt,
+    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
+    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback,
+    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
+    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
+    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
+    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
+    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
+    RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, ReservationRecord,
+    ReservationRequest, ReservationState, ReservedScope, RetryState, RootTransitionCommit,
+    RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
+    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
@@ -226,6 +226,12 @@ const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+/// Durable result provenance beside one host-request completion (issue #1853
+/// W2). Disjoint from `HOST_REQUESTS`; keyed by the same
+/// `operation_id::request_digest` key so the provenance joins its operation
+/// row, and additionally bound by the recorded `result_digest`.
+const HOST_REQUEST_RESULT_PROVENANCE: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_host_request_result_provenance_v1");
 /// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).
 ///
 /// One row per versioned-artifact registry entry, keyed
@@ -3332,6 +3338,14 @@ fn same_store_rebind_binding(
 
 impl persistence_codec::PersistedValue for HostRequestRecord {
     const RECORD_TYPE: &'static str = "host_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for HostRequestResultProvenance {
+    const RECORD_TYPE: &'static str = "host_request_result_provenance";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -7979,6 +7993,122 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Retains one completion's result provenance beside its operation row
+    /// (issue #1853 W2: operation/effect identity and evidence references at
+    /// the Kernel authority boundary).
+    ///
+    /// The envelope is validated and then joined against the durable
+    /// `HOST_REQUESTS` row in the same write transaction: an unknown operation
+    /// returns `Ok(None)` and retains nothing, and an envelope whose recorded
+    /// `result_digest` differs from the row's own recorded result digest is
+    /// refused as [`OrsError::InvalidField`] — evidence about another result is
+    /// never stored beside this completion. The first retained envelope stands:
+    /// an at-least-once replay of the same result returns the durable winner
+    /// unchanged and can neither replace nor erase it.
+    pub fn retain_host_request_result_provenance(
+        &self,
+        provenance: &crate::HostRequestResultProvenance,
+    ) -> Result<Option<crate::HostRequestResultProvenance>, OrsError> {
+        provenance.validate()?;
+        let key = provenance.record_key();
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing_row: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing_row) = existing_row else {
+            return Ok(None);
+        };
+        existing_row.validate()?;
+        if existing_row.result_digest.as_deref() != Some(provenance.result_digest.as_str()) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_result_provenance_result_digest",
+                reason: "retained provenance does not observe the row's recorded result",
+            });
+        }
+        let retained: Option<crate::HostRequestResultProvenance> = {
+            let table = write
+                .open_table(HOST_REQUEST_RESULT_PROVENANCE)
+                .map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(retained) = retained {
+            return Ok(Some(retained));
+        }
+        let payload = encode(provenance)?;
+        {
+            let mut table = write
+                .open_table(HOST_REQUEST_RESULT_PROVENANCE)
+                .map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(provenance.clone()))
+    }
+
+    /// Loads one completion's retained result provenance by exact
+    /// operation/request identity (issue #1853 W2).
+    ///
+    /// `Ok(None)` means no provenance was ever retained for this exact
+    /// operation — the completion carries no durable evidence references and
+    /// that absence stays unknown, never clean. A retained envelope is
+    /// re-validated on decode and re-joined against the operation row's own
+    /// recorded result digest; a durable contradiction surfaces as
+    /// [`OrsError::IntegrityProblem`] instead of serving misbound evidence.
+    pub fn load_host_request_result_provenance(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestResultProvenance>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let provenance: Option<crate::HostRequestResultProvenance> = {
+            let table = read
+                .open_table(HOST_REQUEST_RESULT_PROVENANCE)
+                .map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(provenance) = provenance else {
+            return Ok(None);
+        };
+        let row: Option<crate::HostRequestRecord> = {
+            let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(row) = row else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "host_request_result_provenance",
+                reason: "retained provenance has no operation row".to_owned(),
+            });
+        };
+        row.validate()?;
+        if row.result_digest.as_deref() != Some(provenance.result_digest.as_str()) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "host_request_result_provenance",
+                reason: "retained provenance does not observe the row's recorded result".to_owned(),
+            });
+        }
+        Ok(Some(provenance))
     }
 
     // Bridge-event disclosure gate (I7.23 owner authorization before
