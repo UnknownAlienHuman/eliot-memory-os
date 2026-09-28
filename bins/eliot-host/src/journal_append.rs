@@ -329,6 +329,14 @@ pub(super) fn transition_activation_record(
     }
     if state == ActivationState::StoppedClean {
         next.timestamps.stopped_at = Some(fresh_identity("host-stopped-at")?);
+        // I1.5 W4 release: a clean stop ends the generation's fenced
+        // authority, so the generation releases the runtime-lease references
+        // it held. The obligations were snapshotted into the
+        // `DrainCommitRecord` at linearization
+        // (`drain_commit_record_for_stop`); recovery terminals (`Failed`,
+        // `DegradedRecovery`) keep their refs because reconciliation is still
+        // owed there.
+        next.runtime_lease_refs = Vec::new();
     }
     Ok(next)
 }

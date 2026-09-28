@@ -36,9 +36,12 @@
 //! runtime-lease references the current activation generation holds. An empty
 //! reference set means "this generation holds no runtime-lease reference", so
 //! the gate is generation-scoped by construction and a future Kernel/ORS lease
-//! family must replace that leg rather than sit beside it. The supervision leg
-//! re-uses the one published, Kernel-signed supervision-lease mirror Host
-//! already commits and verifies for the Watchdog spool
+//! family must replace that leg rather than sit beside it. A `StoppedClean`
+//! terminal releases the held references (`transition_activation_record`
+//! clears them once the `DrainCommitRecord` snapshot carries the obligations);
+//! recovery terminals keep them because reconciliation is still owed. The
+//! supervision leg re-uses the one published, Kernel-signed supervision-lease
+//! mirror Host already commits and verifies for the Watchdog spool
 //! (`watchdog_publication::live_supervision_obligation`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
