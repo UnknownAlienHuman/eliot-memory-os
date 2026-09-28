@@ -370,6 +370,23 @@ pub struct ProviderAdmissionReceipt {
     pub g11_admission_receipt_ref: String,
     pub durable_job_ref: String,
     pub admitted_lanes: Vec<AdmittedLaneReceipt>,
+    /// Owner-issued expiry of this admission, in Unix milliseconds (I6.10
+    /// "issued/expires/heartbeat" on the admission that authorizes work; I14.6
+    /// `expires_at_and_release_reason` on the matching canonical admission).
+    ///
+    /// This is the time bound the receipt owner issues with the admission, not
+    /// one a consumer invents: a zero value is an unissued bound and is
+    /// refused, never treated as "never expires". Spelling and type match the
+    /// sibling adapters' owner-issued bounds
+    /// (`ModelCatalogueSnapshot::expires_at_unix_ms`,
+    /// `BillingEvidence::expires_at_unix_ms`), so every owner-issued bound in
+    /// the agent slice is compared the same way.
+    ///
+    /// The external admission owner populates this field; the coordinator only
+    /// stores and validates it. No production issuer exists in this tree yet,
+    /// so every construction site is a test fixture — see
+    /// `swarm_admission_bind`'s module doc.
+    pub expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
