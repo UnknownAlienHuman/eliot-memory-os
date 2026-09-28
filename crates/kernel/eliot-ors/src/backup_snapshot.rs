@@ -8,7 +8,13 @@
 //! missing admission, or unbound evidence is rejected, never relabelled.
 //! I14-21: unknown stays reconciling. Import receipts keep an explicit
 //! per-entry outcome including `Unresolved`; callers attest full validation
-//! via [`OrsBackupImportReceipt::known_zero_unresolved`]. No blind retry.
+//! via [`OrsBackupImportReceipt::known_zero_unresolved`], which since issue
+//! #953/A17 requires a [`CurrentOwnerValidation`] — a record of what the
+//! CURRENT owner was asked about the receipt's members and what it answered,
+//! observed from the store's own live recovery rows — and compares that
+//! record's asked-about roster against the receipt's members in both
+//! directions. A zero `unresolved_count` is not a zero somebody validated, so
+//! it is not trusted. No blind retry.
 //!
 //! Issue #2884 adds the typed row-family cursor. A family that has no canonical
 //! operation order cannot share the operational `after_order` window, so it is
@@ -77,7 +83,7 @@
 //! Storage-free: no `redb`, no filesystem, no `eliot-backup` dependency.
 //! Distinct from `snapshot_model`; every new name starts `OrsBackup`/`Backup`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -2728,6 +2734,125 @@ pub enum PerEntryOutcome {
         reason: String,
     },
 }
+/// What one current owner was asked about a backup import's members, and what it
+/// answered (issue #953, A17).
+///
+/// This is a RECORD of one consultation, not a claim: nothing here is trusted
+/// because it is well formed, and nothing here is recomputed by
+/// [`OrsBackupImportReceipt::known_zero_unresolved`]. The record exists so the
+/// two halves of the guarantee are separately checkable — that the current owner
+/// was asked (which members, which live families, at which instant) and what it
+/// answered (whether it still holds any of them unresolved).
+///
+/// The current owner of ORS recovery effects is the ORS store itself, observed
+/// through its own live durable rows. The producer is the store: it opens
+/// [`RowFamilyKind::RecoveryInbox`] and [`RowFamilyKind::RecoveryProblems`]
+/// inside the read transaction the import already holds, and decides per member
+/// whether the current owner still holds it unresolved. A caller that never read
+/// that live state has no validation to present, which is why
+/// [`Self::consulted_families`] is part of the record and part of the gate.
+///
+/// [`Self::validated_record_ids`] stores the identifiers rather than only a
+/// count, so COMPLETENESS is a comparison against the receipt's own member set
+/// and not a number the validation declared about itself. A validation that
+/// covered fewer members, more members, or different members than the receipt
+/// carries is refused, which is the property a count could never express.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CurrentOwnerValidation {
+    /// Snapshot denominator digest this validation covers.
+    ///
+    /// Bound to the operation, not merely well formed: a validation of a
+    /// different snapshot answers a different question, so the gate refuses a
+    /// validation whose digest is not this receipt's.
+    pub snapshot_digest: String,
+    /// The COMPLETE set of record ids the current owner was asked about.
+    pub validated_record_ids: Vec<String>,
+    /// Identities the current owner still holds unresolved.
+    pub unresolved_effect_identities: Vec<String>,
+    /// The live row families actually read to reach that answer.
+    pub consulted_families: Vec<RowFamilyKind>,
+    /// When the current owner was consulted, in Unix milliseconds.
+    pub validated_at_ms: i64,
+}
+impl CurrentOwnerValidation {
+    /// Shape-checks every field of the record.
+    ///
+    /// Reuses this module's existing validators and rules; it adds none of its
+    /// own. [`require_digest`] covers the snapshot binding,
+    /// [`require_installation_id`] is this module's single bounded-identifier
+    /// shape check and covers each member and each still-unresolved identity,
+    /// and the positive-stamp half of the module's existing
+    /// `expires_at_ms > created_at_ms` rule (`OrsBackupPage::validate_binding`)
+    /// covers the consultation instant. A family roster additionally may not be
+    /// empty and may not repeat a family, because a roster that padded itself
+    /// with a repeat would satisfy the gate's "both families were consulted"
+    /// test without having read both.
+    ///
+    /// Shape is necessary and not sufficient: every obligation
+    /// [`OrsBackupImportReceipt::known_zero_unresolved`] adds on top is a
+    /// relation to the receipt, and none of them is implied here.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        require_digest(&self.snapshot_digest, "backup_owner_validation_digest")?;
+        if self.consulted_families.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "backup_owner_consulted_families",
+                reason: "a current owner validation must name the live families it read",
+            });
+        }
+        let mut families: BTreeSet<RowFamilyKind> = BTreeSet::new();
+        for family in &self.consulted_families {
+            if !families.insert(*family) {
+                return Err(OrsError::InvalidField {
+                    field: "backup_owner_consulted_families",
+                    reason: "a current owner validation must not list one consulted family twice",
+                });
+            }
+        }
+        // The complete asked-about roster. Each identifier takes the module's
+        // existing bounded-identifier check, and a repeat is refused: a roster
+        // that asked the same member twice is not a roster, and comparing it as
+        // a SET against the receipt's members would let a repeated ask stand in
+        // for a member that was never asked about.
+        let mut asked: BTreeSet<&str> = BTreeSet::new();
+        for record_id in &self.validated_record_ids {
+            require_installation_id(record_id, "backup_owner_validated_record_id")?;
+            if !asked.insert(record_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "backup_owner_validated_record_id",
+                    reason: "a current owner validation must ask about each record id at most once",
+                });
+            }
+        }
+        for identity in &self.unresolved_effect_identities {
+            require_installation_id(identity, "backup_owner_unresolved_effect_identity")?;
+        }
+        if self.validated_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "backup_owner_validated_at_ms",
+                reason: "current owner validation must carry a positive unix millisecond stamp",
+            });
+        }
+        Ok(())
+    }
+}
+/// Typed verdict of the known-zero-unresolved gate for one import receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownZeroVerdict {
+    /// A complete current-owner validation covered every member of this receipt
+    /// and the current owner holds none of them unresolved.
+    Satisfied,
+    /// The gate refused; `reason` states which obligation was unmet.
+    ///
+    /// A reason STRING is a report, never the decision: the decision is this
+    /// enum's variant, and [`OrsBackupImportReceipt::known_zero_unresolved`]
+    /// re-derives it from the recorded validation rather than reading this
+    /// field, so a stale or wrong record cannot become a satisfied gate.
+    Refused {
+        /// Why the gate refused.
+        reason: String,
+    },
+}
 /// Import receipt with explicit per-entry outcomes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsBackupImportReceipt {
@@ -2739,9 +2864,28 @@ pub struct OrsBackupImportReceipt {
     pub per_entry: Vec<(String, PerEntryOutcome)>,
     pub unresolved_count: u64,
     pub import_at_ms: i64,
+    /// The live current-owner validation this receipt's members were checked
+    /// against (issue #953, A17).
+    ///
+    /// Recorded, not recomputed: it is what makes the gate observable on the
+    /// receipt, and it is what a replayed receipt re-evaluates from instead of
+    /// carrying a verdict forward.
+    pub current_owner_validation: CurrentOwnerValidation,
+    /// Typed verdict of [`Self::known_zero_unresolved`] for
+    /// [`Self::current_owner_validation`].
+    pub known_zero_verdict: KnownZeroVerdict,
 }
 impl OrsBackupImportReceipt {
     /// Validate and bind an import receipt.
+    ///
+    /// The known-zero verdict is COMPUTED here, by invoking
+    /// [`Self::known_zero_unresolved`] against the supplied validation. It is
+    /// not a parameter, and that is deliberate on both sides: a verdict a caller
+    /// asserted would be a claim with nothing behind it, and a verdict left to a
+    /// later step would mean a receipt exists whose recorded gate was never run.
+    /// A gate refusal is a verdict, not a construction failure, so it is
+    /// recorded on the receipt and does not fail `new` — the caller reads the
+    /// verdict and the standalone gate.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot_digest: String,
@@ -2750,21 +2894,89 @@ impl OrsBackupImportReceipt {
         per_entry: Vec<(String, PerEntryOutcome)>,
         unresolved_count: u64,
         import_at_ms: i64,
+        current_owner_validation: CurrentOwnerValidation,
     ) -> Result<Self, OrsError> {
         require_digest(&snapshot_digest, "backup_snapshot_digest")?;
         require_installation_id(&source_installation, "source_installation_id")?;
         require_installation_id(&destination_installation, "destination_installation_id")?;
-        Ok(Self {
+        let mut receipt = Self {
             snapshot_digest,
             source_installation,
             destination_installation,
             per_entry,
             unresolved_count,
             import_at_ms,
-        })
+            current_owner_validation,
+            known_zero_verdict: KnownZeroVerdict::Refused {
+                reason: "the known-zero gate has not been evaluated for this receipt".to_owned(),
+            },
+        };
+        // ONE evaluation, and the recorded verdict is its result. Assigning from
+        // the gate's own answer (rather than hard-coding either arm) is what
+        // keeps the receipt and the gate the same judgement.
+        receipt.known_zero_verdict =
+            match receipt.known_zero_unresolved(&receipt.current_owner_validation) {
+                Ok(()) => KnownZeroVerdict::Satisfied,
+                Err(error) => KnownZeroVerdict::Refused {
+                    reason: error.to_string(),
+                },
+            };
+        Ok(receipt)
     }
-    /// Explicit gate: succeeds only when no entry remains unresolved.
-    pub fn known_zero_unresolved(&self) -> Result<(), OrsError> {
+    /// The known-zero gate: succeeds only when this receipt's members are
+    /// completely covered by a current-owner validation that found nothing
+    /// unresolved (issue #953, A17).
+    ///
+    /// A zero `unresolved_count` says only that no imported member came back
+    /// `Unresolved`. It says nothing about whether the CURRENT owner still holds
+    /// an effect for any of them, because a brand-new empty destination has no
+    /// row to collide with and therefore triages every entry as a fresh
+    /// quarantined candidate. Trusting that zero is exactly the claim this gate
+    /// now refuses to make on its own, so it takes the current owner's answer as
+    /// an input and refuses unless ALL of the following hold:
+    ///
+    /// 1. the validation's own recorded shape passes
+    ///    ([`CurrentOwnerValidation::validate`]), checked on the ORIGINAL
+    ///    recorded value and never recomputed from live state;
+    /// 2. `owner.snapshot_digest == self.snapshot_digest` — bound to THIS
+    ///    operation, so a well-formed validation of a different snapshot cannot
+    ///    vouch for this one;
+    /// 3. `owner.validated_record_ids` set-equals the record-id set of
+    ///    `self.per_entry` — the completeness comparison. Fewer members, more
+    ///    members or different members are all refused; a count would not
+    ///    distinguish any of them;
+    /// 4. `owner.unresolved_effect_identities` is empty — the current owner
+    ///    still holds nothing unresolved for what it was asked about;
+    /// 5. `owner.consulted_families` contains BOTH
+    ///    [`RowFamilyKind::RecoveryInbox`] and
+    ///    [`RowFamilyKind::RecoveryProblems`] — a validation that did not read
+    ///    the current owner's live recovery state proves nothing about it;
+    /// 6. `unresolved_count == 0` and no `per_entry` outcome is
+    ///    [`PerEntryOutcome::Unresolved`].
+    ///
+    /// Every refusal is [`OrsError::ReconciliationMismatch`]: I14-21 — unknown
+    /// stays reconciling, and a zero that nobody validated is unknown, not
+    /// resolved. Nothing here retries, replays or repairs; it refuses.
+    pub fn known_zero_unresolved(&self, owner: &CurrentOwnerValidation) -> Result<(), OrsError> {
+        owner.validate()?;
+        if owner.snapshot_digest != self.snapshot_digest {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !self.owner_validation_is_complete(owner) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !owner.unresolved_effect_identities.is_empty() {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        if !owner
+            .consulted_families
+            .contains(&RowFamilyKind::RecoveryInbox)
+            || !owner
+                .consulted_families
+                .contains(&RowFamilyKind::RecoveryProblems)
+        {
+            return Err(OrsError::ReconciliationMismatch);
+        }
         let any_unresolved = self
             .per_entry
             .iter()
@@ -2774,6 +2986,29 @@ impl OrsBackupImportReceipt {
         } else {
             Err(OrsError::ReconciliationMismatch)
         }
+    }
+    /// Compares the validation's asked-about roster with this receipt's members
+    /// in BOTH directions.
+    ///
+    /// Two distinct failures, both refused and neither reachable from the
+    /// other: a validation that covered a SUBSET leaves members the current
+    /// owner never spoke about, and one that covered a SUPERSET (or a different
+    /// set) answers a question this receipt is not. Comparing sets rather than
+    /// lengths is what makes the difference observable at all — the W31 producer
+    /// set completeness from the same untrusted import vector it was validating,
+    /// so its length always agreed and its gate could never fire.
+    fn owner_validation_is_complete(&self, owner: &CurrentOwnerValidation) -> bool {
+        let asked: BTreeSet<&str> = owner
+            .validated_record_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let members: BTreeSet<&str> = self
+            .per_entry
+            .iter()
+            .map(|(record_id, _)| record_id.as_str())
+            .collect();
+        asked == members
     }
 }
 /// Reject imports that relabel identity or arrive without bound evidence.
