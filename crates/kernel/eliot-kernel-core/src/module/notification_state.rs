@@ -527,6 +527,19 @@ impl NotificationStore {
         let existing = self.records.get(&draft.dedup_key);
         let occurrences = existing.map_or(1, |record| record.occurrences.saturating_add(1));
         let acknowledgement = existing.and_then(|record| record.acknowledgement.clone());
+        // I11.7:4 coalesces a repeated event into the one record it already
+        // owns, and I11.7:8 requires a failed delivery to stay visible in the
+        // inbox and the metrics. A coalescing upsert has made no new delivery
+        // attempt, so it must not erase the last observed delivery outcome:
+        // rewriting it to `Pending` would silently drop a recorded `Failed` /
+        // `Partial` / `Unknown` adapter degradation out of the canonical
+        // record, and out of every projection derived from it (the
+        // ControlBoard `failed_delivery` view, `failed_delivery_unresolved`).
+        // `Pending` stays the honest value for a genuinely new record, which
+        // has no outcome yet. Acknowledgement and resolution are untouched by
+        // this leg: the acknowledgement is carried over as observed, and the
+        // resolved-record refusal above still fires before this point.
+        let delivery = existing.map_or(DeliveryState::Pending, |record| record.delivery.clone());
         let record = Notification {
             notification_id: draft.notification_id,
             severity: draft.severity,
@@ -540,7 +553,7 @@ impl NotificationStore {
             dedup_key: draft.dedup_key.clone(),
             delivery_channels: draft.delivery_channels,
             occurrences,
-            delivery: DeliveryState::Pending,
+            delivery,
             acknowledgement,
             resolution_ref: None,
             state_fence: draft.state_fence,
