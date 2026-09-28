@@ -66,10 +66,10 @@ use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
     IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS, OperationId, OperationIdentity,
-    ReconciliationOutcome, RecoveryRecord, RequestMeta, RestoreValidationReceipt,
-    SnapshotCompleteness, SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence,
-    StoreError, StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation,
-    sha256_hex,
+    OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord, RequestMeta,
+    RestoreValidationReceipt, RevisionHeadExpectation, SnapshotCompleteness, SnapshotMember,
+    SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreError, StoreMutationDisposition,
+    canonical_json_bytes, reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2679,13 +2679,18 @@ fn check_cancellation(
 /// Verifies the expected-state identity: every expected head must carry the
 /// request's state fence, so a batch cannot bind heads from another fence.
 ///
-/// This is the *shape* half of the expected-state check. The value half — that
-/// the destination's own revision/ordering heads still carry the expected
-/// revision and sequence — is checked inside the commit transaction, by
-/// [`crate::client::restore_apply_statement`]'s indexed head guards, which read
-/// the head values back and abort the whole commit on any divergence. Storing
-/// the expectation is not a check; comparing the observed head inside the same
-/// transaction that applies the batch is.
+/// This is the *shape* half of the expected-state check. The *value* half — that
+/// the destination's own revision/ordering heads actually carry the expected
+/// revision and sequence — is made twice, and never by storing the expectation:
+///
+/// 1. before the write, by [`check_observed_heads`] over the values read back
+///    from the destination through its own canonical read path; and
+/// 2. inside the commit transaction itself, by
+///    [`crate::client::restore_apply_statement`]'s indexed head guards, which
+///    re-read each head and abort the whole commit on any divergence. The
+///    preflight read narrows the failure; only the in-transaction guard is the
+///    commit precondition, because a preflight observation can go stale before
+///    the write lands.
 fn check_expected_state(
     batch: &CanonicalRestoreBatch,
     ctx: &RequestMeta,
@@ -2714,18 +2719,18 @@ fn check_expected_state(
 fn expected_head_digests(
     batch: &CanonicalRestoreBatch,
 ) -> Result<(Vec<String>, Vec<String>), StoreError> {
-    let digest = |head: &RevisionHeadExpectation| -> Result<String, StoreError> {
+    fn digest<T: Serialize>(head: &T) -> Result<String, StoreError> {
         Ok(sha256_hex(&canonical_digest_bytes(head)?))
-    };
+    }
     let revision_digests = batch
         .expected_revision_heads
         .iter()
-        .map(digest)
+        .map(digest::<RevisionHeadExpectation>)
         .collect::<Result<Vec<_>, _>>()?;
     let ordering_digests = batch
         .expected_ordering_heads
         .iter()
-        .map(digest)
+        .map(digest::<OrderingHeadExpectation>)
         .collect::<Result<Vec<_>, _>>()?;
     Ok((revision_digests, ordering_digests))
 }
@@ -3487,7 +3492,7 @@ impl SurrealStoreAdapter {
         source_digest: &str,
         expected_state_fence: &StateFence,
     ) -> Result<Option<RestoreRecordDocument>, StoreError> {
-        let (revision_digests, ordering_digests) = expected_head_digests(batch);
+        let (revision_digests, ordering_digests) = expected_head_digests(batch)?;
         let document = read_record_document(
             transport,
             &self.config,
@@ -3744,7 +3749,7 @@ impl SurrealStoreAdapter {
             &planned,
             fence.document.purge_policy_revision,
         )?;
-        let (revision_digests, ordering_digests) = expected_head_digests(batch);
+        let (revision_digests, ordering_digests) = expected_head_digests(batch)?;
         let document = RestoreRecordDocument {
             operation: batch.operation.clone(),
             destination_id: batch.destination.destination_id.clone(),
