@@ -482,15 +482,13 @@ fn validate_acknowledgement_receipt(
     let operation_sha256 = sha256_hex(&operation_bytes);
     let operation_id = format!("bridge-event-ack:operation:{operation_sha256}");
     let outcome = receipt.get("outcome").ok_or_else(invalid)?;
-    let outcome_bytes = canonical_json_bytes(outcome).map_err(|_| event_transport_failure())?;
-    let outcome_sha256 = sha256_hex(&outcome_bytes);
-    let receipt_material = serde_json::json!({
-        "operation_id": operation_id,
-        "outcome": outcome,
-    });
-    let receipt_bytes =
-        canonical_json_bytes(&receipt_material).map_err(|_| event_transport_failure())?;
-    let receipt_sha256 = sha256_hex(&receipt_bytes);
+    verify_acknowledgement_receipt_digests(
+        receipt,
+        outcome,
+        &request_sha256,
+        &operation_sha256,
+        &operation_id,
+    )?;
     let outcome_streams = outcome
         .get("streams")
         .and_then(serde_json::Value::as_array)
@@ -514,6 +512,30 @@ fn validate_acknowledgement_receipt(
         }
         acknowledged.insert(stream_id.clone(), acked_cursor);
     }
+    Ok(acknowledged)
+}
+
+fn verify_acknowledgement_receipt_digests(
+    receipt: &serde_json::Value,
+    outcome: &serde_json::Value,
+    request_sha256: &str,
+    operation_sha256: &str,
+    operation_id: &str,
+) -> Result<(), ProviderFailure> {
+    let invalid = || {
+        event_shape_failure(
+            "reconciliation refused: acknowledgement receipt does not bind the retained offer",
+        )
+    };
+    let outcome_bytes = canonical_json_bytes(outcome).map_err(|_| event_transport_failure())?;
+    let outcome_sha256 = sha256_hex(&outcome_bytes);
+    let receipt_material = serde_json::json!({
+        "operation_id": operation_id,
+        "outcome": outcome,
+    });
+    let receipt_bytes =
+        canonical_json_bytes(&receipt_material).map_err(|_| event_transport_failure())?;
+    let receipt_sha256 = sha256_hex(&receipt_bytes);
     if recovery_digest(receipt, "request_sha256")? != request_sha256
         || recovery_digest(receipt, "operation_sha256")? != operation_sha256
         || recovery_digest(receipt, "outcome_sha256")? != outcome_sha256
@@ -521,7 +543,7 @@ fn validate_acknowledgement_receipt(
         || receipt
             .get("operation_id")
             .and_then(serde_json::Value::as_str)
-            != Some(operation_id.as_str())
+            != Some(operation_id)
         || receipt
             .get("receipt_id")
             .and_then(serde_json::Value::as_str)
@@ -529,7 +551,7 @@ fn validate_acknowledgement_receipt(
     {
         return Err(invalid());
     }
-    Ok(acknowledged)
+    Ok(())
 }
 
 /// Typed local-state-unavailable failure for the consumed-frontier path.
@@ -1919,12 +1941,7 @@ fn decode_reconciliation_outcome(
     let coverage = decode_recovery_reply_coverage(reconciliation, window_status)?;
     let key = verify_reconcile_key(reconciliation)?;
     decode_handoff_maintenance_pressure(reconciliation)?;
-    let handoffs_reconciled = reconciliation
-        .get("handoffs_reconciled")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            event_shape_failure("reconciliation refused: owner answer without handoff receipt")
-        })?;
+    let handoffs_reconciled = decode_handoffs_reconciled(reconciliation)?;
     check_recovery_page_ordinals(reconciliation, expected)?;
     check_expected_continuation(reconciliation, &stream_facts, expected)?;
     let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
@@ -1980,6 +1997,15 @@ fn decode_reconciliation_outcome(
             result
         },
     ))
+}
+
+fn decode_handoffs_reconciled(reconciliation: &serde_json::Value) -> Result<u64, ProviderFailure> {
+    reconciliation
+        .get("handoffs_reconciled")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner answer without handoff receipt")
+        })
 }
 
 /// Validates typed capacity pressure returned by bounded handoff maintenance.
