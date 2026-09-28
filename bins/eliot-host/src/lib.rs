@@ -1121,6 +1121,30 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         caller: "main::HostIdleDrainSupervisor::observe_readiness",
         test: "891/case-13",
     },
+    HostLifecycleBoundary {
+        name: "backup-cutover.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover",
+        owner_state: "admitted cutover body/evidence/retirement fence",
+        event: "host-backup-cutover-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "backup-cutover-disposition.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover_disposition",
+        owner_state: "durable cutover intent/registry/retirement records",
+        event: "host-backup-cutover-disposition-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "backup-cutover-retire.terminal",
+        source_item: "HostComposition::backup_dispatch_cutover_retire",
+        owner_state: "admitted cutover body/retirement barrier/authorization",
+        event: "host-backup-cutover-retire-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
 ];
 
 /// Compile-time `&str` equality over raw bytes, so boundary lookup
@@ -1418,6 +1442,19 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
+// F-LOG-HOST-8 (#983 W4): the three admitted cutover dispatch arms are the
+// outer caller boundaries for one failed cutover operation, so each arms the
+// crate's own `HostTerminalGuard` and owns exactly one terminal record. The
+// leaf `backup_cutover` phase/refusal records stay nonterminal and correlate
+// beneath the armed guard by emission order; there is no dedup cache, and each
+// code keeps its own operation distinct from its siblings and from any process
+// shutdown failure (`host-stop-failed`, `host-open-failed`).
+const BOUNDARY_BACKUP_CUTOVER_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-failed");
+const BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-disposition-failed");
+const BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-cutover-retire-failed");
 
 /// Static identifiers for the propagated-to-boundary exclusions (#891 case
 /// 1): the table rows that own no emission because a coordinated child
@@ -5847,6 +5884,13 @@ impl HostComposition {
             admitted_cutover_operation, execute_cutover, plan_cutover_attempt,
             reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
+        // F-LOG-HOST-8 (#983 W4): this admitted cutover port is the outer
+        // caller boundary, so it owns the single terminal record per failed
+        // cutover operation. Armed on entry and disarmed on every success
+        // return; the leaf's `backup_cutover` phase/refusal records stay
+        // nonterminal and correlate beneath it. Operation failure stays
+        // distinct from a separate process shutdown failure.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_TERMINAL);
         // Real dispatch decision, resolved from the admitted cutover payload
         // itself rather than from the routing table: the presented body must
         // first prove it is the body the owner admitted, and only then does the
@@ -5919,6 +5963,7 @@ impl HostComposition {
         // is returned exactly as its owner observation produced it, so this
         // read model can never restate a retained unknown as progress (#2737).
         if committed.disposition != CutoverDisposition::Committed {
+            host_terminal.disarm();
             return Ok((committed, barrier));
         }
         // The registry and the journal are separate owners with no shared
@@ -5980,6 +6025,7 @@ impl HostComposition {
             coherence,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
+            host_terminal.disarm();
             return Ok((reconciled, barrier));
         }
         // Reached only when the projection above DID return `RetirementPending`,
@@ -5987,6 +6033,7 @@ impl HostComposition {
         // operation-bound receipt. A torn pair returned `Unknown` +
         // `ConcurrentOwnerMovement` at the branch above, so the proven
         // `Committed` never reaches here unreported.
+        host_terminal.disarm();
         Ok((committed, barrier))
     }
 
@@ -6026,7 +6073,16 @@ impl HostComposition {
         request: &crate::backup_cutover::CutoverRequest,
         retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
     ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
-        crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)
+        // F-LOG-HOST-8 (#983 W4): the disposition read is its own operation,
+        // so it owns its own single terminal record, distinct from the
+        // admitted cutover port and from any process shutdown failure. The
+        // leaf's read-failure observation stays nonterminal beneath it.
+        let mut host_terminal =
+            HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL);
+        let outcome =
+            crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;
+        host_terminal.disarm();
+        Ok(outcome)
     }
 
     /// Executes the separately authorized prior-generation retirement that
@@ -6076,6 +6132,12 @@ impl HostComposition {
         use crate::backup_cutover::{
             CutoverError, admitted_cutover_operation, retire_authorized_generation,
         };
+        // F-LOG-HOST-8 (#983 W4): the separately authorized retirement is its
+        // own operation with its own single terminal record, distinct from the
+        // cutover port and the disposition read, and distinct from any process
+        // shutdown failure. The leaf's `retire` refusal records stay
+        // nonterminal beneath it.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL);
         // Same admitted-payload resolution as the activation port: the body
         // must prove it is the body the owner admitted, and the separately
         // supplied selector must then agree with the operation that body
@@ -6088,7 +6150,15 @@ impl HostComposition {
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        retire_authorized_generation(self, request, evidence, barrier, retirement_authorization)
+        let retired = retire_authorized_generation(
+            self,
+            request,
+            evidence,
+            barrier,
+            retirement_authorization,
+        )?;
+        host_terminal.disarm();
+        Ok(retired)
     }
 
     /// Opens the durable Host contour for one installation identity and
