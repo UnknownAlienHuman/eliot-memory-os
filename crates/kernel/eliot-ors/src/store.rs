@@ -21859,7 +21859,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 return Err(OrsError::DuplicateConflict);
             };
             existing_record.validate()?;
-            if existing_record != &record {
+            // A replay names the original immutable stage request, while the
+            // persisted reservation may have advanced through later
+            // receipt-backed transitions. Compare only the stage inputs so an
+            // exact replay returns that current snapshot without overwriting
+            // its lifecycle state.
+            let same_stage_request = existing_record.reservation_id == record.reservation_id
+                && existing_record.work_item_id == record.work_item_id
+                && existing_record.proposed_attempt_id == record.proposed_attempt_id
+                && existing_record.stage_operation_id == record.stage_operation_id
+                && existing_record.claims == record.claims
+                && existing_record.authority_epoch == record.authority_epoch
+                && existing_record.state_fence == record.state_fence
+                && existing_record.expires_at_ms == record.expires_at_ms
+                && existing_record.created_at_ms == record.created_at_ms;
+            if !same_stage_request {
                 return Err(OrsError::DuplicateConflict);
             }
             let snapshot = Self::admission_reservation_snapshot(&existing)?;
