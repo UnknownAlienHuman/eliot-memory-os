@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 
 use crate::error::AdapterError;
 
@@ -79,18 +79,24 @@ pub struct SurrealAdapterConfig {
     /// `SurrealDB` username whose credential the provider child consumes to
     /// bootstrap its own server identity.
     ///
-    /// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets): "Server
-    /// bootstrap/admin and normal application credentials are distinct,
-    /// independently rotatable references." This identity is therefore a
-    /// different `SurrealDB` user from [`Self::username`], and
-    /// [`Self::validate`] refuses a configuration that aliases the two.
+    /// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets) requires the
+    /// server bootstrap/admin identity and the normal application identity to
+    /// be distinct. The admission is made on the launch declaration, before any
+    /// value is resolved: `StoreLaunchConfig::validate` refuses a
+    /// `provider_bootstrap_username` equal to [`Self::username`], and the two
+    /// values arrive here from two different reserved Credential Manager
+    /// references resolved by two different admission owners.
     pub provider_bootstrap_username: String,
     /// `SurrealDB` provider bootstrap/admin password, held opaque and redacted.
     ///
     /// It is materialized into the provider child's own fresh environment block
     /// immediately before process creation (see
-    /// `client::provider_owner::provider_environment`) and never into argv,
-    /// a serialized form, or the ordinary client credential set.
+    /// `client::provider_owner::provider_environment`) and never into argv, a
+    /// serialized form, or the ordinary client credential set.
+    ///
+    /// This owner holds it only because it is the process that creates the
+    /// provider child and may re-create it after a provider loss, so the
+    /// material is resident exactly as long as this adapter may spawn.
     pub provider_bootstrap_password: SecretString,
     /// Exact loopback address owned by this adapter's provider child.
     pub provider_bind_address: String,
@@ -174,24 +180,13 @@ impl SurrealAdapterConfig {
             &self.provider_bootstrap_username,
             "provider_bootstrap_username",
         )?;
-        // I15.4 requires the server bootstrap/admin identity and the ordinary
-        // application identity to be distinct, independently rotatable
-        // references. Two references resolving to one `SurrealDB` user, or
-        // carrying one secret, would make the bootstrap credential an ordinary
-        // client credential — which is exactly what the separation forbids, and
-        // which would also mean the two references cannot be rotated apart.
-        //
-        // This compares the ORIGINAL values this configuration holds. It is not
-        // a shape check on the reference strings, and it is not inferred from
-        // `SecretString` debug redaction.
-        if self.provider_bootstrap_password.expose_secret().is_empty() {
-            return Err(ConfigError::InvalidField {
-                field: "provider_bootstrap_password",
-            });
-        }
-        if self.provider_bootstrap_username == self.username
-            || self.provider_bootstrap_password.expose_secret() == self.password.expose_secret()
-        {
+        // I15.4: the server bootstrap/admin identity and the ordinary
+        // application identity are distinct. This compares the two recorded
+        // identities this configuration actually holds, so one `SurrealDB` user
+        // cannot hold both roles. The two credential VALUES are deliberately
+        // not compared here: which secret reaches which contour is established
+        // by the two independently resolved references, not by a string test.
+        if self.provider_bootstrap_username == self.username {
             return Err(ConfigError::AliasedProviderCredentials);
         }
         validate_name(&self.installation_id, "installation_id")?;

@@ -1,37 +1,35 @@
-//! One finite production boundary map for the Store contour (issue #1810,
-//! implementation step 1).
+//! One finite production boundary map for the Store/database contour (issue
+//! #1810, implementation step 1).
 //!
 //! I15.3 (`docs/architecture/I15-03-least-privilege-processes.md`) and I15.4
-//! (`docs/architecture/I15-04-secrets.md`) name the production identities that
-//! may hold a database credential or reach the provider endpoint. This module is
-//! that finite set as code: a closed set of contours, the credential role each
-//! is admitted to hold or consume, the issuer of those references, the owner of
-//! the provider endpoint and of the store roots, the named-pipe caller, the
-//! maintenance/break-glass caller, and the Watchdog sensor channels — plus
-//! whether each row is a source declaration or still requires installed Windows
-//! evidence.
+//! (`docs/architecture/I15-04-secrets.md`) are the governing documents: they
+//! name the contours that may hold a database credential or reach the provider
+//! endpoint, require a fresh child-only environment block for the
+//! `surreal.exe` dependency, and require the server bootstrap/admin and normal
+//! application credentials to be distinct, independently rotatable references.
 //!
-//! Three properties are load-bearing and are why this is a map rather than prose:
+//! This module is that finite set as code. It exists so the assignment cannot be
+//! restated loosely at each call site:
 //!
-//! * It is finite and closed. A contour that is not listed here cannot appear
-//!   as a database-capable edge of this launch, so a future contour cannot be
-//!   added by accident.
-//! * Its credential assignment is checked against the launch configuration
-//!   actually in hand, not against a second copy of itself.
-//!   [`StoreBoundaryMap::validate_against`] requires this launch to resolve to
-//!   exactly the assignment the map declares, so a configuration carrying one
-//!   reference for both roles, or the wrong contour for one, is refused before
-//!   any provider process exists.
-//! * It states no installed fact. Every row is a source declaration; the rows
-//!   whose enforcement exists only on a provisioned Windows profile carry
-//!   [`BoundaryEvidence::RequiresInstalledWindowsEvidence`], so a green
-//!   construction is never read as an observed installation. Nothing here is
-//!   inferred from a package boundary, and nothing here is inferred from
-//!   `SecretString` debug redaction.
+//! * It is closed. Every DB-capable contour of this launch is a row here. A
+//!   contour that is not a row holds no database credential of this launch.
+//! * Its credential assignment is enforced against the launch actually in hand
+//!   by [`StoreBoundaryMap::validate_against`], which runs first in
+//!   [`crate::StoreLaunchConfig::validate`], before any reference is resolved
+//!   and before any provider process exists.
+//! * It separates source declaration from installed Windows evidence. Every row
+//!   carries one [`BoundaryEvidence`] class, so a green construction is never
+//!   read as an observed installation.
+//! * Nothing here is inferred from a package boundary and nothing here is
+//!   inferred from `SecretString` debug redaction. Each named owner is named by
+//!   a `path::symbol` that exists in this tree.
 //!
-//! Every claim in the rows below is anchored to a symbol in this repository.
-//! Where an owner is named, it is named by its own module path, not by a
-//! remembered capability.
+//! What this map does NOT state, because the tree does not contain it: there is
+//! no firewall, WFP, service-SID or ACL endpoint-policy owner in
+//! `crates/kernel/eliot-platform-windows`, `crates/kernel/eliot-installation`,
+//! `bins/eliot-host` or `bins/eliot-store-surreal`, and no Watchdog sensor
+//! observes the provider process, its listener or the store data root. Those are
+//! recorded as gaps with their truthful coverage, not as satisfied properties.
 
 use crate::StoreLaunchConfig;
 
@@ -40,12 +38,14 @@ use crate::StoreLaunchConfig;
 pub enum StoreBoundaryContour {
     /// `eliot-host.exe`: installation, service identities and secret delivery.
     Host,
-    /// `eliot-store-surreal.exe`: the closed Store bridge.
+    /// `eliot-store-surreal.exe`: the closed Store bridge. It composes the
+    /// provider child, so it is the process that materializes the child-only
+    /// environment block immediately before process creation.
     StoreBridge,
     /// `surreal.exe`: the Store-bridge-managed provider child owning the DB
     /// files and the loopback listener.
     ProviderChild,
-    /// Kernel/daemon ordinary bridge client over authenticated named IPC.
+    /// Kernel/daemon ordinary bridge client over the authenticated named pipe.
     BridgeClient,
     /// Maintenance/break-glass caller governed by I15.15.
     MaintenanceCaller,
@@ -62,18 +62,19 @@ pub enum StoreCredentialRole {
     NormalClient,
 }
 
-impl StoreCredentialRole {
-    const ALL: [Self; 2] = [Self::ProviderBootstrapAdmin, Self::NormalClient];
-}
-
-/// Issuer of every credential reference in this boundary (I15.4: Windows
-/// Credential Manager/DPAPI-protected `SecretRef` values behind the ELIOT
-/// secret-provider facade).
+/// Issuer of every credential reference in this boundary.
+///
+/// I15.4: "Windows Credential Manager/DPAPI-protected `SecretRef` values behind
+/// the ELIOT secret-provider facade". The reader is
+/// `eliot_platform_windows::WindowsPlatform::read_credential`
+/// (`crates/kernel/eliot-platform-windows/src/secret_store.rs`); the reference
+/// admission owners are
+/// `eliot_installation::validate_store_credential_target` and
+/// `eliot_installation::validate_provider_bootstrap_credential_target`
+/// (`crates/kernel/eliot-installation/src/credential_provision.rs`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialIssuer {
-    /// Windows Credential Manager, read through
-    /// `eliot_platform_windows::WindowsPlatform::read_credential` under the
-    /// bridge's `LocalService` identity.
+    /// Windows Credential Manager, read inside the Store bridge process.
     WindowsCredentialManager,
 }
 
@@ -99,20 +100,53 @@ pub struct ContourBoundary {
     pub issuer: CredentialIssuer,
     /// Whether this contour owns the provider endpoint/listener.
     pub owns_provider_endpoint: bool,
-    /// Whether this contour owns the store data/work/temp roots.
-    pub owns_store_roots: bool,
+    /// Whether this contour retains the exclusive store-root leases.
+    pub leases_store_roots: bool,
     /// Evidence class of this row.
     pub evidence: BoundaryEvidence,
 }
 
-/// The authenticated named-pipe caller of the Store bridge (I15.2/I15.3).
+/// One secret-bearing or DB-capable edge of this launch, with the reference it
+/// resolves and the runtime caller that resolves it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialReferenceBoundary {
+    /// Role this reference is admitted to serve.
+    pub role: StoreCredentialRole,
+    /// Reserving namespace of the Credential Manager target.
+    pub target_namespace: &'static str,
+    /// Admission owner of the exact reference value.
+    pub validator: &'static str,
+    /// Runtime caller that resolves the value.
+    pub resolved_by: &'static str,
+    /// Process whose environment receives the value.
+    pub delivered_to: StoreBoundaryContour,
+    /// One-shot delivery channel. Both rows are a fresh child-only environment
+    /// block or a private `SecretString` field; neither is argv, a serialized
+    /// form, `RuntimeLaunchDescriptor` or `HostStateJournal`.
+    pub delivery_channel: &'static str,
+    /// Evidence class of this row.
+    pub evidence: BoundaryEvidence,
+}
+
+/// The data/work/temp roots this launch binds, and who binds each one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreRootBoundary {
+    /// Runtime-state root field, by its owning symbol.
+    pub root: &'static str,
+    /// Contour that retains the exclusive lease of this root.
+    pub leased_by: StoreBoundaryContour,
+    /// How the root reaches the provider child.
+    pub provider_binding: &'static str,
+    /// Evidence class of this row.
+    pub evidence: BoundaryEvidence,
+}
+
+/// The authenticated named-pipe caller of the Store bridge (I15.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamedPipeCallerBoundary {
     /// Contour admitted to the Store bridge's named pipe.
     pub contour: StoreBoundaryContour,
-    /// Peer the bridge authenticates, taken from `StoreLaunchConfig`'s
-    /// `expected_client_sid` / `expected_client_session_id` and enforced by
-    /// `eliot_platform_windows::NamedPipePeerExpectation`.
+    /// Peer the bridge authenticates.
     pub peer_expectation_source: &'static str,
     /// What the caller may reach once authenticated.
     pub admitted_surface: &'static str,
@@ -128,8 +162,8 @@ pub struct MaintenanceCallerBoundary {
     /// Owning module of that path, by repository path.
     pub owner: &'static str,
     /// Whether the caller receives a database credential of this launch.
-    /// I15.15 routes recovery through credential/epochs rotation, so the
-    /// caller is admitted to no credential of the current launch.
+    /// I15.15 routes recovery through credential/epochs rotation, so the caller
+    /// is admitted to no credential of the current launch.
     pub receives_launch_credential: bool,
     /// Evidence class of this row.
     pub evidence: BoundaryEvidence,
@@ -142,10 +176,14 @@ pub struct WatchdogSensorBoundary {
     pub owner: &'static str,
     /// Channel name inside that owner's closed channel set.
     pub channel: &'static str,
-    /// Measured wiring state in that owner.
+    /// Wiring state recorded by that owner for this channel.
     pub wiring: &'static str,
+    /// Classes the channel would cover once wired, by that owner's own
+    /// `supported_classes`.
+    pub covered_classes: &'static str,
     /// Whether the channel can produce any canonical transition. An independent
-    /// observation never can: the Watchdog holds no canonical write (I15.3).
+    /// observation never can: this owner records `ChannelWiring` and writes its
+    /// own spool/Signal only.
     pub produces_canonical_transition: bool,
     /// Evidence class of this row.
     pub evidence: BoundaryEvidence,
@@ -157,7 +195,7 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
         credential_role: None,
         issuer: CredentialIssuer::WindowsCredentialManager,
         owns_provider_endpoint: false,
-        owns_store_roots: false,
+        leases_store_roots: false,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
     ContourBoundary {
@@ -165,15 +203,19 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
         credential_role: Some(StoreCredentialRole::NormalClient),
         issuer: CredentialIssuer::WindowsCredentialManager,
         owns_provider_endpoint: false,
-        owns_store_roots: false,
+        // `StoreComposition::new` retains the exclusive runtime-root leases and
+        // passes the three store roots to the provider child in argv.
+        leases_store_roots: true,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
     ContourBoundary {
         contour: StoreBoundaryContour::ProviderChild,
         credential_role: Some(StoreCredentialRole::ProviderBootstrapAdmin),
         issuer: CredentialIssuer::WindowsCredentialManager,
+        // The child is the only listener on `provider_bind_address`, and the
+        // bridge proves that ownership before and after it connects.
         owns_provider_endpoint: true,
-        owns_store_roots: true,
+        leases_store_roots: false,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
     ContourBoundary {
@@ -181,7 +223,7 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
         credential_role: None,
         issuer: CredentialIssuer::WindowsCredentialManager,
         owns_provider_endpoint: false,
-        owns_store_roots: false,
+        leases_store_roots: false,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
     ContourBoundary {
@@ -189,7 +231,7 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
         credential_role: None,
         issuer: CredentialIssuer::WindowsCredentialManager,
         owns_provider_endpoint: false,
-        owns_store_roots: false,
+        leases_store_roots: false,
         evidence: BoundaryEvidence::RequiresInstalledWindowsEvidence,
     },
     ContourBoundary {
@@ -197,7 +239,59 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
         credential_role: None,
         issuer: CredentialIssuer::WindowsCredentialManager,
         owns_provider_endpoint: false,
-        owns_store_roots: false,
+        leases_store_roots: false,
+        evidence: BoundaryEvidence::SourceDeclaration,
+    },
+];
+
+/// The two secret-bearing edges of this launch.
+const CREDENTIAL_REFERENCES: &[CredentialReferenceBoundary] = &[
+    CredentialReferenceBoundary {
+        role: StoreCredentialRole::NormalClient,
+        target_namespace: "eliot/store/v1/<32 hex>",
+        validator: "eliot_installation::validate_store_credential_target",
+        resolved_by:
+            "adapter_materialization::resolve_credential, called by StoreComposition::new",
+        delivered_to: StoreBoundaryContour::StoreBridge,
+        delivery_channel: "SecretString field SurrealAdapterConfig::password, used only by \
+             RpcSession::signin; never written into the provider child's environment block",
+        evidence: BoundaryEvidence::SourceDeclaration,
+    },
+    CredentialReferenceBoundary {
+        role: StoreCredentialRole::ProviderBootstrapAdmin,
+        target_namespace: "eliot/provider/v1/<32 hex>",
+        validator: "eliot_installation::validate_provider_bootstrap_credential_target",
+        resolved_by:
+            "adapter_materialization::resolve_provider_bootstrap_credential, called by \
+             StoreComposition::new",
+        delivered_to: StoreBoundaryContour::ProviderChild,
+        delivery_channel: "fresh child-only environment block built by \
+             provider_owner::provider_environment under the two fixed provider bootstrap names; \
+             never argv, never the parent environment, never a serialized form",
+        evidence: BoundaryEvidence::SourceDeclaration,
+    },
+];
+
+/// The data/work/temp roots this launch binds.
+const STORE_ROOTS: &[StoreRootBoundary] = &[
+    StoreRootBoundary {
+        root: "eliot_installation::RuntimeStateRoots::store_data_root",
+        leased_by: StoreBoundaryContour::StoreBridge,
+        provider_binding: "the surrealkv:// argument of SurrealAdapterConfig::expected_provider_arguments",
+        evidence: BoundaryEvidence::SourceDeclaration,
+    },
+    StoreRootBoundary {
+        root: "eliot_installation::RuntimeStateRoots::store_work_root",
+        leased_by: StoreBoundaryContour::StoreBridge,
+        provider_binding: "the --log-file-path argument of \
+             SurrealAdapterConfig::expected_provider_arguments",
+        evidence: BoundaryEvidence::SourceDeclaration,
+    },
+    StoreRootBoundary {
+        root: "eliot_installation::RuntimeStateRoots::store_temp_root",
+        leased_by: StoreBoundaryContour::StoreBridge,
+        provider_binding: "the --temporary-directory argument and the TEMP/TMP entries of the \
+             child-only environment block",
         evidence: BoundaryEvidence::SourceDeclaration,
     },
 ];
@@ -205,11 +299,13 @@ const CANONICAL_ROWS: &[ContourBoundary] = &[
 /// The one authenticated named-pipe caller of the Store bridge.
 const NAMED_PIPE_CALLER: NamedPipeCallerBoundary = NamedPipeCallerBoundary {
     contour: StoreBoundaryContour::BridgeClient,
-    peer_expectation_source: "StoreLaunchConfig::expected_client_sid / expected_client_session_id, enforced by \
-         eliot_platform_windows::NamedPipePeerExpectation and checked in \
-         bins/eliot-store-surreal/src/main.rs::serve",
-    admitted_surface: "closed typed store requests only; the isolated health/admin lane admits exactly \
-         store.health and store.readiness (connection_manager::OperationAdmission::bridge_default)",
+    peer_expectation_source: "StoreLaunchConfig::expected_client_sid / \
+         expected_client_session_id, admitted by eliot_platform_windows::NamedPipePeerExpectation::new \
+         in bins/eliot-store-surreal/src/main.rs::serve_handshake_loop and enforced by \
+         eliot_platform_windows::NamedPipeServer::create",
+    admitted_surface: "closed typed store requests only; the isolated health/admin lane admits \
+         exactly store.health and store.readiness \
+         (connection_manager::HealthAdminAdmission::bridge_default)",
     evidence: BoundaryEvidence::SourceDeclaration,
 };
 
@@ -221,16 +317,21 @@ const MAINTENANCE_CALLER: MaintenanceCallerBoundary = MaintenanceCallerBoundary 
     evidence: BoundaryEvidence::RequiresInstalledWindowsEvidence,
 };
 
-/// The Watchdog sensor channels that can observe this contour, with the wiring
-/// state their own owner records. The Watchdog holds no store edge in its
-/// manifest and no database credential, so these are named gaps today, and the
-/// naming is the truthful-coverage half of issue #1810 item 7: the absence of
-/// an adapter is recorded, not concealed.
+/// The Watchdog sensor channels that could observe this contour, carrying the
+/// wiring state their own owner records.
+///
+/// `bins/eliot-watchdog/src/observation_coverage.rs` is the #1755 sensor map
+/// (`SENSOR_CHANNEL_MAP`). Both channels below are recorded there as
+/// `ChannelWiring::MissingAdapter`, so the honest coverage today is: no
+/// independent process, listener or data-root observation exists, and the
+/// absence of a sensor is not evidence that no foreign client exists. Naming the
+/// gap with its owner is the truthful-coverage half of issue #1810 item 7.
 const WATCHDOG_SENSORS: &[WatchdogSensorBoundary] = &[
     WatchdogSensorBoundary {
         owner: "bins/eliot-watchdog/src/observation_coverage.rs::SENSOR_CHANNEL_MAP",
         channel: "store_process_health",
         wiring: "ChannelWiring::MissingAdapter",
+        covered_classes: "ObservationClass::ReadOnlyProbe",
         produces_canonical_transition: false,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
@@ -238,6 +339,7 @@ const WATCHDOG_SENSORS: &[WatchdogSensorBoundary] = &[
         owner: "bins/eliot-watchdog/src/observation_coverage.rs::SENSOR_CHANNEL_MAP",
         channel: "listener_inventory",
         wiring: "ChannelWiring::MissingAdapter",
+        covered_classes: "ObservationClass::ListenerBinding",
         produces_canonical_transition: false,
         evidence: BoundaryEvidence::SourceDeclaration,
     },
@@ -263,6 +365,18 @@ impl StoreBoundaryMap {
         self.rows
     }
 
+    /// Returns the two secret-bearing edges of this launch.
+    #[must_use]
+    pub const fn credential_references(&self) -> &'static [CredentialReferenceBoundary] {
+        CREDENTIAL_REFERENCES
+    }
+
+    /// Returns the data/work/temp roots this launch binds.
+    #[must_use]
+    pub const fn store_roots(&self) -> &'static [StoreRootBoundary] {
+        STORE_ROOTS
+    }
+
     /// Returns the one authenticated named-pipe caller boundary.
     #[must_use]
     pub const fn named_pipe_caller(&self) -> &'static NamedPipeCallerBoundary {
@@ -283,101 +397,45 @@ impl StoreBoundaryMap {
 
     /// Checks this launch against the finite map.
     ///
-    /// The map itself must be internally consistent — every credential role
-    /// named exactly once, exactly one provider endpoint owner, that owner
-    /// also the root owner, and no contour admitted to two roles — and the
-    /// launch must then resolve to exactly that assignment: two different
-    /// credential references, and a provider bootstrap identity that is not
-    /// the ordinary client identity.
+    /// The map admits each credential role to exactly one contour, and the two
+    /// callers that reach the bridge without a database credential — the
+    /// named-pipe client and the maintenance/break-glass caller — must be
+    /// distinct contours that the map admits to no credential of this launch.
+    /// The launch must then bind its two references to two different contours:
+    /// one reference for both roles would put one secret in both contours.
     pub(crate) fn validate_against(&self, config: &StoreLaunchConfig) -> Result<(), String> {
-        for role in StoreCredentialRole::ALL {
-            let holders = self
-                .rows
-                .iter()
-                .filter(|row| row.credential_role == Some(role))
-                .map(|row| row.contour)
-                .collect::<Vec<_>>();
-            if holders.len() != 1 {
-                return Err(format!(
-                    "boundary map must name exactly one holder of the {role:?} credential, found {}",
-                    holders.len()
-                ));
-            }
-        }
-        if self.holders_of(StoreCredentialRole::NormalClient) != [StoreBoundaryContour::StoreBridge]
-        {
-            return Err(
-                "boundary map does not name the Store bridge as the ordinary client-credential holder"
-                    .to_owned(),
-            );
-        }
-        if self.holders_of(StoreCredentialRole::ProviderBootstrapAdmin)
-            != [StoreBoundaryContour::ProviderChild]
-        {
-            return Err(
-                "boundary map does not name the provider child as the bootstrap-credential consumer"
-                    .to_owned(),
-            );
-        }
-        let owners = |select: fn(&ContourBoundary) -> bool| -> Vec<StoreBoundaryContour> {
-            self.rows
-                .iter()
-                .filter(|row| select(row))
-                .map(|row| row.contour)
-                .collect()
-        };
-        if owners(|row| row.owns_provider_endpoint) != [StoreBoundaryContour::ProviderChild] {
-            return Err(
-                "boundary map must name exactly the provider child as the provider endpoint owner"
-                    .to_owned(),
-            );
-        }
-        if owners(|row| row.owns_store_roots) != [StoreBoundaryContour::ProviderChild] {
-            return Err(
-                "boundary map must name exactly the provider child as the store roots owner"
-                    .to_owned(),
-            );
-        }
-        for caller in [NAMED_PIPE_CALLER.contour, MAINTENANCE_CALLER.contour] {
-            if caller == MAINTENANCE_CALLER.contour && MAINTENANCE_CALLER.receives_launch_credential
-            {
-                return Err(
-                    "the maintenance/break-glass caller must be admitted to no launch credential"
-                        .to_owned(),
-                );
-            }
-            if self
-                .rows
-                .iter()
-                .find(|row| row.contour == caller)
-                .and_then(|row| row.credential_role)
-                .is_some()
-            {
-                return Err(format!(
-                    "the {caller:?} caller must hold no credential of this launch"
-                ));
-            }
-        }
         if NAMED_PIPE_CALLER.contour == MAINTENANCE_CALLER.contour {
             return Err(
                 "the named-pipe caller and the maintenance/break-glass caller must be distinct contours"
                     .to_owned(),
             );
         }
-        if config.provider_bootstrap_credential_ref == config.credential_ref {
+        if MAINTENANCE_CALLER.receives_launch_credential {
             return Err(
-                "provider bootstrap and ordinary client credential references must differ"
+                "the maintenance/break-glass caller must be admitted to no launch credential"
+                    .to_owned(),
+            );
+        }
+        for caller in [NAMED_PIPE_CALLER.contour, MAINTENANCE_CALLER.contour] {
+            if self.holds_credential(caller) {
+                return Err(format!(
+                    "the {caller:?} caller must be admitted to no credential of this launch"
+                ));
+            }
+        }
+        if config.credential_ref == config.provider_bootstrap_credential_ref {
+            return Err(
+                "the ordinary client and the provider bootstrap credential references must differ"
                     .to_owned(),
             );
         }
         Ok(())
     }
 
-    fn holders_of(&self, role: StoreCredentialRole) -> Vec<StoreBoundaryContour> {
+    /// Whether the map admits this contour to any credential of this launch.
+    fn holds_credential(&self, contour: StoreBoundaryContour) -> bool {
         self.rows
             .iter()
-            .filter(|row| row.credential_role == Some(role))
-            .map(|row| row.contour)
-            .collect()
+            .any(|row| row.contour == contour && row.credential_role.is_some())
     }
 }

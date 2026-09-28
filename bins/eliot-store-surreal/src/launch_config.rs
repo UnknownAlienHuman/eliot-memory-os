@@ -231,12 +231,8 @@ impl StoreLaunchConfig {
         )?;
         validate_provider_bootstrap_credential_target(&self.provider_bootstrap_credential_ref)
             .map_err(|reason| format!("invalid provider_bootstrap_credential_ref: {reason}"))?;
-        if self.provider_bootstrap_credential_ref == self.credential_ref {
-            return Err(
-                "provider_bootstrap_credential_ref must be a distinct reference from credential_ref"
-                    .to_owned(),
-            );
-        }
+        // The two references must differ; `StoreBoundaryMap::validate_against`
+        // owns that admission and runs first in `validate`.
         if self.provider_bootstrap_username == self.username {
             return Err(
                 "provider_bootstrap_username must be a distinct identity from username".to_owned(),

@@ -15,7 +15,8 @@ use eliot_installation::{
     RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
     SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
-    agent_bridge_source_plan_from_observed_kernel, source_bundle_publication_operation_id,
+    agent_bridge_source_plan_from_observed_kernel, provider_bootstrap_credential_target_for_store_target,
+    source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
@@ -807,21 +808,6 @@ fn build_typed_bundle(
         format!("eliot/store/v1/{}", &credential_token[..32]),
         "Store credential target",
     )?;
-    // I15.4 requires the provider bootstrap/admin credential to be a separate,
-    // independently rotatable reference from the ordinary client credential.
-    // It is a sibling target in its own reserved namespace, derived from the
-    // same per-transaction template entropy so the two differ.
-    let provider_bootstrap_target_token = sha256_hex(
-        format!(
-            "eliot-provider-credential:phase-a-template:{}:{}:{}",
-            input.installation_epoch.installation.as_str(),
-            input.generation.as_str(),
-            template_digest.as_str()
-        )
-        .as_bytes(),
-    );
-    let provider_bootstrap_credential_ref =
-        format!("eliot/provider/v1/{}", &provider_bootstrap_target_token[..32]);
     let authority_generation = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     let authority_epoch = materializer_genesis_epoch()?;
@@ -992,6 +978,22 @@ fn build_typed_bundle(
     .with_computed_digest()
     .map_err(|error| MaterializeError::Contract(format!("runtime launch: {error}")))?;
     let credential_ref = runtime_launch.store_credential_target.as_str().to_owned();
+    // I15.4 requires the provider bootstrap/admin credential to be a separate,
+    // independently rotatable reference from the ordinary client credential.
+    // The installation secret-provisioning owner derives it from the exact
+    // Store locator, in its own reserved namespace, so no value and no second
+    // derivation rule exists in this composition root.
+    let provider_bootstrap_credential_ref =
+        provider_bootstrap_credential_target_for_store_target(
+            &runtime_launch.store_credential_target,
+        )
+        .map_err(|error| {
+            MaterializeError::Contract(format!(
+                "provider bootstrap credential target: {error}"
+            ))
+        })?
+        .as_str()
+        .to_owned();
     let mut store_config = StoreLaunchConfig {
         store_pipe: format!(r"\\.\pipe\eliot\store-{credential_token}"),
         launch_nonce: format!("store:{credential_token}"),
