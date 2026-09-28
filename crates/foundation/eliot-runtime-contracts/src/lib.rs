@@ -47,9 +47,15 @@ pub use hot_artifact_map::{
 };
 pub use hot_path::{
     HOT_PATH_CONTRACT_NAME, HOT_PATH_CONTRACT_VERSION, HOT_PATH_MANIFEST_VERSION,
-    HotPathDegradation, HotPathExternalCall, HotPathManifest, HotPathManifestSetV1,
-    HotPathProfileRef, HotPathQueueBounds, HotPathQueueDeclaration, HotPathSnapshotDependency,
-    HotPathUnsupportedOperation, hot_path_contract_identity, hot_spine_membership,
+    HOT_PATH_OPERATION_MAP_REVISION, HotPathBindingIdentity, HotPathBoundStatus,
+    HotPathDegradation, HotPathDegradationReason, HotPathEdgeKind, HotPathExternalCall,
+    HotPathLimitingBound, HotPathManifest, HotPathManifestSetV1, HotPathOperationLeg,
+    HotPathOperationMap, HotPathProfileRef, HotPathQueueBounds, HotPathQueueCapacity,
+    HotPathQueueDeclaration, HotPathSnapshotDependency, HotPathUnsupportedOperation,
+    HotPathWorkClass, OptionalCallAuthentication, OptionalCallRefusal, RegisteredOperation,
+    RegisteredQueueSettings, RunningBuildRegistration, bind_hot_path_manifest_set,
+    captured_query_operation_map, hot_path_bound_status, hot_path_contract_identity,
+    hot_spine_membership, optional_call_is_invocable,
 };
 pub use hot_path_profile::{
     HOT_PATH_PROFILE_MAX_CLOCK_DOMAINS, HOT_PATH_PROFILE_MAX_EVIDENCE_REFS,

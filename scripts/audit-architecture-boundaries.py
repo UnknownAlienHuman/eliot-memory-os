@@ -2294,6 +2294,420 @@ def audit_source(
     return findings
 
 
+# ---------------------------------------------------------------------------
+# I12.14 hot-path manifest binding
+# ---------------------------------------------------------------------------
+
+HOT_PATH_MANIFEST_RELPATHS = {
+    "eliot-kernel": "bins/eliot-kernel/hot-path.toml",
+    "eliotd": "bins/eliotd/hot-path.toml",
+}
+HOT_PATH_CONTRACT_OWNER = "eliot-runtime-contracts"
+
+
+def _hot_path_manifest_owner(manifest: dict[str, Any]) -> str | None:
+    declared = manifest.get("owning_service")
+    return str(declared) if isinstance(declared, str) else None
+
+
+# The operation-id literal syntaxes that are real dispatch sites. Each pattern
+# matches one closed position in Rust that names the id the surrounding code
+# actually serves, so a declaration can only bind an id the source dispatches.
+#
+# The accepted positions are deliberately closed, because an open "any quoted
+# string on its own line" rule collects the whole vocabulary of the service:
+# measured against current source, an open line-prefix rule accepts 317 ids in
+# `bins/eliot-kernel` and 161 in `bins/eliotd` (including `password`,
+# `api_key`, `powershell`, `os.system` and `console.log`), against 67 and 34
+# for the closed rules. An open rule therefore makes the S4/A4 registered
+# comparison unable to fail for any id a reader could invent, which is the
+# weaker check this binding exists to prevent.
+_HOT_PATH_JSON_PAYLOAD_OPERATION = re.compile(
+    r'"operation"\s*:\s*"([a-z][A-Za-z0-9_.]*)"'
+)
+_HOT_PATH_TRANSACT_OPERATION = re.compile(
+    r'\btransact_async\s*\(\s*"([a-z][A-Za-z0-9_.]*)"'
+)
+# A closed `match` arm, such as `"local_read_claim" => "local_read_claim",`.
+_HOT_PATH_DISPATCH_ARM = re.compile(r'^\s*"([a-z][A-Za-z0-9_.]*)"\s*=>')
+# One alternative of a closed allow-list, such as `| "local_read_result"`.
+_HOT_PATH_ALLOW_ARM = re.compile(r'^\s*\|\s*"([a-z][A-Za-z0-9_.]*)"\s*,?\s*$')
+
+
+def _registered_operation_ids(root: Path, relpath: str) -> set[str]:
+    """The operation ids the owning service's production source actually dispatches.
+
+    This is the authoritative side of the S4/A4 comparison: the ids come from
+    the production source that dispatches them, never from the declaration.
+    Four closed dispatch shapes all count, because all four are the code that
+    actually serves the id: a single-`operation`-key payload such as
+    `{"operation": "local_read_claim"}`, a closed dispatch match arm, the
+    closed allow-list alternative the frame admission admits, and the outbound
+    IPC leg that names the id as the first positional argument of the Kernel
+    transaction client (`transact_async("local_read_result", ..)`). The
+    transaction shape is load-bearing for the daemon half: `eliotd` dispatches
+    `local_read_result` nowhere in a match arm, so without it a correct
+    declaration would fail against an id its own source really serves.
+
+    Test-only code is excluded, so an id that only a test dispatches is not
+    registered.
+    """
+    source_dir = (root / relpath).parent
+    registered: set[str] = set()
+    for path in sorted(source_dir.rglob("*.rs")):
+        try:
+            content = _production_prefix(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if not content:
+            continue
+        for pattern in (_HOT_PATH_JSON_PAYLOAD_OPERATION, _HOT_PATH_TRANSACT_OPERATION):
+            registered.update(match.group(1) for match in pattern.finditer(content))
+        for line in content.splitlines():
+            for pattern in (_HOT_PATH_DISPATCH_ARM, _HOT_PATH_ALLOW_ARM):
+                match = pattern.match(line)
+                if match is not None:
+                    registered.add(match.group(1))
+                    break
+    return registered
+
+
+def _manifest_source_for_closure(root: Path, crate_name: str) -> Path | None:
+    for candidate in sorted(root.glob(f"crates/**/{crate_name}/Cargo.toml")) + sorted(
+        root.glob(f"bins/**/{crate_name}/Cargo.toml")
+    ):
+        return candidate
+    return None
+
+
+def audit_hot_path_manifests(
+    root: Path, manifests: dict[str, Manifest]
+) -> list[Finding]:
+    """Binds each I12.14 service manifest to the running build's real inputs.
+
+    Four distinct bindings, each with a different authoritative side:
+
+    1. every `supported_operations` row must name an operation the owning
+       service's production source actually dispatches (source/build side);
+    2. every `entrypoint` must resolve to a real file and a real `fn` in it,
+       so a declared entrypoint cannot be a plausible-looking invented path;
+    3. every `crate_closure` entry must be a real workspace package that
+       declares a non-dev production edge from the owning service, so the
+       declared in-process closure is a subset of the real production target
+       graph rather than a list of names;
+    4. every `unsupported_operations` row must NOT appear in that registered
+       set, so an operation the source refuses cannot simultaneously be
+       declared unsupported and be listed as a working row elsewhere.
+
+    This is static source/build evidence. It never claims a dynamic callback
+    graph is proved: the closure check is a declared-edge subset over Cargo's
+    static DAG, and the operation check is a dispatch-marker read, not an
+    executed trace.
+    """
+    findings: list[Finding] = []
+
+    for service, relpath in sorted(HOT_PATH_MANIFEST_RELPATHS.items()):
+        path = root / relpath
+        if not path.is_file():
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "hot_path_manifest_absent",
+                    relpath,
+                    service,
+                    "The service-local I12.14 hot-path manifest is absent; the "
+                    "service has no authoritative declaration source.",
+                )
+            )
+            continue
+        try:
+            manifest = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "hot_path_manifest_unreadable",
+                    relpath,
+                    service,
+                    f"The hot-path manifest does not parse: {error}",
+                )
+            )
+            continue
+
+        owner = _hot_path_manifest_owner(manifest)
+        if owner != service:
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "hot_path_manifest_owner_mismatch",
+                    relpath,
+                    service,
+                    f"Manifest declares owning_service {owner!r} under the "
+                    f"{service!r} service manifest path.",
+                )
+            )
+
+        # Authority side 1: the ids the service's own source dispatches.
+        registered = _registered_operation_ids(root, relpath)
+
+        supported = manifest.get("supported_operations") or []
+        unsupported = manifest.get("unsupported_operations") or []
+        if not supported:
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "hot_path_manifest_no_supported_operation",
+                    relpath,
+                    service,
+                    "The hot-path manifest declares no supported operation.",
+                )
+            )
+        if not isinstance(supported, list) or not isinstance(unsupported, list):
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "hot_path_manifest_operation_shape",
+                    relpath,
+                    service,
+                    "supported_operations/unsupported_operations must both be arrays of tables.",
+                )
+            )
+            continue
+
+        seen_supported: set[str] = set()
+        for index, row in enumerate(supported):
+            if not isinstance(row, dict):
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_manifest_operation_shape",
+                        relpath,
+                        service,
+                        f"supported_operations[{index}] is not a table.",
+                    )
+                )
+                continue
+            operation = str(row.get("operation", ""))
+            if operation in seen_supported:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_manifest_duplicate_operation",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} is declared more than once.",
+                    )
+                )
+            seen_supported.add(operation)
+            if operation and operation not in registered:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_operation_unregistered",
+                        relpath,
+                        service,
+                        f"Declared operation {operation!r} is not dispatched by the "
+                        "owning service's production source.",
+                    )
+                )
+
+            entrypoint = str(row.get("entrypoint", ""))
+            if not entrypoint:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_entrypoint_absent",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} declares no entrypoint.",
+                    )
+                )
+            elif "::" not in entrypoint:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_entrypoint_malformed",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} entrypoint {entrypoint!r} is not "
+                        "a path.rs::symbol reference.",
+                    )
+                )
+            else:
+                entry_path, entry_symbol = entrypoint.rsplit("::", 1)
+                owner_file = root / entry_path
+                if not owner_file.is_file():
+                    findings.append(
+                        Finding(
+                            "HARD_VIOLATION",
+                            "hot_path_entrypoint_unresolved",
+                            relpath,
+                            service,
+                            f"Operation {operation!r} entrypoint file {entry_path!r} "
+                            "does not exist.",
+                        )
+                    )
+                else:
+                    entry_content = owner_file.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    if not re.search(
+                        r"\bfn\s+" + re.escape(entry_symbol) + r"\b", entry_content
+                    ):
+                        findings.append(
+                            Finding(
+                                "HARD_VIOLATION",
+                                "hot_path_entrypoint_unresolved",
+                                relpath,
+                                service,
+                                f"Operation {operation!r} entrypoint symbol "
+                                f"{entry_symbol!r} is absent from {entry_path!r}.",
+                            )
+                        )
+
+            # Authority side 3: the production target/feature graph. Each
+            # declared closure crate must exist as a workspace package and must
+            # be reachable from the service by non-dev Cargo declarations. The
+            # service's own package is its closure root, so it is admitted by
+            # being the owner rather than by a self-edge that cannot exist.
+            closure = row.get("crate_closure") or []
+            if not isinstance(closure, list) or not closure:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_closure_absent",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} declares no in-process crate closure.",
+                    )
+                )
+                continue
+            if service not in [str(name) for name in closure]:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_closure_root_absent",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} declares a crate closure that does "
+                        f"not include its own owning package {service!r}.",
+                    )
+                )
+            service_manifest = manifests.get(service)
+            for crate_name in closure:
+                crate_name = str(crate_name)
+                if _manifest_source_for_closure(root, crate_name) is None:
+                    findings.append(
+                        Finding(
+                            "HARD_VIOLATION",
+                            "hot_path_closure_crate_absent",
+                            relpath,
+                            service,
+                            f"Operation {operation!r} names closure crate "
+                            f"{crate_name!r}, which is not a workspace package.",
+                        )
+                    )
+                    continue
+                # The owning package is trivially in its own closure: it is the
+                # closure root, admitted by being the owner rather than by a
+                # self-edge that cannot exist. The exception is exactly the
+                # owning package -- every other named crate, however internal it
+                # is meant to be, must show a real production edge, so declaring
+                # a crate internal cannot make it pass. An unresolvable owner is
+                # itself a hard violation rather than a reason to skip the check.
+                if crate_name == service:
+                    continue
+                if service_manifest is None:
+                    findings.append(
+                        Finding(
+                            "HARD_VIOLATION",
+                            "hot_path_closure_owner_unresolved",
+                            relpath,
+                            service,
+                            f"Operation {operation!r} declares a crate closure, but the "
+                            f"owning package {service!r} is absent from current Cargo "
+                            "metadata, so no production edge can be checked.",
+                        )
+                    )
+                    break
+                if not any(
+                    edge.package == crate_name and edge.kind in {"normal", "build"}
+                    for edge in service_manifest.dependency_edges
+                ):
+                    findings.append(
+                        Finding(
+                            "HARD_VIOLATION",
+                            "hot_path_closure_edge_absent",
+                            relpath,
+                            service,
+                            f"Operation {operation!r} names closure crate "
+                            f"{crate_name!r}, which has no production dependency "
+                            f"edge from {service!r} in the production target graph.",
+                        )
+                    )
+
+        for index, row in enumerate(unsupported):
+            if not isinstance(row, dict):
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_manifest_operation_shape",
+                        relpath,
+                        service,
+                        f"unsupported_operations[{index}] is not a table.",
+                    )
+                )
+                continue
+            operation = str(row.get("operation", ""))
+            if not operation:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_unsupported_operation_absent",
+                        relpath,
+                        service,
+                        f"unsupported_operations[{index}] names no operation.",
+                    )
+                )
+            elif operation in seen_supported:
+                findings.append(
+                    Finding(
+                        "HARD_VIOLATION",
+                        "hot_path_operation_support_conflict",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} is both supported and unsupported.",
+                    )
+                )
+            if operation in seen_supported and operation in registered:
+                findings.append(
+                    Finding(
+                        "AUDIT_SIGNAL",
+                        "hot_path_unsupported_operation_dispatched",
+                        relpath,
+                        service,
+                        f"Operation {operation!r} is declared unsupported but the "
+                        "owning source still dispatches it; review the declaration.",
+                    )
+                )
+
+    # Authority side 2: the contract crate that owns the schema must itself be
+    # a workspace package, so a manifest can never be validated against a schema
+    # that no package builds.
+    if _manifest_source_for_closure(root, HOT_PATH_CONTRACT_OWNER) is None:
+        findings.append(
+            Finding(
+                "HARD_VIOLATION",
+                "hot_path_contract_owner_absent",
+                "crates/foundation/eliot-runtime-contracts",
+                HOT_PATH_CONTRACT_OWNER,
+                "The hot-path declaration contract owner is not a workspace package.",
+            )
+        )
+
+    return findings
+
+
 def audit(root: Path, policy_path: Path) -> list[Finding]:
     policy = load_policy(policy_path)
     manifests, findings, ambiguous = load_manifests(root)
@@ -2308,6 +2722,7 @@ def audit(root: Path, policy_path: Path) -> list[Finding]:
         audit_dependencies(manifests, policy, ambiguous, unresolved_manifests)
     )
     findings.extend(audit_source(root, manifests, policy))
+    findings.extend(audit_hot_path_manifests(root, manifests))
     return sorted(
         findings,
         key=lambda finding: (
