@@ -7,9 +7,7 @@
 //! under migration authority.
 
 use eliot_store_api::sha256_hex;
-use eliot_store_api::{
-    StateFence, generated_operation_manifests, operation_manifest_set_digest,
-};
+use eliot_store_api::{StateFence, generated_operation_manifests, operation_manifest_set_digest};
 
 use crate::config::SchemaGeneration;
 use crate::schema_inventory;
@@ -223,9 +221,7 @@ impl MigrationReceipt {
         {
             return Err("migration receipt does not match the applied migration plan");
         }
-        if self.root_identity.trim().is_empty()
-            || self.provider_artifact_sha256.trim().is_empty()
-        {
+        if self.root_identity.trim().is_empty() || self.provider_artifact_sha256.trim().is_empty() {
             return Err("migration receipt does not name the root and provider it ran against");
         }
         self.state_fence

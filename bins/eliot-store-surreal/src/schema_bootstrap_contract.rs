@@ -241,8 +241,7 @@ impl StoreSchemaBootstrapBinding {
     ) -> Result<StoreSchemaBootstrapReceipt, StoreSchemaBootstrapError> {
         if migration.state_fence != self.state_fence {
             return Err(StoreSchemaBootstrapError::Rejected(
-                "provider migration receipt was issued under a different state fence"
-                    .to_owned(),
+                "provider migration receipt was issued under a different state fence".to_owned(),
             ));
         }
         if migration.bridge_range != ADAPTER_NAME {

@@ -583,7 +583,7 @@ async fn apply_migration_direct(
         if f.state_fence != *state_fence {
             return Err(AdapterError::PartialOutcome);
         }
-        return Ok(migration_receipt(&adapter.config, migration, state_fence)?);
+        return migration_receipt(&adapter.config, migration, state_fence);
     }
     observed_clock
         .validate()
@@ -624,11 +624,9 @@ async fn apply_migration_direct(
             )
             .await
         }
-        MigrationPreflight::ExactReplay => Ok(migration_receipt(
-            &adapter.config,
-            migration,
-            state_fence,
-        )?),
+        MigrationPreflight::ExactReplay => {
+            Ok(migration_receipt(&adapter.config, migration, state_fence)?)
+        }
     }
 }
 

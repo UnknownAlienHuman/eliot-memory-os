@@ -618,7 +618,9 @@ fn push_census_object(
 /// `OVERWRITE` modifiers the legacy roots use.
 fn declared_name(tokens: &[&str]) -> Option<String> {
     let mut index = 2;
-    if tokens.get(index).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"))
         && tokens
             .get(index + 1)
             .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
@@ -633,9 +635,7 @@ fn declared_name(tokens: &[&str]) -> Option<String> {
     {
         index += 1;
     }
-    tokens
-        .get(index)
-        .map(|token| token.to_ascii_lowercase())
+    tokens.get(index).map(|token| token.to_ascii_lowercase())
 }
 
 /// Returns the owning table named after the `ON` keyword, tolerating the
@@ -651,9 +651,7 @@ fn table_after_on(tokens: &[&str]) -> Option<String> {
     {
         next += 1;
     }
-    tokens
-        .get(next)
-        .map(|token| token.to_ascii_lowercase())
+    tokens.get(next).map(|token| token.to_ascii_lowercase())
 }
 
 /// What the current capability does with one legacy table.
@@ -693,7 +691,6 @@ pub(crate) struct LegacyTableMapping {
     /// What the current capability does with the table.
     pub(crate) disposition: LegacyTableDisposition,
 }
-
 
 /// Rationale shared by every legacy table no current capability owner writes.
 ///
@@ -943,7 +940,10 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
     },
     LegacyTableMapping {
         table: "observability_receipt",
-        indexes: &["idx_observability_receipt_kind", "idx_observability_receipt_write"],
+        indexes: &[
+            "idx_observability_receipt_kind",
+            "idx_observability_receipt_write",
+        ],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
         },
@@ -1081,7 +1081,11 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
     },
     LegacyTableMapping {
         table: "write_receipt",
-        indexes: &["idx_receipt_project", "idx_receipt_sequence", "idx_receipt_write"],
+        indexes: &[
+            "idx_receipt_project",
+            "idx_receipt_sequence",
+            "idx_receipt_write",
+        ],
         disposition: LegacyTableDisposition::Transform {
             capability_owner: CURRENT_MIGRATION_OWNER,
             current_table: "write_receipt",
@@ -1137,7 +1141,10 @@ impl fmt::Display for LegacyMappingOmission {
                 "the mapping for {table} declares legacy index {index}, which the legacy roots no longer define"
             ),
             Self::DuplicateTableRow { table } => {
-                write!(formatter, "the legacy table {table} has more than one mapping row")
+                write!(
+                    formatter,
+                    "the legacy table {table} has more than one mapping row"
+                )
             }
         }
     }
