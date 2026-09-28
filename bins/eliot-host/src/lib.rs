@@ -270,7 +270,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostJobBranches::cutover_with_rollback",
         owner_state: "candidate/prior generations and artifacts",
         event: "host.cutover-rollback requested",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -278,7 +278,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostJobBranches::cutover_with_rollback",
         owner_state: "prior contour relaunched",
         event: "host.cutover-rollback restored",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -286,7 +286,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::cutover_generation",
         owner_state: "prior generation/registry/observations",
         event: "host.cutover-rollback reactivated",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -966,7 +966,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::cutover_generation (candidate arm)",
         owner_state: "candidate generation/registry",
         event: "propagated: candidate launch observed at start-manifest boundary",
-        caller: "none (cutover_generation unwired)",
+        caller: "HostComposition::cutover_generation_contour (#961 cutover dispatch)",
         test: "891/case-11",
     },
     HostLifecycleBoundary {
@@ -4736,7 +4736,6 @@ impl HostJobBranches {
     /// the prior approved contour fails.
     #[allow(
         clippy::too_many_arguments,
-        dead_code,
         reason = "candidate and rollback authority sets stay explicit to prevent cross-generation substitution"
     )]
     fn cutover_with_rollback(
@@ -8565,9 +8564,8 @@ impl HostComposition {
     /// cutover or rollback fails, or the registry cannot be persisted.
     #[cfg(windows)]
     #[allow(
-        clippy::too_many_lines,
         dead_code,
-        reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
+        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches the contour without one"
     )]
     fn cutover_generation(
         &mut self,
@@ -8587,9 +8585,6 @@ impl HostComposition {
                 "cutover pending generation does not match request".to_owned(),
             ));
         }
-        let prior = self.registry.active().cloned().ok_or_else(|| {
-            HostError::ProcessContour("no active generation to cut over".to_owned())
-        })?;
         let candidate = self
             .registry
             .generations()
@@ -8599,6 +8594,95 @@ impl HostComposition {
             .ok_or_else(|| {
                 HostError::ProcessContour("candidate generation is not approved".to_owned())
             })?;
+        self.cutover_generation_contour(
+            &candidate,
+            Some(&pending),
+            candidate_kernel,
+            candidate_store,
+            prior_kernel,
+            prior_store,
+        )?;
+        self.commit_pending_durable(&pending, &host_capability)?;
+        Ok(())
+    }
+
+    /// Records this contour's failure in the installer's staged pending
+    /// activation, when that activation exists.
+    ///
+    /// The staged pending activation is the recovery carrier for the
+    /// candidate-cutover failure arms and exists only for the installer-owned
+    /// activation that stages one. An installation cutover (#961) activates
+    /// through its own durable cutover-intent record and stages no installer
+    /// activation, so it dispatches the contour with `None` and this never
+    /// writes the installer's recovery record on its behalf: there is no
+    /// synthesized pending activation and no second recovery owner.
+    #[cfg(windows)]
+    fn persist_contour_pending_recovery(
+        &mut self,
+        pending: Option<&eliot_installation::PendingActivation>,
+        reason: &str,
+    ) -> Result<(), HostError> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        // The same live owner-lease capability the installer cutover captured
+        // before the launch; the lease is not mutated by the contour, so the
+        // value is identical.
+        let host_capability = self.owner_lease.activation_capability();
+        let registry_root = self.registry_host_root.clone();
+        persist_pending_recovery(
+            &registry_root,
+            &mut self.registry,
+            &host_capability,
+            pending,
+            reason,
+        )
+    }
+
+    /// Runs the ordered durable process contour of one approved-generation
+    /// cutover: resolve the prior generation and both child artifact sets,
+    /// launch the candidate beside the prior image, and on any rejection
+    /// restore and durably reactivate the prior contour before the rejection
+    /// is reported.
+    ///
+    /// This is the ordered sequence the installer cutover has always run, with
+    /// two owner decisions deliberately left to the caller that owns them: the
+    /// staged-pending-activation precondition and the trailing durable commit.
+    /// The #961 installation cutover dispatches this identical sequence from the
+    /// admitted cutover path once its own durable cutover intent is `Pending`,
+    /// so that path moves the live process contour and not only the registry
+    /// generation, under the same owner (A13.7 cutover is a governed
+    /// transition; I14.14 the old route never revives).
+    ///
+    /// `candidate` is the exact approved candidate generation the caller
+    /// resolved from its own owner readback, and the prior generation is read
+    /// here from this composition's approved-generation registry exactly as the
+    /// installer cutover always read it. `pending` is the installer's staged
+    /// activation, the recovery carrier for the failure arms below; see
+    /// [`Self::persist_contour_pending_recovery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either generation is invalid, the candidate
+    /// cannot be launched, or the prior contour cannot be restored and durably
+    /// reactivated.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
+    )]
+    fn cutover_generation_contour(
+        &mut self,
+        candidate: &eliot_installation::ApprovedGeneration,
+        pending: Option<&eliot_installation::PendingActivation>,
+        candidate_kernel: impl AsRef<Path>,
+        candidate_store: impl AsRef<Path>,
+        prior_kernel: impl AsRef<Path>,
+        prior_store: impl AsRef<Path>,
+    ) -> Result<(), HostError> {
+        let prior = self.registry.active().cloned().ok_or_else(|| {
+            HostError::ProcessContour("no active generation to cut over".to_owned())
+        })?;
         let (candidate_kernel_artifact, candidate_store_artifact) = candidate
             .manifest
             .host_child_artifact_digests()
@@ -8641,25 +8725,14 @@ impl HostComposition {
         let launch = match result {
             Ok(launch) => launch,
             Err(error) => {
-                let registry_root = self.registry_host_root.clone();
-                persist_pending_recovery(
-                    &registry_root,
-                    &mut self.registry,
-                    &host_capability,
-                    &pending,
-                    &error.to_string(),
-                )?;
+                self.persist_contour_pending_recovery(pending, &error.to_string())?;
                 return Err(error);
             }
         };
         if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
             let cleanup = self.cleanup_launched_contour(error);
-            let registry_root = self.registry_host_root.clone();
-            persist_pending_recovery(
-                &registry_root,
-                &mut self.registry,
-                &host_capability,
-                &pending,
+            self.persist_contour_pending_recovery(
+                pending,
                 "prior Kernel termination evidence failed",
             )?;
             return cleanup;
@@ -8686,13 +8759,7 @@ impl HostComposition {
                     "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
                 )));
             }
-            if let Err(error) = persist_pending_recovery(
-                &self.registry_host_root.clone(),
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                candidate_error,
-            ) {
+            if let Err(error) = self.persist_contour_pending_recovery(pending, candidate_error) {
                 return self.cleanup_active_kernel_contour(error, "rollback-registry-save-failed");
             }
             if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
@@ -8748,13 +8815,7 @@ impl HostComposition {
                 )));
             }
             let reason = candidate_error.to_string();
-            if let Err(error) = persist_pending_recovery(
-                &self.registry_host_root.clone(),
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                &reason,
-            ) {
+            if let Err(error) = self.persist_contour_pending_recovery(pending, &reason) {
                 return self.cleanup_active_kernel_contour(error, "rollback-registry-save-failed");
             }
             if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
@@ -8770,17 +8831,9 @@ impl HostComposition {
             let reason = error.to_string();
             let cleanup =
                 self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
-            let registry_root = self.registry_host_root.clone();
-            persist_pending_recovery(
-                &registry_root,
-                &mut self.registry,
-                &host_capability,
-                &pending,
-                &reason,
-            )?;
+            self.persist_contour_pending_recovery(pending, &reason)?;
             cleanup
         } else {
-            self.commit_pending_durable(&pending, &host_capability)?;
             Ok(())
         }
     }
