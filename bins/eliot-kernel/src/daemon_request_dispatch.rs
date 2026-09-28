@@ -6520,23 +6520,36 @@ impl KernelComposition {
         // 1. Store-side execution generation. `KernelStoreGateway::apply_reserved`
         //    ends in the Store's `ReservedWrite` wire operation. On the store
         //    side `SurrealStoreAdapter::apply_reserved_write`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:744`)
-        //    takes the `execution_handle()` `None` arm at `:749` and returns
+        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:780`)
+        //    takes the `execution_handle()` `None` arm at `:785` and returns
         //    `StoreError::UnknownOperation` before any provider I/O. The two
         //    methods that can install a generation,
         //    `SurrealStoreAdapter::install_concurrent_execution`
         //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:269`) and
         //    `install_serial_execution` (`:296`), have no non-test caller
         //    anywhere in the workspace; the only production construction path,
-        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs:310`),
-        //    builds the adapter at `:349` and never installs one. Routing live
+        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs`),
+        //    builds the adapter there and never installs one. Routing live
         //    writes through `apply_reserved` today would therefore refuse
         //    every production canonical write.
         // 2. Store-side capability advertisement. `CAPABILITY_RESERVED_WRITE`
         //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is mapped to the
         //    `ReservedWrite` operation at `wire.rs:353`, but is absent from the
         //    advertised `CAPABILITIES` array at `wire.rs:85`, so the handshake
-        //    never admits the capability this wire would select.
+        //    never admits the capability this wire would select. The Kernel
+        //    consumes that same static array on its own side: the session
+        //    hello it sends declares
+        //    `allowed_capabilities: CAPABILITIES`
+        //    (`crates/kernel/eliot-kernel-service/src/store_client.rs:1290`),
+        //    so a `ReservedWrite` request this Kernel submits would sit outside
+        //    the admitted set for the session even against a fully installed
+        //    Store generation. The honest dynamic advertisement already exists
+        //    on the adapter
+        //    (`SurrealStoreAdapter::reserved_write_capability`,
+        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:324`) and
+        //    correctly returns `None` until a concurrent generation owns the
+        //    adapter, but it has no non-test caller, so the Kernel can never
+        //    learn a reserved-write Store is present.
         // 3. No production source for the observed ordering-head digest.
         //    `ReservationSeed::heads` requires
         //    `ObservedHead::expected_head_digest`
@@ -6551,21 +6564,24 @@ impl KernelComposition {
         // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
         //    `RedbRecoveryStore::stage_and_reserve`, whose
         //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:26165`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2686`). This
-        //    composition opens its production ORS with `RedbRecoveryStore::open`
+        //    (`crates/kernel/eliot-ors/src/store.rs:27025`) fails closed while the
+        //    bound provider is `RejectUnboundEvidence` (`store.rs:2659`, whose
+        //    `verify_ordering_heads` returns `OrsError::CanonicalEvidence` at
+        //    `:2662`). This composition opens its production ORS with
+        //    `RedbRecoveryStore::open`
         //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), which binds that rejecting provider; the only
-        //    `open_with_evidence` (`store.rs:20970`) call site is the
-        //    `#[cfg(test)]` `new_with_adapters` at `composition_bootstrap.rs:997`.
-        //    So even a correct seed would be refused by ORS before it could
-        //    reserve. No production `CanonicalEvidenceProvider` implementation
-        //    exists: the only ones are in `eliot-ors` test support and test files.
+        //    `:355`), which binds that rejecting provider at `store.rs:20827`;
+        //    the only `open_with_evidence` (`store.rs:20837`) call site is the
+        //    `new_with_adapters` path at `composition_bootstrap.rs:1000`/`:1007`,
+        //    which production composition never takes. So even a correct seed
+        //    would be refused by ORS before it could reserve. No production
+        //    `CanonicalEvidenceProvider` implementation exists: the only ones are
+        //    `eliot_ors` test support and test files.
         //
-        // Facts 1-3 live in the storage/store-bridge owners, which is what this
-        // issue's `## Scope and owner` ("Kernel / ORS `redb` owner") excludes.
-        // Facts 3-4 are the write-side half of the Kernel's own gap and are not
-        // closed by this delivery either. Nothing here works around any of the
+        // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
+        // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
+        // excludes. Fact 3 is the write-side half of the Kernel's own gap and is
+        // not closed by this delivery either. Nothing here works around any of the
         // four, and there is no configuration switch, second route or
         // `attach_*` probe that manufactures one call.
         //
