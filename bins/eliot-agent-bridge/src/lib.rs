@@ -3528,13 +3528,14 @@ impl BridgeRunner {
         if self.expand_resource(view.handle()).ok()? != bytes {
             return None;
         }
-        // I7.24 disposition on the live path: observe the measured truncation
-        // flag so the delivered completeness is cited from real bytes, never
-        // estimated. Token-measured receipt projection and the
-        // complete-evidence gate still await a route-owner attestation and a
-        // production verifier consumer; until then the disposition is observed
-        // here and the evidence slot carries the preview+handle.
-        let _observed = Self::observed_hot_delivery(&view);
+        // I7.24 disposition rides the live path at frame-build time: both
+        // production doors cite `observed_hot_delivery` for the recorded view
+        // (private Invoke wire via `invocation_wire_result`, MCP door in the
+        // evidence envelope), so the delivered completeness is cited from
+        // real bytes, never estimated. Token-measured receipt projection and
+        // the complete-evidence gate still await a route-owner attestation
+        // and a production verifier consumer; until then the evidence slot
+        // carries the preview+handle.
         Some(view)
     }
     /// Notes the owner-supplied bootstrap context for this session.
