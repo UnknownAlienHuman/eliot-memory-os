@@ -329,10 +329,6 @@ const BRIDGE_OWNER_LIST_SEQUENCE_KEY: &str = "bridge_owner_list_sequence";
 const BRIDGE_RECOVERY_WINDOW_SEQUENCE_KEY: &str = "bridge_recovery_window_sequence";
 const BRIDGE_RECOVERY_SOURCE_REVISION_KEY_PREFIX: &str = "bridge_recovery_source_revision::";
 const BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY: &str = "bridge_recovery_legacy_unproven_v1";
-/// Committed-and-acknowledged bridge-event rows retained per stream for
-/// duplicate suppression. Compaction evicts only acked rows older than this
-/// window; cursors are never evicted.
-const RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM: u64 = 512;
 /// Stored phase of a durably staged bridge event. The stage entry is the
 /// durable relation, so staging always persists `DURABLE`; `RECEIVED` is the
 /// pre-stage transport fact answered without a row.
@@ -1384,13 +1380,19 @@ impl BridgeEventHandoffRow {
     }
 
     /// Reports whether the retained owner evidence permits retirement
-    /// (issue #2731). The persisted reconciliation tuple is supplied by the
-    /// producer and records only its presented consumed frontier and owner
-    /// snapshot. This row has no receiving-owner durable receipt or admitted
-    /// terminal disposition, so no persisted row is eligible for retirement.
-    /// Keep the payload, handoff, replay identity, and cursors pending until an
-    /// owner-issued terminal condition is represented by this contract.
-    fn retirement_eligible(&self, _acked_cursor: u64, _compacted_boundary: u64) -> bool {
+    /// (issue #2731). The row's reconcile tuple is producer-presented metadata,
+    /// not proof of receiving-owner durable acceptance or terminal disposition.
+    /// The current row contract has no receiver receipt, so reconciled rows
+    /// remain pending until that evidence is represented by this contract.
+    fn retirement_eligible(&self) -> bool {
+        if self.state != BRIDGE_EVENT_HANDOFF_RECONCILED
+            || self.owner_namespace.is_empty()
+            || self.sequence == 0
+        {
+            return false;
+        }
+        // Row state and identity checks do not prove receiving-owner custody.
+        // No receiver terminal evidence exists in this persisted contract.
         false
     }
 }
@@ -9546,17 +9548,14 @@ impl RedbRecoveryStore {
     }
 
     /// Advances the per-stream acked cursor monotonically, never past the
-    /// durable cursor, and compacts acknowledged rows past the retention
-    /// window in the same transaction.
+    /// durable cursor. A producer-presented acknowledgement does not authorize
+    /// payload or projection eviction; only an owner-issued terminal handoff
+    /// disposition can do that.
     ///
-    /// Only durable rows at or below the new acked frontier are eligible,
-    /// and only past `RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM` newest acked rows
-    /// per stream: staged-but-uncommitted rows, unacknowledged rows, the
-    /// retention window (duplicate-suppression frontier), and the cursor facts
-    /// themselves are never touched. Re-presentation of a compacted sequence
-    /// at or below the acked cursor answers from the cursor frontier as a
-    /// duplicate instead of minting a second logical event. Returns the cursor
-    /// outcome plus the pruned row count.
+    /// Durable rows and projections remain available to recovery and replay,
+    /// including rows with no handoff record. The legacy response retains its
+    /// `pruned` field and reports zero until receiver-owned terminal evidence is
+    /// available.
     pub fn acknowledge_bridge_events(
         &self,
         stream_id: &str,
@@ -9578,33 +9577,7 @@ impl RedbRecoveryStore {
             acked = sequence;
             Self::write_bridge_cursors_in(&write, stream_id, durable, acked)?;
         }
-        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
-        let mut pruned = 0_u64;
-        if floor > 0 {
-            let victims: Vec<String> = {
-                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-                let mut found = Vec::new();
-                for entry in records.iter().map_err(storage)? {
-                    let (key, value) = entry.map_err(storage)?;
-                    let row: BridgeEventRow = decode(value.value())?;
-                    row.validate()?;
-                    if row.stream_id == stream_id
-                        && row.sequence <= floor
-                        && row.phase == BRIDGE_EVENT_PHASE_DURABLE
-                    {
-                        found.push(key.value().to_owned());
-                    }
-                }
-                found
-            };
-            if !victims.is_empty() {
-                let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-                for victim in &victims {
-                    records.remove(victim.as_str()).map_err(storage)?;
-                    pruned += 1;
-                }
-            }
-        }
+        let pruned = 0_u64;
         write.commit().map_err(storage)?;
         Ok(json!({
             "stream_id": stream_id,
@@ -13929,8 +13902,10 @@ impl RedbRecoveryStore {
     /// principal and the requested sequence. The single write transaction
     /// first validates every item — shape, contradictory duplicates,
     /// stored binding, expected revision/incarnation, lineage/principal
-    /// equality, and phase/frontier — and only then advances the cursors
-    /// and compacts. Any failure aborts the transaction, so a foreign or
+    /// equality, and phase/frontier — and only then advances the cursors.
+    /// Producer acknowledgement does not compact retained payloads or
+    /// projections; those remain pending until receiver-owned terminal
+    /// evidence exists. Any failure aborts the transaction, so a foreign or
     /// stale item changes no batch cursor or retained payload. The commit
     /// is the last fallible operation: after it, only infallible JSON
     /// assembly remains, so a storage/response failure past the commit is
@@ -13987,14 +13962,8 @@ impl RedbRecoveryStore {
                     acked,
                 )?;
             }
-            let pruned = Self::compact_bridge_events_in_checked(
-                &write,
-                &access,
-                &owner.local_stream,
-                durable,
-                acked,
-            )?;
-            if acked > prior_acked || pruned > 0 {
+            let pruned = 0_u64;
+            if acked > prior_acked {
                 Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
             }
             outcomes.push(json!({
@@ -14081,12 +14050,10 @@ impl RedbRecoveryStore {
         Ok(parsed)
     }
 
-    /// Builds the retained replay commitment for one evicted payload row
-    /// (issues #2730 and #2731, item 4): the original admitted identity and
-    /// content commitment with its representation facts, so the admitted
-    /// identity and content commitment outlives payload eviction. Shared by
-    /// window-driven compaction and receipt-driven retirement, so both
-    /// eviction paths retain identical evidence.
+    /// Builds the retained replay commitment for one payload row eligible for
+    /// terminal handoff retirement (issues #2730 and #2731, item 4): the
+    /// original admitted identity and content commitment with its
+    /// representation facts, so those identities outlive payload eviction.
     fn bridge_replay_commitment_for(
         victim: &BridgeEventRow,
         now_ms: u64,
@@ -14115,101 +14082,6 @@ impl RedbRecoveryStore {
             compacted_at_ms: now_ms,
             acked_at_compaction: acked,
         }
-    }
-
-    /// Compacts acknowledged rows of one owner namespace past the
-    /// retention window inside the acknowledgement transaction (issue
-    /// #2729). Only durable rows at or below the acked frontier minus the
-    /// retained window are eligible; unacknowledged rows, the retention
-    /// window, and the cursor facts are never touched.
-    ///
-    /// Issue #2730 retains identity before evicting payload: every
-    /// compacted row first persists its original admitted commitment
-    /// (identity, original content commitment, representation facts) in
-    /// the same transaction, and the cursor's compacted boundary advances
-    /// to the highest compacted sequence with it. The ordered position
-    /// binding is never removed — one admitted position keeps naming its
-    /// one logical event. Exact replays afterwards answer from the
-    /// commitment with `fresh: false`; changed content under a committed
-    /// identity conflicts instead of committing.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "compaction keeps commitment retention, eviction, and boundary advance in one auditable step"
-    )]
-    fn compact_bridge_events_in_checked(
-        write: &redb::WriteTransaction,
-        access: &BridgeStreamAccess,
-        local_stream: &str,
-        durable: u64,
-        acked: u64,
-    ) -> Result<u64, OrsError> {
-        access.require(BridgeStreamRight::Acknowledge)?;
-        let now_ms = current_unix_ms_u64()?;
-        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
-        if floor == 0 {
-            return Ok(0);
-        }
-        let victims: Vec<BridgeEventRow> = {
-            let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            let mut found = Vec::new();
-            for entry in records.iter().map_err(storage)? {
-                let (_, value) = entry.map_err(storage)?;
-                let row: BridgeEventRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == access.namespace
-                    && row.sequence <= floor
-                    && row.phase == BRIDGE_EVENT_PHASE_DURABLE
-                {
-                    found.push(row);
-                }
-            }
-            found
-        };
-        if victims.is_empty() {
-            return Ok(0);
-        }
-        let mut pruned = 0_u64;
-        let mut compacted_boundary = 0_u64;
-        for victim in &victims {
-            let commitment = Self::bridge_replay_commitment_for(victim, now_ms, acked);
-            // A legacy-shaped row predating the privacy decision stores
-            // its verbatim bytes bound by the identity digest; its
-            // commitment is the admissible form, never a projection.
-            Self::write_bridge_commitment_in(write, &commitment)?;
-            compacted_boundary = compacted_boundary.max(victim.sequence);
-            pruned += 1;
-        }
-        {
-            let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for victim in &victims {
-                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
-                records.remove(key.as_str()).map_err(storage)?;
-            }
-        }
-        // The normalized projection is retired with its record (issue #1934):
-        // the retained commitment is the admissible representation of a
-        // compacted event, so a projection left behind under the same key would
-        // be a projection whose raw-or-redacted record no longer exists. Both
-        // removals commit in the transaction that writes the commitment and the
-        // compacted boundary.
-        {
-            let mut projections = write
-                .open_table(BRIDGE_EVENT_PROJECTIONS)
-                .map_err(storage)?;
-            for victim in &victims {
-                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
-                projections.remove(key.as_str()).map_err(storage)?;
-            }
-        }
-        Self::write_bridge_cursors_compacted_in(
-            write,
-            access,
-            local_stream,
-            durable,
-            acked,
-            compacted_boundary,
-        )?;
-        Ok(pruned)
     }
 
     /// Rebuilds the bridge position index and reconciles replay state
@@ -15300,8 +15172,6 @@ impl RedbRecoveryStore {
     fn bridge_retire_eligible_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
-        acked: u64,
-        compacted: u64,
     ) -> Result<Vec<(u64, String, BridgeEventHandoffRow)>, OrsError> {
         let prefix = format!("{}::", access.namespace);
         let mut eligible: Vec<(u64, String, BridgeEventHandoffRow)> = Vec::new();
@@ -15316,7 +15186,7 @@ impl RedbRecoveryStore {
             if row.owner_namespace != access.namespace {
                 continue;
             }
-            if row.retirement_eligible(acked, compacted) {
+            if row.retirement_eligible() {
                 eligible.push((row.sequence, key.value().to_owned(), row));
             }
         }
@@ -15360,7 +15230,7 @@ impl RedbRecoveryStore {
                 row.last_compacted_sequence,
             )
         });
-        let eligible = Self::bridge_retire_eligible_in(write, &access, acked, compacted)?;
+        let eligible = Self::bridge_retire_eligible_in(write, &access)?;
         if eligible.is_empty() {
             return Ok(json!({
                 "namespace": access.namespace,
@@ -15405,7 +15275,7 @@ impl RedbRecoveryStore {
             {
                 continue;
             }
-            if !row.retirement_eligible(acked, compacted) {
+            if !row.retirement_eligible() {
                 continue;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
