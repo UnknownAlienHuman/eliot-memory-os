@@ -303,6 +303,9 @@ pub(super) fn open_production_epoch(
     path: &Path,
     installation: PlatformHandle,
     profile: eliot_installation::InstallationProfile,
+    profile_selection: Option<
+        &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    >,
     pending: Option<&eliot_installation::PendingActivation>,
     active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
     store_recovery_fences: &[StoreRecoveryReopenFence],
@@ -319,10 +322,40 @@ pub(super) fn open_production_epoch(
 > {
     host_epoch_observe("host.epoch production open requested");
     let backend = match profile {
-        eliot_installation::InstallationProfile::SystemService => RedbJournalBackend::open_at(path),
+        eliot_installation::InstallationProfile::SystemService => {
+            if profile_selection.is_some() {
+                return Err(HostError::ProcessContour(
+                    "SystemService journal reopen cannot accept a current-user root receipt"
+                        .to_owned(),
+                ));
+            }
+            RedbJournalBackend::open_at(path)
+        }
         eliot_installation::InstallationProfile::UserMode
         | eliot_installation::InstallationProfile::PortableDev => {
-            RedbJournalBackend::open_user_owned_at(path)
+            let selection = profile_selection.ok_or_else(|| {
+                HostError::ProcessContour(
+                    "current-user journal reopen requires the descriptor-validated root receipt"
+                        .to_owned(),
+                )
+            })?;
+            let profile_matches_selection = matches!(
+                (profile, selection.profile),
+                (
+                    eliot_installation::InstallationProfile::UserMode,
+                    eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                ) | (
+                    eliot_installation::InstallationProfile::PortableDev,
+                    eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev
+                )
+            );
+            if !profile_matches_selection {
+                return Err(HostError::ProcessContour(
+                    "current-user journal root receipt does not match the selected profile"
+                        .to_owned(),
+                ));
+            }
+            RedbJournalBackend::open_user_owned_at(path, selection)
         }
     }
     .map_err(JournalError::Backend)?;
