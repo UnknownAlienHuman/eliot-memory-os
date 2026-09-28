@@ -97,13 +97,19 @@
 //!                             from `eliot-bootstrap`
 //!                             (`CurrentSystemEvidenceCompiler::compile`), and
 //!                             its `snapshot_sha256` verbatim;
-//! 3. install the pair       — `install_compatibility_decision(config_path,
-//!                             &record, &evidence_snapshot_bytes)`.
+//! 3. install the pair       — run the service binary with
+//!                             `ELIOT_STORE_SURREAL_COMPATIBILITY_CONFIG` (the
+//!                             Store launch config to bind to),
+//!                             `ELIOT_STORE_SURREAL_COMPATIBILITY_RECORD` (the
+//!                             owner-decided record) and
+//!                             `ELIOT_STORE_SURREAL_COMPATIBILITY_EVIDENCE` (the
+//!                             I0.5 snapshot document it cites); `main.rs`
+//!                             installs the pair and exits.
 //! ```
 //!
-//! Until the release owner calls that entry point, a normally installed Store
-//! resolves to [`CompatibilityVerdict::Maintenance`] — visible, queryable, and
-//! refusing every mutation, which is the fail-closed outcome, but not a writer.
+//! A launch that installs no decision resolves to
+//! [`CompatibilityVerdict::Maintenance`] — visible, queryable, and refusing
+//! every mutation, which is the fail-closed outcome, but not a writer.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
