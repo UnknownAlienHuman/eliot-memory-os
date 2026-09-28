@@ -1365,6 +1365,9 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
             // misreporting it as a journal limit or corrupt backup input.
             BackupError::UnexpectedRecoveryComponent(component)
         }
+        OrsError::BridgeRecoveryWindowCapacityExceeded => {
+            BackupError::UnexpectedRecoveryComponent("bridge recovery-window capacity pressure")
+        }
         OrsError::UnsupportedContractVersion(version) => BackupError::UnsupportedFormat(format!(
             "restore journal envelope contract version {version}"
         )),
