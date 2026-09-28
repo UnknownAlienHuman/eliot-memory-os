@@ -44,8 +44,10 @@
 use std::path::{Path, PathBuf};
 
 use eliot_notify::{
-    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
+    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, render_acknowledge_request,
+    resolve_notify_launch_inputs,
 };
+use eliot_platform::{NotificationRequest, PlatformHandle};
 
 /// Verified Notify launch inputs staged for one broker-bound grant.
 ///
@@ -115,6 +117,11 @@ pub enum BrokerNotifyError {
     /// The request does not name the canonical installed Notify image, so it
     /// cannot be admitted on the notify-specific launch path.
     NotNotifyImage,
+    /// A delivery-shaped notify request tried to carry standard-input bytes.
+    /// The delivery operation renders no request line of its own, so a payload
+    /// on it means some other operation's bytes reached this one, and the
+    /// acknowledgement is the only admitted request that carries bytes.
+    UnexpectedStdinPayload,
 }
 
 impl BrokerNotifyError {
@@ -128,6 +135,7 @@ impl BrokerNotifyError {
             Self::InvalidDeclaration => "BROKER_NOTIFY_INVALID_DECLARATION",
             Self::BindingRejected => "BROKER_NOTIFY_BINDING_REJECTED",
             Self::NotNotifyImage => "BROKER_NOTIFY_IMAGE_REQUIRED",
+            Self::UnexpectedStdinPayload => "BROKER_NOTIFY_UNEXPECTED_STDIN_PAYLOAD",
         }
     }
 }
@@ -367,6 +375,66 @@ pub fn request_names_notify_image(request: &eliot_user_broker_core::LaunchReques
         .file_name()
         .and_then(|name| name.to_str())
         == Some(NOTIFY_IMAGE_FILE_NAME)
+}
+
+/// One authenticated Human acknowledgement of one canonical notification.
+///
+/// This is the broker edge's typed input for the acknowledgement leg. It
+/// carries only what the acknowledged record already names plus the
+/// acknowledging principal as record data (I11.3:13, "Any authorized role …
+/// acknowledge notifications"). It mints no authority: the transition itself is
+/// applied and re-validated on the admitted Kernel route inside the spawned
+/// adapter, and the acknowledgement deliberately leaves the record unresolved
+/// (I11.7:5).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyAcknowledge {
+    /// The notification record being acknowledged. The adapter resolves its
+    /// canonical store binding from this, so it is the same request the
+    /// delivery leg was issued against.
+    pub parent: NotificationRequest,
+    /// The exact canonical notification handle recorded on that request.
+    pub notification_id: PlatformHandle,
+    /// The acknowledging role identity, recorded as record data.
+    pub principal: String,
+}
+
+/// Renders the exact one-shot standard-input line for one acknowledged
+/// notification.
+///
+/// This is the composition half of I11.6:7 ("canonical notification → User
+/// Broker → native toast → authenticated local UI"): the broker is the admitted
+/// spawner, so the broker composes the line the adapter serves. The rendering
+/// itself is [`eliot_notify::render_acknowledge_request`] — the adapter's own
+/// schema is the single wire vocabulary, and no second spelling of it is
+/// introduced here.
+///
+/// The trailing newline is the line-protocol frame the adapter's
+/// [`eliot_notify::parse_notify_stdin_request`] reader expects; the carriage in
+/// `SuspendedLaunchSpec::with_stdin` writes these bytes verbatim and then
+/// closes the sole parent writer, so the adapter reads this exact line and then
+/// observes deterministic EOF.
+///
+/// # Errors
+///
+/// Returns [`BrokerNotifyError::InvalidIdentity`] when the principal is blank
+/// (an acknowledgement with no actor is not a Human action), and
+/// [`BrokerNotifyError::InvalidDeclaration`] when the line cannot be rendered.
+/// Both are fail-closed stable codes; no payload material is echoed.
+pub fn render_notify_acknowledge_line(
+    acknowledgement: &NotifyAcknowledge,
+) -> Result<String, BrokerNotifyError> {
+    if acknowledgement.principal.trim().is_empty() {
+        return Err(BrokerNotifyError::InvalidIdentity);
+    }
+    let mut line = eliot_notify::render_acknowledge_request(
+        &acknowledgement.parent,
+        acknowledgement.notification_id.clone(),
+        &acknowledgement.principal,
+    )
+    .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
+    line.push('\n');
+    Ok(line)
 }
 
 /// Stages normal Notify launch inputs at the broker edge and RETAINS the
