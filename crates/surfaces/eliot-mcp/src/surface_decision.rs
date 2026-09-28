@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::{
     CANONICAL_DEFINITION_VERSION, EffectClass, OperationClass, SemanticRegistry,
-    ToolMethodIdentity, ToolSchema, canonical_tool_schemas, known_tool_profile,
+    ToolMethodIdentity, ToolSchema, canonical_tool_schemas, invalidation_on_profile_change,
+    known_tool_profile,
 };
 
 /// Maximum number of methods carried by one surface decision.
@@ -720,8 +721,11 @@ pub struct PermittedTaskSurface {
 ///
 /// Only visible and lazy-visible methods are admitted, and only when the
 /// generated descriptor still agrees with the live validated semantic-owner
-/// binding. Hidden, forbidden, and unavailable methods are withheld —
-/// omitted from the permitted subset, never warned about in prose.
+/// binding at the exact definition and profile versions the decision
+/// recorded. A semantic-profile version edit invalidates the entry before
+/// Material reuse: it is withheld, never advertised on stale semantics.
+/// Hidden, forbidden, and unavailable methods are withheld — omitted from
+/// the permitted subset, never warned about in prose.
 ///
 /// # Errors
 ///
@@ -744,11 +748,7 @@ pub fn derive_permitted_surface(
         match decision.disposition_of(name) {
             Some(disposition @ (SurfaceDisposition::Visible | SurfaceDisposition::LazyVisible)) => {
                 match live_descriptor_for(descriptors, entry) {
-                    Some(descriptor)
-                        if registry
-                            .resolve(name, &entry.method.definition_version)
-                            .is_ok() =>
-                    {
+                    Some(descriptor) if live_owner_matches_decision(registry, entry) => {
                         permitted.push(descriptor.clone());
                     }
                     _ => withheld.push(WithheldSurfaceMethod {
@@ -774,6 +774,24 @@ pub fn derive_permitted_surface(
         permitted,
         withheld,
     })
+}
+
+/// Whether the live semantic owner still agrees with the decision entry.
+///
+/// The definition binding must resolve, and the live profile version must
+/// equal the recorded one: any semantic-version edit invalidates the entry
+/// before Material reuse (I7.24).
+fn live_owner_matches_decision(
+    registry: &SemanticRegistry,
+    entry: &ConsideredSurfaceMethod,
+) -> bool {
+    let Ok(live) = registry.resolve(
+        entry.method.canonical_name.as_str(),
+        entry.method.definition_version.as_str(),
+    ) else {
+        return false;
+    };
+    invalidation_on_profile_change(&entry.profile_version, &live.profile_version).is_none()
 }
 
 fn live_descriptor_for<'a>(
