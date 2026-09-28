@@ -4379,11 +4379,23 @@ pub struct CandidateEvidence {
 /// `evidence_spans[].anchor` — and retains each unadmitted one under the same
 /// kinds. On the live path the record's locator is `"<route>#<receipt_handle>"`,
 /// where the route is a module generation and an executable digest and the
-/// receipt handle is a transport digest, so the live record presents no reference
-/// of these shapes and adds no diagnostic. Which records present them is the
-/// composition root's projection, not this boundary's; what this boundary decides
-/// is that such a reference is refused for evidentiary use *and* retained, rather
-/// than being neither.
+/// receipt handle is a transport digest. The locator carries a `:` and a scheme
+/// token, so the shared classifier reads it as a coordinate and the two coordinate
+/// surfaces keep their admitted-by-classification rule.
+///
+/// The receipt handle is the live record reference that is *not* a coordinate:
+/// the transport digest has no `:` and no scheme, so it classifies as an opaque
+/// handle, and it names a different artifact rather than a position inside this
+/// source. It is therefore judged against the manifest's handle lists like any
+/// other identity, which means a run whose manifest does not list that digest now
+/// produces an `ArtifactHandle` diagnostic on the `receipt_handle` surface and
+/// refuses the record. It did neither before: the receipt handle sat on the
+/// coordinate arm, where an opaque spelling was admitted unconditionally, so the
+/// reference was neither refused nor retained and a manifest admitting no
+/// artifact handle at all still yielded citable records. Which records present
+/// which references is the composition root's projection, not this boundary's;
+/// what this boundary decides is that such a reference is refused for evidentiary
+/// use *and* retained, rather than being neither.
 ///
 /// `AmbiguousReference` is reachable for a candidate that breaks the shared
 /// classifier's own grammar — a blank or oversized spelling, a bare scheme
@@ -4424,7 +4436,15 @@ pub enum UnadmittedReferenceKind {
     /// there. A value can be listed in `url_handles` and still be unadmitted as a
     /// handle, and this kind is still the right one. The lever is in the reason.
     LocatorUrl,
-    /// An opaque handle the manifest does not list.
+    /// An opaque handle the manifest does not list, presented as a candidate
+    /// handle or on an identity surface a record presents.
+    ///
+    /// The record surfaces are the citation edge and the receipt handle, both of
+    /// which the manifest must list, so this kind is the right one for either. The
+    /// receipt handle is the live case worth naming: the composition root writes a
+    /// bare transport digest into `candidate.receipt_handle`, a spelling with no
+    /// `:` and no scheme, so it classifies as an opaque handle and is reported
+    /// here when the manifest does not list it.
     ArtifactHandle,
     /// A reference a named owner mints internally — a canonical `eliot://`
     /// resource identity, or a `provider-artifact:<sha256>` content handle —
@@ -5641,6 +5661,17 @@ fn assess_sources(
 /// its own: it is the same `manifest.allows` call, reached through
 /// [`crate::source_admissibility::admits_record_reference`], so the two agree by
 /// construction rather than by review.
+///
+/// The two arms are **siblings over one loop, not one arm and its tail.** Each
+/// candidate is judged for its own handle and for every reference its record
+/// presents, and each unadmitted reference produces its own diagnostic whether or
+/// not the handle beside it was admitted. Nesting the record arm inside the
+/// handle arm — so that an admitted handle `continue`d past it — made the record
+/// references unreachable for exactly the records A1 is about: one whose source
+/// identity the manifest *does* declare while its artifact handle is absent.
+/// Refusing is `decide`'s job and it was already correct; retention was the half
+/// that silently dropped the text, which is why "neither refused nor retained" is
+/// the defect and not merely an unhelpful diagnostic.
 fn reference_firewall(
     observation: &InquiryObservation,
     records: &[SourceAdmissibilityRecord],
@@ -5661,106 +5692,115 @@ fn reference_firewall(
             surface: RecordReferenceSurface::CandidateHandle,
             reference: candidate.handle.clone(),
         };
-        if admits_record_reference(&presented, manifest) {
-            continue;
-        }
-        let (kind, reason): (UnadmittedReferenceKind, String) = if manifest
-            .stale_or_revoked_handles
-            .iter()
-            .any(|stale| stale == &candidate.handle)
-        {
-            // Revocation is applied after membership and on every call, so this
-            // verdict survives a handle-list entry too. The reason says that, or
-            // a reader adds the handle to a list, the diagnostic recurs, and the
-            // firewall looks broken.
-            (
-                UnadmittedReferenceKind::StaleOrRevoked,
-                "the run-bound manifest lists this reference as stale or revoked, and revocation \
-                 applies after membership, so a handle entry alone does not readmit it"
-                    .to_owned(),
-            )
-        } else {
-            // Admitted references already left the loop above, so every
-            // reference reaching here is unadmitted and the only question left
-            // is which identity it presents as. The admission decision itself was
-            // taken by `admits_record_reference`, not here, which is why this arm
-            // no longer re-tests it.
-            if let Some(shape) = line_span_shape(&candidate.handle) {
-                (UnadmittedReferenceKind::LineSpan, line_span_reason(shape))
+        if !admits_record_reference(&presented, manifest) {
+            let (kind, reason): (UnadmittedReferenceKind, String) = if manifest
+                .stale_or_revoked_handles
+                .iter()
+                .any(|stale| stale == &candidate.handle)
+            {
+                // Revocation is applied after membership and on every call, so this
+                // verdict survives a handle-list entry too. The reason says that, or
+                // a reader adds the handle to a list, the diagnostic recurs, and the
+                // firewall looks broken.
+                (
+                    UnadmittedReferenceKind::StaleOrRevoked,
+                    "the run-bound manifest lists this reference as stale or revoked, and revocation \
+                     applies after membership, so a handle entry alone does not readmit it"
+                        .to_owned(),
+                )
             } else {
-                // Every reason below names the one thing that can change this
-                // verdict, and the arm it names is one this path actually reads.
-                // This path tests `manifest.allows` and nothing else:
-                // `AllowedReferenceManifest::allows` reads `source_handles`,
-                // `evidence_handles` and `artifact_handles`, so the handle allowlist
-                // is the only lever here. `url_handles` belongs to the separate
-                // `admits_url` predicate, which is the delivered-locator path in
-                // `eliot_research_exchange_api` and is never called from this
-                // function — so a reason that told a reader to add the value to
-                // `url_handles` would name a list that cannot admit it and the
-                // diagnostic would recur forever.
-                match classify_locator(&candidate.handle) {
-                // The spelling presents as an absolute locator, and the lever is
-                // still the handle allowlist: a candidate handle is a reference
-                // identity, not a `SourceSnapshot::locator`, so it is admitted by
-                // `allows` or by nothing. Saying so is the whole point — naming
-                // `url_handles` here would send the reader to the wrong list.
-                LocatorClass::ExternalUri { .. } => (
-                    UnadmittedReferenceKind::LocatorUrl,
-                    "this reference presents as an absolute locator URL; a candidate handle is \
-                     admitted only by the manifest's source, evidence and artifact handles, and \
-                     url_handles is not consulted on this path"
-                        .to_owned(),
-                ),
-                // An internally owned reference is still just a handle identity:
-                // being internal is not admission, so the lever is the same
-                // handle allowlist.
-                LocatorClass::InternalUri { .. } => (
-                    UnadmittedReferenceKind::InternalOwnedReference,
-                    "this reference is an internally owned handle; admission is a source, evidence \
-                     or artifact handle entry, and being internal is not admission"
-                        .to_owned(),
-                ),
-                LocatorClass::OpaqueHandle => (
-                    UnadmittedReferenceKind::ArtifactHandle,
-                    "the run-bound manifest does not admit this reference handle in its source, \
-                     evidence or artifact handles"
-                        .to_owned(),
-                ),
-                // A spelling the classifier cannot read. The lever is STILL the
-                // handle allowlist, and this is the arm where that is easiest to
-                // get wrong: `classify_locator` plays no part in the admission
-                // decision above — it only chose this kind and this string. A
-                // manifest handle entry for this exact text removes the
-                // diagnostic, exactly as it does for every other arm, so the
-                // reason says so rather than claiming no list can help. What no
-                // entry can do is make the *text* classifiable: that is a
-                // property of the spelling, and the reason names the rule that
-                // failed so a reader knows which one to fix.
-                LocatorClass::MalformedOrAmbiguous { reason } => (
-                    UnadmittedReferenceKind::AmbiguousReference,
-                    format!(
-                        "this reference is not a classifiable locator: {}; a source, evidence or \
-                         artifact handle entry admits it like any other candidate, but no entry \
-                         can make the text itself classifiable",
-                        reason.wire_name()
+                // Admitted references already left the loop above, so every
+                // reference reaching here is unadmitted and the only question left
+                // is which identity it presents as. The admission decision itself was
+                // taken by `admits_record_reference`, not here, which is why this arm
+                // no longer re-tests it.
+                if let Some(shape) = line_span_shape(&candidate.handle) {
+                    (UnadmittedReferenceKind::LineSpan, line_span_reason(shape))
+                } else {
+                    // Every reason below names the one thing that can change this
+                    // verdict, and the arm it names is one this path actually reads.
+                    // This path tests `manifest.allows` and nothing else:
+                    // `AllowedReferenceManifest::allows` reads `source_handles`,
+                    // `evidence_handles` and `artifact_handles`, so the handle allowlist
+                    // is the only lever here. `url_handles` belongs to the separate
+                    // `admits_url` predicate, which is the delivered-locator path in
+                    // `eliot_research_exchange_api` and is never called from this
+                    // function — so a reason that told a reader to add the value to
+                    // `url_handles` would name a list that cannot admit it and the
+                    // diagnostic would recur forever.
+                    match classify_locator(&candidate.handle) {
+                    // The spelling presents as an absolute locator, and the lever is
+                    // still the handle allowlist: a candidate handle is a reference
+                    // identity, not a `SourceSnapshot::locator`, so it is admitted by
+                    // `allows` or by nothing. Saying so is the whole point — naming
+                    // `url_handles` here would send the reader to the wrong list.
+                    LocatorClass::ExternalUri { .. } => (
+                        UnadmittedReferenceKind::LocatorUrl,
+                        "this reference presents as an absolute locator URL; a candidate handle is \
+                         admitted only by the manifest's source, evidence and artifact handles, and \
+                         url_handles is not consulted on this path"
+                            .to_owned(),
                     ),
-                ),
-            }
-            }
-        };
-        diagnostics.push(UnadmittedReference::observe(
-            &observation.inquiry_id,
-            &observation.evidence_set_id,
-            &candidate.handle,
-            kind,
-            &reason,
-            &manifest.state_fence,
-        )?);
+                    // An internally owned reference is still just a handle identity:
+                    // being internal is not admission, so the lever is the same
+                    // handle allowlist.
+                    LocatorClass::InternalUri { .. } => (
+                        UnadmittedReferenceKind::InternalOwnedReference,
+                        "this reference is an internally owned handle; admission is a source, evidence \
+                         or artifact handle entry, and being internal is not admission"
+                            .to_owned(),
+                    ),
+                    LocatorClass::OpaqueHandle => (
+                        UnadmittedReferenceKind::ArtifactHandle,
+                        "the run-bound manifest does not admit this reference handle in its source, \
+                         evidence or artifact handles"
+                            .to_owned(),
+                    ),
+                    // A spelling the classifier cannot read. The lever is STILL the
+                    // handle allowlist, and this is the arm where that is easiest to
+                    // get wrong: `classify_locator` plays no part in the admission
+                    // decision above — it only chose this kind and this string. A
+                    // manifest handle entry for this exact text removes the
+                    // diagnostic, exactly as it does for every other arm, so the
+                    // reason says so rather than claiming no list can help. What no
+                    // entry can do is make the *text* classifiable: that is a
+                    // property of the spelling, and the reason names the rule that
+                    // failed so a reader knows which one to fix.
+                    LocatorClass::MalformedOrAmbiguous { reason } => (
+                        UnadmittedReferenceKind::AmbiguousReference,
+                        format!(
+                            "this reference is not a classifiable locator: {}; a source, evidence or \
+                             artifact handle entry admits it like any other candidate, but no entry \
+                             can make the text itself classifiable",
+                            reason.wire_name()
+                        ),
+                    ),
+                }
+                }
+            };
+            diagnostics.push(UnadmittedReference::observe(
+                &observation.inquiry_id,
+                &observation.evidence_set_id,
+                &candidate.handle,
+                kind,
+                &reason,
+                &manifest.state_fence,
+            )?);
+        }
         // The references the record built from that candidate presents. This runs
-        // after the handle arm rather than inside it, so a retained handle and a
-        // retained locator are two diagnostics a reader can tell apart instead of
-        // one that has silently swallowed the other.
+        // for **every** candidate, not only for one whose own handle was
+        // unadmitted, and it is a sibling of the handle arm above rather than a
+        // continuation of it. Scoping it behind that arm's `continue` is what
+        // made the record's references unreachable whenever the handle was
+        // admitted — which is exactly the A1 case: a source identity the manifest
+        // declares while the record still presents an artifact handle it never
+        // declared. `decide` refuses such a record through
+        // `SourceAdmissibilityReason::ReferenceNotAdmitted`, but nothing else on
+        // this path retains the text, so the reference would be neither refused
+        // nor retained and an absent artifact handle would simply disappear.
+        // Running both arms per candidate also keeps a retained handle and a
+        // retained record reference two diagnostics a reader can tell apart,
+        // instead of one that has silently swallowed the other.
         diagnostics.extend(retain_record_references(
             observation,
             &admissibility.record,
@@ -5789,9 +5829,16 @@ fn reference_firewall(
 /// here is exactly the set the eligibility decision refused. A reason here names
 /// the lever that can change the verdict and, unlike the candidate-handle arm,
 /// names the *surface* it was found on: a URL on a locator is admitted by
-/// `url_handles`, a citation edge is admitted by the handle lists, and those are
-/// different lists for different surfaces, so a reason that named one where the
-/// other applies would send a reader to a list that cannot change the verdict.
+/// `url_handles`, a citation edge and a receipt handle are admitted by the
+/// handle lists, and those are different lists for different surfaces, so a
+/// reason that named one where the other applies would send a reader to a list
+/// that cannot change the verdict.
+///
+/// This runs for every candidate rather than only for one whose own handle was
+/// unadmitted. A record whose source identity the manifest declares but whose
+/// receipt handle it does not is refused by `decide` and must still be retained
+/// here, and the receipt handle is exactly that reference: a bare transport
+/// digest is opaque, so it is admitted by the handle lists and by nothing else.
 ///
 /// Each surface's kind is the same [`classify_locator`] projection the
 /// candidate-handle arm uses, with the line-range arm first for the same reason it
@@ -5857,10 +5904,12 @@ fn retain_record_references(
                     "is an internally owned identity, which is not a source identity and is \
                      admitted only by the manifest's source, evidence and artifact handles"
                 }
-                // An opaque handle reaches this arm on a citation edge only: on the
-                // three coordinate surfaces an opaque spelling carries no
-                // authority of its own and is admitted above, so naming the
-                // handle lists here is the correct lever and the only one.
+                // An opaque handle reaches this arm on an identity surface: on the
+                // two coordinate surfaces an opaque spelling carries no authority
+                // of its own and is admitted above, while a candidate handle, a
+                // citation edge and a receipt handle are all identities the
+                // manifest must list. Naming the handle lists here is therefore the
+                // correct lever on each of them and the only one.
                 LocatorClass::OpaqueHandle => {
                     "is an opaque handle, and an opaque handle is admitted only where it is a \
                      source identity the manifest lists in its source, evidence or artifact handles"

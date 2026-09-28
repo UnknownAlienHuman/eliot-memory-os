@@ -856,15 +856,31 @@ pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
 /// on top of it is this boundary's, and it differs by surface for the reason
 /// I21.7 gives for the same split at the delivered-bundle boundary:
 ///
-/// - a **coordinate** ([`RecordReferenceSurface::Locator`],
-///   [`RecordReferenceSurface::ReceiptHandle`],
-///   [`RecordReferenceSurface::SpanAnchor`]) is a pointer into material the
+/// The rule is stated by *what the reference names*, not by how it is spelled,
+/// because spelling is not what grants authority:
+///
+/// - a **coordinate into an admitted source** ([`RecordReferenceSurface::Locator`],
+///   [`RecordReferenceSurface::SpanAnchor`]) names a position inside material the
 ///   handle gate already admitted, so an opaque or internally owned spelling
 ///   carries no authority of its own and is admitted; a spelling that presents as
 ///   an absolute external URL is authority-bearing and needs an exact
 ///   `url_handles` entry; a spelling the shared classifier cannot read is
 ///   admitted by nothing, because no entry can make unclassifiable text
 ///   classifiable.
+/// - a **receipt handle** ([`RecordReferenceSurface::ReceiptHandle`]) does
+///   **not** name a position: it names a *different artifact*, the retained
+///   raw-evidence material this record's custody rests on. It is therefore an
+///   artifact identity rather than a coordinate, and it is admitted by the source,
+///   evidence and artifact handle lists and by nothing else — never by
+///   classification. Grouping it with the two coordinates is what let an
+///   artifact handle absent from the manifest in every case: a transport digest
+///   such as the one the live composition root puts into
+///   `candidate.receipt_handle` carries no `:` and no scheme, so
+///   `classify_locator` returns [`LocatorClass::OpaqueHandle`], and the
+///   coordinate arm then returned `true` unconditionally — a manifest admitting no
+///   artifact handle at all still produced citable records. The exemption above
+///   rests on the reference naming a position *inside the admitted source*, and
+///   a receipt handle does not, so it does not apply here.
 /// - a **citation edge**
 ///   ([`RecordReferenceSurface::CitationEdge`]) is a source identity, not a
 ///   pointer, so it is admitted only by the source, evidence and artifact handle
@@ -889,24 +905,32 @@ pub fn admits_record_reference(
     presented: &PresentedReference,
     manifest: &AllowedReferenceManifest,
 ) -> bool {
-    // A candidate handle and a citation edge are both *identities* and are
-    // therefore admitted by the handle lists whatever their spelling is, and a
-    // coordinate is admitted by the shared classification instead. Identity
-    // before classification is deliberate and load-bearing: a URL-shaped handle
-    // must not be able to reach `url_handles`, because
-    // `AllowedReferenceManifest::allows` is documented never to make a URL an
-    // allowed source, and classifying first would do exactly that.
+    // A candidate handle, a citation edge and a receipt handle are all
+    // *identities* and are therefore admitted by the handle lists whatever their
+    // spelling is, and only a coordinate is admitted by the shared
+    // classification instead. Identity before classification is deliberate and
+    // load-bearing: a URL-shaped handle must not be able to reach `url_handles`,
+    // because `AllowedReferenceManifest::allows` is documented never to make a URL
+    // an allowed source, and classifying first would do exactly that.
+    //
+    // The receipt handle joins the identity arms and not the coordinate arm
+    // because it names a different artifact rather than a position inside the
+    // admitted source. Reading it as a coordinate is what admitted an artifact
+    // handle the manifest never declared: the transport digest the live
+    // composition root writes into `candidate.receipt_handle` has no `:`, so
+    // `classify_locator` returned `OpaqueHandle` and the coordinate arm answered
+    // `true` for any such spelling, in every manifest, admitted or not.
     match presented.surface {
-        RecordReferenceSurface::CandidateHandle | RecordReferenceSurface::CitationEdge => {
-            manifest.allows(&presented.reference)
+        RecordReferenceSurface::CandidateHandle
+        | RecordReferenceSurface::CitationEdge
+        | RecordReferenceSurface::ReceiptHandle => manifest.allows(&presented.reference),
+        RecordReferenceSurface::Locator | RecordReferenceSurface::SpanAnchor => {
+            match classify_locator(&presented.reference) {
+                LocatorClass::ExternalUri { .. } => manifest.admits_url(&presented.reference),
+                LocatorClass::InternalUri { .. } | LocatorClass::OpaqueHandle => true,
+                LocatorClass::MalformedOrAmbiguous { .. } => false,
+            }
         }
-        RecordReferenceSurface::Locator
-        | RecordReferenceSurface::ReceiptHandle
-        | RecordReferenceSurface::SpanAnchor => match classify_locator(&presented.reference) {
-            LocatorClass::ExternalUri { .. } => manifest.admits_url(&presented.reference),
-            LocatorClass::InternalUri { .. } | LocatorClass::OpaqueHandle => true,
-            LocatorClass::MalformedOrAmbiguous { .. } => false,
-        },
     }
 }
 
