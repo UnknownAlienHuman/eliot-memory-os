@@ -2182,29 +2182,72 @@ fn check_operational_continuation(
     Ok(())
 }
 
+/// Requires the page that follows `page` to have been read under the boundary `page`
+/// actually reached (issue #2967, W6/A2).
+///
+/// The arm is chosen by what `page` OWES, not by how many rows it happened to emit,
+/// and the two are not the same question:
+///
+/// - `page` declares a next cursor, so the walk is still OPEN. The successor must
+///   present exactly that cursor, and its refusal is the truncation refusal.
+/// - `page` declares none, so the walk is EXHAUSTED — and "declares none" is a proof
+///   of that, not an assumption: [`check_operational_continuation`]'s `None` arm has
+///   already established `walked == identity.operational_row_count`. There is no
+///   outstanding operational cursor to present, the pages that follow exist only to
+///   carry the family axes, and this is the "only the family continuation" state that
+///   `next_operational_cursor`'s own documentation names ("a snapshot may carry both,
+///   either, or neither"). It is the one of the four states the chain used to reject,
+///   and refusing it is what made the store's own family-only multi-page output
+///   unvalidatable.
+///
+/// The exhausted arm is NOT "no requirement", and that is the point of the split. The
+/// successor must still present the walk's real TAIL, never its start, and the two
+/// differ exactly when the walk finished early: a start cursor is what the previous
+/// incarnation of the exporter carried, and it re-read the frozen lower bound and
+/// re-emitted every operational row the snapshot had already exported. The chain is
+/// therefore the only structural defence against that, because
+/// [`check_observed_members`] — which refuses a member observed twice — runs on the
+/// `Complete` arm only, so on a `Partial` snapshot nothing else would. The tail is
+/// checked on the two bounds a pure validator can re-derive from the pages themselves;
+/// the durable key and the prefix commitment stay out of scope for the same reason they
+/// are out of scope in [`check_operational_pages`], and are proved at the read boundary
+/// instead.
+fn check_operational_successor(
+    tail: &OperationalPageTail,
+    continuation: &OrsOperationalContinuation,
+    next_page: &OrsBackupPage,
+) -> Result<(), OrsError> {
+    let successor = &next_page.operational_continuation.cursor;
+    if let Some(next) = &continuation.next {
+        if next != successor {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "the next page did not continue from this page's exact emitted operational tail",
+            });
+        }
+    } else if successor.emitted_rows != tail.walked || successor.after_order != tail.last_order {
+        return Err(OrsError::InvalidField {
+            field: "backup_operational_continuation",
+            reason: "a page after the exhausted operational walk did not resume from the walk's exact tail",
+        });
+    }
+    Ok(())
+}
+
 /// Proves cross-page operational continuity independently of the family axes
 /// (issue #2967, A11/A12).
 ///
 /// Every page is checked against the SAME frozen identity, and the pages must form
 /// ONE exact chain:
 ///
-/// - A page that EMITTED operational rows must be continued by the next page from its
-///   exact emitted tail, `pages[i].operational_continuation.next ==
-///   pages[i + 1].operational_continuation.cursor`. This single rule is what makes
-///   duplication and skipping structurally impossible rather than merely unlikely:
-///   page N+1 cannot re-read anything page N emitted, and cannot start anywhere other
-///   than where page N actually stopped, because the boundary it must present IS page
-///   N's emitted tail.
-/// - A page that emitted NO operational row imposes no such requirement, and that is
-///   the second arm rather than an omission. It has no emitted tail for a successor to
-///   present, `check_operational_continuation` has already proved that a page emitting
-///   no row cannot declare a next cursor, and that helper's `None` arm has already
-///   proved `walked == identity.operational_row_count` — so the walk is EXHAUSTED, and
-///   the pages that follow exist to carry the family axes. Refusing that shape is what
-///   made the store's own family-only multi-page output unvalidatable: it is the
-///   "only the family continuation" state that `next_operational_cursor`'s own
-///   documentation names ("a snapshot may carry both, either, or neither"), and it is
-///   the only one of the four states that the page chain used to reject.
+/// - Every page is bound to the page that follows it by
+///   [`check_operational_successor`], which is what makes duplication and skipping
+///   structurally impossible rather than merely unlikely: page N+1 cannot re-read
+///   anything page N emitted, and cannot start anywhere other than where page N
+///   actually stopped, because the boundary it must present IS page N's emitted tail.
+///   It has two arms because a page that owes no continuation has no `next` to compare
+///   against and is not thereby exempt — see that function for the exhausted arm and
+///   why the tail is still required there.
 /// - The first page starts the walk: its in-force cursor must have emitted nothing.
 ///   A chain that is exact from page 1 onward can still under-report coverage if
 ///   page 0 opens in the middle, which is the same defect as a stride window with a
@@ -2254,14 +2297,8 @@ fn check_operational_pages(
         }
         let tail = measure_operational_tail(page, identity)?;
         check_operational_continuation(continuation, &tail, identity)?;
-        if let Some(next_page) = pages.get(index + 1)
-            && tail.emitted > 0
-            && continuation.next.as_ref() != Some(&next_page.operational_continuation.cursor)
-        {
-            return Err(OrsError::InvalidField {
-                field: "backup_operational_continuation",
-                reason: "the next page did not continue from this page's exact emitted operational tail",
-            });
+        if let Some(next_page) = pages.get(index + 1) {
+            check_operational_successor(&tail, continuation, next_page)?;
         }
     }
     Ok(())

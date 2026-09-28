@@ -2900,6 +2900,26 @@ pub(super) fn export_page(
     Ok(page)
 }
 
+/// One page as it leaves the builder, plus the operational boundary the walk it
+/// just performed actually reached (issue #2967, W6/A2).
+///
+/// The page alone does not carry its own walk's end boundary, because a page's
+/// contract is what it OWES — an exhausted walk reports no next cursor — while the
+/// page LOOP needs the boundary a FOLLOWING page must be read under even when the
+/// walk is already finished and the following pages carry nothing but family rows.
+/// Those are two different questions with two different answers, and the one that
+/// must not be answered wrongly is the loop's: reading the next page under the
+/// walk's START instead of its TAIL re-emits every operational row the snapshot has
+/// already exported. The builder therefore returns both, and the single-page
+/// entrypoint ([`export_page`]) drops the boundary for the honest reason that a
+/// one-page export has no following page to be read under.
+struct ExportedPage {
+    /// The validated, digested page itself.
+    page: OrsBackupPage,
+    /// The operational walk's boundary after this page's rows, exhausted or not.
+    operational_tail: OrsOperationalCursor,
+}
+
 /// Builds one backup page under the caller's capture transaction (issue #953).
 ///
 /// Split out of [`export_page`] so the whole page loop of a snapshot can run
@@ -2924,27 +2944,7 @@ pub(super) fn export_page(
 /// [`MAX_BACKUP_BYTES`], so the transaction's lifetime is bounded work, not
 /// unbounded wait (A13.9: no unbounded wait may be held).
 ///
-/// One page as it leaves the builder, plus the operational boundary the walk it
-/// just performed actually reached (issue #2967, W6/A2).
-///
-/// The page alone does not carry its own walk's end boundary, because a page's
-/// contract is what it OWES — an exhausted walk reports no next cursor — while the
-/// page LOOP needs the boundary a FOLLOWING page must be read under even when the
-/// walk is already finished and the following pages carry nothing but family rows.
-/// Those are two different questions with two different answers, and the one that
-/// must not be answered wrongly is the loop's: reading the next page under the
-/// walk's START instead of its TAIL re-emits every operational row the snapshot has
-/// already exported. The builder therefore returns both, and the single-page
-/// entrypoint ([`export_page`]) drops the boundary for the honest reason that a
-/// one-page export has no following page to be read under.
-struct ExportedPage {
-    /// The validated, digested page itself.
-    page: OrsBackupPage,
-    /// The operational walk's boundary after this page's rows, exhausted or not.
-    operational_tail: OrsOperationalCursor,
-}
-
-/// The operational-history walk is the page's FIRST segment and is paged by its
+/// The operational-history walk is this page's FIRST segment and is paged by its
 /// own owner-issued cursor under its own frozen window (issue #2967). Neither
 /// cursor-paged family (#269 process-stream recovery, #1971 versioned artifacts)
 /// shares that cursor: their rows carry no canonical operation order, so each is
