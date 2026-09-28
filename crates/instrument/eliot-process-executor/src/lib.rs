@@ -2048,6 +2048,12 @@ impl WindowsProcessExecutor {
                 environment,
             )
             .map_err(unavailable)?;
+            let spec = match stdin_payload {
+                None => spec,
+                Some(payload) => {
+                    spec.with_stdin(payload.to_vec()).map_err(unavailable)?
+                }
+            };
             let active_limit = request
                 .resource_limits()
                 .max_descendants()
@@ -2741,7 +2747,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None)
+        self.start_inner(request, sink, None, None)
     }
 
     async fn inspect(

@@ -696,6 +696,28 @@ pub struct LaunchRequest {
     pub approved: ApprovedLaunch,
     pub observed_at: u64,
     pub lease_expires_at: u64,
+    /// Exact one-shot standard-input bytes this admitted launch hands the
+    /// child, if any.
+    ///
+    /// This is the launch's only input channel and it is what a per-user
+    /// one-shot adapter reads (I11.6:3, "Normal delivery is launched through
+    /// the authorized User Broker"). It is `None` for every launch that needs
+    /// no input, which is the previous behaviour exactly, and the field is
+    /// `#[serde(default)]` so an older wire shape still decodes without
+    /// inventing a second vocabulary.
+    ///
+    /// The bytes are NOT part of [`ApprovedLaunch`]: the approved launch is the
+    /// Kernel grant and stays Kernel-minted. They are part of THIS request
+    /// whole, so `digest(&request)` binds them into the permit, the durable
+    /// operation cursor, and the replay check - a replayed request with
+    /// different bytes is a `ReplayConflict`, not a second effect.
+    ///
+    /// What an admitted launch may put on its own standard input is decided by
+    /// that launch's owner, not here: the broker composes the
+    /// `eliot-notify.exe` acknowledgement line from typed fields and refuses
+    /// every other request shape that carries a payload.
+    #[serde(default)]
+    pub stdin_payload: Option<String>,
 }
 
 impl LaunchRequest {
