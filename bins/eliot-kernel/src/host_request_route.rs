@@ -5995,6 +5995,11 @@ impl KernelComposition {
                     }));
                 }
                 return Err(match error {
+                    OrsError::BridgeRecoveryCutCapacityExceeded => {
+                        TransportError::AttributedBackpressure(
+                            eliot_ipc::BACKPRESSURE_BRIDGE_RECOVERY_CUTS,
+                        )
+                    }
                     OrsError::BridgeRecoveryWindowCapacityExceeded => {
                         TransportError::AttributedBackpressure(
                             eliot_ipc::BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS,
