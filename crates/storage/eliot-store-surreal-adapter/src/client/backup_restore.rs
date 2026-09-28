@@ -238,13 +238,20 @@ IF array::len($placement_create ?? []) != 1 { THROW 'restore_placement_create_co
 /// transaction that applies the batch, so an expectation stored by an earlier
 /// call is never mistaken for a check: a destination head that does not carry
 /// the revision this operation was admitted against aborts the whole commit.
-const RESTORE_STATEMENT_REVISION_HEAD_GUARD: &str = "LET $restore_revision_guard{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($restore_revision_table, $restore_revision_key{i})); IF type::is_object($restore_revision_guard{i}) AND ($restore_revision_guard{i}.revision != $restore_expected_revision{i} OR $restore_revision_guard{i}.state_fence != $restore_expected_state_fence) { THROW 'restore_revision_head_changed'; };";
+///
+/// An absent head row is a moved head, not a passing check. The admitted
+/// expectation is non-zero by contract, so a destination that serves no such
+/// head has diverged from the expectation; the branch shape is the same
+/// present/absent discipline `crate::schema::TX_CANONICAL_OWNER` already uses
+/// for its own fenced CAS.
+const RESTORE_STATEMENT_REVISION_HEAD_GUARD: &str = "LET $restore_revision_guard{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($restore_revision_table, $restore_revision_key{i})); IF type::is_object($restore_revision_guard{i}) { IF $restore_revision_guard{i}.revision != $restore_expected_revision{i} OR $restore_revision_guard{i}.state_fence != $restore_expected_state_fence { THROW 'restore_revision_head_changed'; }; } ELSE { THROW 'restore_revision_head_changed'; };";
 
 /// Expected-ordering-head precondition of the apply transaction.
 ///
 /// `{i}` selects the binding index. Same discipline as the revision guard: the
-/// destination's own ordering head is compared inside the commit transaction.
-const RESTORE_STATEMENT_ORDERING_HEAD_GUARD: &str = "LET $restore_ordering_guard{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence } FROM ONLY type::record($restore_ordering_table, $restore_ordering_scope{i})); IF type::is_object($restore_ordering_guard{i}) AND ($restore_ordering_guard{i}.sequence != $restore_expected_sequence{i} OR $restore_ordering_guard{i}.state_fence != $restore_expected_state_fence) { THROW 'restore_ordering_head_changed'; };";
+/// destination's own ordering head is compared inside the commit transaction,
+/// and an absent head row aborts it too.
+const RESTORE_STATEMENT_ORDERING_HEAD_GUARD: &str = "LET $restore_ordering_guard{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence } FROM ONLY type::record($restore_ordering_table, $restore_ordering_scope{i})); IF type::is_object($restore_ordering_guard{i}) { IF $restore_ordering_guard{i}.sequence != $restore_expected_sequence{i} OR $restore_ordering_guard{i}.state_fence != $restore_expected_state_fence { THROW 'restore_ordering_head_changed'; }; } ELSE { THROW 'restore_ordering_head_changed'; };";
 
 /// Current-purge-obligation precondition of the apply transaction.
 ///
