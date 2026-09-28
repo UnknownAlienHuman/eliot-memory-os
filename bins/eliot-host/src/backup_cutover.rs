@@ -254,6 +254,25 @@ pub const CUTOVER_EVIDENCE_BOUND: usize = 16;
 /// loop (I14.21 — no blind duplicate).
 const CUTOVER_DISPOSITION_READ_ATTEMPTS: u8 = 3;
 
+/// Diagnostic operation token for the contour-reconcile retained-intent read.
+///
+/// [`observe_retained_cutover_disposition`] is not
+/// [`read_cutover_disposition`]: it reads the journal's own `pending_cutover`
+/// slot on the contour instead of an admitted request, so its records and its
+/// failed-read refusals carry this token. A failure on the contour is
+/// therefore never reported under the other function's `read_disposition`
+/// name, and the two reads stay distinguishable in the diagnostic stream.
+const RETAINED_CUTOVER_OP: &str = "contour_reconcile";
+
+/// Diagnostic operation token for the admitted-request disposition read.
+///
+/// This is the pre-existing token of [`read_cutover_disposition`] and of
+/// [`resolve_cutover_retirement`]'s caller; it is named here only so the
+/// failed-read refusal and the phase record that sit on either side of this
+/// read agree on one token, as they did when the string was written at both
+/// sites.
+const READ_DISPOSITION_OP: &str = "read_disposition";
+
 /// Canonical operation identity for one cutover (I5.27).
 ///
 /// Database idempotency (this identity, bound into the journaled retirement
@@ -1035,23 +1054,36 @@ pub enum CutoverError {
 // issue does not own, so the gap is stated here rather than papered over with
 // a fabricated request.
 //
-// What that gap does NOT justify is reporting `Prepared` from the journal slot
-// alone. The `CutoverIntentRecord` DOES retain this operation's installation,
-// cutover operation, canonical request digest, target generation and expected
-// predecessor, and the installation registry DOES retain the active
-// generation, so the two owners' `Pending` discriminator is reachable without
-// an admitted request. That read therefore loads the registry and brackets the
-// journal sample on both sides of the load with the same
+// What that gap does NOT justify is projecting a disposition from the journal
+// slot alone. The `CutoverIntentRecord` DOES retain this operation's
+// installation, cutover operation, canonical request digest, target generation
+// and expected predecessor, and the installation registry DOES retain the
+// active generation AND its own operation-bound activation receipt, so the two
+// owners' discriminators for an OUTSTANDING cutover are reachable without an
+// admitted request. That read therefore samples the journal's own
+// `pending_cutover` slot FIRST and returns without any registry work when that
+// slot is empty, and when the slot is occupied it loads the registry and
+// brackets the journal sample on both sides of the load with the same
 // `cutover_observation_unchanged` coherence check and the same
-// `CUTOVER_DISPOSITION_READ_ATTEMPTS` ceiling `read_cutover_disposition` uses,
-// and `retained_cutover_disposition` applies exactly the discriminator
-// `reconcile_cutover_outcome` applies to its own `Pending` arm: the active
-// generation must still be the intent's own durable `expected_predecessor` and
-// the pair must be `Coherent`, or the disposition stays `Unknown` with
-// `PredecessorNotActive` / `ConcurrentOwnerMovement` under the retained
-// intent's own operation identity. The two paths can therefore no longer
-// report different dispositions for the same durable state, and a journal-slot
-// read cannot claim "the effect has not been applied" from one owner.
+// `CUTOVER_DISPOSITION_READ_ATTEMPTS` ceiling `read_cutover_disposition` uses.
+// `retained_cutover_disposition` then applies the same arms, in the same
+// order, that `reconcile_cutover_outcome` applies to the same two owners: a
+// target that is active is `RetirementPending`/`RetirementOutstanding` when the
+// registry's receipt binds the flip to this operation and coherent, and
+// `Unknown`/`UnattributedActivation` (or `ConcurrentOwnerMovement` on a torn
+// pair) when it does not; otherwise a `Pending` intent is `Prepared` only when
+// the active generation is still the intent's own durable
+// `expected_predecessor` and the pair is `Coherent`. So a journal-slot read
+// cannot claim "the effect has not been applied" from one owner, and cannot
+// claim a flip nobody attributed to this operation either.
+//
+// What this does NOT close, stated rather than implied: the retirement evidence
+// `read_cutover_disposition` resolves is not reconstructible from this slot, so
+// a settled cutover the retirement owner has resolved is `Reconciled` on the
+// two-owner read model and only its recorded `Committed` word here, and the
+// two paths still describe that one state differently. That is a missing OWNER
+// INPUT, not a second reading of a state both paths can see; closing it needs
+// the resolved `EpochRetirement`, which the contour does not carry.
 //
 // Explicit no-event list: `is_exact_replay`/`check_replay_identity` (pure
 // predicates; the observed replay is recorded at the committed-intent return
@@ -1125,53 +1157,158 @@ fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
 /// rather than the spelling of a state variant.
 ///
 /// `Committed` and `Failed` are the journal owner's own recorded terminal
-/// words, so they are reported as recorded. A refusal never claims an effect,
-/// which is why a torn cross-store pair cannot contradict it — the same rule
+/// words, so they are reported as recorded whenever the registry does not
+/// contradict them. A refusal never claims an effect, which is why a torn
+/// cross-store pair cannot contradict it — the same rule
 /// `reconcile_cutover_outcome` applies when it still reports a refusal backed
-/// by this operation's own durable record.
+/// by this operation's own durable record. `Committed` is the owner's own
+/// recorded word too, but it is a WEAKER claim than a refusal: a durable
+/// `Committed` intent whose target is the active generation is exactly the
+/// common post-cutover state, and `reconcile_cutover_outcome` reports such an
+/// operation as `RetirementPending` + `RetirementOutstanding` — the activation
+/// committed once and the separately authorized retirement has not happened.
+/// Reporting the bare recorded word there would be the same durable state
+/// described two different ways, so the two target-active arms below outrank
+/// the recorded `Committed` word and apply first. A `Committed` intent whose
+/// target is NOT active keeps its recorded `Committed`, because nothing in
+/// that read establishes a settlement or an owed retirement, and a refusal
+/// never claims an effect.
 ///
-/// `Pending` is a claim that the effect has NOT been applied, so the journal
-/// slot alone cannot carry it. Exactly the discriminator
-/// `reconcile_cutover_outcome` applies to its own `Pending` arm is applied
-/// here, against the intent's OWN durable `expected_predecessor`: the
-/// registry's active generation must still be that exact predecessor AND the
-/// two owner observations must have been read as one coherent moment. Any
-/// other active generation — absent, the target's successor, or a third
-/// generation that is neither predecessor nor target — and any pair that did
-/// not settle are `Unknown` with the residual naming which, so a journal-slot
-/// read can no longer report `Prepared` for a state the full owner read model
-/// calls ambiguous, and the ambiguity is preserved rather than flattened into
-/// progress.
+/// # Arm order
 ///
-/// `Validated`, `Reconciled` and `RetirementPending` are still never inferred
-/// here: they remain conclusions only the full `reconcile_cutover_outcome`
-/// owner read model may reach, so this projection can never report a
-/// settlement or an owed retirement. `Unknown` is no longer impossible: it is
-/// what this projection reports when it DID read the registry and the two
-/// owners did not agree.
+/// The arms are ordered exactly as `reconcile_cutover_outcome` orders its own,
+/// because the two project the same two owners and the SAME durable state must
+/// not be described two ways:
+///
+/// 1. the target is active AND the registry's operation-bound receipt names
+///    this operation and target — `RetirementPending` +
+///    `RetirementOutstanding` when coherent, `Unknown` +
+///    `ConcurrentOwnerMovement` when torn;
+/// 2. the target is active with NO such binding — `Unknown` +
+///    `UnattributedActivation`, because a pointer alone attributes a flip to
+///    nobody (an installer commit, or another operation's cutover to the same
+///    target, produces the same pointer);
+/// 3. `Pending` with the predecessor still active — `Prepared` only when the
+///    pair is coherent;
+/// 4. the recorded `Committed` / `Failed` words.
+///
+/// Arms 1 and 2 must precede arm 3: a `Pending` intent whose target is
+/// already active is the `SettleCommitted` state (the registry's receipt proves
+/// the CAS committed while the journal's terminal record never became
+/// durable), and `reconcile_cutover_outcome` reports it through arm 1 at its
+/// own `:4026` — a `RetirementPending` — not through arm 3. Testing the
+/// predecessor condition first would report
+/// `Unknown` + `PredecessorNotActive` for that state, because the active
+/// generation is the target and not the expected predecessor.
+///
+/// Arm 2 is not gated on coherence because it is a NEGATIVE attribution: a
+/// pointer whose receipt does not name this operation is unattributable whether
+/// or not the pair settled, and a torn pair cannot manufacture the binding the
+/// arm is denying. Arm 1's torn case reports movement rather than falling
+/// through, because falling through would reach arm 2 and assert
+/// `UnattributedActivation` for a receipt whose binding the arm above just
+/// matched — an absence the same predicate contradicts.
+///
+/// `Pending` claims the effect has NOT been applied, so the journal slot alone
+/// cannot carry it: the registry's active generation must still be the intent's
+/// OWN durable `expected_predecessor` AND the two owner observations must have
+/// been read as one coherent moment. Any other active generation — absent, or
+/// a generation that is neither the intent's predecessor nor its target — and
+/// any pair that did not settle are `Unknown` with the residual naming which,
+/// so a journal-slot read cannot report `Prepared` for a state the full owner
+/// read model calls ambiguous.
+///
+/// `Validated` and `Reconciled` are still never inferred here: both are
+/// conclusions that require a durable `EpochRetirement` this journal slot does
+/// not carry, and they remain conclusions only the full
+/// `reconcile_cutover_outcome` owner read model may reach. `Unknown` is what
+/// this projection reports whenever it DID read the registry and the two
+/// owners did not agree, and it is the disposition this projection reaches for
+/// every state `reconcile_cutover_outcome` reports as `Unknown` on this same
+/// read.
+///
+/// What the two paths still do NOT cover is stated rather than implied.
+/// `reconcile_cutover_outcome` also reads the resolved retirement evidence this
+/// projection has no input for, and that evidence outranks every arm above it:
+/// a cutover whose retirement the journal owner has already resolved is
+/// `Reconciled` there, while this projection still reports the slot's own
+/// `Committed` word. That difference is a missing OWNER INPUT, not a second
+/// reading of a state both paths can see, and closing it needs the resolved
+/// `EpochRetirement` the contour does not carry.
 fn retained_cutover_disposition(
     intent: &CutoverIntentRecord,
+    committed_activation: Option<&CommittedCutoverActivation>,
     registry_active: Option<&PlatformHandle>,
     coherence: OwnerObservationCoherence,
 ) -> (CutoverDisposition, CutoverResidual) {
-    match intent.state {
-        CutoverIntentState::Pending => {
-            if registry_active != Some(&intent.expected_predecessor) {
+    if registry_active == Some(&intent.target_generation) {
+        // The exact same attribution rule `reconcile_cutover_outcome` applies
+        // at its own target-active arm, and the same predicate, so the two
+        // paths cannot disagree about WHO performed the flip. The operation
+        // identity here is the retained intent's OWN installation, cutover
+        // operation and canonical request digest — the original operation
+        // identity, built from the durable record rather than from a
+        // caller-presented request.
+        let operation = CutoverOperationIdentity {
+            installation: intent.installation.clone(),
+            operation_id: intent.cutover_operation.clone(),
+            request_digest: intent.request_digest.clone(),
+        };
+        if registry_activation_binds_this_operation(
+            committed_activation,
+            &operation,
+            &intent.target_generation,
+        ) {
+            if coherence == OwnerObservationCoherence::Coherent {
+                // The registry's own operation-bound receipt names this
+                // operation and target, so the activation committed exactly
+                // once. Retirement remains a separate explicitly authorized
+                // step that has not happened yet.
                 (
-                    CutoverDisposition::Unknown,
-                    CutoverResidual::PredecessorNotActive,
+                    CutoverDisposition::RetirementPending,
+                    CutoverResidual::RetirementOutstanding,
                 )
-            } else if coherence != OwnerObservationCoherence::Coherent {
+            } else {
+                // The binding matched, but the pair was torn. Falling through
+                // would report `UnattributedActivation` — which the predicate
+                // above just contradicted. The movement is reported instead, so
+                // no affirmative attribution is claimed from a torn read.
                 (
                     CutoverDisposition::Unknown,
                     CutoverResidual::ConcurrentOwnerMovement,
                 )
-            } else {
-                (CutoverDisposition::Prepared, CutoverResidual::None)
             }
+        } else {
+            // The target pointer is active but the registry's operation-bound
+            // receipt does not name this operation, so nothing binds that flip
+            // to this attempt: an installer commit, or another operation's
+            // cutover to the same target. A pointer alone attributes an
+            // activation to nobody.
+            (
+                CutoverDisposition::Unknown,
+                CutoverResidual::UnattributedActivation,
+            )
         }
-        CutoverIntentState::Committed => (CutoverDisposition::Committed, CutoverResidual::None),
-        CutoverIntentState::Failed => (CutoverDisposition::Failed, CutoverResidual::None),
+    } else {
+        match intent.state {
+            CutoverIntentState::Pending => {
+                if registry_active != Some(&intent.expected_predecessor) {
+                    (
+                        CutoverDisposition::Unknown,
+                        CutoverResidual::PredecessorNotActive,
+                    )
+                } else if coherence != OwnerObservationCoherence::Coherent {
+                    (
+                        CutoverDisposition::Unknown,
+                        CutoverResidual::ConcurrentOwnerMovement,
+                    )
+                } else {
+                    (CutoverDisposition::Prepared, CutoverResidual::None)
+                }
+            }
+            CutoverIntentState::Committed => (CutoverDisposition::Committed, CutoverResidual::None),
+            CutoverIntentState::Failed => (CutoverDisposition::Failed, CutoverResidual::None),
+        }
     }
 }
 
@@ -1180,63 +1317,100 @@ fn retained_cutover_disposition(
 /// contour reconcile (`HostComposition::reconcile_approved_contour`).
 ///
 /// Strictly a read-and-observe owner path: it appends nothing, mutates no
-/// registry, activates nothing, retires nothing, and resolves no cutover. The
-/// single `pending_cutover` slot is the journal owner's own projection; when
-/// the slot is empty there is no outstanding cutover and nothing is observed,
-/// so an installation that never had a cutover logs nothing. When a cutover IS
-/// outstanding, the disposition repeats the owners' recorded observation
-/// verbatim through [`cutover_disposition_token`] and the bounded evidence
-/// count is a number, never a handle, digest, or request identity.
+/// registry, activates nothing, retires nothing, and resolves no cutover.
 ///
-/// `Prepared` claims the effect has not been applied, so the journal slot alone
-/// cannot establish it: the installation registry's active generation is read
-/// and the pair is proven to be one moment through the SAME bounded
-/// cross-store recheck [`read_cutover_disposition`] uses
-/// ([`CUTOVER_DISPOSITION_READ_ATTEMPTS`] samples of
-/// [`cutover_observation_unchanged`]). This is the same owner read and the same
-/// coherence notion, not a second one: the registry projection is loaded
-/// through [`HostComposition::open_registry_store`] and its
-/// `active_generation()` is compared against the retained intent's own
-/// durable `expected_predecessor` by
-/// [`retained_cutover_disposition`], exactly as `reconcile_cutover_outcome`
-/// compares the same field against its request's. When the two owners do not
-/// agree, the disposition stays [`CutoverDisposition::Unknown`] under the
-/// retained intent's OWN operation identity — the durable record's
+/// # The journal slot is read BEFORE the registry
+///
+/// The single `pending_cutover` slot is the journal owner's own projection, and
+/// it is sampled first. An empty slot is the whole answer: there is no
+/// outstanding cutover and nothing to observe, so this returns `Ok(None)`
+/// without opening the registry at all. That ordering is what keeps an
+/// installation that never had a cutover free of ANY registry work on the
+/// contour — [`HostComposition::open_registry_store`] takes a short-lived
+/// EXCLUSIVE redb writer handle whose bounded contention retry can sleep for
+/// seconds, and paying that on every readiness contour tick for an
+/// installation that has no cutover would put a multi-second stall on the
+/// contour for a read whose answer is already known to be "nothing". The
+/// registry is therefore opened only when there is a retained intent to project
+/// against it.
+///
+/// The bracket is unchanged for the case that does have a cutover: the journal
+/// is still sampled on BOTH sides of the registry load and the two samples are
+/// still compared with the same [`cutover_observation_unchanged`] coherence
+/// check, so the reported pair still comes from one read. The early return
+/// removes registry work for an empty slot; it does not weaken the coherence
+/// proof for a non-empty one.
+///
+/// When a cutover IS outstanding, the disposition repeats the owners' recorded
+/// observation verbatim through [`cutover_disposition_token`] and the bounded
+/// evidence count is a number, never a handle, digest, or request identity.
+///
+/// The registry projection is read for BOTH axes the two-owner projection
+/// needs: the active generation, and the registry's own operation-bound
+/// activation receipt. The receipt is what attributes an active-generation flip
+/// to an operation rather than to an installer, so it is carried out of the
+/// same load and evaluated by the same
+/// [`registry_activation_binds_this_operation`] predicate
+/// `reconcile_cutover_outcome` uses — one registry read, one attribution rule,
+/// one coherence notion, no second load. This is the same owner read and the
+/// same discriminator `reconcile_cutover_outcome` applies to its own
+/// target-active and `Pending` arms, compared against the retained intent's own
+/// durable `target_generation` and `expected_predecessor`. When the two owners
+/// do not agree, the disposition stays [`CutoverDisposition::Unknown`] under
+/// the retained intent's OWN operation identity — the durable record's
 /// installation, cutover operation and canonical request digest, which is the
 /// original operation identity a caller needs to re-read this exact operation
 /// and must never be dropped because the outcome is ambiguous.
 ///
 /// A read that FAILS is an error, never a disposition: a missing registry
 /// file, a failed journal load or a pair that never settles is not progress.
+/// That error is reported under this function's own `op` token,
+/// `contour_reconcile`, which is the same token its
+/// [`observe_cutover_progress`] records already use, so a failure here is never
+/// filed under [`read_cutover_disposition`]'s `read_disposition` name.
 pub fn observe_retained_cutover_disposition(
     host: &HostComposition,
 ) -> Result<Option<CutoverOutcome>, HostError> {
     let mut attempt = 0_u8;
-    let (intent, registry_active, coherence) = loop {
+    let (intent, committed_activation, registry_active, coherence) = loop {
         attempt = attempt.saturating_add(1);
-        let first = host
-            .journal
-            .snapshot()
-            .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+        let first = host.journal.snapshot().map_err(|error| {
+            note_cutover_read_error(RETAINED_CUTOVER_OP, super::HostError::from(error))
+        })?;
+        // An empty slot settles the whole observation before any registry work.
+        // The check is on `first` and the reported intent is `second`'s, and the
+        // two are compared below, so a cutover that lands between these two
+        // reads is not missed: `first` was empty, so no projection is reported
+        // from a read that cannot have seen the record, and the NEXT contour
+        // tick reads the now-populated slot.
+        if first.pending_cutover.is_none() {
+            return Ok(None);
+        }
         let registry = host
             .open_registry_store()
-            .map_err(note_cutover_read_error)?
+            .map_err(|error| note_cutover_read_error(RETAINED_CUTOVER_OP, error))?
             .load()
             .map_err(|error| HostError::Platform(error.to_string()))
-            .map_err(note_cutover_read_error)?;
-        let second = host
-            .journal
-            .snapshot()
-            .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+            .map_err(|error| note_cutover_read_error(RETAINED_CUTOVER_OP, error))?;
+        let second = host.journal.snapshot().map_err(|error| {
+            note_cutover_read_error(RETAINED_CUTOVER_OP, super::HostError::from(error))
+        })?;
+        // Both registry axes are read from this ONE load, and both are owned
+        // copies of the projection: the short-lived writer handle is dropped at
+        // the end of this iteration exactly as every other registry caller
+        // drops it, and nothing is re-read to recover them.
+        let activation = registry.committed_cutover_activation().cloned();
+        let active = registry.active_generation().cloned();
         if cutover_observation_unchanged(&first, &second) {
             break (
                 second.pending_cutover,
-                registry.active_generation().cloned(),
+                activation,
+                active,
                 OwnerObservationCoherence::Coherent,
             );
         }
         observe_cutover_progress(
-            "contour_reconcile",
+            RETAINED_CUTOVER_OP,
             "retained_recheck",
             "owner_moved",
             backup_cutover_count(usize::from(attempt)),
@@ -1249,7 +1423,8 @@ pub fn observe_retained_cutover_disposition(
             // from one read.
             break (
                 second.pending_cutover,
-                registry.active_generation().cloned(),
+                activation,
+                active,
                 OwnerObservationCoherence::Moving,
             );
         }
@@ -1257,8 +1432,12 @@ pub fn observe_retained_cutover_disposition(
     let Some(intent) = intent.as_ref() else {
         return Ok(None);
     };
-    let (disposition, residual) =
-        retained_cutover_disposition(intent, registry_active.as_ref(), coherence);
+    let (disposition, residual) = retained_cutover_disposition(
+        intent,
+        committed_activation.as_ref(),
+        registry_active.as_ref(),
+        coherence,
+    );
     let outcome = CutoverOutcome {
         disposition,
         residual,
@@ -1276,7 +1455,7 @@ pub fn observe_retained_cutover_disposition(
         ]),
     };
     observe_cutover_progress(
-        "contour_reconcile",
+        RETAINED_CUTOVER_OP,
         "retained_intent",
         cutover_disposition_token(outcome.disposition),
         backup_cutover_count(outcome.evidence_refs.len()),
@@ -1328,12 +1507,19 @@ fn note_cutover_error(op: &'static str, error: CutoverError) -> CutoverError {
 /// Observes one failed owner read behind disposition projection, then hands
 /// the unchanged error back. The unowned [`HostError`] text is never logged:
 /// a failed read is an error, never a disposition.
-fn note_cutover_read_error(error: super::HostError) -> super::HostError {
+///
+/// `op` names the reading function that failed, so a failure is never filed
+/// under another function's name: `read_cutover_disposition` reads under
+/// `read_disposition` and [`observe_retained_cutover_disposition`] reads under
+/// [`RETAINED_CUTOVER_OP`]. Both are the same owner read, but they are
+/// different contours and the diagnostic has to be attributable to one of them.
+fn note_cutover_read_error(op: &'static str, error: super::HostError) -> super::HostError {
     backup_cutover_note_event_log_unavailable();
+    let op = crate::host_diagnostics::bound_field(op);
     tracing::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_refusal",
-        op = "read_disposition",
+        op = op.text(),
         category = "owner_read_failed",
         "host backup cutover disposition read failed"
     );
@@ -2686,24 +2872,22 @@ pub fn read_cutover_disposition(
     let mut attempt = 0_u8;
     let (snapshot, registry, retirement, coherence) = loop {
         attempt = attempt.saturating_add(1);
-        let first = host
-            .journal
-            .snapshot()
-            .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+        let first = host.journal.snapshot().map_err(|error| {
+            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
+        })?;
         let loaded = host
             .open_registry_store()
-            .map_err(note_cutover_read_error)?
+            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?
             .load()
             .map_err(|error| HostError::Platform(error.to_string()))
-            .map_err(note_cutover_read_error)?;
+            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?;
         // The cutover-relevant projection is the binding axis. The journal's
         // global sequence/last_checksum are deliberately NOT used: they advance
         // for every applied record of any kind, so they would report ordinary
         // Host traffic as owner movement.
-        let second = host
-            .journal
-            .snapshot()
-            .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+        let second = host.journal.snapshot().map_err(|error| {
+            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
+        })?;
         // The retirement is resolved by the SAME journal owner through a third
         // read, so it is bracketed on its far side too. Resolving it outside the
         // compared interval would let a record that landed after the second
@@ -2714,11 +2898,10 @@ pub fn read_cutover_disposition(
         // still current; the mapper therefore receives both journal-derived
         // inputs from one read.
         let retirement = resolve_cutover_retirement(host, &second, request, retirement_receipt)
-            .map_err(note_cutover_read_error)?;
-        let third = host
-            .journal
-            .snapshot()
-            .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?;
+        let third = host.journal.snapshot().map_err(|error| {
+            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
+        })?;
         if cutover_observation_unchanged(&first, &second)
             && cutover_observation_unchanged(&second, &third)
         {
@@ -2730,7 +2913,7 @@ pub fn read_cutover_disposition(
             );
         }
         observe_cutover_progress(
-            "read_disposition",
+            READ_DISPOSITION_OP,
             "recheck",
             "owner_moved",
             backup_cutover_count(usize::from(attempt)),

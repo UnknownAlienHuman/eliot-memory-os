@@ -9002,16 +9002,24 @@ impl HostComposition {
         // The corroboration lives in the projection, not here, and the value is
         // deliberately not consumed by this caller. The observed artifact is
         // the `observe_cutover_progress` record the projection emits, and that
-        // projection already resolves the disposition from BOTH owners: a
-        // retained `pending_cutover` reaches `Prepared` only when the
-        // installation registry's active generation is still the intent's own
-        // durable `expected_predecessor` and the cross-store pair read as one
-        // moment, mirroring `reconcile_cutover_outcome` exactly. A journal slot
-        // alone therefore cannot emit `Prepared` for a state the full owner
-        // read model calls ambiguous, so there is nothing downstream to correct
-        // — and a reader of the observed word sees the same state the two-owner
-        // path reports. Nothing here needs the returned outcome, and reading it
-        // would add a gate this contour does not have.
+        // projection resolves the disposition from BOTH owners on one
+        // coherence-bracketed read, applying the same arms in the same order
+        // `reconcile_cutover_outcome` applies to the same durable state: a
+        // retained intent whose target is the active generation is reported
+        // `RetirementPending` only when the registry's own operation-bound
+        // receipt names this operation, and `Unknown` otherwise; a retained
+        // `Pending` intent reaches `Prepared` only when the installation
+        // registry's active generation is still the intent's own durable
+        // `expected_predecessor` and the cross-store pair read as one moment.
+        // So a journal slot alone cannot emit `Prepared` for a state the full
+        // owner read model calls ambiguous, and cannot emit a settlement claim
+        // either — which is what "nothing downstream to correct" means here: no
+        // observed word overstates what its two owners proved. It does NOT mean
+        // the two paths are word-identical: the resolved retirement evidence is
+        // not an input to this read, so a cutover the retirement owner has
+        // already settled is `Reconciled` on the two-owner read model and only
+        // its recorded `Committed` word here. Nothing here needs the returned
+        // outcome, and reading it would add a gate this contour does not have.
         let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
