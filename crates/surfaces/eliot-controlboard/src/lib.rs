@@ -16,7 +16,7 @@
 //! admits only `eliot.packet`, `eliot.query` and the four Skill lifecycle
 //! names, so no `controlboard.read` pair is ever queued or claimed, and no
 //! producer presents that capability. Package presence is therefore **not** a
-//! live ControlBoard capability, and this crate is frozen: no board extension,
+//! live `ControlBoard` capability, and this crate is frozen: no board extension,
 //! owner bindings, authority, or currentness is added here. Full delete belongs
 //! to the eliotd lane, which owns the only production call sites.
 //!

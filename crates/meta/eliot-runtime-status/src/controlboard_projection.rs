@@ -25,7 +25,7 @@
 //! or manifests, and never widens them.
 //!
 //! Support and evidence vocabulary: the implementation-support and
-//! evidence-execution axes are **not** ControlBoard types. The contour carries
+//! evidence-execution axes are **not** `ControlBoard` types. The contour carries
 //! the #216 owner records verbatim — [`DomainCoverage`] for all five
 //! `EvidenceDomain` axes, [`CapabilitySupportRow`] for capability ownership, and
 //! the owner's own [`EvidenceExecutionStatus`] / [`SupportObservationState`] —
