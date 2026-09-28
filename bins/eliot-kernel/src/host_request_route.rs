@@ -63,7 +63,7 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
     OperationIdentity, OrsError, RedbRecoveryStore,
 };
@@ -2624,6 +2624,12 @@ impl KernelComposition {
             &body.result_digest,
         );
         let submitted_ok = self.audit_observe(submitted_draft).is_some();
+        // Issue #1853 W2: the executor-observed evidence travels INTO the
+        // authoritative completion, in the same owner transaction as the result
+        // it observes. Before this, `body.evidence` reached no ORS row, so a
+        // replayer reconciling an expired lease had no durable operation/effect
+        // evidence to reconcile against and could only re-execute.
+        let retained_evidence = retained_effect_evidence(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -2632,6 +2638,7 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained_evidence.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3525,6 +3532,9 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Issue #1853 W2: the executor-observed evidence is persisted with the
+        // completion, in the same owner transaction.
+        let retained_evidence = retained_effect_evidence(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -3533,6 +3543,7 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained_evidence.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3862,6 +3873,35 @@ fn host_request_identity_binding_records(
     ])
 }
 
+/// Projects the executor-observed evidence of one submitted result body into
+/// the ORS-owned durable effect/evidence reference (issue #1853 W2).
+///
+/// This is the only place the wire evidence is mapped into durable state, so
+/// the authority boundary has exactly one owner for the mapping and the
+/// completion legs cannot each invent their own shape. ORS re-checks the
+/// projected identity against the row it writes; this function only carries the
+/// observed values across the crate boundary, and it invents nothing — an
+/// absent slot stays `None` and a leg that observed nothing persists no
+/// evidence at all.
+fn retained_effect_evidence(
+    body: &HostRequestResultBody,
+) -> Result<Option<HostRequestEffectEvidence>, TransportError> {
+    let Some(evidence) = body.evidence.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(HostRequestEffectEvidence {
+        operation_id: OpaqueLabel::new(evidence.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?,
+        input_handle: evidence.input_handle.clone(),
+        output_handle: evidence.output_handle.clone(),
+        side_effects: evidence.side_effects.clone(),
+        actual_route: evidence.actual_route.clone(),
+        invoked_operation: evidence.invoked_operation.clone(),
+        adapter_identity: evidence.adapter_identity.clone(),
+        executor_identity: evidence.executor_identity.clone(),
+    }))
+}
+
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
@@ -3905,6 +3945,7 @@ pub(crate) fn requested_host_request_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
         commit_order: 0,
     })
 }
@@ -5412,6 +5453,7 @@ fn watchdog_intent_projection_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
         commit_order: 0,
     })
 }

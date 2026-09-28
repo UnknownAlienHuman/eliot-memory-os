@@ -1659,6 +1659,7 @@ impl KernelStoreGateway {
             &obligation.request_digest,
             &result_digest,
             &result_response,
+            None,
         )
         .map_err(|error| {
             unretained_answer_reason(
@@ -2034,6 +2035,7 @@ impl KernelStoreGateway {
             attempt: None,
             result_digest: None,
             result_response: None,
+            result_evidence: None,
             commit_order: 0,
         })
     }

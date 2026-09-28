@@ -5625,6 +5625,116 @@ impl HostRequestState {
     }
 }
 
+/// Executor-observed effect and evidence references retained with one
+/// host-request completion (issue #1853 W2).
+///
+/// Every value is opaque to ORS exactly like the rest of the host-request row:
+/// ORS stores the references the executing leg observed, never interprets a
+/// route, an executor, or a side effect, and never grants authority from them.
+///
+/// The three identity fields are what makes the reference BOUND rather than
+/// merely present. [`HostRequestEffectEvidence::validate`] compares the
+/// originally recorded values against the owning row — not against a freshly
+/// recomputed checksum of whatever the reader happens to hold — so evidence
+/// recorded for one operation can never be read back as proof about another:
+///
+/// * `operation_id` must be this row's own operation identity;
+/// * `input_handle` must be this row's `request_digest`, the admitted envelope
+///   digest the evidence observed as its immutable input;
+/// * `output_handle` must be this row's `result_digest`, the canonical result
+///   digest the evidence observed as its immutable output.
+///
+/// The observation slots are optional because a leg reports exactly what it
+/// observed; an absent slot stays absent and is never invented here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestEffectEvidence {
+    /// Exact `hostreq:<sha>` operation handle this evidence observes.
+    pub operation_id: OpaqueLabel,
+    /// Immutable input handle observed by the executor: the envelope digest.
+    pub input_handle: Option<String>,
+    /// Immutable output handle observed by the executor: the result digest.
+    pub output_handle: Option<String>,
+    /// Observed side-effect declaration, or the reference to the effect.
+    pub side_effects: Option<String>,
+    /// Actual route taken, as observed by the executor.
+    pub actual_route: Option<String>,
+    /// Invoked local-port operation.
+    pub invoked_operation: Option<String>,
+    /// Presenting transport adapter instance.
+    pub adapter_identity: Option<String>,
+    /// Executing-process identity.
+    pub executor_identity: Option<String>,
+}
+
+impl HostRequestEffectEvidence {
+    /// Binds this evidence to the one operation and result that own it.
+    ///
+    /// `operation_id`, `request_digest`, and `result_digest` are the values
+    /// read back from the durable row. Every comparison below uses the
+    /// originally recorded value on this struct; nothing is re-derived here,
+    /// so a reader that lost the original bytes cannot pass this check with a
+    /// fresh checksum over the wrong subject.
+    pub(crate) fn validate(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+    ) -> Result<(), OrsError> {
+        if self.operation_id != *operation_id {
+            return Err(OrsError::InvalidField {
+                field: "host_request_effect_evidence_operation_id",
+                reason: "retained evidence does not observe this operation",
+            });
+        }
+        if let Some(input_handle) = &self.input_handle {
+            validate_digest(input_handle, "host_request_effect_evidence_input_handle")?;
+            if input_handle != request_digest {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_effect_evidence_input_handle",
+                    reason: "retained input handle does not bind the admitted envelope digest",
+                });
+            }
+        }
+        if let Some(output_handle) = &self.output_handle {
+            validate_digest(output_handle, "host_request_effect_evidence_output_handle")?;
+            if output_handle != result_digest {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_effect_evidence_output_handle",
+                    reason: "retained output handle does not bind the retained result digest",
+                });
+            }
+        }
+        for (reference, field) in [
+            (
+                &self.side_effects,
+                "host_request_effect_evidence_side_effects",
+            ),
+            (
+                &self.actual_route,
+                "host_request_effect_evidence_actual_route",
+            ),
+            (
+                &self.invoked_operation,
+                "host_request_effect_evidence_invoked_operation",
+            ),
+            (
+                &self.adapter_identity,
+                "host_request_effect_evidence_adapter_identity",
+            ),
+            (
+                &self.executor_identity,
+                "host_request_effect_evidence_executor_identity",
+            ),
+        ] {
+            if let Some(reference) = reference {
+                validate_text(reference, field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Durable P-04 host-request operation record.
 ///
 /// Every identity is opaque to ORS: Session, task, scope, capability, fence,
@@ -5687,6 +5797,30 @@ pub struct HostRequestRecord {
     /// without adding a layering edge from durable state to the wire crate).
     #[serde(default)]
     pub result_response: Option<Value>,
+    /// Executor-observed effect and evidence references retained with the
+    /// completion (issue #1853 W2).
+    ///
+    /// Written atomically with [`Self::result_digest`] and
+    /// [`Self::result_response`] in the same owner transaction, so the durable
+    /// evidence for an operation is never separable from the result it
+    /// describes, and a replayer reads the original observation off the row
+    /// instead of re-executing the operation to find out what already
+    /// happened. Once written the field is never cleared or replaced: an
+    /// at-least-once replay of the same result cannot rewrite or erase it.
+    ///
+    /// Scope of the claim, stated exactly: `ResultReceived` is terminal in
+    /// [`HostRequestState::transition_to`], so a row that reaches `Unknown`
+    /// never carried a result and therefore never carried this field. An
+    /// unresolved operation retains its claimed attempt identity in
+    /// [`Self::attempt`] instead, and the honest disposition for it stays
+    /// unknown rather than becoming a clean observation.
+    ///
+    /// `None` for rows that carry no completion, and for stored rows written
+    /// before this field existed; absence means unknown, never clean, and is
+    /// re-checked against this row on every read by [`Self::validate`].
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_evidence: Option<HostRequestEffectEvidence>,
     /// Monotonic ORS order assigned atomically when the operation first
     /// reaches a terminal state. Zero while non-terminal.
     #[serde(default)]
@@ -5802,6 +5936,22 @@ impl HostRequestRecord {
                     reason: "result digest and body must be present together, only for received or terminal states",
                 });
             }
+        }
+        // Issue #1853 W2: retained evidence exists only for a row that carries
+        // the completion it observes, and it must bind THIS row. The check
+        // compares the originally recorded values, so evidence for another
+        // operation is refused on read rather than trusted. A pre-W2 completed
+        // row carries no evidence at all: that absence stays readable and stays
+        // unknown, and is never upgraded into a clean observation here.
+        if let Some(evidence) = &self.result_evidence {
+            let result_digest = self
+                .result_digest
+                .as_deref()
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_result_evidence",
+                    reason: "retained evidence must observe a retained result",
+                })?;
+            evidence.validate(&self.operation_id, &self.request_digest, result_digest)?;
         }
         if !self.state.is_terminal() && self.commit_order != 0 {
             return Err(OrsError::InvalidField {

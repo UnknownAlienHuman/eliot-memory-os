@@ -2796,7 +2796,13 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// `Submitted` → `ResultReceived`, or a direct legal edge such as
     /// `Unknown`/`Reconciling`/`Submitted`/`PossiblyEffected` →
     /// `ResultReceived`) and stores the exact bounded response JSON with its
-    /// digest. An exact replay (same digest and byte-identical body) returns
+    /// digest. `result_evidence` carries the executor-observed effect and
+    /// evidence references the executing leg submitted (issue #1853 W2); it is
+    /// stored in the SAME owner transaction as the result it observes and is
+    /// re-checked against this operation, this request digest, and this result
+    /// digest by [`crate::HostRequestRecord::validate`], so the durable
+    /// evidence can never drift from the completion it describes. An exact
+    /// replay (same digest and byte-identical body) returns
     /// the durable record unchanged without re-dispatch; a changed digest or
     /// body under the same identity fails as
     /// [`OrsError::HostRequestIdentityConflict`] and never overwrites the
@@ -2808,6 +2814,7 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
@@ -7825,6 +7832,10 @@ impl RedbRecoveryStore {
     /// fence is unchanged. A `Requested` operation cannot receive a result
     /// (it must be admitted first); terminal states without a result cannot
     /// gain one.
+    ///
+    /// Issue #1853 W2: the executor-observed evidence is written with the
+    /// result in the same transaction, so the operation/effect identity and its
+    /// evidence reference are never separable at the authority boundary.
     #[allow(
         clippy::too_many_lines,
         reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
@@ -7835,6 +7846,7 @@ impl RedbRecoveryStore {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
         let campaign_view = campaign_view_publication(result_response)?;
@@ -7938,6 +7950,14 @@ impl RedbRecoveryStore {
         next.state = crate::HostRequestState::ResultReceived;
         next.result_digest = Some(result_digest.to_owned());
         next.result_response = Some(result_response.clone());
+        // Issue #1853 W2: the retained evidence is written with the completion
+        // and is never replaced. A second submission of the SAME result — an
+        // at-least-once replay from a restarted daemon — cannot rewrite the
+        // observation the operation already recorded, and cannot erase it
+        // either: the first durable observation stands for the operation.
+        if next.result_evidence.is_none() {
+            next.result_evidence = result_evidence.cloned();
+        }
         if next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
@@ -24831,6 +24851,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         RedbRecoveryStore::persist_host_request_result(
             self,
@@ -24838,6 +24859,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             request_digest,
             result_digest,
             result_response,
+            result_evidence,
         )
     }
 
@@ -25404,12 +25426,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
         result_digest: &str,
         result_response: &serde_json::Value,
+        result_evidence: Option<&crate::HostRequestEffectEvidence>,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.persist_host_request_result(
             operation_id,
             request_digest,
             result_digest,
             result_response,
+            result_evidence,
         )
     }
 
@@ -26214,6 +26238,7 @@ mod host_request_result_tests {
             attempt: None,
             result_digest: None,
             result_response: None,
+            result_evidence: None,
             commit_order: 0,
         }
     }
@@ -26255,6 +26280,7 @@ mod host_request_result_tests {
                 &early_digest,
                 &"f".repeat(64),
                 &json!({"response": "early"}),
+                None,
             ),
             Err(OrsError::InvalidTransition)
         ));
@@ -26273,7 +26299,7 @@ mod host_request_result_tests {
         let result_digest =
             crate::model::sha256_hex(&serde_json::to_vec(&body).expect("test body must serialize"));
         let received = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None)?
             .expect("resulted record must load");
         assert_eq!(received.state, HostRequestState::ResultReceived);
         assert_eq!(
@@ -26285,14 +26311,14 @@ mod host_request_result_tests {
 
         // Exact replay returns the durable row unchanged: no duplicate dispatch.
         let replay = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None)?
             .expect("replay must load");
         assert_eq!(replay, received);
 
         // A changed payload digest or a forged body under the same identity is
         // rejected before any readback and never overwrites the durable row.
         assert!(matches!(
-            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body, None,),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
         assert!(matches!(
@@ -26301,6 +26327,7 @@ mod host_request_result_tests {
                 &digest,
                 &result_digest,
                 &json!({"forged": true}),
+                None,
             ),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
@@ -26362,7 +26389,7 @@ mod host_request_result_tests {
         // anything else stays a conflict.
         let body = json!({"completed": "legacy-body"});
         let completed = store
-            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .persist_host_request_result(&operation, &digest, &result_digest, &body, None)?
             .expect("exact-digest completion must store");
         assert_eq!(
             completed.result_digest.as_deref(),
@@ -26370,7 +26397,7 @@ mod host_request_result_tests {
         );
         assert_eq!(completed.result_response.as_ref(), Some(&body));
         assert!(matches!(
-            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body, None,),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
 
