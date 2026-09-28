@@ -2604,19 +2604,21 @@ impl DeliverySetChannel {
     }
 
     /// Runs the loop's own tracked cleanup of the stdout helper at a real
-    /// terminal edge: reap a finished helper, and fail closed when one is
-    /// still blocked. The second, deliberate call is the
-    /// process-level containment edge (issue #2785 A6) — the helper is not
-    /// reaped while running, and its unconfirmed frame is reported to the
-    /// process owner instead of being dropped as a clean stop. A stopped
-    /// stream (`emission_broken`) needs no reap, so a bounded emission
-    /// cannot fail twice for one delivery fault.
+    /// terminal edge: reap a helper that has finished, and fail closed when
+    /// one is still blocked.
+    ///
+    /// A still-blocked helper is the process-level containment edge (issue
+    /// #2785 A6): it is never reaped while running, and the result whose
+    /// emission it held is reported to the process owner as still unconfirmed
+    /// rather than dropped as a clean stop. That is exactly what
+    /// [`Self::reap_output_helper`] reports, so the single check below is the
+    /// whole edge — a helper that is still held is reported once, as
+    /// [`LoopError::OutputHelperContained`], and no second reap could
+    /// distinguish it. A stopped stream (`emission_broken`) needs no reap, so
+    /// a bounded emission cannot fail twice for one delivery fault.
     pub(crate) fn cleanup_output_helper(&mut self) -> Result<(), LoopError> {
         if self.emission_broken {
             return Ok(());
-        }
-        if self.reap_output_helper() {
-            return Err(LoopError::ChannelUnavailable);
         }
         if self.reap_output_helper() {
             return Err(LoopError::OutputHelperContained);
