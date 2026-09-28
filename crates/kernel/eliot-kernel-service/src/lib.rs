@@ -91,6 +91,10 @@ pub use doctor_front_door::{
     AuthenticatedDoctorSession, handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
     is_doctor_diagnosis_only_envelope, reconcile_doctor_repair_delivery,
 };
+/// Canonical versioned-write carriers re-exported for the Kernel binary's
+/// authenticated daemon route without adding a second direct Canonical crate
+/// dependency to that composition root.
+pub use eliot_canonical::write_envelope::{VersionedWriteRefusal, VersionedWriteSubmission};
 pub use eliot_kernel_core::user_automation::AutomationExecutionReference;
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
@@ -217,10 +221,6 @@ pub use store_gateway::KernelStoreGateway;
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
-/// Canonical versioned-write carriers re-exported for the Kernel binary's
-/// authenticated daemon route without adding a second direct Canonical crate
-/// dependency to that composition root.
-pub use eliot_canonical::write_envelope::{VersionedWriteRefusal, VersionedWriteSubmission};
 // Issue #2764 item 6: the Dreamer route's real caller must be able to
 // distinguish a proven mutation disposition from a still-open Problem State
 // and from a bare gateway refusal, so both the carrier and the recovered
