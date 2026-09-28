@@ -60,6 +60,7 @@ members = [
   "crates/surfaces/eliot-cli",
   "crates/surfaces/eliot-controlboard",
   "crates/surfaces/eliot-mcp",
+  "crates/surfaces/eliot-messaging-bridge",
   "crates/surfaces/eliot-notify-core",
   "crates/surfaces/eliot-skills",
   "crates/surfaces/eliot-user-broker-core",
@@ -283,6 +284,7 @@ eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", ve
 eliot-cli = { path = "crates/surfaces/eliot-cli", version = "0.1.0" }
 eliot-controlboard = { path = "crates/surfaces/eliot-controlboard", version = "0.1.0" }
 eliot-mcp = { path = "crates/surfaces/eliot-mcp", version = "0.1.0" }
+eliot-messaging-bridge = { path = "crates/surfaces/eliot-messaging-bridge", version = "0.1.0" }
 eliot-notify-core = { path = "crates/surfaces/eliot-notify-core", version = "0.1.0" }
 eliot-skills = { path = "crates/surfaces/eliot-skills", version = "0.1.0" }
 eliot-user-broker-core = { path = "crates/surfaces/eliot-user-broker-core", version = "0.1.0" }
