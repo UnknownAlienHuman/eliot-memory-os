@@ -24,6 +24,7 @@ eliot-process-executor.workspace = true
 eliot-notify = { path = "../eliot-notify", version = "0.1.0" }
 eliot-protocol.workspace = true
 eliot-user-broker-core.workspace = true
+eliot-windows-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
