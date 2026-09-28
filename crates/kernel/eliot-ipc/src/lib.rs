@@ -580,6 +580,16 @@ pub const BACKPRESSURE_BRIDGE_DISPATCH: BackpressureSignal = BackpressureSignal:
     "this frame shed; its commit fate is unknown, never denied; the session is retained",
 );
 
+/// A new recovery-window open was refused at the bounded window capacity.
+/// Reuse an exact live matching window where one exists; otherwise wait for
+/// expiry before reissuing the authenticated open. Only the new open is shed;
+/// existing live windows and their recovery remain retained.
+pub const BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS: BackpressureSignal = BackpressureSignal::new(
+    "bridge-recovery-windows",
+    "reuse an exact live matching recovery window, or wait for expiry then reissue the authenticated open",
+    "only the new recovery-window open shed and deferred; existing live windows and recovery retained",
+);
+
 impl TransportError {
     /// Reports the backpressure dimension attributable at the transport
     /// seam: [`BACKPRESSURE_BRIDGE_DISPATCH`] for [`TransportError::Backpressure`],
