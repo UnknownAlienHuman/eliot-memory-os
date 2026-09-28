@@ -303,9 +303,39 @@ pub struct ArchiveReceipt {
     pub created_at: OffsetDateTime,
 }
 
-/// Decoder: derived and closed. The kept `#[serde(default)]` fields only preserve
-/// protection for older records (`Open`, pinned) or decode release data as
-/// absent; none of them can resolve pressure or admit suppression.
+/// Decoder: derived and closed. `status` and `pinned` are contract-required
+/// protection state and must be present on the wire.
+///
+/// `pinned` was `#[serde(default = "default_true")]`, so an omitted key decoded
+/// as `true` — and `pinned: true` is the *strongest* minority protection
+/// `MinorityLifecycleService::minority_is_pinned` recognises (it additionally
+/// requires `status == Open`, no `resolved_by_ref` and an unexpired
+/// `suppression_forbidden_until`). A default of `true` therefore manufactured
+/// protection from an absent field, which is the reverse of the ordinary
+/// default-direction concern: it is the one default here that would have let a
+/// truncated record claim a guard it never recorded. `status` defaulted to
+/// `Open`, pairing with it to produce a fully-protected record from two absent
+/// keys. Both are now required; omission fails with the derived typed
+/// missing-field error (the existing owner, same pattern as the merged
+/// #722/#3155 and #708/#3437 increments).
+///
+/// Compatibility: this record is persisted through `eliot-store`'s canonical
+/// projection (`canonical_projection_views.rs`,
+/// `minority_pressure: Vec<CanonicalRecord<MinorityPressureRecord>>`). The one
+/// current producer, `mcp_stdio/operator.rs:3595`, sets `status: Open` and
+/// `pinned: true` explicitly, and `Serialize` is untouched, so accepted and
+/// emitted bytes are unchanged. The previously documented "older records"
+/// tolerance is withdrawn: no named/versioned legacy decoder exists for this
+/// record and none may be invented (W4), so such a record now fails loudly.
+///
+/// `release_condition`, `resolved_by_ref` and `write_receipt` keep explicit
+/// `Option` presence: an absent key, an explicit `null` and a value stay three
+/// distinguishable states, and none of them can resolve pressure or admit
+/// suppression. `write_receipt` in particular also keeps
+/// `skip_serializing_if`, because the store stamps it back after
+/// serialization and the canonical bytes on disk omit the key when it is
+/// `None`; dropping `default` there would make a store-written record
+/// unreadable by its own type (the round-trip trap).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MinorityPressureRecord {
@@ -315,13 +345,9 @@ pub struct MinorityPressureRecord {
     pub majority_claim_ref: Option<String>,
     pub why_minority_matters: String,
     pub discriminative_probe: Option<String>,
-    #[serde(default)]
     pub status: MinorityPressureStatus,
-    #[serde(default = "default_true")]
     pub pinned: bool,
-    #[serde(default)]
     pub release_condition: Option<String>,
-    #[serde(default)]
     pub resolved_by_ref: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub suppression_forbidden_until: Option<OffsetDateTime>,
@@ -494,8 +520,4 @@ pub struct MemoryPressureReport {
     pub skill_distractor_pressure: String,
     pub open_lifecycle_proposals: usize,
     pub suppressed_recent_regret: usize,
-}
-
-const fn default_true() -> bool {
-    true
 }

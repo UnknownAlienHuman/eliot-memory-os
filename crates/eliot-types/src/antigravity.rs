@@ -627,9 +627,7 @@ pub struct AntigravityCommandContract {
     pub dangerous_flags_forbidden: bool,
     pub json_output_required: bool,
     pub model_cli_arg_supported: bool,
-    #[serde(default)]
     pub selected_model: Option<String>,
-    #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub model_selection_message: String,
     pub limitations: Vec<String>,
@@ -659,7 +657,6 @@ pub struct AntigravityReviewRequest {
     pub allowed_paths: Vec<PathRef>,
     pub evidence_refs: Vec<String>,
     pub provider_enabled: bool,
-    #[serde(default)]
     pub last_accepted_packet_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -704,7 +701,10 @@ pub struct AntigravitySafetyReceipt {
     ///
     /// `None` means the process was not accepted as model-bound. The typed argv
     /// alone is only request authority and must not populate this receipt.
-    #[serde(default)]
+    ///
+    /// Required on the wire: this is the observation that distinguishes a
+    /// model-bound run from a merely request-authorized one, so an absent key
+    /// must not decode as "observed, and the answer was nothing".
     pub model_observation: Option<AntigravityModelObservation>,
 }
 
@@ -870,6 +870,17 @@ pub struct AntigravityRealReport {
     pub disable_receipt: Option<AntigravityDisableReceipt>,
     pub doctor: AntigravityRealDoctorStatus,
     pub telemetry: AntigravityTelemetryReport,
+    /// Which layers this real report may disclose to.
+    ///
+    /// Retained as a genuinely optional field. This report is a projection, and
+    /// absent key and explicit `null` carry the *same* fact here — no
+    /// visibility report was produced — so the two are not semantically
+    /// distinct and no presence representation would separate them. The real
+    /// three-way distinction (absent / present-empty / value) lives inside
+    /// `AntigravityVisibilityReport` and is preserved there. The paired
+    /// `skip_serializing_if` is what keeps canonical bytes stable for the
+    /// common no-visibility case; removing `default` without it would make the
+    /// type unable to read back its own output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<AntigravityVisibilityReport>,
     #[serde(with = "time::serde::rfc3339")]

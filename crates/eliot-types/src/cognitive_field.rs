@@ -418,6 +418,23 @@ pub struct CognitiveFieldProviderCallPlan {
     pub execution_request_sha256: String,
 }
 
+/// Decoder: derived and closed. The `#[serde(default)]` meta fields keep
+/// pre-meta harness records readable and decode as absent or explicitly
+/// uncertain (`InsufficientEvidence`); none of them can promote a candidate.
+///
+/// These five fields stay `#[serde(default, skip_serializing_if = ...)]` on a
+/// frozen-wire ground, not a tolerance ground. `plan_hash` is this record's own
+/// seal: `validate_provider_plan_hash` recomputes it as blake3 over
+/// `serde_json::to_vec` of this struct with only `plan_hash` cleared. Removing
+/// `skip_serializing_if` therefore changes the bytes the seal is computed over,
+/// and removing `default` makes every already-published plan (whose file omits
+/// these keys) fail to decode at all. Neither is a compatible requiredness
+/// correction: it invalidates a sealed artifact, and #708 forbids re-sealing it
+/// under an invented version or a trial-accept alias. The record's own
+/// `schema_version` is the only named boundary, and its owner already rejects
+/// every other value, so no older accepted layout exists to migrate (W4).
+/// Tracked as BLOCKED-BY in the #708 field table: it needs a migration decision
+/// from the `plan_hash` owner, which lives outside this issue's file scope.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveFieldProviderPlan {
