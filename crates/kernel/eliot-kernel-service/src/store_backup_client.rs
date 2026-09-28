@@ -121,7 +121,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // payload's admitted `OperationIdentity` — copied verbatim, never
         // re-derived.
         let identity = request.operation.clone();
-        let admitted_operation_id = identity.operation_id.clone();
+        let admitted_identity = identity.clone();
         let idempotency_key = identity.idempotency_key.clone();
         let envelope = StoreBackupRequest {
             context: ctx.clone(),
@@ -141,7 +141,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
-                Self::check_backup_begin(&admitted_operation_id, &expected_digest, &response)
+                Self::check_backup_begin(&admitted_identity, &expected_digest, &response)
             }
             // Once the backup mutation has crossed the transport boundary, a
             // valid response of the wrong kind is itself a typed contract
@@ -163,7 +163,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_begin(
-        admitted_operation_id: &OperationId,
+        admitted_identity: &OperationIdentity,
         expected_digest: &str,
         response: &StoreBackupResponse,
     ) -> Result<SnapshotHandle, StoreError> {
@@ -171,13 +171,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             return Err(StoreError::InvalidReceipt);
         };
         handle.validate()?;
-        if handle.operation_id != *admitted_operation_id {
-            return Err(StoreError::IdentityConflict);
-        }
         // The handle digest binds the exact admitted begin request; compare
         // against the digest recomputed from our admitted input (verification
         // of the binding, never a minted identity).
-        if handle.snapshot_digest != expected_digest {
+        if handle.operation_id != admitted_identity.operation_id
+            || handle.idempotency_key != admitted_identity.idempotency_key
+            || handle.snapshot_digest != expected_digest
+        {
             return Err(StoreError::IdentityConflict);
         }
         Ok(handle.clone())
@@ -280,8 +280,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if fault == StoreClientFault::PreCommitCrash {
             return Err(StoreError::MissingReceiptEnvelope);
         }
-        let admitted_operation_id = handle.operation_id.clone();
-        let admitted_digest = handle.snapshot_digest.clone();
+        let admitted_handle = handle.clone();
         let idempotency_key = handle.idempotency_key.clone();
         // Coherence rule: `End` requires the envelope `operation_id` and
         // `idempotency_key` to equal the handle's (a handle carries no
@@ -292,7 +291,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             context: ctx.clone(),
             identity: backup_derived_envelope_identity(
                 &operation,
-                &admitted_operation_id,
+                &admitted_handle.operation_id,
                 &idempotency_key,
             )?,
             operation,
@@ -310,7 +309,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
-                Self::check_backup_end(&admitted_operation_id, &admitted_digest, &response)
+                Self::check_backup_end(&admitted_handle, &response)
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
             Err(RequestFailure::Unknown {
@@ -325,17 +324,14 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_end(
-        admitted_operation_id: &OperationId,
-        admitted_digest: &str,
+        admitted_handle: &SnapshotHandle,
         response: &StoreBackupResponse,
     ) -> Result<SnapshotEndReceipt, StoreError> {
         let StoreBackupResponse::EndReceipt { receipt } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         receipt.validate()?;
-        if receipt.handle.snapshot_digest != admitted_digest
-            || receipt.operation.operation_id != *admitted_operation_id
-        {
+        if &receipt.handle != admitted_handle {
             return Err(StoreError::IdentityConflict);
         }
         Ok(receipt.clone())
@@ -366,6 +362,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if fault == StoreClientFault::PreCommitCrash {
             return Err(StoreError::MissingReceiptEnvelope);
         }
+        let admitted_evidence = destination.evidence.clone();
         let idempotency_projection = format!(
             "store-backup-prepare-destination:{}:{}:{}",
             destination.destination_id,
@@ -403,7 +400,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
-                Self::check_backup_prepare(&response)
+                Self::check_backup_prepare(&admitted_evidence, &response)
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
             Err(RequestFailure::Unknown {
@@ -418,12 +415,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_prepare(
+        admitted_evidence: &IsolationEvidence,
         response: &StoreBackupResponse,
     ) -> Result<IsolationEvidence, StoreError> {
         let StoreBackupResponse::Isolation { evidence } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         evidence.validate()?;
+        if evidence != admitted_evidence {
+            return Err(StoreError::IdentityConflict);
+        }
         Ok(evidence.clone())
     }
 
@@ -678,7 +679,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if fault == StoreClientFault::PreCommitCrash {
             return Err(StoreError::MissingReceiptEnvelope);
         }
-        let admitted_operation_id = first.operation_id.clone();
+        let admitted_operation = first.clone();
         let admitted_first_digest = first.canonical_request_hash.clone();
         let admitted_second_digest = second.canonical_request_hash.clone();
         // Coherence rule: `Reconcile` requires the envelope identity to equal
@@ -705,7 +706,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
                 Self::check_backup_reconcile(
-                    &admitted_operation_id,
+                    &admitted_operation,
                     &admitted_first_digest,
                     &admitted_second_digest,
                     &response,
@@ -724,7 +725,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_reconcile(
-        admitted_operation_id: &OperationId,
+        admitted_operation: &OperationIdentity,
         admitted_first_digest: &str,
         admitted_second_digest: &str,
         response: &StoreBackupResponse,
@@ -733,7 +734,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             return Err(StoreError::InvalidReceipt);
         };
         reconciliation.validate()?;
-        if reconciliation.operation.operation_id != *admitted_operation_id
+        if &reconciliation.operation != admitted_operation
             || reconciliation.first_digest != admitted_first_digest
             || reconciliation.second_digest != admitted_second_digest
         {
