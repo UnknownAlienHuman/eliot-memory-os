@@ -111,7 +111,8 @@ use crate::{
     CONTRACT_NAME, CONTRACT_VERSION, ContractVersion, EffectClass, GENESIS_MANIFEST_NAME,
     NamedMutationOperation, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
     OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition,
-    StoreError, TransitionClass, canonical_json_bytes, sha256_hex,
+    ReadConsistency, StoreError, TransitionClass, canonical_json_bytes,
+    maintenance_trigger_decision_owner_key, sha256_hex,
 };
 
 /// Operation identity kind carried by each manifest entry.
@@ -281,7 +282,7 @@ struct ActivatedReadDescriptor {
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
 /// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -392,11 +393,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetMaintenanceTriggerDecisionOwner,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -420,6 +426,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
+        ACTIVATED_READS[22].operation,
     ]
 }
 
@@ -774,6 +781,31 @@ pub fn validate_read_against_catalogue(
         return Err(StoreError::ManifestMismatch);
     }
     validate_typed_read_parameters(request.operation, &request.parameters)?;
+    if request.operation == NamedReadOperation::GetMaintenanceTriggerDecisionOwner {
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "consistency",
+                reason: "maintenance trigger decision owner read requires exact_fence",
+            });
+        }
+        let trigger_id = request
+            .parameters
+            .get("trigger_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "maintenance_trigger_decision.trigger_id",
+                reason: "must be non-empty text",
+            })?;
+        let trigger_revision = request
+            .parameters
+            .get("trigger_revision")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "maintenance_trigger_decision.trigger_revision",
+                reason: "must be a positive decimal revision",
+            })?;
+        let _ = maintenance_trigger_decision_owner_key(trigger_id, trigger_revision)?;
+    }
     match (entry.requires_scope_id, request.scope_id.as_ref()) {
         (true, None) => {
             return Err(StoreError::InvalidField {

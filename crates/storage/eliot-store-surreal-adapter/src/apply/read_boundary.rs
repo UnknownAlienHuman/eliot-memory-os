@@ -404,12 +404,76 @@ async fn named_read_payload(
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             capability_evidence_record_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetMaintenanceTriggerDecisionOwner => {
+            maintenance_trigger_decision_owner_payload(db, &adapter.config, query).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
+    }
+}
+
+async fn maintenance_trigger_decision_owner_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+) -> Result<Value, AdapterError> {
+    let trigger_id = query
+        .parameters
+        .get("trigger_id")
+        .and_then(Value::as_str)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_id",
+            reason: "must be non-empty text",
+        }))?;
+    let trigger_revision = query
+        .parameters
+        .get("trigger_revision")
+        .and_then(Value::as_str)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a positive decimal revision",
+        }))?;
+    let owner_key =
+        eliot_store_api::maintenance_trigger_decision_owner_key(trigger_id, trigger_revision)
+            .map_err(AdapterError::Store)?;
+
+    let mut bindings = Map::new();
+    bindings.insert(
+        "recovery_namespace0".to_owned(),
+        json!(&owner_key.namespace),
+    );
+    bindings.insert("recovery_key0".to_owned(), json!(&owner_key.key));
+    let sql = schema::indexed(schema::READ_RECOVERY_OWNER_BY_KEY, 0);
+    let mut response = client::query(
+        db,
+        config,
+        "read.maintenance_trigger_decision_owner",
+        &sql,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    match rows.as_slice() {
+        [] => Ok(Value::Null),
+        [record] => {
+            record.validate().map_err(AdapterError::Store)?;
+            if record.record_key() != owner_key
+                || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "maintenance_trigger_decision.owner_record",
+                    reason: "does not match the requested immutable owner identity",
+                }));
+            }
+            to_value(record)
+        }
+        _ => Err(AdapterError::Store(StoreError::Duplicate {
+            field: "maintenance_trigger_decision.owner_record",
+        })),
     }
 }
 
