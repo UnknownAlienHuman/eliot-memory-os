@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform::{PlatformHandle, UnknownReason};
 use eliot_platform_windows::{
-    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    require_protected_program_data_path, windows_paths_equal,
+    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, UserOwnedPathLease,
+    UserOwnedRootLease, require_protected_program_data_path, windows_paths_equal,
 };
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
@@ -73,6 +73,10 @@ enum JournalPathLease {
     Runtime {
         _root_lease: ProtectedRootLease,
         _path_lease: ProtectedRuntimePathLease,
+    },
+    UserOwnedRuntime {
+        _root_lease: UserOwnedRootLease,
+        _path_lease: UserOwnedPathLease,
     },
     #[cfg(any(test, feature = "test-support"))]
     Unprotected,
@@ -292,6 +296,53 @@ impl RedbJournalBackend {
             database,
             path: path.to_path_buf(),
             _path_lease: JournalPathLease::Runtime {
+                _root_lease: root_lease,
+                _path_lease: path_lease,
+            },
+        })
+        .and_then(|backend| {
+            backend.ensure_schema()?;
+            backend.snapshot()?;
+            Ok(backend)
+        })
+    }
+
+    /// Opens or creates the Host journal below one retained current-user Host
+    /// state root. The caller must select this entrypoint only after the
+    /// profile descriptor has been validated as `UserMode` or `PortableDev`.
+    /// The parent and file use retained current-user no-follow handles; the
+    /// final file is opened with create-new semantics when absent.
+    pub fn open_user_owned_at(path: impl AsRef<Path>) -> Result<Self, BackendError> {
+        let path = path.as_ref();
+        let parent = path.parent().ok_or(BackendError::Unavailable)?;
+        let root_lease =
+            UserOwnedRootLease::open_existing(parent).map_err(|_| BackendError::Unavailable)?;
+        let canonical_root = root_lease
+            .canonical_path()
+            .map_err(|_| BackendError::Unavailable)?;
+        if !windows_paths_equal(&canonical_root, parent) {
+            return Err(BackendError::Unavailable);
+        }
+        let path_lease = UserOwnedPathLease::open_or_create(&root_lease, path)
+            .map_err(|_| BackendError::Unavailable)?;
+        if path_lease.path() != path {
+            return Err(BackendError::Unavailable);
+        }
+        path_lease
+            .verify_stable_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let database =
+            Database::create(path_lease.path()).map_err(|_| BackendError::Unavailable)?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        root_lease
+            .verify_stable_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        Ok(Self {
+            database,
+            path: path.to_path_buf(),
+            _path_lease: JournalPathLease::UserOwnedRuntime {
                 _root_lease: root_lease,
                 _path_lease: path_lease,
             },

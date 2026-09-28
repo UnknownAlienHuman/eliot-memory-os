@@ -106,6 +106,7 @@ mod platform_security;
 mod process_identity;
 mod process_job;
 mod process_path_lease;
+pub mod profile_supervision;
 mod protected_path;
 mod runtime_receipt_publication;
 pub mod scm_entry;
