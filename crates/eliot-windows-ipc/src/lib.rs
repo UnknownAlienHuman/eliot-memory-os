@@ -342,6 +342,157 @@ impl TerminalStorageRelease {
     }
 }
 
+/// One fault-injection boundary named by issue #789's implementation
+/// requirements, paragraph 7.
+///
+/// That paragraph names seven points at which a Windows operation can
+/// fail independently of the code that issued it: acquisition,
+/// submission, pending/synchronous completion, cancellation, late
+/// completion, observation/result validation, and cleanup. Every variant
+/// below has a real production site that consults it, so a fault is
+/// injected into the production path instead of simulated beside it:
+///
+/// ```text
+/// Acquisition      DirectoryOplockGuard::acquire, before any handle exists
+/// Submission       DirectoryOplockGuard::acquire, after the raw submit
+/// Completion       DirectoryOplockGuard::mutation_attempted
+/// Cancellation     DirectoryOplockGuard::drop, instead of the cancel
+/// LateCompletion   DirectoryOplockGuard::drop, after the drain wait
+/// Observation      JobProcessObserver::drain_pending
+/// Cleanup          OwnedHandle::drop, instead of the close
+/// ```
+///
+/// An injected fault never fabricates a successful operating-system
+/// result. It only forces the fail-closed branch the site already owns
+/// for that failure, so no injected run can turn a failure into
+/// undefined behavior, a false success, or a release of request storage
+/// the kernel may still own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultBoundary {
+    /// Acquiring the OS resource: handle, event, and request buffers.
+    Acquisition,
+    /// Issuing the raw submit call.
+    Submission,
+    /// The submit's pending or synchronous completion.
+    Completion,
+    /// Requesting cancellation of a pending operation.
+    Cancellation,
+    /// A completion that arrives after cancellation or teardown started.
+    LateCompletion,
+    /// Validating an observation or a kernel-reported result.
+    Observation,
+    /// Releasing a resource this module uniquely owns.
+    Cleanup,
+}
+
+impl FaultBoundary {
+    /// Every boundary, in paragraph-7 order. Its length is the closed
+    /// denominator of the arming table: a boundary absent from this
+    /// array cannot be armed and has no injection site, and an arming
+    /// request naming a duplicate boundary arms that boundary once.
+    pub const ALL: [Self; 7] = [
+        Self::Acquisition,
+        Self::Submission,
+        Self::Completion,
+        Self::Cancellation,
+        Self::LateCompletion,
+        Self::Observation,
+        Self::Cleanup,
+    ];
+
+    /// Stable name used in the fail-closed message, so an injected run
+    /// stays distinguishable from a real kernel failure.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Acquisition => "acquisition",
+            Self::Submission => "submission",
+            Self::Completion => "completion",
+            Self::Cancellation => "cancellation",
+            Self::LateCompletion => "late-completion",
+            Self::Observation => "observation",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
+    /// One arming bit per boundary, so arming is a single atomic store
+    /// and a boundary read is a single masked load.
+    const fn bit(self) -> u64 {
+        match self {
+            Self::Acquisition => 1 << 0,
+            Self::Submission => 1 << 1,
+            Self::Completion => 1 << 2,
+            Self::Cancellation => 1 << 3,
+            Self::LateCompletion => 1 << 4,
+            Self::Observation => 1 << 5,
+            Self::Cleanup => 1 << 6,
+        }
+    }
+}
+
+/// Currently armed boundaries. Zero in every run that does not arm
+/// anything, which is every production run.
+static ARMED_FAULT_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+
+/// Owned handles whose close was fault-injected and therefore
+/// intentionally left open. The count is what keeps such a leak from
+/// reading as a successful cleanup.
+static UNRESOLVED_HANDLE_CLEANUPS: AtomicU64 = AtomicU64::new(0);
+
+/// Restores the previously armed boundaries when dropped, so an injected
+/// fault cannot outlive the scope that armed it.
+#[derive(Debug)]
+pub struct ArmedFaultBoundaries {
+    previous: u64,
+}
+
+impl Drop for ArmedFaultBoundaries {
+    fn drop(&mut self) {
+        ARMED_FAULT_BOUNDARIES.store(self.previous, Ordering::Release);
+    }
+}
+
+/// Arms `boundaries` until the returned guard is dropped.
+///
+/// This is the injection seam paragraph 7 requires on the real
+/// production paths. Arming a boundary makes that boundary's production
+/// site take its own fail-closed branch, deterministically and with no
+/// elapsed sleep, so interleavings are distinguished by state rather
+/// than by timing. The armed set is process-wide: it belongs to a
+/// controlled fault-injection run, never to request handling.
+pub fn arm_fault_boundaries(boundaries: &[FaultBoundary]) -> ArmedFaultBoundaries {
+    let mut mask = 0_u64;
+    for boundary in boundaries {
+        mask |= boundary.bit();
+    }
+    let previous = ARMED_FAULT_BOUNDARIES.swap(mask, Ordering::AcqRel);
+    ArmedFaultBoundaries { previous }
+}
+
+/// How many owned-handle cleanups ended unresolved because
+/// [`FaultBoundary::Cleanup`] was armed while they ran. A non-zero value
+/// means that many owned handles are still open, which is exactly why
+/// their cleanup is not reported as successful.
+#[must_use]
+pub fn unresolved_handle_cleanup_count() -> u64 {
+    UNRESOLVED_HANDLE_CLEANUPS.load(Ordering::Acquire)
+}
+
+/// Whether `boundary` is armed. Consulted on the real production path;
+/// the unarmed default costs one acquire load.
+fn fault_armed(boundary: FaultBoundary) -> bool {
+    ARMED_FAULT_BOUNDARIES.load(Ordering::Acquire) & boundary.bit() != 0
+}
+
+/// Fail-closed error for a fault injected at `boundary`. It names the
+/// boundary instead of impersonating an OS error code, so an injected
+/// run never reports a fabricated kernel result.
+fn injected_fault(boundary: FaultBoundary) -> io::Error {
+    io::Error::other(format!(
+        "eliot-windows-ipc fault injected at the {} boundary",
+        boundary.name()
+    ))
+}
+
 /// Typed outcome of one bounded Win32 transfer/length observation (issue
 /// #789, implementation-requirements paragraph 5).
 ///
@@ -725,6 +876,9 @@ pub struct DirectoryOplockGuard {
 // the pending kernel request stays bound to the same allocations. The guard
 // is only moved, never shared (`Sync` is deliberately not implemented), and
 // `Drop` cancels, then frees the boxes only when drained, else leaks them.
+// An armed `FaultBoundary::Cancellation` or `FaultBoundary::LateCompletion`
+// fault only removes a proof: it drives the same leak branch, so it can
+// never make the boxes drop while the kernel may still own them.
 // The outcome cell is plain `Copy` data that moves with the guard.
 unsafe impl Send for DirectoryOplockGuard {}
 
@@ -736,6 +890,12 @@ impl DirectoryOplockGuard {
     /// Returns an error when the directory is invalid or Windows cannot grant
     /// a pending oplock request.
     pub fn acquire(path: &Path) -> io::Result<Self> {
+        // Acquisition boundary: an injected acquisition fault fails
+        // closed before any handle, event, or request allocation exists,
+        // so no partially built guard can be returned or dropped.
+        if fault_armed(FaultBoundary::Acquisition) {
+            return Err(injected_fault(FaultBoundary::Acquisition));
+        }
         let directory = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -803,10 +963,20 @@ impl DirectoryOplockGuard {
         // rejection before the kernel took ownership. The last-error code is
         // meaningful only when the call returned zero.
         let submit_error = (requested == 0).then(io::Error::last_os_error);
-        let outcome = submitted.classify_oplock_submit(
+        let classified = submitted.classify_oplock_submit(
             requested,
             submit_error.as_ref().and_then(io::Error::raw_os_error),
         );
+        // Submission boundary: the raw submit is already issued, so an
+        // injected submission fault means its acceptance could not be
+        // established. `UnknownSubmit` is the state that yields no
+        // release proof and refuses a blind retry, and the arm below
+        // resolves it by retaining the request storage.
+        let outcome = if fault_armed(FaultBoundary::Submission) {
+            AsyncIoOutcome::UnknownSubmit
+        } else {
+            classified
+        };
         match outcome {
             AsyncIoOutcome::Pending => Ok(Self {
                 directory: Some(directory),
@@ -822,7 +992,22 @@ impl DirectoryOplockGuard {
             AsyncIoOutcome::RejectedBeforeSubmit => {
                 Err(submit_error.unwrap_or_else(io::Error::last_os_error))
             }
-            _ => unreachable!("oplock submit classification is total over the raw result"),
+            // The raw submit was issued but its acceptance is not
+            // established, so the kernel may still own the three
+            // allocations below. Retaining them is the only safe
+            // disposition, and it is the same one `Drop` already takes:
+            // dropping them would free storage a late kernel completion
+            // may still write. The typed error records the unresolved
+            // outcome rather than reporting a granted lease.
+            _ => {
+                Box::leak(overlapped);
+                Box::leak(input);
+                Box::leak(output);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oplock submit outcome is unknown; request storage retained",
+                ))
+            }
         }
     }
 
@@ -838,6 +1023,15 @@ impl DirectoryOplockGuard {
         if self.async_outcome() == AsyncIoOutcome::ObservedComplete {
             return Ok(true);
         }
+        // Completion boundary: an injected completion fault means the
+        // poll's observation cannot be trusted. It must not advance the
+        // outcome to `ObservedComplete`, which a later `Drop` would read
+        // as a drained request, and it must not answer `false`, which
+        // callers read as "no mutation attempted". Failing closed keeps
+        // both readings unavailable.
+        if fault_armed(FaultBoundary::Completion) {
+            return Err(injected_fault(FaultBoundary::Completion));
+        }
         // SAFETY: event remains live for the complete guard lifetime.
         let observed =
             AsyncIoOutcome::classify_oplock_poll(unsafe { WaitForSingleObject(self.event.0, 0) })?;
@@ -850,7 +1044,10 @@ impl DirectoryOplockGuard {
     /// Returns the guard's current async-I/O outcome: `Pending` while the
     /// kernel may still own the request, `ObservedComplete` once a poll has
     /// seen the break event. `Drop` consumes this to select its cancel/drain
-    /// path; any other state is unreachable on a live guard.
+    /// path; on a live guard every fault boundary of paragraph 7 that can
+    /// apply (`Acquisition`, `Submission`, `Completion`) returns from
+    /// `acquire`/`mutation_attempted` with a typed error instead of changing
+    /// the stored state, so no other state is reachable here.
     #[must_use]
     pub fn async_outcome(&self) -> AsyncIoOutcome {
         self.outcome.get()
@@ -872,8 +1069,21 @@ impl Drop for DirectoryOplockGuard {
             // request. Illegal stored states fail closed to `Unresolved`
             // inside `request_cancel`.
             let canceling = self.async_outcome().request_cancel();
-            self.outcome.set(canceling);
+            // Cancellation boundary: an injected cancellation fault means
+            // no cancel is ever requested, so nothing downstream can prove
+            // the kernel released the request. The indeterminate state is
+            // entered instead, which also suppresses the `CancelIoEx` call
+            // below: a run that pretends its cancel was not issued must not
+            // issue one, and the drain can no longer construct a proof.
+            let cancel_injected = canceling == AsyncIoOutcome::CancelRequested
+                && fault_armed(FaultBoundary::Cancellation);
+            self.outcome.set(if cancel_injected {
+                AsyncIoOutcome::Unresolved
+            } else {
+                canceling
+            });
             if canceling == AsyncIoOutcome::CancelRequested
+                && !cancel_injected
                 && let Some(request) = overlapped.as_ref()
             {
                 // SAFETY: the pending request belongs to this exact file handle and
@@ -891,7 +1101,16 @@ impl Drop for DirectoryOplockGuard {
             // field, so it drops after `Drop` returns) and the wait only
             // drains the cancellation before the boxed buffers release below.
             let drained = unsafe { WaitForSingleObject(self.event.0, 5_000) };
-            let observed = self.async_outcome().classify_cancel_drain(drained);
+            let drained_outcome = self.async_outcome().classify_cancel_drain(drained);
+            // Late-completion boundary: a signal that arrives once
+            // teardown has started cannot be attributed to this guard's
+            // cancel, so an injected late completion never converts into
+            // a release proof. The storage is retained instead.
+            let observed = if fault_armed(FaultBoundary::LateCompletion) {
+                AsyncIoOutcome::Unresolved
+            } else {
+                drained_outcome
+            };
             self.outcome.set(observed);
             // Release is gated on the exact terminal-ownership proof: only a
             // drained cancel or an observed completion constructs it. The
@@ -1369,10 +1588,12 @@ struct OwnedHandle(HANDLE);
 // SAFETY: a Windows kernel handle value is usable from any thread. This
 // wrapper keeps unique ownership of its single `HANDLE` field: it is created
 // only via `new` (both failure sentinels, null and `INVALID_HANDLE_VALUE`,
-// rejected), closed exactly once in `Drop`, or moved exactly once into
-// `File` via `into_file` (`mem::forget` prevents a double close). `Send`
-// therefore transfers only the unique owner. `Sync` is deliberately not
-// implemented: concurrent shared access is not established.
+// rejected), closed exactly once in `Drop` (or, under an armed
+// `FaultBoundary::Cleanup` fault, deliberately left open exactly once and
+// counted as unresolved), or moved exactly once into `File` via `into_file`
+// (`mem::forget` prevents a double close). `Send` therefore transfers only
+// the unique owner. `Sync` is deliberately not implemented: concurrent
+// shared access is not established.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
@@ -1401,6 +1622,15 @@ impl OwnedHandle {
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            // Cleanup boundary: an injected cleanup fault leaves the handle
+            // open instead of closing it. The leak is bounded and counted,
+            // so the cleanup is reported as unresolved rather than being
+            // silently reported as a successful close. Ownership left this
+            // wrapper either way, so the value is never closed twice.
+            if fault_armed(FaultBoundary::Cleanup) {
+                UNRESOLVED_HANDLE_CLEANUPS.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             // SAFETY: the wrapper uniquely owns the handle until this Drop;
             // both failure sentinels (null and `INVALID_HANDLE_VALUE`) were
             // rejected by `new` and are re-checked here so neither sentinel
@@ -1681,6 +1911,15 @@ impl JobProcessObserver {
     /// previously applied inline. Only a poisoned lock marks the history
     /// truncated.
     fn drain_pending(&self) {
+        // Observation boundary: an injected observation fault means the
+        // queued notifications can be neither resolved nor validated, so
+        // the retained history is marked explicitly truncated instead of
+        // being reported complete, and the queue is left unconsumed for a
+        // later drain rather than silently dropped here.
+        if fault_armed(FaultBoundary::Observation) {
+            self.history_truncated.store(true, Ordering::Release);
+            return;
+        }
         let pids = self.pending.lock().map_or_else(
             |_| {
                 self.history_truncated.store(true, Ordering::Release);
