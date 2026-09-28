@@ -280,8 +280,10 @@ struct ActivatedReadDescriptor {
 /// scope-free); `GetLearningRecordRange` addresses its scope through the
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
-/// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
+/// `record_kind` selector plus the `max_records` bound; `GetMailboxItem`
+/// addresses no scope (issue #1820: exact `task_id` + `message_id` head
+/// readback under the request fence).
+const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -383,6 +385,11 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
         scope_kind: SCOPE_KIND_NONE,
     },
     ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetMailboxItem,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
+    ActivatedReadDescriptor {
         operation: NamedReadOperation::GetLearningRecordRange,
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
@@ -396,7 +403,7 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -420,6 +427,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
+        ACTIVATED_READS[22].operation,
     ]
 }
 
@@ -466,11 +474,17 @@ struct ActivatedMutationDescriptor {
 /// keyed `(skill_id, scope_key)` with the closed capability-evidence typed
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
-/// influence, or lifecycle change). All
-/// eighteen address no store scope, mirroring the scope-free read
+/// influence, or lifecycle change);
+/// `AdmitMailboxItem`, `RecordMailboxDelivery`, `AcknowledgeMailboxItem`,
+/// and `ExpireMailboxItem` persist `Candidate` through the same family
+/// (issue #1820, I10.18: Kernel-admitted durable directed mailbox items
+/// with per-stream ordering CAS, delivery/acknowledgement observations,
+/// and terminal expiry under the closed mailbox typed contract; the
+/// writes grant no task acceptance, truth, authority, or effect). All
+/// twenty-two address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -568,6 +582,30 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitMailboxItem,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordMailboxDelivery,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AcknowledgeMailboxItem,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ExpireMailboxItem,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordLearningRecord,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
@@ -642,8 +680,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the eighteen activated reads, the
-/// sixteen activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the twenty-three activated reads, the
+/// twenty-two activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -814,6 +852,10 @@ pub fn validate_read_against_catalogue(
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed per-operation dispatch table; one arm per activated mutation by design"
+)]
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -909,6 +951,18 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::ApplyBlackboardItem => {
                 validate_blackboard_transition(transition, &command.parameters)?;
             }
+            NamedMutationOperation::AdmitMailboxItem => {
+                validate_mailbox_admission_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::RecordMailboxDelivery => {
+                validate_mailbox_delivery_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::AcknowledgeMailboxItem => {
+                validate_mailbox_ack_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::ExpireMailboxItem => {
+                validate_mailbox_expiry_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordLearningRecord => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::decode_learning_mutation(command.operation, &command.parameters)
@@ -952,6 +1006,78 @@ fn validate_blackboard_transition(
     if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
         return Err(StoreError::InvalidField {
             field: "blackboard.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_admission_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let revision =
+        crate::decode_mailbox_item(NamedMutationOperation::AdmitMailboxItem, parameters)?;
+    if revision.record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_delivery_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let advance =
+        crate::decode_mailbox_delivery(NamedMutationOperation::RecordMailboxDelivery, parameters)?;
+    if advance.expected_head.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(advance.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_ack_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let advance =
+        crate::decode_mailbox_ack(NamedMutationOperation::AcknowledgeMailboxItem, parameters)?;
+    if advance.expected_head.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(advance.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_expiry_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let advance =
+        crate::decode_mailbox_expiry(NamedMutationOperation::ExpireMailboxItem, parameters)?;
+    if advance.expected_head.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(advance.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
             reason: "must match the prepared transition task",
         });
     }
