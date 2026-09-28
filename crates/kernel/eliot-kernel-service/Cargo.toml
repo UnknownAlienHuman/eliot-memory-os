@@ -19,6 +19,14 @@ proof_entrypoint = "cargo test -p eliot-kernel-service"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
+# Issue #40 W5: the kernel-local lifecycle admission owner
+# (`lifecycle_admission`) binds typed `eliot-epistemic` receipts to the
+# canonical mutations that persist them, so the receipt vocabulary and the
+# epistemic status vocabulary are production dependencies here. The
+# `eliot-memory-curation` donor edge is gone: the donor no longer owns
+# lifecycle/action admission.
+eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
+eliot-evidence.workspace = true
 # Issue #2966 step 2: the history projector declares the traversal bounds
 # the committed closures were proven under. Narrow use of one type plus
 # `default_bounds`; same layer-family edge `eliot-kernel-core` already holds.
@@ -26,7 +34,6 @@ eliot-influence.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
-eliot-memory-curation = { path = "../../smart/eliot-memory-curation", version = "0.1.0" }
 eliot-ors.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
@@ -54,11 +61,6 @@ eliot-ors = { workspace = true, features = ["test-support"] }
 # edges never enter the production dependency graph or the runtime boundary.
 eliot-store-surreal-adapter.workspace = true
 eliot-read = { path = "../../governor/eliot-read", version = "0.1.0" }
-# Issue #1905: lifecycle persist tests admit real curation chains, so the
-# epistemic/evidence contract types behind the fixtures are test-only deps.
-# They never enter the production dependency graph or the runtime boundary.
-eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
-eliot-evidence.workspace = true
 # Issue #1905 mutation legs: tests play the legitimate Governor caller via
 # the owned revision encoder, and build payloads from the exact contract
 # types. Test-only; production accepts caller-supplied typed payloads.

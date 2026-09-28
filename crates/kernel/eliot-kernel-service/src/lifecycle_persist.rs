@@ -3,13 +3,14 @@
 //!
 //! This module is the authority/fence/operation boundary for lifecycle
 //! persistence: it binds an authenticated session from live Kernel state,
-//! re-verifies the presented admission chain through the curation owner
-//! (order, shapes, and receipt continuity), persists it as one capture
+//! re-verifies the presented admission chain through the kernel-local
+//! lifecycle admission owner (order, shapes, and receipt continuity),
+//! persists it as one capture
 //! plus one hash-chained audit leg per hop through the existing
 //! [`CanonicalStoreClient`] path, validates every store response
-//! receipt, and maps outcomes without claiming success. Curation and
-//! epistemic semantics stay with their owners: the seam consumes the
-//! typed [`CurationAdmission`] chain directly — never a generic
+//! receipt, and maps outcomes without claiming success. Epistemic
+//! semantics stay with their owner: the seam consumes the
+//! typed [`LifecycleAdmission`] chain directly — never a generic
 //! parameter map — and never derives epistemic content, lineage, or
 //! standing.
 //!
@@ -54,9 +55,6 @@
 
 use eliot_contracts::ArtifactId;
 use eliot_contracts::SessionId;
-use eliot_memory_curation::admission::{
-    CurationAdmission, CurationMutationOperation, verify_admission_chain,
-};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventId,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -70,6 +68,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::lifecycle_admission::{
+    LifecycleAdmission, LifecycleMutationOperation, verify_lifecycle_admission_chain,
+};
 use crate::{KernelService, KernelServiceError, KernelServiceState, validate_text};
 
 /// Authenticated lifecycle session bound from live Kernel state.
@@ -190,7 +191,7 @@ pub struct LifecyclePersistRequest {
     /// Fence every hop is admitted under (single-fence calls only).
     pub state_fence: StateFence,
     /// Ordered verified admissions, genesis-first.
-    pub chain: Vec<CurationAdmission>,
+    pub chain: Vec<LifecycleAdmission>,
     /// Caller-issued transition identities: exactly `chain.len() + 1`
     /// (capture plus one audit leg per hop, in order).
     pub hop_identities: Vec<OperationIdentity>,
@@ -316,7 +317,7 @@ pub enum LifecyclePersistError {
         /// Stable reason code.
         reason: &'static str,
     },
-    /// The presented chain failed curation verification.
+    /// The presented chain failed admission verification.
     #[error("lifecycle chain rejected: {0}")]
     ChainRejected(String),
     /// The presented fence does not match live service authority.
@@ -354,7 +355,8 @@ impl LifecyclePersistError {
 /// hash-chained audit leg per hop.
 ///
 /// Validates the session, fence, and request shape; re-verifies the
-/// chain through the curation owner; pre-builds every transition and
+/// chain through the kernel-local admission owner; pre-builds every
+/// transition and
 /// verifies every sealed hash before the first commit; then commits
 /// sequentially, chaining each audit leg to the previous committed
 /// hash. A mid-chain commit failure stops with an error while earlier
@@ -374,7 +376,7 @@ pub async fn handle_lifecycle_persist_request(
     if request.context.state_fence != request.state_fence {
         return Err(LifecyclePersistError::FenceMismatch);
     }
-    verify_admission_chain(&request.chain)
+    verify_lifecycle_admission_chain(&request.chain)
         .map_err(|error| LifecyclePersistError::ChainRejected(error.to_string()))?;
     let legs = build_persist_transitions(request)?;
     for leg in &legs {
@@ -507,7 +509,7 @@ pub fn build_persist_transitions(
     request: &LifecyclePersistRequest,
 ) -> Result<Vec<BuiltLeg>, LifecyclePersistError> {
     validate_persist_request(request)?;
-    verify_admission_chain(&request.chain)
+    verify_lifecycle_admission_chain(&request.chain)
         .map_err(|error| LifecyclePersistError::ChainRejected(error.to_string()))?;
     let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)
         .map_err(|_| LifecyclePersistError::ManifestMismatch)?;
@@ -554,7 +556,7 @@ pub fn build_persist_transitions(
         request.hop_identities.len() + request.hop_mutations.iter().flatten().count(),
     );
     let genesis = &request.chain[0];
-    if genesis.operation != CurationMutationOperation::CaptureObservation {
+    if genesis.operation != LifecycleMutationOperation::CaptureObservation {
         return Err(LifecyclePersistError::ChainRejected(
             "chain must start from a CaptureObservation genesis".to_owned(),
         ));
@@ -704,7 +706,7 @@ fn validate_persist_request(
 /// appointment are the cross-owner bindings.
 fn validate_mutation_input(
     input: &HopMutationInput,
-    admission: &CurationAdmission,
+    admission: &LifecycleAdmission,
     request: &LifecyclePersistRequest,
 ) -> Result<(), LifecyclePersistError> {
     let invalid = |field: &'static str| LifecyclePersistError::InvalidField {
@@ -727,7 +729,7 @@ fn validate_mutation_input(
             payload
                 .validate()
                 .map_err(LifecyclePersistError::from_store)?;
-            if admission.operation != CurationMutationOperation::ApplyEpistemicRevision {
+            if admission.operation != LifecycleMutationOperation::ApplyEpistemicRevision {
                 return Err(invalid("lifecycle.persist.mutation"));
             }
             if payload.candidate.scope != admission.receipt.scope.as_str() {
@@ -755,7 +757,7 @@ fn validate_mutation_input(
             // Declared six-field shape is enforced by the owner
             // catalogue gate at build; semantic policy content stays
             // skill-owner-admitted.
-            if admission.operation != CurationMutationOperation::ApplyLifecyclePolicy {
+            if admission.operation != LifecycleMutationOperation::ApplyLifecyclePolicy {
                 return Err(invalid("lifecycle.persist.mutation"));
             }
         }
@@ -797,9 +799,9 @@ fn event_id_for(receipt_id: &ArtifactId) -> Result<EventId, LifecyclePersistErro
 }
 
 fn capture_command(
-    admission: &CurationAdmission,
+    admission: &LifecycleAdmission,
 ) -> Result<NamedMutationRequest, LifecyclePersistError> {
-    if admission.operation != CurationMutationOperation::CaptureObservation {
+    if admission.operation != LifecycleMutationOperation::CaptureObservation {
         return Err(LifecyclePersistError::ChainRejected(
             "genesis hop must carry CaptureObservation".to_owned(),
         ));
@@ -816,7 +818,7 @@ fn capture_command(
 }
 
 fn audit_command(
-    admission: &CurationAdmission,
+    admission: &LifecycleAdmission,
     identity: &OperationIdentity,
     session_id: &SessionId,
     previous_operation_id: &str,
@@ -876,7 +878,7 @@ struct TransitionBindings {
 /// seal.
 fn mutation_transition_for(
     input: &HopMutationInput,
-    admission: &CurationAdmission,
+    admission: &LifecycleAdmission,
     bindings: &TransitionBindings,
 ) -> Result<PreparedTransition, LifecyclePersistError> {
     let transition = match &input.mutation {
@@ -1008,7 +1010,7 @@ struct TransitionSpec {
 /// One hop's leg inputs for [`hop_legs_for`].
 struct HopLegParams<'a> {
     index: usize,
-    admission: &'a CurationAdmission,
+    admission: &'a LifecycleAdmission,
     audit_identity: &'a OperationIdentity,
     mutation: Option<&'a HopMutationInput>,
     session_id: &'a SessionId,
