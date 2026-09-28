@@ -87,14 +87,35 @@
 //!   denominator, which [`OrsBackupSnapshot::validate`] can never accept as
 //!   `Complete`. Legacy evidence is partial evidence, not an empty family.
 //!
+//! Issue #953 gives the row family denominator its missing reader
+//! ([`check_row_family_census`]). [`row_family_denominator`] was a static
+//! `vec![]` that nothing compared with anything, so a physical ORS table absent
+//! from the list was invisible in both directions: not exported, not counted and
+//! not refused. The census now enumerates every `TableDefinition` the store
+//! declares — by referencing `store.rs`'s own constants, so a renamed table
+//! cannot drift from its entry — and compares that set with the tables redb
+//! reports for the file being read, under the same transaction as the pages.
+//! Counted at the time of writing: 59 declared tables, 39 backing a dispositioned
+//! row family and 20 carrying an explicit source-bound nonrestorable/forensic
+//! exclusion with the reason written next to it; 42 dispositioned families, of
+//! which 3 (the restore-journal families) are table-less by design and named as
+//! such. A table with no disposition is refused with
+//! [`OrsError::MigrationRequired`] on all three paths that run —
+//! [`export_page`], [`export_snapshot`] and [`import_page_quarantined`] — so it
+//! cannot be silently exported, imported or counted, and no table disappears
+//! because its name was absent from an old checklist.
+//!
 //! Issue #2883 adds the durable `backup.verify` result family to that same
 //! denominator. `RowFamilyKind::BackupVerificationResults` is one row per distinct
 //! `(principal, authority lineage, operation id)` within one installation's ORS
 //! file, and it is now DECLARED in this EXISTING ORS operational retention/export
 //! contract, which is the existing owner of its lifecycle. Be precise about what
-//! that declaration is worth: `row_family_denominator` has NO production reader in
-//! this tree, on this branch and on `origin/main`, so nothing yet COUNTS the family
-//! and nothing bounds it. Its real cardinality is one row per distinct
+//! that declaration is worth: `row_family_denominator` is now READ by
+//! [`check_row_family_census`], which compares it with the tables redb reports
+//! for the file being read and refuses a store whose tables outrun the compiled
+//! contract (issue #953, A5), so the list is a census that runs rather than a
+//! constant that is compared with nothing. What it still does NOT do is bound the
+//! family: nothing here evicts, expires or caps it. Its real cardinality is one row per distinct
 //! `(principal, authority lineage, operation id)`, plus one quarantined row per
 //! pre-#2883 caller key. No eviction, TTL, cap or deletion is added here, and the
 //! bounded-retirement work stays with the separate ORS retention owner. The
@@ -190,7 +211,7 @@ use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableHandle};
 
 use super::persistence_codec::{decode, decode_named, encode};
 use super::persistence_models::DurableOperationalRecord;
@@ -200,8 +221,8 @@ use crate::backup_snapshot::{
     MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest,
     OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor,
     OrsFamilyRowChain, OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition,
-    RowFamilyDisposition, RowFamilyKind, StoredEffectClass, check_canonical_frozen,
-    validate_import_binding,
+    RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
+    check_canonical_frozen, validate_import_binding,
 };
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
@@ -308,9 +329,11 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         // Owner-backed verification results are evidence, never authority: this
         // family is DECLARED in the EXISTING ORS operational retention/export
         // contract here (#2883 instruction 10), which is that contract's own
-        // lifecycle owner. Be precise about what the declaration buys: this
-        // function has NO production reader in this tree, so nothing yet counts
-        // the family and nothing bounds it. No eviction, TTL, cap or deletion is
+        // lifecycle owner. Be precise about what the declaration buys: since
+        // issue #953 this function has a production reader,
+        // `check_row_family_census`, so the family is now COUNTED against the
+        // store's real tables — but nothing BOUNDS it, and that is a separate
+        // owner's job. No eviction, TTL, cap or deletion is
         // added; the real cardinality is one row per distinct
         // `(principal, authority lineage, operation id)` within one installation's
         // ORS file, plus one quarantined row per pre-#2883 caller key, and bounded
@@ -442,6 +465,524 @@ fn effect_class_for_versioned_artifact(state: ArtifactGenerationState) -> Stored
 /// the same type the store's own family constants are declared with, instead of
 /// restating a lifetime spelling that would have to track redb's generics.
 type FamilyTable = redb::TableDefinition<'static, &'static str, &'static str>;
+
+/// The source-bound backup disposition of ONE physical ORS table (issue #953,
+/// A5).
+///
+/// The issue's requirement is two-sided and both sides are here. "Every stored
+/// row family is included" is [`TableDisposition::Family`]: the table is the
+/// durable backing of a row family, and that family's exact policy is
+/// [`row_family_denominator`], so there is one disposition per family and not
+/// one per table. "or has an explicit source-bound nonrestorable/forensic
+/// exclusion" is [`TableDisposition::Excluded`]: the table is named, its
+/// disposition is one of the two exclusion dispositions, and the reason is
+/// written next to it. An unnamed table is not an option — that is the whole
+/// point, because a table that is merely absent from a list is indistinguishable
+/// from a table that was forgotten.
+#[derive(PartialEq, Eq)]
+enum TableDisposition {
+    /// The table is the durable backing of a dispositioned row family.
+    Family(RowFamilyKind),
+    /// The table is not a backup row family, permanently and by decision.
+    Excluded {
+        /// Always `NonrestorableHistorical` or `ForensicOnly`. `Restorable` is
+        /// refused for an excluded table by [`check_row_family_census`]: it means
+        /// "eligible for the family's own quarantined import", and a table with
+        /// no family has no import path, so the word would advertise a durable
+        /// re-import that does not exist.
+        disposition: RowDisposition,
+        /// Why this table is excluded, in terms of what restoring it would mean.
+        reason: &'static str,
+    },
+}
+
+/// One physical ORS table and the disposition that covers it.
+struct DispositionedTable {
+    /// The store's OWN table constant, not a re-spelled name.
+    table: FamilyTable,
+    disposition: TableDisposition,
+}
+
+/// Every physical table the ORS store declares, each with its exact disposition
+/// (issue #953, A5).
+///
+/// The table is named by referencing `store.rs`'s own `const`, never by
+/// restating its string. That is the difference between a census and another
+/// hand-maintained list: a renamed or replaced table changes its `TableDefinition`
+/// here too, so the two cannot drift apart, and the live-name comparison in
+/// [`check_row_family_census`] is the only place a literal name appears at all —
+/// and there it comes from redb, not from this file.
+///
+/// Counted against `store.rs` at the time of writing: 59 declared tables, of
+/// which 39 back a dispositioned row family and 20 are explicit source-bound
+/// exclusions. `row_family_denominator` carries 42 families; the three that are
+/// not table-backed are named in [`table_less_families`].
+///
+/// Split in two so neither half can grow past the point where a reader stops
+/// checking it: 39 table-backed families and 20 source-bound exclusions.
+fn dispositioned_tables() -> Vec<DispositionedTable> {
+    let mut tables = family_backed_tables();
+    tables.extend(source_bound_exclusions());
+    tables
+}
+
+/// Binds one table to the row family that owns it.
+fn family(table: FamilyTable, kind: RowFamilyKind) -> DispositionedTable {
+    DispositionedTable {
+        table,
+        disposition: TableDisposition::Family(kind),
+    }
+}
+
+/// Records one table as an explicit, source-bound exclusion.
+///
+/// The reason is a mandatory argument, not a comment: it is what makes this entry
+/// a decision rather than an absence, and it says what restoring the table would
+/// MEAN, which is the question an operator actually has when a row is missing
+/// from a restore.
+fn excluded(
+    table: FamilyTable,
+    disposition: RowDisposition,
+    reason: &'static str,
+) -> DispositionedTable {
+    DispositionedTable {
+        table,
+        disposition: TableDisposition::Excluded {
+            disposition,
+            reason,
+        },
+    }
+}
+
+/// The 39 tables that back a dispositioned row family.
+fn family_backed_tables() -> Vec<DispositionedTable> {
+    let mut tables = canonical_family_tables();
+    tables.extend(supervision_and_replay_family_tables());
+    tables
+}
+
+/// The 22 tables backing the canonical operational and recovery row families.
+fn canonical_family_tables() -> Vec<DispositionedTable> {
+    vec![
+        family(super::ENVELOPES, RowFamilyKind::Envelopes),
+        family(super::RESERVATIONS, RowFamilyKind::Reservations),
+        family(super::RESERVATION_ORDERS, RowFamilyKind::ReservationOrders),
+        family(super::SCOPE_HEADS, RowFamilyKind::ScopeHeads),
+        family(super::SCOPE_TERMINALS, RowFamilyKind::ScopeTerminals),
+        family(
+            super::OPERATIONAL_CURRENT,
+            RowFamilyKind::OperationalCurrent,
+        ),
+        family(
+            super::OPERATIONAL_HISTORY,
+            RowFamilyKind::OperationalHistory,
+        ),
+        family(super::RECOVERY_INBOX, RowFamilyKind::RecoveryInbox),
+        family(
+            super::RECOVERY_INBOX_HISTORY,
+            RowFamilyKind::RecoveryInboxHistory,
+        ),
+        family(
+            super::PROCESS_START_REPLAY,
+            RowFamilyKind::ProcessStartReplay,
+        ),
+        family(super::AUTHORITY_HANDOFFS, RowFamilyKind::AuthorityHandoffs),
+        family(super::PROCESS_EVIDENCE, RowFamilyKind::ProcessEvidence),
+        family(
+            super::PROCESS_STREAM_RECOVERY,
+            RowFamilyKind::ProcessStreamRecovery,
+        ),
+        family(
+            super::SCAN_DISCLOSURE_RECORDS,
+            RowFamilyKind::ScanDisclosure,
+        ),
+        family(
+            super::BACKUP_VERIFICATION_RESULTS,
+            RowFamilyKind::BackupVerificationResults,
+        ),
+        family(super::CUTOVER_OWNERSHIP, RowFamilyKind::CutoverOwnership),
+        family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
+        family(
+            super::VERSIONED_ARTIFACTS,
+            RowFamilyKind::VersionedArtifacts,
+        ),
+        family(
+            super::ACTIVATION_LIFECYCLES,
+            RowFamilyKind::ActivationLifecycle,
+        ),
+    ]
+}
+
+/// The 17 tables backing the supervision, replay, doctor and retention families.
+///
+/// A separate function from [`canonical_family_tables`] only because the whole
+/// census must stay inside one reviewable length; the split is at the
+/// supervision-lease boundary, which is also where the issue's own list of
+/// retained families begins.
+fn supervision_and_replay_family_tables() -> Vec<DispositionedTable> {
+    vec![
+        family(
+            super::SUPERVISION_LEASE_STAGED,
+            RowFamilyKind::SupervisionLeaseStaged,
+        ),
+        family(
+            super::SUPERVISION_LEASE_CURRENT,
+            RowFamilyKind::SupervisionLeaseCurrent,
+        ),
+        family(
+            super::SUPERVISION_LEASE_HISTORY,
+            RowFamilyKind::SupervisionLeaseHistory,
+        ),
+        family(
+            super::SUPERVISION_LEASE_RESULTS,
+            RowFamilyKind::SupervisionLeaseResults,
+        ),
+        family(
+            super::SUPERVISION_LEASE_STAGE_RESOLUTIONS,
+            RowFamilyKind::SupervisionStageResolutions,
+        ),
+        family(super::STORE_REBIND_REPLAY, RowFamilyKind::StoreRebindReplay),
+        family(
+            super::STORE_FAILURE_RETENTION,
+            RowFamilyKind::StoreFailureRetention,
+        ),
+        family(
+            super::UNKNOWN_COMMIT_RECOVERY,
+            RowFamilyKind::UnknownCommitRecovery,
+        ),
+        family(
+            super::ACTIVATION_RESULT_RETENTION,
+            RowFamilyKind::ActivationResultRetention,
+        ),
+        family(
+            super::NATIVE_WORKER_CLAIMS,
+            RowFamilyKind::NativeWorkerClaims,
+        ),
+        family(super::REPLAY_STREAMS, RowFamilyKind::ReplayStreams),
+        family(super::REPLAY_REQUESTS, RowFamilyKind::ReplayRequests),
+        family(super::REPLAY_EVENTS, RowFamilyKind::ReplayEvents),
+        family(super::REPLAY_ACKS, RowFamilyKind::ReplayAcks),
+        family(super::DOCTOR_ATTEMPTS, RowFamilyKind::DoctorAttempts),
+        family(super::DOCTOR_EFFECTS, RowFamilyKind::DoctorEffects),
+        family(super::DOCTOR_BUDGETS, RowFamilyKind::DoctorBudgets),
+        family(super::RECOVERY_PROBLEMS, RowFamilyKind::RecoveryProblems),
+        family(
+            super::GRANT_CLOSURE_CURRENT,
+            RowFamilyKind::GrantClosureCurrent,
+        ),
+        family(
+            super::GRANT_GRAPH_REVISION_CURRENT,
+            RowFamilyKind::GrantGraphRevisionCurrent,
+        ),
+    ]
+}
+
+/// The 20 tables that are explicitly NOT backup row families, each with the
+/// disposition and the reason that excludes it.
+///
+/// Grouped by what makes a table un-restorable rather than alphabetically, so
+/// the grouping's own justification is visible.
+fn source_bound_exclusions() -> Vec<DispositionedTable> {
+    let mut tables = owner_state_exclusions();
+    tables.extend(projection_family_exclusions());
+    tables
+}
+
+/// The five exclusions that are owner state: three re-established by the
+/// receiving owner, two superseded or already-committed facts.
+fn owner_state_exclusions() -> Vec<DispositionedTable> {
+    vec![
+        // ---- Owner-re-established state, not historical evidence ------------
+        // Not a row family: the store's own counters and schema keys. The
+        // receiving installation re-establishes them from its own writes, and a
+        // restored counter would let a fresh file claim an ordering head or a
+        // family revision it never had.
+        excluded(
+            super::META,
+            RowDisposition::NonrestorableHistorical,
+            "store-owned counters and schema keys are re-established by the receiving owner; a restored counter would let a fresh file claim an ordering head it never had",
+        ),
+        // Not a row family: the durable operation index is re-derived by the
+        // canonical ordering owner from the operational history it admits, so a
+        // restored index would present another installation's operations as this
+        // one's.
+        excluded(
+            super::OPERATIONS,
+            RowDisposition::NonrestorableHistorical,
+            "the durable operation index is re-derived by the canonical ordering owner; a restored index would present another installation's operations as this one's",
+        ),
+        // Not a row family: a derived index over HOST_REQUESTS, carrying no row a
+        // backup of that family does not already carry.
+        excluded(
+            super::HOST_REQUEST_LOGICAL_KEYS,
+            RowDisposition::NonrestorableHistorical,
+            "a derived lookup index over HOST_REQUESTS; it is rebuilt from those rows and holds no row of its own",
+        ),
+        // ---- Explicit source-bound exclusions: superseded or committed ----
+        // Superseded by `GRANT_CLOSURE_CURRENT` (v2). Its bytes are an explicit
+        // startup-migration input and are removed by that migration, so a
+        // restored row is a legacy artefact, never a closure fact.
+        excluded(
+            super::GRANT_CLOSURE_LEGACY_CURRENT,
+            RowDisposition::ForensicOnly,
+            "superseded by the v2 closure table; these bytes are a startup-migration input that migration removes, never a restorable closure fact",
+        ),
+        // Committed second-phase closure links. They record that an order was
+        // placed; no import path re-authorizes one, and re-deriving them from
+        // the first-phase row is the owner's job at its own write time.
+        excluded(
+            super::GRANT_CLOSURE_SECOND_PHASE_CURRENT,
+            RowDisposition::ForensicOnly,
+            "committed second-phase closure links are evidence that an order was placed; no import path re-authorizes one and the owner re-derives them at its own write time",
+        ),
+    ]
+}
+
+/// The fifteen exclusions that are another owner's projection: four campaign
+/// families and eleven bridge families.
+///
+/// `ForensicOnly` for all of them, and for the same reason the
+/// `BackupVerificationResults` sibling is: none has a durable `import_*_suspended`
+/// path in this crate, so `Restorable` would advertise a re-import that does not
+/// exist, while every one of them is genuinely evidence about a past event.
+fn projection_family_exclusions() -> Vec<DispositionedTable> {
+    vec![
+        // ---- Campaign projections ------------------------------------------
+        // Generated views are derived from authenticated local reads. A
+        // restored view is stale by construction, and its content address names
+        // bytes a future read of the restored store need not reproduce.
+        excluded(
+            super::CAMPAIGN_LEARNING_STATE_VIEWS,
+            RowDisposition::ForensicOnly,
+            "content-addressed views generated from authenticated local reads; a restored view is stale by construction and its address need not name anything a future read reproduces",
+        ),
+        // Immutable owner-source rows: evidence of a past publication, with no
+        // durable import path in this crate.
+        excluded(
+            super::CAMPAIGN_SOURCE_RECORDS,
+            RowDisposition::ForensicOnly,
+            "immutable owner-source rows are evidence of a past publication; this crate has no import path that would make one current again",
+        ),
+        // Current heads are the installation's own source authority. A restored
+        // head would re-point the owner at a source the restored installation
+        // never read from.
+        excluded(
+            super::CAMPAIGN_SOURCE_HEADS,
+            RowDisposition::ForensicOnly,
+            "current owner-source heads are this installation's own source authority; a restored head would re-point the owner at a source it never read",
+        ),
+        // Pre-commit CAS reservations exist to reconcile a crash this
+        // installation did not have. Replaying one would re-reserve against
+        // durable state that no longer exists.
+        excluded(
+            super::CAMPAIGN_SOURCE_PENDING,
+            RowDisposition::ForensicOnly,
+            "pre-commit CAS reservations reconcile a crash the restored installation did not have; replaying one would re-reserve against state that no longer exists",
+        ),
+        // ---- Bridge families, owned by the bridge owner -------------------
+        // Bridge-event rows are bound to the bridge owner's own stream cursors.
+        // A restored row would re-present an event this installation never
+        // received, behind a cursor that never advanced.
+        excluded(
+            super::BRIDGE_EVENT_RECORDS,
+            RowDisposition::ForensicOnly,
+            "bridge-event rows are bound to the bridge owner's own cursors; a restored row re-presents an event this installation never received",
+        ),
+        // Per-stream cursors are the bridge owner's progress state. Restoring one
+        // would silently skip or repeat events.
+        excluded(
+            super::BRIDGE_EVENT_CURSORS,
+            RowDisposition::ForensicOnly,
+            "per-stream bridge cursors are the bridge owner's own progress; a restored cursor skips or repeats events without the owner ever moving it",
+        ),
+        // Coverage gaps record what the owner did not receive, which is only
+        // meaningful next to the cursor that would have closed them.
+        excluded(
+            super::BRIDGE_EVENT_GAPS,
+            RowDisposition::ForensicOnly,
+            "coverage gaps record what the bridge owner did not receive and are only meaningful beside the cursor that would close them",
+        ),
+        // Staged handoffs belong to a handoff the destination never accepted.
+        excluded(
+            super::BRIDGE_EVENT_HANDOFFS,
+            RowDisposition::ForensicOnly,
+            "staged bridge handoffs belong to a handoff this installation never accepted, and completing one would cross an authority boundary",
+        ),
+        // Retained authority lineage, principals and presenter-scope ownership:
+        // installation-bound authority, exactly what recovery must not resurrect
+        // (I05-27 / ARCH-RES-03).
+        excluded(
+            super::BRIDGE_STREAM_OWNERS,
+            RowDisposition::ForensicOnly,
+            "retained bridge authority lineage, principals and presenter-scope ownership are installation-bound authority; recovery must not resurrect them",
+        ),
+        // A derived enumeration index over the row above.
+        excluded(
+            super::BRIDGE_STREAM_OWNER_LIST_INDEX,
+            RowDisposition::ForensicOnly,
+            "a derived enumeration index over BRIDGE_STREAM_OWNERS; it is rebuilt from those rows and holds no owner of its own",
+        ),
+        // Recovery windows are bound to a presenter and an owner inventory
+        // cutoff. Neither is re-establishable in the destination, so a restored
+        // window would authorize a search over an inventory that no longer
+        // exists.
+        excluded(
+            super::BRIDGE_EVENT_RECOVERY_WINDOWS,
+            RowDisposition::ForensicOnly,
+            "recovery windows are bound to a presenter and an owner inventory cutoff; neither is re-establishable in the destination, so a restored window authorizes a search over an inventory that no longer exists",
+        ),
+        // Per-window cuts are the window's own progress through a stream and gap
+        // set: forensic evidence of a past window.
+        excluded(
+            super::BRIDGE_EVENT_RECOVERY_CUTS,
+            RowDisposition::ForensicOnly,
+            "per-window stream and gap cuts are forensic evidence of a past window, not state any owner resumes from",
+        ),
+        // Monotonic per-owner view revisions. Re-establishing them would misreport
+        // how much of the owner's view the destination has seen.
+        excluded(
+            super::BRIDGE_EVENT_RECOVERY_REVISIONS,
+            RowDisposition::ForensicOnly,
+            "monotonic per-owner view revisions describe how much the owner has seen; a restored value misreports that for the destination",
+        ),
+        // Compacted replay-commitment boundaries. The owner recomputes them from
+        // live evidence, and a restored boundary would retire replay evidence
+        // that is still exact.
+        excluded(
+            super::BRIDGE_EVENT_POSITIONS,
+            RowDisposition::ForensicOnly,
+            "compacted replay boundaries are recomputed by the owner from live evidence; a restored one would retire evidence that is still exact",
+        ),
+        // Replay commitments are minted against the committing store's own
+        // evidence. A restored commitment names a commitment this installation
+        // never made.
+        excluded(
+            super::BRIDGE_EVENT_REPLAY_COMMITMENTS,
+            RowDisposition::ForensicOnly,
+            "replay commitments are minted against the committing store's own evidence; a restored one names a commitment this installation never made",
+        ),
+    ]
+}
+
+/// Dispositioned row families that are deliberately NOT backed by an ORS table.
+///
+/// They are restore-journal families, owned by `crate::restore_journal`, which is
+/// not a redb table family at all — so a census that demanded a table for them
+/// would be demanding a table that does not exist. They are named here precisely
+/// so that "no table in the ORS store backs this family" is a stated decision
+/// this function checks, rather than an absence a future family could hide in:
+/// adding a [`RowFamilyKind`] variant and a disposition without either a table
+/// here or a listing here is refused.
+fn table_less_families() -> &'static [RowFamilyKind] {
+    &[
+        RowFamilyKind::RestoreJournalIntents,
+        RowFamilyKind::RestoreJournalResults,
+        RowFamilyKind::RestoreJournalMeta,
+    ]
+}
+
+/// Refuses a backup whose row-family denominator does not cover the store the
+/// snapshot is being taken from (issue #953, A5).
+///
+/// This is the production reader [`row_family_denominator`] did not have. The
+/// disposition list used to be a decorative constant compared with nothing, so a
+/// table that no entry named was invisible in both directions: it was not
+/// exported, not counted, and not refused. It is now compared with the tables
+/// redb reports for the file being read, under the caller's own transaction, so
+/// the census describes the same moment as the pages.
+///
+/// Five checks, all fail-closed, all [`OrsError::MigrationRequired`] because a
+/// store whose tables outrun the compiled contract is exactly a schema the
+/// compiled binary was not built for:
+///
+/// 1. No table name appears twice in the census — a doubled entry would make one
+///    physical table look dispositioned twice and hide a genuine gap behind the
+///    duplicate.
+/// 2. Every table redb reports for this file is dispositioned. This is the
+///    issue's sentence verbatim: "No table disappears because its name was
+///    absent from an old checklist." A table the file has and the contract does
+///    not name is refused, not exported around.
+/// 3. Every census entry that claims a family is dispositioned by
+///    [`row_family_denominator`], so the physical census and the family policy
+///    cannot disagree about a family's disposition.
+/// 4. Every family in [`row_family_denominator`] is either table-backed by the
+///    census or named in [`table_less_families`], so a new declared family
+///    cannot be added without deciding which of the two it is.
+/// 5. No excluded table claims [`RowDisposition::Restorable`], which would
+///    advertise a quarantined import path for a table that has no family and
+///    therefore no import path.
+///
+/// Cost is one `list_tables` plus a 59-entry linear scan, both bounded and both
+/// independent of store size: it is a schema census, not a data scan. It runs
+/// once per export entrypoint and once per quarantined import, never per page.
+fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
+    let census = dispositioned_tables();
+    let mut census_names: Vec<&str> = Vec::with_capacity(census.len());
+    for entry in &census {
+        let name = entry.table.name();
+        if census_names.contains(&name) {
+            return Err(OrsError::MigrationRequired {
+                reason: format!("row family census declares table {name:?} more than once"),
+            });
+        }
+        if let TableDisposition::Excluded { disposition, .. } = entry.disposition
+            && disposition == RowDisposition::Restorable
+        {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "row family census excludes table {name:?} as Restorable; an excluded table has no quarantined import path"
+                ),
+            });
+        }
+        census_names.push(name);
+    }
+    // Check 2. `list_tables` is the file's own answer, not this crate's
+    // compilation of it, so a table written by another build of the ORS is
+    // caught here rather than silently skipped.
+    let live = read.list_tables().map_err(storage)?;
+    for handle in live {
+        let name = handle.name();
+        if !census_names.contains(&name) {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "ORS table {name:?} is present in this store and has no backup row family disposition; a table must not disappear because its name is absent from an old checklist"
+                ),
+            });
+        }
+    }
+    // Checks 3 and 4, against the family policy this module delegates to.
+    let denominator = row_family_denominator();
+    for entry in &census {
+        let TableDisposition::Family(kind) = entry.disposition else {
+            continue;
+        };
+        if !denominator
+            .iter()
+            .any(|disposition| disposition.kind == kind)
+        {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "table {:?} is bound to row family {kind:?}, which the backup row family denominator does not disposition",
+                    entry.table.name()
+                ),
+            });
+        }
+    }
+    for disposition in &denominator {
+        let bound = census
+            .iter()
+            .any(|entry| entry.disposition == TableDisposition::Family(disposition.kind));
+        if !bound && !table_less_families().contains(&disposition.kind) {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "row family {:?} is dispositioned as a backup row family but is neither bound to an ORS table nor declared table-less",
+                    disposition.kind
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// The durable table that backs one cursor-paged row family (issue #1971).
 ///
@@ -985,6 +1526,13 @@ fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize
             order,
             payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
             effect_class: effect,
+            // A row that reached this point was decoded and re-encoded from the
+            // source bytes, so its payload WAS obtained. The state is stated
+            // rather than defaulted because the enum has no "unknown" arm: a row
+            // this path cannot read is refused by `family_row_refused` above and
+            // never becomes an entry, so `Unavailable` is unreachable from the
+            // store and is an admission-side refusal only (issue #953, A6).
+            payload_state: RowPayloadState::Obtained,
         });
     }
     let continuation = OrsFamilyContinuation {
@@ -1293,6 +1841,12 @@ pub(super) fn export_page(
     let read = database.begin_read().map_err(storage)?;
     let observation = capture_store_fence(&read)?;
     check_export_fence(request, &observation)?;
+    // The census runs on the single-page entrypoint too, not only on the whole
+    // snapshot: a page is the unit a caller actually holds, and a page built
+    // from a store whose tables outrun the compiled contract must not be
+    // produced at all. It is the same transaction as the page, so it describes
+    // the same moment (issue #953, A5).
+    check_row_family_census(&read)?;
     let page = export_page_in(&read, request, page_index, &observation)?;
     drop(read);
     Ok(page)
@@ -1407,6 +1961,11 @@ fn export_page_in(
             order,
             payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
             effect_class: effect_class_for_export(record.phase),
+            // `selected` holds only rows that decoded and re-encoded, so the
+            // payload was obtained; an unreadable operational row fails the
+            // export at `decode_named` instead of becoming an unavailable entry
+            // (issue #953, A6).
+            payload_state: RowPayloadState::Obtained,
         });
     }
     // Family paging, in a fixed order, each charged from what is actually left
@@ -1646,6 +2205,11 @@ pub(super) fn export_snapshot(
     let read = database.begin_read().map_err(storage)?;
     let observation = capture_store_fence(&read)?;
     check_export_fence(request, &observation)?;
+    // Every table this store declares must carry an exact row family disposition
+    // BEFORE a single row is read, so a store whose tables outrun the compiled
+    // contract refuses the whole export rather than producing a snapshot whose
+    // denominator silently omits a table (issue #953, A5).
+    check_row_family_census(&read)?;
     // Every declared family cursor is proved frozen BEFORE the page loop, so a
     // family that already moved refuses the whole export rather than only the
     // page that would have read it.
@@ -1835,6 +2399,13 @@ pub(super) fn import_page_quarantined(
     // ONE read transaction for the whole entry loop: every entry is triaged
     // against the same durable state, so the outcome vector describes one moment.
     let read = database.begin_read().map_err(storage)?;
+    // The DESTINATION's own row family census, before a single entry is triaged
+    // (issue #953, A5). The issue requires that a family with no disposition
+    // "cannot be silently exported, imported or counted", and this is the import
+    // half: a page carrying a family this installation's compiled contract does
+    // not disposition is refused here rather than triaged entry by entry into
+    // outcomes that describe a denominator nobody declared.
+    check_row_family_census(&read)?;
     let mut outcomes: Vec<(String, PerEntryOutcome)> = Vec::with_capacity(page.entries.len());
     for entry in &page.entries {
         outcomes.push((entry.record_id.clone(), triage_entry(&read, entry)?));
