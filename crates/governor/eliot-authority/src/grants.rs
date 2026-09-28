@@ -2495,10 +2495,9 @@ impl GrantGraph {
     /// omission source's authority root, and every such omission to bind to
     /// a CURRENT verified quarantine binding. Anything less — an unfinished
     /// traversal, a nonempty frontier, a same-root dependent recorded as
-    /// cross-scope, an unbound omission, or a
-    /// denominator mismatch — is an explicit partial/unknown state with
-    /// the exact frontier and omissions, never an omission-labelled
-    /// success.
+    /// cross-scope, an unbound omission, or a denominator mismatch — is an
+    /// explicit partial/unknown state with the exact frontier and
+    /// omissions, never an omission-labelled success.
     ///
     /// The graph consumes already-qualified evidence only: it looks
     /// bindings up by exact relation id and rechecks the edge, but it
