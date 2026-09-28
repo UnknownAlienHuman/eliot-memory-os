@@ -1282,7 +1282,11 @@ mod tests {
             if frame.kind == FrameKind::Control {
                 let hello = ServerHello {
                     selected_protocol: ProtocolVersion::CURRENT,
-                    session_principal_binding: "fake-store-session".to_owned(),
+                    session_principal_binding: format!(
+                        "sid={};session={}",
+                        self.requirement.expected_peer_sid.as_str(),
+                        self.requirement.expected_peer_session_id
+                    ),
                     allowed_capabilities: CAPABILITIES
                         .iter()
                         .map(|value| (*value).to_owned())
@@ -2651,6 +2655,11 @@ fn decode_server_hello(
     requirement: &HostStoreBootstrapRequirement,
 ) -> Result<ServerHello, StoreClientError> {
     let server = eliot_ipc::decode_server_hello_frame(frame, requirement.connection_id.as_str())?;
+    let expected_session_principal_binding = format!(
+        "sid={};session={}",
+        requirement.expected_peer_sid.as_str(),
+        requirement.expected_peer_session_id
+    );
     let config_hash = server
         .config_snapshot
         .get("config_hash")
@@ -2670,6 +2679,7 @@ fn decode_server_hello(
         server.allowed_effects.iter().map(String::as_str).collect();
     if server.authority_epoch != requirement.authority_epoch().clone()
         || server.selected_protocol != ProtocolVersion::CURRENT
+        || server.session_principal_binding != expected_session_principal_binding
         || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())
         || config_hash != Some(requirement.approved_config_hash.as_str())
