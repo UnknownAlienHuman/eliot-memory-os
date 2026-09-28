@@ -114,28 +114,264 @@ interface handler {
   // ResearchSynthesis subtype: governed ResearchPack -> candidate ResearchBrief.
   // Preserves claims/counterclaims, citations, lineage, rivals, unknowns, probes,
   // inert concilium recommendation. Never invents evidence.
+  // Native wire names (kebab, exact model.rs order):
+  //   ResearchPack: pack-digest, question, task-id, scope-id, fence-epoch,
+  //     fence-generation, bundle-digest, manifest-digest, sources,
+  //     source-denominator, coverage-denominator, counter-search,
+  //     missing-source-classes, omitted-sources.
+  //   ResearchBrief: brief-id, pack-digest, question, claim-matrix, rivals,
+  //     unknowns, probes, probe-residue, concilium, coverage, dependence,
+  //     disposition, preservation, omitted, raw-digest, semantic-digest.
+  // Native: crates/smart/eliot-dreamer-research-synthesis/src/model.rs.
+  // The envelope keeps the governed pack reference beside the brief; the brief
+  // disposition stays the #634 guest parity spelling (candidate-disposition).
   record research-pack-ref {
     pack-digest: digest-hex,
-    source-denominator: list<artifact-id>,
     question: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    bundle-digest: digest-hex,
+    manifest-digest: digest-hex,
+    sources: list<source-card>,
+    source-denominator: list<artifact-id>,
+    coverage-denominator: denominator-kind,
+    counter-search: counter-search-status,
+    missing-source-classes: list<string>,
+    omitted-sources: list<omitted-source>,
     authorized-sources: list<artifact-id>,
   }
 
+  // One governed source card; the only citable set. Native: SourceCard.
+  record source-card {
+    handle: string,
+    grade: evidence-grade,
+    authority: source-authority,
+    freshness: freshness,
+    competence: string,
+    privacy-class: string,
+    allowed-use: string,
+    lineage-group: string,
+    transformed: bool,
+  }
+
+  // Denominator member not represented, with its reason. Native: OmittedSource.
+  record omitted-source {
+    handle: string,
+    reason: string,
+  }
+
+  // Coverage denominator kind backing absence reasoning. Native: DenominatorKind.
+  enum denominator-kind {
+    complete-scope,
+    sampled,
+    unknown,
+  }
+
+  // Counter-search status backing absence reasoning. Native: CounterSearchStatus.
+  enum counter-search-status {
+    complete,
+    partial,
+    not-run,
+  }
+
+  // Canonical evidence grade wire spelling. Native: EvidenceGrade (E0..E3).
+  enum evidence-grade {
+    e0,
+    e1,
+    e2,
+    e3,
+  }
+
+  // Claim-specific source authority tier, strongest first. Native: SourceAuthority.
+  enum source-authority {
+    authoritative,
+    competent,
+    limited,
+    unknown,
+  }
+
+  // Observed freshness. Native: Freshness.
+  enum freshness {
+    fresh,
+    stale,
+    unknown,
+  }
+
+  // One claim verdict of the claim/counterclaim matrix, input order preserved.
+  // Native: ClaimVerdict.
   record research-claim {
     claim-id: artifact-id,
+    is-counterclaim: bool,
+    kind: claim-kind,
+    disposition: claim-disposition,
     support: list<artifact-id>,
-    counterclaim: list<artifact-id>,
+    counter-evidence: list<artifact-id>,
     citations: list<artifact-id>,
+    weakest-grade: evidence-grade,
+    authority: source-authority,
+    lineage-groups: list<string>,
+    precision-notes: list<string>,
+    absence-basis: string,
+  }
+
+  // Material shape of the input. Native: ClaimKind.
+  enum claim-kind {
+    factual,
+    numeric,
+    time,
+    version,
+    causal,
+    absence,
+  }
+
+  // Exactly one disposition per input. Native: ClaimDisposition.
+  enum claim-disposition {
+    supported,
+    contested,
+    unsupported,
+    outside-manifest,
+    precision-limited,
+    absent-scope-complete,
+    absent-scope-incomplete,
+    duplicate-collapsed,
+    withheld,
   }
 
   record research-brief {
+    brief-id: string,
     pack: research-pack-ref,
+    pack-digest: digest-hex,
+    question: string,
     claims: list<research-claim>,
-    rivals: list<string>,
+    rivals: list<rival-position>,
     unknowns: list<string>,
-    probes: list<string>,
-    concilium-note: string,
+    probes: list<recommended-probe>,
+    probe-residue: list<probe-residue>,
+    concilium: concilium-recommendation,
+    coverage: coverage-report,
+    dependence: list<dependence-group>,
     disposition: candidate-disposition,
+    preservation: list<preservation-verdict>,
+    omitted: list<brief-omission>,
+    raw-digest: digest-hex,
+    semantic-digest: digest-hex,
+  }
+
+  // One retained rival position, input order preserved. Native: RivalPosition.
+  record rival-position {
+    rival-id: string,
+    position: string,
+    stance: rival-stance,
+    target-claim: string,
+    minority: bool,
+    evidence: list<string>,
+    weakest-grade: evidence-grade,
+  }
+
+  // Stance of a rival position toward one target claim. Native: RivalStance.
+  enum rival-stance {
+    supports,
+    opposes,
+    alternative,
+  }
+
+  // One recommended discriminative probe; recommendation only.
+  // Native: RecommendedProbe.
+  record recommended-probe {
+    probe-id: string,
+    discriminates: list<string>,
+    outcomes: list<string>,
+    verifier: string,
+    owner: string,
+    cost-class: string,
+    applicability: string,
+  }
+
+  // One supplied probe kept out of the recommendations. Native: ProbeResidue.
+  record probe-residue {
+    probe-id: string,
+    reason: probe-residue-reason,
+    detail: string,
+  }
+
+  // Why a supplied probe was not recommended. Native: ProbeResidueReason.
+  enum probe-residue-reason {
+    nondiscriminative,
+    unknown-target,
+    unauthorized,
+    budget,
+  }
+
+  // Sources grouped by canonical authoritative lineage. Native: DependenceGroup.
+  record dependence-group {
+    lineage-group: string,
+    members: list<string>,
+    independent-roots: u64,
+    unknown: bool,
+  }
+
+  // Inert Concilium recommendation; creates no meeting, message, job, budget
+  // or agent. Native: ConciliumRecommendation.
+  record concilium-recommendation {
+    owner: string,
+    evidence-refs: list<string>,
+    positions: list<string>,
+    review-objective: string,
+    effect-count: u64,
+    suppressed: bool,
+  }
+
+  // Visible coverage report with gaps. Native: CoverageReport.
+  record coverage-report {
+    denominator: denominator-kind,
+    counter-search: counter-search-status,
+    missing-classes: list<string>,
+    omitted-sources: list<omitted-source>,
+    represented-sources: list<string>,
+    cited-sources: list<string>,
+  }
+
+  // One bounded omission with its preserved denominator. Native: Omission.
+  record brief-omission {
+    kind: omission-kind,
+    detail: string,
+    denominator: u64,
+    omitted: u64,
+  }
+
+  // Which independent bound produced an omission. Native: OmissionKind.
+  enum omission-kind {
+    claims,
+    rivals,
+    references,
+    probes,
+    unknowns,
+    work,
+    output-bytes,
+    concilium,
+  }
+
+  // One I9.7 preservation verdict, canonical order. Native: PreservationVerdict.
+  // The dimension set is the research brief set, distinct from the handler
+  // preservation-dimension envelope set.
+  record preservation-verdict {
+    dimension: brief-preservation-dimension,
+    passed: bool,
+    known: bool,
+    note: string,
+  }
+
+  // The seven I9.7 preservation dimensions. Native: PreservationDimension.
+  enum brief-preservation-dimension {
+    coverage,
+    preservation,
+    faithfulness,
+    lineage,
+    reversibility,
+    source-authority,
+    dependency-closure,
   }
 
   record research-payload {
@@ -179,6 +415,20 @@ interface handler {
     payload: curation-payload,
   }
 
+  // Closed ceiling shared with the descriptor contract; candidate-only never
+  // implies admission. Same eight cases as context-admission, context-assembly
+  // and descriptor; mirrors component_contract::ProofCeiling.
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
   // Exhaustive subtype discriminator; unknown is explicit unsupported.
   variant handler-subtype {
     orientation(orientation-payload),
@@ -220,7 +470,7 @@ interface handler {
     disposition: candidate-disposition,
     preservation: preservation-report,
     output-digest: digest-hex,
-    proof-ceiling: string,
+    proof-ceiling: proof-ceiling,
     frontier: list<artifact-id>,
   }
 

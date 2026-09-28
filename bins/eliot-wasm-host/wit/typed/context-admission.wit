@@ -8,6 +8,10 @@ package eliot:current@0.1.0;
 //   NON_DROPPABLE -> non-droppable, HANDLE_ONLY -> handle-only,
 //   EXTRACTIVE -> extractive, SUMMARIZABLE -> summarizable.
 // Incomplete code: DECISION_CONTEXT_INCOMPLETE -> decision-context-incomplete (distinct from error).
+//   Native ContextErrorCode::DecisionContextIncomplete
+//   (crates/smart/eliot-context-contracts/src/error.rs) is the only code a
+//   decision-incomplete outcome carries; the record binds it as the closed
+//   decision-incomplete-code enum, never a free string.
 
 interface admission {
   type artifact-id = string;
@@ -188,10 +192,17 @@ interface admission {
     state: atom-availability,
   }
 
-  // First-class incomplete outcome; code must be decision-context-incomplete.
+  // Closed incomplete code; the only code a decision-incomplete outcome carries.
+  // Native: ContextErrorCode::DecisionContextIncomplete
+  // (crates/smart/eliot-context-contracts/src/error.rs). Never a free string.
+  enum decision-incomplete-code {
+    decision-context-incomplete,
+  }
+
+  // First-class incomplete outcome; code is the closed decision-incomplete-code.
   // Never converts to thinner complete success.
   record decision-incomplete {
-    code: string,
+    code: decision-incomplete-code,
     missing: list<artifact-id>,
     stale: list<artifact-id>,
     blocked: list<artifact-id>,
