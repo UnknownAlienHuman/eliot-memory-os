@@ -22,12 +22,13 @@
 //! [`BlobStore`](eliot_store::BlobStore); the returned handles are
 //! content-addressed, so both entries observe the identical bytes.
 //!
-//! Every planned stage is also resolved through the ready provider registry
-//! and admitted behind the test execution plane by admitted identity only
-//! ([`ProviderRegistry::resolve_parts`](eliot_instrument_runner::registry::ProviderRegistry::resolve_parts)
-//! plus [`TestdPlaneAdmission::admit_parts`](eliot_instrument_runner::TestdPlaneAdmission::admit_parts)):
-//! classification without execution provisions, so no invocation authority
-//! material is ever fabricated here.
+//! Every planned stage is also classified through the single composed
+//! provider-dispatch closure
+//! ([`compose_provider_dispatch`](eliot_instrument_runner::compose_provider_dispatch)):
+//! exactly-one-entry resolution, generation and fingerprint freshness,
+//! host support, then Testd admission behind the test execution plane, by
+//! admitted identity only. Classification without execution provisions, so
+//! no invocation authority material is ever fabricated here.
 //!
 //! No process is launched here and no task is declared complete: execution
 //! provisions (executor, request port, evidence sink) and finish authority
@@ -44,7 +45,10 @@ use eliot_instrument_runner::profile_run::{
     InstrumentRun, ProfileAggregate, StageEvidence, StageOrchestrator, StagePlan,
 };
 use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
-use eliot_instrument_runner::{RegistryError, TestdPlaneAdmission, TestdPortError};
+use eliot_instrument_runner::{
+    AvailabilityInputs, ProviderDispatch, ProviderDisposition, compose_provider_dispatch,
+    host_platform,
+};
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
 use serde::Serialize;
@@ -248,6 +252,8 @@ pub struct GovernedStageReport {
     pub provider_adapter: Option<String>,
     /// Testd admission decision over the admitted stage identity:
     /// `admitted`, `refused:<typed reason>`, or `unresolved:<typed reason>`.
+    /// Refusals name the exact closure cause, including
+    /// `refused:unsupported-platform` when this host cannot run the entry.
     /// Classification only; no stage launches on this decision.
     pub testd_admission: String,
     /// Execution axis only; never a semantic result.
@@ -435,10 +441,12 @@ impl GovernedProfileService {
             )
         })?;
         let aggregate = ProfileAggregate::assemble(&plan, runs);
+        let fingerprints = unattested_fingerprints();
+        let normative_pair_digest = String::new();
         let providers = ProviderRegistry::ready(
             BUILTIN_REGISTRY_GENERATION,
-            String::new(),
-            &unattested_fingerprints(),
+            normative_pair_digest.clone(),
+            &fingerprints,
         )
         .map_err(|error| {
             rejected(
@@ -446,9 +454,15 @@ impl GovernedProfileService {
                 &format!("ready provider registry is unavailable: {error}"),
             )
         })?;
+        let dispatch_inputs = AvailabilityInputs {
+            generation: BUILTIN_REGISTRY_GENERATION,
+            normative_pair_digest: &normative_pair_digest,
+            fingerprints: &fingerprints,
+            platform: host_platform(),
+        };
         let mut stages = Vec::with_capacity(plan.stages.len());
         for (planned, run) in plan.stages.iter().zip(aggregate.runs.iter()) {
-            let admission = admit_stage(&providers, planned);
+            let admission = admit_stage(&providers, planned, &dispatch_inputs);
             stages.push(persist_stage_report(
                 blob_store, &resolved, &plan, planned, run, &admission,
             )?);
@@ -539,67 +553,64 @@ struct StageAdmission {
     decision: String,
 }
 
-/// Admits one planned stage by admitted identity only (issue #1813 W4).
+/// Classifies one planned stage through the composed dispatch closure
+/// (issue #1813 W4 describe path).
 ///
-/// The stage spec and class resolve through the ready provider registry and
-/// admit behind the test execution plane without any invocation authority
-/// material: no State Fence, session, or lease is fabricated, and no stage
-/// launches on this decision. Callers match on the typed variants, never on
-/// message text.
+/// The stage spec and class run the single
+/// [`compose_provider_dispatch`](eliot_instrument_runner::compose_provider_dispatch)
+/// closure — exactly-one-entry resolution, generation and fingerprint
+/// freshness, host support, then Testd admission — by admitted identity
+/// only, without any invocation authority material: no State Fence,
+/// session, or lease is fabricated, and no stage launches on this decision.
+/// Every refusal keeps the stage inside the declared denominator under its
+/// typed disposition. Callers match on the typed variants, never on message
+/// text.
 fn admit_stage(
     providers: &ProviderRegistry,
     planned: &eliot_instrument_runner::PlannedStage,
+    inputs: &AvailabilityInputs<'_>,
 ) -> StageAdmission {
-    match providers.resolve_parts(&planned.stage.spec, planned.stage.kind) {
-        Ok(entry) => {
-            let adapter = entry.adapter.clone();
-            match TestdPlaneAdmission::admit_parts(&planned.stage.spec, planned.stage.kind, entry) {
-                Ok(_) => StageAdmission {
-                    adapter: Some(adapter),
-                    decision: "admitted".to_owned(),
-                },
-                Err(error) => StageAdmission {
-                    adapter: Some(adapter),
-                    decision: format!("refused:{}", testd_port_error_name(&error)),
-                },
+    match compose_provider_dispatch(providers, &planned.stage.spec, planned.stage.kind, inputs) {
+        ProviderDispatch::Dispatch { entry } => StageAdmission {
+            adapter: Some(entry.adapter.clone()),
+            decision: "admitted".to_owned(),
+        },
+        ProviderDispatch::Refused { disposition } => {
+            let (adapter, reason) = match disposition {
+                // Unreachable through the closure: it never refuses as Ready.
+                ProviderDisposition::Ready => (None, "admitted".to_owned()),
+                ProviderDisposition::Unmapped => (None, "unresolved:missing".to_owned()),
+                ProviderDisposition::Ambiguous { .. } => (None, "unresolved:ambiguous".to_owned()),
+                ProviderDisposition::Stale { .. } => (None, "unresolved:stale".to_owned()),
+                ProviderDisposition::Unsupported { .. } => {
+                    (None, "unresolved:unsupported".to_owned())
+                }
+                ProviderDisposition::UnsupportedByTestd { adapter, .. } => {
+                    (Some(adapter), "refused:unsupported-by-testd".to_owned())
+                }
+                ProviderDisposition::UnsupportedPlatform { .. } => {
+                    (None, "refused:unsupported-platform".to_owned())
+                }
+                ProviderDisposition::Unavailable { .. } => {
+                    (None, "unresolved:unavailable".to_owned())
+                }
+            };
+            StageAdmission {
+                adapter,
+                decision: reason,
             }
         }
-        Err(error) => StageAdmission {
-            adapter: None,
-            decision: format!("unresolved:{}", registry_error_name(&error)),
-        },
     }
 }
 
-/// Names one registry failure variant for the stage admission record.
-fn registry_error_name(error: &RegistryError) -> &'static str {
-    match error {
-        RegistryError::Missing { .. } => "missing",
-        RegistryError::Duplicate { .. } => "duplicate",
-        RegistryError::Stale { .. } => "stale",
-        RegistryError::Ambiguous { .. } => "ambiguous",
-        RegistryError::Unsupported { .. } => "unsupported",
-        RegistryError::Contract(_) => "contract",
-        RegistryError::UnresolvedExecutable { .. } => "unresolved-executable",
-        RegistryError::ExecutableMismatch { .. } => "executable-mismatch",
-    }
-}
-
-/// Names one testd admission failure for the stage admission record.
-fn testd_port_error_name(error: &TestdPortError) -> String {
-    match error {
-        TestdPortError::UnsupportedByTestd { .. } => "unsupported-by-testd".to_owned(),
-        TestdPortError::Registry(error) => format!("registry-{}", registry_error_name(error)),
-    }
-}
-
-/// Empty fingerprints for static provider resolution.
+/// Empty fingerprints for static provider classification.
 ///
-/// The describe path performs classification only via
-/// [`ProviderRegistry::resolve_parts`](eliot_instrument_runner::registry::ProviderRegistry::resolve_parts),
-/// which never consults fingerprints: empty slots attest nothing and make no
-/// freshness claim. Launching callers must supply caller-attested
-/// fingerprints with
+/// The describe path classifies through the composed dispatch closure
+/// against the ready registry it just constructed from these same inputs,
+/// so the closure's freshness step passes self-consistently by
+/// construction: empty slots attest no machine state and make no freshness
+/// claim beyond the registry handle itself. Launching callers must supply
+/// caller-attested fingerprints with
 /// [`ProviderRegistry::resolve_current`](eliot_instrument_runner::registry::ProviderRegistry::resolve_current)
 /// instead.
 fn unattested_fingerprints() -> InvalidationSet {

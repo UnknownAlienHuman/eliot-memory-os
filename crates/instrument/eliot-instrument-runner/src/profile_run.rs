@@ -1064,8 +1064,8 @@ pub fn compose_provider_dispatch(
             entry: Box::new(entry.clone()),
         },
         Err(TestdPortError::UnsupportedByTestd { kind }) => ProviderDispatch::Refused {
-            disposition: crate::ProviderDisposition::Unsupported {
-                adapter: instrument.as_str().to_owned(),
+            disposition: crate::ProviderDisposition::UnsupportedByTestd {
+                adapter: entry.adapter.clone(),
                 kind,
             },
         },
