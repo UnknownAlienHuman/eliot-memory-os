@@ -4083,6 +4083,12 @@ pub struct MaintenanceTriggerLifecycleRecord {
     pub decision_record: Option<MaintenanceTriggerCanonicalRecord>,
     /// Exact canonical downstream intent retained before acknowledgement.
     pub downstream_intent_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Explicitly marks a decision and intent recovered from an exact
+    /// committed Store owner/receipt lookup under the current fence.
+    /// Ordinary and legacy rows default to false. ORS treats the value as
+    /// opaque provenance and requires both retained records when it is true.
+    #[serde(default)]
+    pub recovered_from_store: bool,
     /// Exact claim record that owned the effect when the intent was first retained.
     /// `None` on a legacy row with an intent means its effect origin is unproven.
     #[serde(default)]
@@ -4112,6 +4118,7 @@ impl MaintenanceTriggerLifecycleRecord {
         self.validate_identity_and_timestamps()?;
         self.validate_claim_and_terminal_records()?;
         self.validate_downstream_intent_origin()?;
+        self.validate_recovered_from_store()?;
         self.validate_phase_record_combination()?;
         self.validate_retention_and_compaction()?;
         Ok(())
@@ -4218,6 +4225,23 @@ impl MaintenanceTriggerLifecycleRecord {
             return Err(OrsError::InvalidField {
                 field: "maintenance_trigger_downstream_intent_origin_claim_record",
                 reason: "effect origin requires a retained claim and downstream intent",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_recovered_from_store(&self) -> Result<(), OrsError> {
+        if self.recovered_from_store
+            && (self.decision_record.is_none()
+                || self.downstream_intent_record.is_none()
+                || self.claim_record.is_none()
+                || self.downstream_intent_origin_claim_record.is_none()
+                || self.downstream_intent_origin_claim_record.as_ref()
+                    != self.claim_record.as_ref())
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_recovered_from_store",
+                reason: "recovered provenance requires the exact decision/intent and matching retained claim origin",
             });
         }
         Ok(())
