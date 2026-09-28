@@ -139,7 +139,14 @@ jobs:
           $sourceSha = (git rev-parse HEAD).Trim()
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Manual Source Candidate Run Manifest"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Source SHA: $sourceSha"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57"
+          $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
+          python scripts/verify-github-workflows.py --root . --json-out $gwfJson
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_WORKFLOWS_MANIFEST_REJECTED: common verifier failed; no action manifest is published" }
+          $gwf = Get-Content -LiteralPath $gwfJson -Raw | ConvertFrom-Json
+          if ($gwf.status -ne 'pass') { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: verifier payload status is not pass' }
+          $derivedActions = @($gwf.actions | Where-Object { $_.workflow -eq '.github/workflows/source-candidate.yml' } | ForEach-Object { "$($_.action)@$($_.ref)" } | Select-Object -Unique)
+          if ($derivedActions.Count -eq 0) { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: derived record holds no action identities for source-candidate.yml' }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Actions: " + ($derivedActions -join ', '))
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: pinned rust-toolchain.toml identity shown via rustup show active-toolchain (no latest installer)"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cargo: --locked workspace check/clippy/test/build with nonzero listed and executed tests"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore of Eliot.Operator and Eliot.Operator.Tests packages.lock.json files"

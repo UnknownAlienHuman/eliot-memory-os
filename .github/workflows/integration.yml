@@ -326,3 +326,15 @@ jobs:
           if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             throw 'EVIDENCE_CLEANUP_UNKNOWN: redacted receipt is missing; result stays unknown.'
           }
+
+      - name: Record derived third-party action manifest
+        shell: pwsh
+        run: |
+          $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
+          python scripts/verify-github-workflows.py --root . --json-out $gwfJson
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_WORKFLOWS_MANIFEST_REJECTED: common verifier failed; no action manifest is published" }
+          $gwf = Get-Content -LiteralPath $gwfJson -Raw | ConvertFrom-Json
+          if ($gwf.status -ne 'pass') { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: verifier payload status is not pass' }
+          $derivedActions = @($gwf.actions | Where-Object { $_.workflow -eq '.github/workflows/integration.yml' } | ForEach-Object { "$($_.action)@$($_.ref)" } | Select-Object -Unique)
+          if ($derivedActions.Count -eq 0) { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: derived record holds no action identities for integration.yml' }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Actions: " + ($derivedActions -join ', '))
