@@ -44,7 +44,13 @@
 //! explicit receipted escalate/defer disposition and can never be satisfied by
 //! a silent same-family or paid substitute, and a mid-attempt provider switch
 //! is refused unless an explicit receipted policy-authorized degradation was
-//! recorded first.
+//! recorded first. Route-class eligibility is bound to the request's own
+//! declared route classes, so a class the request never bound a route to is
+//! unstaffed and carries an explicit disposition rather than a candidate
+//! borrowed from a neighbouring class. The bridge's remaining two inputs — the
+//! shape-derived preset and the assumed route-local privacy dimension — are
+//! known defects of this path, each recorded with its out-of-scope enabler in
+//! [`crate::staffing_policy`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -78,9 +84,11 @@ use crate::staffing_policy::{
 pub const COORDINATOR_CRATE: &str = "eliot-agent-coordinator";
 /// Daemon composition root that owns this wiring.
 pub const DAEMON_CRATE: &str = "eliotd";
-/// Explicit plan-only gap reason: candidate planning stays available while live
-/// provider admission remains unavailable outside the sealed verifier path.
-pub const FABRIC_PLAN_GAP_REASON: &str = "eliotd agent fabric plans candidates only; live provider admission arrives through the sealed owner path";
+/// Explicit plan-gap reason: the coordinator has no admitted G-11 provider
+/// admission owner, and the human/brain-owned Task-Controller operation that
+/// would drive this fabric from definition through admission, activation and
+/// dispatch is not present, so candidate planning is the only reachable step.
+pub const FABRIC_PLAN_GAP_REASON: &str = "eliotd agent fabric holds definition, admission, activation and dispatch capability but is entered with the G-11 plan gap: no admitted Task-Controller production operation drives this path and no sealed G-11 provider admission owner is present";
 /// Capacity identity threaded by the daemon fabric composition.
 pub const FABRIC_CAPACITY_IDENTITY: &str = "eliotd-fabric-capacity";
 /// Capacity revision threaded by the daemon fabric composition.
@@ -716,6 +724,17 @@ pub(crate) fn build_admitted_provider_capability(
 /// not staff for this task class — a same-family or paid stand-in for an
 /// unavailable independent audit included — is refused here, before any
 /// reservation, admission, activation or dispatch can observe it.
+///
+/// Route-class eligibility is bound to the request's own declared route
+/// classes, so a class with no owner-proven binding is unstaffed and dispositioned
+/// rather than filled from the whole candidate pool. The shape-derived preset
+/// and the assumed route-local privacy dimension are known defects of this path
+/// and are documented, with their enablers, in [`crate::staffing_policy`].
+///
+/// # Errors
+///
+/// Returns [`FabricError::Contract`] carrying the staffing-policy rejection
+/// verbatim, or the coordinator owner rejection from [`AgentCoordinator::plan`].
 pub fn plan_candidate(
     config: &CoordinatorConfig,
     request: StaffingPlanRequest,
@@ -1848,10 +1867,27 @@ impl AgentFabric {
     /// dispatch. The `staffing_plan_receipted` ledger event precedes
     /// `definition_validated`.
     ///
+    /// Definition is the first step of the chain an admitted Task-Controller
+    /// production operation must drive ([`Self::define_and_plan`] →
+    /// [`Self::stage_reservation`] → [`Self::commit_admission`] →
+    /// [`Self::activate`] → [`Self::dispatch`]). That operation is not wired
+    /// into `eliotd`: no `DaemonComposition` method or daemon poll step calls
+    /// this method, so on the current base no production operation reaches
+    /// definition, admission, activation and dispatch through this fabric.
+    ///
+    /// BLOCKED-BY scope `bins/eliotd/src/lib.rs::DaemonComposition` (and
+    /// `bins/eliotd/src/campaign_task_controller.rs` /
+    /// `bins/eliotd/src/daemon_runtime.rs` for the request producer): an
+    /// admitted Task-Controller operation must be defined that carries the
+    /// frozen `StaffingPlanRequest` plus the owner reservation, admission and
+    /// activation authorities through these five steps. The step methods exist
+    /// and are exercised; only the admitted production caller is absent.
+    ///
     /// # Errors
     ///
     /// Returns the coordinator owner rejection, the staffing-policy rejection
-    /// when the task class cannot be staffed under current evidence, or
+    /// when the recipe exceeds the selected policy's lane or writer bound or
+    /// the task class cannot be staffed under current evidence, or
     /// [`FabricError::DefinitionConflict`].
     pub fn define_and_plan(
         &mut self,
