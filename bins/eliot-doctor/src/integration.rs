@@ -371,6 +371,7 @@ pub fn evaluate(
         hook_events_ok,
         hook_event_gaps,
         handshake_ok: observation.handshake_ok,
+        installation: None,
         installed,
         live,
         disposition: disposition.to_owned(),
