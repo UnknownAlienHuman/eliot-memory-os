@@ -256,7 +256,7 @@ pub fn load_expectation(path: &Path) -> Result<LoadedExpectation, IntegrationErr
 /// installed claim.
 fn expectation_from_install_receipt(
     document: &serde_json::Value,
-) -> Result<IntegrationExpectation, IntegrationError> {
+) -> Result<LoadedExpectation, IntegrationError> {
     let profile = document
         .get("profile")
         .and_then(serde_json::Value::as_str)
