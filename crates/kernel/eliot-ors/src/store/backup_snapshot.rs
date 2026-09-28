@@ -280,8 +280,7 @@ use crate::backup_snapshot::{
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
-    StreamRecoveryReconciliation, StreamRecoveryReconciliationState,
-    VersionedArtifactEntry,
+    StreamRecoveryReconciliation, StreamRecoveryReconciliationState, VersionedArtifactEntry,
 };
 
 impl super::RedbRecoveryStore {
