@@ -74,7 +74,8 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
+    KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
+    LegacyTwoValueRelationBackupVerificationClass,
     LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
     OperationalCurrentRecoveryCursor, OperationalCurrentRecoveryEntry,
@@ -5497,6 +5498,54 @@ impl RedbRecoveryStore {
             return Ok(LegacyTwoValueRelationBackupVerificationClass::Absent);
         };
         Ok(crate::classify_backup_verification_two_value_key(&bytes))
+    }
+
+    /// Classifies the PRE-#2862 `v2` durable key for this operation
+    /// (issue #2862).
+    ///
+    /// #2862 bumped the verify profile to `v3`, which is a new
+    /// `idempotency_namespace` and therefore a different key, because the
+    /// identity gained the retained-handle, capture-receipt-digest and
+    /// validity-attestation-digest commitments and those are in the canonical
+    /// request hash. A new namespace alone is not enough: a `v2` row simply
+    /// becomes unreachable, and the caller would read that as `Absent` and stage
+    /// a SECOND row for an operation that already has a stored answer — the
+    /// fail-open outcome. So the route addresses the `v2` key explicitly,
+    /// through
+    /// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`], and
+    /// asks this question about it.
+    ///
+    /// The three classes must be honoured differently, which is what makes the
+    /// probe fail CLOSED. `Absent` means the `v2` key is free and nothing is
+    /// quarantined. `LegacyUnqualified` means intact pre-#2862 evidence: a
+    /// correctly scoped, isolated, replayable STRUCTURAL-CANDIDATE result that
+    /// carries no retained handle, no capture receipt digest and no validity
+    /// attestation digest at all. It must never be upgraded, re-keyed,
+    /// backfilled or projected as a current-profile answer, and a code upgrade
+    /// does not make it provenance-bound — there is nothing in it to read that
+    /// from. `Unreadable` means bytes that are neither shape, for which NO
+    /// verification result may be answered at all.
+    ///
+    /// Nothing is migrated, re-keyed, backfilled or returned. The `v2` row keeps
+    /// its own key and its own bytes, and a NEW explicit verification operation
+    /// — a new `operation_id`, hence a different `v2` key that reads `Absent` —
+    /// is what produces a row under the current profile.
+    pub fn legacy_fence_bound_backup_verification_class(
+        &self,
+        legacy_record_key: &str,
+    ) -> Result<LegacyFenceBoundBackupVerificationClass, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(legacy_record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(LegacyFenceBoundBackupVerificationClass::Absent);
+        };
+        Ok(crate::classify_backup_verification_fence_bound_key(&bytes))
     }
 
     /// Stages one durable `backup.verify` result under its scoped namespace key.
