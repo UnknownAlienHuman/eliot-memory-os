@@ -6165,8 +6165,9 @@ impl KernelComposition {
         } }))
     }
 
-    /// Resolves current owner namespaces after acknowledgement and runs their
-    /// existing bounded maintenance slices.
+    /// Resolves current request namespaces after acknowledgement and runs
+    /// their bounded maintenance slices, then advances one separate ORS-owned
+    /// owner-index page under the authenticated presenter.
     fn maintain_bridge_event_handoffs_for_owner(
         &self,
         presenter: &serde_json::Value,
@@ -6209,7 +6210,43 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?;
             namespaces.push((namespace.to_owned(), stream_id, revision, incarnation));
         }
-        self.maintain_bridge_event_handoffs(&namespaces)
+        let mut handoff_maintenance = self.maintain_bridge_event_handoffs(&namespaces)?;
+        let owner_maintenance = self
+            .generation_gateway
+            .ors
+            .maintain_bridge_event_handoffs_for_owner_checked(presenter)
+            .map_err(|error| match error {
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    TransportError::Backpressure
+                }
+                _ => TransportError::SessionFenced,
+            })?;
+        let owners_processed = owner_maintenance
+            .get("owners_processed")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TransportError::SessionFenced)?;
+        let owner_maintenance_continuation = owner_maintenance
+            .get("owner_maintenance_continuation")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(TransportError::SessionFenced)?;
+        let owner_maintenance_cursor_bytes = owner_maintenance
+            .get("owner_maintenance_cursor_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TransportError::SessionFenced)?;
+
+        // This owner-index page is another bounded maintenance leg, not a
+        // recovery selector and not part of the reconciliation-key preimage.
+        // Keep its flat per-stream entries in the existing post-key array so
+        // the Bridge can retain typed capacity pressure exactly as before.
+        // Scan-byte values are current snapshots, not additive charges; keep
+        // the per-batch and owner-page observations in call order without
+        // summing or coalescing a namespace that appears in both.
+        handoff_maintenance.extend(owners_processed.iter().cloned());
+        handoff_maintenance.push(serde_json::json!({
+            "owner_maintenance_continuation": owner_maintenance_continuation,
+            "owner_maintenance_cursor_bytes": owner_maintenance_cursor_bytes,
+        }));
+        Ok(handoff_maintenance)
     }
 
     /// Runs the bounded handoff maintenance for one reconciled scope on the
@@ -6255,12 +6292,23 @@ impl KernelComposition {
             let repaired = match repaired {
                 Ok(repaired) => repaired,
                 Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                    let terminalized = retired
+                        .get("terminalized")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let handoff_scan_bytes = retired
+                        .get("handoff_scan_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or(TransportError::SessionFenced)?;
                     handoff_maintenance.push(serde_json::json!({
+                        "namespace": namespace,
                         "stream_id": stream_id,
                         "retired": retired.get("retired")
                             .and_then(serde_json::Value::as_u64).unwrap_or(0),
+                        "terminalized": terminalized,
                         "retirement_continuation": retired.get("retirement_continuation")
                             .and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        "handoff_scan_bytes": handoff_scan_bytes,
                         "capacity_pressure": pressure,
                     }));
                     continue;
@@ -6270,9 +6318,19 @@ impl KernelComposition {
                 }
                 Err(_) => return Err(TransportError::SessionFenced),
             };
+            let terminalized = retired
+                .get("terminalized")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            let handoff_scan_bytes = repaired
+                .get("handoff_scan_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
             handoff_maintenance.push(serde_json::json!({
+                "namespace": namespace,
                 "stream_id": stream_id,
                 "retired": retired.get("retired").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                "terminalized": terminalized,
                 "retirement_continuation": retired
                     .get("retirement_continuation")
                     .and_then(serde_json::Value::as_bool)
@@ -6282,6 +6340,7 @@ impl KernelComposition {
                     .get("repair_continuation")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                "handoff_scan_bytes": handoff_scan_bytes,
             }));
         }
         Ok(handoff_maintenance)
