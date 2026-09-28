@@ -33,12 +33,12 @@
 //! - [`admit_canonical_write`] — the composition-root named-mutation intake.
 //!   The caller presents its compiled
 //!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
-//!   so this is the only entry that can see the exact
-//!   `TaskSelectionEvidence`: [`resolve_task_selection`] reads the owner-issued
-//!   `CurrentTaskContract` and routes a capture through [`admit_capture`] and
-//!   every task-relative transition through [`admit_task_bound`]. I5.6 step 4
-//!   verbatim — "resolve `TaskSelectionEvidence` and `TaskContract`
-//!   compatibility when the command is task-relative".
+//!   so this is the only entry that can see its task binding. The receipt has
+//!   no owner-proven selection source/evidence; a `CurrentTaskContract` binding
+//!   is refused with `TASK_SELECTION_REQUIRED` until the task-intake owner
+//!   supplies it. No source is synthesized from an unrelated profile or
+//!   receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
+//!   and `TaskContract` compatibility when the command is task-relative".
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
 //!   this entry only decides the capture leg: a `CaptureObservation` naming no
@@ -54,12 +54,11 @@
 //!   mints no receipt of its own.
 //!
 //! - [`bind_current_task_selection`] — the applicability recheck admission
-//!   needs (issue #1746, W4). It joins the Governor-resolved activation
-//!   snapshot with the owner-compiled readiness receipt so the acceptance
-//!   digest, `TaskContract` revision, and `WorkScope` are only usable while
-//!   they still name what the activation route just proved at the live fence.
-//!   Structural validation of a request-supplied `TaskSelectionEvidence` is
-//!   never sufficient.
+//!   needs (issue #1746, W4). It refuses a current task until the readiness
+//!   receipt carries owner-proven selection source/evidence. Once that owner
+//!   producer exists, the activation snapshot and receipt can be compared at
+//!   the live fence. Structural validation of request-supplied
+//!   `TaskSelectionEvidence` is never sufficient.
 //!
 //! No entry creates a second write path, re-derives a downstream layer's
 //! decision, or accepts a task the caller did not name.
@@ -276,10 +275,9 @@ pub enum TaskBindingAdmission {
 
 /// Task-selection disposition a caller-presented readiness receipt carries.
 ///
-/// This is the I5.6 step-4 resolution result: exactly one current
-/// `TaskContract` revision plus its acceptance digest becomes selection
-/// evidence; a missing, exploratory, stale, or multi-candidate binding does
-/// not.
+/// This is the I5.6 step-4 resolution result. A current task binding is
+/// admitted only when its owner-proven selection source/evidence is available;
+/// task/revision/digest shape by itself does not become selection evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSelectionDisposition {
     /// The caller selected no task.
@@ -300,7 +298,7 @@ pub enum TaskSelectionDisposition {
         task_ref: String,
         task_revision: u64,
     },
-    /// Exactly one current `TaskContract` revision with an acceptance digest.
+    /// One current `TaskContract` revision with owner-proven selection evidence.
     Current(TaskSelectionEvidence),
 }
 
@@ -525,11 +523,11 @@ pub fn admit_task_bound_with_observed_scope(
 /// Resolves the exact task-selection disposition of one caller-presented
 /// readiness receipt (I5.6 step 4, issue #1929).
 ///
-/// This is the only producer of [`TaskSelectionEvidence`] in the daemon, and
-/// it invents nothing: a `CurrentTaskContract` binding is the owner-issued
-/// `task_ref` + `task_revision` + `acceptance_digest` triple from the receipt's
-/// own `task_binding`, joined with the receipt's exact `WorkScope` identity and
-/// reference handles. Every other binding state keeps its typed meaning:
+/// A current binding lacks owner-proven selection source/evidence in the
+/// receipt, so this function returns `TASK_SELECTION_REQUIRED` rather than
+/// fabricating [`TaskSelectionEvidence`]. The governance profile and receipt
+/// handle are unrelated to task selection and are not used as provenance.
+/// Every non-current binding state keeps its typed meaning:
 ///
 /// - [`TaskBindingState::None_`] — the caller selected no task;
 /// - `Exploratory` — a task is named but the binding is explicitly
@@ -541,58 +539,53 @@ pub fn admit_task_bound_with_observed_scope(
 ///   disposition stays non-material.
 ///
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
-/// ambiguity is reported, never resolved.
+/// ambiguity is reported, never resolved. The task-intake owner producer is
+/// absent pending issue #8.
 #[must_use]
-pub fn resolve_task_selection(receipt: &OnboardingReadinessReceipt) -> TaskSelectionDisposition {
+pub fn resolve_task_selection(
+    receipt: &OnboardingReadinessReceipt,
+) -> Result<TaskSelectionDisposition, TaskBindingError> {
     match &receipt.task_binding {
-        TaskBindingState::CurrentTaskContract {
-            task_ref,
-            task_revision,
-            acceptance_digest,
-        } => TaskSelectionDisposition::Current(TaskSelectionEvidence {
-            task_ref: task_ref.clone(),
-            task_revision: *task_revision,
-            acceptance_digest: acceptance_digest.clone(),
-            work_scope_ref: receipt.scope.scope_ref.clone(),
-            selection_source_ref: receipt.governance_profile_ref.clone(),
-            evidence_ref: receipt.receipt_ref.clone(),
-            contamination_flags: Vec::new(),
-        }),
+        TaskBindingState::CurrentTaskContract { .. } => Err(
+            TaskBindingError::selection_required(
+                "current task has no owner-proven selection source/evidence",
+            ),
+        ),
         TaskBindingState::Exploratory {
             task_ref,
             task_revision,
             acceptance_digest,
-        } => TaskSelectionDisposition::Exploratory {
+        } => Ok(TaskSelectionDisposition::Exploratory {
             task_ref: task_ref.clone(),
             task_revision: *task_revision,
             acceptance_digest: acceptance_digest.clone(),
-        },
+        }),
         TaskBindingState::Ambiguous { candidate_handles } => {
-            TaskSelectionDisposition::Ambiguous(candidate_handles.clone())
+            Ok(TaskSelectionDisposition::Ambiguous(candidate_handles.clone()))
         }
         TaskBindingState::Stale {
             task_ref,
             task_revision,
-        } => TaskSelectionDisposition::Stale {
+        } => Ok(TaskSelectionDisposition::Stale {
             task_ref: task_ref.clone(),
             task_revision: *task_revision,
-        },
-        TaskBindingState::None_ => TaskSelectionDisposition::Absent,
+        }),
+        TaskBindingState::None_ => Ok(TaskSelectionDisposition::Absent),
     }
 }
 
 /// Rechecks one Governor-resolved task selection against the current
 /// applicability and fence before any admission (I5.6 step 4, issue #1746 W4).
 ///
-/// [`resolve_task_selection`] alone only reads the *shape* of the compiled
-/// receipt's binding. This entry is the applicability leg the issue requires:
-/// the acceptance digest, `TaskContract` revision, and `WorkScope` come from
-/// the owner-compiled receipt, but they are only usable when they still name
-/// exactly what the activation route just proved for this exact fence —
-/// principal, session, task, non-zero revision, and `WorkScope`. A selection
-/// that names another task, a moved revision, or another scope is a stale
-/// selection, not a second resolver's opinion, so it rejects with
-/// `TASK_SCOPE_INCOMPATIBLE` and admits nothing.
+/// [`resolve_task_selection`] refuses `CurrentTaskContract` today because the
+/// readiness receipt has no owner-proven selection source/evidence. If that
+/// owner producer is added, this entry is the applicability leg required by
+/// the issue: the acceptance digest, `TaskContract` revision, and `WorkScope`
+/// from the owner-compiled receipt must name exactly what the activation route
+/// proved at this exact fence — principal, session, task, non-zero revision,
+/// and `WorkScope`. A selection naming another task, moved revision, or other
+/// scope rejects with `TASK_SCOPE_INCOMPATIBLE` and admits nothing. Until then,
+/// no current selection evidence escapes this entry.
 ///
 /// Structure preserved, never resolved:
 ///
@@ -623,7 +616,7 @@ pub fn bind_current_task_selection(
             "compiled readiness receipt was compiled at another fence",
         ));
     }
-    let disposition = resolve_task_selection(receipt);
+    let disposition = resolve_task_selection(receipt)?;
     let TaskSelectionDisposition::Current(evidence) = &disposition else {
         // The Governor's current-task owner returns no activation for these
         // receipt states. A contradictory activation must fail closed rather
@@ -718,10 +711,11 @@ fn compatibility_for(
 ///   finish while cold;
 /// - any task-relative write — one that names a task, or a task-control,
 ///   finish, or other task-bearing transition — requires the exact selection
-///   and is admitted only through [`admit_task_bound`]. Absent, exploratory, or
-///   stale evidence rejects with `TASK_SELECTION_REQUIRED`; a selection naming
-///   a different task, `WorkScope`, or a moved fence rejects with
-///   `TASK_SCOPE_INCOMPATIBLE`, mutating nothing;
+///   and is admitted only through [`admit_task_bound`]. Absent, exploratory,
+///   stale, or current-without-owner-proven-source evidence rejects with
+///   `TASK_SELECTION_REQUIRED`; a selection naming a different task,
+///   `WorkScope`, or moved fence rejects with `TASK_SCOPE_INCOMPATIBLE`,
+///   mutating nothing;
 /// - anything else is [`TaskBindingAdmission::NotTaskRelative`].
 ///
 /// This entry never selects a task the caller did not name and never consults
@@ -736,15 +730,7 @@ pub fn admit_canonical_write(
     receipt: &OnboardingReadinessReceipt,
     write_fence: &StateFence,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
-    let disposition = resolve_task_selection(receipt);
     let compatibility = compatibility_for(receipt, envelope, write_fence);
-    let (selection, candidate_count) = match &disposition {
-        TaskSelectionDisposition::Absent
-        | TaskSelectionDisposition::Exploratory { .. }
-        | TaskSelectionDisposition::Stale { .. } => (None, 0_usize),
-        TaskSelectionDisposition::Ambiguous(candidate_handles) => (None, candidate_handles.len()),
-        TaskSelectionDisposition::Current(evidence) => (Some(evidence), 1_usize),
-    };
     let carries = |operation: NamedMutationOperation| {
         envelope
             .semantic_commands
@@ -756,6 +742,20 @@ pub fn admit_canonical_write(
         || carries(NamedMutationOperation::UpdateTaskState)
         || carries(NamedMutationOperation::RecordFinishDecision)
         || carries(NamedMutationOperation::RecordFinishEvidence);
+    let selection_resolution = resolve_task_selection(receipt);
+    let (selection, candidate_count) = match selection_resolution {
+        Ok(TaskSelectionDisposition::Absent)
+        | Ok(TaskSelectionDisposition::Exploratory { .. })
+        | Ok(TaskSelectionDisposition::Stale { .. }) => (None, 0_usize),
+        Ok(TaskSelectionDisposition::Ambiguous(candidate_handles)) => {
+            (None, candidate_handles.len())
+        }
+        Ok(TaskSelectionDisposition::Current(evidence)) => (Some(evidence), 1_usize),
+        // A task-free capture remains cold and unrelated non-task writes need
+        // no task selection. Task-relative effects return the typed error.
+        Err(_) if !task_relative => (None, 0_usize),
+        Err(error) => return Err(error),
+    };
 
     if captures && !task_relative {
         // `admit_capture` consumes the candidate identity on each of its cold
