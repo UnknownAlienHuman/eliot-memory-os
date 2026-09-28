@@ -85,6 +85,7 @@ mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
 mod learning_record_commit;
+mod migration_inventory;
 mod negative_memory_activation;
 mod negative_memory_context;
 mod negative_memory_gate;
@@ -176,6 +177,16 @@ pub use learning_promotion::{
 pub use learning_record_commit::{
     commit_learning_record, learning_effective_under_admission,
     learning_record_mutation_request_for_delta,
+};
+pub use migration_inventory::{
+    ALL_ACTIVE_REFERENCE_STATUSES, ALL_COMPONENT_DISPOSITIONS, ALL_COMPONENT_KINDS,
+    AUDIT_UNREACHABLE_PREMISE, ActiveReferenceStatus, BINS_REACHABLE, BINS_ROOTS, BINS_UNREACHABLE,
+    COORDINATOR, ComponentDisposition, ComponentKind, EXCLUDED_SCOPE, IMPACT_EDGES, IMPACT_NODES,
+    INVENTORY, INVENTORY_PIN_AGGREGATE, INVENTORY_PIN_COMMIT, INVENTORY_PIN_LOCK, INVENTORY_SCHEMA,
+    INVENTORY_TOOL, ImpactEdge, ImpactNode, InventoryEntry, PRODUCT_PROOF_PLAN, PROOF_CEILING,
+    ProductProofPlan, ResolvedComponent, STANDALONE_PACKAGES, SURFACE_CLASSES, SURFACE_LOOKUP,
+    SurfaceClass, UNSCANNED_SURFACES, WORKSPACE_MEMBERS, impact_edges_from, impact_edges_to,
+    impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
