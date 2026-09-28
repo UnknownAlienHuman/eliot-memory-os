@@ -6,13 +6,88 @@
 //! providers therefore remain an explicit `PLAN_GAP`; this crate never creates
 //! a caller-mintable substitute.
 //!
-//! Fixture disposition (#1213 MGR01 half): bounded reference fixture. The
-//! `eliot-cli` catalogue edge is severed to an inlined `PLAN_GAP` literal;
-//! the remaining reverse dependency is the `bins/eliotd` production daemon
-//! composition (`DaemonComposition::controlboard`) over production adapters
-//! (`bins/eliotd/src/controlboard_adapters.rs`). Full delete follows with the
-//! eliotd lane. This crate is frozen: no board extension, owner bindings, authority,
-//! or currentness is added here.
+//! Disposition (#1213): **bounded reference fixture**, retained. The
+//! `eliot-cli` catalogue edge is severed to an inlined `PLAN_GAP` literal, and
+//! the only reverse dependency with production call sites is the `bins/eliotd`
+//! daemon composition over `bins/eliotd/src/controlboard_adapters.rs`
+//! (`is_controlboard_read_tool`, `serve_controlboard_view`). That branch is
+//! **source-reachable only** on current `main`: the closed admission match in
+//! `bins/eliot-kernel/src/host_request_route.rs::local_read_admission_from_tool`
+//! admits only `eliot.packet`, `eliot.query` and the four Skill lifecycle
+//! names, so no `controlboard.read` pair is ever queued or claimed, and no
+//! producer presents that capability. Package presence is therefore **not** a
+//! live `ControlBoard` capability, and this crate is frozen: no board extension,
+//! owner bindings, authority, or currentness is added here. Full delete belongs
+//! to the eliotd lane, which owns the only production call sites.
+//!
+//! #1213 inventory (public surface, projection builders, mutable state,
+//! reverse consumers, tests). Every entry below is a `pub` item of this
+//! package; a name that stops being `pub` makes this list wrong and must be
+//! corrected in the same change.
+//!
+//! *Identity and fence:* `CONTRACT_NAME`, `PLAN_GAP`, `ViewRevision`,
+//! `StateFence` (re-exported from `eliot-contracts`), `EffectCeiling` and
+//! `PrivacyClass` (re-exported from `eliot-security-contracts`).
+//!
+//! *Read edge:* `ReadRequest`, `AccessBinding`, `Role`, `ActionCapability`,
+//! `Visibility`, `AccessResolverPort`, `CanonicalStatePort`.
+//!
+//! *Canonical state and board view:* `CanonicalState` (+ `validate`),
+//! `ProviderCompleteness`, `ProjectionBinding`, `ProjectionProvider`,
+//! `BoardItem`, `BoardItemKind`, `ReviewItem`, `ReviewAnchor`,
+//! `AnchorTargetKind`, `AnchorResolution`, `ReviewLifecycle` (+ `can_transition`),
+//! `ProvenanceEdge`, `Attribution`, `ControlBoardView`, `RequiredProvider`,
+//! `PortError`.
+//!
+//! *Operator command surface (unused by any production caller):*
+//! `OperatorAction`, `CommandRequest`, `CommandReceipt`, `CommandDisposition`,
+//! `CommandQuery`, `OperatorCommandPort`.
+//!
+//! *Skill lifecycle surface:* `ProposeSkillRequest`, `SkillLifecyclePort`.
+//!
+//! *Board:* `ControlBoard` — `new`, `view`, `submit`, `reconcile`,
+//! `with_skill_lifecycle`, `skill_view`, `propose_skill_candidate` — and
+//! `ControlBoardError`.
+//!
+//! *Notification projection (`notification_projection`, re-exported):*
+//! `ProjectedSeverity`, `NotificationRow`, `project`,
+//! `CanonicalNotificationMetrics`, `NotificationReadProjection`,
+//! `project_read_page`, `NotificationInbox`, `NotificationMetrics`, `inbox`,
+//! `unresolved_critical`, `failed_delivery`, `metrics`.
+//!
+//! *Swarm read surface (`swarm_read`, re-exported):* `AUTHENTICATED_SWARM_VIEW_VERSION`,
+//! `SwarmProjectionEnvelope`, `SwarmProjectionPort`, `AuthenticatedSwarmView`,
+//! `swarm_projection_source_digest`.
+//!
+//! *Swarm command surface (`swarm_command`, re-exported):*
+//! `AUTHENTICATED_SWARM_COMMAND_CANDIDATE_PACKAGE_PROOF_ONLY`.
+//!
+//! *Projection builders (pure, no mutable state):* `project`,
+//! `project_read_page`, `inbox`, `unresolved_critical`, `failed_delivery`,
+//! `metrics`, `swarm_projection_source_digest`, `CanonicalState::validate`,
+//! `ProposeSkillRequest::validate`, `ReviewLifecycle::can_transition`.
+//!
+//! *Mutable and cache state:* exactly one — the private
+//! `ControlBoard::replay` map of `StoredReplay` records, keyed by
+//! `operation_id`. It is written only by `ControlBoard::submit` after the
+//! effecting port answered, is read only on the replay-hit path, and lives no
+//! longer than the `ControlBoard` value. It is not a board, not a cache of
+//! currentness, and not authority: no other type in this package mutates.
+//!
+//! *Reverse consumers (Cargo metadata and production call sites):*
+//! `crates/meta/eliot-runtime-status` (Cargo dependency; the read-only
+//! contour/consumer/transport modules) and `bins/eliotd` (Cargo dependency;
+//! `controlboard_adapters.rs`, `notification_board_attach.rs`,
+//! `skill_surface_adapters.rs`, `lib.rs::DaemonComposition::controlboard`).
+//! `crates/surfaces/eliot-cli` mentions `PLAN_GAP` in a doc comment only and is
+//! not a dependency.
+//!
+//! *Tests:* every `#[cfg(test)]` module in this package, plus the dependent
+//! projection/consumer/transport test capsules in
+//! `crates/meta/eliot-runtime-status/src/controlboard_*.rs` and the CLI
+//! consumer capsule in `bins/eliot/src/controlboard_status.rs`. No test in this
+//! package is a Product Pulse: `crates/meta/AGENTS.md` and Implementation
+//! I0.5 reserve live support proof to issue #11.
 
 #![forbid(unsafe_code)]
 

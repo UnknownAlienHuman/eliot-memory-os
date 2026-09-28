@@ -1,11 +1,11 @@
 //! Operator-adjacent live read path over the `read_controlboard_contour` projection.
 //!
-//! Issue #1213 follow-through: this module is the one live read-only consumer
-//! that binds the merged [`read_controlboard_contour`](super::read_controlboard_contour)
-//! projection to real consumption. It performs exactly one board effect — the
-//! authenticated [`ControlBoard::view`](eliot_controlboard::ControlBoard::view)
-//! read owned by the projection — then reconciles the resulting contour against
-//! a caller-frozen expected-row denominator.
+//! Issue #1213 follow-through: this module binds the
+//! [`read_controlboard_contour`](super::read_controlboard_contour) projection to
+//! real consumption. It performs exactly one board effect — the authenticated
+//! [`ControlBoard::view`](eliot_controlboard::ControlBoard::view) read owned by
+//! the projection — then reconciles the resulting contour against a
+//! caller-frozen expected-row denominator.
 //!
 //! Read-only enforcement (structural, not prose):
 //!
@@ -33,8 +33,17 @@
 //! intentionally no health predicate: no method here reports green, ready, or
 //! healthy, and disposition labels never collapse to a color or scalar.
 //! Dispositions are observation states only; they are never copied into
-//! `ImplementationSupport`, maturity, or evidence-execution claims
+//! implementation support, maturity, or evidence-execution claims
 //! (Implementation I0.5).
+//!
+//! Independent axes: the rendered board carries the observation disposition per
+//! row and the owner's I0.5 evidence records at board level —
+//! [`SupportObservationState`] for transport reachability,
+//! [`EvidenceExecutionStatus`] for evidence execution, the five
+//! [`DomainCoverage`] rows, and the [`CapabilitySupportRow`] set — reproduced
+//! verbatim from the contour. A disposition is never derived from them and they
+//! are never derived from a disposition, so transport reachability can never
+//! become semantic readiness and an observation can never become support.
 //!
 //! Typed fields: every rendered row stamps the four observer-supplied typed
 //! bindings ([`ControlBoardInstallation`], [`ControlBoardObservationTime`],
@@ -68,6 +77,9 @@
 
 use std::collections::BTreeMap;
 
+use eliot_conformance_contracts::{
+    CapabilitySupportRow, DomainCoverage, EvidenceExecutionStatus, SupportObservationState,
+};
 use eliot_contracts::StateFence;
 use eliot_controlboard::{ControlBoard, NotificationInbox, ReadRequest};
 use serde::{Deserialize, Serialize};
@@ -79,7 +91,7 @@ use super::controlboard_projection::{
 };
 
 /// Stable contract identity for this read-only consumer rendering.
-pub const CONTROLBOARD_CONSUMER_CONTRACT: &str = "eliot.runtime-status.controlboard-consumer/v1";
+pub const CONTROLBOARD_CONSUMER_CONTRACT: &str = "eliot.runtime-status.controlboard-consumer/v2";
 
 /// Maximum expected entries in one frozen denominator (allocation guard,
 /// fail-closed; matches the projection-side row bound).
@@ -507,7 +519,11 @@ pub struct RenderedControlBoardRow {
 
 /// Read-only reconciled board: one row per frozen denominator entry, in
 /// frozen order, with projection-owned identities bound verbatim.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally absent: the owner records carried here
+/// ([`DomainCoverage`], [`CapabilitySupportRow`]) are `PartialEq` only, and the
+/// rendered board refuses to narrow them to a weaker equality contract.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderedControlBoard {
     /// Always [`CONTROLBOARD_CONSUMER_CONTRACT`].
@@ -530,6 +546,19 @@ pub struct RenderedControlBoard {
     /// view order. Preserved verbatim so denominator drift cannot silently
     /// drop observations.
     pub unexpected_observed: Vec<String>,
+    /// Transport reachability of the read edge, reproduced verbatim from the
+    /// contour. Never inferred from a row or a disposition.
+    pub transport: SupportObservationState,
+    /// Evidence execution of the cited evidence, reproduced verbatim from the
+    /// contour. Never recomputed from the support rows.
+    pub evidence_execution: EvidenceExecutionStatus,
+    /// The one evaluation boundary the owner declared for this validation unit.
+    pub evaluated_at_ms: u64,
+    /// Exactly one owner coverage record per declared evidence domain.
+    pub domain_coverage: Vec<DomainCoverage>,
+    /// Owner capability support rows, each keeping its own independent
+    /// maturity, implementation-support and evidence-execution values.
+    pub support_rows: Vec<CapabilitySupportRow>,
     /// Stamped from the contour expiry binding.
     pub expiry: String,
     /// Stamped from the contour invalidation binding.
@@ -581,6 +610,47 @@ pub enum ControlBoardConsumerError {
     },
 }
 
+/// One reconciled row: exactly one entry identity, exactly one typed
+/// disposition, and the four observer bindings plus the projection identities.
+///
+/// An unobserved row was never projected under a capability, at a generation,
+/// or against an evidence handle, so those bindings are `None` — because
+/// nothing was observed, never because the value is unknown or empty. Nothing
+/// here is inferred, defaulted, or filled in.
+fn rendered_row(
+    entry_id: &str,
+    observed: Option<&ControlBoardStatusRow>,
+    disposition: ControlBoardRowDisposition,
+    context: &ControlBoardObservationContext,
+    contour: &ControlBoardContour,
+) -> Result<RenderedControlBoardRow, ControlBoardConsumerError> {
+    let (summary, capability, owner, generation, evidence_handle) = match observed {
+        Some(row) => (
+            Some(row.summary.clone()),
+            Some(ControlBoardCapability::new(row.capability.clone())?),
+            Some(ControlBoardOwner::new(row.owner.clone())?),
+            Some(ControlBoardGeneration::new(row.generation.clone())?),
+            Some(ControlBoardEvidenceHandle::new(row.evidence.clone())?),
+        ),
+        None => (None, None, None, None, None),
+    };
+    Ok(RenderedControlBoardRow {
+        entry_id: entry_id.to_owned(),
+        disposition,
+        summary,
+        capability,
+        owner,
+        generation,
+        evidence_handle,
+        installation: context.installation.clone(),
+        observed_at: context.observed_at,
+        source_digest: context.source_digest.clone(),
+        recovery_owner: context.recovery_owner.clone(),
+        view_revision: contour.view_revision,
+        contour_digest: contour.contour_digest.clone(),
+    })
+}
+
 /// Reconciles one contour against the frozen denominator.
 ///
 /// Every expected entry receives exactly one row in frozen order: observed
@@ -588,7 +658,7 @@ pub enum ControlBoardConsumerError {
 /// when none was supplied); unobserved entries render `Missing` with no
 /// summary. Observed contour entries outside the denominator are preserved in
 /// `unexpected_observed`. Dispositions are never inferred from entry kinds or
-/// summaries.
+/// summaries, and the board-level I0.5 axes are never derived from them.
 pub fn render_controlboard_status(
     contour: &ControlBoardContour,
     context: &ControlBoardObservationContext,
@@ -603,58 +673,37 @@ pub fn render_controlboard_status(
             });
         }
     }
-    let mut observed_by_id: BTreeMap<&str, &ControlBoardStatusRow> = BTreeMap::new();
-    for row in &contour.rows {
-        observed_by_id.insert(row.entry_id.as_str(), row);
-    }
+    let observed_by_id: BTreeMap<&str, &ControlBoardStatusRow> = contour
+        .rows
+        .iter()
+        .map(|row| (row.entry_id.as_str(), row))
+        .collect();
     let mut rows = Vec::with_capacity(expected.len());
     let mut observed_count = 0_usize;
     for entry_id in expected.entries() {
-        let rendered = match observed_by_id.get(entry_id.as_str()) {
-            Some(observed) => {
-                observed_count = observed_count.saturating_add(1);
-                RenderedControlBoardRow {
-                    entry_id: entry_id.clone(),
-                    disposition: overrides
-                        .get(entry_id.as_str())
-                        .copied()
-                        .unwrap_or(ControlBoardRowDisposition::Unknown),
-                    summary: Some(observed.summary.clone()),
-                    capability: Some(ControlBoardCapability::new(observed.capability.clone())?),
-                    owner: Some(ControlBoardOwner::new(observed.owner.clone())?),
-                    generation: Some(ControlBoardGeneration::new(observed.generation.clone())?),
-                    evidence_handle: Some(ControlBoardEvidenceHandle::new(
-                        observed.evidence.clone(),
-                    )?),
-                    installation: context.installation.clone(),
-                    observed_at: context.observed_at,
-                    source_digest: context.source_digest.clone(),
-                    recovery_owner: context.recovery_owner.clone(),
-                    view_revision: contour.view_revision,
-                    contour_digest: contour.contour_digest.clone(),
-                }
-            }
-            None => RenderedControlBoardRow {
-                entry_id: entry_id.clone(),
-                disposition: ControlBoardRowDisposition::Missing,
-                summary: None,
-                // An unobserved row was never projected under a capability, at a
-                // generation, or against an evidence handle. These bindings are
-                // `None` because nothing was observed, never because the value
-                // is unknown or empty; nothing here is inferred or filled in.
-                capability: None,
-                owner: None,
-                generation: None,
-                evidence_handle: None,
-                installation: context.installation.clone(),
-                observed_at: context.observed_at,
-                source_digest: context.source_digest.clone(),
-                recovery_owner: context.recovery_owner.clone(),
-                view_revision: contour.view_revision,
-                contour_digest: contour.contour_digest.clone(),
-            },
+        let Some(observed) = observed_by_id.get(entry_id.as_str()).copied() else {
+            let missing = rendered_row(
+                entry_id,
+                None,
+                ControlBoardRowDisposition::Missing,
+                context,
+                contour,
+            )?;
+            rows.push(missing);
+            continue;
         };
-        rows.push(rendered);
+        observed_count = observed_count.saturating_add(1);
+        let disposition = overrides
+            .get(entry_id.as_str())
+            .copied()
+            .unwrap_or(ControlBoardRowDisposition::Unknown);
+        rows.push(rendered_row(
+            entry_id,
+            Some(observed),
+            disposition,
+            context,
+            contour,
+        )?);
     }
     let mut unexpected_observed = Vec::new();
     for row in &contour.rows {
@@ -673,6 +722,11 @@ pub fn render_controlboard_status(
         observed_count,
         missing_count,
         unexpected_observed,
+        transport: contour.transport,
+        evidence_execution: contour.evidence_execution,
+        evaluated_at_ms: contour.evaluated_at_ms,
+        domain_coverage: contour.domain_coverage.clone(),
+        support_rows: contour.support_rows.clone(),
         expiry: contour.expiry.clone(),
         invalidation: contour.invalidation.clone(),
     })
@@ -788,6 +842,14 @@ mod tests {
             product_not_applicable: Some(
                 "read-only status contour carries no product claim".to_owned(),
             ),
+            evaluated_at_ms: super::super::controlboard_projection::owner_records::EVALUATED_AT_MS,
+            domain_coverage:
+                super::super::controlboard_projection::owner_records::unobserved_coverage(),
+            support_rows: vec![
+                super::super::controlboard_projection::owner_records::target_source_support_row(),
+            ],
+            transport: SupportObservationState::Unknown,
+            evidence_execution: EvidenceExecutionStatus::NotExecuted,
         }
     }
 
