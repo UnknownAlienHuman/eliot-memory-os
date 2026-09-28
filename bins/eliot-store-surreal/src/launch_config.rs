@@ -21,7 +21,8 @@
 use std::path::{Component, Path};
 
 use eliot_installation::{
-    PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor, validate_store_credential_target,
+    PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor,
+    validate_provider_bootstrap_credential_target, validate_store_credential_target,
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{UserOwnedPathLease, UserOwnedRootLease, read_protected_file};
@@ -61,11 +62,24 @@ pub struct StoreLaunchConfig {
     pub blob_root: String,
     pub instance_id: String,
     pub credential_ref: String,
+    /// Reserved Credential Manager reference for the provider child's own
+    /// bootstrap/admin credential (I15.4). It is a different reference from
+    /// [`Self::credential_ref`] so the two can be rotated independently, and
+    /// it never carries a value: this configuration is a secret-free launch
+    /// declaration.
+    pub provider_bootstrap_credential_ref: String,
+    /// `SurrealDB` identity whose credential the provider child consumes. It
+    /// must not be the ordinary client [`Self::username`].
+    pub provider_bootstrap_username: String,
     pub runtime_launch: RuntimeLaunchDescriptor,
 }
 
 impl StoreLaunchConfig {
     pub fn validate(&self) -> Result<(), String> {
+        // One finite production boundary map (issue #1810) decides which
+        // contours may hold a database credential and which owns the provider
+        // endpoint; this launch must resolve to exactly that assignment.
+        crate::boundary_map::StoreBoundaryMap::canonical().validate_against(self)?;
         validate_launch_text(&self.store_pipe, "store_pipe")?;
         validate_launch_text(&self.launch_nonce, "launch_nonce")?;
         // #726: the typed namespace owner decides the legacy/current boundary
@@ -99,6 +113,7 @@ impl StoreLaunchConfig {
                     .to_owned(),
             );
         }
+        self.validate_provider_credential_boundary()?;
         if self.approved_artifact_hash != self.runtime_launch.store_bridge_artifact_digest.as_str()
         {
             return Err(
@@ -196,6 +211,36 @@ impl StoreLaunchConfig {
             .map_err(|error| format!("runtime launch/config materialization mismatch: {error}"))
     }
 
+    /// Validates the provider bootstrap/admin credential boundary of this
+    /// launch (I15.4).
+    ///
+    /// The provider child and the Store bridge must be admitted to two
+    /// different reserved credential references carrying two different
+    /// `SurrealDB` identities. A shared reference, or a bootstrap identity
+    /// equal to the ordinary client identity, would collapse the separation
+    /// into one credential; it is refused here rather than at provider
+    /// start-up, where the failure would already have launched the provider.
+    fn validate_provider_credential_boundary(&self) -> Result<(), String> {
+        validate_launch_text(
+            &self.provider_bootstrap_credential_ref,
+            "provider_bootstrap_credential_ref",
+        )?;
+        validate_launch_text(
+            &self.provider_bootstrap_username,
+            "provider_bootstrap_username",
+        )?;
+        validate_provider_bootstrap_credential_target(&self.provider_bootstrap_credential_ref)
+            .map_err(|reason| format!("invalid provider_bootstrap_credential_ref: {reason}"))?;
+        // The two references must differ; `StoreBoundaryMap::validate_against`
+        // owns that admission and runs first in `validate`.
+        if self.provider_bootstrap_username == self.username {
+            return Err(
+                "provider_bootstrap_username must be a distinct identity from username".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) const fn authority_epoch(&self) -> u64 {
         self.runtime_launch
             .authority_state_fence
@@ -291,6 +336,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         blob_root: &'a str,
         instance_id: &'a str,
         credential_ref: &'a str,
+        provider_bootstrap_credential_ref: &'a str,
+        provider_bootstrap_username: &'a str,
         runtime_launch: &'a RuntimeLaunchDescriptor,
     }
     let input = OperationalConfig {
@@ -311,6 +358,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
         credential_ref: &config.credential_ref,
+        provider_bootstrap_credential_ref: &config.provider_bootstrap_credential_ref,
+        provider_bootstrap_username: &config.provider_bootstrap_username,
         runtime_launch: &config.runtime_launch,
     };
     let bytes =

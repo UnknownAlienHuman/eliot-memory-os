@@ -232,6 +232,8 @@ fn test_config() -> SurrealAdapterConfig {
         database: "eliot952".to_owned(),
         username: "provider-user-952".to_owned(),
         password: SecretString::new("test-secret-952".into()),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+        provider_bootstrap_password: SecretString::new("provider-bootstrap-fixture-secret".into()),
         provider_bind_address: "127.0.0.1:18001".to_owned(),
         installation_id: "installation-test-952".to_owned(),
         installation_profile: "portable_dev".to_owned(),

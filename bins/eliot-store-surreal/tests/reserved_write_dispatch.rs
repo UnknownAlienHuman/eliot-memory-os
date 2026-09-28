@@ -239,6 +239,9 @@ fn config() -> StoreLaunchConfig {
         blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
         instance_id: "store-test".to_owned(),
         credential_ref: "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
+        provider_bootstrap_credential_ref: "eliot/provider/v1/fedcba9876543210fedcba9876543210"
+            .to_owned(),
+        provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
         runtime_launch: runtime_launch(),
     };
     config.approved_config_hash = launch_config_digest(&config).unwrap();

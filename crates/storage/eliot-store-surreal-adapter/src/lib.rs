@@ -766,6 +766,10 @@ mod tests {
             database: "eliot".to_owned(),
             username: "provider-user".to_owned(),
             password: SecretString::new("test-secret".into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: "127.0.0.1:18000".to_owned(),
             installation_id: "installation-test".to_owned(),
             installation_profile: "portable_dev".to_owned(),

@@ -7826,6 +7826,10 @@ mod live_surreal_evidence_pack_e2e {
             database: "eliot".to_owned(),
             username: username.clone(),
             password: secrecy::SecretString::new(password.clone().into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: secrecy::SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: bind.clone(),
             installation_id: "t11-live-installation".to_owned(),
             installation_profile: "portable_dev".to_owned(),

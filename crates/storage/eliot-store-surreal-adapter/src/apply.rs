@@ -2780,6 +2780,10 @@ mod concurrent_allocation_tests {
                     database: "alloc989".into(),
                     username: "sconc989-user".into(),
                     password: SecretString::new(format!("test-{}", uuid::Uuid::new_v4()).into()),
+                    provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+                    provider_bootstrap_password: SecretString::new(
+                        "provider-bootstrap-fixture-secret".into(),
+                    ),
                     provider_bind_address: bind,
                     installation_id: "sconc989-test".into(),
                     installation_profile: "portable_dev".into(),

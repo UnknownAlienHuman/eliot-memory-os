@@ -550,6 +550,74 @@ pub fn validate_store_credential_target(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates the one canonical Credential Manager target admitted for the
+/// provider child's own bootstrap/admin credential.
+///
+/// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets) requires the
+/// server bootstrap/admin credential and the normal application credential to
+/// be "distinct, independently rotatable references". A separate reserved
+/// namespace is what makes that comparison and that rotation possible: two
+/// references in one namespace could only be distinguished by an accidental
+/// token difference, and rotating one would silently rewrite the other.
+///
+/// The target is an opaque [`PlatformHandle`] at the wire boundary. No target
+/// may be derived, defaulted or substituted at runtime, and no value is ever
+/// carried here.
+pub fn validate_provider_bootstrap_credential_target(value: &str) -> Result<(), String> {
+    let target_token = value.strip_prefix("eliot/provider/v1/");
+    if target_token.is_none_or(|token| {
+        token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(
+            "must be an unpredictable reserved provider bootstrap credential target".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Derives the one reserved provider bootstrap/admin credential locator from the
+/// exact Store locator.
+///
+/// I15.4 requires the two references to be independently rotatable, so the
+/// derivation is a distinct digest domain in a distinct namespace. A caller
+/// cannot pass an arbitrary provider target: the only admitted value is the one
+/// this owner derives from the Store target it already admitted.
+///
+/// # Errors
+/// Returns [`InstallationError::InvalidField`] when the Store locator is not
+/// itself an admitted reserved Store credential target.
+pub fn provider_bootstrap_credential_target_for_store_target(
+    store_target: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    validate_store_credential_target(store_target.as_str()).map_err(|reason| {
+        InstallationError::InvalidField {
+            field: "credential.provider_bootstrap_target".to_owned(),
+            reason,
+        }
+    })?;
+    let digest = sha256_hex(
+        format!(
+            "eliot.provider-bootstrap-credential-target.v1\0{}",
+            store_target.as_str()
+        )
+        .as_bytes(),
+    );
+    let target = format!("eliot/provider/v1/{}", &digest[..32]);
+    validate_provider_bootstrap_credential_target(&target).map_err(|reason| {
+        InstallationError::InvalidField {
+            field: "credential.provider_bootstrap_target".to_owned(),
+            reason,
+        }
+    })?;
+    PlatformHandle::new(target).map_err(|error| InstallationError::InvalidField {
+        field: "credential.provider_bootstrap_target".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
 /// Derives the one transaction-owned dispatch-secret locator from the exact
 /// Store locator.  It is a distinct digest domain, so a Store config digest,
 /// watchdog selector, or destination path cannot be substituted as the

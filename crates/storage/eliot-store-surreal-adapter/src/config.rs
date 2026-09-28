@@ -76,6 +76,28 @@ pub struct SurrealAdapterConfig {
     pub username: String,
     /// `SurrealDB` password credential, held opaque and redacted.
     pub password: SecretString,
+    /// `SurrealDB` username whose credential the provider child consumes to
+    /// bootstrap its own server identity.
+    ///
+    /// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets) requires the
+    /// server bootstrap/admin identity and the normal application identity to
+    /// be distinct. The admission is made on the launch declaration, before any
+    /// value is resolved: `StoreLaunchConfig::validate` refuses a
+    /// `provider_bootstrap_username` equal to [`Self::username`], and the two
+    /// values arrive here from two different reserved Credential Manager
+    /// references resolved by two different admission owners.
+    pub provider_bootstrap_username: String,
+    /// `SurrealDB` provider bootstrap/admin password, held opaque and redacted.
+    ///
+    /// It is materialized into the provider child's own fresh environment block
+    /// immediately before process creation (see
+    /// `client::provider_owner::provider_environment`) and never into argv, a
+    /// serialized form, or the ordinary client credential set.
+    ///
+    /// This owner holds it only because it is the process that creates the
+    /// provider child and may re-create it after a provider loss, so the
+    /// material is resident exactly as long as this adapter may spawn.
+    pub provider_bootstrap_password: SecretString,
     /// Exact loopback address owned by this adapter's provider child.
     pub provider_bind_address: String,
     /// Canonical installation identity that owns the provider roots.
@@ -116,6 +138,8 @@ impl fmt::Debug for SurrealAdapterConfig {
             .field("database", &self.database)
             .field("username", &"[REDACTED]")
             .field("password", &"[REDACTED]")
+            .field("provider_bootstrap_username", &"[REDACTED]")
+            .field("provider_bootstrap_password", &"[REDACTED]")
             .field("provider_bind_address", &self.provider_bind_address)
             .field("installation_id", &self.installation_id)
             .field("installation_profile", &self.installation_profile)
@@ -152,6 +176,19 @@ impl SurrealAdapterConfig {
         validate_name(&self.namespace, "namespace")?;
         validate_name(&self.database, "database")?;
         validate_name(&self.username, "username")?;
+        validate_name(
+            &self.provider_bootstrap_username,
+            "provider_bootstrap_username",
+        )?;
+        // I15.4: the server bootstrap/admin identity and the ordinary
+        // application identity are distinct. This compares the two recorded
+        // identities this configuration actually holds, so one `SurrealDB` user
+        // cannot hold both roles. The two credential VALUES are deliberately
+        // not compared here: which secret reaches which contour is established
+        // by the two independently resolved references, not by a string test.
+        if self.provider_bootstrap_username == self.username {
+            return Err(ConfigError::AliasedProviderCredentials);
+        }
         validate_name(&self.installation_id, "installation_id")?;
         if !matches!(
             self.installation_profile.as_str(),
@@ -768,6 +805,8 @@ pub enum ConfigError {
     InvalidField { field: &'static str },
     #[error("Store data, work, and temp roots must be distinct")]
     AliasedRuntimeRoots,
+    #[error("provider bootstrap/admin and normal client credentials must be distinct identities")]
+    AliasedProviderCredentials,
 }
 
 #[cfg(test)]
@@ -785,6 +824,10 @@ mod tests {
             database: "eliot".to_owned(),
             username: "provider-user".to_owned(),
             password: SecretString::new("test-secret".into()),
+            provider_bootstrap_username: "provider-bootstrap-fixture".to_owned(),
+            provider_bootstrap_password: SecretString::new(
+                "provider-bootstrap-fixture-secret".into(),
+            ),
             provider_bind_address: "127.0.0.1:18000".to_owned(),
             installation_id: "installation-test".to_owned(),
             installation_profile: "portable_dev".to_owned(),
