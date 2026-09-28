@@ -17,21 +17,28 @@
 //! mechanical transport bindings before any staging work.
 //!
 //! The corrected operation identity is the owner's, not prose. The Governor
-//! owner in `eliot-canonical` issues it (`derive_corrected_operation_id`) and
-//! verifies lineage against the refusals it retained
+//! owner in `eliot-canonical` issues it (`derive_corrected_operation_id`)
+//! and verifies lineage against the refusals it retained
 //! (`RetainedRejections::verify_correction_lineage`); this gate never rebuilds
-//! that decision. What the gate can and does enforce mechanically is the
-//! identity half it can see on the wire: it records every operation identity
-//! it refused, and a resubmission that still wears one is refused here instead
-//! of committing under the rejected identity. The rule string below stays as
-//! the stated rule; it is no longer the only statement of the rule.
+//! that semantic decision. The derivation itself is the one shared
+//! `eliot-store-api` primitive both layers call, so the identity this gate
+//! stamps on its live refusals is exactly the identity the owner issues.
+//! What the gate can and does enforce mechanically is the identity half it
+//! can see on the wire: it records every operation identity it refused, and
+//! a resubmission that still wears one is refused here instead of committing
+//! under the rejected identity. It also retains the corrected identity each
+//! refusal issued, so a corrected resubmission presenting exactly that
+//! identity is admitted with a verified [`VerifiedCorrectionLink`] binding
+//! the committed write to the rejected operation it corrects. The rule
+//! string below stays as the stated rule; it is no longer the only
+//! statement of the rule.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{RequestMetadata, sha256_hex};
 use eliot_store_api::{
     CanonicalRequestView, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    verify_canonical_request_hash,
+    derive_corrected_operation_id, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,6 +82,13 @@ pub struct PreStageRejection {
     pub canonical_request_hash: String,
     /// Stable rejection identity for exact same-hash retry.
     pub rejection_id: String,
+    /// Operation identity a corrected resubmission must use.
+    ///
+    /// Derived through the one shared `eliot-store-api` primitive from the
+    /// inputs this refusal is already fixed by (the rejected operation
+    /// identity and the rejection identity), so it is exactly the identity
+    /// the Governor owner issues for the same refusal.
+    pub corrected_operation_id: String,
     /// Always `none` pre-stage.
     pub stage_state: PreStageState,
     /// Always `false` pre-stage.
@@ -133,6 +147,15 @@ impl PreStageRejection {
             return Err(PreStageGateError::InvalidField {
                 field: "rejection.rejection_id",
                 reason: "must derive from the idempotency key and canonical hash",
+            });
+        }
+        if self.corrected_operation_id
+            != derive_corrected_operation_id(&self.proposed_operation_id, &self.rejection_id)
+            || self.corrected_operation_id == self.proposed_operation_id
+        {
+            return Err(PreStageGateError::InvalidField {
+                field: "rejection.corrected_operation_id",
+                reason: "must carry the corrected operation identity issued for this refusal, which differs from the rejected one",
             });
         }
         if !matches!(self.stage_state, PreStageState::None) {
@@ -211,17 +234,48 @@ pub fn derive_rejection_id(idempotency_key: &str, canonical_request_hash: &str) 
     sha256_hex(format!("{idempotency_key}:{canonical_request_hash}").as_bytes())
 }
 
+/// Verified correction lineage for one admitted resubmission.
+///
+/// Every field comes from the gate's own retained refusal record: the
+/// presented operation identity matched a corrected identity this cache
+/// retained, so the recorded rejected operation is the proven parent of the
+/// committed write. No caller assertion is believed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedCorrectionLink {
+    /// Admitted operation identity: exactly the corrected identity issued.
+    pub corrected_operation_id: String,
+    /// Rejected operation identity this correction was issued for.
+    pub corrected_from_operation_id: String,
+    /// Rejection identity that issued the correction.
+    pub correction_rejection_id: String,
+}
+
+/// One refusal this gate kept, bound to the operation identity it refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IssuedCorrection {
+    /// Operation identity this gate refused.
+    rejected_operation_id: String,
+    /// Stable rejection identity returned for it.
+    rejection_id: String,
+}
+
 /// In-memory pre-stage identity cache.
 ///
 /// Preserves exact same-hash retry identity and `IDENTITY_CONFLICT` without
 /// touching ORS, the store, or any sequence allocator. It also records every
 /// operation identity it refused, so corrected bytes can never come back still
-/// wearing a rejected operation identity. It issues no identity of its own:
-/// the corrected operation identity stays Governor-owned.
+/// wearing a rejected operation identity, and retains the corrected identity
+/// each refusal issued, so a resubmission presenting exactly that identity is
+/// admitted with its lineage proven instead of committing unlinked. The
+/// corrected identity itself is the one shared `eliot-store-api` derivation
+/// the Governor owner also issues: this cache retains it, it never invents a
+/// divergent one.
 #[derive(Clone, Debug, Default)]
 pub struct PreStageIdentityCache {
     entries: BTreeMap<String, (String, PreStageRejection)>,
     refused_operations: BTreeSet<String>,
+    issued_corrections: BTreeMap<String, IssuedCorrection>,
 }
 
 impl PreStageIdentityCache {
@@ -243,8 +297,51 @@ impl PreStageIdentityCache {
             key.to_owned(),
             (canonical_hash.to_owned(), rejection.clone()),
         );
-        self.refused_operations
-            .insert(proposed_operation_id.to_owned());
+        self.retain_refused_operation(proposed_operation_id, rejection);
+    }
+
+    /// Retains the refused operation identity without touching the keyed retry
+    /// entry: a changed-bytes `IDENTITY_CONFLICT` refusal must never overwrite
+    /// the stored rejection for that key.
+    ///
+    /// The first refusal of an operation identity is the one retained, so the
+    /// corrected identity issued for that operation never changes.
+    fn retain_refused_operation(
+        &mut self,
+        proposed_operation_id: &str,
+        rejection: &PreStageRejection,
+    ) {
+        if self
+            .refused_operations
+            .insert(proposed_operation_id.to_owned())
+        {
+            self.issued_corrections.insert(
+                rejection.corrected_operation_id.clone(),
+                IssuedCorrection {
+                    rejected_operation_id: proposed_operation_id.to_owned(),
+                    rejection_id: rejection.rejection_id.clone(),
+                },
+            );
+        }
+    }
+
+    /// Verifies a presented operation identity against this cache's own record.
+    ///
+    /// Returns the verified link only when the presented identity is exactly
+    /// a corrected identity a retained refusal issued. A fresh unrelated
+    /// operation yields `None`: it is an ordinary new write, and stamping it
+    /// with lineage would stamp unproven lineage.
+    fn verified_correction_for(
+        &self,
+        presented_operation_id: &str,
+    ) -> Option<VerifiedCorrectionLink> {
+        self.issued_corrections
+            .get(presented_operation_id)
+            .map(|issued| VerifiedCorrectionLink {
+                corrected_operation_id: presented_operation_id.to_owned(),
+                corrected_from_operation_id: issued.rejected_operation_id.clone(),
+                correction_rejection_id: issued.rejection_id.clone(),
+            })
     }
 }
 
@@ -258,6 +355,11 @@ impl PreStageIdentityCache {
 /// NOT_ATTEMPTED`, and no `write_intent_id`. A resubmission that still carries
 /// an operation identity this gate already refused is refused too, so
 /// corrected bytes never commit under a rejected operation identity.
+///
+/// An admitted resubmission presenting exactly the corrected identity a
+/// retained refusal issued returns the verified [`VerifiedCorrectionLink`]
+/// binding the committed write to the rejected operation it corrects; any
+/// other admitted write returns `None` and commits unlinked.
 #[allow(
     clippy::too_many_lines,
     reason = "each mechanical gate pushes its own defect code so one request reports every defect"
@@ -272,7 +374,7 @@ pub fn pre_stage_check(
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<(), PreStageRejection> {
+) -> Result<Option<VerifiedCorrectionLink>, PreStageRejection> {
     let view = CanonicalRequestView::from_apply(
         context,
         transition,
@@ -291,9 +393,7 @@ pub fn pre_stage_check(
         // identity never reached the store; the keyed entry stays untouched, so
         // the first rejection for the key is still the one an exact retry
         // replays.
-        cache
-            .refused_operations
-            .insert(transition.identity.operation_id.as_str().to_owned());
+        cache.retain_refused_operation(transition.identity.operation_id.as_str(), &rejection);
         return Err(rejection);
     }
 
@@ -301,9 +401,9 @@ pub fn pre_stage_check(
     // This cache records every operation identity it refused, so a
     // resubmission that still wears one is refused here instead of committing
     // under the rejected identity. The transported apply request carries no
-    // lineage field, so the gate asserts none and issues none: the corrected
-    // operation identity and the lineage proof stay with the Governor owner,
-    // which derived the identity and retained the refusal.
+    // lineage field, so the gate believes no caller assertion: the presented
+    // operation identity itself is the proof exactly when it equals a
+    // corrected identity this cache retained.
     if cache
         .refused_operations
         .contains(transition.identity.operation_id.as_str())
@@ -362,7 +462,7 @@ pub fn pre_stage_check(
     }
 
     if defects.is_empty() {
-        return Ok(());
+        return Ok(cache.verified_correction_for(transition.identity.operation_id.as_str()));
     }
     let semantic = defects.iter().any(|code| {
         code.contains("FENCE") || code.contains("REVISION") || code.contains("ORDERING")
@@ -373,7 +473,11 @@ pub fn pre_stage_check(
         proposed_operation_id: transition.identity.operation_id.as_str().to_owned(),
         idempotency_key: key.clone(),
         canonical_request_hash: canonical_hash.clone(),
-        rejection_id,
+        rejection_id: rejection_id.clone(),
+        corrected_operation_id: derive_corrected_operation_id(
+            transition.identity.operation_id.as_str(),
+            &rejection_id,
+        ),
         stage_state: PreStageState::None,
         ordering_sequence_assigned: false,
         decision: PreStageDecision::NotAccepted,
@@ -405,12 +509,17 @@ fn conflict_rejection(
     canonical_hash: &str,
 ) -> PreStageRejection {
     let key = transition.identity.idempotency_key.clone();
+    let rejection_id = derive_rejection_id(&key, canonical_hash);
     PreStageRejection {
         request_id: context.request_id.as_str().to_owned(),
         proposed_operation_id: transition.identity.operation_id.as_str().to_owned(),
         idempotency_key: key.clone(),
         canonical_request_hash: canonical_hash.to_owned(),
-        rejection_id: derive_rejection_id(&key, canonical_hash),
+        rejection_id: rejection_id.clone(),
+        corrected_operation_id: derive_corrected_operation_id(
+            transition.identity.operation_id.as_str(),
+            &rejection_id,
+        ),
         stage_state: PreStageState::None,
         ordering_sequence_assigned: false,
         decision: PreStageDecision::Conflict,
@@ -430,21 +539,26 @@ fn conflict_rejection(
 ///
 /// The refusal is pre-stage like every other one here: `stage_state: none`, no
 /// ordering sequence, `write_mutation_status: NOT_ATTEMPTED`, no
-/// `write_intent_id`. The corrected operation identity itself stays
-/// Governor-owned: this gate names no identity of its own, so the caller is
-/// told to resubmit under a new operation identity and the owner issues it.
+/// `write_intent_id`. The corrected operation identity is the one shared
+/// derivation the Governor owner also issues, so the caller is told the exact
+/// identity to resubmit under.
 fn refused_operation_identity_rejection(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     canonical_hash: &str,
 ) -> PreStageRejection {
     let key = transition.identity.idempotency_key.clone();
+    let rejection_id = derive_rejection_id(&key, canonical_hash);
     PreStageRejection {
         request_id: context.request_id.as_str().to_owned(),
         proposed_operation_id: transition.identity.operation_id.as_str().to_owned(),
         idempotency_key: key.clone(),
         canonical_request_hash: canonical_hash.to_owned(),
-        rejection_id: derive_rejection_id(&key, canonical_hash),
+        rejection_id: rejection_id.clone(),
+        corrected_operation_id: derive_corrected_operation_id(
+            transition.identity.operation_id.as_str(),
+            &rejection_id,
+        ),
         stage_state: PreStageState::None,
         ordering_sequence_assigned: false,
         decision: PreStageDecision::Conflict,

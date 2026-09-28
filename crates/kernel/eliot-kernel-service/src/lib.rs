@@ -74,7 +74,7 @@ pub use capacity_evidence::{
 };
 pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageRejection,
-    PreStageState, derive_rejection_id, pre_stage_check,
+    PreStageState, VerifiedCorrectionLink, derive_rejection_id, pre_stage_check,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,

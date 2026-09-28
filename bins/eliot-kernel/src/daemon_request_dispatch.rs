@@ -6384,26 +6384,32 @@ impl KernelComposition {
         // replays the same rejection identity; changed canonical bytes under
         // one idempotency key yield `IDENTITY_CONFLICT`. The gate allocates no
         // ordering sequence, mints no `write_intent_id`, and records no
-        // effect, so a refusal never reaches the Store backend below.
-        {
+        // effect, so a refusal never reaches the Store backend below. An
+        // admitted resubmission presenting exactly the corrected identity a
+        // retained refusal issued additionally returns its verified correction
+        // lineage, which travels on the commit response below.
+        let verified_correction = {
             let mut cache = self
                 .pre_stage_identity_cache
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            if let Err(rejection) = eliot_kernel_service::pre_stage_check(
+            match eliot_kernel_service::pre_stage_check(
                 &mut cache,
                 &operation.context,
                 &operation.transition,
                 &operation.expected_revision_heads,
                 &operation.expected_ordering_heads,
             ) {
-                return Ok(Self::pre_stage_rejection_response(&rejection));
+                Err(rejection) => {
+                    return Ok(Self::pre_stage_rejection_response(&rejection));
+                }
+                Ok(link) => link,
             }
-        }
+        };
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
-            .replay_committed_apply_receipt(&gateway, &operation)
+            .replay_committed_apply_receipt(&gateway, &operation, verified_correction.as_ref())
             .await?
         {
             return Ok(replayed);
@@ -6490,7 +6496,7 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt))
+                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
             }
             Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
         }
@@ -6512,6 +6518,7 @@ impl KernelComposition {
         &self,
         gateway: &Arc<KernelStoreGateway>,
         operation: &StoreApplyOperation,
+        verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
         let Ok(Some(receipt)) = gateway
             .receipt(
@@ -6534,7 +6541,7 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
-        Ok(Some(store_apply_response(&receipt)))
+        Ok(Some(store_apply_response(&receipt, verified_correction)))
     }
 
     #[cfg(not(windows))]
@@ -8731,12 +8738,30 @@ fn store_genesis_response(receipt: &WriteReceipt) -> serde_json::Value {
     })
 }
 
-fn store_apply_response(receipt: &WriteReceipt) -> serde_json::Value {
-    serde_json::json!({
+/// Renders one committed `store.apply` receipt (issue #1796, I6.8).
+///
+/// A resubmission the pre-stage gate verified as a correction carries its
+/// proven lineage on the response, so the committed write is observably
+/// linked to the rejected operation it corrects. Any other write renders
+/// exactly the historical shape: lineage is never stamped without the
+/// gate's verified link.
+fn store_apply_response(
+    receipt: &WriteReceipt,
+    verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+) -> serde_json::Value {
+    let mut response = serde_json::json!({
         "status": "known",
         "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
-    })
+    });
+    if let Some(link) = verified_correction {
+        response["correction_lineage"] = serde_json::json!({
+            "corrected_operation_id": link.corrected_operation_id,
+            "corrected_from_operation_id": link.corrected_from_operation_id,
+            "correction_rejection_id": link.correction_rejection_id,
+        });
+    }
+    response
 }
 
 /// Requires a local-read store request to be the closed evidence-pack read.
