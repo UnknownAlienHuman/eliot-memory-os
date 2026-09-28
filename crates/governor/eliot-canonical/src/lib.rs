@@ -234,6 +234,14 @@ impl<'a> StoreRecoveryProjection<'a> {
             StoreError::OrderingConflict => {
                 conflict_parts("ORDERING_CONFLICT", RefreshRevisionHeads)
             }
+            // A disposition naming stale, foreign, partial or changed evidence
+            // (issue #1684) is a conflict: nothing was attempted, nothing was
+            // changed, and the current revisions must be re-read before the
+            // decision can be taken again. It is projected exactly like the
+            // other revision-bearing conflicts.
+            StoreError::StaleDisposition { .. } => {
+                conflict_parts("STALE_DISPOSITION", RefreshRevisionHeads)
+            }
             StoreError::AutomationContinuation(failure) => automation_continuation_parts(*failure),
             StoreError::InvalidProjection => internal_defect_parts("INVALID_PROJECTION"),
             StoreError::InvalidOutbox => internal_defect_parts("INVALID_OUTBOX"),

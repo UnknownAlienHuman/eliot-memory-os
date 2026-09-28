@@ -1262,6 +1262,10 @@ pub enum StoreReadFailure {
     RevisionConflict,
     /// An ordering conflict was observed.
     OrderingConflict,
+    /// A sequence disposition named evidence that is stale, foreign, partial
+    /// or changed since the decision was taken (issue #1684); nothing was
+    /// changed and the current revisions must be re-read before deciding again.
+    StaleDisposition,
     /// A legacy unauthenticated user-automation continuation was presented; the
     /// caller must read a fresh first page instead of resuming it.
     AutomationContinuationLegacyRefresh,
@@ -1324,6 +1328,9 @@ impl std::fmt::Display for StoreReadFailure {
             Self::FenceMismatch => formatter.write_str("state fence mismatch"),
             Self::RevisionConflict => formatter.write_str("revision conflict"),
             Self::OrderingConflict => formatter.write_str("ordering conflict"),
+            Self::StaleDisposition => {
+                formatter.write_str("sequence disposition refused: stale evidence")
+            }
             Self::AutomationContinuationLegacyRefresh => {
                 formatter.write_str("user-automation continuation requires a first-page refresh")
             }
@@ -1380,6 +1387,7 @@ impl From<StoreError> for StoreReadFailure {
             StoreError::FenceMismatch => Self::FenceMismatch,
             StoreError::RevisionConflict => Self::RevisionConflict,
             StoreError::OrderingConflict => Self::OrderingConflict,
+            StoreError::StaleDisposition { .. } => Self::StaleDisposition,
             StoreError::AutomationContinuation(failure) => match failure {
                 AutomationContinuationFailure::LegacyRefresh => {
                     Self::AutomationContinuationLegacyRefresh
