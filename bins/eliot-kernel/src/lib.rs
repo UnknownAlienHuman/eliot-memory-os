@@ -166,10 +166,12 @@ pub use trace_manifest::{
 /// raised anywhere else would be a second opinion about an authority that
 /// decision owns. The route label is the renewal path itself, not a daemon or
 /// session name, so the label cardinality stays bounded by the number of renewal
-/// paths.
+/// paths. The same terminal also moves the Kernel-observed daemon health gauge
+/// to `Unavailable`: an expired lease requires a new admission and never
+/// auto-revives, so the daemon is not serving under supervision.
 #[cfg(windows)]
 fn observe_supervision_lease_expiry() {
-    use eliot_observability_runtime::{ModuleIdentity, WorkClass};
+    use eliot_observability_runtime::{ModuleHealthOutcome, ModuleIdentity, WorkClass};
     let Some(metrics) = execution_metrics::kernel_metrics() else {
         return;
     };
@@ -178,6 +180,43 @@ fn observe_supervision_lease_expiry() {
         WorkClass::Control,
         "kernel.daemon_supervision_renewal",
     ));
+    metrics.record(metrics.record_daemon_health(ModuleHealthOutcome::Unavailable));
+}
+
+/// Records the daemon's supervision health from one renewal decision.
+///
+/// A decision that advances or echoes the lease (`Renewed`, `ExactReplay`,
+/// `NotDue`) observes a progressing daemon; `DegradedNoRenewal` records the
+/// daemon's own explicitly degraded observation, and
+/// `ReconciliationRequired` observes supervision that cannot advance. The
+/// mapping reads the decision only: no health dimension is re-derived here.
+#[cfg(windows)]
+fn observe_daemon_supervision_decision(outcome: DaemonSupervisionRenewalOutcome) {
+    use eliot_observability_runtime::ModuleHealthOutcome;
+    let Some(metrics) = execution_metrics::kernel_metrics() else {
+        return;
+    };
+    let health = match outcome {
+        DaemonSupervisionRenewalOutcome::Renewed
+        | DaemonSupervisionRenewalOutcome::ExactReplay
+        | DaemonSupervisionRenewalOutcome::NotDue => ModuleHealthOutcome::Healthy,
+        DaemonSupervisionRenewalOutcome::DegradedNoRenewal
+        | DaemonSupervisionRenewalOutcome::ReconciliationRequired => ModuleHealthOutcome::Degraded,
+    };
+    metrics.record(metrics.record_daemon_health(health));
+}
+
+/// Records the chain stage that carried one audit submission.
+///
+/// Called from the single fallback cascade in
+/// [`crate::KernelComposition::audit_observe`] with the cascade's own terminal
+/// outcome. Never sampled: every submission counts exactly once, and the
+/// sample carries no record identity, detail or content.
+fn observe_audit_fallback_submission(outcome: &crate::audit_fallback::AuditFallbackOutcome) {
+    let Some(metrics) = execution_metrics::kernel_metrics() else {
+        return;
+    };
+    metrics.record(metrics.record_audit_fallback_outcome(outcome));
 }
 
 mod idle_lease_census;
@@ -3636,6 +3675,9 @@ impl KernelComposition {
                 progress.note_reconciliation_pending();
             }
         }
+        // The decision is also the Kernel's health observation of the daemon:
+        // it reaches the gauge exactly once per decided renewal.
+        observe_daemon_supervision_decision(decision.outcome);
         Ok(decision)
     }
 

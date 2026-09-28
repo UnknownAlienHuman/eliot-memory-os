@@ -525,9 +525,11 @@ pub fn install_daemon_execution_metrics(
     let outcome = install(&observability)?;
     // The install may have already happened in `main` (#1836/#3513): the
     // recorder profile is the served install's profile, never a second
-    // derivation that could disagree with it.
+    // derivation that could disagree with it. The endpoint likewise reports
+    // the served install's bound address, so a second install can never
+    // report a listener its own configuration did not bind.
     let profile = outcome.handles().profile;
-    let endpoint = match observability.metrics_listen {
+    let endpoint = match outcome.handles().metrics_endpoint.clone() {
         Some(address) => DaemonMetricsEndpoint::Bound(address),
         None => DaemonMetricsEndpoint::Absent,
     };

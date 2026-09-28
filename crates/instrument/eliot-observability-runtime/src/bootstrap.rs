@@ -114,6 +114,13 @@ pub struct ObservabilityInstall {
     pub otlp_bridge: Option<OtlpBridge>,
     /// Installation profile the stack was configured with.
     pub profile: RuntimeProfile,
+    /// Loopback address the served `OpenMetrics` listener bound, when the
+    /// served install configured one.
+    ///
+    /// Recorded from the configuration that actually installed the stack, so a
+    /// later `AlreadyInstalled` caller reports the served surface instead of
+    /// its own unserved configuration.
+    pub metrics_endpoint: Option<String>,
 }
 
 impl ObservabilityInstall {
@@ -252,6 +259,7 @@ pub fn install(
         },
         otlp_bridge,
         profile: config.profile,
+        metrics_endpoint: config.metrics_listen.clone(),
     };
     // The bridge is live, so it exports now. The verdict is the collector's own
     // status line: a refusal is recorded through the subscriber that is already

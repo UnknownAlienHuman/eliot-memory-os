@@ -2676,7 +2676,12 @@ impl crate::KernelComposition {
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
             return None;
         };
-        match fallback.observe(&mut chain, draft, now) {
+        // I16.5 (issue #1841): the cascade terminal is also the
+        // audit-fallback metric sample, counted once per submission and never
+        // sampled. The sample carries the stage only, never record content.
+        let outcome = fallback.observe(&mut chain, draft, now);
+        crate::observe_audit_fallback_submission(&outcome);
+        match outcome {
             crate::audit_fallback::AuditFallbackOutcome::Appended(record) => Some(record),
             outcome => {
                 crate::kernel_diagnostics::observe_terminal_error(

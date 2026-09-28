@@ -132,6 +132,19 @@ fn observe_local_read_queue_gauges(
     ));
 }
 
+/// Publishes one sealed trace manifest's completeness (I16.5, #1841).
+///
+/// The outcome is the seal's own finish — a proof-bearing seal is replayable
+/// and anything else is explicitly not claimed — and the missing-part count is
+/// the seal's own tally. Both are read from the sealed manifest, never
+/// re-derived, so the metric cannot disagree with the retained chain record.
+fn observe_trace_seal(manifest: &TraceManifest) {
+    let Some(metrics) = crate::execution_metrics::kernel_metrics() else {
+        return;
+    };
+    metrics.record(metrics.record_trace_seal(manifest));
+}
+
 /// Typed frame operations carrying one [`HostRequestEnvelope`] through the
 /// closed frame gateway.
 ///
@@ -2839,9 +2852,12 @@ impl KernelComposition {
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
-        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
-        ));
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // I16.5 (issue #1841): the sealed finish is also the
+        // trace-completeness metric sample, counted once per seal.
+        observe_trace_seal(&manifest);
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(&manifest));
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
         // completes the chain from it); a failed persist likewise leaves the
@@ -3750,9 +3766,12 @@ impl KernelComposition {
         ));
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain.
-        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
-        ));
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // I16.5 (issue #1841): the sealed finish is also the
+        // trace-completeness metric sample, counted once per seal.
+        observe_trace_seal(&manifest);
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(&manifest));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
         self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
