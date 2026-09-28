@@ -302,7 +302,12 @@ impl BackupControlRegistration {
     /// table is full. It never replaces an existing record: an operation that
     /// already has one is reconciled against that record instead, so this
     /// cannot be used to re-enter an owner for an operation that already ran.
-    fn claim(&self, binding: &str, operation: BackupOperationKind, digest: &str) -> Result<(), CompositionError> {
+    fn claim(
+        &self,
+        binding: &str,
+        operation: BackupOperationKind,
+        digest: &str,
+    ) -> Result<(), CompositionError> {
         let mut slots = self.lock()?;
         if slots.closed {
             return Err(CompositionError::InvalidConfiguration(
@@ -333,7 +338,12 @@ impl BackupControlRegistration {
     /// Stores the owner's own result for an operation this composition already
     /// claimed. An operation claimed under a different canonical identity is
     /// left unresolved rather than overwritten.
-    fn settle(&self, binding: &str, digest: &str, outcome: WatchdogBackupChannelOutcome) -> Result<(), CompositionError> {
+    fn settle(
+        &self,
+        binding: &str,
+        digest: &str,
+        outcome: WatchdogBackupChannelOutcome,
+    ) -> Result<(), CompositionError> {
         let mut slots = self.lock()?;
         let Some(record) = slots.retained.get_mut(binding) else {
             return Err(CompositionError::InvalidConfiguration(
@@ -529,12 +539,10 @@ pub fn resolve_accepted_method(
     accepted_watchdog_backup_methods()
         .iter()
         .find(|method| method.wire_id == wire_id)
-        .ok_or_else(|| {
-            BackupControlError::Contract(BackupError::InvalidField {
-                field: "watchdog_backup.method",
-                reason: "unsupported backup wire identity for this owner",
-            })
-        })
+        .ok_or(BackupControlError::Contract(BackupError::InvalidField {
+            field: "watchdog_backup.method",
+            reason: "unsupported backup wire identity for this owner",
+        }))
 }
 
 /// Returns `Ok(())` when this owner can actually execute `operation`, or the
@@ -572,8 +580,7 @@ fn executable_owner_method(operation: BackupOperationKind) -> Result<(), SpoolEr
         | BackupOperationKind::PrepareIsolatedRestore
         | BackupOperationKind::CompleteRehearsal
         | BackupOperationKind::AdmitCutover => Err(SpoolError::Corrupt(format!(
-            "watchdog backup control rejects {}; it is outside this owner's registered table and fails before any owner effect",
-            operation
+            "watchdog backup control rejects {operation}; it is outside this owner's registered table and fails before any owner effect"
         ))),
     }
 }
@@ -620,7 +627,8 @@ impl WatchdogBackupAdmission {
         if readiness.service != SERVICE_NAME || readiness.protocol != PROTOCOL_VERSION {
             return Err(BackupControlError::Composition(
                 CompositionError::InvalidConfiguration(
-                    "watchdog backup control refuses an unrecognized composition identity".to_owned(),
+                    "watchdog backup control refuses an unrecognized composition identity"
+                        .to_owned(),
                 ),
             ));
         }
@@ -966,7 +974,8 @@ impl BackupControlHandle {
         }
         if request.identity.principal.session_id != self.admission.session_id {
             return Err(BackupControlError::Rejected(
-                "watchdog backup control rejects a request for a foreign admitted session".to_owned(),
+                "watchdog backup control rejects a request for a foreign admitted session"
+                    .to_owned(),
             ));
         }
         if request.identity.fence.resource_generation.value() != self.admission.owner_generation {
@@ -976,7 +985,8 @@ impl BackupControlHandle {
         }
         if request.identity.source_installation != self.admission.owner_installation {
             return Err(BackupControlError::Rejected(
-                "watchdog backup control rejects a request for a foreign source installation".to_owned(),
+                "watchdog backup control rejects a request for a foreign source installation"
+                    .to_owned(),
             ));
         }
         if watchdog_attesting_role(request.operation).is_none() {
@@ -1160,7 +1170,8 @@ impl BackupControlHandle {
             || fence.watchdog_generation != self.admission.owner_generation
         {
             return Err(BackupControlError::Rejected(
-                "watchdog backup control refuses an owner result that names a foreign owner".to_owned(),
+                "watchdog backup control refuses an owner result that names a foreign owner"
+                    .to_owned(),
             ));
         }
         if fence.requester_principal != identity.principal.principal {
