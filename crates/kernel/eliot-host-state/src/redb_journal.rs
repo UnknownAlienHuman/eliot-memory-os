@@ -1,11 +1,13 @@
 //! Crash-safe redb adapter for the Host-owned journal.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use eliot_platform::{PlatformHandle, UnknownReason};
 use eliot_platform_windows::{
     ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, UserOwnedPathLease,
-    UserOwnedRootLease, require_protected_program_data_path, windows_paths_equal,
+    UserOwnedRootLease, profile_supervision::ProfileSelectionReceipt,
+    require_protected_program_data_path, windows_paths_equal,
 };
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
@@ -27,8 +29,29 @@ const RECEIPTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_host_journal_receipts_v1");
 const PAYLOADS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_host_journal_payloads_v1");
+const USER_PROFILE_BINDINGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("eliot_host_journal_user_profile_bindings_v1");
 const SCHEMA_MARKER_KEY: &str = "schema";
 const SCHEMA_MARKER: &[u8] = b"eliot-host-journal-schema-v1";
+const USER_PROFILE_BINDING_KEY: &str = "profile-selection";
+const USER_PROFILE_BINDING_CONTRACT: &str = "eliot.host.profile-selection-binding.v1";
+const REQUIRED_PROFILE_ROOT_ROLES: [&str; 4] = [
+    "immutable_binaries",
+    "durable_data",
+    "user_config",
+    "user_cache",
+];
+const REQUIRED_RUNTIME_ROOT_ROLES: [&str; 9] = [
+    "runtime_state_roots.profile_anchor_root",
+    "runtime_state_roots.installation_root",
+    "runtime_state_roots.host_state_root",
+    "runtime_state_roots.kernel_ors_root",
+    "runtime_state_roots.kernel_work_root",
+    "runtime_state_roots.store_data_root",
+    "runtime_state_roots.store_work_root",
+    "runtime_state_roots.store_temp_root",
+    "runtime_state_roots.watchdog_state_root",
+];
 
 const MAX_EPOCHS: usize = 256;
 const MAX_PREPARED: usize = 128;
@@ -44,6 +67,68 @@ struct StoredPrepared {
     bytes: Vec<u8>,
     flushed: bool,
     synced: bool,
+}
+
+/// Persisted user-profile root identity. The digest covers the exact original
+/// selection receipt and contract discriminator; it is validated before the
+/// receipt is compared with the current OS-derived selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredUserProfileBinding {
+    contract: String,
+    selection: ProfileSelectionReceipt,
+    binding_sha256: String,
+}
+
+#[derive(Serialize)]
+struct UserProfileBindingDigestInput<'a> {
+    contract: &'static str,
+    selection: &'a ProfileSelectionReceipt,
+}
+
+impl StoredUserProfileBinding {
+    fn new(selection: &ProfileSelectionReceipt) -> Result<Self, BackendError> {
+        validate_profile_selection(selection)?;
+        let mut stored = Self {
+            contract: USER_PROFILE_BINDING_CONTRACT.to_owned(),
+            selection: selection.clone(),
+            binding_sha256: String::new(),
+        };
+        stored.binding_sha256 = stored.compute_digest()?;
+        stored.validate()?;
+        Ok(stored)
+    }
+
+    fn compute_digest(&self) -> Result<String, BackendError> {
+        let bytes = serde_json::to_vec(&UserProfileBindingDigestInput {
+            contract: USER_PROFILE_BINDING_CONTRACT,
+            selection: &self.selection,
+        })
+        .map_err(|_| BackendError::Unavailable)?;
+        Ok(sha256_digest(&bytes))
+    }
+
+    fn validate(&self) -> Result<(), BackendError> {
+        validate_profile_selection(&self.selection)?;
+        if self.contract != USER_PROFILE_BINDING_CONTRACT
+            || !is_sha256_digest(&self.binding_sha256)
+            || self.compute_digest()? != self.binding_sha256
+        {
+            return Err(BackendError::Unavailable);
+        }
+        Ok(())
+    }
+
+    fn matches_current_selection(
+        &self,
+        current: &ProfileSelectionReceipt,
+    ) -> Result<bool, BackendError> {
+        self.validate()?;
+        validate_profile_selection(current)?;
+        let mut current_without_historical_session = current.clone();
+        current_without_historical_session.session_id = self.selection.session_id;
+        Ok(self.selection == current_without_historical_session)
+    }
 }
 
 /// Production `HostStateJournal` backend backed by a separate Host-owned redb file.
@@ -308,11 +393,19 @@ impl RedbJournalBackend {
     }
 
     /// Opens or creates the Host journal below one retained current-user Host
-    /// state root. The caller must select this entrypoint only after the
-    /// profile descriptor has been validated as `UserMode` or `PortableDev`.
-    /// The parent and file use retained current-user no-follow handles; the
-    /// final file is opened with create-new semantics when absent.
-    pub fn open_user_owned_at(path: impl AsRef<Path>) -> Result<Self, BackendError> {
+    /// state root and binds it to the descriptor-derived profile receipt. The
+    /// parent and file use retained current-user no-follow handles; the final
+    /// file is opened with create-new semantics when absent. Existing journals
+    /// must contain an intact receipt matching the current OS-derived root
+    /// identities before any journal record is replayed.
+    /// A legacy journal without a binding is accepted only when it contains no
+    /// epochs, prepared writes, committed receipts, or payloads; that empty
+    /// state receives its first binding atomically. Non-empty legacy journals
+    /// fail closed and require an explicit migration.
+    pub fn open_user_owned_at(
+        path: impl AsRef<Path>,
+        selection: &ProfileSelectionReceipt,
+    ) -> Result<Self, BackendError> {
         let path = path.as_ref();
         let parent = path.parent().ok_or(BackendError::Unavailable)?;
         let root_lease =
@@ -321,6 +414,17 @@ impl RedbJournalBackend {
             .canonical_path()
             .map_err(|_| BackendError::Unavailable)?;
         if !windows_paths_equal(&canonical_root, parent) {
+            return Err(BackendError::Unavailable);
+        }
+        validate_profile_selection(selection)?;
+        let selected_host_state_root = selection
+            .roots
+            .iter()
+            .find(|root| root.role == "runtime_state_roots.host_state_root")
+            .ok_or(BackendError::Unavailable)?;
+        if !windows_paths_equal(&selected_host_state_root.canonical_path, parent)
+            || selected_host_state_root.identity != root_lease.identity()
+        {
             return Err(BackendError::Unavailable);
         }
         let path_lease = UserOwnedPathLease::open_or_create(&root_lease, path)
@@ -339,19 +443,18 @@ impl RedbJournalBackend {
         root_lease
             .verify_stable_identity()
             .map_err(|_| BackendError::Unavailable)?;
-        Ok(Self {
+        let backend = Self {
             database,
             path: path.to_path_buf(),
             _path_lease: JournalPathLease::UserOwnedRuntime {
                 _root_lease: root_lease,
                 _path_lease: path_lease,
             },
-        })
-        .and_then(|backend| {
-            backend.ensure_schema()?;
-            backend.snapshot()?;
-            Ok(backend)
-        })
+        };
+        backend.ensure_schema()?;
+        backend.bind_profile_selection(selection)?;
+        backend.snapshot()?;
+        Ok(backend)
     }
 
     /// Opens a physical temporary journal for the feature-gated Host
@@ -475,6 +578,111 @@ impl RedbJournalBackend {
             .begin_read()
             .map_err(|_| BackendError::Unavailable)?;
         snapshot_from_read(&read, limit)
+    }
+
+    fn bind_profile_selection(
+        &self,
+        selection: &ProfileSelectionReceipt,
+    ) -> Result<(), BackendError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|_| BackendError::Unavailable)?;
+        match read_profile_binding(&read)? {
+            Some(stored) => {
+                if stored.matches_current_selection(selection)? {
+                    return Ok(());
+                }
+                Err(BackendError::Unavailable)
+            }
+            None => {
+                drop(read);
+                let snapshot = self.snapshot()?;
+                if !snapshot.epochs.is_empty()
+                    || !snapshot.prepared.is_empty()
+                    || !snapshot.receipts.is_empty()
+                {
+                    return Err(BackendError::Unavailable);
+                }
+                let encoded = encode_bounded(
+                    &StoredUserProfileBinding::new(selection)?,
+                    MAX_METADATA_BYTES,
+                )?;
+                let write = self
+                    .database
+                    .begin_write()
+                    .map_err(|_| BackendError::Unavailable)?;
+                {
+                    let epochs = write
+                        .open_table(EPOCHS)
+                        .map_err(|_| BackendError::Unavailable)?;
+                    if epochs
+                        .iter()
+                        .map_err(|_| BackendError::Unavailable)?
+                        .next()
+                        .is_some()
+                    {
+                        return Err(BackendError::Unavailable);
+                    }
+                }
+                {
+                    let prepared = write
+                        .open_table(PREPARED)
+                        .map_err(|_| BackendError::Unavailable)?;
+                    if prepared
+                        .iter()
+                        .map_err(|_| BackendError::Unavailable)?
+                        .next()
+                        .is_some()
+                    {
+                        return Err(BackendError::Unavailable);
+                    }
+                }
+                {
+                    let receipts = write
+                        .open_table(RECEIPTS)
+                        .map_err(|_| BackendError::Unavailable)?;
+                    if receipts
+                        .iter()
+                        .map_err(|_| BackendError::Unavailable)?
+                        .next()
+                        .is_some()
+                    {
+                        return Err(BackendError::Unavailable);
+                    }
+                }
+                {
+                    let payloads = write
+                        .open_table(PAYLOADS)
+                        .map_err(|_| BackendError::Unavailable)?;
+                    if payloads
+                        .iter()
+                        .map_err(|_| BackendError::Unavailable)?
+                        .next()
+                        .is_some()
+                    {
+                        return Err(BackendError::Unavailable);
+                    }
+                }
+                {
+                    let mut table = write
+                        .open_table(USER_PROFILE_BINDINGS)
+                        .map_err(|_| BackendError::Unavailable)?;
+                    if table
+                        .iter()
+                        .map_err(|_| BackendError::Unavailable)?
+                        .next()
+                        .is_some()
+                    {
+                        return Err(BackendError::Conflict);
+                    }
+                    table
+                        .insert(USER_PROFILE_BINDING_KEY, encoded.as_slice())
+                        .map_err(|_| BackendError::Unavailable)?;
+                }
+                commit_write(write)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1090,6 +1298,75 @@ fn validate_digest(value: &str) -> Result<(), BackendError> {
     } else {
         Err(BackendError::Unavailable)
     }
+}
+
+fn validate_profile_selection(selection: &ProfileSelectionReceipt) -> Result<(), BackendError> {
+    if !is_valid_text(&selection.installation_id)
+        || selection
+            .installation_key
+            .as_deref()
+            .is_some_and(|key| !is_valid_text(key))
+        || !is_valid_text(&selection.component)
+        || !is_valid_text(&selection.version)
+        || !is_valid_text(&selection.generation)
+        || !is_valid_text(&selection.owner_sid)
+        || selection.authority_generation == 0
+        || selection.session_id == 0
+        || !selection.authority_descriptor_path.is_absolute()
+        || selection.roots.len()
+            != REQUIRED_PROFILE_ROOT_ROLES.len() + REQUIRED_RUNTIME_ROOT_ROLES.len()
+    {
+        return Err(BackendError::Unavailable);
+    }
+    validate_digest(&selection.authority_descriptor_sha256)?;
+    let mut roles = BTreeSet::new();
+    for root in &selection.roots {
+        if !is_valid_text(&root.role)
+            || !root.canonical_path.is_absolute()
+            || root.identity.volume_serial_number == 0
+            || root.identity.file_index == 0
+            || (!REQUIRED_PROFILE_ROOT_ROLES.contains(&root.role.as_str())
+                && !REQUIRED_RUNTIME_ROOT_ROLES.contains(&root.role.as_str()))
+            || !roles.insert(root.role.as_str())
+        {
+            return Err(BackendError::Unavailable);
+        }
+    }
+    if REQUIRED_PROFILE_ROOT_ROLES
+        .iter()
+        .chain(REQUIRED_RUNTIME_ROOT_ROLES.iter())
+        .any(|role| !roles.contains(*role))
+    {
+        return Err(BackendError::Unavailable);
+    }
+    Ok(())
+}
+
+fn read_profile_binding(
+    read: &ReadTransaction,
+) -> Result<Option<StoredUserProfileBinding>, BackendError> {
+    let table = match read.open_table(USER_PROFILE_BINDINGS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(_) => return Err(BackendError::Unavailable),
+    };
+    let mut budget = ReadBudget::new(MAX_METADATA_BYTES);
+    let mut binding = None;
+    for item in table.iter().map_err(|_| BackendError::Unavailable)? {
+        let (key, value) = item.map_err(|_| BackendError::Unavailable)?;
+        budget.charge(key.value().len(), value.value().len())?;
+        if key.value() != USER_PROFILE_BINDING_KEY || binding.is_some() {
+            return Err(BackendError::Unavailable);
+        }
+        if value.value().is_empty() || value.value().len() > MAX_METADATA_BYTES {
+            return Err(BackendError::Unavailable);
+        }
+        let stored: StoredUserProfileBinding =
+            serde_json::from_slice(value.value()).map_err(|_| BackendError::Unavailable)?;
+        stored.validate()?;
+        binding = Some(stored);
+    }
+    Ok(binding)
 }
 
 fn is_valid_text(value: &str) -> bool {
