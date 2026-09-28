@@ -217,6 +217,29 @@ fn validate_governed_tool_mutation(
     Ok(())
 }
 
+fn is_reconciliation_evidence(observation: &ChangeObservation) -> bool {
+    !observation.unknown_origin
+        && matches!(
+            observation.origin,
+            ChangeOrigin::ProcessToolReceipt | ChangeOrigin::ArtifactScan
+        )
+        && matches!(
+            observation.attribution,
+            Attribution::Exact | Attribution::ReceiptLinked
+        )
+        && observation.origin_ref.is_some()
+        && (observation.operation_ref.is_some() || observation.diff_or_artifact_ref.is_some())
+        && (observation.origin != ChangeOrigin::ProcessToolReceipt
+            || validate_governed_tool_mutation(observation).is_ok())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationAdmissionProof {
+    None,
+    VerifiedHint,
+    GovernedMutation,
+}
+
 fn hint_observation_id(
     role: &str,
     hint: &ChangeHint,
@@ -229,6 +252,55 @@ fn hint_observation_id(
         }
     })?;
     Ok(format!("change-hint:{role}:{}", sha256_hex(&bytes)))
+}
+
+fn hint_material_observations(
+    hint: &ChangeHint,
+    verification: &ChangeHintVerification,
+    kind: ChangeKind,
+) -> Result<(ChangeObservation, ChangeObservation), ChangeMonitorError> {
+    let unknown = ChangeObservation {
+        change_id: hint_observation_id("unknown", hint, verification)?,
+        state_fence: hint.state_fence.clone(),
+        kind,
+        before: verification.before.clone(),
+        after: verification.after.clone(),
+        origin: hint.origin,
+        attribution: Attribution::Unknown,
+        origin_ref: Some(
+            hint.origin_ref
+                .clone()
+                .unwrap_or_else(|| format!("host-hint:{}", hint.hint_id)),
+        ),
+        session_ref: None,
+        action_lease_ref: None,
+        operation_ref: None,
+        diff_or_artifact_ref: None,
+        unknown_origin: true,
+        invalidations: vec![FenceInvalidation {
+            dependency: format!("resource:{}", hint.resource_ref),
+            state_fence: hint.state_fence.clone(),
+            reason_ref: format!("change-hint:{}", hint.hint_id),
+        }],
+    };
+    let git = ChangeObservation {
+        change_id: hint_observation_id("git", hint, verification)?,
+        state_fence: hint.state_fence.clone(),
+        kind,
+        before: verification.before.clone(),
+        after: verification.after.clone(),
+        origin: ChangeOrigin::GitReconciliation,
+        // Git readback proves bytes and state, not who made the mutation.
+        attribution: Attribution::Unknown,
+        origin_ref: Some(verification.git.status_ref.clone()),
+        session_ref: None,
+        action_lease_ref: None,
+        operation_ref: None,
+        diff_or_artifact_ref: verification.git.diff_ref.clone(),
+        unknown_origin: false,
+        invalidations: Vec::new(),
+    };
+    Ok((unknown, git))
 }
 
 /// Origin route for one host/tool observation.
@@ -985,7 +1057,12 @@ impl ChangeMonitor {
                 // an unknown-origin blocker during rebuild.
                 return Err(ChangeMonitorError::UntrustedMaterialIngress);
             }
-            monitor.ingest_observation(observed, true, true, true)?;
+            let already_projected = monitor.has_projected_counterpart(&observed, true);
+            monitor.ingest_observation(
+                observed,
+                ObservationAdmissionProof::GovernedMutation,
+                !already_projected,
+            )?;
         }
         for record in &snapshot.hints {
             if let Some(verification) = &record.verification
@@ -1029,32 +1106,32 @@ impl ChangeMonitor {
         if is_material_mutation(observation.kind) {
             return Err(ChangeMonitorError::UntrustedMaterialIngress);
         }
-        self.ingest_observation(observation, false, false, true)
+        self.ingest_observation(observation, ObservationAdmissionProof::None, true)
     }
 
     fn ingest_observation(
         &mut self,
         observation: ChangeObservation,
-        from_verified_hint: bool,
-        from_governed_mutation: bool,
-        require_projected_preimage: bool,
+        proof: ObservationAdmissionProof,
+        apply_projection: bool,
     ) -> Result<ObservationAdmission, ChangeMonitorError> {
         if is_material_mutation(observation.kind)
             && matches!(
                 observation.origin,
                 ChangeOrigin::HostEvent | ChangeOrigin::FilesystemNotification
             )
-            && !from_verified_hint
+            && proof != ObservationAdmissionProof::VerifiedHint
         {
             return Err(ChangeMonitorError::InvalidHintVerification);
         }
         if is_material_mutation(observation.kind)
             && observation.origin == ChangeOrigin::ProcessToolReceipt
-            && !from_governed_mutation
+            && proof != ObservationAdmissionProof::GovernedMutation
         {
             return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
         }
-        if require_projected_preimage
+        if apply_projection
+            && proof == ObservationAdmissionProof::GovernedMutation
             && is_material_mutation(observation.kind)
             && observation.origin == ChangeOrigin::ProcessToolReceipt
             && observation.before.as_ref() != self.current_resources.get(observation.resource_ref())
@@ -1080,11 +1157,13 @@ impl ChangeMonitor {
                     .collect(),
             });
         }
-        if let Some(after) = &observation.after {
-            self.current_resources
-                .insert(after.resource_ref.clone(), after.clone());
-        } else if let Some(before) = &observation.before {
-            self.current_resources.remove(&before.resource_ref);
+        if apply_projection {
+            if let Some(after) = &observation.after {
+                self.current_resources
+                    .insert(after.resource_ref.clone(), after.clone());
+            } else if let Some(before) = &observation.before {
+                self.current_resources.remove(&before.resource_ref);
+            }
         }
         for invalidation in &observation.invalidations {
             self.invalidated_dependencies
@@ -1127,10 +1206,17 @@ impl ChangeMonitor {
         observation: ChangeObservation,
     ) -> Result<ObservationAdmission, ChangeMonitorError> {
         validate_governed_tool_mutation(&observation)?;
-        if observation.before.as_ref() != self.current_resources.get(observation.resource_ref()) {
+        let already_projected = self.has_projected_counterpart(&observation, true);
+        if observation.before.as_ref() != self.current_resources.get(observation.resource_ref())
+            && !already_projected
+        {
             return Err(ChangeMonitorError::InvalidGovernedMutationReceipt);
         }
-        self.ingest_observation(observation, false, true, true)
+        self.ingest_observation(
+            observation,
+            ObservationAdmissionProof::GovernedMutation,
+            !already_projected,
+        )
     }
 
     /// Admits an untrusted host/filesystem event as a pending re-check hint.
@@ -1190,60 +1276,20 @@ impl ChangeMonitor {
         // A missing projection is not evidence that the path was absent. The
         // trusted producer must first admit an owner-verified baseline for an
         // existing file before a first external mutation can be classified.
-        if require_projected_before
-            && verification.before.as_ref() != self.current_resources.get(&hint.resource_ref)
-        {
-            return Err(ChangeMonitorError::InvalidHintVerification);
-        }
-
         if let Some(kind) = kind {
-            let unknown_change_id = hint_observation_id("unknown", &hint, verification)?;
-            let evidence_change_id = hint_observation_id("git", &hint, verification)?;
-            let reason_ref = format!("change-hint:{}", hint.hint_id);
-            let unknown_observation = ChangeObservation {
-                change_id: unknown_change_id.clone(),
-                state_fence: hint.state_fence.clone(),
-                kind,
-                before: verification.before.clone(),
-                after: verification.after.clone(),
-                origin: hint.origin,
-                attribution: Attribution::Unknown,
-                origin_ref: Some(
-                    hint.origin_ref
-                        .clone()
-                        .unwrap_or_else(|| format!("host-hint:{}", hint.hint_id)),
-                ),
-                session_ref: None,
-                action_lease_ref: None,
-                operation_ref: None,
-                diff_or_artifact_ref: None,
-                unknown_origin: true,
-                invalidations: vec![FenceInvalidation {
-                    dependency: format!("resource:{}", hint.resource_ref),
-                    state_fence: hint.state_fence.clone(),
-                    reason_ref,
-                }],
-            };
-            let evidence_observation = ChangeObservation {
-                change_id: evidence_change_id.clone(),
-                state_fence: hint.state_fence.clone(),
-                kind,
-                before: verification.before.clone(),
-                after: verification.after.clone(),
-                origin: ChangeOrigin::GitReconciliation,
-                // This row records observed bytes and Git state only; it says
-                // nothing about which actor caused the transition.
-                attribution: Attribution::Unknown,
-                origin_ref: Some(verification.git.status_ref.clone()),
-                session_ref: None,
-                action_lease_ref: None,
-                operation_ref: None,
-                diff_or_artifact_ref: verification.git.diff_ref.clone(),
-                unknown_origin: false,
-                invalidations: Vec::new(),
-            };
+            let (unknown_observation, evidence_observation) =
+                hint_material_observations(&hint, verification, kind)?;
+            let unknown_change_id = unknown_observation.change_id.clone();
+            let evidence_change_id = evidence_observation.change_id.clone();
             let unknown_digest = unknown_observation.digest()?;
             let evidence_digest = evidence_observation.digest()?;
+            let already_projected = self.has_projected_counterpart(&unknown_observation, false);
+            if require_projected_before
+                && verification.before.as_ref() != self.current_resources.get(&hint.resource_ref)
+                && !already_projected
+            {
+                return Err(ChangeMonitorError::InvalidHintVerification);
+            }
             let pair_already_admitted = match (
                 self.observations.get(&unknown_change_id),
                 self.observations.get(&evidence_change_id),
@@ -1261,15 +1307,92 @@ impl ChangeMonitor {
                 // Both rows and identities have been validated before either
                 // can mutate the projection, preventing a half-admitted pair
                 // if the second ID is already occupied or malformed.
-                self.ingest_observation(unknown_observation, true, false, false)?;
-                self.ingest_observation(evidence_observation, false, false, false)?;
+                self.ingest_observation(
+                    unknown_observation,
+                    ObservationAdmissionProof::VerifiedHint,
+                    !already_projected,
+                )?;
+                self.ingest_observation(
+                    evidence_observation,
+                    ObservationAdmissionProof::None,
+                    !already_projected,
+                )?;
             }
+        } else if require_projected_before
+            && verification.before.as_ref() != self.current_resources.get(&hint.resource_ref)
+        {
+            return Err(ChangeMonitorError::InvalidHintVerification);
         }
         self.hints
             .get_mut(hint_id)
             .ok_or(ChangeMonitorError::InvalidHint)?
             .verification = Some(verification.clone());
         self.hint_confirmation(&hint, verification, kind)
+    }
+
+    /// Returns true only when the exact transition was already projected by
+    /// admitted attribution evidence, or by a verified unknown-origin hint
+    /// when a validated governed receipt is being admitted. The projection
+    /// must still reflect its after-state, and no later different material
+    /// transition may exist for the resource.
+    fn has_projected_counterpart(
+        &self,
+        observation: &ChangeObservation,
+        allow_unknown_hint: bool,
+    ) -> bool {
+        if !is_material_mutation(observation.kind) {
+            return false;
+        }
+        let after_is_current = match &observation.after {
+            Some(after) => self.current_resources.get(&after.resource_ref) == Some(after),
+            None => !self
+                .current_resources
+                .contains_key(observation.resource_ref()),
+        };
+        if !after_is_current {
+            return false;
+        }
+
+        let counterpart_index =
+            self.observation_order
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, change_id)| {
+                    let counterpart = &self.observations.get(change_id)?.observation;
+                    let trusted = is_reconciliation_evidence(counterpart)
+                        || (allow_unknown_hint
+                            && counterpart.unknown_origin
+                            && matches!(
+                                counterpart.origin,
+                                ChangeOrigin::HostEvent | ChangeOrigin::FilesystemNotification
+                            ));
+                    (trusted
+                        && is_material_mutation(counterpart.kind)
+                        && counterpart.resource_ref() == observation.resource_ref()
+                        && counterpart.kind == observation.kind
+                        && counterpart.state_fence == observation.state_fence
+                        && counterpart.before == observation.before
+                        && counterpart.after == observation.after)
+                        .then_some(index)
+                });
+        let Some(counterpart_index) = counterpart_index else {
+            return false;
+        };
+
+        self.observation_order
+            .iter()
+            .skip(counterpart_index + 1)
+            .filter_map(|change_id| self.observations.get(change_id))
+            .all(|record| {
+                let later = &record.observation;
+                !is_material_mutation(later.kind)
+                    || later.resource_ref() != observation.resource_ref()
+                    || (later.kind == observation.kind
+                        && later.state_fence == observation.state_fence
+                        && later.before == observation.before
+                        && later.after == observation.after)
+            })
     }
 
     fn hint_confirmation(
