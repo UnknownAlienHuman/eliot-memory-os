@@ -103,14 +103,47 @@ to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or 
 reason = "Smart handlers are deterministic/stateless or rebuildable projections and have no operational authority"
 
 # #1862: the campaign packet route is a Host/composition consumer of Context, so
-# it must link the owner cells (A-16a/A-17a/A-18) and the A-15 contracts, never
-# the #40-frozen donor algorithm in `eliot-context`. The production call and its
-# `#[allow(deprecated)]` were removed rather than suppressed; a new binary
-# caller of the frozen legacy compiler is a forbidden compile edge.
+# it must use owner contracts and never call the #40-frozen donor algorithm in
+# `eliot-context`. The production call and its `#[allow(deprecated)]` were
+# removed; this remains a no-new-call prohibition, not a live compile edge. The
+# surviving campaign_publication imports and their #40 removal denominator are
+# recorded separately below.
 [[forbidden_compile_edge]]
 from = "bins/eliotd campaign packet route (eliot.packet)"
 to = "eliot-context legacy ContextCompiler / CampaignCompiledContext"
-reason = "the frozen donor surface takes no new caller; the current candidate -> admission -> assembly cells own candidate construction, membership and rendering"
+reason = "the frozen donor surface takes no new caller; compile_with_campaign_learning_state has zero product callers, so this row is a regression prohibition rather than a current edge. The campaign_publication imports that remain are recorded in legacy_facade_consumer."
+
+[[legacy_facade_consumer]]
+issue = 1862
+from = "bins/eliotd campaign source boundary"
+to = "eliot_context::campaign_publication"
+consumer_manifest = "bins/eliotd/Cargo.toml"
+status = "MIGRATION_REMAINS"
+external_production_cargo_dependents = ["bins/eliotd"]
+external_production_cargo_edge_count = 1
+importing_source_modules = [
+  "bins/eliotd/src/campaign_packet.rs",
+  "bins/eliotd/src/campaign_context_owner.rs",
+  "bins/eliotd/src/campaign_task_controller.rs",
+]
+importing_source_module_count = 3
+unique_imported_symbols = [
+  "ContextCampaignRecipeBody",
+  "ContextPublicationError",
+  "ContextSourcePublication",
+  "context_delivery_body_digest",
+  "context_delivery_publication",
+  "context_recipe_body_digest",
+  "context_recipe_publication",
+]
+unique_imported_symbol_count = 7
+import_item_occurrences = 9
+facade_disposition_rows = 62
+campaign_publication_disposition_rows = 10
+compile_with_campaign_learning_state_product_callers = 0
+replacement_owner_chain = ["A-15", "A-16a", "A-17a", "A-18"]
+owner_admission_status = "AUD1_PARTIAL_NO_ADMITTED_OWNER_MINTED_CLOSURE"
+removal_condition = "Migrate all three bins/eliotd source modules from the frozen campaign_publication surface to admitted owner contracts, then re-verify zero external Cargo dependents and zero imports before #40 A4 facade retirement. The owner chain is not yet an admitted campaign closure."
 
 # Issue #816 uses consumer -> dependency notation for compile edges.  Runtime
 # value flow is recorded separately below so a producer does not become an
