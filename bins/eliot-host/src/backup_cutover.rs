@@ -333,6 +333,101 @@ pub struct CutoverRequest {
     pub expected_predecessor: PlatformHandle,
 }
 
+/// The exact operation, target, predecessor and owner-approved facts one
+/// cutover STATUS readback is reported for.
+///
+/// These are the only fields the status read model consumes: the operation
+/// identity the journal owner keys its records on, the approved target and
+/// expected predecessor, and the four owner-approved facts a retirement record
+/// must echo. They are read from exactly one of the two owners that holds them:
+///
+/// * [`CutoverReadback::from_request`] — the admitted cutover body the
+///   separately admitted status port is given, and
+/// * [`CutoverReadback::from_retained_intent`] — the Host journal owner's own
+///   durable [`CutoverIntentRecord`], which retains the same six bindings under
+///   the same operation identity.
+///
+/// It carries NO envelope, admission receipt, archive digest/class, activation
+/// fence or recovery evidence: those gate the EXECUTE path, and #2739's first
+/// Work step requires that reading a historical result not reopen execution
+/// admission. So this value grants no authority and mints no permit; it names
+/// which operation a readback is about.
+///
+/// On the contour path the readback and the durable intent are the SAME durable
+/// record, so the mapper's "is the retained intent this operation's" join is
+/// vacuous there and always answers yes. That is honest rather than circular:
+/// the contour reports on the operation the slot itself names, and it holds no
+/// second owner holding a competing request. The join is load-bearing on the
+/// admitted-request path, where the journal slot and the admitted body are two
+/// independent records. Neither the retirement re-proof nor the registry
+/// receipt comparison becomes vacuous on either path: the retirement record is
+/// selected from the journal log and the receipt is read from the registry
+/// owner, so both remain comparisons against independent durable facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CutoverReadback {
+    operation: CutoverOperationIdentity,
+    target_generation: PlatformHandle,
+    expected_predecessor: PlatformHandle,
+    user_broker_ref: PlatformHandle,
+    target_build_digest: PlatformHandle,
+    target_config_digest: PlatformHandle,
+}
+
+impl CutoverReadback {
+    /// Names the operation an admitted cutover body asks about.
+    ///
+    /// Takes only the six bindings the status read model consumes; the body's
+    /// admission-bearing fields are not read here, and nothing about them is
+    /// asserted by the status path.
+    #[must_use]
+    pub fn from_request(request: &CutoverRequest) -> Self {
+        Self {
+            operation: request.operation.clone(),
+            target_generation: request.target_generation.clone(),
+            expected_predecessor: request.expected_predecessor.clone(),
+            user_broker_ref: request.user_broker_ref.clone(),
+            target_build_digest: request.target_build_digest.clone(),
+            target_config_digest: request.target_config_digest.clone(),
+        }
+    }
+
+    /// Names the operation the Host journal owner's own durable intent names.
+    ///
+    /// Every field is the durable record's own value, never a
+    /// caller-presented copy, so the readback and the intent the journal
+    /// returned describe the same operation by construction.
+    #[must_use]
+    pub fn from_retained_intent(intent: &CutoverIntentRecord) -> Self {
+        Self {
+            operation: CutoverOperationIdentity {
+                installation: intent.installation.clone(),
+                operation_id: intent.cutover_operation.clone(),
+                request_digest: intent.request_digest.clone(),
+            },
+            target_generation: intent.target_generation.clone(),
+            expected_predecessor: intent.expected_predecessor.clone(),
+            user_broker_ref: intent.user_broker_ref.clone(),
+            target_build_digest: intent.target_build_digest.clone(),
+            target_config_digest: intent.target_config_digest.clone(),
+        }
+    }
+
+    /// The operation identity this readback is about.
+    pub const fn operation(&self) -> &CutoverOperationIdentity {
+        &self.operation
+    }
+
+    /// The approved target generation this operation activates.
+    pub const fn target_generation(&self) -> &PlatformHandle {
+        &self.target_generation
+    }
+
+    /// The active predecessor generation this operation expected.
+    pub const fn expected_predecessor(&self) -> &PlatformHandle {
+        &self.expected_predecessor
+    }
+}
+
 /// Current recovery evidence consumed from the actual owners (#960 shape).
 ///
 /// Every denominator is complete-current: partial/unknown ORS/spool/effect
@@ -2826,9 +2921,16 @@ fn activate_cutover_contour(
 
 /// Reads the exact cutover disposition for one operation from the real owners.
 ///
-/// This is the implementation behind
-/// [`crate::HostComposition::backup_dispatch_cutover_disposition`]. It
-/// re-reads the Host journal's own durable cutover projection, the
+/// This is the shared status read model. It backs
+/// [`crate::HostComposition::backup_dispatch_cutover_disposition`] for the
+/// separately admitted request read, and
+/// [`observe_retained_cutover_disposition`] for the live Host contour, so both
+/// read the same owners through the same bracketing, resolve the retirement
+/// through the same journal-owner lookup, and project through the same
+/// [`reconcile_cutover_outcome`] arms. `op` names the calling contour in the
+/// diagnostic stream only; it selects nothing.
+///
+/// It re-reads the Host journal's own durable cutover projection, the
 /// installation registry's active generation and operation-bound cutover
 /// receipt, and — through `resolve_cutover_retirement` — the retirement record
 /// this journal actually applied for this exact cutover operation. All of it is
