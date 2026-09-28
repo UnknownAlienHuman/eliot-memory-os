@@ -120,14 +120,24 @@ pub enum ProjectionError {
 // Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
 // only, with no dedup cache. The single terminal record per failed operation
 // belongs to the outer caller boundary, which owns the one
-// `observe_terminal_error` call. Handoff (caller-owned, STILL NOT APPLIED, and
-// this is a measured fact rather than an omission): this leaf has no
-// production caller anywhere in the repository - `project_backup_config` is
-// reached only from this crate's own `tests/backup_preparation.rs` - so there
-// is no HostComposition dispatch wrapper to arm. When that delegation lands,
-// its wrapper must arm one terminal guard with a frozen
-// `host-backup-config-failed` code; these leaf records correlate beneath it by
-// emission order. No wrapper was invented to close that gap.
+// `observe_terminal_error` call. Handoff (caller-owned, APPLIED for the
+// admitted preparation port under #983 W4): the production path is
+// `project_backup_config_owner_bound`, invoked by
+// `crate::backup_preparation::OwnerEvidence::project_backup_configuration`
+// from the delegated preparation owner path, so a projection refusal here is a
+// failed PREPARATION operation, not an operation of its own. That one terminal
+// record is already owned by `HostComposition::backup_dispatch_prepare`
+// through the crate's own `HostTerminalGuard` and the frozen
+// `host-backup-prepare-failed` code; these leaf records correlate beneath that
+// record by emission order. This leaf therefore deliberately arms no guard: a
+// second terminal for the same failed operation would break "exactly one
+// terminal emitter per failed operation". STILL PENDING, and deliberately not
+// claimed: the snapshot variant `project_backup_config` has no production
+// caller anywhere in the repository (only this crate's own
+// `tests/backup_preparation.rs` reaches it) and its `AuthoritySnapshot` has no
+// production constructor, which is why the owner-bound variant is the only
+// production projector. No wrapper and no new terminal code were invented to
+// close that gap.
 //
 // Explicit no-event list: `describe_audit_fence` (pure renderer, not an
 // observation point; its forensic text must never be logged),
