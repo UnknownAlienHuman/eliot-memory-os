@@ -78,6 +78,7 @@ use crate::admitted_material::{
     v1_model_of, validation_policy_of,
 };
 use crate::controller::verify_admitted_binding;
+use crate::curation_pulse::compose_curation_pulse;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
     KernelJobAdmission, SourceCoverage,
@@ -689,7 +690,9 @@ fn curation_routing_policy() -> RoutingPolicy {
 /// ports (an empty port set refuses at the genuine owner port boundary), and
 /// routes the injected batch through the real
 /// [`route_validated_curation`](eliot_dreamer_curation::route_validated_curation),
-/// mapping the returned candidate set onto [`DreamResult::Curation`].
+/// then composes the narrow Curation Product Pulse from the owner screen
+/// binding, the admitted batch, and the routed set, and maps the candidate set
+/// plus that pulse onto [`DreamResult::Curation`].
 /// Never returns `UnsupportedJobClass`.
 #[allow(
     clippy::needless_pass_by_value,
@@ -719,7 +722,8 @@ pub(crate) fn dispatch_curation(
     }
     let set = route_validated_curation(&carrier.batch, &screen, &registry, &policy, &carrier.ports)
         .map_err(|error| curation_denied(&error))?;
-    map_curation_set(&set)
+    let pulse = compose_curation_pulse(&screen, &carrier.batch, &set)?;
+    map_curation_set(&set, pulse)
 }
 
 /// Maps one routed A-31 candidate set onto the crate curation result.
@@ -737,8 +741,13 @@ pub(crate) fn dispatch_curation(
 /// Provenance carries the omitted targets plus the denominator members
 /// (G4-like lineage: what the set covered and what it left uncovered). A set
 /// with zero accepted members refuses fail-closed instead of returning an
-/// empty success.
-fn map_curation_set(set: &CurationCandidateSet) -> Result<DreamResult, DreamerError> {
+/// empty success. The composed Curation Product Pulse travels alongside the
+/// candidate list, so the receipt always names the route, identities,
+/// disposition, omissions, and proof ceiling the candidates came from.
+fn map_curation_set(
+    set: &CurationCandidateSet,
+    pulse: crate::CurationProductPulse,
+) -> Result<DreamResult, DreamerError> {
     let mut candidates = Vec::with_capacity(set.members.len());
     for member in &set.members {
         if member.disposition != RoutingDisposition::Candidate || member.calls != 1 {
@@ -777,6 +786,7 @@ fn map_curation_set(set: &CurationCandidateSet) -> Result<DreamResult, DreamerEr
         job_id: set.job_id.clone(),
         candidates,
         provenance,
+        pulse,
     })
 }
 
@@ -1997,6 +2007,7 @@ mod slice_7_native_owner_tests {
             job_id,
             candidates,
             provenance,
+            pulse,
         }) = result
         else {
             panic!("injected-carrier curation must route, got {result:?}");
@@ -2036,6 +2047,21 @@ mod slice_7_native_owner_tests {
             vec!["target-slice-7".to_owned()],
             "provenance must carry the denominator members, got {provenance:?}"
         );
+        assert_eq!(
+            pulse.schema_version,
+            crate::CURATION_PULSE_SCHEMA_VERSION,
+            "the receipt must carry the curation product pulse"
+        );
+        assert_eq!(
+            pulse.disposition,
+            crate::CurationPulseDisposition::Complete,
+            "an all-or-nothing run with no omission must read complete"
+        );
+        assert_eq!(
+            pulse.candidate_ids,
+            vec![candidate.candidate_id.clone()],
+            "the pulse must name the routed candidate identities"
+        );
         let view = project_result_view(
             &job_id,
             JobState::Completed,
@@ -2043,6 +2069,7 @@ mod slice_7_native_owner_tests {
                 job_id: job_id.clone(),
                 candidates: candidates.clone(),
                 provenance: provenance.clone(),
+                pulse: pulse.clone(),
             }),
         );
         let Ok(line) = render_jsonl(&view) else {
