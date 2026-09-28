@@ -204,8 +204,12 @@ const INSTALL_RECEIPT_CONTRACT: &str = "eliot.plugin.install";
 /// Two shapes are admitted: a plain expectation record (the
 /// [`IntegrationExpectation`] contract), or the install receipt minted by
 /// `eliot plugin install`, whose embedded preview record becomes the
-/// expectation after its digest binding is verified. Verification mismatches
-/// stay data inside the report either way; only malformed inputs are `Err`.
+/// expectation after its digest binding is verified, and whose own
+/// installation status is carried alongside it. A receipt also supplies its
+/// recorded install status ([`LoadedExpectation::install_status`]); a plain
+/// expectation record supplies none and none is invented for it. Verification
+/// mismatches stay data inside the report either way; only malformed inputs
+/// are `Err`.
 pub fn load_expectation(path: &Path) -> Result<LoadedExpectation, IntegrationError> {
     if !path.is_absolute() {
         return Err(IntegrationError::InputInvalid(
