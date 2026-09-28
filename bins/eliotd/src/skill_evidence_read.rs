@@ -48,6 +48,13 @@
 //! qualification path is real and wired — it is simply fed by an owner that
 //! has not yet published that record, which is exactly the honest state I7.25
 //! asks for.
+//!
+//! What IS verified here is the verifier *contract*: every resolved outcome
+//! record must name the canonically bound verifier for this exact
+//! skill/package -- the deciding acceptance row's `verifier_ref` (I12.24
+//! verifier competence) -- in its own `verifier_refs`. A real record naming
+//! an unrelated verifier therefore cannot qualify, exactly as a real record
+//! for an unrelated artifact cannot.
 
 #![forbid(unsafe_code)]
 
@@ -268,19 +275,25 @@ fn record_document(row: &serde_json::Value) -> Option<&serde_json::Value> {
 }
 
 /// Resolves the presented outcome references of one receipt against the
-/// durable evidence-owner records a single bounded learning read returned.
+/// durable evidence-owner records a single bounded learning read returned,
+/// bound to the competent verifier contract for this exact skill/package.
 ///
 /// The comparison is against CONTENT, not existence: a reference qualifies
 /// only when a served record document decodes to a
 /// [`SkillExecutionEvidence`] whose own `execution_ref` equals the exact
-/// string the receipt presented, and that record validates against itself.
-/// A record that merely exists, is well-shaped, or carries a handle that
-/// resembles the reference never qualifies. No recursive crawl, no free-text
+/// string the receipt presented, that names the canonically bound verifier
+/// (`accepting_verifier`, the deciding acceptance row's `verifier_ref`) in
+/// its own `verifier_refs`, and that validates against itself. A record
+/// that merely exists, is well-shaped, carries a handle that resembles the
+/// reference, or names an unrelated verifier never qualifies: a real
+/// verifier record for an unrelated artifact -- or an unrelated verifier --
+/// is insufficient (issue #2663, I12.24). No recursive crawl, no free-text
 /// search and no URL fetch happens here: the page is exactly what the one
 /// bounded read returned, and a reference absent from it stays unresolved.
 pub fn resolve_outcome_records(
     receipt: &SkillHarnessActivationReceipt,
     rows: &[serde_json::Value],
+    accepting_verifier: &str,
 ) -> OutcomeResolution {
     let mut records: Vec<eliot_skill::ResolvedOutcome> = Vec::new();
     for reference in &receipt.verified_outcome_refs {
@@ -296,6 +309,17 @@ pub fn resolve_outcome_records(
                 return None;
             }
             let record: SkillExecutionEvidence = serde_json::from_value(document.clone()).ok()?;
+            // Verifier competence: the record must name the verifier the
+            // governance bound to this exact skill/package. A valid record
+            // observed by any other verifier is a real-but-unrelated outcome
+            // and cannot support this receipt's claim.
+            if !record
+                .verifier_refs
+                .iter()
+                .any(|name| name == accepting_verifier)
+            {
+                return None;
+            }
             if record.validate().is_err() {
                 return None;
             }

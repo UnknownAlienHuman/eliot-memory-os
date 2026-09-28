@@ -1014,7 +1014,10 @@ fn decode_activation(
 /// 2. the evidence owner (`GetLearningRecordRange`, closed
 ///    `activation_receipt` kind, `ExactFence`) is read for the durable
 ///    activation-receipt rows, and the receipt's presented
-///    `verified_outcome_refs` are resolved by CONTENT against those rows.
+///    `verified_outcome_refs` are resolved by CONTENT against those rows --
+///    each resolved record must name the deciding acceptance row's verifier
+///    in its own `verifier_refs` (I12.24 verifier competence), so a
+///    nonexistent verifier or a real-but-unrelated outcome cannot qualify.
 ///
 /// The result is a private plan: nothing is published here, and no
 /// composition state is borrowed. A refused or failed read is an error the
@@ -1057,10 +1060,31 @@ async fn plan_qualified_activation(
         ));
     };
 
+    // The deciding row binds the competent verifier contract for this exact
+    // skill/package (acceptance row `verifier_ref`, I12.24). The outcome
+    // resolution below must see it: an unresolved subject already returned
+    // above, so only a deciding row's verifier travels forward.
+    let accepting_verifier = match &acceptance.verdict {
+        super::skill_acceptance_read::AcceptanceVerdict::Accepted(record)
+        | super::skill_acceptance_read::AcceptanceVerdict::Revoked(record) => {
+            record.verifier_ref.as_str()
+        }
+        super::skill_acceptance_read::AcceptanceVerdict::Unknown => {
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                &eliot_skill::SkillError::InvalidField {
+                    field: "receipt.skill_id",
+                    reason: "no committed lifecycle row backs this Skill at the current revision; the activation candidate remains unqualified",
+                },
+            ));
+        }
+    };
+
     // 2. Evidence-owner read: resolve the presented outcome references against
-    //    durable owner records. There is no activated verifier-run producer
-    //    today, so this legitimately resolves nothing and usefulness stays
-    //    unestablished — the honest state, not a success port.
+    //    durable owner records, each bound to the deciding row's verifier.
+    //    There is still no activated verifier-run producer, so this
+    //    legitimately resolves nothing until such rows exist -- and any row
+    //    that does arrive must name the bound verifier, so a nonexistent
+    //    verifier or a real-but-unrelated outcome can never qualify.
     let (rows, coverage) = match super::skill_evidence_read::read_evidence_owner_records(
         kernel,
         &admitted_fence,
@@ -1075,11 +1099,14 @@ async fn plan_qualified_activation(
             ));
         }
     };
-    let resolved_outcomes =
-        match super::skill_evidence_read::resolve_outcome_records(&receipt, &rows) {
-            super::skill_evidence_read::OutcomeResolution::Resolved { records } => records,
-            super::skill_evidence_read::OutcomeResolution::NoOwnerRecord => Vec::new(),
-        };
+    let resolved_outcomes = match super::skill_evidence_read::resolve_outcome_records(
+        &receipt,
+        &rows,
+        accepting_verifier,
+    ) {
+        super::skill_evidence_read::OutcomeResolution::Resolved { records } => records,
+        super::skill_evidence_read::OutcomeResolution::NoOwnerRecord => Vec::new(),
+    };
     let mut source_revisions = revisions;
     source_revisions.push(super::skill_evidence_read::activation_receipt_revision());
     PlannedSkillPair::Activation(ActivationCandidate {
