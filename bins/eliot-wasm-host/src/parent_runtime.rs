@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError, Generation, ImageId, JobId,
-    OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessIntent, ProcessTreeId,
-    ResourceLimits, SessionId,
+    OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessIntent, ProcessLifecycle,
+    ProcessTreeId, ResourceLimits, SessionId,
 };
 use eliot_wasm_runtime::{EngineBinding, InvocationRequest, Sha256Digest, WasmRuntime};
 
@@ -62,12 +62,90 @@ pub(crate) struct BoundedParentSink {
     retained: Mutex<Vec<ProcessEvidence>>,
 }
 
+/// The exact operation, process-tree, and generation a termination read is
+/// bound to. Every field is the admitted identity
+/// [`derive_parent_intent`] derived, so a read can only ever speak about the
+/// one P-03 child this grant launched (issue #2785 audit, defect 2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessTerminationKey {
+    operation: OperationId,
+    tree: ProcessTreeId,
+    generation: Generation,
+}
+
+impl ProcessTerminationKey {
+    /// Builds the read key from the one derived child intent, so the match
+    /// cannot drift from the identity the P-03 owner actually launched.
+    #[must_use]
+    pub fn from_intent(intent: &ProcessIntent) -> Self {
+        Self {
+            operation: intent.operation_id().clone(),
+            tree: intent.process_tree_id().clone(),
+            generation: intent.generation(),
+        }
+    }
+}
+
+/// What the P-03 owner actually observed about the exact child's termination.
+///
+/// Only an actual exit/reap or an owner-confirmed containment carries
+/// `Proven`. An engine name, a worker-thread join, an interrupt request, and
+/// a guest receipt are all other facts and can never produce it; a missing,
+/// failed, or unreadable readback stays `Unknown` (issue #2785 audit,
+/// defect 2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessTerminationObservation {
+    /// The exact child was observed exited and its tree closure proven.
+    Proven,
+    /// No such observation: absent, still running, unclassified, or an
+    /// unreadable readback. Never a claim in either direction.
+    Unknown,
+}
+
 impl BoundedParentSink {
     const CAP: usize = 1024;
 
     pub(crate) fn new() -> Self {
         Self {
             retained: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Bounded read projection over the observations this sink already
+    /// retains: no second executor, no journal, no new observation. It
+    /// answers one question only — did the owner prove that the exact bound
+    /// child terminated.
+    ///
+    /// Evidence counts only when its binding matches the exact operation,
+    /// process-tree, and generation, and its own view carries a proven
+    /// terminal lifecycle together with the exit observation that only the
+    /// executor's reap can produce: `Exited` (exit and full tree closure
+    /// observed) or `Reconciled` (an unknown outcome closed out by the owner
+    /// against exact tree closure). `UnknownOutcome`, `Quarantined`,
+    /// `Failed`, and every live lifecycle are not termination proof, and a
+    /// poisoned lock is reported as unknown rather than as observed.
+    pub(crate) fn observe_termination(
+        &self,
+        key: &ProcessTerminationKey,
+    ) -> ProcessTerminationObservation {
+        let Ok(retained) = self.retained.lock() else {
+            return ProcessTerminationObservation::Unknown;
+        };
+        let proven = retained.iter().any(|evidence| {
+            let view = evidence.view();
+            view.binding().operation_id() == &key.operation
+                && view.binding().process_tree_id() == &key.tree
+                && view.binding().state_fence().generation() == key.generation
+                && view.exit().is_some()
+                && matches!(
+                    view.lifecycle(),
+                    ProcessLifecycle::Exited | ProcessLifecycle::Reconciled
+                )
+        });
+        if proven {
+            ProcessTerminationObservation::Proven
+        } else {
+            ProcessTerminationObservation::Unknown
         }
     }
 }
@@ -162,6 +240,42 @@ pub struct AdmittedRuntime {
     pub engine_binding: EngineBinding,
     /// Shared live authority cell for the granted window.
     pub live: Arc<LiveAuthority>,
+    /// Read-only handle onto the SAME P-03 evidence sink the running child
+    /// reports through, paired with the exact child identity its termination
+    /// must be read for. This is the operation-bound process-termination
+    /// projection the loop consumes; it observes the owner's own evidence and
+    /// never launches, observes, or journals anything itself (issue #2785
+    /// audit, defect 2).
+    pub termination: ProcessTermination,
+}
+
+/// Operation-bound process-termination projection: a read-only handle onto
+/// the one admitted P-03 evidence sink, with the exact child identity its
+/// termination must match. Cheap to clone, and safe to hold beside the
+/// runtime because it can only read.
+#[derive(Clone)]
+pub struct ProcessTermination {
+    sink: Arc<BoundedParentSink>,
+    key: ProcessTerminationKey,
+}
+
+impl ProcessTermination {
+    /// Binds the read projection to the derived child intent, so the
+    /// identity it can speak about is exactly the one the P-03 owner
+    /// launched and can never drift from.
+    #[must_use]
+    pub(crate) fn new(sink: Arc<BoundedParentSink>, key: ProcessTerminationKey) -> Self {
+        Self { sink, key }
+    }
+
+    /// Reads the owner's termination evidence for the exact bound child.
+    /// Returns `Proven` only on an actual exit/reap or an owner-confirmed
+    /// containment; every other outcome, including a failed or poisoned
+    /// readback, stays unknown (issue #2785 audit, defect 2).
+    #[must_use]
+    pub fn observed(&self) -> ProcessTerminationObservation {
+        self.sink.observe_termination(&self.key)
+    }
 }
 
 /// Bounds the composed scheduler by the admitted profile: instance ceiling
@@ -221,5 +335,6 @@ pub fn build_admitted_runtime(
         admitted,
         engine_binding: grant.engine_binding,
         live: grant.live,
+        termination: grant.termination,
     })
 }
