@@ -588,6 +588,14 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #1773 (I3.4, W2): immediately after the complete paged drain above, apply
+    // and COMMIT the dependency change the Host admitted about this daemon's own
+    // served bytes. This is the step that makes a restriction durable: an
+    // in-process invalidation is erased by a restart, after which the evidence
+    // it limited can be re-admitted. It is placed here, before the composition is
+    // shared, because the commit is an async Kernel exchange and this is the last
+    // point at which the composition can be borrowed exclusively.
+    commit_installation_scope_restriction(&mut composition, &launch.executable_sha256);
     // #1145: report the Governor-owned improvement pipeline owner at startup
     // (diagnostics only), keeping the owner identity observable without adding
     // policy semantics to the composition root.
@@ -997,6 +1005,131 @@ fn hydrate_capability_evidence_view(
                 event = "eliotd.capability_evidence_hydration_unavailable",
                 reason = %reason,
                 "canonical capability evidence did not refresh the admission view; the view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
+    }
+}
+
+/// The daemon's OWN admitted installation scope, and the only dependency
+/// selector built from it (issue #1773, I3.4, W2).
+///
+/// `executable_sha256` is the digest the Host admitted on the launch contour:
+/// the exact 8-value descriptor binding requires the literal
+/// `--executable-sha256` flag (`parse_launch_args`), `DaemonConfig::load_protected_bound`
+/// validates it, and the same value already names this process's artifact
+/// (`eliotd-exe:<digest>`). It is therefore the one fact the daemon can attest
+/// to about its own runtime instance and its own integration implementation, and
+/// it is bound to both of exactly those two `RouteScopeFingerprint` dimensions.
+///
+/// Every other dimension stays `None`, i.e. UNKNOWN, never inferred. The
+/// requested provider/model/auth/billing route is not observable from this
+/// process, and I3.4 is explicit that an unexposed field is `unknown` and must
+/// not be back-filled from a UI selection or prompt text. The daemon asserts
+/// what it observed about itself and nothing else.
+fn observed_installation_scope(executable_sha256: &str) -> eliot_governor::RouteScopeFingerprint {
+    let artifact = format!("eliotd-exe:{executable_sha256}");
+    eliot_governor::RouteScopeFingerprint {
+        runtime_hash: Some(artifact.clone()),
+        adapter_hash: Some(artifact),
+        ..eliot_governor::RouteScopeFingerprint::default()
+    }
+}
+
+/// Applies the installation-scope dependency change to the drained admission
+/// view and commits every record it limited (issue #1773, I3.4, W2).
+///
+/// **The selector is narrow by construction, and that is the point.**
+/// `ScopeDependencySelector::all()` is exactly the trap this repository already
+/// recorded: a record is staled when it DIFFERS from `current` on a selected
+/// dimension, so selecting every dimension against a single observed scope
+/// invalidates every other route's and account's still-valid evidence, on every
+/// call, permanently. Here the selector names only `runtime_hash` and
+/// `adapter_hash` — the two dimensions the Host admitted about THIS process.
+///
+/// **The exact predicate, so the retained case is not over-claimed.** With this
+/// selector `ScopeDependencySelector::selects_difference` reduces to
+/// `record.runtime_hash != observed.runtime_hash
+/// || record.adapter_hash != observed.adapter_hash`. So a record matching the
+/// observed installation on BOTH dimensions is never staled, and no other
+/// dimension — provider/model, serializer, auth profile, tool-call ordering —
+/// can stale anything at all from this call site, which is what preserves
+/// `is_fresh_positive_for`'s exact-match retention for every unrelated route. A
+/// record that matches one dimension and differs on the other IS staled, and
+/// that is correct rather than lossy: `is_fresh_positive_for` already demands
+/// exact equality of the whole fingerprint, so such a record could never have
+/// admitted the observed route, and this is exactly I3.4's "adapter change makes
+/// dependent evidence stale".
+///
+/// A record that does differ is restricted, and the restriction is then COMMITTED
+/// through the Governor's existing `RecordCapabilityEvidenceRecord` leg, so the
+/// next restart re-derives it from the served
+/// `limitations_and_negative_evidence` rather than from memory.
+///
+/// The step is a one-shot startup write on a composition that is still
+/// exclusively owned here, so a current-thread runtime is built for exactly this
+/// step — the same shape `DaemonKernelClient::blocking` already uses for its
+/// one-shot exchanges. No thread, no transport, no `start()` contour or
+/// run-loop change.
+///
+/// Fail-closed: a refused commit is a `warn` naming the exact reason and how far
+/// it got. The in-process restriction the registry already applied REMAINS, so
+/// this process keeps refusing the affected evidence; only its durability across
+/// a restart is lost, and the diagnostic says so.
+fn commit_installation_scope_restriction(
+    composition: &mut DaemonComposition,
+    executable_sha256: &str,
+) {
+    // A drain that failed left the view as it was, so there is nothing for the
+    // change to narrow; the step then legitimately restricts nothing and the
+    // log line below reports zero rather than claiming coverage.
+    let observed = observed_installation_scope(executable_sha256);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_unavailable",
+                reason = %error,
+                "the installation-scope restriction could not be committed; it remains in process only, so a restart would forget it while this process keeps refusing the restricted evidence"
+            );
+            return;
+        }
+    };
+    let committed = runtime.block_on(composition.commit_scope_change_restriction(
+        &observed,
+        eliot_governor::ScopeDependencySelector {
+            runtime_hash: true,
+            adapter_hash: true,
+            ..eliot_governor::ScopeDependencySelector::none()
+        },
+    ));
+    match committed {
+        Ok(report) if report.restricted > 0 => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_committed",
+                restricted_records = report.restricted,
+                committed_records = report.committed,
+                change_ref = %report.blocking_evidence_ref,
+                "a runtime/adapter change staled the dependent evidence and the restriction is now an owner-issued durable fact that survives a restart"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_not_needed",
+                "every retained evidence record already matches this installation's admitted runtime and adapter hashes; nothing was staled and nothing was written"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_restriction_unavailable",
+                reason = %error,
+                "the installation-scope restriction was not committed; it remains in process only, so a restart would forget it while this process keeps refusing the restricted evidence"
             );
         }
     }

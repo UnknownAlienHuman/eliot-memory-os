@@ -63,8 +63,8 @@
 //! capability's invalidation on the same fingerprint: the key is the record
 //! identity, not the bare scope.
 //!
-//! **Invalidation is durable once committed — and is a known restriction until
-//! then.** An applied dependency change is written into the affected record's
+//! **Invalidation is durable once committed — and the daemon commits it.** An
+//! applied dependency change is written into the affected record's
 //! [`CapabilityEvidenceRecord::limitations_and_negative_evidence`] — an
 //! already-declared I3.4 field, not a parallel structure — and
 //! [`ScopeInvalidationSet`] is a *derived index*, recomputed by
@@ -72,16 +72,26 @@
 //! rather than remembered separately. A fresh process that hydrates the records
 //! the store served therefore re-derives every restriction that was **committed**.
 //!
-//! But the mutated record is only durable once the caller commits it through the
-//! named `RecordCapabilityEvidenceRecord` leg, and the call that applies a change
-//! does not yet commit it. An uncommitted restriction is therefore a *known*
-//! restriction in this process — it refuses production work, which is the
-//! fail-closed direction — and it **is** erased by a restart. That is a real gap,
-//! not a property: a restriction the running process applied and never committed
-//! is forgotten, and the affected evidence can be re-admitted after a restart.
-//! It is not repaired here, because the commit path has no production caller
-//! (`STITCH`: no capability-probe producer exists in the repository). Do not read
-//! the durability above as covering the uncommitted case.
+//! The mutated record is durable once the caller commits it through the named
+//! `RecordCapabilityEvidenceRecord` leg, and the daemon's startup attach now
+//! does exactly that: after the complete paged drain it applies the dependency
+//! change the Host admitted about the daemon's own served bytes and commits
+//! every record that change limited, through
+//! [`crate::capability_evidence_commit::commit_capability_evidence_record`]. The
+//! write leg and the change leg therefore have a production caller, and the
+//! restriction a running process applied is no longer erased by a restart: the
+//! next hydration re-derives it from the committed
+//! `limitations_and_negative_evidence`.
+//!
+//! Two bounds on that repair are stated rather than papered over. It needs no
+//! capability probe, because narrowing a record is not minting one — but the
+//! *positive* producer is still absent from this repository, so the caller can
+//! restrict existing evidence without ever having produced it. And the commit is
+//! issued with the presented predecessor the hydrated store revision gives, so
+//! the registry's ordering depends on the store's `expected + 1` contract
+//! (stated in the commit module) rather than on a readback. If a commit leg is
+//! refused, the in-process restriction remains — the fail-closed direction — and
+//! only the un-committed leg is lost.
 //!
 //! The two admission predicates additionally read
 //! [`CapabilityEvidenceRecord::is_limited`] directly, so once a limitation IS
@@ -1271,9 +1281,12 @@ impl CapabilityRegistry {
     /// the mutated records and the owner-issued reference of the change. The
     /// caller is responsible for committing them through the named
     /// `RecordCapabilityEvidenceRecord` leg before the restriction may be
-    /// treated as an owner-issued durable fact. An in-process change that is
-    /// never committed still restricts this process, so the direction of failure
-    /// is always closed.
+    /// treated as an owner-issued durable fact, and the daemon's startup attach
+    /// does that for the installation-scope change it observes
+    /// (`commit_scope_change_restriction` in `bins/eliotd`). An in-process change
+    /// whose commit leg is refused still restricts this process, so the
+    /// direction of failure is always closed; already-committed legs stay
+    /// committed and are never partially cleared.
     ///
     /// `blocking_evidence_ref` is the exact owner-issued reference of the
     /// applied change — the digest of the observed behaviour scope

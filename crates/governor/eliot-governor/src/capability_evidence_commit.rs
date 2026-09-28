@@ -75,33 +75,43 @@
 //! A provider that issued anything other than `expected + 1` would therefore
 //! break the registry's ordering, and this code would not detect it: the
 //! derivation and the store would disagree silently. That coupling is the price
-//! of not adding a readback round trip on a path that has no production caller
-//! yet; it is stated here rather than papered over. The readback half of the
-//! leg does exist and does not share this weakness — the paged range read
-//! projects the store's own `revision` column, so a hydrated record is ordered
-//! by the revision the store actually holds.
+//! of not adding a readback round trip on a path whose every commit is issued
+//! from a record the owner itself just derived; it is stated here rather than
+//! papered over. The readback half of the leg does exist and does not share this
+//! weakness — the paged range read projects the store's own `revision` column,
+//! so a hydrated record is ordered by the revision the store actually holds,
+//! and the next commit's presented predecessor is that hydrated revision.
 //!
 //! Fail-closed checks before any commit: the named-operation guard, closed
 //! parameter decode, request-identity validity, and idempotency agreement
 //! between the caller identity and the named request key.
 //!
-//! Production caller status: **none, and that is a measured fact rather than an
-//! oversight.** This repository contains no capability-probe producer. A whole-
-//! tree search for `RouteScopeFingerprint {` outside `#[cfg(test)]` returns
-//! exactly two sites: the legacy importer (which yields an all-`None` scope and
-//! a `declared` status) and `ActualRouteReceipt::current_scope`, which itself
-//! needs an `ActualRouteReceipt` that no production path supplies. The single
-//! missing producer is therefore a route/capability observation yielding a
-//! `RouteScopeFingerprint`, a probed status, and the owner-issued evidence
-//! reference — and the same absence is why
-//! [`CapabilityRegistry::apply_scope_change`](crate::CapabilityRegistry::apply_scope_change)
-//! has no reachable caller yet. The write leg and the change leg are committed
-//! here and become reachable together, at that one producer; wiring either one
-//! earlier would mean fabricating a probe result that no probe produced.
+//! Production caller status: **one, and it is a restriction, not a positive.**
+//! The daemon startup attach (`bins/eliotd::daemon_runtime`'s
+//! `hydrate_capability_evidence_view` site) applies the installation-scope
+//! dependency change the Host admitted about the daemon's own served bytes and
+//! then commits every record that change limited, through this path. It mints no
+//! `probe_passed` and no `observed` record: a whole-tree search for
+//! `RouteScopeFingerprint {` outside `#[cfg(test)]` still returns exactly two
+//! sites, the legacy importer (which yields an all-`None` scope and a `declared`
+//! status) and `ActualRouteReceipt::current_scope`, which itself needs an
+//! `ActualRouteReceipt` that no production path supplies. The positive-minting
+//! producer is still absent, and that absence is still recorded rather than
+//! worked around.
+//!
+//! It does not block this leg. [`CapabilityRegistry::apply_scope_change`]'s
+//! contract is to *narrow* a record, and narrowing needs no probe: it writes the
+//! owner-issued change reference into the affected record's already-declared
+//! `limitations_and_negative_evidence`. What that mutation was missing was
+//! durability — an un-committed restriction is erased by a restart and the stale
+//! evidence it limits can then be re-admitted. Committing it here is what closes
+//! that direction, and it commits bytes the owner already had.
 //!
 //! The readback half of this path is live today: the daemon's complete paged
 //! drain runs at startup and rebuilds the registry from whatever the store
-//! actually holds.
+//! actually holds, so a restriction committed by this leg is re-derived in a
+//! fresh process from the served `limitations_and_negative_evidence` rather than
+//! remembered.
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
@@ -119,8 +129,20 @@ use crate::capability_evidence::{
 };
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
 
-/// Builds the closed `RecordCapabilityEvidenceRecord` mutation request for one
-/// verified record.
+/// The exact wire address of one evidence row: the `(skill_id, scope_key)` row
+/// address, the opaque record document, and the presented digest over it.
+///
+/// One implementation, so the committed `operation_id` and the deterministic
+/// commit `idempotency_key` cannot disagree. Two derivations would be free to
+/// drift, and a drift would not fail closed anywhere: it would simply address a
+/// second row for the same record.
+struct CapabilityEvidenceRowAddress {
+    scope_key: String,
+    record_json: String,
+    record_digest: String,
+}
+
+/// Builds the exact durable row address of one evidence record.
 ///
 /// The presented `record_digest` is the digest over the exact canonical record
 /// bytes, and the same digest is the owner-issued evidence reference the store
@@ -129,15 +151,12 @@ use crate::composition::{CompositionError, GovernorComposition, KernelGeneration
 ///
 /// # Errors
 ///
-/// Returns [`CompositionError::Owner`] when the skill identity or scope
-/// fingerprint cannot produce a bounded wire shape, when the record bytes
-/// exceed the declared bounded length, or when the built request fails the
-/// closed named-operation guard.
-pub fn capability_evidence_mutation_request_for_record(
+/// Returns [`CompositionError::Owner`] when the skill identity cannot produce a
+/// bounded wire shape, or when the record bytes exceed the declared bounded
+/// length or are not UTF-8.
+fn capability_evidence_row_address(
     record: &CapabilityEvidenceRecord,
-    expected_canonical_revision: u64,
-    idempotency_key: String,
-) -> Result<NamedMutationRequest, CompositionError> {
+) -> Result<CapabilityEvidenceRowAddress, CompositionError> {
     if !eliot_store_api::valid_skill_id(&record.skill_id) {
         return Err(CompositionError::Owner(
             "capability evidence skill identity is not a bounded non-blank identity".to_owned(),
@@ -157,14 +176,93 @@ pub fn capability_evidence_mutation_request_for_record(
     // The scope key is the owner-issued reference of the exact route-scope
     // fingerprint, so the durable row is addressed by behaviour scope and the
     // store never has to parse a route.
-    let scope_key = record.scope_fingerprint.reference_digest();
-    let record_digest = sha256_hex(record_json.as_bytes());
+    Ok(CapabilityEvidenceRowAddress {
+        scope_key: record.scope_fingerprint.reference_digest(),
+        record_digest: sha256_hex(record_json.as_bytes()),
+        record_json,
+    })
+}
+
+/// The single operation text both the committed `operation_id` and the commit
+/// `idempotency_key` are derived from.
+///
+/// `skill_id` + `scope_key` + `record_digest` is exactly the durable row's
+/// identity: the presented digest is the immutable record identity, so two
+/// different revisions of the same evidence key address two different rows and
+/// the SAME revision always addresses the same one. A retry therefore converges
+/// at the store instead of appending a second row.
+fn capability_evidence_operation_text(
+    skill_id: &str,
+    scope_key: &str,
+    record_digest: &str,
+) -> String {
+    format!("capability-evidence-{skill_id}-{scope_key}-{record_digest}")
+}
+
+/// Derives the deterministic commit idempotency key for one evidence record.
+///
+/// The key is byte-for-byte the text the committed
+/// [`OperationId`] is built from
+/// ([`capability_evidence_operation_text`]), so a caller that needs the key
+/// before it can build the named request — because the admitted
+/// [`RequestIdentity`] must already carry it — derives exactly the value the
+/// commit will commit under. That is what makes a retried startup safe: the
+/// same record re-presents the same key, and the store's compare-and-set
+/// converges instead of creating a second row.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Owner`] when the record cannot produce a bounded
+/// wire address (see [`capability_evidence_row_address`]) or when the derived key
+/// exceeds the store's bounded idempotency length.
+pub fn capability_evidence_idempotency_key(
+    record: &CapabilityEvidenceRecord,
+) -> Result<String, CompositionError> {
+    let address = capability_evidence_row_address(record)?;
+    let key = capability_evidence_operation_text(
+        &record.skill_id,
+        &address.scope_key,
+        &address.record_digest,
+    );
+    if key.len() > eliot_store_api::MAX_CAPABILITY_EVIDENCE_IDEMPOTENCY_BYTES {
+        return Err(CompositionError::Owner(
+            "capability evidence idempotency key exceeds the bounded length".to_owned(),
+        ));
+    }
+    Ok(key)
+}
+
+/// Builds the closed `RecordCapabilityEvidenceRecord` mutation request for one
+/// verified record.
+///
+/// The presented `record_digest` is the digest over the exact canonical record
+/// bytes, and the same digest is the owner-issued evidence reference the store
+/// echoes on readback — so one value binds the committed bytes, the durable row
+/// identity, and the revision the Governor registry orders by.
+///
+/// `idempotency_key` must be
+/// [`capability_evidence_idempotency_key`] for this same record;
+/// [`commit_capability_evidence_record`] refuses any other value, so the two can
+/// never silently diverge.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Owner`] when the skill identity or scope
+/// fingerprint cannot produce a bounded wire shape, when the record bytes
+/// exceed the declared bounded length, or when the built request fails the
+/// closed named-operation guard.
+pub fn capability_evidence_mutation_request_for_record(
+    record: &CapabilityEvidenceRecord,
+    expected_canonical_revision: u64,
+    idempotency_key: String,
+) -> Result<NamedMutationRequest, CompositionError> {
+    let address = capability_evidence_row_address(record)?;
     let request = eliot_store_api::capability_evidence_mutation_request(
         eliot_store_api::capability_evidence_commit_params(
             record.skill_id.clone(),
-            scope_key,
-            record_json,
-            record_digest,
+            address.scope_key,
+            address.record_json,
+            address.record_digest,
             expected_canonical_revision,
             idempotency_key,
         ),
@@ -259,9 +357,10 @@ pub async fn commit_capability_evidence_record<P: KernelGenerationPort + ?Sized>
             "capability evidence presented digest is not one hex SHA-256 digest".to_owned(),
         ));
     }
-    let operation_id = OperationId::new(format!(
-        "capability-evidence-{}-{}-{}",
-        decoded.skill_id, decoded.scope_key, decoded.record_digest
+    let operation_id = OperationId::new(capability_evidence_operation_text(
+        &decoded.skill_id,
+        &decoded.scope_key,
+        &decoded.record_digest,
     ))
     .map_err(|error| {
         CompositionError::Owner(format!("capability evidence identity invalid: {error}"))

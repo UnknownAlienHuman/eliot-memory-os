@@ -18,7 +18,12 @@
 //!    observed without waiting for a restart. The one-shot apply installs only
 //!    a COMPLETE page: a page that reports further eligible rows is refused
 //!    whole before any row is minted, so partial coverage can never present
-//!    itself as the view and admit past an unread restriction.
+//!    itself as the view and admit past an unread restriction;
+//! 3. [`commit_scope_change_restriction`], also reached from the startup attach,
+//!    which applies the installation-scope dependency change the Host admitted
+//!    about the daemon's own served bytes and COMMITS every record that change
+//!    limited, so a restriction a running process applied cannot be erased by a
+//!    restart and leave the stale evidence re-admissible.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -48,7 +53,8 @@
 //! `bins/eliotd`, and no composition method here invents a caller for it.
 //!
 //! **Trap recorded for the next writer: do NOT reintroduce an
-//! `apply_scope_change` call here.** `CapabilityRegistry::apply_scope_change`
+//! `apply_scope_change` call with an OBSERVED route as `current` and
+//! `ScopeDependencySelector::all()`.** `CapabilityRegistry::apply_scope_change`
 //! stales a record when its fingerprint DIFFERS from the scope supplied as
 //! `current` on a selected dimension, and a scope once invalidated is not
 //! revived by a later matching record. A call that passes an OBSERVED route as
@@ -59,11 +65,17 @@
 //! document protects. The over-broad call has been REMOVED from
 //! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route),
 //! so no production path invokes it any more; staleness is instead DERIVED at the
-//! gate (below). [`apply_scope_change`](Self::apply_scope_change) is left in
-//! place, unreferenced from production: it is pre-existing public surface whose
-//! correct direction is a narrower selector than any current observation site
-//! can supply, and an existing test exercises it, so removing the method itself
-//! would exceed this issue.
+//! gate (below).
+//!
+//! [`commit_scope_change_restriction`] IS a production caller, and it is the
+//! narrow direction this note describes: the startup attach holds the scope the
+//! Host admitted about the daemon's OWN served bytes and selects exactly the two
+//! dimensions it can attribute to its own installation — `runtime_hash` and
+//! `adapter_hash` — not `all()`. A record whose two selected dimensions already
+//! equal the observed ones is therefore not staled at all and keeps its
+//! exact-match retention. Narrowing a record needs no capability probe, so
+//! reaching this caller did not require the absent positive producer; see that
+//! function's own documentation.
 //!
 //! Evidence bridges, and why there are two. Both are canonical reads, and they
 //! carry different things — measured on current store source:
@@ -121,8 +133,10 @@ use eliot_config::legacy_capability_import::{
     LegacyCapabilityDeclaration, LegacyScopeFingerprint, import_legacy_declaration,
 };
 use eliot_governor::{
-    CapabilityEvidenceRecord, CapabilityRegistry, MAX_CAPABILITY_EVIDENCE_RECORDS,
-    OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
+    CapabilityEvidenceRecord, CapabilityRegistry, GovernorComposition, KernelGenerationPort,
+    MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision, RouteScopeFingerprint,
+    ScopeDependencySelector, SkillStanding, capability_evidence_idempotency_key,
+    capability_evidence_mutation_request_for_record, commit_capability_evidence_record,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
@@ -130,6 +144,8 @@ use eliot_store_api::{
     NamedReadResponse, ReadConsistency, ScopeId,
 };
 use thiserror::Error;
+
+use super::SERVICE_NAME;
 
 /// Fail-closed errors for the daemon capability-evidence bridge.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -159,6 +175,16 @@ pub enum EvidenceBridgeError {
     /// continuation to drain. Nothing from the page is installed.
     #[error("capability evidence page is truncated; complete coverage requires the paged drain")]
     CoverageIncomplete,
+    /// The narrowed dependency change was refused, so nothing was staled and
+    /// nothing was committed.
+    #[error("capability evidence scope change was refused: {0}")]
+    ScopeChange(String),
+    /// One restricted record's durable commit leg was refused. The in-process
+    /// restriction for every staled key REMAINS (the fail-closed direction) and
+    /// every leg already committed stays committed; the message names how far
+    /// the commit got so the residual in-process-only restriction is visible.
+    #[error("capability evidence restriction commit leg refused: {0}")]
+    RestrictionCommit(String),
 }
 
 /// Daemon-held Governor capability admission view.
@@ -298,6 +324,11 @@ impl GovernorCapabilityAdmission {
     /// restriction holds in this process only, which is the fail-closed
     /// direction. The limitation is also what a later hydration re-derives the
     /// invalidation from, so a committed restriction is never forgotten.
+    ///
+    /// The daemon commits exactly this at startup: see
+    /// [`commit_scope_change_restriction`], which is the only production caller
+    /// and which selects only the dimensions the daemon can attribute to its own
+    /// installation.
     ///
     /// # Errors
     ///
@@ -914,6 +945,241 @@ pub fn drain_capability_evidence_records(
         minted_records,
         retained: usize::try_from(observed_records).unwrap_or(usize::MAX),
     })
+}
+
+/// Bound the one canonical evidence commit's deadline from the daemon clock.
+const CAPABILITY_EVIDENCE_COMMIT_DEADLINE_MS: u64 = 30_000;
+
+/// Applies one narrowed dependency change to the held admission view and
+/// COMMITS every record that change limited, through the named
+/// `RecordCapabilityEvidenceRecord` leg (issue #1773, I3.4, W2).
+///
+/// # Why this exists and why it needs no probe
+///
+/// [`CapabilityRegistry::apply_scope_change`] only ever *narrows* a record: it
+/// writes the owner-issued change reference into the record's already-declared
+/// [`limitations_and_negative_evidence`](CapabilityEvidenceRecord::limitations_and_negative_evidence)
+/// field. That is not a capability claim, so I3.4's "production admission
+/// requires matching `probe_passed` or `observed` evidence" does not gate it and
+/// no probe has to exist for it to be honest. What the mutation was missing was
+/// durability: an un-committed limitation lives only in this process and is
+/// erased by a restart, after which the evidence it limited can be re-admitted.
+/// Committing it is therefore the whole of the repair, and it commits bytes the
+/// owner already held.
+///
+/// # Order, and why it cannot partially clear
+///
+/// 1. [`GovernorCapabilityAdmission::apply_scope_change`] mutates the registry
+///    and derives the invalidation index. A malformed change reference stales
+///    nothing and returns an error, so nothing is committed.
+/// 2. Each newly staled record is committed through
+///    [`commit_capability_evidence_record`], presented at the CAS predecessor
+///    the hydration gave it (the store-issued revision the registry retained),
+///    so the store arbitrates `expected + 1` under its own compare-and-set.
+/// 3. The store-issued revision is then installed into the held view, so the
+///    registry orders the restricted record by the revision the store actually
+///    holds and the next hydration re-presents it as the next predecessor.
+///
+/// Any refusal short-circuits. The in-process restriction REMAINS for every
+/// staled key — that is the fail-closed direction, and it is why an un-committed
+/// leg degrades to "this process refuses" rather than "the change did not
+/// happen". Legs already committed stay committed: progress is monotone, and
+/// there is no path here that clears an invalidation.
+///
+/// **The fence is read once, before the batch, not per leg.** That is the
+/// existing house shape: the improvement-intake path commits its candidate
+/// record and then a loop of archive receipts under one pre-batch
+/// `state_fence` (`improvement_intake_dispatch::commit_intake_artifact`), and
+/// the daemon's retained Kernel snapshot does not advance mid-process. If a
+/// provider ever did move the fence between legs, the later leg is simply
+/// refused and the message names how many legs committed — fail-closed, never a
+/// partial clear, and never a silent success.
+///
+/// # The write path is the existing one
+///
+/// This is the Governor's own commit leg through
+/// [`GovernorComposition::commit_canonical`](eliot_governor::GovernorComposition::commit_canonical)
+/// — the same single canonical write the composition root uses for every other
+/// durable record. No second capability service, registry or fingerprint type is
+/// introduced, and the registry's own ordering/requalification rules are reused
+/// unchanged rather than re-derived.
+///
+/// # Failures
+///
+/// Returns [`EvidenceBridgeError::ScopeChange`] when the change itself is
+/// refused, and [`EvidenceBridgeError::RestrictionCommit`] naming the committed
+/// prefix when a leg cannot be built or committed.
+pub async fn commit_scope_change_restriction<P>(
+    governor: &GovernorComposition<P>,
+    admission: &mut GovernorCapabilityAdmission,
+    observed: &RouteScopeFingerprint,
+    changed: ScopeDependencySelector,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+) -> Result<ScopeChangeRestrictionReport, EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+{
+    // The owner-issued change reference is the exact reference of the OBSERVED
+    // scope, i.e. a digest over the caller's own admitted observation — not over
+    // a probe result, and not over anything inferred. It is therefore stable for
+    // one observed scope across processes, which is what makes a retried startup
+    // present the same cause, and it is exactly the digest shape
+    // `is_evidence_ref` requires. `RouteScopeFingerprint` is eleven `Option<String>`
+    // fields with no `skip_serializing_if`, so its canonical encoding cannot
+    // fail and this cannot panic.
+    let blocking_evidence_ref = observed.reference_digest();
+    let staled = admission
+        .apply_scope_change(observed, changed, &blocking_evidence_ref)
+        .map_err(|error| EvidenceBridgeError::ScopeChange(error.to_string()))?;
+    let restricted = staled.records.len();
+    let mut committed = 0_usize;
+    for retained in &staled.records {
+        // The presented predecessor is the store-issued revision the hydration
+        // read back for this exact key. The registry is then re-inserted at the
+        // revision the store issues, so a requalification is still measured
+        // entirely in owner authority.
+        let outcome = commit_restriction_leg(
+            governor,
+            admission,
+            &retained.record,
+            retained.revision.owner_revision,
+            &blocking_evidence_ref,
+            scope,
+            fence,
+        )
+        .await;
+        if let Err(error) = outcome {
+            // Name exactly how much of the restriction reached the store, so the
+            // residual in-process-only invalidation is observable rather than
+            // silently narrower than the change applied.
+            return Err(EvidenceBridgeError::RestrictionCommit(format!(
+                "{error} ({committed} of {restricted} restricted records were committed)"
+            )));
+        }
+        committed += 1;
+    }
+    Ok(ScopeChangeRestrictionReport {
+        blocking_evidence_ref,
+        restricted,
+        committed,
+    })
+}
+
+/// Commits one restricted record's durable leg and installs the store-issued
+/// revision into the held view.
+///
+/// The idempotency key is derived by the SAME owner function that derives the
+/// committed `operation_id`, from the same skill + scope + record digest, so a
+/// retried startup converges at the store rather than appending a second row for
+/// one record.
+async fn commit_restriction_leg<P>(
+    governor: &GovernorComposition<P>,
+    admission: &mut GovernorCapabilityAdmission,
+    restricted: &CapabilityEvidenceRecord,
+    expected_canonical_revision: u64,
+    blocking_evidence_ref: &str,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+) -> Result<(), EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+{
+    let idempotency_key =
+        capability_evidence_idempotency_key(restricted).map_err(restriction_commit_refused)?;
+    let request = capability_evidence_mutation_request_for_record(
+        restricted,
+        expected_canonical_revision,
+        idempotency_key.clone(),
+    )
+    .map_err(restriction_commit_refused)?;
+    let identity = restriction_commit_identity(&idempotency_key, fence)?;
+    // The proof refs are the owner-issued change reference, passed through
+    // unchanged: this commit is authorized by the observed dependency change,
+    // not by a probe result.
+    let (_receipt, revision) = commit_capability_evidence_record(
+        governor,
+        &identity,
+        request,
+        scope.clone(),
+        vec![blocking_evidence_ref.to_owned()],
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .map_err(restriction_commit_refused)?;
+    // `insert` cannot refuse here and the reason is structural, not empirical:
+    // the key was located by `apply_scope_change` and is therefore already
+    // retained, and the revision presented now is exactly one greater than the
+    // revision retained for it, which is the only ordering `insert` accepts.
+    admission.insert(restricted.clone(), revision);
+    Ok(())
+}
+
+/// Names one refused restriction commit leg without inventing a second error
+/// vocabulary for it.
+fn restriction_commit_refused(error: impl std::fmt::Display) -> EvidenceBridgeError {
+    EvidenceBridgeError::RestrictionCommit(error.to_string())
+}
+
+/// Builds the admitted ingress identity for one restriction commit leg.
+///
+/// The idempotency key IS the deterministic evidence operation text, so a
+/// retried startup re-presents the same key and converges at the store. The
+/// request and cancellation identities are the house
+/// `{SERVICE_NAME}:{operation}` shape used by
+/// `improvement_intake_dispatch::improvement_commit_identity`; nothing here
+/// mints an authority the Kernel has not admitted.
+fn restriction_commit_identity(
+    idempotency_key: &str,
+    fence: &eliot_contracts::StateFence,
+) -> Result<eliot_protocol::RequestIdentity, EvidenceBridgeError> {
+    let now = crate::unix_ms_i64();
+    let metadata = eliot_contracts::RequestMetadata {
+        request_id: eliot_contracts::RequestId::new(format!("{SERVICE_NAME}:{idempotency_key}"))
+            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new(SERVICE_NAME)
+            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+        source_id: eliot_contracts::SourceId::new(SERVICE_NAME)
+            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+        state_fence: fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: Some(now),
+            known_time_ms: Some(now),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    Ok(eliot_protocol::RequestIdentity {
+        request: eliot_receipts::RequestBinding {
+            metadata,
+            state_fence: fence.clone(),
+        },
+        idempotency_key: idempotency_key.to_owned(),
+        deadline_unix_ms: crate::unix_ms().saturating_add(CAPABILITY_EVIDENCE_COMMIT_DEADLINE_MS),
+        cancellation_id: format!("{SERVICE_NAME}:{idempotency_key}:cancel"),
+    })
+}
+
+/// What one applied-and-committed dependency change did.
+///
+/// `committed == restricted` on success, and only then is every restriction the
+/// change applied also an owner-issued durable fact. A refusal is an error
+/// rather than a report, because a partially committed restriction set must not
+/// be readable as a complete one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeChangeRestrictionReport {
+    /// The exact owner-issued reference of the applied change.
+    pub blocking_evidence_ref: String,
+    /// How many `(skill_id, scope_fingerprint)` keys the change limited.
+    pub restricted: usize,
+    /// How many of those limitations are now committed in the canonical store.
+    pub committed: usize,
 }
 
 /// One applied page of the capability-evidence record read.

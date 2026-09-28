@@ -131,7 +131,8 @@ pub use capability_evidence::{
     scope_has_any_invalidation,
 };
 pub use capability_evidence_commit::{
-    capability_evidence_mutation_request_for_record, commit_capability_evidence_record,
+    capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
+    commit_capability_evidence_record,
 };
 pub use composition::*;
 pub use controlboard_projection::{

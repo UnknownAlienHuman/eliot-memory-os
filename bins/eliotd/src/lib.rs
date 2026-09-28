@@ -146,7 +146,8 @@ pub use capability_admission::{
 };
 pub use capability_evidence_wiring::{
     CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
-    GovernorCapabilityAdmission, ObservedLifecycleSummary, drain_capability_evidence_records,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, ScopeChangeRestrictionReport,
+    commit_scope_change_restriction, drain_capability_evidence_records,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
@@ -1164,6 +1165,81 @@ impl DaemonComposition {
             self.view_stale = true;
         }
         Ok(receipt)
+    }
+
+    /// Applies one narrowed dependency change to the held capability-admission
+    /// view and commits every record it limited, then publishes the resulting
+    /// owner change (issue #1773, I3.4, W2).
+    ///
+    /// Outbound-only and the same shape as
+    /// [`Self::commit_experience_bank_record`]: this method owns no Store
+    /// client and opens no second durability path. The only write path is the
+    /// retained neutral Kernel port, reached through
+    /// [`eliot_governor::commit_capability_evidence_record`], and the resulting
+    /// owner change is published with the same refresh/stale discipline — the
+    /// receipts are returned unmodified and a failed refresh marks the
+    /// dependent view stale/pending instead of hiding divergence.
+    ///
+    /// `observed` is the scope this daemon can attribute to ITSELF; `changed`
+    /// must name only dimensions that observation actually observed, because
+    /// the registry stales every record differing from `observed` on a selected
+    /// dimension. The blocking reference is the observed scope's own
+    /// [`reference_digest`](eliot_governor::RouteScopeFingerprint::reference_digest),
+    /// so it is a digest over an admitted observation rather than a probe
+    /// result.
+    ///
+    /// The two borrows are split by field precisely so the composition guard is
+    /// never held across a Kernel exchange: `governor` and
+    /// `capability_admission` are disjoint fields, and `refresh_from_kernel`
+    /// runs only after the exchange has settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Composition`] when the composition is not ready,
+    /// or the bridge refusal unchanged — which names how many of the restricted
+    /// records reached the store, so an in-process-only residual restriction is
+    /// observable rather than silently narrower than the applied change.
+    pub async fn commit_scope_change_restriction(
+        &mut self,
+        observed: &eliot_governor::RouteScopeFingerprint,
+        changed: eliot_governor::ScopeDependencySelector,
+    ) -> Result<crate::ScopeChangeRestrictionReport, DaemonError> {
+        // Same readiness gate as `capability_admission_mut`, taken and released
+        // before the write so the borrow below is unconditional.
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let fence = self.governor.kernel_snapshot().state_fence();
+        let scope =
+            eliot_store_api::ScopeId::new(eliot_governor::GOVERNOR_SCOPE_ID).map_err(|error| {
+                DaemonError::Composition(CompositionError::Owner(error.to_string()))
+            })?;
+        // Disjoint field borrows: the exchange below needs the Governor
+        // composition immutably and the held view mutably at the same time, and
+        // neither is a second owner. The block is what releases both borrows
+        // before `refresh_from_kernel` takes the composition again, so no guard
+        // is ever held across a Kernel exchange.
+        let report = {
+            let DaemonComposition {
+                governor,
+                capability_admission,
+                ..
+            } = self;
+            crate::capability_evidence_wiring::commit_scope_change_restriction(
+                governor,
+                capability_admission,
+                observed,
+                changed,
+                &scope,
+                &fence,
+            )
+            .await
+            .map_err(|error| DaemonError::Composition(CompositionError::Owner(error.to_string())))?
+        };
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(report)
     }
 
     /// Commits one prebuilt named learning-record request through the
@@ -2952,10 +3028,11 @@ impl DaemonComposition {
         // "runtime/adapter/provider/serializer change makes dependent evidence
         // stale", and it is the one the document describes.
         //
-        // `GovernorCapabilityAdmission::apply_scope_change` itself is left in
-        // place, unreferenced from production: it is pre-existing public surface
-        // whose correct direction is a narrower selector than any current
-        // observation site can supply, and removing it would exceed this issue.
+        // `GovernorCapabilityAdmission::apply_scope_change` is therefore NOT
+        // called here. Its production caller is the startup attach's
+        // [`Self::commit_scope_change_restriction`], which passes a narrower
+        // selector — the two dimensions the Host admitted about the daemon's own
+        // served bytes — and never an observed per-call route.
         // The intake path's durable leg
         // (`capability_evidence_wiring::hydrate_capability_admission_view`)
         // re-derives the invalidation index from each served record's own
