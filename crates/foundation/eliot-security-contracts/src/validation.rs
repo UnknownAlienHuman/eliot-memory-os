@@ -10,9 +10,9 @@ use crate::{
     DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState,
     LegacySelectionIntegrityReceiptV1, MAX_SELECTION_MEMBERS, MAX_SELECTION_STAGES,
     ObservationDomainRef, PurgeLedgerEntry, PurgeState, SELECTION_INTEGRITY_SCHEMA,
-    SelectionInfluenceState, SelectionIntegrityReceipt, SelectionMember,
-    SelectionMemberDisposition, SelectionMemberDispositionKind, SelectionStage, SelectionStageLink,
-    SourceAssurance, TransformationLineage,
+    SelectionChainHead, SelectionChainSeal, SelectionInfluenceState, SelectionIntegrityReceipt,
+    SelectionMember, SelectionMemberDisposition, SelectionMemberDispositionKind, SelectionStage,
+    SelectionStageLink, SourceAssurance, TransformationLineage,
 };
 
 /// Validation failure that never carries protected payload content.
@@ -111,6 +111,30 @@ pub enum SecurityContractError {
     SelectionLegacyMemberUnbound { member_ref: String },
     #[error("legacy selection stage at ordinal {ordinal} is not attributable to its input members")]
     SelectionLegacyStageUnattributable { ordinal: usize },
+    #[error(
+        "selection chain head names ordinal {expected}, but this chain carries {observed} stages"
+    )]
+    SelectionChainHeadOrdinal { expected: usize, observed: usize },
+    #[error("selection chain head does not bind the digest of its own stage prefix")]
+    SelectionChainHeadDigest,
+    #[error("selection chain head does not name the chain it belongs to")]
+    SelectionChainHeadIdentity,
+    #[error("selection chain head carries no stable append idempotency identity")]
+    SelectionChainHeadIdempotency,
+    #[error(
+        "selection seal is taken against chain head {expected}, but the chain head recomputes to {observed}"
+    )]
+    SelectionSealChainSubstituted { expected: String, observed: String },
+    #[error("selection seal does not name the chain or recipe revision it was taken for")]
+    SelectionSealIdentity,
+    #[error(
+        "selection seal final membership does not bind its ordered digest, or its order is not the chain's final order"
+    )]
+    SelectionSealFinalMembership,
+    #[error("selection seal does not bind the exact delivered packet or export bytes")]
+    SelectionSealPacketBytes,
+    #[error("selection seal declares a membership page without a complete closure reference")]
+    SelectionSealPageClosureMissing,
     #[error("canonical security contract serialization failed: {0}")]
     Serialization(String),
 }
@@ -1082,4 +1106,240 @@ pub fn validate_selection_pipeline(
     canonical_json_bytes(receipt)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|error| SecurityContractError::Serialization(error.to_string()))
+}
+
+/// Computes the digest of one chain head over its own stage prefix.
+///
+/// The digest is recomputed from the stages it names, never taken on trust
+/// from a caller: an append that re-derives it over the exact stage prefix it
+/// added is what makes the head a projection of the immutable history rather
+/// than a second, self-asserted authority (#1728 step 4).
+///
+/// # Errors
+///
+/// Returns an error when the prefix cannot be serialized canonically.
+pub fn selection_chain_head_digest(
+    receipt: &SelectionIntegrityReceipt,
+    chain_head_ordinal: usize,
+) -> Result<String, SecurityContractError> {
+    #[derive(serde::Serialize)]
+    struct ChainHeadPrefix<'a> {
+        selection_id: &'a str,
+        schema: &'a str,
+        contract_version: &'a eliot_contracts::ContractVersion,
+        root_context_ref: &'a str,
+        recipe_revision: &'a str,
+        chain_head_ordinal: usize,
+        stages: &'a [SelectionStage],
+    }
+    let prefix = receipt
+        .transformation_stages
+        .get(..=chain_head_ordinal)
+        .ok_or(SecurityContractError::SelectionChainHeadOrdinal {
+            expected: chain_head_ordinal,
+            observed: receipt.transformation_stages.len(),
+        })?;
+    let view = ChainHeadPrefix {
+        selection_id: &receipt.selection_id,
+        schema: &receipt.schema,
+        contract_version: &receipt.contract_version,
+        root_context_ref: &receipt.root_context_ref,
+        recipe_revision: &receipt.recipe_revision,
+        chain_head_ordinal,
+        stages: prefix,
+    };
+    canonical_json_bytes(&view)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| SecurityContractError::Serialization(error.to_string()))
+}
+
+impl SelectionIntegrityReceipt {
+    /// Derives the rebuildable chain head of this chain.
+    ///
+    /// The head is computed from the immutable stages themselves. The caller
+    /// supplies only the stable append identity and the chain revision the
+    /// append advanced to; neither can substitute for the recomputed digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the append identity text is unusable or the
+    /// prefix cannot be serialized canonically.
+    pub fn derive_chain_head(
+        &self,
+        chain_revision: u64,
+        append_idempotency_key: &str,
+    ) -> Result<SelectionChainHead, SecurityContractError> {
+        text(
+            append_idempotency_key,
+            "selection.chain_head.append_idempotency_key",
+        )?;
+        let chain_head_ordinal = self.transformation_stages.len().checked_sub(1).ok_or(
+            SecurityContractError::SelectionChainHeadOrdinal {
+                expected: 0,
+                observed: 0,
+            },
+        )?;
+        Ok(SelectionChainHead {
+            selection_id: self.selection_id.clone(),
+            chain_head_ordinal,
+            chain_head_digest: selection_chain_head_digest(self, chain_head_ordinal)?,
+            chain_revision,
+            append_idempotency_key: append_idempotency_key.to_owned(),
+        })
+    }
+
+    /// Verifies one presented chain head against the stages it names.
+    ///
+    /// The head must name this chain, address a real stage prefix, and bind
+    /// the digest recomputed from that prefix. A head that merely exists, or
+    /// that carries a well-formed digest for a different chain, is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error naming the exact failed binding.
+    pub fn verify_chain_head(
+        &self,
+        head: &SelectionChainHead,
+    ) -> Result<(), SecurityContractError> {
+        if head.selection_id != self.selection_id {
+            return Err(SecurityContractError::SelectionChainHeadIdentity);
+        }
+        text(
+            &head.append_idempotency_key,
+            "selection.chain_head.append_idempotency_key",
+        )?;
+        if head.chain_head_ordinal >= self.transformation_stages.len() {
+            return Err(SecurityContractError::SelectionChainHeadOrdinal {
+                expected: head.chain_head_ordinal,
+                observed: self.transformation_stages.len(),
+            });
+        }
+        let observed = selection_chain_head_digest(self, head.chain_head_ordinal)?;
+        if head.chain_head_digest != observed {
+            return Err(SecurityContractError::SelectionChainHeadDigest);
+        }
+        Ok(())
+    }
+}
+
+impl SelectionChainSeal {
+    /// Verifies this seal against the exact chain and output it was taken for.
+    ///
+    /// The authoritative side is the chain: the presented
+    /// `chain_head_digest` is compared with the digest recomputed from the
+    /// receipt's own stages, the sealed final membership is compared with the
+    /// receipt's own final membership **in order** (so a changed packet with
+    /// the same member count fails), and the recipe revision is compared with
+    /// the chain's own recipe revision. `packet_bytes_digest` is bound to the
+    /// delivered bytes by this call's `delivered_packet_bytes`, which is the
+    /// content the consumer is about to act on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error naming the exact failed binding.
+    pub fn verify_against(
+        &self,
+        receipt: &SelectionIntegrityReceipt,
+        delivered_packet_bytes: &[u8],
+        delivered_expansion_handle_ids: &[String],
+    ) -> Result<(), SecurityContractError> {
+        self.validate()?;
+        receipt.validate()?;
+        let head_digest = selection_chain_head_digest(
+            receipt,
+            receipt.transformation_stages.len().checked_sub(1).ok_or(
+                SecurityContractError::SelectionChainHeadOrdinal {
+                    expected: 0,
+                    observed: 0,
+                },
+            )?,
+        )?;
+        if self.selection_id != receipt.selection_id
+            || self.recipe_revision != receipt.recipe_revision
+        {
+            return Err(SecurityContractError::SelectionSealIdentity);
+        }
+        if self.chain_head_digest != head_digest {
+            return Err(SecurityContractError::SelectionSealChainSubstituted {
+                expected: self.chain_head_digest.clone(),
+                observed: head_digest,
+            });
+        }
+        // Order is part of the claim: the sealed ordered membership must be
+        // exactly the chain's declared final membership, and its digest must
+        // recompute from those very members.
+        if self.final_output_refs != receipt.final_output_refs
+            || self.final_output_digest != selection_member_digest(&self.final_output_members)?
+            || self.final_output_refs
+                != member_refs(&self.final_output_members)
+                    .iter()
+                    .map(|member| (*member).to_owned())
+                    .collect::<Vec<String>>()
+        {
+            return Err(SecurityContractError::SelectionSealFinalMembership);
+        }
+        if self.packet_bytes_digest != sha256_hex(delivered_packet_bytes) {
+            return Err(SecurityContractError::SelectionSealPacketBytes);
+        }
+        if self.expansion_handle_ids != delivered_expansion_handle_ids {
+            return Err(SecurityContractError::SelectionSealPacketBytes);
+        }
+        Ok(())
+    }
+
+    /// Validates the seal's own shape before it is compared with any chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error naming the exact failed field.
+    pub fn validate(&self) -> Result<(), SecurityContractError> {
+        text(&self.selection_id, "selection.seal.selection_id")?;
+        text(&self.recipe_revision, "selection.seal.recipe_revision")?;
+        text(&self.chain_head_digest, "selection.seal.chain_head_digest")?;
+        text(
+            &self.packet_bytes_digest,
+            "selection.seal.packet_bytes_digest",
+        )?;
+        validate_digest(&self.chain_head_digest, "selection.seal.chain_head_digest")?;
+        validate_digest(
+            &self.packet_bytes_digest,
+            "selection.seal.packet_bytes_digest",
+        )?;
+        validate_members(&self.final_output_members, "seal.final_output_members")?;
+        unique(self.final_output_refs.iter(), "seal.final_output_refs")?;
+        unique(
+            self.expansion_handle_ids.iter(),
+            "seal.expansion_handle_ids",
+        )?;
+        unique(
+            self.membership_page_refs.iter(),
+            "seal.membership_page_refs",
+        )?;
+        for reference in self
+            .expansion_handle_ids
+            .iter()
+            .chain(self.membership_page_refs.iter())
+        {
+            text(reference, "selection.seal.evidence_ref")?;
+        }
+        // A page reference is only honest when it also names its verified
+        // complete closure: a page cap is never permission to declare the
+        // chain complete over an unbounded denominator.
+        if !self.membership_page_refs.len().is_multiple_of(2) {
+            return Err(SecurityContractError::SelectionSealPageClosureMissing);
+        }
+        Ok(())
+    }
+}
+
+/// Claim ceiling a chain's untrusted influence permits for a dependent packet.
+///
+/// I12.13 `Selection integrity` makes `unknown` an admissible finding that
+/// "lowers the claim ceiling of the resulting packet instead of being resolved
+/// by assumption". The chain's own rolled-up state is authoritative here: a
+/// later clean stage cannot raise it, and `Unknown` never becomes `Absent` or a
+/// zero risk.
+#[must_use]
+pub fn selection_claim_ceiling(receipt: &SelectionIntegrityReceipt) -> SelectionInfluenceState {
+    receipt.chain_untrusted_influence
 }

@@ -486,6 +486,8 @@ mod tests {
             influence_closure: None,
             purge_entry: None,
             selection_integrity: None,
+            selection_chain_head: None,
+            selection_chain_seal: None,
         }
     }
 

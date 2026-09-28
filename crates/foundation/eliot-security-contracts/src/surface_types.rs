@@ -866,6 +866,63 @@ pub struct SelectionStage {
     pub state_fence: StateFence,
 }
 
+/// Rebuildable head of one selection chain, advanced with its stages.
+///
+/// The head is a projection of the immutable stage list, never an independent
+/// authority: `chain_head_digest` is recomputed from the stages it points at
+/// and compared, so a caller-supplied head value proves nothing on its own
+/// (#1728 step 4).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionChainHead {
+    /// Chain identity this head belongs to; it equals the receipt `selection_id`.
+    pub selection_id: String,
+    /// Ordinal of the last immutable stage in the chain.
+    pub chain_head_ordinal: usize,
+    /// Recomputed digest over the ordered stages up to `chain_head_ordinal`.
+    pub chain_head_digest: String,
+    /// Chain revision this head was advanced to by its append.
+    pub chain_revision: u64,
+    /// Stable idempotency identity of the append that produced this head.
+    pub append_idempotency_key: String,
+}
+
+/// Exact seal between one selection chain and one delivered output.
+///
+/// Every field names content that must be compared with the chain that
+/// produced the output, so a valid unrelated chain, a changed packet with the
+/// same member count, or a swapped expansion handle cannot substitute
+/// (#1728 step 6). The seal is written by the producer and re-verified by the
+/// consumer against the receipt it is handed; a seal that was never verified
+/// against this chain proves nothing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionChainSeal {
+    /// Chain identity sealed; it must equal the receipt `selection_id`.
+    pub selection_id: String,
+    /// Chain-head digest this seal was taken against.
+    pub chain_head_digest: String,
+    /// Exact versioned recipe revision that produced the output.
+    pub recipe_revision: String,
+    /// Final membership in the exact delivered order, not a set.
+    pub final_output_refs: Vec<String>,
+    /// Final ordered membership digest recomputed over
+    /// `final_output_members`.
+    pub final_output_digest: String,
+    /// The final ordered membership whose digest is `final_output_digest`.
+    pub final_output_members: Vec<SelectionMember>,
+    /// Lowercase SHA-256 over the exact packet or export bytes delivered.
+    pub packet_bytes_digest: String,
+    /// Exact expansion handles delivered alongside the output.
+    pub expansion_handle_ids: Vec<String>,
+    /// Complete closure over any membership page the chain references.
+    ///
+    /// A chain that delegates a membership list to a retained immutable page
+    /// names that page and its verified complete closure here; a page cap is
+    /// never permission to drop an earlier stage or counterevidence.
+    pub membership_page_refs: Vec<String>,
+}
+
 /// Receipt of candidate-set membership through all selection transformations.
 ///
 /// The receipt records history, not permission. A well-formed record of known or
