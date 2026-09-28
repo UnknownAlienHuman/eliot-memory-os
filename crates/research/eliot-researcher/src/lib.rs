@@ -66,8 +66,9 @@ pub use inquiry_obligations::{
     TaskGraphCompilationInputs,
 };
 pub use source_admissibility::{
-    GovernorSourceTransitionRequest, SourceAdmissibilityReason, SourceAdmissibilityRecord,
-    SourceEligibility, SourceIndependence, SourceLimits, SourceTaint,
+    GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
+    SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility, SourceIndependence,
+    SourceLimits, SourceTaint, admits_record_reference, record_references,
 };
 
 pub struct Researcher<B> {
