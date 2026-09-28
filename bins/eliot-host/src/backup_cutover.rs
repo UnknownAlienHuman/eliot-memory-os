@@ -7,6 +7,14 @@
 //! This module mints no installer/grant/source-DB/restore-engine authority
 //! and adds no mutation to Kernel rehearsal.
 //!
+//! External ingress is the one owner still missing, and it is not this
+//! module's: the admitted command that would reach
+//! `HostComposition::backup_dispatch_cutover` (the Host console protocol, the
+//! Host runtime-control endpoint, the CLI `CommandId`) is owned by #962 (no
+//! transport) and #945 (no public command surface). Nothing here adds a
+//! caller, an adapter or a startup probe for it, and nothing here claims an
+//! operator command can reach this module.
+//!
 //! Actual-owner integration (read from current main, no substitutes):
 //! - Admission: `eliot_protocol::{HostRequestEnvelope,
 //!   HostRequestAdmissionReceipt, HostRequestKind, host_request_operation_id}`
@@ -46,13 +54,15 @@
 //!   admission. The legacy `eliot_types::RestorePlan`
 //!   (`crates/eliot-types/src/safety.rs:166`, stringly plan/check shape) is
 //!   NOT the accepted contract and is not consumed here.
-//! - Pending dependency edge (#974 owns Cargo/root/lock per #959/#960):
-//!   `eliot-backup` is not in `bins/eliot-host/Cargo.toml` (precedent:
-//!   `bins/eliot/Cargo.toml:22` carries its own path edge), so the typed
-//!   `eliot_backup::{BackupClass, RestoreReceipt,
-//!   OperationalValidationEvidence}` imports in this module resolve once
-//!   #974 takes the one-line edge hunk (in the report, never applied here).
-//!   Nothing here is an opaque substitute: class gates run through
+//! - Backup dependency edge (LANDED): `bins/eliot-host/Cargo.toml` carries
+//!   `eliot-backup = { path = "../../crates/storage/eliot-backup",
+//!   version = "0.1.0" }`, so the typed `eliot_backup::{BackupClass,
+//!   RestoreReceipt, OperationalValidationEvidence}` imports below resolve
+//!   against the real owner crate and this module compiles wired. The
+//!   previously recorded "pending dependency edge (#974 owns Cargo/root/lock
+//!   per #959/#960)" is stale and is kept here only as traceability: nothing
+//!   about this module's Cargo edge is outstanding. Nothing here is an opaque
+//!   substitute: class gates run through
 //!   `is_full_recovery`/`is_canonical_only`/`evidence_level`, receipt gates
 //!   through `RestoreReceipt::validate` plus bundle/fence/level bindings,
 //!   validation gates through `OperationalValidationEvidence::validate`
@@ -81,11 +91,13 @@
 //!   private fields plus pub read accessors `fence()`,
 //!   `drain_commit_operation()`, `runtime_lease_census()`,
 //!   `kernel_process_id()`, `kernel_process_start_time_100ns()`; `pub fn`
-//!   on `HostComposition` taking `&mut self`; registered as
-//!   `#[cfg(windows)] mod lease_drain;` +
+//!   on `HostComposition` taking `&mut self`) and since registered by the
+//!   root as `#[cfg(windows)] mod lease_drain;` plus
 //!   `#[cfg(windows)] pub use lease_drain::{GenerationRetirementBarrier,
-//!   GenerationRetirementFence};`). Remaining here: root serialization +
-//!   registration, then this module compiles wired. The fence binds
+//!   GenerationRetirementFence};` (host `lib.rs:50` and `lib.rs:1517`), so
+//!   the "root serialization + registration" step this module used to
+//!   record as remaining here is DONE and this module consumes the real
+//!   types. The fence binds
 //!   `activation_id: PlatformHandle` (`eliot_platform`, as in host `lib.rs`
 //!   line 214), `activation_generation: EpochTransition` (`eliot_host_state`
 //!   re-export of `eliot_contracts`, `epoch_identity.rs:211`), and
@@ -171,6 +183,22 @@
 //!   classify_host_scm_inspection}`, `scm_launch.rs:430,262) driven by the
 //!   committed retirement record. `scm_launch` owns no stop/deregister API on
 //!   current main, so this module claims no SCM effect it cannot call.
+//! - Process contour of the destination generation
+//!   (`HostComposition::cutover_generation_contour`, host `lib.rs`, the
+//!   ordered sequence extracted from `HostComposition::cutover_generation`
+//!   under the same owner): `activate_cutover_contour` below dispatches it
+//!   once this module's own durable cutover intent is `Pending` and before the
+//!   registry CAS, so the cutover moves the live process contour and not only
+//!   the registry generation. It resolves the candidate/prior generations and
+//!   their child artifact digests and approved child paths from the same
+//!   owner-validated registry projection the CAS fences on, and the four
+//!   executables are those approved child paths — the same derivation the
+//!   staged pending activation contour uses
+//!   (`HostComposition::start_approved_manifest_contour`). It stages no
+//!   installer pending activation: this module's failure evidence is its own
+//!   durable cutover-intent record plus its own residual vocabulary, and a
+//!   failure after a possible activation is reported as the bounded
+//!   reconciliation state rather than as a clean `Failed`.
 //!
 //! Normative anchors: A12.3 one governed write path; A13.7 separate cutover
 //! authority, old authority never revives; I5.13 isolated restore, new
@@ -202,10 +230,11 @@ use eliot_protocol::{
 };
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use serde::Deserialize;
+use std::path::Path;
 
-// Stubless consumption of the Parfit-owned (#1751) retirement barrier,
-// landed in Parfit's branch (see module docs); root serializes the
-// definition + registration. This module defines no local duplicate.
+// Consumption of the Parfit-owned (#1751) retirement barrier, landed and
+// registered by the root (see module docs). This module defines no local
+// duplicate.
 use super::{GenerationRetirementBarrier, GenerationRetirementFence, HostComposition, HostError};
 
 /// Maximum bounded evidence references carried on any cutover outcome or
@@ -1001,6 +1030,7 @@ pub enum CutoverError {
 // predicates; the observed replay is recorded at the committed-intent return
 // in `execute_cutover`, never as a second effect),
 // `bind_approved_target`/`read_and_verify_prior_authority`/
+// `activate_cutover_contour`/
 // `commit_with_durable_intent`/`append_cutover_intent`/`bounded_evidence`/
 // `admission_handle`/`receipt_handle`/`owner_approved_build_digests`/
 // `cutover_intent_state_spelling`/`cutover_class_wire`/`cutover_payload`/
@@ -2041,13 +2071,17 @@ fn execute_cutover_inner(
         host,
         validated,
         retirement,
+        &fresh,
         expected_revision,
         activation_id,
     )?;
+    // The observed disposition repeats the owner read verbatim, so an attempt
+    // whose activation outcome the owners could not establish is never logged
+    // as a commit.
     observe_cutover_progress(
         "execute",
-        "committed",
-        "committed",
+        "activation_settled",
+        cutover_disposition_token(committed_outcome.disposition),
         backup_cutover_count(committed_outcome.evidence_refs.len()),
     );
     Ok((committed_outcome, barrier))
@@ -2273,17 +2307,25 @@ fn read_and_verify_prior_authority(
     Ok(live)
 }
 
-/// Persists the cutover intent, runs the activation linearization point, and
-/// persists the terminal disposition — in that order.
+/// Persists the cutover intent, activates the destination generation's live
+/// process contour, runs the activation linearization point, and persists the
+/// terminal disposition — in that order.
 ///
-/// The `Pending` record is durable before the registry CAS, so an activation
-/// can never exist without the intent that authorized it; the `Committed` or
-/// `Failed` record is durable after it, so reconciliation never has to infer
-/// the outcome from local state.
+/// The `Pending` record is durable before the process contour is activated and
+/// before the registry CAS, so no live contour and no active-generation flip
+/// can exist without the intent that authorized them; the `Committed` or
+/// `Failed` record is durable after the CAS, so reconciliation never has to
+/// infer the outcome from local state.
+///
+/// `registry` is the owner-validated approved-generation projection this
+/// attempt was fenced on: the same `expected_revision` below is read from it,
+/// and the process contour resolves its candidate and prior generations from
+/// it too, so the contour and the CAS agree on one owner observation.
 fn commit_with_durable_intent(
     host: &mut HostComposition,
     validated: &ValidatedCutover,
     retirement: &GenerationRetirementFence,
+    registry: &ApprovedGenerationRegistry,
     expected_revision: u64,
     activation_id: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
@@ -2294,6 +2336,13 @@ fn commit_with_durable_intent(
         CutoverIntentState::Pending,
         &validated.request().admission,
     )?;
+    // The durable intent is now the record that authorizes this operation's
+    // effects, so the process contour moves only after it. A crash between
+    // this append and the activation outcome leaves exactly the retained
+    // `Pending` intent the reconciliation state below is read from.
+    if let Some(unestablished) = activate_cutover_contour(host, registry, validated)? {
+        return Ok(unestablished);
+    }
     // The registry owner is re-opened here, after the durable intent, so the
     // handle is held only across the single bounded CAS. The operation binding
     // travels with the CAS so the registry durably records WHICH cutover
@@ -2352,6 +2401,102 @@ fn commit_with_durable_intent(
             intent,
         ]),
     })
+}
+
+/// Activates the destination generation's live process contour under this
+/// module's already-durable `Pending` cutover intent, and bounds a failure
+/// that follows a possible activation.
+///
+/// Returns `None` when the contour activation completed, which is the only
+/// case in which the registry CAS may still run. A refusal from the contour
+/// returns the module's bounded reconciliation state instead: the cutover did
+/// not record a clean `Failed` and did not claim a rollback it did not prove,
+/// because the owner of a lost or interrupted activation outcome is
+/// reconciliation, not this attempt (I14.21, I5.27: a committed canonical
+/// intent never proves that the effect occurred exactly once).
+///
+/// The four executables are the approved child paths of the exact generations
+/// this cutover names — the same derivation the staged pending-activation
+/// contour uses — and the candidate is the one the owner's own
+/// `bind_approved_target` join proved approved against this attempt's own
+/// registry projection, so no path and no generation is presented text. The
+/// contour reads its prior generation from the Host's approved-generation
+/// registry, the same owner the installer cutover always read it from.
+///
+/// The failure evidence is this module's own durable record: the `Pending`
+/// intent appended immediately before this call, re-read from the journal owner
+/// and re-proved as this operation's before it is carried as evidence. No
+/// terminal `Failed` is appended — a durable `Failed` would refuse this
+/// operation identity for good (`classify_retained_cutover`) and contradict the
+/// `Unknown` returned here — and no installer pending activation is synthesized
+/// to feed the installer's recovery carrier.
+fn activate_cutover_contour(
+    host: &mut HostComposition,
+    registry: &ApprovedGenerationRegistry,
+    validated: &ValidatedCutover,
+) -> Result<Option<CutoverOutcome>, CutoverError> {
+    let candidate = bind_approved_target(validated.request(), registry)?;
+    let prior = host.registry.active().ok_or_else(|| {
+        note_cutover_error(
+            "activate_contour",
+            CutoverError::Registry("cutover has no active prior generation".to_owned()),
+        )
+    })?;
+    let (prior_kernel, prior_store, _) = prior.manifest.host_child_paths();
+    let prior_kernel = prior_kernel.clone();
+    let prior_store = prior_store.clone();
+    let (candidate_kernel, candidate_store, _) = candidate.manifest.host_child_paths();
+    let launched = host.cutover_generation_contour(
+        candidate,
+        None,
+        Path::new(candidate_kernel.as_str()),
+        Path::new(candidate_store.as_str()),
+        Path::new(prior_kernel.as_str()),
+        Path::new(prior_store.as_str()),
+    );
+    let error = match launched {
+        Ok(()) => return Ok(None),
+        Err(error) => error,
+    };
+    // The process contour refused after `cutover_with_rollback` was already
+    // attempted, so a candidate activation may have taken effect. What the
+    // owners can establish is re-read, not assumed: the retained intent is
+    // this operation's own record, and its absence or a foreign one means this
+    // attempt can no longer speak for the installation at all.
+    let operation = validated.sealed_operation()?;
+    let retained = host
+        .journal
+        .snapshot()
+        .map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?
+        .pending_cutover
+        .clone()
+        .ok_or_else(|| note_cutover_error("activate_contour", CutoverError::IdentityConflict))?;
+    if !is_own_cutover_intent(
+        &retained,
+        &operation,
+        &validated.request().target_generation,
+        &validated.request().expected_predecessor,
+    ) {
+        return Err(note_cutover_error(
+            "activate_contour",
+            CutoverError::IdentityConflict,
+        ));
+    }
+    let outcome = unresolved_cutover_outcome(validated, &retained)?;
+    observe_cutover_progress(
+        "execute",
+        "activation_unestablished",
+        cutover_disposition_token(outcome.disposition),
+        backup_cutover_count(outcome.evidence_refs.len()),
+    );
+    // The contour's own refusal is observed through the module's existing
+    // observer, which records its typed category and never its owner text; the
+    // disposition returned to the caller is the bounded reconciliation state,
+    // not this refusal.
+    let _observed = note_cutover_error("activate_contour", CutoverError::HostTransition(error));
+    Ok(Some(outcome))
 }
 
 /// Reads the exact cutover disposition for one operation from the real owners.
