@@ -20,18 +20,110 @@ use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_learning_contracts::{CampaignSourceRole, OwnerId};
 use eliot_store_api::{
-    CampaignOwnerProjectionBody, CampaignSourceDocument as StoreCampaignSourceDocument,
-    CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
-    CampaignSourcePublisher, CampaignSourceRecord,
+    CampaignOwnerProjectionBody, CampaignOwnerReadReceipt,
+    CampaignSourceDocument as StoreCampaignSourceDocument, CampaignSourceDocumentSchema,
+    CampaignSourceHead, CampaignSourcePublication, CampaignSourcePublisher, CampaignSourceRecord,
 };
 
-fn build_context_tool_policy_publication(
+/// One current owner row and the exact head returned by its authenticated read.
+/// Callers construct this only from a validated Kernel named read or its
+/// current-reference publication; the owner validator rechecks the receipt
+/// and complete row/head binding before accepting it.
+#[derive(Clone, Copy)]
+pub(crate) struct ContextOwnerSourceRead<'a> {
+    pub(crate) record: &'a CampaignSourceRecord,
+    pub(crate) current_head: &'a CampaignSourceHead,
+    pub(crate) read_receipt: &'a CampaignOwnerReadReceipt,
+}
+
+/// Authenticated current Context rows selected by the task recipe.
+#[derive(Clone, Copy)]
+pub(crate) struct ContextOwnerSourceReads<'a> {
+    pub(crate) recipe: ContextOwnerSourceRead<'a>,
+    pub(crate) tool_policy: Option<ContextOwnerSourceRead<'a>>,
+    pub(crate) delivery: Option<ContextOwnerSourceRead<'a>>,
+}
+
+fn context_required_references(recipe_body: &ContextCampaignRecipeBody) -> Vec<ArtifactId> {
+    recipe_body
+        .compiler_input
+        .atoms
+        .iter()
+        .flat_map(|atom| atom.source_handles.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn build_context_recipe_record(
+    recipe_owner: &ContextSourcePublication,
+    required_references: Vec<ArtifactId>,
+) -> Result<CampaignSourceRecord, ContextPublicationError> {
+    let owner_id =
+        OwnerId::from_artifact(ArtifactId::new(recipe_owner.owner_id().to_owned()).map_err(
+            |_| ContextPublicationError::BindingMismatch {
+                field: "context_recipe.owner_id",
+            },
+        )?);
+    CampaignSourceRecord::new(
+        CampaignSourceRole::ContextRecipe,
+        owner_id,
+        recipe_owner.record_id().clone(),
+        recipe_owner.revision().clone(),
+        recipe_owner.recorded_state_fence().clone(),
+        Vec::new(),
+        Vec::new(),
+        required_references,
+        Vec::new(),
+        Vec::new(),
+        StoreCampaignSourceDocument {
+            schema: CampaignSourceDocumentSchema::ContextRecipe,
+            schema_version: StoreCampaignSourceDocument::SCHEMA_VERSION,
+            body: recipe_owner.body_value()?,
+        },
+    )
+    .map_err(|_| ContextPublicationError::BindingMismatch {
+        field: "context_recipe.publication",
+    })
+}
+
+fn build_context_delivery_record(
+    delivery_owner: &ContextSourcePublication,
+) -> Result<CampaignSourceRecord, ContextPublicationError> {
+    let owner_id = OwnerId::from_artifact(
+        ArtifactId::new(delivery_owner.owner_id().to_owned()).map_err(|_| {
+            ContextPublicationError::BindingMismatch {
+                field: "context_delivery.owner_id",
+            }
+        })?,
+    );
+    CampaignSourceRecord::new(
+        CampaignSourceRole::ContextDelivery,
+        owner_id,
+        delivery_owner.record_id().clone(),
+        delivery_owner.revision().clone(),
+        delivery_owner.recorded_state_fence().clone(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        StoreCampaignSourceDocument {
+            schema: CampaignSourceDocumentSchema::ContextDelivery,
+            schema_version: StoreCampaignSourceDocument::SCHEMA_VERSION,
+            body: delivery_owner.body_value()?,
+        },
+    )
+    .map_err(|_| ContextPublicationError::BindingMismatch {
+        field: "context_delivery.publication",
+    })
+}
+
+fn build_context_tool_policy_record(
     recipe_body: &ContextCampaignRecipeBody,
     recipe_owner: &ContextSourcePublication,
     required_references: Vec<ArtifactId>,
-    expected_head: Option<CampaignSourceHead>,
-    read_state_fence: &StateFence,
-) -> Result<CampaignSourcePublication, ContextPublicationError> {
+) -> Result<CampaignSourceRecord, ContextPublicationError> {
     let owner_id =
         OwnerId::from_artifact(ArtifactId::new(recipe_owner.owner_id().to_owned()).map_err(
             |_| ContextPublicationError::BindingMismatch {
@@ -44,18 +136,16 @@ fn build_context_tool_policy_publication(
         &eliot_contracts::canonical_json_bytes(&projection)
             .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?,
     );
-    let record_id = recipe_owner.record_id_text();
-    let revision = recipe_owner.revision_text();
     let body = CampaignOwnerProjectionBody {
         owner_id: recipe_owner.owner_id().to_owned(),
-        record_id,
-        revision,
+        record_id: recipe_owner.record_id_text(),
+        revision: recipe_owner.revision_text(),
         state_fence: recipe_owner.recorded_state_fence().clone(),
         projection_digest,
         required_references: required_references.clone(),
         projection,
     };
-    let record = CampaignSourceRecord::new(
+    CampaignSourceRecord::new(
         CampaignSourceRole::ContextToolPolicy,
         owner_id,
         recipe_owner.record_id().clone(),
@@ -75,7 +165,28 @@ fn build_context_tool_policy_publication(
     )
     .map_err(|_| ContextPublicationError::BindingMismatch {
         field: "context_tool_policy.publication",
-    })?;
+    })
+}
+
+/// Derive the exact recipe owner row for candidate validation before its
+/// authenticated current row is read.
+pub(crate) fn derive_context_recipe_record(
+    recipe_body: &ContextCampaignRecipeBody,
+) -> Result<CampaignSourceRecord, String> {
+    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
+        .map_err(|error| error.to_string())?;
+    build_context_recipe_record(&recipe_owner, context_required_references(recipe_body))
+        .map_err(|error| error.to_string())
+}
+
+fn build_context_tool_policy_publication(
+    recipe_body: &ContextCampaignRecipeBody,
+    recipe_owner: &ContextSourcePublication,
+    required_references: Vec<ArtifactId>,
+    expected_head: Option<CampaignSourceHead>,
+    read_state_fence: &StateFence,
+) -> Result<CampaignSourcePublication, ContextPublicationError> {
+    let record = build_context_tool_policy_record(recipe_body, recipe_owner, required_references)?;
     let publication = CampaignSourcePublication::from_observed_head(
         CampaignSourcePublisher::ContextToolPolicy,
         record,
@@ -101,49 +212,8 @@ pub fn build_context_owner_publications(
     let recipe_owner =
         context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)?;
     let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
-    let recipe_value = recipe_owner.body_value()?;
-    let delivery_value = delivery_owner.body_value()?;
-    let recipe_owner_id =
-        OwnerId::from_artifact(ArtifactId::new(recipe_owner.owner_id().to_owned()).map_err(
-            |_| ContextPublicationError::BindingMismatch {
-                field: "context_recipe.owner_id",
-            },
-        )?);
-    let delivery_owner_id = OwnerId::from_artifact(
-        ArtifactId::new(delivery_owner.owner_id().to_owned()).map_err(|_| {
-            ContextPublicationError::BindingMismatch {
-                field: "context_delivery.owner_id",
-            }
-        })?,
-    );
-    let required_references = recipe_body
-        .compiler_input
-        .atoms
-        .iter()
-        .flat_map(|atom| atom.source_handles.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let recipe_record = CampaignSourceRecord::new(
-        CampaignSourceRole::ContextRecipe,
-        recipe_owner_id,
-        recipe_owner.record_id().clone(),
-        recipe_owner.revision().clone(),
-        recipe_owner.recorded_state_fence().clone(),
-        Vec::new(),
-        Vec::new(),
-        required_references.clone(),
-        Vec::new(),
-        Vec::new(),
-        StoreCampaignSourceDocument {
-            schema: CampaignSourceDocumentSchema::ContextRecipe,
-            schema_version: StoreCampaignSourceDocument::SCHEMA_VERSION,
-            body: recipe_value,
-        },
-    )
-    .map_err(|_| ContextPublicationError::BindingMismatch {
-        field: "context_recipe.publication",
-    })?;
+    let required_references = context_required_references(recipe_body);
+    let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())?;
     let tool_policy_publication = build_context_tool_policy_publication(
         recipe_body,
         &recipe_owner,
@@ -151,26 +221,7 @@ pub fn build_context_owner_publications(
         expected_tool_policy_head,
         read_state_fence,
     )?;
-    let delivery_record = CampaignSourceRecord::new(
-        CampaignSourceRole::ContextDelivery,
-        delivery_owner_id,
-        delivery_owner.record_id().clone(),
-        delivery_owner.revision().clone(),
-        delivery_owner.recorded_state_fence().clone(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        StoreCampaignSourceDocument {
-            schema: CampaignSourceDocumentSchema::ContextDelivery,
-            schema_version: StoreCampaignSourceDocument::SCHEMA_VERSION,
-            body: delivery_value,
-        },
-    )
-    .map_err(|_| ContextPublicationError::BindingMismatch {
-        field: "context_delivery.publication",
-    })?;
+    let delivery_record = build_context_delivery_record(&delivery_owner)?;
     let recipe_publication = CampaignSourcePublication::from_observed_head(
         CampaignSourcePublisher::ContextRecipe,
         recipe_record,
@@ -199,75 +250,105 @@ pub fn build_context_owner_publications(
 /// Validate the exact Context owner bodies against a campaign source fence
 /// before a packet attempt consumes them.
 ///
-/// This is the owner-side recheck of the named-read joins for the Context
-/// source rows: the typed bodies this attempt decoded from the fresh
-/// authenticated reads are re-derived by the Context owner and re-bound to the
-/// packet State Fence. It is a validator, not a second publisher, and it never
-/// creates a recipe, delivery snapshot, or campaign source row of its own.
+/// Every re-derived row must equal the row returned by its authenticated named
+/// read, and the read's current head must identify that same complete row. A
+/// successor publication is not current evidence and is rejected here.
 pub(crate) fn validate_context_owner_bodies(
     recipe_body: &ContextCampaignRecipeBody,
     prior_delivery: Option<&SessionDeliverySnapshot>,
+    source_reads: &ContextOwnerSourceReads<'_>,
     state_fence: &StateFence,
 ) -> Result<Vec<CampaignSourcePublication>, String> {
     if recipe_body.recipe.binding.state_fence != *state_fence {
         return Err("Context recipe does not share the packet State Fence".to_owned());
     }
-    let Some(prior_delivery) = prior_delivery else {
-        let recipe_owner =
-            context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
+    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
+        .map_err(|error| error.to_string())?;
+    let required_references = context_required_references(recipe_body);
+    let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())
+        .map_err(|error| error.to_string())?;
+    let recipe_publication = bind_current_owner_record(
+        CampaignSourcePublisher::ContextRecipe,
+        recipe_record,
+        source_reads.recipe,
+        state_fence,
+    )?;
+    let mut publications = vec![recipe_publication];
+
+    if let Some(tool_policy_read) = source_reads.tool_policy {
+        let tool_policy_record =
+            build_context_tool_policy_record(recipe_body, &recipe_owner, required_references)
                 .map_err(|error| error.to_string())?;
-        let owner_id = OwnerId::from_artifact(
-            ArtifactId::new(recipe_owner.owner_id().to_owned())
-                .map_err(|_| "Context recipe owner identity is invalid".to_owned())?,
-        );
-        let required_references = recipe_body
-            .compiler_input
-            .atoms
-            .iter()
-            .flat_map(|atom| atom.source_handles.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let record = CampaignSourceRecord::new(
-            CampaignSourceRole::ContextRecipe,
-            owner_id,
-            recipe_owner.record_id().clone(),
-            recipe_owner.revision().clone(),
-            recipe_owner.recorded_state_fence().clone(),
-            Vec::new(),
-            Vec::new(),
-            required_references.clone(),
-            Vec::new(),
-            Vec::new(),
-            StoreCampaignSourceDocument {
-                schema: CampaignSourceDocumentSchema::ContextRecipe,
-                schema_version: StoreCampaignSourceDocument::SCHEMA_VERSION,
-                body: recipe_owner
-                    .body_value()
-                    .map_err(|error| error.to_string())?,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let publication = CampaignSourcePublication::from_observed_head(
-            CampaignSourcePublisher::ContextRecipe,
-            record,
-            None,
+        publications.push(bind_current_owner_record(
+            CampaignSourcePublisher::ContextToolPolicy,
+            tool_policy_record,
+            tool_policy_read,
             state_fence,
-        )
-        .map_err(|error| error.to_string())?;
-        let tool_policy = build_context_tool_policy_publication(
-            recipe_body,
-            &recipe_owner,
-            required_references,
-            None,
-            state_fence,
-        )
-        .map_err(|error| error.to_string())?;
-        return Ok(vec![publication, tool_policy]);
-    };
-    if prior_delivery.state_fence != *state_fence {
-        return Err("Context delivery does not share the packet State Fence".to_owned());
+        )?);
     }
-    build_context_owner_publications(recipe_body, prior_delivery, None, None, None, state_fence)
-        .map_err(|error| error.to_string())
+
+    match (prior_delivery, source_reads.delivery) {
+        (Some(prior_delivery), Some(delivery_read)) => {
+            let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)
+                .map_err(|error| error.to_string())?;
+            let delivery_record = build_context_delivery_record(&delivery_owner)
+                .map_err(|error| error.to_string())?;
+            publications.push(bind_current_owner_record(
+                CampaignSourcePublisher::ContextDelivery,
+                delivery_record,
+                delivery_read,
+                state_fence,
+            )?);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "Context delivery body and authenticated read must be present together".to_owned(),
+            );
+        }
+    }
+    Ok(publications)
+}
+
+fn source_record_matches_head(record: &CampaignSourceRecord, head: &CampaignSourceHead) -> bool {
+    record.role == head.role
+        && record.owner_id == head.owner_id
+        && record.record_id == head.record_id
+        && record.revision == head.revision
+        && record.content_digest == head.content_digest
+        && record.recorded_state_fence == head.recorded_state_fence
+        && record.slot_projection_digests == head.slot_projection_digests
+}
+
+fn bind_current_owner_record(
+    publisher: CampaignSourcePublisher,
+    record: CampaignSourceRecord,
+    read: ContextOwnerSourceRead<'_>,
+    state_fence: &StateFence,
+) -> Result<CampaignSourcePublication, String> {
+    if read.read_receipt.validate().is_err()
+        || read.read_receipt.read_state_fence != *state_fence
+        || !read.read_receipt.binds_record(read.record)
+        || read.current_head.validate().is_err()
+        || !source_record_matches_head(read.record, read.current_head)
+        || record != *read.record
+    {
+        return Err(
+            "Context owner derivation does not match its authenticated current row".to_owned(),
+        );
+    }
+    let publication = CampaignSourcePublication::from_observed_head(
+        publisher,
+        record,
+        Some(read.current_head.clone()),
+        state_fence,
+    )
+    .map_err(|error| error.to_string())?;
+    if !publication.state.is_current_reference()
+        || publication.state.current_head() != Some(read.current_head)
+        || publication.record != *read.record
+    {
+        return Err("Context owner head is not the exact current row".to_owned());
+    }
+    Ok(publication)
 }

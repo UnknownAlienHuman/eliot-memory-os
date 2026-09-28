@@ -8,6 +8,7 @@
 //! record or reconstructs a missing owner publication.
 
 use eliot_context::campaign_publication::ContextCampaignRecipeBody;
+use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     CampaignOwnerSourceInput, GuardedTaskCommand, KernelTransitionPort, PreparedTaskTransition,
@@ -20,9 +21,9 @@ use eliot_protocol::{
     TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerResultBody,
 };
 use eliot_store_api::{
-    CampaignSourceDocumentSchema, CampaignSourcePublication, CampaignSourcePublisher,
-    CampaignSourceReadStatus, CampaignSourceRevisionLookup, CampaignSourceRevisionRead,
-    NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
+    CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
+    CampaignSourcePublisher, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
+    CampaignSourceRevisionRead, NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -85,43 +86,24 @@ fn reject_caller_owner_material(
     Ok(())
 }
 
-fn exactly_one_context_recipe_publication(
-    publications: &[CampaignSourcePublication],
-) -> Result<&CampaignSourcePublication, String> {
-    let mut matching = publications
-        .iter()
-        .filter(|publication| publication.record.role == CampaignSourceRole::ContextRecipe);
-    let publication = matching
-        .next()
-        .ok_or_else(|| "campaign owner reads omitted the Context recipe".to_owned())?;
-    if matching.next().is_some() {
-        return Err("campaign owner reads duplicated the Context recipe".to_owned());
-    }
-    Ok(publication)
-}
-
 fn validate_authenticated_context_recipe(
-    invocation_validated_publications: &[CampaignSourcePublication],
+    candidate: &ContextCampaignRecipeBody,
+    recipe: &LearningStateViewRecipe,
     authenticated_publications: &[CampaignSourcePublication],
     state_fence: &StateFence,
 ) -> Result<(), String> {
-    let invocation_validated =
-        exactly_one_context_recipe_publication(invocation_validated_publications)?;
-    let authenticated = exactly_one_context_recipe_publication(authenticated_publications)?;
-    if invocation_validated.publisher != CampaignSourcePublisher::ContextRecipe
-        || invocation_validated.record.document.schema
-            != CampaignSourceDocumentSchema::ContextRecipe
-        || authenticated.publisher != CampaignSourcePublisher::ContextRecipe
-        || authenticated.record.document.schema != CampaignSourceDocumentSchema::ContextRecipe
-        || !authenticated.state.is_current_reference()
-        || authenticated.read_receipt.read_state_fence != *state_fence
-        || !authenticated
-            .read_receipt
-            .binds_record(&authenticated.record)
-        || authenticated.record != invocation_validated.record
-    {
-        return Err("authenticated Context recipe does not match the invocation".to_owned());
-    }
+    let source_reads = context_owner_source_reads(recipe, authenticated_publications, state_fence)?;
+    let prior_delivery: Option<SessionDeliverySnapshot> = source_reads
+        .delivery
+        .map(|read| serde_json::from_value(read.record.document.body.clone()))
+        .transpose()
+        .map_err(|_| "authenticated Context delivery body is invalid".to_owned())?;
+    crate::campaign_context_owner::validate_context_owner_bodies(
+        candidate,
+        prior_delivery.as_ref(),
+        &source_reads,
+        state_fence,
+    )?;
     Ok(())
 }
 
@@ -131,7 +113,7 @@ fn validate_invocation_context_recipe(
     task_id: &str,
     work_scope_id: &str,
     state_fence: &StateFence,
-) -> Result<Vec<CampaignSourcePublication>, String> {
+) -> Result<ContextCampaignRecipeBody, String> {
     let body: ContextCampaignRecipeBody = serde_json::from_value(json!({
         "recipe": context_campaign_recipe.clone(),
         "compiler_input": context_input.clone(),
@@ -143,7 +125,8 @@ fn validate_invocation_context_recipe(
     {
         return Err("Task Controller Context recipe binding does not match the claim".to_owned());
     }
-    crate::campaign_context_owner::validate_context_owner_bodies(&body, None, state_fence)
+    crate::campaign_context_owner::derive_context_recipe_record(&body)?;
+    Ok(body)
 }
 
 fn source_reference_from_record(
@@ -158,6 +141,139 @@ fn source_reference_from_record(
         slot_projection_digests: source.slot_projection_digests.clone(),
         recorded_state_fence: source.recorded_state_fence.clone(),
     }
+}
+
+fn source_reference_from_head(head: &CampaignSourceHead) -> CampaignSourceRevisionRef {
+    CampaignSourceRevisionRef {
+        role: head.role,
+        owner: head.owner_id.clone(),
+        record_id: head.record_id.clone(),
+        revision: head.revision.clone(),
+        content_digest: head.content_digest.clone(),
+        slot_projection_digests: head.slot_projection_digests.clone(),
+        recorded_state_fence: head.recorded_state_fence.clone(),
+    }
+}
+
+fn context_owner_read_for_role<'a>(
+    recipe: &LearningStateViewRecipe,
+    publications: &'a [CampaignSourcePublication],
+    state_fence: &StateFence,
+    role: CampaignSourceRole,
+    required: bool,
+) -> Result<Option<crate::campaign_context_owner::ContextOwnerSourceRead<'a>>, String> {
+    let requirements = recipe
+        .source_requirements
+        .iter()
+        .filter(|requirement| requirement.role == role)
+        .collect::<Vec<_>>();
+    if requirements.len() > 1 || (required && requirements.len() != 1) {
+        return Err("Context owner requirement is missing or duplicated".to_owned());
+    }
+    let rows = publications
+        .iter()
+        .filter(|publication| publication.record.role == role)
+        .collect::<Vec<_>>();
+    let Some(requirement) = requirements.first() else {
+        if required || !rows.is_empty() {
+            return Err("Context owner row has no recipe requirement".to_owned());
+        }
+        return Ok(None);
+    };
+    match requirement.source_binding {
+        CampaignSourceBinding::ExactReference => {
+            let expected = requirement
+                .expected_reference
+                .as_ref()
+                .ok_or_else(|| "Context owner requirement lacks its exact reference".to_owned())?;
+            if expected.role != role || expected.owner != requirement.owner || rows.len() != 1 {
+                return Err("Context owner read does not match its recipe requirement".to_owned());
+            }
+            let publication = rows[0];
+            let current_head = publication
+                .state
+                .current_head()
+                .ok_or_else(|| "Context owner read omitted its current head".to_owned())?;
+            let (publisher, schema) = match role {
+                CampaignSourceRole::ContextRecipe => (
+                    CampaignSourcePublisher::ContextRecipe,
+                    CampaignSourceDocumentSchema::ContextRecipe,
+                ),
+                CampaignSourceRole::ContextToolPolicy => (
+                    CampaignSourcePublisher::ContextToolPolicy,
+                    CampaignSourceDocumentSchema::ContextToolPolicy,
+                ),
+                CampaignSourceRole::ContextDelivery => (
+                    CampaignSourcePublisher::ContextDelivery,
+                    CampaignSourceDocumentSchema::ContextDelivery,
+                ),
+                _ => return Err("Unsupported Context owner source role".to_owned()),
+            };
+            if publication.publisher != publisher
+                || publication.record.document.schema != schema
+                || !publication.state.is_current_reference()
+                || source_reference_from_record(&publication.record) != *expected
+                || source_reference_from_head(current_head) != *expected
+                || publication.read_receipt.validate().is_err()
+                || !publication.read_receipt.binds_record(&publication.record)
+                || publication.read_receipt.read_state_fence != *state_fence
+            {
+                return Err(
+                    "Context owner read is not the exact authenticated current row".to_owned(),
+                );
+            }
+            Ok(Some(
+                crate::campaign_context_owner::ContextOwnerSourceRead {
+                    record: &publication.record,
+                    current_head,
+                    read_receipt: &publication.read_receipt,
+                },
+            ))
+        }
+        CampaignSourceBinding::ExplicitlyAbsent => {
+            if requirement.expected_reference.is_some() || !rows.is_empty() {
+                return Err("Explicitly absent Context owner has unexpected evidence".to_owned());
+            }
+            Ok(None)
+        }
+        CampaignSourceBinding::AuthenticatedTaskAnchor => {
+            Err("Context owner cannot use a Task Controller anchor".to_owned())
+        }
+    }
+}
+
+fn context_owner_source_reads<'a>(
+    recipe: &LearningStateViewRecipe,
+    publications: &'a [CampaignSourcePublication],
+    state_fence: &StateFence,
+) -> Result<crate::campaign_context_owner::ContextOwnerSourceReads<'a>, String> {
+    let recipe_read = context_owner_read_for_role(
+        recipe,
+        publications,
+        state_fence,
+        CampaignSourceRole::ContextRecipe,
+        true,
+    )?
+    .ok_or_else(|| "campaign owner reads omitted the Context recipe".to_owned())?;
+    let tool_policy = context_owner_read_for_role(
+        recipe,
+        publications,
+        state_fence,
+        CampaignSourceRole::ContextToolPolicy,
+        false,
+    )?;
+    let delivery = context_owner_read_for_role(
+        recipe,
+        publications,
+        state_fence,
+        CampaignSourceRole::ContextDelivery,
+        false,
+    )?;
+    Ok(crate::campaign_context_owner::ContextOwnerSourceReads {
+        recipe: recipe_read,
+        tool_policy,
+        delivery,
+    })
 }
 
 /// Read every non-Task-Controller owner row through the authenticated Kernel
@@ -323,7 +439,7 @@ pub async fn prepare_task_controller_claim(
                     task_controller_rejection(&claimed, "invalid_owner_materials")?,
                 )));
             }
-            let Ok(invocation_validated_context_publications) = validate_invocation_context_recipe(
+            let Ok(candidate_context_recipe) = validate_invocation_context_recipe(
                 &invocation.context_campaign_recipe,
                 &invocation.context_input,
                 invocation.task_id.as_str(),
@@ -346,7 +462,8 @@ pub async fn prepare_task_controller_claim(
                 )));
             };
             if validate_authenticated_context_recipe(
-                &invocation_validated_context_publications,
+                &candidate_context_recipe,
+                &recipe,
                 &publications,
                 &claimed.envelope.state_fence,
             )
