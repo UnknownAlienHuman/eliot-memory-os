@@ -28,8 +28,8 @@ mod transition;
 
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
-    admit_at_trigger, derive_observed_resources, describe_observed_scope, propose_scope,
-    verify_receipt_for_admission,
+    admit_at_trigger, derive_observed_resources, describe_observed_scope, observed_scope_binding,
+    propose_scope, verify_receipt_for_admission,
 };
 pub use governance::{
     AuthorityBasis, GoverningSourceAdmission, GoverningSourceCandidate, NewSourceCandidate,
@@ -487,6 +487,13 @@ pub enum WorkScopeError {
     DuplicateReference { field: &'static str },
     #[error("{field} must not be empty")]
     EmptyCollection { field: &'static str },
+    /// A live observation named more than one workspace instance, so the scope
+    /// cannot be authenticated and no candidate may be selected (I4.2.1
+    /// `AMBIGUOUS`).
+    #[error(
+        "observed scope is ambiguous: {observed_instances} workspace instances observed, none selected"
+    )]
+    AmbiguousObservation { observed_instances: usize },
     #[error("source assurance is invalid")]
     InvalidSourceEvidence,
     #[error("source identity does not match its assurance")]

@@ -885,6 +885,15 @@ pub enum CompositionError {
         missing_observed_binding: bool,
         missing_source_closure: bool,
     },
+    /// A live workspace observation named several instances at a use boundary,
+    /// so the scope stays `AMBIGUOUS` and no candidate is selected (I4.2.1).
+    #[error(
+        "scope guard withheld {trigger:?}: {observed_instances} observed workspace instances, none selected"
+    )]
+    ScopeObservationAmbiguous {
+        trigger: GuardTrigger,
+        observed_instances: usize,
+    },
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
     StartupOrder { expected: String, observed: String },
@@ -5106,6 +5115,188 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// mismatches append to the bounded process-local diagnostic projection
     /// (no silent overwrite, no state or memory transfer); durable quarantine
     /// and restart recovery remain partial (W6).
+    /// Runs the retained `WorkScope` guard at one I4.2.1 use boundary from a
+    /// live resource observation (issue #1746, W3).
+    ///
+    /// This is the guard at every boundary the architecture names — session
+    /// attach/resume, first tool/process event for a task, agent/process
+    /// launch, a root/worktree/cwd/editor-workspace change, and a
+    /// scope-sensitive canonical write or Material effect — not only at the
+    /// canonical-write boundary [`Self::check_canonical_write_work_scope`]
+    /// already covered. The trigger is supplied by the boundary, never guessed.
+    ///
+    /// The comparison input is derived from the observation itself:
+    /// [`eliot_workscope::observed_scope_binding`] builds the observed
+    /// [`ScopeBinding`] from the live instance/lineage/generation the caller
+    /// read plus the *retained* scope reference, so a caller cwd, a normalized
+    /// path string, or a caller-chosen scope label can never stand in for a real
+    /// workspace read. An observation of several instances is refused as
+    /// [`CompositionError::ScopeObservationAmbiguous`] without picking one.
+    ///
+    /// The verdict is preserved in full. On success the fresh `MATCHED`
+    /// [`TriggerReport`] is returned; otherwise the typed
+    /// [`CompositionError::ScopeGuardWithheld`] carries the exact identity leg
+    /// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, `STALE_BINDING`) and the
+    /// receipt disposition (`MATCHED`, `STALE_BINDING`, `DIFFERENT_INSTANCE`,
+    /// `AMBIGUOUS`, `CONFLICTED`), and every non-identity-clear outcome also
+    /// retains the conflicting lineage in the bounded process-local quarantine
+    /// projection. A mismatching observation never moves the retained binding,
+    /// a task, or any scope's memory, and it never re-binds silently: a
+    /// relocation still needs its explicit owner receipt through
+    /// [`Self::admit_scope_relocation`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "use-boundary guard joins the observation, privacy, source closure, and trigger in one fail-closed entry"
+    )]
+    pub fn check_work_scope_at_use_boundary(
+        &mut self,
+        observed: &ObservedScopeResources,
+        observed_privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerReport, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; scope-guarded work is unavailable".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ensure_snapshot_fresh(&snapshot, "use-boundary WorkScope is not fresh")?;
+        let observed_binding = eliot_workscope::observed_scope_binding(
+            &snapshot.binding,
+            observed,
+            observed_privacy_class,
+            governing_source_generation,
+        )
+        .map_err(|error| match error {
+            eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
+                CompositionError::ScopeObservationAmbiguous {
+                    trigger,
+                    observed_instances,
+                }
+            }
+            other => CompositionError::Recovery(other.to_string()),
+        })?;
+        let report = check_at_trigger(
+            &snapshot.binding,
+            &observed_binding,
+            source_closure,
+            trigger,
+        );
+        if !report.is_matched() {
+            if report.identity != IdentityLegOutcome::IdentityClear {
+                self.push_scope_quarantine_record(
+                    &snapshot.binding,
+                    &observed_binding,
+                    &report,
+                    fence.resource_generation.value(),
+                )?;
+            }
+            return Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: snapshot.binding.scope.scope_ref.clone(),
+                observed_scope: observed_binding.scope.scope_ref.clone(),
+                trigger: report.trigger,
+                identity: report.identity,
+                verdict: report.verdict,
+                report: Box::new(report),
+            });
+        }
+        Ok(report)
+    }
+
+    /// Resolves the Governor's *current* task selection for admission,
+    /// including the `TaskContract` acceptance digest and the selection
+    /// source/evidence (issue #1746, W4).
+    ///
+    /// Both halves are owner state and neither comes from a request: the
+    /// activation half is [`Self::read_unique_agent_activation`], which proves
+    /// one unique live work lease, one live owner session, one durable
+    /// `TaskContract` revision, and an installed `MATCHED` `WorkScope`; the
+    /// acceptance digest and the selection source exist only inside the
+    /// owner-compiled [`eliot_workscope::OnboardingReadinessReceipt`] retained
+    /// as the terminal of the cold-start lease, so this entry reads that
+    /// receipt back through the retained [`OnboardingSingleFlight`] registry
+    /// instead of accepting a request-supplied
+    /// `TaskSelectionEvidence`.
+    ///
+    /// The join is the applicability recheck admission needs: the compiled
+    /// receipt must name the same task, the same non-zero `TaskContract`
+    /// revision, and the same `WorkScope` the activation route just proved, and
+    /// must have been compiled at the live fence. A receipt that disagrees on
+    /// any of those is a stale selection, not a second resolver's opinion, and
+    /// the typed `ScopeGuardWithheld` refusal keeps the exact disposition. No
+    /// task and several candidates keep their own typed refusals with bounded
+    /// candidate handles; this entry never prefers the latest, the most
+    /// similar, or any other task, and it never creates one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] while the composition is not
+    /// ready, [`CompositionError::Recovery`] when no terminal receipt is
+    /// retained for the exact lease key, and the activation route's own typed
+    /// refusals (`ActivationTaskSelectionRequired`, `ActivationScopeAmbiguous`,
+    /// `ActivationStaleFence`, `ActivationScopeSelectionRequired`, `NotReady`)
+    /// unchanged.
+    pub fn current_task_selection(
+        &self,
+        now: u64,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Result<
+        (
+            GovernorActivationSnapshot,
+            eliot_workscope::OnboardingReadinessReceipt,
+        ),
+        CompositionError,
+    > {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let activation = self.read_unique_agent_activation(now)?;
+        let (_lease, receipt) = self
+            .cold_start
+            .terminal_for_key(
+                lineage_candidate_ref,
+                workspace_instance_candidate_ref,
+                privacy_class,
+                governing_source_generation,
+            )
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "no terminal cold-start receipt for lease key".to_owned(),
+                )
+            })?;
+        if receipt.state_fence != activation.state_fence
+            || receipt.scope.scope_ref != activation.work_scope_id
+        {
+            return Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: receipt.scope.scope_ref.clone(),
+                observed_scope: activation.work_scope_id.clone(),
+                trigger: GuardTrigger::FirstToolEvent,
+                identity: IdentityLegOutcome::StaleBinding,
+                verdict: GuardVerdict::Withhold,
+                report: Box::new(TriggerReport {
+                    trigger: GuardTrigger::FirstToolEvent,
+                    identity: IdentityLegOutcome::StaleBinding,
+                    receipt: None,
+                    verdict: GuardVerdict::Withhold,
+                }),
+            });
+        }
+        Ok((activation, receipt))
+    }
+
+    /// Admits one scope-sensitive canonical write whose observed binding and
+    /// source closure the caller already holds (issue #1787).
     pub fn check_canonical_write_work_scope(
         &mut self,
         scope_id: &str,

@@ -53,6 +53,14 @@
 //!   (`GovernorComposition::admit_observed_scope_attach`), so this module
 //!   mints no receipt of its own.
 //!
+//! - [`bind_current_task_selection`] — the applicability recheck admission
+//!   needs (issue #1746, W4). It joins the Governor-resolved activation
+//!   snapshot with the owner-compiled readiness receipt so the acceptance
+//!   digest, `TaskContract` revision, and `WorkScope` are only usable while
+//!   they still name what the activation route just proved at the live fence.
+//!   Structural validation of a request-supplied `TaskSelectionEvidence` is
+//!   never sufficient.
+//!
 //! No entry creates a second write path, re-derives a downstream layer's
 //! decision, or accepts a task the caller did not name.
 //!
@@ -278,7 +286,9 @@ pub enum TaskSelectionDisposition {
     /// No current exact selection: absent, exploratory (non-material), or stale.
     Absent,
     /// More than one candidate task handle survived selection; none is chosen.
-    Ambiguous(usize),
+    /// The owner-issued handles are carried verbatim so the caller can answer
+    /// with the bounded eligible set instead of inventing a choice.
+    Ambiguous(Vec<String>),
     /// Exactly one current `TaskContract` revision with an acceptance digest.
     Current(TaskSelectionEvidence),
 }
@@ -496,12 +506,88 @@ pub fn resolve_task_selection(receipt: &OnboardingReadinessReceipt) -> TaskSelec
             contamination_flags: Vec::new(),
         }),
         TaskBindingState::Ambiguous { candidate_handles } => {
-            TaskSelectionDisposition::Ambiguous(candidate_handles.len())
+            TaskSelectionDisposition::Ambiguous(candidate_handles.clone())
         }
         TaskBindingState::None_
         | TaskBindingState::Exploratory { .. }
         | TaskBindingState::Stale { .. } => TaskSelectionDisposition::Absent,
     }
+}
+
+/// Rechecks one Governor-resolved task selection against the current
+/// applicability and fence before any admission (I5.6 step 4, issue #1746 W4).
+///
+/// [`resolve_task_selection`] alone only reads the *shape* of the compiled
+/// receipt's binding. This entry is the applicability leg the issue requires:
+/// the acceptance digest, `TaskContract` revision, and `WorkScope` come from
+/// the owner-compiled receipt, but they are only usable when they still name
+/// exactly what the activation route just proved for this exact fence —
+/// principal, session, task, non-zero revision, and `WorkScope`. A selection
+/// that names another task, a moved revision, or another scope is a stale
+/// selection, not a second resolver's opinion, so it rejects with
+/// `TASK_SCOPE_INCOMPATIBLE` and admits nothing.
+///
+/// Structure preserved, never resolved:
+///
+/// - [`TaskSelectionDisposition::Absent`] stays absent. No task is created to
+///   remove the ambiguity;
+/// - [`TaskSelectionDisposition::Ambiguous`] keeps the owner-issued candidate
+///   handles verbatim (bounded by the owner that produced them) so the caller
+///   can return the typed selection/intake response. None is chosen;
+/// - a receipt compiled for a different `WorkScope` or a different fence is
+///   refused before the binding state is even inspected.
+///
+/// It reads no caller-supplied `TaskSelectionEvidence`: structural validation
+/// of evidence a request carried is never sufficient here.
+pub fn bind_current_task_selection(
+    activation: &eliot_governor::GovernorActivationSnapshot,
+    receipt: &OnboardingReadinessReceipt,
+    live_fence: &StateFence,
+) -> Result<TaskSelectionDisposition, TaskBindingError> {
+    if !eliot_contracts::fences_match_exact(&activation.state_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "activation snapshot is not applicable at the current fence",
+        ));
+    }
+    if receipt.principal_ref != activation.principal_id
+        || receipt.session_ref != activation.session_id
+        || receipt.scope.scope_ref != activation.work_scope_id
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt is bound to another principal, session, or WorkScope",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt was compiled at another fence",
+        ));
+    }
+    let disposition = resolve_task_selection(receipt);
+    let TaskSelectionDisposition::Current(evidence) = &disposition else {
+        // No task and several candidates are honest typed answers here, not
+        // rejections: the caller answers with selection/intake data carrying
+        // the owner's bounded candidate handles.
+        return Ok(disposition);
+    };
+    if evidence.task_ref != activation.task_id.as_str()
+        || evidence.task_revision != activation.task_revision
+        || evidence.work_scope_ref != activation.work_scope_id
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection is no longer the applicable TaskContract revision",
+        ));
+    }
+    if receipt.scope_resolution != eliot_workscope::ScopeResolutionState::Authenticated {
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection rests on a scope that is not authenticated",
+        ));
+    }
+    if receipt.readiness != eliot_workscope::ReadinessLifecycle::ReadyMaterial {
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection rests on a readiness that is not material-ready",
+        ));
+    }
+    Ok(disposition)
 }
 
 /// Computes the `TaskContract` compatibility disposition for one write from
@@ -570,7 +656,7 @@ pub fn admit_canonical_write(
     let compatibility = compatibility_for(receipt, envelope, write_fence);
     let (selection, candidate_count) = match &disposition {
         TaskSelectionDisposition::Absent => (None, 0_usize),
-        TaskSelectionDisposition::Ambiguous(count) => (None, *count),
+        TaskSelectionDisposition::Ambiguous(candidate_handles) => (None, candidate_handles.len()),
         TaskSelectionDisposition::Current(evidence) => (Some(evidence), 1_usize),
     };
     let carries = |operation: NamedMutationOperation| {

@@ -1656,7 +1656,13 @@ impl KernelComposition {
         match &result.disposition {
             AgentActivationResolutionDisposition::Resolved { binding } => self
                 .with_current_activation_owner(pending, result, binding, || {
-                    self.resolved_result_response_frame(connection_id, original, pending, binding)
+                    self.resolved_result_response_frame(
+                        connection_id,
+                        original,
+                        pending,
+                        result,
+                        binding,
+                    )
                 }),
             AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
             | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
@@ -1692,8 +1698,21 @@ impl KernelComposition {
     /// continuity (issue #1746). The revision must be the canonical
     /// decimal `TaskRevision`; anything else fails closed here, before any
     /// retained state is mutated.
+    ///
+    /// The retained record is the A12.2 application binding: the
+    /// activation-owner `principal_id`, the semantic session, the
+    /// Governor-selected task/`WorkScope`/`TaskContract` revision, the authority
+    /// epoch and resource generation the activation fence carried, and the exact
+    /// ticket/result correlation that produced it. The bridge peer identity is
+    /// never consulted: identity is what the activation owner resolved, not what
+    /// the authenticated pipe peer is (I7.8 step 1, A12.2). A blank principal
+    /// cannot identify anyone, and a principal equal to the bridge's own module
+    /// identity would be the transport process posing as the end user, so both
+    /// fail closed before any state is retained.
     fn activated_application_binding(
         binding: &AgentActivationResolvedBinding,
+        pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
     ) -> Result<super::ActivatedApplicationBinding, TransportError> {
         let task_revision = binding
             .task_revision
@@ -1702,11 +1721,31 @@ impl KernelComposition {
             .filter(|revision| revision.to_string() == binding.task_revision)
             .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
             .ok_or(TransportError::SessionFenced)?;
+        let principal_id = binding.principal_id.trim();
+        if principal_id.is_empty()
+            || principal_id.chars().any(char::is_control)
+            || principal_id == eliot_protocol::AGENT_BRIDGE_MODULE_ID
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // The retained record correlates to the exact ticket and typed result
+        // that were accepted, never to a stored projection alone.
+        if pending.ticket.ticket_id != result.ticket_id
+            || result.ticket_sha256 != pending.ticket.ticket_sha256
+            || result.ticket_state_fence != pending.ticket.state_fence
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         Ok(super::ActivatedApplicationBinding {
+            principal_id: principal_id.to_owned(),
             session_id: binding.session_id.clone(),
             task_id: binding.task_id.clone(),
             work_scope_id: binding.work_scope_id.clone(),
             task_revision,
+            authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
+            activation_generation: pending.ticket.state_fence.resource_generation,
+            activation_ticket_id: result.ticket_id.clone(),
+            resolution_result_sha256: result.result_sha256.clone(),
         })
     }
 
@@ -1715,6 +1754,7 @@ impl KernelComposition {
         connection_id: &str,
         original: &Frame,
         pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
         binding: &AgentActivationResolvedBinding,
     ) -> Result<Frame, TransportError> {
         let session_nonce = fresh_activation_nonce_material()
@@ -1801,7 +1841,7 @@ impl KernelComposition {
         // Retain the exact Resolved task/scope binding for later dispatch
         // continuity (issue #1746); fails closed here, before any retained
         // state is mutated.
-        let activated_binding = Self::activated_application_binding(binding)?;
+        let activated_binding = Self::activated_application_binding(binding, pending, result)?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.

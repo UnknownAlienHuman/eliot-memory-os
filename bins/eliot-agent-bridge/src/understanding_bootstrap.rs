@@ -24,6 +24,9 @@
 //! projection stays comparable without duplicating that contract.
 
 use eliot_governor::ColdStartSurfaceView;
+use eliot_integration_coverage::{
+    EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -44,6 +47,8 @@ pub const MAX_CANDIDATE_HANDLES: usize = 16;
 pub const MAX_HANDLES: usize = 32;
 /// Maximum limiting integration evidence handles.
 pub const MAX_EVIDENCE_HANDLES: usize = 8;
+/// Maximum changed handles carried in one bounded boot delta preview.
+pub const MAX_BOOT_DELTA_HANDLES: usize = 16;
 /// Maximum length of one opaque handle or reference.
 pub const MAX_HANDLE_LEN: usize = 256;
 
@@ -109,6 +114,177 @@ pub struct GovernanceEvidence {
     pub profile_ref: String,
     pub profile_revision: String,
     pub limiting_integration_evidence: Vec<String>,
+}
+
+impl GovernanceEvidence {
+    /// Derives the bootstrap's governance evidence from the actual
+    /// `IntegrationCoverageProfile` and the `GovernanceProfile` the Governor
+    /// derived from it (I7.8 step 4, I7.16; issue #1746 W5).
+    ///
+    /// This is the only constructor that produces owner-backed governance
+    /// evidence. It refuses three ways a caller-authored readiness could
+    /// otherwise imply full authority:
+    ///
+    /// - `IntegrationCoverageProfile::validate` requires every one of the ten
+    ///   logical events to be present, so an empty sensor list is rejected by
+    ///   the owner itself and can never be presented as coverage;
+    /// - the derived `GovernanceProfile` must name the *same* active
+    ///   fingerprint, the *same* verification state, and the *same*
+    ///   completeness as the coverage it was derived from, so a verified
+    ///   profile over an unverified candidate coverage (or a `COMPLETE`
+    ///   profile over a `PARTIAL` one) is refused rather than projected;
+    /// - the limiting evidence is derived from the coverage's own gap handles
+    ///   and from every event whose observation is not enforced-and-complete,
+    ///   in coverage order. Unknown, unavailable, and partial evidence is
+    ///   therefore preserved verbatim instead of being summarised away. A
+    ///   coverage that genuinely declares no gap and no limiting event still
+    ///   yields one handle: the owner-issued proof ceiling it was graded
+    ///   against, so the "at least one limiting handle" rule stays
+    ///   satisfiable without inventing content.
+    ///
+    /// `profile_ref` is the exact active fingerprint the derivation was bound
+    /// to and `profile_revision` its canonical decimal revision, so a later
+    /// coverage change moves both and cannot be presented as the same profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `COVERAGE_INVALID` when the owner coverage does not validate,
+    /// `GOVERNANCE_FINGERPRINT_MISMATCH`,
+    /// `GOVERNANCE_COVERAGE_UNVERIFIED`, or
+    /// `GOVERNANCE_COMPLETENESS_MISMATCH` when the derived profile disagrees
+    /// with the coverage it claims to come from, and
+    /// `GOVERNANCE_EVIDENCE_BOUND` when the derived handle list exceeds
+    /// `MAX_EVIDENCE_HANDLES`.
+    pub fn from_owner_profiles(
+        coverage: &IntegrationCoverageProfile,
+        profile: &GovernanceProfile,
+    ) -> Result<Self, BootstrapError> {
+        coverage.validate().map_err(|error| {
+            BootstrapError::new(
+                "COVERAGE_INVALID",
+                format!("integration coverage profile is not valid: {error}"),
+            )
+        })?;
+        if profile.fingerprint != coverage.fingerprint {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_FINGERPRINT_MISMATCH",
+                "derived governance profile names another active coverage fingerprint",
+            ));
+        }
+        if profile.verified != coverage.verified {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COVERAGE_UNVERIFIED",
+                "derived governance profile claims a verification state its coverage does not carry",
+            ));
+        }
+        if profile.completeness != coverage.completeness {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COMPLETENESS_MISMATCH",
+                "derived governance profile claims a completeness its coverage does not carry",
+            ));
+        }
+        let mut handles: Vec<String> = coverage.gaps.clone();
+        for event in &coverage.events {
+            if event.completeness != EventCompleteness::Complete
+                || event.disposition != EventDisposition::Enforced
+            {
+                let mut handle = format!("coverage:{:?}:{:?}", event.event, event.disposition);
+                handle.truncate(MAX_HANDLE_LEN);
+                handles.push(handle);
+            }
+        }
+        if handles.is_empty() {
+            let mut handle = format!("coverage:proof-ceiling:{}", coverage.proof_ceiling);
+            handle.truncate(MAX_HANDLE_LEN);
+            handles.push(handle);
+        }
+        handles.truncate(MAX_EVIDENCE_HANDLES);
+        bounded_list(&handles, "GOVERNANCE_EVIDENCE_BOUND", MAX_EVIDENCE_HANDLES)?;
+        Ok(Self {
+            profile_ref: coverage.fingerprint.clone(),
+            profile_revision: profile.revision.to_string(),
+            limiting_integration_evidence: handles,
+        })
+    }
+}
+
+/// Bounded boot delta carried alongside the readiness surface (I7.8 step 4,
+/// issue #1746 W5).
+///
+/// A boot delta is additive only. It names the readiness receipt revision it is
+/// relative to and the owner-issued handles that changed, plus one expansion
+/// handle for the full delta; it never replaces the required selection,
+/// authority, or recovery information, which [`validate_context`] still demands
+/// in full. Budgeting the preview to a bounded handle list therefore cannot drop
+/// the floor: the expanded delta sits behind the handle while the floor stays
+/// inline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootDelta {
+    /// Readiness receipt revision the last delivered bootstrap carried. `None`
+    /// for the first bootstrap of a session, where there is nothing to delta
+    /// against; it is never defaulted to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_receipt_revision: Option<u64>,
+    /// Receipt revision this delta moves to.
+    pub receipt_revision: u64,
+    /// Bounded owner-issued change handles.
+    #[serde(default)]
+    pub changed_handles: Vec<String>,
+    /// Bounded owner handle that expands the full delta.
+    pub expansion_handle: String,
+}
+
+impl BootDelta {
+    /// Validates the delta's own shape and its relationship to the readiness
+    /// surface it accompanies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BOOT_DELTA_REVISION_MISSING` for a zero revision,
+    /// `BOOT_DELTA_REVISION_STALE` when the delta does not move the receipt
+    /// forward from the revision it names, `BOOT_DELTA_EXPANSION_MISSING` for a
+    /// blank or over-long expansion handle, and `BOOT_DELTA_BOUND` for a
+    /// changed-handle list that is not bounded.
+    pub fn validate(&self, receipt_revision: u64) -> Result<(), BootstrapError> {
+        if self.receipt_revision == 0 {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_MISSING",
+                "boot delta carries a zero readiness receipt revision",
+            ));
+        }
+        if self.receipt_revision != receipt_revision {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_STALE",
+                "boot delta names another readiness receipt revision than the surface it accompanies",
+            ));
+        }
+        if let Some(previous) = self.previous_receipt_revision
+            && previous >= self.receipt_revision
+        {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_STALE",
+                "boot delta does not move the readiness receipt forward",
+            ));
+        }
+        if self.expansion_handle.trim().is_empty() {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_EXPANSION_MISSING",
+                "boot delta must carry a non-blank expansion handle",
+            ));
+        }
+        if self.expansion_handle.len() > MAX_HANDLE_LEN {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_EXPANSION_MISSING",
+                "boot delta expansion handle exceeds bound",
+            ));
+        }
+        bounded_list(
+            &self.changed_handles,
+            "BOOT_DELTA_BOUND",
+            MAX_BOOT_DELTA_HANDLES,
+        )
+    }
 }
 
 /// One task candidate considered for binding.
@@ -247,6 +423,14 @@ pub struct BootstrapContext {
     #[serde(default)]
     pub conflicts_unknowns: Vec<String>,
     pub next_safe_expansion: String,
+    /// Bounded boot delta relative to the previous delivered bootstrap.
+    ///
+    /// Purely additive (I7.8 step 4): it never replaces the readiness, task
+    /// selection, authority, or recovery fields above, so budgeting the preview
+    /// cannot drop them. `None` when the owner produced no delta for this
+    /// surface; it is never defaulted into an empty "nothing changed" claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_delta: Option<BootDelta>,
 }
 
 impl BootstrapContext {
@@ -316,6 +500,7 @@ impl BootstrapContext {
             candidate_count,
             conflicts_unknowns,
             next_safe_expansion,
+            boot_delta: None,
         };
         validate_context(&context)?;
         Ok(context)
@@ -361,6 +546,7 @@ impl BootstrapContext {
         candidate_count: u32,
         conflicts_unknowns: Vec<String>,
         next_safe_expansion: String,
+        boot_delta: Option<BootDelta>,
     ) -> Result<Self, BootstrapError> {
         let onboarding_disposition = match surface.readiness.as_str() {
             "UNSEEN" => ReadinessDisposition::Unseen,
@@ -406,6 +592,14 @@ impl BootstrapContext {
             conflicts_unknowns,
             next_safe_expansion,
         )
+        .and_then(|mut context| {
+            // The boot delta is bound to this exact compiled receipt revision,
+            // so a delta left over from an earlier surface fails closed here
+            // instead of being projected against a readiness it never described.
+            context.boot_delta = boot_delta;
+            validate_context(&context)?;
+            Ok(context)
+        })
     }
 }
 
@@ -482,6 +676,9 @@ pub struct UnderstandingBootstrap {
     pub revision_refs: Vec<String>,
     pub conflicts_unknowns: Vec<String>,
     pub next_safe_expansion: String,
+    /// Bounded boot delta projected from the owner (I7.8 step 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_delta: Option<BootDelta>,
     pub governance: GovernanceEvidence,
 }
 
@@ -612,6 +809,9 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
         "FLOOR_BOUND",
         MAX_EVIDENCE_HANDLES,
     )?;
+    if let Some(delta) = &context.boot_delta {
+        delta.validate(context.receipt_revision)?;
+    }
     validate_governance(&context.governance)
 }
 
@@ -934,6 +1134,7 @@ pub fn get_understanding_bootstrap(
         revision_refs: context.revision_refs.clone(),
         conflicts_unknowns: context.conflicts_unknowns.clone(),
         next_safe_expansion: context.next_safe_expansion.clone(),
+        boot_delta: context.boot_delta.clone(),
         governance: context.governance.clone(),
     })
 }
@@ -1020,6 +1221,7 @@ mod tests {
             candidate_count: 1,
             conflicts_unknowns: vec![],
             next_safe_expansion: "bind task before material effects".to_owned(),
+            boot_delta: None,
         }
     }
 

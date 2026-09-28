@@ -810,9 +810,22 @@ struct AgentBridgeProfile {
 /// values instead of trusting caller claims. Selection currency against live
 /// Governor state stays the Governor's; a claim naming another task or scope
 /// fails as a conflict and must re-activate, it is never silently rebound.
+///
+/// The retained record is the A12.2 application binding in full: the
+/// harness/installation-established `principal_id`, the durable semantic
+/// `session_id`, the Governor-selected `work_scope_id`, and the authority epoch
+/// plus resource generation the activation was issued under. The bridge process
+/// identity is deliberately absent — a transport peer is never the end user
+/// (I7.8 step 1, A12.2). `activation_ticket_id` and
+/// `resolution_result_sha256` are the correlation to the exact Kernel-issued
+/// ticket and typed result that produced it, so a stored `Resolved` projection
+/// is never treated as perpetual authority on its own.
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 struct ActivatedApplicationBinding {
+    /// Application principal the activation owner resolved for this
+    /// connection. Never the bridge module identity or the pipe peer identity.
+    principal_id: String,
     /// Application session resolved by Governor for this activation.
     session_id: String,
     /// Governor-owned task selected at activation time.
@@ -821,6 +834,16 @@ struct ActivatedApplicationBinding {
     work_scope_id: String,
     /// `TaskContract` revision selected at activation time.
     task_revision: eliot_contracts::TaskRevision,
+    /// Authority epoch the activation fence carried when the result was
+    /// accepted; a later request under another epoch is not this binding.
+    authority_epoch: eliot_contracts::EpochId,
+    /// Resource generation the activation fence carried when the result was
+    /// accepted; a later request under another generation is not this binding.
+    activation_generation: ResourceGeneration,
+    /// Exact Kernel-issued activation ticket the accepted result answered.
+    activation_ticket_id: String,
+    /// Digest of the exact typed semantic resolution result that was accepted.
+    resolution_result_sha256: String,
 }
 
 #[cfg(windows)]

@@ -100,7 +100,7 @@ pub use transport_profile::{
     loopback_http_route, validate_credential, validate_host, validate_origin,
 };
 pub use understanding_bootstrap::{
-    AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
+    AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
     BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
     SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
     UnderstandingBootstrap, get_understanding_bootstrap,
@@ -3566,6 +3566,90 @@ impl BridgeRunner {
             binding,
         });
         Ok(())
+    }
+
+    /// Notes one bootstrap assembled from the real owners: the Governor's
+    /// compiled readiness surface, the actual `IntegrationCoverageProfile`, the
+    /// `GovernanceProfile` the Governor derived from it, the bounded boot
+    /// delta, and the task inputs that came with them (issue #1746 W5, I7.8
+    /// step 4).
+    ///
+    /// This is the I7.8 bootstrap assembled end to end from real owners instead
+    /// of from a host-authored readiness string. The readiness half
+    /// (`onboarding_readiness_ref`, `onboarding_disposition`,
+    /// `smallest_missing_question`, `lease_deadline`, `receipt_revision`,
+    /// `workspace_instance_ref`, `projection_source_ref`,
+    /// `projection_generation`) comes from the Governor's
+    /// [`eliot_governor::ColdStartSurfaceView`], the governance half from
+    /// [`GovernanceEvidence::from_owner_profiles`] over the exact coverage and
+    /// derived profile, and the delta is bound to that receipt revision. An
+    /// unknown readiness token, a coverage that does not validate, a derived
+    /// profile that disagrees with its coverage, and a delta that does not move
+    /// this receipt forward all fail closed with their own codes; none of them
+    /// degrades into a caller READY flag.
+    ///
+    /// Everything is then sealed to the live attach binding exactly as
+    /// [`Self::note_owner_snapshot`] seals, so a wrong principal, another
+    /// `WorkScope`, or a stale fence can never project through this path
+    /// either. The context is stored through the same retained snapshot, so the
+    /// once-per-session auto-boot and the bounded explicit retrieval both
+    /// compose from these owner inputs.
+    ///
+    /// # Live status
+    ///
+    /// `caller: STITCH`. The bridge delivery transport that would carry the
+    /// Governor surface and the coverage profile from `eliotd` into this intake
+    /// is owned by the bridge-transport wiring (the same owner that already
+    /// blocks [`Self::note_bootstrap_context`]'s host-authored path from being
+    /// authority). No synthetic caller was added.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_owner_surface(
+        &mut self,
+        surface: &eliot_governor::ColdStartSurfaceView,
+        coverage: &eliot_integration_coverage::IntegrationCoverageProfile,
+        governance_profile: &eliot_integration_coverage::GovernanceProfile,
+        boot_delta: Option<BootDelta>,
+        tasks: BootstrapTaskInputs,
+        principal_ref: String,
+        profile_ref: String,
+        workscope_ref: String,
+        revision_refs: Vec<String>,
+        orientation_handles: Vec<String>,
+        attention_handles: Vec<String>,
+        problem_handles: Vec<String>,
+        role_lease_ref: String,
+        state_fence_ref: String,
+        route_profile_ref: String,
+        decision_safety_floor_refs: Vec<String>,
+        supported_count: u32,
+        verified_count: u32,
+        candidate_count: u32,
+        conflicts_unknowns: Vec<String>,
+        next_safe_expansion: String,
+    ) -> Result<(), BootstrapError> {
+        let governance = GovernanceEvidence::from_owner_profiles(coverage, governance_profile)?;
+        let context = BootstrapContext::from_compiled_surface(
+            surface,
+            principal_ref,
+            profile_ref,
+            workscope_ref,
+            revision_refs,
+            orientation_handles,
+            attention_handles,
+            problem_handles,
+            role_lease_ref,
+            state_fence_ref,
+            governance,
+            route_profile_ref,
+            decision_safety_floor_refs,
+            supported_count,
+            verified_count,
+            candidate_count,
+            conflicts_unknowns,
+            next_safe_expansion,
+            boot_delta,
+        )?;
+        self.note_owner_snapshot(context, tasks)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
