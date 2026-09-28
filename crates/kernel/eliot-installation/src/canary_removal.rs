@@ -31,7 +31,7 @@
 //! can never author a green `Completed`; only a per-row authoritative readback
 //! can.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1246,32 +1246,40 @@ fn require_complete_effect_coverage(
     install: &InstallationTransaction,
     plan: &CanaryRemovalPlan,
 ) -> Result<(), InstallationError> {
-    let roster = install
-        .installer_effects
-        .iter()
-        .map(|effect| effect.effect_id().as_str())
-        .collect::<BTreeSet<_>>();
-    let covered = plan
-        .effects
-        .iter()
-        .filter_map(|row| row.install_effect_index.map(|index| (index, row)))
-        .filter_map(|(index, row)| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| install.installer_effects.get(index))
-                .map(|effect| (row.effect_id.as_str(), effect.effect_id().as_str()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    if covered.len() != plan
-        .effects
-        .iter()
-        .filter(|row| row.install_effect_index.is_some())
-        .count()
-        || !roster
-            .iter()
-            .all(|effect_id| covered.contains_key(effect_id))
-        || covered.iter().any(|(row_id, effect_id)| row_id != effect_id)
-    {
+    // Expected set: the effect identities the installation owner durably
+    // recorded for the installed transaction.
+    let mut expected = BTreeSet::new();
+    for effect in &install.installer_effects {
+        expected.insert(effect.effect_id().as_str());
+    }
+    // Observed set: the identities the frozen graph claims for that roster,
+    // each re-read from the roster position the row itself names. A row that
+    // names no position, an out-of-range position, or a position whose recorded
+    // identity differs from the row's own identity all fail here.
+    let mut observed = BTreeSet::new();
+    for row in &plan.effects {
+        let Some(index) = row.install_effect_index else {
+            continue;
+        };
+        let index = usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
+        let effect = install
+            .installer_effects
+            .get(index)
+            .ok_or(InstallationError::IncompleteObservation(
+            "a removal effect names an installer effect the installed transaction does not have"
+                .to_owned(),
+        ))?;
+        if effect.effect_id() != &row.effect_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if !observed.insert(row.effect_id.as_str()) {
+            return Err(InstallationError::Duplicate {
+                kind: "canary removal installer effect coverage".to_owned(),
+                identity: row.effect_id.as_str().to_owned(),
+            });
+        }
+    }
+    if observed != expected {
         return Err(InstallationError::IncompleteObservation(
             "the frozen removal effect graph does not account for the installed transaction's own effect roster"
                 .to_owned(),
@@ -2073,7 +2081,7 @@ where
     // so a deadline can never author a terminal `Completed` or a clean cleanup.
     if reconcile_budget_exhausted(operation) {
         return Err(InstallationError::IncompleteObservation(format!(
-            "the bounded reconcile wait for removal {} expired with {} effect(s) still unresolved; the incomplete recovery is preserved and no further mutating call is admitted under this operation identity",
+            "the bounded reconcile wait for removal {} expired with {} of {} removal effect(s) still unresolved; the exact blocking effect {} keeps this operation in incomplete recovery and no further mutating call is admitted under this operation identity",
             operation.removal_transaction_id.as_str(),
             operation
                 .effect_progress
@@ -2081,7 +2089,9 @@ where
                 .filter(|progress| {
                     !matches!(progress.state, CanaryRemovalEffectState::Resolved { .. })
                 })
-                .count()
+                .count(),
+            operation.plan.effects.len(),
+            row.effect_id.as_str()
         )));
     }
     // Re-observed against the owner's current durable projection immediately
