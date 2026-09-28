@@ -52,7 +52,7 @@ use eliot_protocol::{
     MAX_MAINTENANCE_TRIGGER_PAGE_GAPS, MAX_MAINTENANCE_TRIGGER_PAGE_MEMBERS, MaintenanceTriggerAck,
     MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGap,
     MaintenanceTriggerIntakeOutcome, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage,
-    MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerRecord, MaintenanceTriggerRoutingClass,
     MaintenanceTriggerTerminalDisposition,
 };
 #[cfg(windows)]
@@ -3759,11 +3759,11 @@ impl KernelComposition {
 
     #[cfg(windows)]
     fn maintenance_trigger_session_recovery_view(
-        claim_recovery: Result<
+        claim_recovery: &Result<
             MaintenanceTriggerSessionRecovery,
             MaintenanceTriggerLifecycleFailure,
         >,
-        pending_page: Result<Option<MaintenanceTriggerPage>, MaintenanceTriggerLifecycleFailure>,
+        pending_page: &Result<Option<MaintenanceTriggerPage>, MaintenanceTriggerLifecycleFailure>,
     ) -> serde_json::Value {
         let revoked_claims = claim_recovery
             .as_ref()
@@ -3801,20 +3801,8 @@ impl KernelComposition {
             .as_ref()
             .ok()
             .and_then(|page| page.as_ref().and_then(|page| page.continuation.as_deref()));
-        let empty_membership_proven = pending_page.as_ref().ok().map(|page| page.is_none());
-        // Each source page is independently bounded by the owner contract.
-        // Preserve both lists and allow their combined compatibility view up
-        // to twice the per-page gap limit rather than losing a second-page gap.
-        let mut gaps = Vec::with_capacity(claim_gaps.len() + pending_gaps.len());
-        for gap in claim_gaps.iter().chain(pending_gaps.iter()) {
-            if gaps
-                .iter()
-                .any(|retained: &MaintenanceTriggerGap| retained.gap_id == gap.gap_id)
-            {
-                continue;
-            }
-            gaps.push(gap.clone());
-        }
+        let empty_membership_proven = pending_page.as_ref().ok().map(Option::is_none);
+        let gaps = Self::maintenance_trigger_session_recovery_gaps(claim_gaps, pending_gaps);
         let reconciliation_complete = claim_recovery_complete
             && pending_members.is_some()
             && pending_has_more == Some(false)
@@ -3825,7 +3813,7 @@ impl KernelComposition {
             "value": {
                 "kind": "maintenance_trigger_session_recovery",
                 "revoked_claims": revoked_claims,
-                "pages_scanned": if claim_recovery.is_ok() { 1_u64 } else { 0_u64 },
+                "pages_scanned": u8::from(claim_recovery.is_ok()),
                 "claim_recovery_complete": claim_recovery_complete,
                 "claim_has_more": claim_has_more,
                 "claim_continuation": claim_continuation,
@@ -3855,10 +3843,42 @@ impl KernelComposition {
 
         let claim_failure = claim_recovery.as_ref().err();
         let pending_failure = pending_page.as_ref().err();
-        if claim_failure.is_none() && pending_failure.is_none() {
-            return view;
-        }
+        Self::maintenance_trigger_session_recovery_failure_view(
+            view,
+            claim_failure,
+            pending_failure,
+            revoked_claims,
+        )
+    }
 
+    #[cfg(windows)]
+    fn maintenance_trigger_session_recovery_gaps(
+        claim_gaps: &[MaintenanceTriggerGap],
+        pending_gaps: &[MaintenanceTriggerGap],
+    ) -> Vec<MaintenanceTriggerGap> {
+        // Each source page is independently bounded by the owner contract.
+        // Preserve both lists and allow their combined compatibility view up
+        // to twice the per-page gap limit rather than losing a second-page gap.
+        let mut gaps = Vec::with_capacity(claim_gaps.len() + pending_gaps.len());
+        for gap in claim_gaps.iter().chain(pending_gaps.iter()) {
+            if gaps
+                .iter()
+                .any(|retained: &MaintenanceTriggerGap| retained.gap_id == gap.gap_id)
+            {
+                continue;
+            }
+            gaps.push(gap.clone());
+        }
+        gaps
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_session_recovery_failure_view(
+        view: serde_json::Value,
+        claim_failure: Option<&MaintenanceTriggerLifecycleFailure>,
+        pending_failure: Option<&MaintenanceTriggerLifecycleFailure>,
+        revoked_claims: u64,
+    ) -> serde_json::Value {
         let Some(primary_failure) = claim_failure.or(pending_failure) else {
             return view;
         };
@@ -3976,13 +3996,10 @@ impl KernelComposition {
                 "MAINTENANCE_TRIGGER_PAGE_LIMIT_EXCEEDED",
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+            ));
         };
         let page = match gateway.maintenance_trigger_page(
             &session.module_generation.state_fence,
@@ -4078,13 +4095,10 @@ impl KernelComposition {
                 },
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+            ));
         };
         let retained = match gateway.claim_maintenance_trigger(
             &session.module_generation.state_fence,
@@ -4135,13 +4149,10 @@ impl KernelComposition {
                 },
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+            ));
         };
         let retained = match gateway
             .record_maintenance_trigger_decision(
@@ -4187,13 +4198,10 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+            ));
         };
         let receipt = match gateway
             .load_maintenance_trigger_decision_receipt(
@@ -4260,13 +4268,10 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
+            ));
         };
         let retained = match gateway
             .acknowledge_maintenance_trigger(
@@ -4316,13 +4321,10 @@ impl KernelComposition {
                 },
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
+            ));
         };
         let retained = match gateway
             .terminalize_maintenance_trigger(&session.module_generation.state_fence, &terminal)
@@ -4372,13 +4374,10 @@ impl KernelComposition {
                 },
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
+            ));
         };
         let retained = match gateway.record_maintenance_trigger_gap(
             &session.module_generation.state_fence,
@@ -4423,13 +4422,10 @@ impl KernelComposition {
                 "MAINTENANCE_TRIGGER_PAGE_LIMIT_EXCEEDED",
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
+            ));
         };
         let gaps = match gateway.list_maintenance_trigger_gaps(
             &session.module_generation.state_fence,
@@ -4482,13 +4478,10 @@ impl KernelComposition {
                 },
             ));
         }
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
+            ));
         };
         let record = match gateway.record_maintenance_trigger_retention(
             &session.module_generation.state_fence,
@@ -4523,13 +4516,10 @@ impl KernelComposition {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerCompactOperation =
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
-                    MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
+            ));
         };
         let record = match gateway.compact_maintenance_trigger_payload(
             &session.module_generation.state_fence,
@@ -4570,7 +4560,7 @@ impl KernelComposition {
         if let Err(error) = record.validate() {
             return Ok(Self::maintenance_trigger_intake_failure_response(
                 &retry_identity,
-                MaintenanceTriggerIntakeFailure::Protocol {
+                &MaintenanceTriggerIntakeFailure::Protocol {
                     error,
                     commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
                 },
@@ -4581,18 +4571,15 @@ impl KernelComposition {
         {
             return Ok(Self::maintenance_trigger_intake_failure_response(
                 &retry_identity,
-                MaintenanceTriggerIntakeFailure::ProtectedRoutingUnsupported,
+                &MaintenanceTriggerIntakeFailure::ProtectedRoutingUnsupported,
             ));
         }
 
-        let gateway = match self.retained_store_gateway() {
-            Ok(gateway) => gateway,
-            Err(_) => {
-                return Ok(Self::maintenance_trigger_intake_failure_response(
-                    &retry_identity,
-                    MaintenanceTriggerIntakeFailure::OrsUnavailable,
-                ));
-            }
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_intake_failure_response(
+                &retry_identity,
+                &MaintenanceTriggerIntakeFailure::OrsUnavailable,
+            ));
         };
         let projection = match gateway
             .stage_maintenance_trigger_intake(&session.module_generation.state_fence, &record)
@@ -4601,7 +4588,7 @@ impl KernelComposition {
             Err(failure) => {
                 return Ok(Self::maintenance_trigger_intake_failure_response(
                     &retry_identity,
-                    failure,
+                    &failure,
                 ));
             }
         };
@@ -4621,7 +4608,7 @@ impl KernelComposition {
         if let Err(error) = receipt.validate_for(&record) {
             return Ok(Self::maintenance_trigger_intake_failure_response(
                 &retry_identity,
-                MaintenanceTriggerIntakeFailure::Protocol {
+                &MaintenanceTriggerIntakeFailure::Protocol {
                     error,
                     commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
                 },
@@ -4644,7 +4631,7 @@ impl KernelComposition {
     #[cfg(windows)]
     fn maintenance_trigger_intake_failure_response(
         retry_identity: &str,
-        failure: MaintenanceTriggerIntakeFailure,
+        failure: &MaintenanceTriggerIntakeFailure,
     ) -> serde_json::Value {
         let commit_outcome = failure.commit_outcome();
         let status = match commit_outcome {
@@ -4659,7 +4646,7 @@ impl KernelComposition {
                 "kind": MAINTENANCE_TRIGGER_INTAKE_FAILURE_KIND,
                 "accepted": false,
                 "retry_identity": retry_identity,
-                "failure_code": Self::maintenance_trigger_intake_failure_code(&failure),
+                "failure_code": Self::maintenance_trigger_intake_failure_code(failure),
                 "commit_outcome": Self::maintenance_trigger_commit_outcome_code(commit_outcome),
             },
             "recovery": null,
@@ -7799,8 +7786,8 @@ impl KernelComposition {
                             Err(failure) => Err(failure),
                         };
                         Self::maintenance_trigger_session_recovery_view(
-                            claim_recovery,
-                            pending_page,
+                            &claim_recovery,
+                            &pending_page,
                         )
                     }
                     _ => Self::maintenance_trigger_input_failure_response(

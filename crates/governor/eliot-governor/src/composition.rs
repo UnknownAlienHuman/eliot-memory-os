@@ -4478,7 +4478,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<MaintenanceTriggerRecoveryProjection, CompositionError> {
         self.kernel
             .maintenance_trigger_recovery_page(
-                &self.snapshot.state_fence,
+                &self.snapshot.state_fence(),
                 &self.snapshot.protected_snapshot_digest,
                 claim_continuation,
                 pending_continuation,
