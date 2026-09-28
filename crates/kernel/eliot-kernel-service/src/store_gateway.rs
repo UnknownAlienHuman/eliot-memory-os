@@ -864,9 +864,24 @@ fn maintenance_trigger_receipt_contains_intents(
         .applied_command_ids
         .iter()
         .map(String::as_str)
-        .chain(receipt.emitted_event_ids.iter().map(String::as_str))
-        .chain(receipt.projection_refs.iter().map(String::as_str))
-        .chain(receipt.outbox_refs.iter().map(String::as_str))
+        .chain(
+            receipt
+                .emitted_event_ids
+                .iter()
+                .map(eliot_store_api::EventId::as_str),
+        )
+        .chain(
+            receipt
+                .projection_refs
+                .iter()
+                .map(eliot_store_api::ProjectionPublicationId::as_str),
+        )
+        .chain(
+            receipt
+                .outbox_refs
+                .iter()
+                .map(eliot_store_api::OutboxId::as_str),
+        )
         .collect::<std::collections::BTreeSet<_>>();
     [
         &decision.job_ref,
@@ -3324,45 +3339,59 @@ impl KernelStoreGateway {
             return Ok(replayed_acknowledgement);
         }
 
+        self.validate_maintenance_trigger_acknowledgement_decision(
+            active_state_fence,
+            &trigger,
+            &lifecycle,
+            &claim,
+            acknowledgement,
+        )
+        .await?;
+        Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable)
+    }
+
+    #[cfg(windows)]
+    async fn validate_maintenance_trigger_acknowledgement_decision(
+        &self,
+        active_state_fence: &StateFence,
+        trigger: &MaintenanceTriggerRecord,
+        lifecycle: &MaintenanceTriggerLifecycleRecord,
+        claim: &MaintenanceTriggerClaim,
+        acknowledgement: &MaintenanceTriggerAck,
+    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
         acknowledgement
             .validate_for_claim(
-                &claim,
-                &trigger,
+                claim,
+                trigger,
                 active_state_fence,
                 maintenance_trigger_now_ms()?,
             )
             .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
-        let Some(decision_record) = lifecycle.decision_record.as_ref() else {
+        let decision = &acknowledgement.decision_receipt;
+        let expected_record = maintenance_trigger_decision_record(decision)?;
+        if let Some(decision_record) = lifecycle.decision_record.as_ref() {
+            if decision_record != &expected_record
+                || lifecycle.phase != MaintenanceTriggerLifecyclePhase::DecisionRecorded
+            {
+                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+            }
+        } else {
             let intent = lifecycle
                 .downstream_intent_record
                 .as_ref()
                 .ok_or(MaintenanceTriggerLifecycleFailure::DecisionReceiptUnavailable)?;
-            if intent != &maintenance_trigger_decision_record(&acknowledgement.decision_receipt)? {
+            if intent != &expected_record {
                 return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
             }
-            self.read_maintenance_trigger_canonical_receipt(
-                active_state_fence,
-                &trigger,
-                &lifecycle,
-                &acknowledgement.decision_receipt,
-            )
-            .await?;
-            return Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable);
-        };
-        if decision_record
-            != &maintenance_trigger_decision_record(&acknowledgement.decision_receipt)?
-            || lifecycle.phase != MaintenanceTriggerLifecyclePhase::DecisionRecorded
-        {
-            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
         }
         self.read_maintenance_trigger_canonical_receipt(
             active_state_fence,
-            &trigger,
-            &lifecycle,
-            &acknowledgement.decision_receipt,
+            trigger,
+            lifecycle,
+            decision,
         )
         .await?;
-        Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable)
+        Ok(())
     }
 
     #[cfg(windows)]

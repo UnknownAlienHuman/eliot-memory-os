@@ -657,6 +657,20 @@ pub struct KernelServiceRecovery {
     pub observation: ServiceObservation,
 }
 
+/// Progress markers for the bounded maintenance-trigger recovery scans.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceTriggerRecoveryProgress {
+    /// Whether more active claims remain in the revocation scan.
+    #[serde(default)]
+    pub claim_has_more: bool,
+    /// Whether the claim-revocation scan reached a known closed boundary.
+    #[serde(default)]
+    pub claim_recovery_complete: bool,
+    /// Whether both bounded scans completed without unresolved gaps.
+    #[serde(default)]
+    pub reconciliation_complete: bool,
+}
+
 /// Bounded owner-issued summaries returned by the Kernel recovery route.
 /// Members and gap summaries remain opaque JSON because eliotd does not own
 /// their lifecycle meaning. The exact envelope is retained so fields added by
@@ -675,18 +689,12 @@ pub struct MaintenanceTriggerRecoveryPage {
     /// Opaque cursor for the next pending-member page.
     #[serde(default)]
     pub continuation: Option<String>,
-    /// Whether more active claims remain in the revocation scan.
-    #[serde(default)]
-    pub claim_has_more: bool,
     /// Opaque cursor for the next active-claim revocation page.
     #[serde(default)]
     pub claim_continuation: Option<String>,
-    /// Whether the claim-revocation scan reached a known closed boundary.
-    #[serde(default)]
-    pub claim_recovery_complete: bool,
-    /// Whether both bounded scans completed without unresolved gaps.
-    #[serde(default)]
-    pub reconciliation_complete: bool,
+    /// Progress of the bounded claim and pending scans.
+    #[serde(flatten)]
+    pub progress: MaintenanceTriggerRecoveryProgress,
     /// Explicit proof that the pending membership is empty; absent when unknown.
     #[serde(default)]
     pub empty_membership_proven: Option<bool>,
@@ -752,7 +760,7 @@ impl MaintenanceTriggerRecoveryProjection {
             && self
                 .value
                 .as_ref()
-                .is_some_and(|value| value.reconciliation_complete)
+                .is_some_and(|value| value.progress.reconciliation_complete)
     }
 
     /// Retains request failure as unavailable operational evidence, not as an
