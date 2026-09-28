@@ -1130,10 +1130,10 @@ impl GenerationPackagePlanner {
     /// binaries are refused here, before any effect is derived. Planning stays
     /// read-only: nothing is created, reserved or mutated.
     ///
-    /// The returned binding is the versioned layout the runtime consumers and
-    /// restart recovery rehydrate and revalidate; persisting it onto the
-    /// transaction wire and threading it through the out-of-crate launch
-    /// owners is stitching work owned by those consumers.
+    /// The returned binding is the versioned layout the registry store
+    /// persists with the transaction and restart recovery rehydrates and
+    /// revalidates; threading it through the out-of-crate runtime consumers
+    /// and launch owners is stitching work owned by those consumers.
     ///
     /// # Errors
     ///
@@ -1158,12 +1158,14 @@ impl GenerationPackagePlanner {
         governed.admits_write_target(input.staging_root.as_str())?;
         let roots = Self::planner_runtime_roots(&input)?;
         let binding = governed.into_installation_roots(roots)?;
-        let transaction = Self::plan_with_source_publication_binding(
+        let mut transaction = Self::plan_with_source_publication_binding(
             input,
             source_identity,
             files,
             evidence_digest,
         )?;
+        transaction.profile_governed_roots = Some(binding.clone());
+        transaction.validate()?;
         Ok((transaction, binding))
     }
 
