@@ -4091,7 +4091,7 @@ impl AgentBridgeCore {
         };
         let mut import_result = result.clone();
         if !result.is_pure_recovery_read() {
-            if let Some((candidate, _)) = &prepared {
+            if let Some((Some(candidate), _)) = &prepared {
                 import_result = import_result.with_recovery_candidate_stream_facts(
                     candidate.owner_candidate_stream_facts()?,
                 );
@@ -4212,8 +4212,11 @@ impl AgentBridgeCore {
         };
         let mut import_result = result.clone();
         if !result.is_pure_recovery_read() {
-            import_result = import_result
-                .with_recovery_candidate_stream_facts(prepared.0.owner_candidate_stream_facts()?);
+            if let Some(candidate) = prepared.0.as_ref() {
+                import_result = import_result.with_recovery_candidate_stream_facts(
+                    candidate.owner_candidate_stream_facts()?,
+                );
+            }
         }
         // Joint commit (issue #2799): the transport half swaps first; the
         // core half below publishes through infallible field moves, so a

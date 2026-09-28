@@ -5427,16 +5427,13 @@ impl KernelComposition {
             Vec::with_capacity(batch_namespaces.len());
         let mut handoff_failure = false;
         for (namespace, stream_id, sequence, revision, incarnation) in &batch_namespaces {
-            let marked = match self
+            let Ok(marked) = self
                 .generation_gateway
                 .ors
                 .reconcile_bridge_event_handoffs_checked(namespace, *sequence, &reconcile_key)
-            {
-                Ok(marked) => marked,
-                Err(_) => {
-                    handoff_failure = true;
-                    break;
-                }
+            else {
+                handoff_failure = true;
+                break;
             };
             handoffs_reconciled += marked
                 .get("reconciled")
@@ -5450,13 +5447,12 @@ impl KernelComposition {
                 "expected_incarnation": incarnation,
                 "reconcile_key": reconcile_key,
             });
-            match mutation_receipt("bridge-event-handoff", &handoff_request, &marked) {
-                Ok(receipt) => handoff_receipts.push(receipt),
-                Err(_) => {
-                    handoff_failure = true;
-                    break;
-                }
-            }
+            let Ok(receipt) = mutation_receipt("bridge-event-handoff", &handoff_request, &marked)
+            else {
+                handoff_failure = true;
+                break;
+            };
+            handoff_receipts.push(receipt);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
         if handoff_failure {
@@ -5479,28 +5475,25 @@ impl KernelComposition {
         // bounded repair/retirement slices after their cursor stops moving.
         // Resolve each stream again after acknowledgement so maintenance
         // uses its current owner namespace, revision, and incarnation.
-        let handoff_maintenance = match self.maintain_bridge_event_handoffs_for_owner(
+        let Ok(handoff_maintenance) = self.maintain_bridge_event_handoffs_for_owner(
             &presenter,
             &reconciliation,
             &batch_namespaces,
-        ) {
-            Ok(maintenance) => maintenance,
-            Err(_) => {
-                // Retirement/repair is a separate ORS mutation family. If
-                // it fails after the ack and handoffs above, retain every
-                // completed receipt and expose maintenance as unknown so a
-                // later reconcile can safely converge it.
-                reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
-                return Ok(serde_json::json!({ "status": "known", "value": {
-                    "accepted": true,
-                    "reconciliation_status": "known",
-                    "handoff_reconciliation_status": "known",
-                    "handoff_maintenance_status": "unknown",
-                    "acknowledgement": acknowledgement,
-                    "handoff_receipts": handoff_receipts,
-                    "reconciliation": reconciliation,
-                } }));
-            }
+        ) else {
+            // Retirement/repair is a separate ORS mutation family. If
+            // it fails after the ack and handoffs above, retain every
+            // completed receipt and expose maintenance as unknown so a
+            // later reconcile can safely converge it.
+            reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
+            return Ok(serde_json::json!({ "status": "known", "value": {
+                "accepted": true,
+                "reconciliation_status": "known",
+                "handoff_reconciliation_status": "known",
+                "handoff_maintenance_status": "unknown",
+                "acknowledgement": acknowledgement,
+                "handoff_receipts": handoff_receipts,
+                "reconciliation": reconciliation,
+            } }));
         };
         reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {

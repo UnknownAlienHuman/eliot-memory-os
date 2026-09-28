@@ -10092,6 +10092,10 @@ impl RedbRecoveryStore {
     /// rows are counted from the gap table, rather than inferred from any
     /// returned page. Overflow of either bounded set fails closed instead of
     /// yielding a denominator that is a guess.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owner authentication and bounded gap accounting share one snapshot"
+    )]
     fn bridge_recovery_window_denominators_in(
         write: &redb::WriteTransaction,
         scope: &str,
