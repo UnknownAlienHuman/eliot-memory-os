@@ -63,9 +63,10 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
-    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
-    OperationIdentity, OrsError, RedbRecoveryStore,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
+    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
+    HostRequestRetainedSourceRevision, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
+    RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -2624,6 +2625,12 @@ impl KernelComposition {
             &body.result_digest,
         );
         let submitted_ok = self.audit_observe(submitted_draft).is_some();
+        // Issue #1853 W2: the executor-observed evidence travels INTO the
+        // authoritative completion, in the same owner transaction as the result
+        // it observes. Before this, `body.evidence` reached no ORS row, so a
+        // replayer reconciling an expired lease had no durable operation/effect
+        // evidence to reconcile against and could only re-execute.
+        let retained = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -2632,6 +2639,8 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained.effect_evidence.as_ref(),
+                retained.result_lineage.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3525,6 +3534,9 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Issue #1853 W2: the executor-observed evidence is persisted with the
+        // completion, in the same owner transaction.
+        let retained = retained_result_provenance(body)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -3533,6 +3545,8 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                retained.effect_evidence.as_ref(),
+                retained.result_lineage.as_ref(),
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -3862,6 +3876,85 @@ fn host_request_identity_binding_records(
     ])
 }
 
+/// The ORS-owned durable retention fields one submitted result body
+/// contributes at the Kernel authority boundary (issue #1853 W2).
+///
+/// Both halves are the claims and references the executing leg observed about
+/// the completion, carried in ONE value so the mapping from wire body to
+/// durable state has exactly one owner and cannot drift between the executor
+/// half and the lineage half.
+struct RetainedResultProvenance {
+    /// Executor-observed operation/effect evidence, when the leg observed any.
+    effect_evidence: Option<HostRequestEffectEvidence>,
+    /// Result-side lineage claims and references, when the leg submitted any.
+    result_lineage: Option<HostRequestRetainedLineage>,
+}
+
+/// Projects one submitted result body into the ORS-owned durable evidence and
+/// lineage fields (issue #1853 W2).
+///
+/// This is the only place the wire evidence and lineage are mapped into durable
+/// state, so the authority boundary has exactly one owner for the mapping and
+/// the completion legs cannot each invent their own shape. ORS re-checks both
+/// projections against the row it writes; this function only carries the
+/// observed values across the crate boundary, and it invents nothing — an
+/// absent wire slot stays `None`, and a leg that observed nothing persists
+/// neither field.
+fn retained_result_provenance(
+    body: &HostRequestResultBody,
+) -> Result<RetainedResultProvenance, TransportError> {
+    let effect_evidence = body
+        .evidence
+        .as_ref()
+        .map(|evidence| {
+            OpaqueLabel::new(evidence.operation_id.clone()).map(|operation_id| {
+                HostRequestEffectEvidence {
+                    operation_id,
+                    input_handle: evidence.input_handle.clone(),
+                    output_handle: evidence.output_handle.clone(),
+                    side_effects: evidence.side_effects.clone(),
+                    actual_route: evidence.actual_route.clone(),
+                    invoked_operation: evidence.invoked_operation.clone(),
+                    adapter_identity: evidence.adapter_identity.clone(),
+                    executor_identity: evidence.executor_identity.clone(),
+                }
+            })
+        })
+        .transpose()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let result_lineage = body
+        .lineage
+        .as_ref()
+        .map(|lineage| HostRequestRetainedLineage {
+            output_artifact_ref: lineage.output_artifact_ref.clone(),
+            output_digest: lineage.output_digest.clone(),
+            producer_ref: lineage.producer_ref.clone(),
+            source_revisions: lineage.source_revisions.as_ref().map(|revisions| {
+                revisions
+                    .iter()
+                    .map(|revision| HostRequestRetainedSourceRevision {
+                        key: revision.key.clone(),
+                        revision: revision.revision,
+                        state_fence: revision.state_fence.clone(),
+                    })
+                    .collect()
+            }),
+            source_state_fence: lineage.source_state_fence.clone(),
+            input_refs: lineage.input_refs.clone(),
+            transformation_lineage: lineage.transformation_lineage.clone(),
+            closure_refs: lineage.closure_refs.clone(),
+            policy_fence: lineage.policy_fence.clone(),
+            origin_evidence_refs: lineage.origin_evidence_refs.clone(),
+            proof_ceiling: lineage.proof_ceiling,
+            influence_state: lineage.influence_state,
+            instruction_taint: lineage.instruction_taint,
+        });
+    Ok(RetainedResultProvenance {
+        effect_evidence,
+        result_lineage,
+    })
+}
+
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
@@ -3905,6 +3998,8 @@ pub(crate) fn requested_host_request_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }
@@ -5412,6 +5507,8 @@ fn watchdog_intent_projection_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }

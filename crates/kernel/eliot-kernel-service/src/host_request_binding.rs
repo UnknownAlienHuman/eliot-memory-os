@@ -530,7 +530,10 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
     /// payload and revision the read owner returned for this envelope without
     /// any re-dispatch. The revision travels inside the bounded content (the
     /// read owner embeds `revision_heads` there); the binder preserves it
-    /// opaquely and never interprets it. Runs after `check_response_binding`
+    /// opaquely and never interprets it. This leg dispatches in-process and
+    /// therefore observes no executor evidence, so it retains no evidence
+    /// reference: that absence means this leg observed nothing, never that the
+    /// execution was clean. Runs after `check_response_binding`
     /// and the plan-gap check, so only admitted Candidate/Projection answers
     /// are persisted, in the required order: validate → linkage → admit →
     /// dispatch → response binding → persist.
@@ -546,7 +549,17 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             })?;
         let operation_id = ors_operation_id(envelope)?;
         self.store
-            .persist_host_request_result(&operation_id, &envelope.envelope_sha256, &digest, &body)
+            .persist_host_request_result(
+                &operation_id,
+                &envelope.envelope_sha256,
+                &digest,
+                &body,
+                // Issue #1853 W2: this leg dispatches in-process and submits
+                // no executor evidence and no result lineage, so it retains
+                // neither. Absence means nothing was observed or claimed here.
+                None,
+                None,
+            )
             .map_err(|error| ors_failure(&error))?
             .ok_or(PortFailure::TransportBindingRejected {
                 reason: "admitted operation disappeared before result persistence".to_owned(),
@@ -988,6 +1001,8 @@ fn requested_host_request_record(
         attempt: None,
         result_digest: None,
         result_response: None,
+        result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }
@@ -1623,6 +1638,8 @@ mod local_read_result_tests {
             attempt: None,
             result_digest: None,
             result_response: None,
+            result_evidence: None,
+            result_lineage: None,
             commit_order: 0,
         };
         assert!(

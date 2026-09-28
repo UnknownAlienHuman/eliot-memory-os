@@ -700,6 +700,13 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                // Issue #1853 W2: a task-controller result body carries neither an
+                // executor-observed evidence slot nor a result-lineage slot, so
+                // this leg retains neither. The absence means this leg
+                // observed and claimed nothing, never a clean execution and
+                // never clean provenance.
+                None,
+                None,
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
@@ -780,6 +787,13 @@ impl KernelComposition {
                 &body.request_sha256,
                 &body.result_digest,
                 &body.response,
+                // Issue #1853 W2: a finish result body carries neither an
+                // executor-observed evidence slot nor a result-lineage slot, so
+                // this leg retains neither. The absence means this leg
+                // observed and claimed nothing, never a clean execution and
+                // never clean provenance.
+                None,
+                None,
             )
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
