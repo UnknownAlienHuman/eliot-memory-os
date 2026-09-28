@@ -91,7 +91,8 @@ pub use controlboard_projection::{
 
 mod controlboard_consumer;
 pub use controlboard_consumer::{
-    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardConsumerError, ControlBoardExpectedSet,
+    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardConsumerError,
+    ControlBoardEvidenceHandle, ControlBoardExpectedSet, ControlBoardGeneration,
     ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
     ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
     RenderedControlBoard, RenderedControlBoardRow, read_controlboard_status,

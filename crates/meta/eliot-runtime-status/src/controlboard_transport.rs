@@ -305,7 +305,8 @@ mod tests {
     use eliot_protocol::{FrameKind, MessageType, ProtocolError};
 
     use super::super::controlboard_consumer::{
-        CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardInstallation, ControlBoardObservationTime,
+        CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardEvidenceHandle,
+        ControlBoardGeneration, ControlBoardInstallation, ControlBoardObservationTime,
         ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
         RenderedControlBoard, RenderedControlBoardRow,
     };
@@ -331,6 +332,13 @@ mod tests {
             entry_id: entry_id.to_owned(),
             disposition,
             summary: summary.map(str::to_owned),
+            capability: Some(ControlBoardCapability::new("controlboard.read").expect("capability")),
+            generation: Some(
+                ControlBoardGeneration::new("generation-transport-test").expect("generation"),
+            ),
+            evidence_handle: Some(
+                ControlBoardEvidenceHandle::new("evidence-transport-test").expect("evidence"),
+            ),
             installation: ControlBoardInstallation::new("installation-transport-test")
                 .expect("installation"),
             observed_at: ControlBoardObservationTime::new(1_786_000_000_002).expect("observed_at"),
