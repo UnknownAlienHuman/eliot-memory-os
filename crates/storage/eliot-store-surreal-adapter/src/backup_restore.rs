@@ -3422,7 +3422,8 @@ impl SurrealStoreAdapter {
         // binding is checked here: the batch's declared source must not be the
         // admitted process that performs the write, or the import would land in
         // the source's or the active store's canonical tables.
-        if batch.source.store_id == active_store || batch.source.installation_id == active_installation
+        if batch.source.store_id == active_store
+            || batch.source.installation_id == active_installation
         {
             return Err(StoreError::InvalidField {
                 field: "restore.source_store_id",
