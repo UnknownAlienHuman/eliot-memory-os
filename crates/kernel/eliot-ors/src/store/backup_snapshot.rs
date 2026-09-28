@@ -280,7 +280,7 @@ use crate::backup_snapshot::{
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
-    VersionedArtifactEntry,
+    StreamRecoveryReconciliation, StreamRecoveryReconciliationState, VersionedArtifactEntry,
 };
 
 impl super::RedbRecoveryStore {
@@ -305,6 +305,35 @@ impl super::RedbRecoveryStore {
     ///   [`stream_recovery_entry`] the export uses, and its `payload_digest` is
     ///   the digest of the row re-encoded through the same ORS codec. Any
     ///   disagreement refuses the whole driver with zero writes.
+    /// - every row is then pre-flighted against the destination's CURRENT
+    ///   durable row for the same `(operation, stream)` key, still before the
+    ///   first write, through [`restore_row_refusal`], which MIRRORS the
+    ///   refusals the family's write body applies to a restored row — the write
+    ///   body is the owner of every one of them. The mirrored set is: differing
+    ///   evidence axes; an activation the destination may not become; an
+    ///   archived `Retired` row landing on a destination row that is not already
+    ///   `Retired` (a restore must not terminate a live row); a restore
+    ///   rewriting the retained reconciliation of an already `Retired`
+    ///   destination row; and the write-once `Reconciled` handoff rule, in ALL
+    ///   THREE of its clauses and in BOTH branches of the check — a destination
+    ///   that is not `Reconciled` may not be moved into it, one that is may not
+    ///   be moved out of it, and one that is already `Reconciled` may not have
+    ///   its owner or its `handoff_sha256` changed. Any of these refuses the
+    ///   whole driver with zero writes, so a page is never left half-restored
+    ///   by a refusal the driver could have seen in advance. The pre-pass is
+    ///   strictly stronger than the write body for the terminal-over-live case:
+    ///   it refuses that page even when the archived row is byte-identical to
+    ///   the destination row apart from the activation. The pre-pass has no
+    ///   case for an EMPTY `(operation, stream)` key, because the write body
+    ///   has none either: the disclosed residual is that an archived
+    ///   `Reconciled` row lands on a fresh key carrying its digest.
+    ///
+    /// The pre-pass reads destination state in one read transaction that is
+    /// dropped before the first write, so the zero-write property is exact for
+    /// a destination that does not move during the driver's pre-pass. A
+    /// destination that does move is still stopped row by row by the write body
+    /// itself, fail closed; the only difference is that such a move can abort
+    /// the page after an earlier row was already written.
     ///
     /// The same source/destination and page bindings
     /// [`import_page_quarantined`](super::RedbRecoveryStore::import_backup_page_quarantined)
@@ -325,42 +354,205 @@ impl super::RedbRecoveryStore {
             return Err(OrsError::InvalidExpiry);
         }
         let mut bound = Vec::with_capacity(rows.len());
-        for projection in rows {
-            let record_id = projection.record_key()?;
-            let entry = page
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.family == RowFamilyKind::ProcessStreamRecovery
-                        && entry.record_id == record_id
-                })
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: format!(
-                        "restored row {record_id:?} is not an entry of the presented backup page"
-                    ),
-                })?;
-            let (order, effect_class) = stream_recovery_entry(projection)?;
-            if entry.order != order || entry.effect_class != effect_class {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: format!(
-                        "restored row {record_id:?} does not match the exported entry's order and \
-                         effect class"
-                    ),
-                });
+        {
+            // One read transaction for the whole pre-pass, dropped before the
+            // first write so no reader overlaps the write loop below.
+            let read = self.database.begin_read().map_err(storage)?;
+            let destination_rows = read
+                .open_table(super::PROCESS_STREAM_RECOVERY)
+                .map_err(storage)?;
+            for projection in rows {
+                let record_id = projection.record_key()?;
+                let entry = page
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.family == RowFamilyKind::ProcessStreamRecovery
+                            && entry.record_id == record_id
+                    })
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} is not an entry of the presented backup page"
+                        ),
+                    })?;
+                let (order, effect_class) = stream_recovery_entry(projection)?;
+                if entry.order != order || entry.effect_class != effect_class {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} does not match the exported entry's order \
+                             and effect class"
+                        ),
+                    });
+                }
+                let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
+                if entry.payload_digest != digest {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+                // The pre-flight, in the same pass and still before any write:
+                // a refusal the write body would raise on this row is raised
+                // here, once for the whole page, instead of after an earlier row
+                // of the same page was already written.
+                let destination = destination_rows
+                    .get(record_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                    .transpose()?;
+                if let Some(destination) = destination
+                    && let Some(refusal) =
+                        restore_row_refusal(&record_id, projection, &destination)?
+                {
+                    return Err(refusal);
+                }
+                bound.push(projection);
             }
-            let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
-            if entry.payload_digest != digest {
-                return Err(OrsError::PayloadIntegrityMismatch);
-            }
-            bound.push(projection);
         }
         let mut outcomes = Vec::with_capacity(bound.len());
         for projection in bound {
             outcomes.push(self.import_process_stream_recovery_suspended(projection)?);
         }
         Ok(outcomes)
+    }
+}
+
+/// Whether one archived row must be refused against the destination's current
+/// durable row for the same `(operation, stream)` key.
+///
+/// THE WRITE BODY IS THE OWNER OF EVERY RULE MIRRORED HERE. This pre-pass
+/// duplicates them on purpose, so that the driver's documented "any
+/// disagreement refuses the whole driver with zero writes" property holds and
+/// the pre-pass can never say `Ok(None)` where the write body will refuse; the
+/// duplication is accepted rather than factored into a cross-module helper
+/// because a shared helper would put the rule outside the write body it
+/// describes. If a rule changes in `RedbRecoveryStore`'s write body, it changes
+/// here in the same item.
+///
+/// The activation an archived row imports as is restated here exactly as
+/// [`RedbRecoveryStore::import_process_stream_recovery_suspended`] maps it,
+/// which is the single owner of that rule: an already `Retired` row stays
+/// `Retired` and every other row becomes `Suspended`.
+///
+/// `Ok(None)` means the write body accepts the pair. Each refusal below is one
+/// the write body raises too, except the terminal-over-live case, where this
+/// pre-flight is deliberately stricter: a restore proves no terminal
+/// disposition, so it may re-preserve a terminal row into an empty key or over
+/// an already terminal row, and never turns a live destination row terminal.
+/// That single stricter case is disclosed at its own write path rather than
+/// closed here, because closing it would break "an archived `Retired` row stays
+/// `Retired`" (merged W7).
+///
+/// The caller invokes this only for a key the destination already holds; for
+/// an EMPTY `(operation, stream)` key it is not called, and neither is the write
+/// body able to compare any of its rules against anything, so an archived
+/// `Reconciled` row lands on a fresh key with its digest. That is the one
+/// remaining author of a `Reconciled` handoff and it is disclosed, not closed,
+/// at [`RedbRecoveryStore::import_process_stream_recovery_suspended`].
+fn restore_row_refusal(
+    record_id: &str,
+    archived: &ProcessStreamRecoveryProjection,
+    destination: &ProcessStreamRecoveryProjection,
+) -> Result<Option<OrsError>, OrsError> {
+    let refusal = |reason: String| OrsError::IntegrityProblem {
+        record_type: "process_stream_recovery",
+        reason: format!(
+            "restored row {record_id:?} conflicts with the destination's durable row: {reason}"
+        ),
+    };
+    if destination.evidence_axes_sha256()? != archived.evidence_axes_sha256()? {
+        return Ok(Some(refusal(
+            "the durable evidence axes are immutable and differ".to_owned(),
+        )));
+    }
+    let imported = if archived.activation == StreamRecoveryActivation::Retired {
+        StreamRecoveryActivation::Retired
+    } else {
+        StreamRecoveryActivation::Suspended
+    };
+    let terminal_restore = imported == StreamRecoveryActivation::Retired;
+    // The write-once `Reconciled` handoff rule, mirrored into BOTH branches
+    // below, because the write body applies it above its whole `match`.
+    let handoff_rewrite =
+        reconciled_handoff_rewrite(&destination.reconciliation, &archived.reconciliation);
+    if destination.activation == imported {
+        // Observation-advance arm of the write body, which cannot move
+        // activation. The write body's blanket "a non-admitted writer may not
+        // change a durable row's reconciliation" rule does NOT apply here,
+        // because a restore is admitted; what still applies is the write-once
+        // handoff rule mirrored above, and the retained-history rule, which is
+        // the comparison below. Mirroring both is what keeps this pre-pass
+        // faithful to the write body it stands in front of, so the documented
+        // "any disagreement refuses the whole driver with zero writes" property
+        // holds for these conflicts instead of aborting the page after an
+        // earlier row was written.
+        if let Some(reason) = handoff_rewrite {
+            return Ok(Some(refusal(reason.to_owned())));
+        }
+        if terminal_restore && destination.reconciliation != archived.reconciliation {
+            return Ok(Some(refusal(
+                "a restore must not rewrite the retained reconciliation of an already retired \
+                 destination row"
+                    .to_owned(),
+            )));
+        }
+        return Ok(None);
+    }
+    if let Some(reason) = handoff_rewrite {
+        return Ok(Some(refusal(reason.to_owned())));
+    }
+    if terminal_restore || !destination.activation.permits_transition_to(imported) {
+        return Ok(Some(refusal(format!(
+            "the destination row is {:?} and the restored row imports as {:?}, which that durable \
+             row may not become",
+            destination.activation, imported
+        ))));
+    }
+    Ok(None)
+}
+
+/// The refusal reason for a write that rewrites a `Reconciled` handoff on a
+/// durable row, or `None` for a write that does not.
+///
+/// This MIRRORS `RedbRecoveryStore`'s write-body rule and is not its owner: the
+/// write body applies that rule above its whole `match`, for every writer, and
+/// this pre-pass must agree with it in both the same-activation branch and the
+/// transition branch or the driver's zero-write property would not hold. Three
+/// clauses, exactly as the write body states them: a reconciliation that is not
+/// `Reconciled` is never moved into it, a `Reconciled` one is never moved out
+/// of it, and a row already `Reconciled` keeps its `owner` and its
+/// `handoff_sha256` byte for byte.
+///
+/// A `destination` that is not `Reconciled` may still change owner and move
+/// between the other three states — that is the ordinary cross-installation
+/// restore, which legitimately presents a different `owner` and carries no
+/// proof.
+fn reconciled_handoff_rewrite(
+    destination: &StreamRecoveryReconciliation,
+    archived: &StreamRecoveryReconciliation,
+) -> Option<&'static str> {
+    let reconciled = StreamRecoveryReconciliationState::Reconciled;
+    match (
+        destination.state == reconciled,
+        archived.state == reconciled,
+    ) {
+        (false, true) => Some(
+            "a durable reconciliation is never moved into Reconciled by a restore, so an archived \
+             reconciled handoff cannot be placed on a row that does not already carry one",
+        ),
+        (true, false) => Some(
+            "a durable Reconciled handoff is write-once, so a restore may never move it out of \
+             Reconciled",
+        ),
+        (true, true)
+            if archived.owner != destination.owner
+                || archived.handoff_sha256 != destination.handoff_sha256 =>
+        {
+            Some(
+                "a durable Reconciled handoff is write-once and immutable, so a restore may not \
+                 re-point its owner or its handoff digest",
+            )
+        }
+        _ => None,
     }
 }
 

@@ -86,10 +86,10 @@ use crate::{
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
     ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    StateFenceSnapshot, StreamRecoveryActivation, StreamRecoveryReconciliationState,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
@@ -17781,13 +17781,355 @@ impl RedbRecoveryStore {
     /// continuation holding the family frozen detect the movement. An exact
     /// re-presentation that wrote nothing leaves the revision alone, so a
     /// replayed observation never looks like movement.
+    ///
+    /// This path never CREATES terminality. A move into `Retired` from any
+    /// other activation is refused here with a typed error, and so is a
+    /// `Retired` projection presented for an empty `(operation, stream)` key:
+    /// no path creates terminality out of nothing, because a terminal
+    /// disposition and a proven evidence handoff/readback are facts about the
+    /// owning operation contract that this projection cannot carry. The only
+    /// two writers that may place a terminal row are the retirement that
+    /// proves it ([`Self::retire_process_stream_recovery`]) and the restore
+    /// that re-preserves already-proven terminal evidence
+    /// ([`Self::import_process_stream_recovery_suspended`]); each carries its
+    /// own reason, and the family's write body names both. An already `Retired`
+    /// row that a restore re-presents over an already `Retired` row is not a
+    /// move and is still accepted unchanged, so terminal evidence survives
+    /// backup/restore.
+    ///
+    /// This path never RECORDS a handoff either, and that is the property the
+    /// retirement gate leans on. It passes the placement token as `false`, so
+    /// the write body refuses ANY change to a durable row's `reconciliation`
+    /// here — in the merge arm and in the transition arm alike, in either
+    /// direction and onto any owner, state or digest — and refuses an empty-key
+    /// insert that carries a handoff digest. An observation therefore advances
+    /// `availability`, and only `availability`. The digest that
+    /// [`Self::retire_process_stream_recovery`] later compares cannot be
+    /// authored here; the one remaining author is a restore into an EMPTY
+    /// `(operation, stream)` key, which is disclosed at
+    /// [`Self::import_process_stream_recovery_suspended`].
     pub fn put_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
     ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        self.write_process_stream_recovery(projection, false)
+    }
+
+    /// The one refusal a writer without the placement token gets, shared by both
+    /// placement sites and naming both admitted writers truthfully instead of
+    /// calling either of them the only one.
+    const TERMINAL_PLACEMENT_REFUSED: &str = "no path creates terminality out of nothing: a terminal recovery projection is placed \
+         only by retire_process_stream_recovery, which proves terminal disposition against the \
+         durable row, or by a restore that re-preserves already-proven terminal evidence";
+
+    /// The one refusal a reconciliation rewrite by a writer without the
+    /// placement token gets, shared by the durable-row check and the empty-key
+    /// check. It keys on the WRITER, so it says nothing about an admitted one;
+    /// [`Self::HANDOFF_WRITE_ONCE_REFUSED`] is the other half and keys on the
+    /// VALUE.
+    const HANDOFF_AUTHORSHIP_REFUSED: &str = "a durable recovery reconciliation is rewritten only by the \
+         owning operation contract's own write: a writer that is not admitted for terminal placement may \
+         not change a durable row's reconciliation at all — not into Reconciled, not out of it, and not \
+         onto a different one — and may not insert a row that carries a handoff digest";
+
+    /// The one refusal a WRITE-ONCE `Reconciled` handoff rewrite gets. It is a
+    /// separate message from [`Self::HANDOFF_AUTHORSHIP_REFUSED`] on purpose:
+    /// that one says no writer outside the operation contract's own write may
+    /// record a handoff, and this one says that once a DURABLE row carries
+    /// one, nothing may move it, re-point it or erase it — not the owning
+    /// operation contract, and not the admitted restore either.
+    const HANDOFF_WRITE_ONCE_REFUSED: &str = "a durable reconciled handoff is write-once and immutable: a \
+         recovery reconciliation is never moved into Reconciled by a later write, never moved out of it, \
+         and a row that is already Reconciled keeps its owner and its handoff digest byte for byte";
+
+    /// THE RULE, stated once and applied ABOVE the whole match: a writer that
+    /// is not admitted for terminal placement may not change a durable row's
+    /// `reconciliation` AT ALL.
+    ///
+    /// It is deliberately not written inside any one arm of
+    /// [`Self::write_process_stream_recovery`]. The transition arm can change
+    /// a row's reconciliation just as the merge arm can, and it is reached by
+    /// any `Active -> Suspended` observation, so a rule that lived in the merge
+    /// arm alone would leave the same caller able to author a handoff digest
+    /// one call earlier and then present it back as proof. This helper sits
+    /// above the `match`, so every arm — merge, transition, exact-replay and
+    /// empty-key — is covered by construction, and an arm added later cannot
+    /// bypass it.
+    ///
+    /// `existing` is the durable row this write transaction just read, or
+    /// `None` for an empty `(operation, stream)` key. With a durable row the
+    /// rule is a comparison against it, so it refuses moving into `Reconciled`,
+    /// moving out of `Reconciled`, and substituting a different owner, state
+    /// or digest alike. With no durable row there is nothing to compare, so the
+    /// refusal is stated on the value that matters instead: a non-admitted
+    /// writer may not ESTABLISH a handoff digest on a brand-new row.
+    /// `StreamRecoveryReconciliation::validate` makes `handoff_sha256`
+    /// non-`None` if and only if the state is `Reconciled`, so that one
+    /// comparison covers both spellings of the handoff.
+    ///
+    /// `evidence_axes_sha256` cannot see any of this: it excludes
+    /// `reconciliation` by design, which is exactly why the rule is here. What
+    /// the two admitted writers do instead is in
+    /// [`Self::write_process_stream_recovery`]: retirement writes the row it
+    /// read back, so the reconciliation is byte-identical and no rule fires,
+    /// and the restore is re-presenting an archived row and is held by the
+    /// SECOND rule below, [`Self::refuse_handoff_rewrite`], which speaks to
+    /// every writer.
+    fn refuse_unadmitted_handoff(
+        unadmitted: bool,
+        projection: &ProcessStreamRecoveryProjection,
+        existing: Option<&ProcessStreamRecoveryProjection>,
+    ) -> Result<(), OrsError> {
+        let authors = match existing {
+            Some(existing) => projection.reconciliation != existing.reconciliation,
+            None => projection.reconciliation.handoff_sha256.is_some(),
+        };
+        if unadmitted && authors {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_reconciliation",
+                reason: Self::HANDOFF_AUTHORSHIP_REFUSED,
+            });
+        }
+        Ok(())
+    }
+
+    /// THE SECOND RULE, also above the whole `match`, and applying to EVERY
+    /// writer: a `Reconciled` handoff on a DURABLE row is write-once.
+    ///
+    /// [`Self::refuse_unadmitted_handoff`] keys on the WRITER, so it is silent
+    /// about a writer that IS admitted — and the admitted restore is not
+    /// hypothetical. It reaches the TRANSITION arm, which writes
+    /// `encode(projection)` verbatim, so a rule that lived in the merge arm
+    /// alone left a reachable counterexample: take a live destination row, hand
+    /// the same observation an archive page that carries a different
+    /// `reconciliation.owner` in state `Reconciled` with any well-formed
+    /// digest, and the axes compare equal (they exclude `reconciliation` by
+    /// design), the activation moves `Active -> Suspended` which
+    /// [`StreamRecoveryActivation::permits_transition_to`] allows, and the
+    /// archived `Reconciled` row is written over the live one. That durable
+    /// row then passes the handoff half of
+    /// [`Self::retire_process_stream_recovery`], so the terminal record's
+    /// "proven evidence handoff" was authored by a backup page.
+    ///
+    /// The protected thing is therefore the HANDOFF, not the owner. A
+    /// cross-installation restore legitimately carries a different
+    /// `reconciliation.owner` (`mod:source` against `mod:local`) and is still
+    /// allowed to present it, so a byte-identical-reconciliation rule would
+    /// have refused every ordinary W7 restore. Three clauses instead:
+    /// - a reconciliation that is not `Reconciled` is never moved INTO it;
+    /// - a `Reconciled` one is never moved OUT of it;
+    /// - a row already `Reconciled` keeps its `owner` and its `handoff_sha256`
+    ///   byte for byte.
+    ///
+    /// A `Unreconciled`, `Reconciling` or `Blocked` row may still change owner
+    /// and move between those three states: none of them carries a handoff, and
+    /// the retirement gate reads only `Reconciled` plus its digest.
+    ///
+    /// `existing` is the durable row this write transaction just read, or `None`
+    /// for an empty `(operation, stream)` key. With no durable row there is
+    /// nothing to compare and this rule cannot fire, so the ONE remaining
+    /// author of a `Reconciled` handoff is a restore into an empty key. That is
+    /// a disclosed pre-existing residual, at
+    /// [`Self::import_process_stream_recovery_suspended`].
+    fn refuse_handoff_rewrite(
+        projection: &ProcessStreamRecoveryProjection,
+        existing: Option<&ProcessStreamRecoveryProjection>,
+    ) -> Result<(), OrsError> {
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let reconciled = StreamRecoveryReconciliationState::Reconciled;
+        let rewrites = match (
+            existing.reconciliation.state == reconciled,
+            projection.reconciliation.state == reconciled,
+        ) {
+            // Clause one (not `Reconciled` -> `Reconciled`) and clause two
+            // (`Reconciled` -> anything else) are the same refusal: the handoff
+            // is never moved across that state boundary in either direction.
+            (false, true) | (true, false) => true,
+            // Clause three: an already `Reconciled` row keeps its owner and its
+            // digest. Its handoff digest is `Some` by
+            // `StreamRecoveryReconciliation::validate`, so comparing the
+            // option compares the digest.
+            (true, true) => {
+                projection.reconciliation.owner != existing.reconciliation.owner
+                    || projection.reconciliation.handoff_sha256
+                        != existing.reconciliation.handoff_sha256
+            }
+            // Neither side is `Reconciled`, so no handoff exists on either side
+            // to rewrite. This is the ordinary cross-installation restore.
+            (false, false) => false,
+        };
+        if rewrites {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_reconciliation",
+                reason: Self::HANDOFF_WRITE_ONCE_REFUSED,
+            });
+        }
+        Ok(())
+    }
+
+    /// The activation half of the write body's TRANSITION arm, as one named rule
+    /// set, so that arm is a payload write and nothing else. Extracted as a
+    /// real helper because these three refusals are the arm's whole content.
+    ///
+    /// In the order the arm applies them:
+    /// 1. a writer that is not admitted for terminal placement may not move a
+    ///    live row to `Retired` — the same
+    ///    [`Self::TERMINAL_PLACEMENT_REFUSED`] the empty-key arm raises;
+    /// 2. the transition itself must be one
+    ///    [`StreamRecoveryActivation::permits_transition_to`] allows, so a
+    ///    restore can never revive `Suspended` or re-terminalise `Retired`;
+    /// 3. the row that becomes terminal must be the row that was proved, as
+    ///    THIS transaction reads it, in every field except the activation.
+    ///
+    /// Clause 3 compares the whole projection rather than only the evidence
+    /// axes on purpose: `availability`, `reconciliation` and the observation
+    /// timestamp are excluded from `evidence_axes_sha256` by design. It is also
+    /// what makes the read-before/write window in
+    /// [`Self::retire_process_stream_recovery`] fail closed instead of
+    /// persisting a stale copy of the row it proved.
+    ///
+    /// This says nothing about `reconciliation`: the two rules that do live
+    /// above the `match`, so they are already decided by the time the arm
+    /// reaches here.
+    fn permit_process_stream_recovery_transition(
+        existing: &ProcessStreamRecoveryProjection,
+        projection: &ProcessStreamRecoveryProjection,
+        places_terminal_row: bool,
+        unadmitted: bool,
+    ) -> Result<(), OrsError> {
+        if places_terminal_row && unadmitted {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_activation",
+                reason: Self::TERMINAL_PLACEMENT_REFUSED,
+            });
+        }
+        if !existing
+            .activation
+            .permits_transition_to(projection.activation)
+        {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_activation",
+                reason: "durable activation transition is not permitted",
+            });
+        }
+        if places_terminal_row {
+            let mut proved = projection.clone();
+            proved.activation = existing.activation;
+            if proved != *existing {
+                return Err(OrsError::ReconciliationMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// The family's one durable write body, shared by the gated public writer,
+    /// by retirement and by the restore's terminal re-presentation.
+    ///
+    /// `terminal_placement_admitted` is `true` on exactly two call sites, and
+    /// they are admitted for DIFFERENT reasons:
+    /// - [`Self::retire_process_stream_recovery`], which proves terminal
+    ///   disposition, the terminal receipt and the evidence handoff against the
+    ///   durable row immediately before this write, and writes that row back
+    ///   with only its activation changed;
+    /// - [`Self::import_process_stream_recovery_suspended`], where a restore
+    ///   does not decide terminality: it re-preserves terminal evidence the
+    ///   owning operation contract already proved and durably archived, which is
+    ///   why an archived `Retired` row stays `Retired`.
+    ///
+    /// Every other caller passes `false`, and the flag is an admission token
+    /// rather than a licence: no path creates terminality out of nothing, and an
+    /// empty `(operation, stream)` key is no exemption, so the insert arm
+    /// refuses a `Retired` projection exactly as the transition arm does. A
+    /// write that changes a live row's activation to `Retired` is accepted only
+    /// when the projection equals that row, as read by THIS transaction, in
+    /// every field except the activation, and is refused with
+    /// [`OrsError::ReconciliationMismatch`] otherwise: the exact shape
+    /// retirement writes, and what makes the read-before/write window fail
+    /// closed instead of rolling the row back to a stale copy.
+    ///
+    /// THE SAME TOKEN GATES RECONCILIATION, AND THE RULE SITS ABOVE BOTH ARMS.
+    /// A writer that is not admitted may not change a durable row's
+    /// `reconciliation` AT ALL: not into `Reconciled`, not out of it, and not
+    /// onto a different owner, state or digest. It is checked ONCE, by
+    /// [`Self::refuse_unadmitted_handoff`] above the `match` on the durable
+    /// row, so the same-activation merge arm and the transition arm are covered
+    /// by construction and no arm can be added later that bypasses it; the same
+    /// call states the empty-key refusal for the one way a non-admitted writer
+    /// could otherwise ESTABLISH a handoff on a brand-new row.
+    ///
+    /// A SECOND RULE, ALSO ABOVE THE `match`, COVERS EVERY WRITER, because the
+    /// first one is silent about an admitted one and the admitted restore
+    /// reaches the transition arm, which writes the incoming projection
+    /// verbatim. [`Self::refuse_handoff_rewrite`] makes a `Reconciled` handoff
+    /// on a durable row write-once for EVERY writer: never moved into
+    /// `Reconciled`, never moved out of it, and a row already `Reconciled`
+    /// keeps its owner and its digest byte for byte. An `Unreconciled` ->
+    /// `Unreconciled` owner change stays allowed, because that is what a
+    /// legitimate cross-installation restore does and it carries no proof.
+    /// `evidence_axes_sha256` cannot see any of this — it excludes
+    /// `reconciliation` by design — which is exactly why the rules are here and
+    /// not left to the immutability check.
+    ///
+    /// Together they are what the handoff half of
+    /// [`Self::retire_process_stream_recovery`] compares against. With ONE
+    /// exception, which is disclosed rather than closed: a restore into an
+    /// EMPTY `(operation, stream)` key has no durable row to compare against,
+    /// so an archived `Reconciled` row lands there carrying its digest. Both
+    /// rules compare against a durable row, so neither can see it, and the
+    /// exception is pre-existing — before any of this the restore went through
+    /// [`Self::put_process_stream_recovery`] and could do the same. Closing it
+    /// would mean either refusing "restore proven terminal evidence into a
+    /// fresh store" or inventing an archive signature, and this item names
+    /// neither.
+    ///
+    /// The two admitted shapes are unaffected, and neither is a licence to
+    /// rewrite proven history. The retirement writes the row it read back with
+    /// only its activation changed, so its reconciliation is byte-identical to
+    /// the durable row and no reconciliation rule fires at all. The restore
+    /// re-preserves an archived row, and the write body refuses every rewrite
+    /// of a proven handoff on a durable row: the hoisted
+    /// [`Self::refuse_handoff_rewrite`] in BOTH arms, and, for a destination
+    /// row that is already `Retired` and carries an `Unreconciled`
+    /// reconciliation, the merge arm's retained-history check, which the
+    /// hoisted rule cannot subsume because it compares STATES rather than
+    /// values. Re-presentation therefore cannot overwrite a proven handoff on a
+    /// durable row, in either direction, through any arm.
+    ///
+    /// DISCLOSED LIMIT OF THE ADMITTED RESTORE. A restore is admitted, so it
+    /// can still terminate a LIVE destination row in the one
+    /// byte-identical-except-activation shape, which the proved-row comparison
+    /// accepts. That is kept deliberately: the alternative breaks "an archived
+    /// `Retired` row stays `Retired`" (merged W7). The restore driver
+    /// pre-flights and refuses that shape before its first write (see
+    /// `restore_row_refusal`), so the driver-level property holds; this is an
+    /// operator-facing disclosure, not a hidden exemption, and it is not
+    /// narrowed here with a second flag or a new type.
+    ///
+    /// The same-activation merge arm never moves `activation`, so it cannot
+    /// create terminality and is not gated by the placement token itself. For a
+    /// non-admitted writer it now advances `availability` and nothing else: an
+    /// observation advances what it observed, and the handoff is recorded by the
+    /// owning operation contract, not by whoever is watching the stream.
+    /// Availability still advances even on an already `Retired` row, and that
+    /// exception stays open for one reason: availability GRANTS NO AUTHORITY
+    /// and `Retired` ADMITS NO DEPENDENT RECONCILIATION
+    /// ([`StreamRecoveryActivation::admits_dependent_reconciliation`] is false
+    /// for `Retired`), so it cannot be a step toward any terminal fact, and
+    /// [`Self::revalidate_process_stream_recovery`] re-observes every projection
+    /// it loads, a terminal one included, through `with_availability` alone, so
+    /// refusing it would turn a re-observation into a hard read failure for the
+    /// whole operation.
+    fn write_process_stream_recovery(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+        terminal_placement_admitted: bool,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
         projection.validate()?;
         let key = projection.record_key()?;
         let incoming_axes = projection.evidence_axes_sha256()?;
+        let places_terminal_row = projection.activation == StreamRecoveryActivation::Retired;
         let write = self.database.begin_write().map_err(storage)?;
         let outcome = {
             let mut table = write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
@@ -17796,6 +18138,16 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
                 .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
                 .transpose()?;
+            // BOTH reconciliation rules, ABOVE every arm of the match below, so
+            // the merge arm, the transition arm, the exact-replay arm and the
+            // empty-key arm cannot each be a way around either one. The first
+            // keys on the writer and is silent about an admitted one; the
+            // second keys on the value and speaks to every writer, which is why
+            // the admitted restore cannot author a `Reconciled` handoff on a
+            // durable row either.
+            let unadmitted = !terminal_placement_admitted;
+            Self::refuse_unadmitted_handoff(unadmitted, projection, existing.as_ref())?;
+            Self::refuse_handoff_rewrite(projection, existing.as_ref())?;
             match existing {
                 Some(existing) if existing == *projection => {
                     ProcessStreamRecoveryWriteOutcome::Unchanged
@@ -17807,20 +18159,60 @@ impl RedbRecoveryStore {
                             reason: "recovery evidence axes are immutable".to_owned(),
                         });
                     }
+                    // Both reconciliation rules already ran above the `match`,
+                    // against this very row, so from here on a non-admitted
+                    // writer's reconciliation is byte-identical to the durable
+                    // row's in every arm of this one, and an admitted writer's
+                    // can differ only between the non-`Reconciled` states.
                     if existing.activation == projection.activation {
                         // Same durable activation under unchanged evidence axes:
                         // this is an observation advance, not a lifecycle
                         // transition (issue #269). Exact replay of the same
                         // evidence under a later observation timestamp returns
                         // the retained row without attempting an activation
-                        // transition; a fresh availability/reconciliation
-                        // observation advances only those explicitly mutable
-                        // fields. The original source-observation timestamp is
-                        // preserved (I14.26 never merges by timestamp),
-                        // activation can never move on this path, and changed
-                        // evidence under this key is still a conflict above.
+                        // transition; a fresh availability observation advances
+                        // only that explicitly mutable field. The original
+                        // source-observation timestamp is preserved (I14.26
+                        // never merges by timestamp), activation can never move
+                        // on this path, and changed evidence under this key is
+                        // still a conflict above. Because activation never moves
+                        // here, this arm cannot create terminality and is not
+                        // gated by the placement token; the two reconciliation
+                        // rules above are what cover this arm and the transition
+                        // arm together.
                         let mut merged = existing.clone();
                         merged.availability = projection.availability;
+                        // Retained history of an ALREADY TERMINAL row, and the
+                        // only reconciliation refusal left inside an arm. The
+                        // hoisted [`Self::refuse_handoff_rewrite`] above
+                        // already refuses every way of authoring, moving or
+                        // re-pointing a `Reconciled` handoff, so the half of
+                        // this condition that can still fire here is the
+                        // terminal one: an already `Retired` destination row's
+                        // retained reconciliation is not rewritten even when
+                        // NEITHER side is `Reconciled`, because an owner change
+                        // over a terminal row rewrites the history that row
+                        // exists to preserve.
+                        //
+                        // This is NOT redundant with the hoisted rule, and the
+                        // difference is exact: `refuse_handoff_rewrite`
+                        // compares reconciliation STATES, so a `Retired` row
+                        // carrying an `Unreconciled` reconciliation that a
+                        // restore re-presents under a different owner is a
+                        // difference it cannot see, and such a row is
+                        // reachable because the empty-key restore path places
+                        // one. A retirement never reaches this rule: it is a
+                        // transition arm, and its reconciliation is the durable
+                        // row's.
+                        if projection.reconciliation != existing.reconciliation
+                            && existing.activation == StreamRecoveryActivation::Retired
+                        {
+                            return Err(OrsError::InvalidField {
+                                field: "stream_recovery_reconciliation",
+                                reason: "the reconciliation of an already retired recovery projection is \
+                                         retained history and is not rewritten",
+                            });
+                        }
                         merged.reconciliation = projection.reconciliation.clone();
                         merged.validate()?;
                         if merged == existing {
@@ -17833,15 +18225,19 @@ impl RedbRecoveryStore {
                             ProcessStreamRecoveryWriteOutcome::Advanced
                         }
                     } else {
-                        if !existing
-                            .activation
-                            .permits_transition_to(projection.activation)
-                        {
-                            return Err(OrsError::InvalidField {
-                                field: "stream_recovery_activation",
-                                reason: "durable activation transition is not permitted",
-                            });
-                        }
+                        Self::permit_process_stream_recovery_transition(
+                            &existing,
+                            projection,
+                            places_terminal_row,
+                            unadmitted,
+                        )?;
+                        // Both reconciliation rules already ran above the
+                        // `match` against this very row, so neither a
+                        // non-admitted writer NOR the admitted restore can
+                        // author, move or re-point a handoff digest here. An
+                        // ordinary observation is `Suspended` against a live
+                        // `Unreconciled` sink row on both sides, so no rule
+                        // fires for it.
                         let payload = encode(projection)?;
                         table
                             .insert(key.as_str(), payload.as_str())
@@ -17850,6 +18246,14 @@ impl RedbRecoveryStore {
                     }
                 }
                 None => {
+                    // The same refusal as the transition arm: an empty
+                    // `(operation, stream)` key is not an exemption.
+                    if places_terminal_row && unadmitted {
+                        return Err(OrsError::InvalidField {
+                            field: "stream_recovery_activation",
+                            reason: Self::TERMINAL_PLACEMENT_REFUSED,
+                        });
+                    }
                     let payload = encode(projection)?;
                     table
                         .insert(key.as_str(), payload.as_str())
@@ -17965,8 +18369,60 @@ impl RedbRecoveryStore {
     /// Retirement is not deletion: the row stays durable as terminal evidence so
     /// a mistaken retirement remains recoverable, which is why the Architecture
     /// forbids destroying it outright. Nothing here infers terminality from the
-    /// projection; the terminal reservation state, its named recovery owner,
-    /// its terminal receipt and the proven handoff digest must all agree.
+    /// projection the caller passed in: the terminal reservation state, its named
+    /// recovery owner, its terminal receipt and the proven handoff digest are
+    /// all read from durable state — the reservation rows and the recovery
+    /// projection row this operation owns — and the caller's proof must match
+    /// them, never replace them.
+    ///
+    /// Exactly what the handoff half compares: the DURABLE row's
+    /// reconciliation must already be `Reconciled` and must already carry
+    /// `proof.handoff_sha256` as its handoff digest. This is no longer a
+    /// property of one arm. The family's write body applies TWO checks above
+    /// the merge and transition arms alike: a non-admitted writer may not
+    /// change a durable row's `reconciliation` at all
+    /// ([`Self::refuse_unadmitted_handoff`]), and for EVERY writer, admitted
+    /// ones included, a `Reconciled` handoff on a durable row is write-once —
+    /// never moved into `Reconciled`, never moved out of it, and a row already
+    /// `Reconciled` keeps its owner and its digest byte for byte
+    /// ([`Self::refuse_handoff_rewrite`]). The second rule is what stops the
+    /// other admitted writer, the restore, from authoring the handoff: an
+    /// archived `Reconciled` row cannot be moved onto a live destination row
+    /// through the transition arm, and the merge arm's retained-history check
+    /// still covers an already `Retired` row whose reconciliation is not
+    /// `Reconciled`.
+    ///
+    /// So a digest on a DURABLE row can only have been recorded by the owning
+    /// operation contract's own write — and there is no owner-facing API for
+    /// that write yet, so the handoff half of this gate is enforced rather
+    /// than satisfiable today. ONE residual is disclosed rather than closed: a
+    /// restore into an EMPTY `(operation, stream)` key has no durable row for
+    /// either rule to compare, so an archived `Reconciled` row lands there
+    /// carrying its digest. That is pre-existing (before any of this the
+    /// restore went through [`Self::put_process_stream_recovery`] and could do
+    /// the same), and closing it would mean either refusing the legitimate
+    /// restore of proven terminal evidence into a fresh store or inventing an
+    /// archive signature this item does not name. Apart from that one case, a
+    /// handoff the owning operation contract has not already recorded and read
+    /// back into this row is refused.
+    ///
+    /// The reservation facts are proven in a read transaction that is dropped
+    /// before the write opens, so `reservation.state.is_terminal()` and
+    /// `terminal_receipt_id` are a pre-transaction check and are NOT re-read at
+    /// commit. What the write transaction does re-verify is the row: the write
+    /// body requires the projection to equal the row that same transaction
+    /// reads, in every field except the activation. A retirement therefore
+    /// refuses, rather than persisting a stale copy of the proved row, whenever
+    /// anything advanced that row in between.
+    ///
+    /// Retirement is one of exactly two writers that may place a terminal row:
+    /// the other is the restore that re-preserves already-proven terminal
+    /// evidence ([`Self::import_process_stream_recovery_suspended`]). Neither
+    /// [`Self::put_process_stream_recovery`] nor any other observation writer
+    /// can create terminality in either the empty-key or the transition arm, so
+    /// a caller cannot reach a terminal record by presenting a retired copy of
+    /// its own projection. The row written here is the row that was read back,
+    /// with only `activation` changed.
     ///
     /// Because the retired row is written through the family's one write path,
     /// retirement advances the durable family revision in the same transaction
@@ -17982,9 +18438,13 @@ impl RedbRecoveryStore {
         proof.validate()?;
         let key = projection.record_key()?;
         let read = self.database.begin_read().map_err(storage)?;
-        {
+        // The durable row, already decoded and validated by the existing ORS
+        // codec. It is the ORIGINAL RECORDED projection: every fact below is
+        // checked against this row, never against the caller's copy of it, so a
+        // caller cannot carry its own reconciliation into a terminal record.
+        let stored = {
             let table = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
-            let stored = table
+            table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
@@ -17992,13 +18452,13 @@ impl RedbRecoveryStore {
                 .ok_or(OrsError::IntegrityProblem {
                     record_type: "process_stream_recovery",
                     reason: "the named recovery projection row is not durable".to_owned(),
-                })?;
-            if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: "retirement target does not match the durable evidence axes".to_owned(),
-                });
-            }
+                })?
+        };
+        if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_stream_recovery",
+                reason: "retirement target does not match the durable evidence axes".to_owned(),
+            });
         }
         let reservation_id = {
             let operations = read.open_table(OPERATIONS).map_err(storage)?;
@@ -18020,22 +18480,47 @@ impl RedbRecoveryStore {
             decode::<ReservationRecord>(value.value())?
         };
         if reservation.token.recovery_owner != proof.recovery_owner
-            || projection.reconciliation.owner != proof.recovery_owner
+            || stored.reconciliation.owner != proof.recovery_owner
         {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         if !reservation.state.is_terminal() {
             return Err(OrsError::UnsafeExpiry);
         }
-        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id)
-            || projection.reconciliation.handoff_sha256.as_deref()
+        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        // The handoff/readback proof is read off the DURABLE reconciliation,
+        // not recomputed over what the caller holds: the durable row's
+        // reconciliation must already be `Reconciled` and must already carry
+        // this exact digest. No write may author that state on a durable row:
+        // the write body refuses every reconciliation change by a writer that
+        // is not admitted, and it makes a `Reconciled` handoff write-once for
+        // every writer, the admitted restore included, in the merge arm and the
+        // transition arm alike. A live projection records `Unreconciled` with
+        // no handoff digest, and absent a handoff the owning operation contract
+        // already recorded and read back into this row — or one a restore
+        // placed on an EMPTY key, which is the disclosed residual above — no
+        // proof object can retire anything.
+        if stored.reconciliation.state != StreamRecoveryReconciliationState::Reconciled
+            || stored.reconciliation.handoff_sha256.as_deref()
                 != Some(proof.handoff_sha256.as_str())
         {
             return Err(OrsError::ReconciliationMismatch);
         }
         drop(read);
-        let retired = projection.with_activation(StreamRecoveryActivation::Retired)?;
-        self.put_process_stream_recovery(&retired)
+        // The reservation half above is a pre-transaction check: this read
+        // transaction ends here, so the terminal state and terminal receipt are
+        // not re-read at commit. The write body re-verifies the row itself, so a
+        // row that moved in between is refused instead of being overwritten by
+        // this stale copy.
+        //
+        // The row that becomes terminal is the row that was read back and
+        // checked, with only its activation changed. Nothing the gate did not
+        // compare against the durable row can be smuggled in through the
+        // caller's copy.
+        let retired = stored.with_activation(StreamRecoveryActivation::Retired)?;
+        self.write_process_stream_recovery(&retired, true)
     }
 
     /// Imports a recovery projection from backup/restore as suspended evidence.
@@ -18046,6 +18531,61 @@ impl RedbRecoveryStore {
     /// state through this record. Only the recovery projection row is written;
     /// no reservation, session or authority row is created, reactivated or
     /// otherwise revived.
+    ///
+    /// A restore does not DECIDE terminality, so it is not the public write
+    /// path: it is one of exactly two writers that may place a terminal row,
+    /// and it is admitted for the opposite reason retirement is. A restore
+    /// re-preserves terminal evidence the owning operation contract already
+    /// proved and durably archived, so an archived `Retired` row stays
+    /// `Retired`; downgrading it to `Suspended` would be a hidden rewrite of
+    /// retained history, which is why the incoming activation is discarded for
+    /// every OTHER row rather than for this one.
+    ///
+    /// What a restore may never do is terminate a live destination row. When
+    /// the destination already holds a non-`Retired` row for the same
+    /// `(operation, stream)` key, a retired backup row is refused rather than
+    /// terminating that row, because the restore proves no handoff and no
+    /// terminal disposition: the restore driver pre-flights that conflict
+    /// against destination state before its first write and refuses the page as
+    /// a whole instead of restoring it halfway, and the family's write body
+    /// refuses the row too unless the archived row is byte-identical to the
+    /// destination's apart from the activation. An empty key and an
+    /// already-`Retired` destination row are the two cases this path is
+    /// admitted for, and a `Retired` row whose retained reconciliation differs
+    /// from the destination's `Retired` row's is refused too, so re-presentation
+    /// never rewrites proven evidence.
+    ///
+    /// Being admitted for terminal placement is also what admits this path to
+    /// CARRY a `Reconciled` reconciliation, because re-preserving a proven
+    /// handoff is exactly what an archived terminal row is. It does NOT admit it
+    /// to MANUFACTURE one on a durable row. The admission token keys on the
+    /// WRITER, so the refusal an unadmitted writer gets
+    /// ([`Self::refuse_unadmitted_handoff`]) is silent here — and that is
+    /// exactly why a SECOND rule exists, [`Self::refuse_handoff_rewrite`],
+    /// which speaks to every writer and is applied above the whole `match`, in
+    /// the merge arm and the transition arm alike: this path may not move a
+    /// durable reconciliation INTO `Reconciled`, may not move one OUT of it, and
+    /// may not change the owner or the `handoff_sha256` of a row that is already
+    /// `Reconciled`. It may still carry a different `owner` on a row that is
+    /// not `Reconciled`, which is the ordinary cross-installation restore. An
+    /// already `Retired` destination row's retained reconciliation is refused
+    /// even when neither side is `Reconciled`, by the merge arm's own
+    /// retained-history check.
+    ///
+    /// DISCLOSED RESIDUAL, THE ONE REMAINING AUTHOR OF A `RECONCILED` HANDOFF.
+    /// Both rules compare against a DURABLE row, so neither can fire when the
+    /// `(operation, stream)` key is EMPTY, and this path is admitted. An
+    /// archived `Reconciled` row therefore lands on a fresh key carrying its
+    /// digest — which is also the one way the handoff half of
+    /// [`Self::retire_process_stream_recovery`] is reachable at all. It is
+    /// disclosed, not closed: it is pre-existing behaviour (before any of this
+    /// the restore went through [`Self::put_process_stream_recovery`] and could
+    /// do the same), and closing it would mean either refusing the legitimate
+    /// "restore proven terminal evidence into a fresh store" path or inventing an
+    /// archive signature, neither of which this item names. Note also that
+    /// `OrsBackupPage::validate_binding` is a self-digest with no signature, so
+    /// an archived `Reconciled` row is not authenticated as the owning
+    /// contract's record either.
     ///
     /// This stays the only durable restore route for the family (issue #2884):
     /// paging the family into more backup pages raises no authority, and every
@@ -18063,7 +18603,17 @@ impl RedbRecoveryStore {
         } else {
             projection.with_activation(StreamRecoveryActivation::Suspended)?
         };
-        self.put_process_stream_recovery(&imported)
+        // The second admitted placement site, for the reason its doc gives: this
+        // is a re-presentation of terminal evidence the owning operation
+        // contract already proved, not a decision about terminality. The write
+        // body still refuses a restore that would terminate a live destination
+        // row, still refuses any re-presentation that would author, move or
+        // re-point a `Reconciled` handoff on a durable row
+        // (`refuse_handoff_rewrite`, above the `match`, admitted or not), and
+        // still refuses a rewrite of a terminal row's retained reconciliation.
+        // An EMPTY key is the disclosed residual above: no durable row exists
+        // for any of those rules to compare, so the archived row lands.
+        self.write_process_stream_recovery(&imported, true)
     }
 
     /// Maps a codec failure onto its explicit recovery disposition.
