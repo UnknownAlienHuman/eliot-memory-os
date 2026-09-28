@@ -22,8 +22,8 @@ use crate::SNAPSHOT_SCHEMA_VERSION;
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CapacityDeferral,
-    CapacityLimitDimension, CapacityResetSource, ClassSkipReason, CoordinatedAttemptState,
-    CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot, DeliverableClaim,
+    CapacityLimitDimension, ClassSkipReason, CoordinatedAttemptState, CoordinatorConfig,
+    CoordinatorError, CoordinatorEvent, CoordinatorSnapshot, DeliverableClaim,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
     ExecutionContext, FAIR_PULL_ALGORITHM, FAIRNESS_QUANTUM, LegacyResultWireKind,
     LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt, PlanGap,
@@ -309,10 +309,15 @@ struct RouteCapacityRequest {
 /// One class's admitted and in-flight view for a single fair pull (issue
 /// #1683 W2). It borrows the stored records; nothing is copied or re-stored.
 ///
-/// `in_flight` is exactly the set that holds a concurrency slot: a non-terminal
-/// attempt that has started (`Running` or `CancellationRequested`). A queued
-/// (`Admitted`) item is in `ready` only, so the concurrency, byte and WIP
-/// ceilings measure real in-flight pressure and not queue length.
+/// `in_flight` is every non-terminal attempt that is not queued: `Running`,
+/// `CancellationRequested` and `UnknownOutcome`. `UnknownOutcome` is in that set
+/// deliberately. Issue #1683 W4 requires that "unknown old execution keeps
+/// exclusion until reconciliation, not merely until an outer result says
+/// Partial or its lease expires", and an attempt whose outcome is unknown has
+/// not been reconciled, so it keeps holding its concurrency slot, its bytes and
+/// its WIP partition until `reconcile_unknown_outcome` releases it. A queued
+/// (`Admitted`) item is in `ready` only, so these ceilings measure real
+/// in-flight pressure rather than queue length.
 struct ClassPullView<'a> {
     in_flight: Vec<&'a AttemptRecord>,
     in_flight_bytes: u64,
@@ -405,10 +410,18 @@ fn count_as_u64(value: usize) -> u64 {
 fn wip_partition_value(attempt: &AttemptRecord, key: WipPartitionKey) -> String {
     match key {
         WipPartitionKey::Route => route_key(&attempt.route),
+        WipPartitionKey::Scope => attempt
+            .mutation_scope
+            .clone()
+            .unwrap_or_else(|| WORKSCOPE_ABSENT.to_owned()),
         WipPartitionKey::Task => attempt.task_id.as_str().to_owned(),
         WipPartitionKey::Worker => attempt.worker_id.as_str().to_owned(),
     }
 }
+
+/// Partition value for an attempt that declares no scope. It cannot collide with
+/// a declared scope, because `plan` rejects a blank `mutation_scope`.
+const WORKSCOPE_ABSENT: &str = "\u{0}no-mutation-scope";
 
 /// Publishes one class's exact result. Ceilings are the profile's own values
 /// and are `None` on the profile-free peek, so a caller can tell an absent
@@ -426,7 +439,7 @@ fn class_report(
         in_flight_bytes: view.in_flight_bytes,
         item_ceiling: class_profile.map(|profile| count_as_u64(profile.max_items)),
         concurrency_ceiling: class_profile.map(|profile| count_as_u64(profile.max_concurrency)),
-        byte_ceiling: class_profile.and_then(|profile| profile.max_bytes),
+        byte_ceiling: class_profile.map(|profile| profile.max_bytes),
         scanned_ready_items: view.scanned,
         oldest_ready_enqueue_sequence: view.oldest_ready_sequence(),
         offered_attempt_id: view.head.map(|attempt| attempt.attempt_id.clone()),
@@ -459,6 +472,9 @@ fn class_views<'a>(
         if attempt.state == CoordinatedAttemptState::Admitted {
             view.ready.push((*sequence, attempt));
         } else {
+            // `Running`, `CancellationRequested` and `UnknownOutcome`; see the
+            // `ClassPullView` doc for why an unknown outcome still holds its
+            // resources.
             view.in_flight.push(attempt);
             view.in_flight_bytes = view
                 .in_flight_bytes
@@ -475,36 +491,55 @@ fn class_views<'a>(
     views
 }
 
+/// The per-class policy in force for one pull, with the revision any refusal
+/// from that class is measured against.
+///
+/// A capacity deferral is only ever built from one of these, because every
+/// limit it reports comes from the profile; the profile revision, not the route
+/// capacity view, is what re-opens a closed class.
+#[derive(Clone, Copy)]
+struct ClassContext<'a> {
+    profile: &'a WorkClassProfile,
+    revision: &'a str,
+}
+
 /// Decides what one class offers to this pull: its oldest eligible admitted
 /// item, or the exact reason it offers nothing.
 fn offer_class_head(
     view: &mut ClassPullView<'_>,
     work_class: WorkClass,
-    class_profile: Option<&WorkClassProfile>,
-    reset_source: &CapacityResetSource,
+    context: Option<ClassContext<'_>>,
 ) {
+    let Some(context) = context else {
+        // Profile-free peek: no limit applies, so the class offers its oldest
+        // admitted item directly and nothing beyond that item is examined.
+        if let Some((_, attempt)) = view.ready.first() {
+            view.scanned += 1;
+            view.head = Some(attempt);
+        }
+        return;
+    };
     if view.ready.is_empty() {
         return;
     }
-    if let Some(profile) = class_profile
-        && view.in_flight.len() >= profile.max_concurrency
-    {
+    if view.in_flight.len() >= context.profile.max_concurrency {
         view.skip_reason = Some(ClassSkipReason::ClassConcurrencyAtLimit);
         view.deferral = Some(CapacityDeferral::new(
             work_class,
             CapacityLimitDimension::ClassConcurrency,
             count_as_u64(view.in_flight.len()),
-            count_as_u64(profile.max_concurrency),
-            reset_source,
+            count_as_u64(context.profile.max_concurrency),
+            context.revision,
         ));
         return;
     }
-    // Bounded scan for the oldest eligible head. The window is the class item
-    // ceiling, or the whole class on the profile-free path.
-    let window = class_profile.map_or(usize::MAX, |profile| profile.max_items);
-    for (_, attempt) in view.ready.iter().take(window) {
+    // Bounded scan for the oldest eligible head; the window is the class item
+    // ceiling. See the known-limitation note on `next_ready`: the window always
+    // starts at the oldest admitted item, so a window whose items are all
+    // permanently out of profile never advances.
+    for (_, attempt) in view.ready.iter().take(context.profile.max_items) {
         view.scanned += 1;
-        let Some(block) = item_block(view, attempt, class_profile) else {
+        let Some(block) = item_block(view, attempt, context.profile) else {
             view.head = Some(attempt);
             return;
         };
@@ -527,7 +562,7 @@ fn offer_class_head(
             closure.dimension,
             closure.observed,
             closure.limit,
-            reset_source,
+            context.revision,
         ));
     }
 }
@@ -549,28 +584,25 @@ fn offer_class_head(
 fn item_block(
     view: &ClassPullView<'_>,
     attempt: &AttemptRecord,
-    class_profile: Option<&WorkClassProfile>,
+    class_profile: &WorkClassProfile,
 ) -> Option<ItemBlock> {
-    let profile = class_profile?;
-    if attempt.budget.wall_time_ms > profile.deadline_ms {
+    if attempt.budget.wall_time_ms > class_profile.deadline_ms {
         return Some(ItemBlock::unclosed(
             ReadyItemSkipReason::ClassDeadlineCeiling,
         ));
     }
-    if let Some(byte_cap) = profile.max_bytes {
-        let requested = view
-            .in_flight_bytes
-            .saturating_add(attempt.budget.output_bytes);
-        if requested > byte_cap {
-            return Some(ItemBlock::closed(
-                ReadyItemSkipReason::ClassByteCapReached,
-                CapacityLimitDimension::ClassBytes,
-                requested,
-                byte_cap,
-            ));
-        }
+    let requested = view
+        .in_flight_bytes
+        .saturating_add(attempt.budget.output_bytes);
+    if requested > class_profile.max_bytes {
+        return Some(ItemBlock::closed(
+            ReadyItemSkipReason::ClassByteCapReached,
+            CapacityLimitDimension::ClassBytes,
+            requested,
+            class_profile.max_bytes,
+        ));
     }
-    for partition in &profile.wip_partitions {
+    for partition in &class_profile.wip_partitions {
         let value = wip_partition_value(attempt, partition.key);
         let observed = view
             .in_flight
@@ -580,7 +612,7 @@ fn item_block(
         if observed >= partition.max_in_flight {
             return Some(ItemBlock::closed(
                 ReadyItemSkipReason::WipPartitionAtLimit,
-                CapacityLimitDimension::WipPartition,
+                CapacityLimitDimension::WipPartition { key: partition.key },
                 count_as_u64(observed),
                 count_as_u64(partition.max_in_flight),
             ));
@@ -591,13 +623,33 @@ fn item_block(
 
 /// Smooth weighted round robin over the classes that offered a head.
 ///
-/// Each participating class advances its virtual time by
-/// `FAIRNESS_QUANTUM / weight`; the lowest virtual time wins and an exact tie
-/// goes to the lower scheduler rank, so equal weights keep the I14.1 class
-/// order. The reported credit of a participant is its virtual time minus the
-/// winner's, which is at most `FAIRNESS_QUANTUM`. A class that could not
-/// participate keeps its virtual time, so a class that becomes eligible again
-/// is not charged for the pulls it missed.
+/// The lowest virtual time among the participating classes wins, an exact tie
+/// goes to the lower scheduler rank (so equal weights keep the I14.1 class
+/// order), and **only the winner** then advances by
+/// `FAIRNESS_QUANTUM / weight`. Selecting before advancing is what makes the
+/// rotation proportional: advancing every participant first would leave the
+/// minimum unchanged between pulls, so the same class would win every pull.
+///
+/// Service bound, as implemented and checked: over any complete round of
+/// `W = sum(weight)` pulls, class `i` is selected exactly `weight_i` times. In
+/// a shorter window the observed share deviates from `weight_i / W` by at most
+/// one round, so `weight / W` is the round share and not a per-pull guarantee.
+///
+/// Credit bound. A class's credit is its virtual time minus the winner's, so it
+/// is non-negative. For a class served at global time `T`, its virtual time is
+/// `T + FAIRNESS_QUANTUM / weight`, and the global time only moves forward, so
+/// the credit is at most `FAIRNESS_QUANTUM / weight`, hence at most
+/// `FAIRNESS_QUANTUM` because every weight is at least 1. That bound is tight:
+/// a weight-1 class that has fallen a full quantum behind reaches exactly
+/// `FAIRNESS_QUANTUM`. A class that has never been served holds virtual time 0,
+/// and the winner's time is a minimum, so its credit is 0 as well. The bound
+/// assumes no virtual time has saturated: the *spread* is bounded as above, but
+/// the stored values themselves grow by one stride per pull and saturate after
+/// roughly `u64::MAX / FAIRNESS_QUANTUM` pulls, after which the rotation
+/// degrades to index tie-breaks.
+///
+/// A class that cannot participate keeps its virtual time, so it is not charged
+/// for the pulls it missed.
 ///
 /// Returns the advanced virtual times separately: committing them is the
 /// caller's decision, so the profile-free peek can leave scheduler state
@@ -609,26 +661,20 @@ fn choose_fair_head<'a, 'profile>(
 ) -> (Option<&'a AttemptRecord>, [u64; 9], [Option<u64>; 9]) {
     let mut virtual_time = *current;
     let mut credits: [Option<u64>; 9] = [None; 9];
-    let mut participants: Vec<(usize, u64)> = Vec::new();
-    for (index, view) in views.iter().enumerate() {
-        if view.head.is_none() {
-            continue;
-        }
-        let weight = resolve(WorkClass::ALL[index]).map_or(1, |profile| u64::from(profile.weight));
-        virtual_time[index] = virtual_time[index].saturating_add(FAIRNESS_QUANTUM / weight);
-        participants.push((index, weight));
-    }
-    let winner = participants
-        .iter()
-        .min_by_key(|(index, _)| (virtual_time[*index], *index))
-        .map(|(index, _)| *index);
+    let winner = (0..WorkClass::ALL.len())
+        .filter(|index| views[*index].head.is_some())
+        .min_by_key(|index| (virtual_time[*index], *index));
     let Some(winner) = winner else {
         return (None, virtual_time, credits);
     };
     let base = virtual_time[winner];
-    for (index, _) in &participants {
-        credits[*index] = Some(virtual_time[*index].saturating_sub(base));
+    for index in 0..WorkClass::ALL.len() {
+        if views[index].head.is_some() {
+            credits[index] = Some(virtual_time[index] - base);
+        }
     }
+    let weight = resolve(WorkClass::ALL[winner]).map_or(1, |profile| u64::from(profile.weight));
+    virtual_time[winner] = virtual_time[winner].saturating_add(FAIRNESS_QUANTUM / weight);
     (views[winner].head, virtual_time, credits)
 }
 
@@ -1266,25 +1312,29 @@ impl AgentCoordinator {
     /// This is the coordinator's existing selection entry point and it calls
     /// the same bounded fair-pull selector as [`Self::pull_next`], with no
     /// [`SchedulingProfile`]: every class then carries equal weight and **no
-    /// per-class I14.2 item, byte, concurrency, deadline or WIP partition is
-    /// applied** — the ceilings it publishes are `None`, not unlimited ones.
-    /// Only the canonical enqueue age order inside a class and the cross-class
-    /// rank tie-break on an exact virtual-time tie apply, on top of the
-    /// coordinator's existing global limits. The call is a read: it consumes no
-    /// fairness credit, so two peeks over unchanged state return the same item
-    /// and a peek never changes what a later pull selects.
+    /// per-class item, byte, concurrency, deadline or WIP limit is applied** —
+    /// the ceilings it publishes are `None`, not unlimited ones. Only the
+    /// canonical enqueue age order inside a class and the cross-class rank
+    /// tie-break on an exact virtual-time tie apply. The call is a read: it
+    /// consumes no fairness credit, so two peeks over unchanged state return the
+    /// same item and a peek never changes what a later pull selects.
+    ///
+    /// The coordinator's global limits are **not** applied here. `max_ready_items`,
+    /// `max_admitted_attempts` and `max_active_per_route` are admission-time
+    /// limits, enforced in `plan`, `admit` and `reassign`; selection reads none of
+    /// them. A returned item may therefore already sit on a route that is at
+    /// `max_active_per_route`, and a class may hold more admitted items than a
+    /// single plan's `max_ready_items` would suggest.
     ///
     /// Known limitation, stated here so a reader of the code does not need the
-    /// delivery report: the per-class I14.2 partition is reachable only through
-    /// the profile-bound path [`Self::pull_next`], and `pull_next` has **no
-    /// in-tree caller** — the composition root that could supply a
-    /// `SchedulingProfile` is out of this crate's grant. So on every path that
-    /// runs today, selection applies the age order and the class-rank order but
-    /// no per-class item, byte, concurrency, deadline or WIP limit, and
+    /// delivery report: the per-class partition is reachable only through the
+    /// profile-bound path [`Self::pull_next`], and `pull_next` has **no in-tree
+    /// caller** — the composition root that could supply a `SchedulingProfile` is
+    /// out of this crate's grant. So on every path that runs today, selection
+    /// applies the age order and the class-rank order but no per-class limit, and
     /// `profile_revision` in the published outcome is `None`. A reader must not
     /// conclude from this method that saturated low-priority work is prevented
-    /// from consuming another class's partition: nothing on this path does
-    /// that.
+    /// from consuming another class's partition: nothing on this path does that.
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1301,23 +1351,52 @@ impl AgentCoordinator {
     /// come from `profile` and are counted per class only — the item ceiling
     /// bounds the class scan, and the byte, concurrency, deadline and WIP
     /// ceilings gate the head — so a saturated class cannot consume another
-    /// class's partition.
+    /// class's partition. The coordinator's global limits are admission-time
+    /// only and are not re-checked here; see the note on [`Self::next_ready`].
     ///
-    /// Service bounds, stated for what this code does:
+    /// Service bounds, each stated for what this code does (see
+    /// [`choose_fair_head`] for the derivation):
     ///
-    /// - a class whose weight is `w` out of the total eligible weight `W`
-    ///   receives at least its `w / W` share of the selections it stays
-    ///   eligible for, and a class that becomes eligible again wins the next
-    ///   pull against classes that were scheduled while it was closed;
-    /// - the per-class scan is bounded by the class item ceiling and walks the
-    ///   items in ascending canonical enqueue ordinal, so a truncated window
-    ///   can only leave later items unserved, never displace an older one;
-    /// - every credit is a virtual time difference of at most
-    ///   [`FAIRNESS_QUANTUM`], so scheduler state is bounded;
-    /// - work that is not *temporarily* closed but permanently outside the
-    ///   class profile (its own `wall_time_ms` budget above the class deadline
-    ///   ceiling) is reported as infeasible and gets no service promise from
-    ///   this selector. Disposing of it is the admission owner's decision.
+    /// - **round share**: over any complete round of `W = sum(weight)` pulls,
+    ///   class `i` is selected exactly `weight_i` times, so `weight / W` is the
+    ///   share it receives in a round. In a window shorter than a round the
+    ///   observed share deviates from it by at most one round; it is not a
+    ///   per-pull guarantee.
+    /// - **returning class**: a class that becomes eligible again keeps the
+    ///   virtual time it had, so it is not charged for the pulls it missed. It
+    ///   wins again as soon as its frozen time is the lowest among the eligible
+    ///   classes. That is **not** necessarily the very next pull: if it was
+    ///   closed with a virtual time above the current minimum, the classes that
+    ///   ran meanwhile are still below it. Each of them advances by exactly
+    ///   [`FAIRNESS_QUANTUM`] per round of their own service, so the wait is
+    ///   finite and is a whole number of those rounds.
+    /// - **bounded scan**: the per-class scan is bounded by the class item
+    ///   ceiling and walks the items in ascending canonical enqueue ordinal, so
+    ///   a truncated window can only leave later items unserved, never displace
+    ///   an older one.
+    /// - **bounded credit**: each class's credit for a pull — its virtual time
+    ///   minus the winner's — lies in `0..=[FAIRNESS_QUANTUM]`, and the bound is
+    ///   tight. The scheduler's *stored* virtual times are not bounded in value:
+    ///   each pull advances one of them by a stride, so they grow until they
+    ///   saturate (after roughly `u64::MAX / FAIRNESS_QUANTUM` pulls) and the
+    ///   rotation then degrades to index tie-breaks.
+    /// - **no promise for permanently out-of-profile work**: an item whose own
+    ///   `wall_time_ms` budget exceeds the class deadline ceiling is reported as
+    ///   infeasible and gets no service promise from this selector. Disposing of
+    ///   it is the admission owner's decision.
+    ///
+    /// Known limitation, not papered over: the scan window always starts at the
+    /// oldest admitted item of its class. If every item inside the window is
+    /// permanently out of profile — the deadline-ceiling case above — then the
+    /// class reports `AllReadyItemsSkipped`, publishes no capacity deferral
+    /// (a deadline mismatch is not a capacity dimension), and the window never
+    /// advances, so both the blocked items and everything queued behind them in
+    /// that class make no progress on any pull. Nothing in this selector breaks
+    /// that: the disposition belongs to admission, which must refuse or stage an
+    /// item whose budget exceeds the class deadline ceiling, and `plan`/`admit`
+    /// take no profile today. The condition is reachable by profile choice
+    /// alone: any class whose `deadline_ms` is below the `wall_time_ms` budget of
+    /// its first `max_items` admitted items.
     ///
     /// The pull selects; it does not start anything. A caller that receives a
     /// `selected_attempt_id` starts that attempt through the existing
@@ -1359,18 +1438,18 @@ impl AgentCoordinator {
         consume_credit: bool,
     ) -> ReadySelectionOutcome {
         let resolve = |work_class: WorkClass| profile.and_then(|set| set.class_profile(work_class));
-        let reset_source = CapacityResetSource {
-            capacity_identity: self.config.capacity_identity.clone(),
-            capacity_revision: self.config.capacity_revision.clone(),
+        let class_context = |work_class: WorkClass| {
+            profile.and_then(|set| {
+                set.class_profile(work_class)
+                    .map(|class_profile| ClassContext {
+                        profile: class_profile,
+                        revision: set.profile_revision.as_str(),
+                    })
+            })
         };
         let mut views = class_views(&self.attempts, &self.enqueue_sequence);
         for (index, work_class) in WorkClass::ALL.into_iter().enumerate() {
-            offer_class_head(
-                &mut views[index],
-                work_class,
-                resolve(work_class),
-                &reset_source,
-            );
+            offer_class_head(&mut views[index], work_class, class_context(work_class));
         }
         let (selected, advanced, credits) =
             choose_fair_head(&views, &self.fair_virtual_time, &resolve);
@@ -1403,8 +1482,8 @@ impl AgentCoordinator {
         ReadySelectionOutcome {
             algorithm: FAIR_PULL_ALGORITHM,
             profile_revision: profile.map(|set| set.profile_revision.clone()),
-            capacity_identity: reset_source.capacity_identity,
-            capacity_revision: reset_source.capacity_revision,
+            capacity_identity: self.config.capacity_identity.clone(),
+            capacity_revision: self.config.capacity_revision.clone(),
             selected_attempt_id,
             selected_work_class,
             selected_enqueue_sequence,
