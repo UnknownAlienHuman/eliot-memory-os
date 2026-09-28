@@ -43,12 +43,14 @@ pub use host_event::{
     contains_restricted_source_token, stable_event_id_for,
 };
 pub use provider_translation::{
-    CodecRevision, EventOrderChange, IdentifierPolicy, LossyConversionPolicy, NormalizedMutation,
-    PreservationPolicy, ProviderNeutralRuntimeIr, ProviderPayloadHandle, ProviderRepresentation,
-    ProviderTranslationBridge, ReasoningOrderingPolicy, ReceiptedTranslationTransform,
-    SharedProviderPayload, TranslatedProviderPayload, TranslationByteBounds, TranslationDiagnostic,
-    TranslationError, TranslationLossClass, TranslationOverlay, TranslationPolicyProfile,
-    TranslationProfileKind, TranslationReceipt, TranslationTransform, UnknownFieldPolicy,
+    CodecRevision, EventOrderChange, EventReorderRequest, IdentifierPolicy, LossyConversionPolicy,
+    NormalizedMutation, OutputIndexCollapseRequest, PreservationPolicy, ProviderNeutralRuntimeIr,
+    ProviderPayloadHandle, ProviderRepresentation, ProviderSourceStream, ProviderStreamFraming,
+    ProviderStreamTranslationBridge, ProviderTranslationBridge, ReasoningOrderingPolicy,
+    ReceiptedTranslationTransform, SharedProviderPayload, ToolArgumentRepairRequest,
+    TranslatedProviderPayload, TranslationByteBounds, TranslationDiagnostic, TranslationError,
+    TranslationLossClass, TranslationOverlay, TranslationPolicyProfile, TranslationProfileKind,
+    TranslationReceipt, TranslationTransform, UnknownBlockDropRequest, UnknownFieldPolicy,
 };
 pub use route_receipts::{
     AdmittedRouteReceipt, CandidateSelectionDisposition, ExecutionOutcome,
