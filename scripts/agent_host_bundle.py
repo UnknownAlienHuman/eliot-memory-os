@@ -87,14 +87,16 @@ MANIFEST_PARSE_BYTES_MAX = 1024 * 1024
 PAYLOAD_MODE_FILE = "verbatim_copy"
 PAYLOAD_MODE_TREE = "verbatim_tree_copy"
 # Tree-digest provenance (issue #2615 AUD3): the byte recipe computed by
-# `_tree_digest` is reader-inferred, NOT owner-sourced — it was matched against
-# the existing generation pins, and no producer-owned helper or tool defines it.
-# The governing I07-29 fragment names only a generic versioned digest, not this
-# byte recipe, so it cannot source it either. The producer manifest declares the
-# recipe label per tree (`tree_digest_recipe`) and any other label fails
-# explicitly in `_verify_tree_payload`. A different concatenation or order
-# requires an explicit schema migration of the producer manifest plus every
-# reader — never a second recipe alongside this one.
+# `_tree_digest` is the producer-owned definition for the host-bundle manifest.
+# The manifest names this module as its generator script, declares the recipe
+# version per tree (`tree_digest_recipe`), and pins the resulting digests.
+# `_emit_tree_commitment` computes exactly the commitment shape a producer
+# stamps into the manifest, and `_verify_tree_payload` routes its source
+# observation through that helper before comparing with the declared pins.
+# Member pins still prove byte identity only (I15.19), never origin. A
+# different concatenation or order requires a new recipe label, re-pinned
+# producer commitments, and reader support in one explicit schema migration;
+# no second recipe may sit alongside this one.
 TREE_DIGEST_RECIPE = "sha256-canonical-json-tree-members-v1"
 DISPOSITIONS = (
     "live-admitted",
@@ -644,16 +646,61 @@ def _read_snapshot(root: Path, relative: PurePosixPath, limits: dict[str, int]) 
 
 
 def _tree_digest(member_entries: list[dict[str, Any]]) -> str:
-    """Compute the tree digest with the reader-inferred recipe (provenance unverified).
+    """Compute the producer-owned tree digest for one recipe version.
 
-    Recipe: SHA-256 over the canonical JSON of member entries sorted by path.
-    This recipe is NOT owner-sourced (issue #2615 AUD3): it was inferred by
-    matching existing generation pins. The declared `tree_digest_recipe` label
-    is still enforced and the computed value is still compared with the DECLARED
-    `tree_digest_sha256` pin — this function never verifies by itself.
+    Normative byte definition of `sha256-canonical-json-tree-members-v1`:
+    SHA-256 over the canonical JSON (`canonical_json_bytes`) of the member
+    entries sorted by path, where each entry is exactly `{"path": <relative
+    posix path>, "sha256": <member byte hex>, "bytes": <member length>}`.
+    The manifest producer declares the recipe label per tree and pins the
+    resulting digest; `_emit_tree_commitment` produces these commitments and
+    `_verify_tree_payload` compares them with the declared pins. This function
+    never verifies by itself.
     """
     ordered = sorted(member_entries, key=lambda entry: entry["path"])
     return sha256_bytes(canonical_json_bytes(ordered))
+
+
+def _emit_tree_commitment(
+    root: Path,
+    source_relative: PurePosixPath,
+    limits: dict[str, int],
+    host: str,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Compute the producer-direction tree commitment for one source tree.
+
+    This is the producer-owned side of the versioned tree-digest recipe: the
+    host-bundle manifest names this module as its generator script, and every
+    tree pin in that manifest is a commitment of exactly this shape.
+    `_verify_tree_payload` routes its source observation through this helper
+    and compares the result with the declared pins, so production and
+    verification share one recipe implementation. Returns the manifest-shaped
+    commitment plus the observed member bytes keyed by relative path.
+    """
+    source = root.joinpath(*source_relative.parts)
+    if source.is_symlink() or not source.is_dir():
+        raise BundleError(f"{host}: expected tree source is missing")
+    observed: list[str] = []
+    for file_path in _walk_tree(source):
+        if file_path.is_symlink() or not file_path.is_file():
+            raise BundleError(f"{host}: tree member is not a regular file: {file_path.name!r}")
+        observed.append(file_path.relative_to(source).as_posix())
+    observed.sort()
+    member_entries: list[dict[str, Any]] = []
+    member_bytes: dict[str, bytes] = {}
+    for member in observed:
+        data = _read_snapshot(root, source_relative / PurePosixPath(member), limits)
+        member_entries.append({"path": member, "sha256": sha256_bytes(data), "bytes": len(data)})
+        member_bytes[member] = data
+    commitment = {
+        "tree_digest_recipe": TREE_DIGEST_RECIPE,
+        "tree_digest_sha256": _tree_digest(member_entries),
+        "tree_file_count": len(observed),
+        "tree_files": [
+            {"path": entry["path"], "sha256": entry["sha256"]} for entry in member_entries
+        ],
+    }
+    return commitment, member_bytes
 
 
 def _validate_route_profile(profile: dict[str, Any], host: str) -> None:
@@ -776,9 +823,6 @@ def _verify_tree_payload(
         raise BundleError(f"{host}: unsupported tree digest recipe")
     source_relative = _safe_relative(str(mapping.get("source", "")), "payload source")
     destination_relative = _safe_relative(str(mapping.get("destination", "")), "payload destination")
-    source = root.joinpath(*source_relative.parts)
-    if source.is_symlink() or not source.is_dir():
-        raise BundleError(f"{host}: expected tree source is missing")
     declared_files = mapping.get("tree_files")
     if not isinstance(declared_files, list) or not declared_files:
         raise BundleError(f"{host}: tree payload {source_relative.as_posix()!r} declares no members")
@@ -803,18 +847,14 @@ def _verify_tree_payload(
         f"{host}: tree payload {source_relative.as_posix()!r}",
         label="tree_digest_sha256",
     )
-    observed: list[str] = []
-    for file_path in _walk_tree(source):
-        if file_path.is_symlink() or not file_path.is_file():
-            raise BundleError(f"{host}: tree member is not a regular file: {file_path.name!r}")
-        observed.append(file_path.relative_to(source).as_posix())
-    observed.sort()
+    commitment, member_bytes = _emit_tree_commitment(root, source_relative, limits, host)
+    observed = [item["path"] for item in commitment["tree_files"]]
     if observed != sorted(declared):
         raise BundleError(f"{host}: tree payload {source_relative.as_posix()!r} member set mismatch")
     staged: list[tuple[PurePosixPath, bytes]] = []
     member_entries: list[dict[str, Any]] = []
     for member in observed:
-        data = _read_snapshot(root, source_relative / PurePosixPath(member), limits)
+        data = member_bytes[member]
         if sha256_bytes(data) != declared[member]:
             raise BundleError(f"{host}: tree member bytes do not match the declared pin: {member!r}")
         staged.append((destination_relative / PurePosixPath(member), data))
