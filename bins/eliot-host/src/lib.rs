@@ -1138,6 +1138,14 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         test: "983/case-9",
     },
     HostLifecycleBoundary {
+        name: "backup-prepare.terminal",
+        source_item: "HostComposition::backup_dispatch_prepare",
+        owner_state: "caller auth, owner lease/installation binding, owner evidence, registry-revision fence, journal persistence",
+        event: "host-backup-prepare-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
         name: "backup-cutover-retire.terminal",
         source_item: "HostComposition::backup_dispatch_cutover_retire",
         owner_state: "admitted cutover body/retirement barrier/authorization",
@@ -1451,6 +1459,8 @@ const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
 // shutdown failure (`host-stop-failed`, `host-open-failed`).
 const BOUNDARY_BACKUP_CUTOVER_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-backup-cutover-failed");
+const BOUNDARY_BACKUP_PREPARE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-prepare-failed");
 const BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-backup-cutover-disposition-failed");
 const BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL: &HostLifecycleBoundary =
@@ -5802,11 +5812,20 @@ impl HostComposition {
         ),
         crate::backup_preparation::PreparationError,
     > {
+        // F-LOG-HOST-8 (#983 W4): this admitted preparation port is the outer
+        // caller boundary for one failed preparation operation, so it owns the
+        // single terminal record. Armed on entry and disarmed on the success
+        // return only; the leaf's `backup_preparation` phase/refusal records
+        // stay nonterminal and correlate beneath it. Operation failure stays
+        // distinct from a separate process shutdown failure.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_PREPARE_TERMINAL);
         // Route through the shared dispatch validation before delegating:
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        self.prepare_backup_destination(journal, caller, request)
+        let prepared = self.prepare_backup_destination(journal, caller, request)?;
+        host_terminal.disarm();
+        Ok(prepared)
     }
 
     /// Dispatches one admitted installation cutover through the existing

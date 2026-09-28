@@ -109,8 +109,8 @@
   },
   "boundary_table": {
   "source": "bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE",
-  "rows": 116,
-  "emitting": 113,
+  "rows": 120,
+  "emitting": 117,
   "propagated": 3,
   "propagated_exclusions": [
     "propagated.phase-b-rollback",
@@ -188,6 +188,10 @@
     "liveness.requested",
     "liveness.terminal",
     "liveness.observed",
+    "backup-prepare.terminal",
+    "backup-cutover.terminal",
+    "backup-cutover-disposition.terminal",
+    "backup-cutover-retire.terminal",
     "reconcile.requested",
     "reconcile.terminal",
     "reconcile.admitted",
