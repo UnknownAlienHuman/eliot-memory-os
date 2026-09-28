@@ -21,6 +21,13 @@ use crate::{
     RouteFingerprint,
 };
 
+pub mod transformations;
+
+pub use transformations::{
+    EventReorderRequest, OutputIndexCollapseRequest, ProviderSourceStream, ProviderStreamFraming,
+    ProviderStreamTranslationBridge, ToolArgumentRepairRequest, UnknownBlockDropRequest,
+};
+
 /// Provider payload metadata plus its opaque immutable source identity.
 ///
 /// The raw bytes are carried separately by [`SharedProviderPayload`] so cloning
@@ -895,4 +902,10 @@ pub enum TranslationError {
     SourceContract(ContractError),
     #[error("privacy metadata validation failed: {0}")]
     PrivacyContract(ObservationError),
+    #[error("the named translation target is absent from the source event set")]
+    UnknownTransformationTarget,
+    #[error("the named translation target is not a quarantined unknown block")]
+    NotAQuarantinedUnknownBlock,
+    #[error("the requested transformation would not change the translated representation")]
+    DegenerateTransformation,
 }
