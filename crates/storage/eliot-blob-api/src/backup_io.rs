@@ -28,7 +28,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BlobError, BlobHash, BlobId, BlobLocator, BlobRootLease, CryptoDescriptor, ObjectResidencyKey,
+    BlobError, BlobHash, BlobId, BlobLocator, BlobReadyReceipt, BlobRootLease, CryptoDescriptor,
+    ObjectResidencyKey,
 };
 
 fn validate_hex_field(value: &str, field: &'static str) -> Result<(), BlobError> {
@@ -37,6 +38,70 @@ fn validate_hex_field(value: &str, field: &'static str) -> Result<(), BlobError>
         reason: "must be lowercase hex",
     })?;
     Ok(())
+}
+
+/// Original sealed envelope bytes fetched by the active Blob owner together
+/// with the exact durable receipt that already binds them.
+///
+/// This is an export/read result, not a second receipt. It is deliberately
+/// not deserializable: the Blob owner constructs it only after resolving the
+/// requested lease, metadata digest, and ready-receipt identity against its
+/// stored object. The byte check below preserves the owner's existing sealed
+/// digest instead of inventing new capture evidence or re-sealing plaintext.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SealedBlobRead {
+    ready_receipt: BlobReadyReceipt,
+    sealed_bytes: Vec<u8>,
+}
+
+impl SealedBlobRead {
+    /// Binds exact stored bytes to an already owner-issued receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the receipt validation error or an integrity error if the
+    /// envelope length or existing sealed digest does not match the receipt.
+    pub fn from_verified(
+        ready_receipt: BlobReadyReceipt,
+        sealed_bytes: Vec<u8>,
+    ) -> Result<Self, BlobError> {
+        let value = Self {
+            ready_receipt,
+            sealed_bytes,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// The exact ready receipt read from the Blob owner's stored metadata.
+    #[must_use]
+    pub fn ready_receipt(&self) -> &BlobReadyReceipt {
+        &self.ready_receipt
+    }
+
+    /// The exact sealed envelope bytes stored by the Blob owner.
+    #[must_use]
+    pub fn sealed_bytes(&self) -> &[u8] {
+        &self.sealed_bytes
+    }
+
+    /// Consumes this validated pair without changing either owner value.
+    #[must_use]
+    pub fn into_parts(self) -> (BlobReadyReceipt, Vec<u8>) {
+        (self.ready_receipt, self.sealed_bytes)
+    }
+
+    /// Re-validates the existing receipt and its byte binding.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.ready_receipt.validate()?;
+        if self.sealed_bytes.is_empty()
+            || self.sealed_bytes.len() as u64 != self.ready_receipt.stored_length()
+            || sha256_hex(&self.sealed_bytes) != self.ready_receipt.sealed_sha256()
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Owner-issued destination scope for sealed-blob backup import.
