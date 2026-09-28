@@ -638,19 +638,21 @@ impl WatchdogComposition {
     /// it cannot stall supervision or exhaust the Control Reserve.
     ///
     /// Registration is refused only by this composition's own bounded table
-    /// (exhausted, or closed by this composition's own shutdown). Starting
-    /// supervision does not close it, and another composition's shutdown does
-    /// not affect it, so the port stays registrable for the whole supervised
-    /// lifetime.
+    /// (exhausted, or closed by this composition's own shutdown), by an
+    /// unrecognized composition identity, or by an unreachable owner spool.
+    /// Starting supervision does not close it, and another composition's
+    /// shutdown does not affect it, so the port stays registrable for the whole
+    /// supervised lifetime.
     ///
     /// # Errors
     ///
-    /// Returns an error when the composition identity is unexpected or when
-    /// the injected kernel port owns no spool, so no owner-bound backup port
-    /// exists to admit.
+    /// Returns [`crate::BackupControlError`] when the composition identity is
+    /// unexpected, when the injected kernel port owns no spool, when the
+    /// owner-bound spool is not reachable, or when this composition's own
+    /// bounded registration table is exhausted or closed.
     pub fn register_backup_control(
         &self,
-    ) -> Result<crate::backup_control::BackupControlHandle, CompositionError> {
+    ) -> Result<crate::backup_control::BackupControlHandle, crate::BackupControlError> {
         crate::backup_control::register_backup_control(self)
     }
 
@@ -853,6 +855,27 @@ impl WatchdogBackupPort {
     #[must_use]
     pub const fn watchdog_generation(&self) -> u64 {
         self.watchdog_generation
+    }
+
+    /// Proves the owner spool this port is bound to is live and readable now.
+    ///
+    /// One real read transaction against the owner's own `watchdog.redb`
+    /// high-water metadata, through the same owner handle every heartbeat and
+    /// gap record is appended through. No second database is opened and no
+    /// state is mutated.
+    ///
+    /// The returned value is the owner's own durable sequence, not a synthetic
+    /// one. Callers use this to establish that the resource behind a backup
+    /// registration is genuinely reachable, instead of establishing only that a
+    /// slot number was handed out; it mints no identity, authority, fence, or
+    /// approval, and it is not a health verdict about the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the owner's database cannot be read or its
+    /// high-water metadata is absent or invalid.
+    pub(crate) fn owner_spool_high_water(&self) -> Result<u64, SpoolError> {
+        self.spool.high_water_sequence()
     }
 
     /// Binds one capture request against the owner's retained identity.
