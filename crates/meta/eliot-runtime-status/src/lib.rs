@@ -94,9 +94,9 @@ pub use controlboard_consumer::{
     CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardConsumerError,
     ControlBoardEvidenceHandle, ControlBoardExpectedSet, ControlBoardGeneration,
     ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
-    ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
-    RenderedControlBoard, RenderedControlBoardRow, read_controlboard_status,
-    render_controlboard_status,
+    ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
+    ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
+    read_controlboard_status, render_controlboard_status,
 };
 
 mod controlboard_transport;

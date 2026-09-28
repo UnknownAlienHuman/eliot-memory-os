@@ -307,8 +307,8 @@ mod tests {
     use super::super::controlboard_consumer::{
         CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardEvidenceHandle,
         ControlBoardGeneration, ControlBoardInstallation, ControlBoardObservationTime,
-        ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
-        RenderedControlBoard, RenderedControlBoardRow,
+        ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
+        ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
     };
     use super::*;
 
@@ -333,6 +333,7 @@ mod tests {
             disposition,
             summary: summary.map(str::to_owned),
             capability: Some(ControlBoardCapability::new("controlboard.read").expect("capability")),
+            owner: Some(ControlBoardOwner::new("owner-transport-test").expect("owner")),
             generation: Some(
                 ControlBoardGeneration::new("generation-transport-test").expect("generation"),
             ),

@@ -18,8 +18,8 @@
 
 use eliot_runtime_status::{
     CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardCapability,
-    ControlBoardEvidenceHandle, ControlBoardGeneration, ControlBoardTransportMessage,
-    RenderedControlBoard,
+    ControlBoardEvidenceHandle, ControlBoardGeneration, ControlBoardOwner,
+    ControlBoardTransportMessage, RenderedControlBoard,
 };
 
 /// Re-exported operation selector so the composition root names the exact
@@ -81,6 +81,7 @@ pub fn render_status_json(
                 "disposition": row.disposition.label(),
                 "summary": row.summary,
                 "capability": row.capability.as_ref().map(ControlBoardCapability::as_str),
+                "owner": row.owner.as_ref().map(ControlBoardOwner::as_str),
                 "generation": row.generation.as_ref().map(ControlBoardGeneration::as_str),
                 "evidence_handle": row.evidence_handle.as_ref().map(ControlBoardEvidenceHandle::as_str),
                 "installation": row.installation.as_str(),
@@ -155,6 +156,7 @@ mod tests {
             disposition,
             summary: summary.map(str::to_owned),
             capability: Some(ControlBoardCapability::new("controlboard.read").expect("capability")),
+            owner: Some(ControlBoardOwner::new("owner-consumer-test").expect("owner")),
             generation: Some(
                 ControlBoardGeneration::new("generation-consumer-test").expect("generation"),
             ),
