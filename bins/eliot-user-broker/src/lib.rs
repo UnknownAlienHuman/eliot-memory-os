@@ -62,9 +62,9 @@ pub use notify_fallback_ensure::{
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
-    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyLaunchStage, VerifiedLaunchRef,
-    admit_notify_request, request_names_notify_image, resolve_broker_notify_launch,
-    stage_normal_notify_launch,
+    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyLaunchStage,
+    VerifiedLaunchRef, admit_notify_request, render_notify_acknowledge_line,
+    request_names_notify_image, resolve_broker_notify_launch, stage_normal_notify_launch,
 };
 use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
@@ -836,10 +836,10 @@ impl ProcessPort for LocalProcessPort {
         _registration: &RegistrationReceipt,
         expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError> {
-        let (request, stdin_payload) = self
-            .pending_requests
-            .remove(&grant.approved.operation_id)
-            .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
+        let (request, stdin_payload) =
+            self.pending_requests
+                .remove(&grant.approved.operation_id)
+                .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
         let request_digest = request.invocation_digest().to_owned();
         if request_digest != expected_request_digest {
             return Err(PortError::Invalid(
@@ -1586,6 +1586,58 @@ impl BrokerComposition {
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
         self.broker.launch(request).map_err(Self::classify)
+    }
+
+    /// Spawns the per-user notification adapter to record one authenticated
+    /// Human acknowledgement (issue #1780, A2).
+    ///
+    /// This is the composition's production entry to the acknowledgement leg,
+    /// and the reason `eliot-notify`'s acknowledgement line has a caller: the
+    /// broker is the only admitted spawner (I11.6:7, "canonical notification →
+    /// User Broker → native toast → authenticated local UI"), so the broker is
+    /// what composes the line the adapter serves
+    /// ([`notify_launch_callin::render_notify_acknowledge_line`]).
+    ///
+    /// The same three independent gates as [`Self::launch_notify`] apply — the
+    /// protected launch lease, the retained verified launch reference, and the
+    /// request naming exactly those bytes — plus one more: a caller-supplied
+    /// `stdin_payload` is refused, so the bytes handed to the child are always
+    /// the line this composition rendered and never caller text.
+    ///
+    /// The acknowledgement is a Human role action (I11.3:13) and it is not a
+    /// resolution (I11.7:5): the principal travels as record data, the
+    /// transition is applied and re-validated on the admitted Kernel route
+    /// inside the adapter, and the record stays unresolved.
+    ///
+    /// `principal` is the authenticated principal this broker admitted for the
+    /// request. It is never taken from the request line: it is the identity
+    /// `admit_human_state_change` proved against the live registration, so the
+    /// canonical record can name no actor but the admitted Human.
+    pub fn launch_notify_acknowledge(
+        &mut self,
+        request: LaunchRequest,
+        acknowledgement: &NotifyAcknowledge,
+        principal: &str,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        // This gate also refuses a caller-supplied `stdin_payload`, so the bytes
+        // bound below are the only bytes this launch can ever carry.
+        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+            |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
+        )?;
+        let line = notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
+            .map_err(|error| {
+                CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+            })?;
+        // The rendered line becomes the admitted request's own standard-input
+        // bytes, so it is inside `digest(&request)`: this operation identity is
+        // bound to exactly this acknowledgement, and a replay carrying different
+        // bytes is a `ReplayConflict` rather than a second effect.
+        let request = LaunchRequest {
+            stdin_payload: Some(line),
+            ..request
+        };
+        self.launch(request)
     }
 
     /// The composition's production entry to the owner-issued, single-use

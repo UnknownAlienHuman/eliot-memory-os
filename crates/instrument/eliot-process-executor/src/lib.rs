@@ -2050,9 +2050,7 @@ impl WindowsProcessExecutor {
             .map_err(unavailable)?;
             let spec = match stdin_payload {
                 None => spec,
-                Some(payload) => {
-                    spec.with_stdin(payload.to_vec()).map_err(unavailable)?
-                }
+                Some(payload) => spec.with_stdin(payload.to_vec()).map_err(unavailable)?,
             };
             let active_limit = request
                 .resource_limits()

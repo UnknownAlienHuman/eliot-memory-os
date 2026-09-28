@@ -44,8 +44,7 @@
 use std::path::{Path, PathBuf};
 
 use eliot_notify::{
-    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, render_acknowledge_request,
-    resolve_notify_launch_inputs,
+    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
 
@@ -327,6 +326,14 @@ impl BrokerNotifyLaunchAuthority {
 /// staging and launch therefore fails the request-time comparison as well as
 /// the launch-time re-hash inside the process port.
 ///
+/// A third check makes the adapter's input channel broker-authored: a request
+/// that already carries standard-input bytes is refused. The delivery-shaped
+/// notify request renders no line of its own, so bytes on it can only have come
+/// from a caller, and the one admitted request that does carry a line — the
+/// acknowledgement — binds its own rendered bytes after this gate has run. That
+/// keeps [`render_notify_acknowledge_line`] the single writer of a notify
+/// child's standard input.
+///
 /// The retained reference itself stays inside the composition: returning it
 /// would only re-expose the same verified bytes the request already names, and
 /// holding the borrow across the dispatch would tie admission to the very
@@ -336,13 +343,18 @@ impl BrokerNotifyLaunchAuthority {
 ///
 /// Returns [`BrokerNotifyError::NotAuthenticated`] when the broker retains no
 /// verified reference, [`BrokerNotifyError::NotNotifyImage`] when the request
-/// does not name the canonical installed Notify image, and
+/// does not name the canonical installed Notify image,
+/// [`BrokerNotifyError::UnexpectedStdinPayload`] when the request already
+/// carries caller-authored standard-input bytes, and
 /// [`BrokerNotifyError::BindingRejected`] when the executable path or artifact
 /// digest diverges from the retained verified bytes.
 pub fn admit_notify_request(
     authority: &BrokerNotifyLaunchAuthority,
     request: &eliot_user_broker_core::LaunchRequest,
 ) -> Result<(), BrokerNotifyError> {
+    if request.stdin_payload.is_some() {
+        return Err(BrokerNotifyError::UnexpectedStdinPayload);
+    }
     let launch = authority
         .launch_ref()
         .ok_or(BrokerNotifyError::NotAuthenticated)?;
@@ -380,10 +392,12 @@ pub fn request_names_notify_image(request: &eliot_user_broker_core::LaunchReques
 /// One authenticated Human acknowledgement of one canonical notification.
 ///
 /// This is the broker edge's typed input for the acknowledgement leg. It
-/// carries only what the acknowledged record already names plus the
-/// acknowledging principal as record data (I11.3:13, "Any authorized role …
-/// acknowledge notifications"). It mints no authority: the transition itself is
-/// applied and re-validated on the admitted Kernel route inside the spawned
+/// carries only what the acknowledged record already names: the acknowledging
+/// principal is deliberately NOT a wire field. I11.3:13 places the
+/// acknowledging act in the Human's hands, so the identity recorded on the
+/// canonical record is the principal this broker admitted and proved, never
+/// caller-supplied text. This struct mints no authority: the transition itself
+/// is applied and re-validated on the admitted Kernel route inside the spawned
 /// adapter, and the acknowledgement deliberately leaves the record unresolved
 /// (I11.7:5).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -395,8 +409,6 @@ pub struct NotifyAcknowledge {
     pub parent: NotificationRequest,
     /// The exact canonical notification handle recorded on that request.
     pub notification_id: PlatformHandle,
-    /// The acknowledging role identity, recorded as record data.
-    pub principal: String,
 }
 
 /// Renders the exact one-shot standard-input line for one acknowledged
@@ -409,6 +421,11 @@ pub struct NotifyAcknowledge {
 /// schema is the single wire vocabulary, and no second spelling of it is
 /// introduced here.
 ///
+/// `principal` is the authenticated principal the broker admitted for this
+/// request. It is the only actor the record can name, and it travels as record
+/// data: the acknowledged transition is applied and re-validated on the admitted
+/// Kernel route inside the adapter, not by this line.
+///
 /// The trailing newline is the line-protocol frame the adapter's
 /// [`eliot_notify::parse_notify_stdin_request`] reader expects; the carriage in
 /// `SuspendedLaunchSpec::with_stdin` writes these bytes verbatim and then
@@ -417,20 +434,21 @@ pub struct NotifyAcknowledge {
 ///
 /// # Errors
 ///
-/// Returns [`BrokerNotifyError::InvalidIdentity`] when the principal is blank
-/// (an acknowledgement with no actor is not a Human action), and
+/// Returns [`BrokerNotifyError::InvalidIdentity`] when the admitted principal is
+/// blank (an acknowledgement with no actor is not a Human action), and
 /// [`BrokerNotifyError::InvalidDeclaration`] when the line cannot be rendered.
 /// Both are fail-closed stable codes; no payload material is echoed.
 pub fn render_notify_acknowledge_line(
     acknowledgement: &NotifyAcknowledge,
+    principal: &str,
 ) -> Result<String, BrokerNotifyError> {
-    if acknowledgement.principal.trim().is_empty() {
+    if principal.trim().is_empty() {
         return Err(BrokerNotifyError::InvalidIdentity);
     }
     let mut line = eliot_notify::render_acknowledge_request(
         &acknowledgement.parent,
         acknowledgement.notification_id.clone(),
-        &acknowledgement.principal,
+        principal,
     )
     .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
     line.push('\n');

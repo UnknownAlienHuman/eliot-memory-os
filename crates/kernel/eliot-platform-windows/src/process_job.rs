@@ -1779,7 +1779,15 @@ fn inheritable_pipe_with_buffer(
         bInheritHandle: 1,
     };
     // SAFETY: output pointers and security attributes are valid for the call.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, buffer_bytes) } == 0 {
+    if unsafe {
+        CreatePipe(
+            &raw mut read,
+            &raw mut write,
+            &raw const attributes,
+            buffer_bytes,
+        )
+    } == 0
+    {
         return Err(last_windows_adapter_error());
     }
     Ok((
@@ -2810,7 +2818,8 @@ impl SuspendedJobChild {
         let mut environment = command_environment(&spec.environment);
         let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
             .map_err(|error| windows_adapter_from_io(&error))?;
-        let (stdin_read, stdin_write) = inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
+        let (stdin_read, stdin_write) =
+            inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
         let (stdout_read, stdout_write) = inheritable_pipe()?;
         let (stderr_read, stderr_write) = inheritable_pipe()?;
         make_non_inheritable(stdin_write.0)?;

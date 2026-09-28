@@ -244,10 +244,10 @@ pub use process_job::{
     ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
     JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
     RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
-    SuspendedExistingJobChild, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
-    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedValidationError, TerminatedExistingJobChild,
-    TerminatedJobChild, ValidatedSuspendedExistingJobChild, ValidatedSuspendedJobChild,
-    cancel_capture_thread_io,
+    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
+    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
+    ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
 pub use process_path_lease::RetainedProcessPathLease;
 pub use protected_path::{
