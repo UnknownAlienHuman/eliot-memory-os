@@ -127,6 +127,7 @@
 //! the exact canonical receipt the commit entry point demands, and a payload
 //! that merely asserts proven-not-applied is refused, because asserting it on
 //! the wire is not the act.
+//!
 //! # Write submission and the admission decision
 //!
 //! [`WriteSubmission`] is the I5.19 admission result returned by the front door
@@ -1163,6 +1164,8 @@ fn require_committed_receipt_evidence(
         return Err(StoreError::InvalidReceipt);
     }
     Ok(())
+}
+
 /// Maximum reason codes one [`WriteSubmission`] may carry.
 ///
 /// The bound keeps an admission decision a bounded operational response. A

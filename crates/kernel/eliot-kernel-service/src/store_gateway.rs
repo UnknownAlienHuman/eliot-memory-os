@@ -684,22 +684,37 @@ impl KernelStoreGateway {
     }
 
     /// Applies one already prepared transition after fixed Kernel admission.
+    ///
+    /// The refusal is the typed [`StoreApplyRefusal`] rather than a flattened
+    /// string, so the I5.19 admission decision this route actually took reaches
+    /// the caller as typed evidence instead of being erased into prose: the
+    /// `not_accepted` decision keeps its submission id, reason codes, and next
+    /// allowed action, while every pre-existing gateway refusal keeps the exact
+    /// text it has always returned.
     pub async fn apply(
         &self,
         context: &RequestMetadata,
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> Result<WriteReceipt, String> {
-        let _flight = self.flight.enter()?;
+    ) -> Result<WriteReceipt, StoreApplyRefusal> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
-        self.refuse_shadow_mutation()?;
+        self.refuse_shadow_mutation()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
         // 1927: authenticate the caller before plan admission (I5.6 step 1),
         // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
-            return Err("transition caller is not the active daemon".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "transition caller is not the active daemon".to_owned(),
+            ));
         }
         // I5.19: `admit_prepared_transition` is the single decision point for
         // this route. It returns the typed `staged` decision on its accepted
@@ -721,15 +736,18 @@ impl KernelStoreGateway {
         )?;
 
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            let service = self.service.lock().map_err(|_| {
+                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
-                return Err("Kernel generation is fenced".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "Kernel generation is fenced".to_owned(),
+                ));
             }
             if self.is_fenced() {
-                return Err("canonical-store gateway is fenced for rebind".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "canonical-store gateway is fenced for rebind".to_owned(),
+                ));
             }
             // Canonical route/epoch gate (Implements #64): route currency is
             // the exact-tuple match between the composition-bound route epoch
@@ -740,13 +758,13 @@ impl KernelStoreGateway {
             if !self.route.authority_epoch().is_same_authority(&live_epoch)
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
-                return Err(
+                return Err(StoreApplyRefusal::GatewayRefusal(
                     "canonical-store route is outside the active Kernel generation".to_owned(),
-                );
+                ));
             }
             let lease = service
                 .acquire_admission()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
             // Slices A+B (#65): `apply_prepared` is normal Store work
             // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
             // above holds a Slice A typed normal permit from the disjoint
@@ -758,12 +776,16 @@ impl KernelStoreGateway {
                 .authority_epoch()
                 .is_same_authority(&transition.state_fence.authority_epoch)
             {
-                return Err("canonical-store route authority epoch is stale".to_owned());
+                return Err(StoreApplyRefusal::GatewayRefusal(
+                    "canonical-store route authority epoch is stale".to_owned(),
+                ));
             }
             lease
         };
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
 
         let identity = transition.identity.clone();
@@ -799,7 +821,7 @@ impl KernelStoreGateway {
             query,
         )
         .await
-        .map_err(|error| error.to_string());
+        .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()));
         drop(lease);
         result
     }
@@ -5519,15 +5541,16 @@ fn refuse_determinate_reserved_write(
 /// into the `Err` arm HERE, which is why the decision point is this function
 /// and not [`KernelStoreGateway::apply`]: there is no second state check
 /// downstream that a `not_accepted` or `resolved_existing` value would have to
-/// be caught by. The composed refusal text keeps both the typed decision and
-/// the gate's own cause, so the operational response can name the I5.19
-/// decision that was taken and the specific refusal under it.
+/// be caught by. The refusal is the typed [`StoreApplyRefusal`], whose rendered
+/// line keeps both the typed decision and the gate's own cause, so the
+/// operational response can name the I5.19 decision that was taken and the
+/// specific refusal under it.
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<WriteSubmission, String> {
+) -> Result<WriteSubmission, StoreApplyRefusal> {
     let gate: Result<(), StoreError> = (|| {
         context.validate().map_err(StoreError::Foundation)?;
         transition.validate()?;
@@ -5557,14 +5580,19 @@ fn admit_prepared_transition(
         // A request whose own identity is unnameable has no submission to
         // report under, so the gate's own typed refusal is reported instead.
         Err(unnameable) => {
-            return Err(gate_cause.unwrap_or_else(|| unnameable.to_string()));
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                gate_cause.unwrap_or_else(|| unnameable.to_string()),
+            ));
         }
     };
     if submission.state != WriteSubmissionState::Staged {
-        return Err(match gate_cause {
-            Some(cause) => format!("{submission}; cause: {cause}"),
-            None => submission.to_string(),
-        });
+        // The gate ORDER above is load-bearing and this runs before any store
+        // send, so a non-`staged` decision is always produced BY one of those
+        // gates: `gate_cause` is therefore present on every armed
+        // `Admission` refusal and the composed text stays byte-identical to
+        // the single line this arm has always rendered.
+        let cause = gate_cause.unwrap_or_else(|| submission.to_string());
+        return Err(StoreApplyRefusal::admission(submission, cause));
     }
     Ok(submission)
 }
@@ -5666,6 +5694,71 @@ where
         ));
     }
     Ok(response)
+}
+
+/// Closed refusal set for one `Apply` through the Kernel gateway.
+///
+/// Two arms, and they stay separate because they carry different evidence:
+///
+/// - [`StoreApplyRefusal::Admission`] is a real I5.19 admission decision. The
+///   typed [`WriteSubmission`] is kept whole, so the submission id, state,
+///   reason codes, retry-identity rule, next allowed action, and any I5.17
+///   split directive reach the caller as typed evidence instead of being
+///   erased into prose before the response is built. The `cause` is the
+///   preserving gate's own text, carried beside the decision rather than
+///   re-derived from it, and the rendered line is byte-identical to the single
+///   line this refusal has always produced.
+/// - [`StoreApplyRefusal::GatewayRefusal`] is every pre-existing refusal
+///   (flight fence, shadow mutation, route/epoch staleness, unknown-commit
+///   recovery) plus a request whose own identity is too malformed to name a
+///   submission under. Its text is preserved exactly; no message is rewritten,
+///   reworded, or reinterpreted on the way out.
+///
+/// The `Display` of both arms is the operator-visible refusal line, so every
+/// existing consumer that renders the value sees the same message it saw when
+/// this route returned a bare `String`.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreApplyRefusal {
+    /// The I5.19 admission decision refused the submission, composed with the
+    /// specific preserving gate that refused it.
+    #[error("{submission}; cause: {cause}")]
+    Admission {
+        /// The typed admission decision taken by the gate, boxed so a refusal
+        /// value stays small enough to return by value from every entry point.
+        /// The decision itself is unchanged and is handed out as a plain
+        /// borrow by [`StoreApplyRefusal::admission_decision`].
+        submission: Box<WriteSubmission>,
+        /// The preserving gate's own refusal text, preserved unchanged.
+        cause: String,
+    },
+    /// A pre-existing gateway refusal, preserved exactly.
+    #[error("{0}")]
+    GatewayRefusal(String),
+}
+
+impl StoreApplyRefusal {
+    /// Arms the typed admission arm from a decision and its preserving cause.
+    ///
+    /// The cause is taken as given, never re-derived: it is the exact text the
+    /// preserving gate produced, and the rendered line is the same
+    /// `"<decision>; cause: <cause>"` line this refusal has always rendered.
+    pub fn admission(submission: WriteSubmission, cause: String) -> Self {
+        Self::Admission {
+            submission: Box::new(submission),
+            cause,
+        }
+    }
+
+    /// Returns the typed admission decision when this refusal carries one.
+    ///
+    /// `None` is a pre-existing gateway refusal: there is no admission decision
+    /// to report, and a caller must not infer one from the prose.
+    pub fn admission_decision(&self) -> Option<&WriteSubmission> {
+        match self {
+            Self::Admission { submission, .. } => Some(submission.as_ref()),
+            Self::GatewayRefusal(_) => None,
+        }
+    }
 }
 
 /// Closed failure set for one named Store read through the Kernel gateway.
@@ -5814,7 +5907,7 @@ mod tests {
             Ok(_) => unreachable!("unsupported manifest must fail"),
         };
         assert!(
-            error.contains("recovery"),
+            error.to_string().contains("recovery"),
             "unsupported plan must name recovery, got: {error}"
         );
     }
