@@ -34,12 +34,14 @@ pub use admission_reservation::{
     verify_admission_reservation_launch_prerequisite,
 };
 pub use backup_snapshot::{
-    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
-    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION, OrsBackupDestination,
-    OrsBackupEntry, OrsBackupFence, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
-    OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, OrsFamilyContinuation,
-    OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition,
-    RowFamilyDisposition, RowFamilyKind, StoredEffectClass,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
+    MAX_BACKUP_ID_LEN, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION,
+    ORS_OPERATIONAL_CURSOR_VERSION, OrsBackupDestination, OrsBackupEntry, OrsBackupFence,
+    OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest,
+    OrsBackupSnapshot, OrsBackupSourceIdentity, OrsFamilyContinuation, OrsFamilyCursor,
+    OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
+    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
+    RowFamilyKind, RowPayloadState, StoredEffectClass,
 };
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,

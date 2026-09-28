@@ -3279,6 +3279,38 @@ impl RedbRecoveryStore {
         )
     }
 
+    /// Opens the typed operational-history cursor for a backup (issue #2967).
+    ///
+    /// The operational twin of
+    /// [`Self::open_backup_process_stream_recovery_family`], and for the same
+    /// reason it is the ONLY producer of an operational cursor: it reads the
+    /// owner-observed ordering high-water and the streamed content root, eligible
+    /// row count and encoded-byte denominator of the declared window under ONE read
+    /// transaction, so the frozen operational identity can never mix two moments.
+    /// Attach the returned cursor with
+    /// [`crate::backup_snapshot::OrsBackupRequest::with_operational_cursor`] so the
+    /// operational history is paged by an exact continuation under a frozen
+    /// high-water instead of by `after_order + page_entries * page_index`, which is
+    /// not a continuation in a sparse operation-order domain.
+    ///
+    /// `after_order` is the walk's declared EXCLUSIVE start and becomes part of the
+    /// frozen identity, so the denominator this cursor declares is the window the
+    /// caller asked for and not the whole history. Omitting the cursor entirely
+    /// exports the first page of exactly that window and nothing beyond it, which is
+    /// the same subsetting statement in a different form.
+    ///
+    /// Opening the cursor is not authority, confers no restore path, and does not
+    /// bound the family's retention. Rows above the frozen high-water are a
+    /// successor snapshot's rows, never this one's, even when they were already
+    /// durable and stable when the cursor was opened.
+    pub fn open_backup_operational_history(
+        &self,
+        source: &crate::backup_snapshot::OrsBackupSourceIdentity,
+        after_order: u64,
+    ) -> Result<crate::backup_snapshot::OrsOperationalCursor, OrsError> {
+        backup_snapshot::open_backup_operational_history(&self.database, source, after_order)
+    }
+
     /// Triages one backup page as quarantined import outcomes without writing.
     ///
     /// Every entry returns imported/rejected/forensic/blocked/unresolved;
