@@ -18,17 +18,18 @@
 use std::collections::BTreeSet;
 
 use eliot_authority::{
-    AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantActivationRequest, GrantGraph,
-    GrantGraphRecoverySnapshot, GrantId, GrantRestoreOutcome, GrantRevocationRequest, GrantStatus,
-    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest, LogicalTime,
-    P07AuthorityPort, P07PortError, PrincipalRef, RevocationHistoryError,
+    AuthorityRevocationClosureEvidence, AuthoritySet, CapabilityGrant, EffectAuthorizer,
+    GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRestoreOutcome,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
+    IntroductionRevocationRequest, LogicalTime, P07AuthorityPort, P07PortError, PrincipalRef,
+    REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationEvidenceDisposition, RevocationHistoryError,
     RevocationHistoryEvidence, SuppressionCause, UnavailableP07AuthorityPort,
 };
 use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_receipts::{
     AuthorityBinding, EffectClass, ProofCeiling, SessionBinding, WorkScopeBinding,
 };
-use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState, RevocationReason};
+use eliot_security_contracts::{InfluenceState, RevocationReason};
 use std::num::NonZeroU64;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -91,6 +92,7 @@ fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> G
         source_revision: denominator.source_revision,
         closures: vec![closure(
             &denominator.mid_closure_id,
+            &denominator.authority_root,
             &denominator.mid_grant,
             &denominator
                 .mid_affected
@@ -268,21 +270,53 @@ fn chain(fence: &StateFence, denominator: &Denominator) -> GrantGraph {
     GrantGraph::from_grants([origin, mid, leaf, tip, unrelated], 7).expect("chain validates")
 }
 
+/// One declared authority-specific versioned closure (issue #2966 step 2).
+///
+/// The fixture declares the coordinates the durable history owner declares:
+/// the owner namespace the history was served under, the traversal bounds the
+/// affected membership was committed under, the completeness disposition, the
+/// omission set, and the two content addresses of the exact presented bytes.
 fn closure(
     closure_id: &str,
+    owner_namespace: &str,
     root_ref: &str,
     dependents: &[String],
     revision: u64,
     fence: &StateFence,
-) -> InfluenceDependencyClosure {
-    InfluenceDependencyClosure {
+) -> AuthorityRevocationClosureEvidence {
+    let dependent_refs = dependents.to_owned();
+    let affected = AuthorityRevocationClosureEvidence::members_of(root_ref, &dependent_refs);
+    let invalidation_reason = Some(RevocationReason::SourceRevoked);
+    let affected_member_digest =
+        AuthorityRevocationClosureEvidence::affected_members_digest(&affected)
+            .expect("affected membership is addressable");
+    let canonical_request_digest =
+        AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
+            closure_id,
+            root_ref,
+            &dependent_refs,
+            invalidation_reason,
+            InfluenceState::Revoked,
+            fence,
+            revision,
+        )
+        .expect("closure presentation is addressable");
+    AuthorityRevocationClosureEvidence {
+        evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
         closure_id: closure_id.to_owned(),
+        owner_namespace: owner_namespace.to_owned(),
         root_ref: root_ref.to_owned(),
-        dependent_refs: dependents.to_owned(),
-        invalidation_reason: Some(RevocationReason::SourceRevoked),
+        dependent_refs,
+        invalidation_reason,
         current_influence: InfluenceState::Revoked,
         state_fence: fence.clone(),
         revision,
+        bounds: eliot_influence::RevocationBounds::default_bounds(),
+        disposition: RevocationEvidenceDisposition::Complete,
+        omissions: Vec::new(),
+        affected_member_count: affected.len() as u64,
+        affected_member_digest,
+        canonical_request_digest,
     }
 }
 
@@ -299,6 +333,7 @@ fn origin_evidence(fence: &StateFence, denominator: &Denominator) -> RevocationH
         source_revision: denominator.source_revision,
         closures: vec![closure(
             &denominator.origin_closure_id,
+            &denominator.authority_root,
             &denominator.authority_root,
             &dependents,
             denominator.source_revision,
@@ -421,6 +456,7 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
         source_revision: denominator.source_revision,
         closures: vec![closure(
             &denominator.mid_closure_id,
+            &denominator.authority_root,
             &denominator.mid_grant,
             &denominator
                 .mid_affected
@@ -501,6 +537,7 @@ fn stale_evidence_refuses_restoration() {
         closures: vec![closure(
             &denominator.origin_closure_id,
             &denominator.authority_root,
+            &denominator.authority_root,
             &denominator.origin_affected,
             denominator.source_revision + 1,
             &fence,
@@ -542,6 +579,7 @@ fn unknown_evidence_refuses_restoration() {
     let mut active = closure(
         &denominator.origin_closure_id,
         &denominator.authority_root,
+        &denominator.authority_root,
         &denominator.origin_affected,
         denominator.source_revision,
         &fence,
@@ -565,12 +603,14 @@ fn unknown_evidence_refuses_restoration() {
     let later = closure(
         &denominator.origin_closure_id,
         &denominator.authority_root,
+        &denominator.authority_root,
         &denominator.origin_affected,
         denominator.source_revision,
         &fence,
     );
     let earlier = closure(
         "revocation-686-origin-00",
+        &denominator.authority_root,
         &denominator.authority_root,
         &denominator.origin_affected,
         denominator.source_revision,

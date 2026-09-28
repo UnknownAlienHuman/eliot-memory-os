@@ -60,17 +60,21 @@ use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoverySt
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure,
-    NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
-    ReadConsistency, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
-    generated_operation_manifests, operation_manifest_set_digest, parse_revocation_history_payload,
+    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationManifestDigest,
+    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, ScopeId, SecurityContext,
+    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
+    parse_revocation_history_payload,
 };
 
 use crate::{
     CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort, KernelPortError,
 };
-use eliot_authority::{GrantRevocationRequest, RevocationHistoryEvidence};
+use eliot_authority::{
+    AuthorityRevocationClosureEvidence, GrantRevocationRequest,
+    REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationEvidenceDisposition, RevocationHistoryEvidence,
+};
+use eliot_influence::RevocationBounds;
 
 /// Governor scope reused from the observation/operator precedent; no new
 /// scope is introduced for revocation recording.
@@ -363,6 +367,31 @@ pub fn revocation_history_read_request(
 /// (CURRENT vs stale/unknown) is enforced at restore by
 /// [`AuthorityOwner::from_snapshot_with_revocation_history`](crate::AuthorityOwner::from_snapshot_with_revocation_history),
 /// not here.
+///
+/// #2966 step 2: each row is declared here as the authority-specific
+/// versioned evidence, not as the shared `eliot-influence` observation DTO.
+/// The declared coordinates come from what the durable owner actually served
+/// and from what this owner actually did:
+///
+/// * the owner namespace is the exact `origin_ref` selector the durable
+///   payload echoes — the axis this owner pre-partitions history by, so a row
+///   served under another namespace is never merged into this one;
+/// * the declared bounds are the bounded-engine limits this owner used for
+///   the closure evidence it commits. The durable recorded row does not yet
+///   carry producer-chosen limits, so this is the same default the closure
+///   was always computed under, now declared by its producer instead of
+///   minted by the authority at admission;
+/// * the declared disposition is `Complete` because only committed
+///   revocations are ever recorded, and the authority re-proves that claim
+///   against the denominator it recomputes. A producer that cannot vouch for
+///   the whole membership must declare `Partial`/`Unknown` and is refused as
+///   incomplete coverage;
+/// * the declared omission set is empty because a recorded row carries no
+///   omission evidence. A closure that genuinely omitted a dependent must
+///   declare the reference and is refused as incomplete coverage;
+/// * the committed affected-member digest/count and the canonical request
+///   hash are the content addresses of exactly these presented bytes, and the
+///   authority recomputes and compares both.
 pub fn decode_revocation_history_evidence(
     response: &NamedReadResponse,
     expected_fence: &eliot_contracts::StateFence,
@@ -383,19 +412,48 @@ pub fn decode_revocation_history_evidence(
     let payload = parse_revocation_history_payload(&response.payload).map_err(|error| {
         owner_refused(format!("revocation history payload is malformed: {error}"))
     })?;
-    let closures = payload
-        .closures
-        .into_iter()
-        .map(|row| InfluenceDependencyClosure {
+    let mut closures = Vec::with_capacity(payload.closures.len());
+    for row in payload.closures {
+        let dependent_refs = row.dependent_refs;
+        let affected =
+            AuthorityRevocationClosureEvidence::members_of(&row.root_ref, &dependent_refs);
+        let affected_member_digest = AuthorityRevocationClosureEvidence::affected_members_digest(
+            &affected,
+        )
+        .ok_or_else(|| {
+            owner_refused("revocation history affected membership is not addressable".to_owned())
+        })?;
+        let canonical_request_digest =
+            AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
+                &row.closure_id,
+                &row.root_ref,
+                &dependent_refs,
+                Some(row.invalidation_reason),
+                eliot_store_api::InfluenceState::Revoked,
+                &response.state_fence,
+                row.revision,
+            )
+            .ok_or_else(|| {
+                owner_refused("revocation history closure is not addressable".to_owned())
+            })?;
+        closures.push(AuthorityRevocationClosureEvidence {
+            evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
             closure_id: row.closure_id,
+            owner_namespace: payload.origin_ref.clone(),
             root_ref: row.root_ref,
-            dependent_refs: row.dependent_refs,
+            dependent_refs,
             invalidation_reason: Some(row.invalidation_reason),
             current_influence: eliot_store_api::InfluenceState::Revoked,
             state_fence: response.state_fence.clone(),
             revision: row.revision,
-        })
-        .collect();
+            bounds: RevocationBounds::default_bounds(),
+            disposition: RevocationEvidenceDisposition::Complete,
+            omissions: Vec::new(),
+            affected_member_count: affected.len() as u64,
+            affected_member_digest,
+            canonical_request_digest,
+        });
+    }
     Ok(RevocationHistoryEvidence {
         state_fence: response.state_fence.clone(),
         source_revision: payload.source_revision,

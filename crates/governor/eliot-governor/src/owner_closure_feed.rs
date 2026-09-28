@@ -274,6 +274,14 @@ pub async fn synchronize_owner_feed_with_quarantine_evidence<
                     "owner history returned a closure for a different authority root".to_owned(),
                 ));
             }
+            // #2966 step 2: the declared owner namespace is the partition key
+            // this feed merges under, so a row served under another namespace
+            // is never merged into this graph's history.
+            if closure.owner_namespace != *origin_ref {
+                return Err(CompositionError::Recovery(
+                    "owner history returned a closure for a different owner namespace".to_owned(),
+                ));
+            }
             if let Some(previous) = merged_closures.get(&closure.closure_id) {
                 if previous != &closure {
                     return Err(CompositionError::Recovery(

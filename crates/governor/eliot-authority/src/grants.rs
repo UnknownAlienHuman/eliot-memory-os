@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::quarantine_evidence::{QuarantineDisposition, VerifiedQuarantineBinding};
 use crate::revocation_history::{
-    AdmittedRevocationClosure, AuthorityRootRef, OriginTargetMismatch, RevocationOrigin,
-    ValidatedRevocationClosure, derive_suppressions,
+    AdmittedRevocationClosure, AuthorityRootRef, OriginTargetMismatch,
+    RevocationEvidenceDisposition, RevocationOrigin, ValidatedRevocationClosure,
+    derive_suppressions,
 };
 use crate::root_transition::{AdmittedRootTransition, AdmittedRootTransitionRecord};
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
@@ -24,6 +25,32 @@ const REVOCATION_PAGE_WORK_LIMIT: u64 = 513;
 
 fn map_bounded_revocation_error(error: eliot_influence::InfluenceError) -> AuthorityError {
     AuthorityError::BoundedRevocation(error)
+}
+
+/// Every reference one closure completeness state leaves unresolved: the
+/// explicit frontier plus each engine omission's withheld dependent.
+///
+/// This is the recomputed half of the committed-evidence omission
+/// comparison. A complete state resolves nothing, so it reports the empty set
+/// and a closure that declares an omission is refusing against a denominator
+/// that resolved none.
+fn unresolved_references(state: &RevocationClosureState) -> BTreeSet<String> {
+    match state {
+        RevocationClosureState::Complete { .. } => BTreeSet::new(),
+        RevocationClosureState::PartialOrUnknown {
+            frontier,
+            omissions,
+            ..
+        } => frontier
+            .iter()
+            .cloned()
+            .chain(
+                omissions
+                    .iter()
+                    .map(|omission| omission.edge_dependent.clone()),
+            )
+            .collect(),
+    }
 }
 
 /// Maps one graph-owner refusal onto the typed recovery vocabulary.
@@ -1241,6 +1268,32 @@ impl GrantGraph {
                 .any(|relation| relation.child.grant_id.as_str() == reference)
     }
 
+    /// Whether this graph holds at least one admitted grant owned by exactly
+    /// this authority root, and returns that typed root when it does.
+    ///
+    /// This is the only proof of graph/snapshot owner-namespace membership
+    /// available to a pure restore: the namespace a committed closure was
+    /// served under is an authority-root reference, and its membership is
+    /// decided against the bound graph's own admitted grants. It is never
+    /// inferred from a name prefix, from "it looks like a grant id", or from
+    /// any free-form label.
+    pub(crate) fn owned_authority_root(
+        &self,
+        reference: &str,
+    ) -> Result<AuthorityRootRef, RevocationHistoryError> {
+        let root_ref =
+            AuthorityRootRef::new(reference).map_err(|_| RevocationHistoryError::UnknownHistory)?;
+        if self
+            .grants
+            .values()
+            .any(|grant| grant.authority_root_ref == root_ref.as_str())
+        {
+            Ok(root_ref)
+        } else {
+            Err(RevocationHistoryError::UnknownHistory)
+        }
+    }
+
     /// Resolves one declared closure origin against this graph, the only
     /// namespace a restore of this snapshot is bound to.
     ///
@@ -1630,11 +1683,17 @@ impl GrantGraph {
     ///
     /// 1. the declared origin resolves against this graph to exactly one
     ///    typed [`RevocationOrigin`] — a grant or an authority root, never a
-    ///    guess read from the reference's spelling. An origin that resolves
-    ///    to none, or to two, refuses. This is the A0.3 hard boundary
-    ///    "restoration of revoked influence after recovery" refused by cause
-    ///    instead of accepted unrecheckable;
-    /// 2. the expected denominator for that one origin must be complete.
+    ///    guess read from the reference's spelling — and the declared owner
+    ///    namespace is an authority root THIS graph owns that the declared
+    ///    origin belongs to. An origin that resolves to none, or to two,
+    ///    refuses, and so does a namespace this graph does not own or that the
+    ///    origin does not belong to: a reference under a foreign namespace is
+    ///    foreign evidence, never a silent skip. This is the A0.3 hard
+    ///    boundary "restoration of revoked influence after recovery" refused
+    ///    by cause instead of accepted unrecheckable;
+    /// 2. the expected denominator for that one origin must be complete, and
+    ///    it is computed under the traversal bounds the EVIDENCE declared —
+    ///    this crate mints no bounds of its own here.
     ///    [`revocation_denominator_for_origin`](Self::revocation_denominator_for_origin)
     ///    evaluates the declared origin exactly once and reconciles the
     ///    bounded engine outcome against the live graph, following same-root
@@ -1642,7 +1701,11 @@ impl GrantGraph {
     ///    cross-scope dependents as unresolved frontier entries, so a partial
     ///    verdict still refuses under I15.7's explicit incomplete-coverage
     ///    rule and an omitted dependent without owner-qualified quarantine
-    ///    evidence is never silently cleared;
+    ///    evidence is never silently cleared. The declared disposition and
+    ///    the declared omissions are compared against that recomputed
+    ///    completeness: a closure that does not declare itself complete, or
+    ///    that declares an omission the recomputed denominator does not also
+    ///    report, refuses under the same typed cause;
     /// 3. every in-graph target the closure names must be a member of that
     ///    one denominator. An in-graph target outside it is
     ///    [`RevocationHistoryError::OriginTargetMismatch`]: a
@@ -1666,6 +1729,13 @@ impl GrantGraph {
         closure: &ValidatedRevocationClosure,
         fence: &StateFence,
     ) -> Result<AdmittedRevocationClosure, RevocationHistoryError> {
+        // The declared owner namespace is proven against this graph's own
+        // admitted grants, never read from the reference's spelling, and the
+        // declared origin must belong to it. A closure served under a
+        // namespace this graph does not own is unknown evidence: the durable
+        // history owner pre-partitions multi-graph history by namespace, and
+        // an unpartitioned row is not silently reinterpreted as this graph's.
+        let owner_namespace = self.owned_authority_root(&closure.owner_namespace)?;
         let origin = match self.resolve_revocation_origin(&closure.root_ref)? {
             BoundRevocationOrigin::Bound(origin) => origin,
             BoundRevocationOrigin::Foreign => {
@@ -1686,7 +1756,31 @@ impl GrantGraph {
                 return Err(RevocationHistoryError::UnknownHistory);
             }
         };
-        let bounds = eliot_influence::RevocationBounds::default_bounds();
+        // The declared origin must belong to the declared owner namespace: a
+        // grant origin is owned by that root, and a root origin IS that root.
+        let origin_namespace = match &origin {
+            RevocationOrigin::Grant(grant_id) => self
+                .grant(grant_id.as_str())
+                .map(|grant| grant.authority_root_ref.as_str()),
+            RevocationOrigin::AuthorityRoot(root_ref) => Some(root_ref.as_str()),
+        };
+        if origin_namespace != Some(owner_namespace.as_str()) {
+            return Err(RevocationHistoryError::UnknownHistory);
+        }
+        // The admission bounds are the bounds the EVIDENCE declared. A
+        // completeness claim proven under different bounds than the ones
+        // committed is a different proof, so this call site mints none.
+        let bounds = closure.bounds.clone();
+        // The declared disposition is the committed closure's own honesty
+        // statement, and only a complete claim is admissible: I15.7 requires
+        // incomplete coverage to be explicit, and recovery refuses it.
+        if closure.disposition != RevocationEvidenceDisposition::Complete {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::IncompleteCoverage(
+                    "recovery.closure_declared_disposition",
+                ),
+            ));
+        }
         let denominator = self
             .revocation_denominator_for_origin(&origin, fence, &bounds)
             .map_err(map_bounded_history_error)?;
@@ -1698,6 +1792,15 @@ impl GrantGraph {
         ) {
             return Err(RevocationHistoryError::BoundedRevocation(
                 eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
+            ));
+        }
+        // The declared omissions must reconcile with the recomputed
+        // denominator's own unresolved set. A committed closure that declares
+        // it omitted a dependent is not a whole denominator and refuses under
+        // the same typed cause; a whole denominator must declare none.
+        if closure.omissions != unresolved_references(&denominator.completeness) {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_omissions"),
             ));
         }
         for reference in &closure.affected {
@@ -1729,7 +1832,7 @@ impl GrantGraph {
                 eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
             ));
         }
-        AdmittedRevocationClosure::admit(closure, origin, denominator, bounds)
+        AdmittedRevocationClosure::admit(closure, origin, owner_namespace, denominator)
     }
 
     /// The first denominator member the committed closure leaves
