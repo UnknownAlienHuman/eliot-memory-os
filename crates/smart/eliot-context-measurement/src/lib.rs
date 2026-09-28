@@ -9,15 +9,15 @@
 //! * `tokenizer` remains an observation from an actually-run route tokenizer
 //!   and is never fabricated locally.
 //!
-//! No route owner invokes this crate yet: no workspace member depends on it
-//! (its manifest records `prototype = true` with `workspace_admission`
-//! pending), so [`measure_exact_utf8`] is shaped as the assembly
-//! `measure: FnOnce(&[u8])` callback for a future admitted consumer —
-//! `|bytes| measure_exact_utf8(bytes, &params)` — but that closure is not
-//! formed anywhere in the workspace today. There is no byte/3 fallback and
-//! payload, an oversized payload, or an invalid binding is refused with a
-//! typed [`ContextError`]. The operation is leaf-local and pure: no I/O,
-//! no retrieval, no ranking, no admission, no persistence.
+//! The declared consumer edge is `eliot-context-assembly`, which depends on
+//! this crate and forms the canonical
+//! `|bytes| measure_exact_utf8(bytes, &params)` callback inside
+//! `assemble_active_view_with_measurement`. A route therefore reaches this
+//! owner through the assembly entry rather than hand-rolling a local byte/3
+//! fallback or fabricating a tokenizer observation. There is no byte/3
+//! fallback and a malformed or oversized payload, or an invalid binding, is
+//! refused with a typed [`ContextError`]. The operation is leaf-local and
+//! pure: no I/O, no retrieval, no ranking, no admission, no persistence.
 //!
 //! The canonical #704 entrypoint is [`measure_serialized_context`], which
 //! measures one exact serialized Context envelope and additionally owns the
