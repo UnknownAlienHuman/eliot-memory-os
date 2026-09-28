@@ -43,6 +43,15 @@
 //!    omission, even with an authentic receipt identity borrowed from
 //!    another decision.
 //!
+//! One further clause decides WHICH of the two omitting dispositions may
+//! close a given omission, and it is decided by the quarantined child's own
+//! commitment-proven record rather than by the presenter: a child whose
+//! record says it never became effective is omitted on exact current
+//! `NeverAdmitted` readback with no revocation effect invented for it, and
+//! a child that was previously active or possibly active is omitted only on
+//! exact `RevokedAndFenced` Kernel/ORS evidence (see
+//! `QuarantineOmissionEvidence::required_by`).
+//!
 //! # Purity boundary: this crate reads no Store, mints no canonical receipt,
 //! authenticates no session, and cannot verify a Kernel/ORS durable record.
 //! What this crate guarantees is that a verified binding replays stably
@@ -59,7 +68,7 @@ use eliot_receipts::{AuthorityBinding, ReceiptIdentity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::grants::{GrantGraph, GrantId, GrantRecoveryRecord};
+use crate::grants::{GrantGraph, GrantId, GrantRecoveryRecord, GrantStatus};
 use crate::{AuthorityError, validate_digest, validate_text};
 
 /// Closed operation kind of every quarantine verification, part of the
@@ -77,7 +86,12 @@ pub const QUARANTINE_EVIDENCE_VERSION: u16 = 1;
 ///
 /// Only [`QuarantineDisposition::NeverAdmitted`] and
 /// [`QuarantineDisposition::RevokedAndFenced`] may satisfy a complete
-/// omission, and only through a current [`VerifiedQuarantineBinding`].
+/// omission, and only through a current [`VerifiedQuarantineBinding`],
+/// which also binds the chosen disposition to the quarantined child's own
+/// recorded admission state: `NeverAdmitted` is admissible only for a child
+/// whose record says it never became effective, and `RevokedAndFenced` is
+/// the only admissible class for a child that was previously active or
+/// possibly active.
 /// [`QuarantineDisposition::LegacyUnverified`] is never issued as evidence
 /// content: it is the disposition of a structural relation with no current
 /// binding. [`QuarantineDisposition::UnknownOrReconciling`] is validated
@@ -392,6 +406,60 @@ fn resolve_retained_enforcement(
     Ok(())
 }
 
+/// The closed pair of evidence classes that may close ONE closure omission
+/// (issue #2976, items A3 and A4), decided from the quarantined CHILD'S OWN
+/// recorded admission state.
+///
+/// The two classes are not interchangeable, and neither is chosen by the
+/// presenter. A child whose own durable record says it never became
+/// effective authority may be omitted on exact current `NeverAdmitted`
+/// owner readback alone: no revocation effect is required for something
+/// that never existed, and none is invented. A child that was previously
+/// active, or whose record cannot prove it never was, may be omitted ONLY
+/// on exact `RevokedAndFenced` Kernel/ORS evidence — the semantic
+/// quarantine decision, a matching relation id, and absence from the
+/// CURRENT admitted map prove nothing about whether the child ever became
+/// effective.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuarantineOmissionEvidence {
+    /// Exact current `NeverAdmitted` owner readback.
+    NeverAdmitted,
+    /// Exact `RevokedAndFenced` Kernel/ORS enforcement result.
+    RevokedAndFenced,
+}
+
+impl QuarantineOmissionEvidence {
+    /// The evidence class this child's OWN durable record demands.
+    ///
+    /// Fail-closed by construction: only the explicit pre-activation status
+    /// is positive proof that the child never became effective authority
+    /// (I6.10 keeps a canonical proposal inactive until its activation
+    /// receipt exists). Every other recorded status means the child was
+    /// admitted or possibly was — `Active` directly, and the
+    /// post-admission `Revoked`/`Expired`/`Stale` states — so only the
+    /// exact revocation and enforcement evidence may close its omission.
+    ///
+    /// This decision deliberately never reads CURRENT admitted-map absence.
+    /// A quarantined child is by construction absent from the admitted map,
+    /// so CURRENT absence answers nothing about whether it ever became
+    /// effective; reading the child's own record instead of asking is the
+    /// repair item A4 names.
+    ///
+    /// The answer bounds what the omission MAY be closed with, not what it
+    /// must be: a never-admitted child may still carry a genuine
+    /// `RevokedAndFenced` enforcement result (a pending proposal is
+    /// revocable), and that evidence is validated on its own terms.
+    fn required_by(child: &GrantRecoveryRecord) -> Self {
+        match child.status {
+            GrantStatus::PendingActivation => Self::NeverAdmitted,
+            GrantStatus::Active
+            | GrantStatus::Revoked
+            | GrantStatus::Expired
+            | GrantStatus::Stale => Self::RevokedAndFenced,
+        }
+    }
+}
+
 /// Verified quarantine binding: the ONLY quarantine input executable
 /// closure verdicts accept.
 ///
@@ -445,7 +513,9 @@ impl VerifiedQuarantineBinding {
     /// [`AuthorityError::StaleQuarantineEvidence`] when the record is
     /// revoked, names no CURRENT relation, disagrees with CURRENT revision
     /// or fence, resolves no retained semantic decision or enforcement
-    /// result, or lacks its durable receipt readback.
+    /// result, lacks its durable receipt readback, or claims
+    /// `NeverAdmitted` for a child whose own record shows it was previously
+    /// active or possibly active.
     pub fn admit(
         evidence: &CrossRootQuarantineEvidence,
         graph: &GrantGraph,
@@ -609,8 +679,9 @@ impl VerifiedQuarantineBinding {
     /// the retained semantic decision, exact edge/root correspondence,
     /// relation and grant commitments recomputed from CURRENT records,
     /// fence/epoch readback, revision currency, semantic receipt readback,
-    /// ORS-resolved disposition-gated mechanical readback, and non-revoked
-    /// status.
+    /// the child's recorded admission state bound to the declared
+    /// disposition, ORS-resolved disposition-gated mechanical readback, and
+    /// non-revoked status.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -729,9 +800,27 @@ impl VerifiedQuarantineBinding {
                         "quarantine_evidence.enforcement_never_admitted",
                     ));
                 }
-                // Owner evidence that no activation became effective: the
-                // retained semantic decision attests NeverAdmitted at
-                // decision time, and the child is still absent from the
+                // "This child was never admitted" is a claim about a child
+                // the child's OWN durable record says was never admitted.
+                // That record is already commitment-proven against this
+                // evidence and the retained semantic decision above, so this
+                // is a comparison of committed owner content, not a flag the
+                // presenter supplied. A child whose record says it was
+                // admitted, or cannot say it never was, refuses here and its
+                // omission can be closed only by the exact
+                // `RevokedAndFenced` Kernel/ORS evidence the
+                // `RevokedAndFenced` arm requires. When the record does say
+                // the child never became effective, the retained semantic
+                // decision and the CURRENT absence below are sufficient and
+                // no revocation effect is invented for it.
+                if QuarantineOmissionEvidence::required_by(child_record)
+                    != QuarantineOmissionEvidence::NeverAdmitted
+                {
+                    return Err(AuthorityError::StaleQuarantineEvidence(
+                        "quarantine_evidence.never_admitted_previously_active",
+                    ));
+                }
+                // CURRENT owner readback: the child is still absent from the
                 // admitted map now.
                 if child_admitted {
                     return Err(AuthorityError::StaleQuarantineEvidence(
@@ -748,8 +837,11 @@ impl VerifiedQuarantineBinding {
                 resolve_retained_enforcement(enforcement, retained_enforcements)?;
                 // Mechanical readback: the resolved exact Kernel/ORS fence
                 // operation must have completed canonical reconciliation to
-                // exactly this receipt, fencing this decision's child.
-                // Semantic quarantine alone is insufficient.
+                // exactly this receipt, fencing this decision's child. This
+                // is the class `QuarantineOmissionEvidence::required_by`
+                // routes every previously-active or possibly-active child
+                // to, so semantic quarantine alone can never close such an
+                // omission.
                 if canonical_receipts.get(&enforcement.operation_id) != Some(&enforcement.receipt) {
                     return Err(AuthorityError::StaleQuarantineEvidence(
                         "quarantine_evidence.mechanical_readback",
