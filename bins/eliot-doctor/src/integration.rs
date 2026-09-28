@@ -557,10 +557,15 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "handshake": {
             "ok": report.handshake_ok,
         },
+        "installation": report.installation.as_ref().map(|status| serde_json::json!({
+            "status": status.status,
+            "code": status.code,
+            "completed": status.completed,
+        })),
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
-        "note": "file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06): installed is granted only when every expected hash matches and nothing unverifiable is expected, live is never granted here",
+        "note": "installation is the status the install receipt itself recorded (null when the expectation record carries none), reported separately from the evidence below: file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06). installed is granted only when every expected hash matches, nothing unverifiable is expected, and the record does not state an incomplete install; live is never granted here",
     })
 }
 
