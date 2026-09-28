@@ -20,9 +20,8 @@ use crate::{
     RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
     StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate,
-    provider_bootstrap_credential_target_for_store_target, select_profile_roots,
-    supervision_key_slot_for_scope_id,
+    phase_b_static_template_for_candidate, provider_bootstrap_credential_target_for_store_target,
+    select_profile_roots, supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 

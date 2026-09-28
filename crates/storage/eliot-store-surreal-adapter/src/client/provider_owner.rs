@@ -423,7 +423,7 @@ pub(super) struct ProviderEnvironment {
 /// allowlist. I15.4 (`docs/architecture/I15-04-secrets.md`) admits exactly this
 /// channel for the `surreal.exe` dependency: "Host materializes a fresh
 /// child-only environment block ... immediately before process creation; secret
-/// values are never placed in argv, HostStateJournal, Module Catalog, crash
+/// values are never placed in argv, `HostStateJournal`, Module Catalog, crash
 /// command text or reusable environment snapshots."
 ///
 /// The allowlist is the literal below: the two Windows roots, the store temp
@@ -450,7 +450,11 @@ pub(super) fn provider_environment(
         .ok_or_else(|| {
             AdapterError::Config("required Windows SystemRoot is unavailable".to_owned())
         })?;
-    if config.provider_bootstrap_password.expose_secret().is_empty() {
+    if config
+        .provider_bootstrap_password
+        .expose_secret()
+        .is_empty()
+    {
         return Err(AdapterError::Config(
             "provider bootstrap credential is unavailable; refusing to launch an \
              unauthenticated provider server"
@@ -462,7 +466,10 @@ pub(super) fn provider_environment(
         ("WINDIR".into(), system_root),
         ("TEMP".into(), config.store_temp_root.clone().into()),
         ("TMP".into(), config.store_temp_root.clone().into()),
-        (PROVIDER_BOOTSTRAP_USER_ENV.into(), config.provider_bootstrap_username.clone().into()),
+        (
+            PROVIDER_BOOTSTRAP_USER_ENV.into(),
+            config.provider_bootstrap_username.clone().into(),
+        ),
         (
             PROVIDER_BOOTSTRAP_PASSWORD_ENV.into(),
             config.provider_bootstrap_password.expose_secret().into(),

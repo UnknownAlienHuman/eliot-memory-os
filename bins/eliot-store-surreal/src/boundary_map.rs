@@ -263,8 +263,7 @@ const CREDENTIAL_REFERENCES: &[CredentialReferenceBoundary] = &[
         target_namespace: "eliot/store/v1/<32 hex>",
         reserved_prefix: "eliot/store/v1/",
         validator: "eliot_installation::validate_store_credential_target",
-        resolved_by:
-            "adapter_materialization::resolve_credential, called by StoreComposition::new",
+        resolved_by: "adapter_materialization::resolve_credential, called by StoreComposition::new",
         delivered_to: StoreBoundaryContour::StoreBridge,
         delivery_channel: "SecretString field SurrealAdapterConfig::password, used only by \
              RpcSession::signin; never written into the provider child's environment block",
@@ -275,8 +274,7 @@ const CREDENTIAL_REFERENCES: &[CredentialReferenceBoundary] = &[
         target_namespace: "eliot/provider/v1/<32 hex>",
         reserved_prefix: "eliot/provider/v1/",
         validator: "eliot_installation::validate_provider_bootstrap_credential_target",
-        resolved_by:
-            "adapter_materialization::resolve_provider_bootstrap_credential, called by \
+        resolved_by: "adapter_materialization::resolve_provider_bootstrap_credential, called by \
              StoreComposition::new",
         delivered_to: StoreBoundaryContour::ProviderChild,
         delivery_channel: "fresh child-only environment block built by \
