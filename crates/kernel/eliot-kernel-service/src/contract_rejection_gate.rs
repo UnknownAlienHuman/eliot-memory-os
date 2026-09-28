@@ -336,6 +336,18 @@ pub struct PreStageIdentitySnapshot {
     issued_corrections: BTreeMap<String, PreStageRejection>,
 }
 
+impl PreStageIdentitySnapshot {
+    /// Reports which publication of the durable record this snapshot is.
+    ///
+    /// The daemon reads this off the exact snapshot it wrote and hands it to
+    /// [`PreStageIdentityCache::acknowledge_journal_save`], so only the save of
+    /// the revision that is still pending can discharge the obligation.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
 impl PreStageIdentityCache {
     /// Reports whether this cache holds no retained refusal at all.
     ///

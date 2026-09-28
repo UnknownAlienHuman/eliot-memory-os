@@ -6445,12 +6445,17 @@ impl KernelComposition {
                 &operation.expected_ordering_heads,
             );
             // Taken, not written, under the lock: the file write below never
-            // holds the cache across I/O.
+            // holds the cache across I/O, and it re-takes the lock only to
+            // acknowledge the exact revision whose bytes reached the file.
             let pending_journal = cache.take_journal_snapshot();
             (gate_outcome, pending_journal)
         };
         if let Some(snapshot) = pending_journal {
-            persist_pre_stage_corrections(&self.work_root, &snapshot);
+            persist_pre_stage_corrections(
+                &self.work_root,
+                &snapshot,
+                &self.pre_stage_identity_cache,
+            );
         }
         let verified_correction = match gate_outcome {
             Err(rejection) => {
@@ -8998,19 +9003,25 @@ fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::
 /// Restores retained refusals from the Kernel-owned durable pre-stage
 /// journal into a freshly started, still-empty gate cache (issue #1796 F1).
 ///
-/// Merging is a union over deterministic records, so a retain that landed
-/// after the journal was read is never lost by the merge. Best-effort: a
-/// missing or unreadable journal starts empty, which is exactly the
-/// pre-journal behavior, and a cache that already holds a live refusal is
-/// never overwritten by stale disk state. No store, receipt, or envelope
-/// format is touched.
+/// The journal is untrusted input, so the gate re-validates every refusal it
+/// carries before merging anything; a journal that fails that check restores
+/// nothing at all, because a decoded record is not a validated record. A
+/// missing journal is a legitimate first use: this gate has retained nothing
+/// yet, which is exactly the pre-journal behavior. A journal that exists but
+/// cannot be read or decoded is NOT first use, and this gate never claims it
+/// was: the cache simply stays unrestored, so the same journal is read again
+/// on every later request, and until its refusals are provable again the gate
+/// issues no correction lineage rather than stamping an unproven one (I6.8).
+/// No store, receipt, or envelope format is touched.
 #[cfg(windows)]
 fn restore_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
 ) {
-    let Ok(bytes) = std::fs::read(pre_stage_correction_journal_path(work_root)) else {
-        return;
+    let bytes = match std::fs::read(pre_stage_correction_journal_path(work_root)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => return,
     };
     let Ok(snapshot) =
         serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
@@ -9021,7 +9032,13 @@ fn restore_pre_stage_corrections(
         return;
     };
     if guard.is_empty() {
-        guard.restore(snapshot);
+        // An inconsistent journal is refused as a whole: the gate restores
+        // nothing rather than partially adopting a record it could not prove,
+        // and this cache therefore stays empty and keeps re-reading the same
+        // journal.
+        if guard.restore(snapshot).is_err() {
+            return;
+        }
     }
 }
 
@@ -9029,14 +9046,21 @@ fn restore_pre_stage_corrections(
 /// (issue #1796 F1).
 ///
 /// Called write-ahead of the commit the retain authorizes, so a restart
-/// between commit and response still replays the lineage. Best-effort: a
-/// failed write keeps the in-memory behavior and never fails the write it
-/// records. The tmp-plus-rename keeps a crash from leaving a half-written
-/// journal behind.
+/// between commit and response still replays the lineage. Best-effort for the
+/// request: a failed write never fails the write it records, but it also never
+/// discharges what is owed. Every early return leaves the snapshot pending in
+/// the gate, so the refusal is republished and stays visible instead of being
+/// forgotten; only the exact revision that actually reached the file is
+/// acknowledged, and only while it is still the pending one, so a retain that
+/// landed during the write cannot be retired by this older save. The tmp-plus-
+/// rename keeps a crash from leaving a half-written journal behind. The
+/// acknowledgement is taken under the cache's own lock and after the write,
+/// so the file I/O never runs while the cache is held.
 #[cfg(windows)]
 fn persist_pre_stage_corrections(
     work_root: &std::path::Path,
     snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
 ) {
     let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
         return;
@@ -9052,7 +9076,17 @@ fn persist_pre_stage_corrections(
     if std::fs::write(&tmp, &bytes).is_err() {
         return;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    if std::fs::rename(&tmp, &path).is_err() {
+        return;
+    }
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+    // The durable write landed, so this exact publication is discharged. An
+    // acknowledgement the gate refuses names a revision that is no longer the
+    // pending one, which only a concurrent retain can produce; that newer
+    // record keeps its own obligation instead of being retired here.
+    let _ = guard.acknowledge_journal_save(snapshot.revision());
 }
 fn store_apply_response(
     receipt: &WriteReceipt,
