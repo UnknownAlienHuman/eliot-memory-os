@@ -3876,8 +3876,8 @@ impl SurrealStoreAdapter {
         // member this batch actually imports, in the same obligation domain.
         // Unverified derived data cannot grant completion, so a dangling edge
         // refuses the batch rather than being committed and reported.
-        let dispositions_by_member = dispositions_by_member(batch, &dispositions);
-        validate_reference_closure_against(batch, &dispositions_by_member)?;
+        let planned_by_member = dispositions_by_member(batch, &dispositions);
+        validate_reference_closure_against(batch, &planned_by_member)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let (completeness, mutation) = planned_outcome(&dispositions);
