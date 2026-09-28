@@ -452,7 +452,9 @@ pub(super) fn provider_environment(
         })?;
     if config.provider_bootstrap_password.expose_secret().is_empty() {
         return Err(AdapterError::Config(
-            "provider bootstrap credential is unavailable; refusing to launch an unauthenticated provider server".to_owned(),
+            "provider bootstrap credential is unavailable; refusing to launch an \
+             unauthenticated provider server"
+                .to_owned(),
         ));
     }
     let entries = vec![
@@ -466,5 +468,55 @@ pub(super) fn provider_environment(
             config.provider_bootstrap_password.expose_secret().into(),
         ),
     ];
+    require_no_client_credential_inheritance(config, &entries)?;
     Ok(ProviderEnvironment { entries })
+}
+
+/// Proves, against the values this launch actually holds, that the provider
+/// child's environment block carries neither ordinary client credential.
+///
+/// I15.4: "Sibling processes inherit neither credential." The block is built
+/// from a closed allowlist above, so the client credential is not expected to
+/// appear — but a closed allowlist is only a claim about the code as written.
+/// This compares every produced entry against the client username and client
+/// password **this configuration actually holds**, so the proof is over content
+/// rather than over a fixed denylist of names: a renamed variable, a newly
+/// allowlisted entry, or a future edit that forwards the client secret under an
+/// unexpected name is refused instead of silently delivered to a sibling
+/// process.
+///
+/// This reads the ORIGINAL recorded values (the same
+/// `SurrealAdapterConfig` fields `signin` uses), not a shape or a digest of
+/// them, and it compares in constant time so the refusal itself reveals nothing
+/// about which credential matched. A match is refused, never sanitized: a
+/// sanitized block would still be a block this function could not account for.
+pub(super) fn require_no_client_credential_inheritance(
+    config: &SurrealAdapterConfig,
+    entries: &[(OsString, OsString)],
+) -> Result<(), AdapterError> {
+    let client_username = config.username.as_bytes();
+    let client_password = config.password.expose_secret().as_bytes();
+    for (name, value) in entries {
+        if constant_time_eq(value.to_string_lossy().as_bytes(), client_username)
+            || constant_time_eq(value.to_string_lossy().as_bytes(), client_password)
+        {
+            return Err(AdapterError::Config(format!(
+                "provider child environment entry {name:?} carries the ordinary client credential; \
+                 refusing to deliver it to a sibling process"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Compares two byte strings without an early exit, so the comparison time does
+/// not depend on the position of the first difference.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }

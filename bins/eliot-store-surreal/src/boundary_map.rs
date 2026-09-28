@@ -408,7 +408,8 @@ impl StoreBoundaryMap {
     pub(crate) fn validate_against(&self, config: &StoreLaunchConfig) -> Result<(), String> {
         if NAMED_PIPE_CALLER.contour == MAINTENANCE_CALLER.contour {
             return Err(
-                "the named-pipe caller and the maintenance/break-glass caller must be distinct contours"
+                "the named-pipe caller and the maintenance/break-glass caller must be distinct \
+                 contours"
                     .to_owned(),
             );
         }
