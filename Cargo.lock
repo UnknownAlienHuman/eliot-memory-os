@@ -3385,6 +3385,7 @@ dependencies = [
  "eliot-process-executor",
  "eliot-protocol",
  "eliot-user-broker-core",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

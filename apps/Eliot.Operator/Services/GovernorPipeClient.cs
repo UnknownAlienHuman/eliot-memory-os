@@ -464,6 +464,13 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // connection, and it never waits for the request gate the cancelled
             // operation itself may hold.
             using var abortOnEstablishment = connection.BindAbort(establishment.Token);
+            // The inherited handoff is consumed before any broker request.
+            // Broker challenge and redemption share this establishment window
+            // and finish before the Governor pipe is connected.
+            await BrokerPipeClient.RedeemOperatorHandoffAsync(
+                handoff.Endpoint,
+                clientIdentity,
+                establishment.Token).ConfigureAwait(false);
             try
             {
                 await pipe.ConnectAsync(establishment.Token).ConfigureAwait(false);
@@ -487,16 +494,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             connection.PublishStreams(streams);
 
             // Handshake write, handshake read and the required initialize
-            // exchange are the initial authentication steps. They observe the
-            // establishment window, not the request budget's remaining time and
-            // not a fresh per-call window.
-            //
-            // The handshake presents the full I11.8 client binding proof the
-            // broker validates at redemption: the owner-issued session/nonce,
-            // the locally proved Windows user SID, logon session and Operator
-            // process generation/artifact, and the exact requested role and
-            // capability set. The broker admits only the granted set; anything
-            // wider is refused rather than narrowed.
+            // exchange are the remaining initial Governor authentication steps.
+            // They observe the establishment window, not the request budget's
+            // remaining time and not a fresh per-call window. The preceding
+            // broker redemption already proved the local SID, session, process
+            // and exact granted role/capability set.
             establishment.ThrowIfExpired();
             await streams.Writer.WriteLineAsync(JsonSerializer.Serialize(new
             {
@@ -554,10 +556,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
         catch (OperatorRestartRequiredException)
         {
+            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
             throw;
         }
         catch (OperatorNotAttemptedException)
         {
+            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
             throw;
         }
         catch (OperationCanceledException)
