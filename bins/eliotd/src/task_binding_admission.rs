@@ -544,6 +544,11 @@ pub fn bind_current_task_selection(
     receipt: &OnboardingReadinessReceipt,
     live_fence: &StateFence,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
+    receipt.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "compiled readiness receipt is invalid: {error}"
+        ))
+    })?;
     if !eliot_contracts::fences_match_exact(&activation.state_fence, live_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "activation snapshot is not applicable at the current fence",

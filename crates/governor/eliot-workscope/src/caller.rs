@@ -312,6 +312,9 @@ pub fn observed_scope_binding(
         });
     }
     let instance = &observed.instances[0];
+    if observed.generation.resource_generation.value() != instance.generation {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
     let binding = ScopeBinding {
         scope: ScopeIdentity {
             scope_ref: retained.scope.scope_ref.clone(),
