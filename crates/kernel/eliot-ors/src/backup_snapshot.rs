@@ -260,6 +260,13 @@ pub enum RowFamilyKind {
     RecoveryInboxHistory,
     ProcessStartReplay,
     AuthorityHandoffs,
+    /// Observation-only process-evidence rows (issue #269, A1).
+    ///
+    /// A row of this family may be a pre-#269 row that still holds the accepted
+    /// `ProcessEvidence` value inline, bounded preview bytes included, so the
+    /// family carries payload a restore must never receive as an answer. It is
+    /// `ForensicOnly`: an exported row lands as forensics and never as an
+    /// importable observation.
     ProcessEvidence,
     /// Immutable process-stream recovery projections (issue #269): one durable
     /// row per `(operation_id, stream)` identity, carrying only the locator,
@@ -363,7 +370,18 @@ impl RowFamilyKind {
             // variant would otherwise silently fall through to `Restorable`.
             Self::StoreRebindReplay
             | Self::StoreFailureRetention
-            | Self::BackupVerificationResults => RowDisposition::ForensicOnly,
+            | Self::BackupVerificationResults
+            // `ProcessEvidence` (issue #269, A1) is listed EXPLICITLY for the
+            // same reason `BackupVerificationResults` is. The family has no
+            // `import_*_suspended` path at all, so `Restorable` would advertise
+            // a durable re-import that does not exist; and a row of it may be a
+            // pre-#269 row that still holds the inline stdout/stderr payload, so
+            // an imported copy of that row would be raw stream payload crossing
+            // a restore boundary. `ForensicOnly`'s premise — evidence, never
+            // authority — is the one that actually holds. Listing it explicitly
+            // is what makes that true rather than merely stated: a new trailing
+            // variant would otherwise silently fall through to `Restorable`.
+            | Self::ProcessEvidence => RowDisposition::ForensicOnly,
             Self::AuthorityHandoffs
             | Self::HostRequests
             | Self::ActivationLifecycle

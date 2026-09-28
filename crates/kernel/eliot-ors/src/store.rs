@@ -24,7 +24,7 @@ use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[path = "persistence_codec.rs"]
 mod persistence_codec;
@@ -75,9 +75,10 @@ use crate::{
     LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
     OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
-    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
-    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
+    ProcessEvidenceReadback, ProcessEvidenceRecord, ProcessStartReplayAbort,
+    ProcessStartReplayRecord, ProcessStartReplayState, ProcessStreamRecoveryFence,
+    ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
@@ -134,6 +135,45 @@ const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_evidence_v1");
+/// The table name is unchanged by issue #269's row revision: the byte-free
+/// observation is a ROW version, not a new table, so no migration, no rewrite
+/// and no census entry is introduced. The row's own
+/// [`crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA`] field is the codec's version
+/// discriminator (see `RedbRecoveryStore::decode_process_evidence_row`), a
+/// pre-#269 row is dispositioned rather than rewritten, and the table's backup
+/// disposition is `ForensicOnly` so a row that still holds the inline payload
+/// can never cross a restore boundary as an answer.
+/// The pre-#269 `ors_process_evidence_v1` row shape, read only far enough to be
+/// dispositioned (issue #269, A1).
+///
+/// `evidence` is the accepted `ProcessEvidence` value, bounded inline preview
+/// bytes included. It is read as raw JSON so the decoder can report WHICH
+/// physical streams still carry an inline byte array without ever materializing
+/// those bytes, and the payload is dropped with the row. The row is never
+/// re-encoded, never migrated and never written back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyInlineProcessEvidenceRow {
+    operation_id: OperationIdentity,
+    process_tree_id: OpaqueLabel,
+    job_id: OpaqueLabel,
+    image_id: OpaqueLabel,
+    session_id: OpaqueLabel,
+    evidence_digest: String,
+    observed_at_ms: i64,
+    evidence: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct InlineProcessEvidenceIdentity<'a> {
+    operation_id: &'a str,
+    process_tree_id: &'a str,
+    job_id: &'a str,
+    image_id: &'a str,
+    session_id: &'a str,
+    evidence_digest: &'a str,
+    observed_at_ms: i64,
+}
 /// Versioned per-stream process-evidence recovery projections (issue #269).
 ///
 /// One row per `(operation_id, stream)` identity, keyed `operation:stdout` or
@@ -16331,40 +16371,67 @@ impl RedbRecoveryStore {
     }
 
     /// Appends one observation-only evidence projection, preserving conflicts.
+    ///
+    /// Issue #269, A1: the row written here is the byte-free
+    /// [`crate::ProcessEvidenceRecord`]. The accepted `ProcessEvidence` value is
+    /// read at this boundary to take the digest over the ORIGINAL observed bytes
+    /// and is then dropped; the bounded inline preview bytes never reach ORS.
+    ///
+    /// A pre-#269 row already held at the same key is NOT replaced. Same key
+    /// means the same observation, so overwriting it would rewrite history with
+    /// a payload-stripped copy of the same observation; that is refused with its
+    /// own reason instead.
     pub fn persist_process_evidence(&self, record: &ProcessEvidenceRecord) -> Result<(), OrsError> {
         record.validate()?;
         let key = record.record_key()?;
         let write = self.database.begin_write().map_err(storage)?;
         {
             let mut table = write.open_table(PROCESS_EVIDENCE).map_err(storage)?;
-            let existing: Option<ProcessEvidenceRecord> = table
+            let existing = table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| Self::decode_process_evidence_row(value.value()))
                 .transpose()?;
-            if let Some(existing) = existing {
-                existing.validate()?;
-                if existing != *record {
+            match existing {
+                Some(ProcessEvidenceReadback::Observation(existing)) => {
+                    if *existing != *record {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "process_evidence",
+                            reason: "conflicting evidence replacement rejected".to_owned(),
+                        });
+                    }
+                }
+                Some(ProcessEvidenceReadback::InlinePayloadNotRetained(_)) => {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "process_evidence",
-                        reason: "conflicting evidence replacement rejected".to_owned(),
+                        reason: "a pre-#269 row retaining the inline stream payload is held at \
+                                 this key and is never replaced"
+                            .to_owned(),
                     });
                 }
-            } else {
-                let payload = encode(record)?;
-                table
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
+                None => {
+                    let payload = encode(record)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
             }
         }
         write.commit().map_err(storage)
     }
 
     /// Reads bounded observation-only evidence history for one operation.
+    ///
+    /// The element type is the codec's explicit version transition
+    /// ([`ProcessEvidenceReadback`]): a current row reads back as a byte-free
+    /// [`ProcessEvidenceRecord`], and a pre-#269 row reads back as its
+    /// [`crate::ProcessInlineEvidenceRow`] disposition with the inline payload
+    /// left on disk and unretained here. The two are never merged, and a
+    /// dispositioned row is never deleted, stripped or upgraded.
     pub fn load_process_evidence(
         &self,
         operation_id: &crate::OperationIdentity,
-    ) -> Result<Vec<ProcessEvidenceRecord>, OrsError> {
+    ) -> Result<Vec<ProcessEvidenceReadback>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
         // Process-evidence rows are written by ProcessEvidenceRecord::record_key with the
@@ -16372,7 +16439,7 @@ impl RedbRecoveryStore {
         // physical prefix range inclusively so the U+10FFFF endpoint cannot hide a row.
         let prefix = format!("{}::", operation_id.as_str());
         let prefix_end = format!("{prefix}\u{10ffff}");
-        let mut records = Vec::new();
+        let mut records: Vec<ProcessEvidenceReadback> = Vec::new();
         for entry in table
             .range(prefix.as_str()..=prefix_end.as_str())
             .map_err(storage)?
@@ -16382,16 +16449,18 @@ impl RedbRecoveryStore {
             if !key.starts_with(prefix.as_str()) {
                 break;
             }
-            let record: ProcessEvidenceRecord = decode(value.value())?;
-            record.validate()?;
+            let record = Self::decode_process_evidence_row(value.value())?;
             // Raw sibling identities can fall inside the physical prefix range (for example,
             // `op::sibling` while reading `op`). Decode the identity before applying the
             // canonical-key check so those rows are not misclassified as corruption.
-            if record.operation_id != *operation_id {
+            let row_operation = match &record {
+                ProcessEvidenceReadback::Observation(row) => &row.operation_id,
+                ProcessEvidenceReadback::InlinePayloadNotRetained(row) => &row.operation_id,
+            };
+            if row_operation != operation_id {
                 continue;
             }
-            let canonical_key = record.record_key()?;
-            if key != canonical_key {
+            if key != record.record_key() {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "process_evidence",
                     reason: "evidence record does not match its canonical key".to_owned(),
@@ -16420,9 +16489,12 @@ impl RedbRecoveryStore {
                 if !key.starts_with(encoded_prefix.as_str()) {
                     break;
                 }
-                let record: ProcessEvidenceRecord = decode(value.value())?;
-                record.validate()?;
-                if record.operation_id == *operation_id && key != record.record_key()? {
+                let record = Self::decode_process_evidence_row(value.value())?;
+                let row_operation = match &record {
+                    ProcessEvidenceReadback::Observation(row) => &row.operation_id,
+                    ProcessEvidenceReadback::InlinePayloadNotRetained(row) => &row.operation_id,
+                };
+                if row_operation == operation_id && key != record.record_key() {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "process_evidence",
                         reason:
@@ -16433,12 +16505,122 @@ impl RedbRecoveryStore {
             }
         }
         records.sort_by(|left, right| {
-            left.observed_at_ms
-                .cmp(&right.observed_at_ms)
-                .then_with(|| left.evidence_digest.cmp(&right.evidence_digest))
-                .then_with(|| left.record_key().ok().cmp(&right.record_key().ok()))
+            left.observed_at_ms()
+                .cmp(&right.observed_at_ms())
+                .then_with(|| left.evidence_digest().cmp(right.evidence_digest()))
+                .then_with(|| left.record_key().cmp(&right.record_key()))
         });
         Ok(records)
+    }
+
+    /// The explicit process-evidence codec version transition (issue #269, A1).
+    ///
+    /// The discriminator is the row's own
+    /// [`crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA`] field, read from the raw
+    /// JSON before any typed decode:
+    ///
+    /// - the current value decodes as a byte-free
+    ///   [`ProcessEvidenceRecord`] through the existing ORS codec;
+    /// - a field that is absent is a pre-#269 row: it is decoded into the
+    ///   inline-payload disposition and the payload is dropped with the row,
+    ///   never re-encoded and never written back;
+    /// - a field carrying a different value is a codec-version mismatch and is
+    ///   refused as such rather than being read as either shape.
+    ///
+    /// A row that is neither shape is an integrity problem, so a corrupt current
+    /// row is never downgraded into a legacy disposition.
+    fn decode_process_evidence_row(value: &str) -> Result<ProcessEvidenceReadback, OrsError> {
+        let raw: Value =
+            serde_json::from_str(value).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: error.to_string(),
+            })?;
+        let declared = match raw.get("observation_schema_version") {
+            None => return Self::dispose_inline_process_evidence_row(value),
+            Some(Value::String(declared)) => declared.as_str(),
+            Some(_) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_evidence",
+                    reason: "observation_schema_version must be a string".to_owned(),
+                });
+            }
+        };
+        if declared != crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA {
+            return Err(OrsError::MigrationRequired {
+                reason: format!(
+                    "process evidence observation revision {declared:?} is not the current ORS \
+                     observation revision {}",
+                    crate::PROCESS_EVIDENCE_OBSERVATION_SCHEMA
+                ),
+            });
+        }
+        decode::<ProcessEvidenceRecord>(value)
+            .map(|record| ProcessEvidenceReadback::Observation(Box::new(record)))
+    }
+
+    /// Decodes one pre-#269 row into its inline-payload disposition.
+    ///
+    /// The `evidence` value is read as raw JSON and never decoded into bytes: the
+    /// disposition reports which physical streams still carry an inline preview
+    /// byte array, and the payload is dropped with the row. No digest is
+    /// re-derived, because ORS cannot revalidate a digest over the bytes it must
+    /// not keep.
+    fn dispose_inline_process_evidence_row(
+        value: &str,
+    ) -> Result<ProcessEvidenceReadback, OrsError> {
+        let legacy: LegacyInlineProcessEvidenceRow =
+            serde_json::from_str(value).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence_legacy",
+                reason: error.to_string(),
+            })?;
+        let evidence_schema_version = legacy
+            .evidence
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut inline_streams = Vec::new();
+        for (field, stream) in [
+            ("stdout", ProcessStreamKind::Stdout),
+            ("stderr", ProcessStreamKind::Stderr),
+        ] {
+            let carries_inline_bytes = legacy
+                .evidence
+                .get(field)
+                .and_then(|stream_value| stream_value.get("preview"))
+                .and_then(|preview| preview.get("bytes"))
+                .is_some_and(Value::is_array);
+            if carries_inline_bytes {
+                inline_streams.push(stream);
+            }
+        }
+        let record_key = format!(
+            "{}::{}",
+            legacy.operation_id.as_str(),
+            crate::model::sha256_hex(
+                serde_json::to_vec(&InlineProcessEvidenceIdentity {
+                    operation_id: legacy.operation_id.as_str(),
+                    process_tree_id: legacy.process_tree_id.as_str(),
+                    job_id: legacy.job_id.as_str(),
+                    image_id: legacy.image_id.as_str(),
+                    session_id: legacy.session_id.as_str(),
+                    evidence_digest: &legacy.evidence_digest,
+                    observed_at_ms: legacy.observed_at_ms,
+                })
+                .map_err(|error| OrsError::Encoding(error.to_string()))?
+                .as_slice()
+            )
+        );
+        Ok(ProcessEvidenceReadback::InlinePayloadNotRetained(
+            crate::ProcessInlineEvidenceRow {
+                record_key,
+                operation_id: legacy.operation_id,
+                evidence_schema_version,
+                evidence_digest: legacy.evidence_digest,
+                observed_at_ms: legacy.observed_at_ms,
+                inline_streams,
+            },
+        ))
     }
 
     /// Durable key of one `(operation, stream)` recovery projection.

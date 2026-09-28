@@ -67,14 +67,15 @@ pub use execution_manifest::{
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
 pub use process_stream_recovery::{
-    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamRecoveryBinding,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryRefusal, ProcessStreamRecoveryRevalidation,
-    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceReadback,
-    ProcessStreamSourceResolution, ProcessStreamSourceResolver, StreamRecoveryActivation,
-    StreamRecoveryAvailability, StreamRecoveryCoverage, StreamRecoveryEvidenceScope,
-    StreamRecoveryPreview, StreamRecoveryRange, StreamRecoveryReconciliation,
-    StreamRecoveryReconciliationState, StreamRecoverySourceFault,
+    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamObservation,
+    ProcessStreamRecoveryBinding, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRefusal,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryWriteOutcome,
+    ProcessStreamRetirementProof, ProcessStreamSourceReadback, ProcessStreamSourceResolution,
+    ProcessStreamSourceResolver, StreamRecoveryActivation, StreamRecoveryAvailability,
+    StreamRecoveryCoverage, StreamRecoveryEvidenceScope, StreamRecoveryPreview,
+    StreamRecoveryRange, StreamRecoveryReconciliation, StreamRecoveryReconciliationState,
+    StreamRecoverySourceFault,
 };
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,

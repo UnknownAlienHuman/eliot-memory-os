@@ -226,8 +226,89 @@ use crate::backup_snapshot::{
 };
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
-    StreamRecoveryActivation, VersionedArtifactEntry,
+    ProcessStreamRecoveryWriteOutcome, StreamRecoveryActivation, VersionedArtifactEntry,
 };
+
+impl super::RedbRecoveryStore {
+    /// Restores exported process-stream recovery rows as suspended recovery
+    /// evidence (issue #269, W7).
+    ///
+    /// This is the restore-side driver the family's own durable import was
+    /// missing. It supplies ACTUAL projection rows — the rows the archive holds
+    /// for this page — to the family's one fail-closed import,
+    /// [`RedbRecoveryStore::import_process_stream_recovery_suspended`], which
+    /// discards the incoming activation and always writes `Suspended` (or keeps
+    /// an already `Retired` row `Retired`). It creates no reservation, session or
+    /// authority row, so an imported projection is recovered as suspended
+    /// evidence and can never revive old process, session or authority state
+    /// (A13.7: old sessions, leases, approvals and epochs do not revive).
+    ///
+    /// Each row is bound to the exact backup entry the page already carries for
+    /// it before anything is written, so a restore cannot import a row the
+    /// presented page never exported:
+    /// - the entry's `record_id` is the family's durable key, its `order` and
+    ///   `effect_class` are read off the same decoded row through the one
+    ///   [`stream_recovery_entry`] the export uses, and its `payload_digest` is
+    ///   the digest of the row re-encoded through the same ORS codec. Any
+    ///   disagreement refuses the whole driver with zero writes.
+    ///
+    /// The same source/destination and page bindings
+    /// [`import_page_quarantined`](super::RedbRecoveryStore::import_backup_page_quarantined)
+    /// applies are applied here, so a same-installation or expired page restores
+    /// nothing. The family is not re-triaged, because triage is the quarantine
+    /// reader: it constructs no `PerEntryOutcome::Imported` and confers no
+    /// authority, and the suspended write below IS the family's own durable
+    /// route.
+    pub fn import_backup_process_stream_recovery_suspended(
+        &self,
+        import: &OrsBackupImportRequest,
+        page: &OrsBackupPage,
+        rows: &[ProcessStreamRecoveryProjection],
+    ) -> Result<Vec<ProcessStreamRecoveryWriteOutcome>, OrsError> {
+        validate_import_binding(&import.source, &import.destination)?;
+        page.validate_binding()?;
+        if page.expires_at_ms <= super::current_unix_ms()? {
+            return Err(OrsError::InvalidExpiry);
+        }
+        let mut bound = Vec::with_capacity(rows.len());
+        for projection in rows {
+            let record_id = projection.record_key()?;
+            let entry = page
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.family == RowFamilyKind::ProcessStreamRecovery
+                        && entry.record_id == record_id
+                })
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "process_stream_recovery",
+                    reason: format!(
+                        "restored row {record_id:?} is not an entry of the presented backup page"
+                    ),
+                })?;
+            let (order, effect_class) = stream_recovery_entry(projection)?;
+            if entry.order != order || entry.effect_class != effect_class {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_stream_recovery",
+                    reason: format!(
+                        "restored row {record_id:?} does not match the exported entry's order and \
+                         effect class"
+                    ),
+                });
+            }
+            let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
+            if entry.payload_digest != digest {
+                return Err(OrsError::PayloadIntegrityMismatch);
+            }
+            bound.push(projection);
+        }
+        let mut outcomes = Vec::with_capacity(bound.len());
+        for projection in bound {
+            outcomes.push(self.import_process_stream_recovery_suspended(projection)?);
+        }
+        Ok(outcomes)
+    }
+}
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
 /// freeze digest. Keeps quarantine reads from becoming unbounded scans;
@@ -265,7 +346,9 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::ProcessStartReplay),
         // Past handoffs never re-fence authority.
         RowFamilyDisposition::of(RowFamilyKind::AuthorityHandoffs),
-        // Process evidence is observational only.
+        // Process evidence is observational only, and a pre-#269 row of this
+        // family still holds the inline stdout/stderr payload: it exports as
+        // forensics and never as an importable observation (#269 A1).
         RowFamilyDisposition::of(RowFamilyKind::ProcessEvidence),
         // Process-stream recovery re-imports as suspended evidence only, never
         // a live process, session or authority owner (#269).

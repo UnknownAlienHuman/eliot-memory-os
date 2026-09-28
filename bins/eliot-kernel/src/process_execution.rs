@@ -103,10 +103,18 @@ struct OrsProcessEvidenceSink {
 }
 
 impl ProcessEvidenceSink for OrsProcessEvidenceSink {
+    /// Records the byte-free ORS observation of one physical result.
+    ///
+    /// Issue #269, A1: the accepted `ProcessEvidence` is read at this boundary
+    /// to take the digest over the ORIGINAL observed bytes, and the bounded
+    /// inline preview bytes are then dropped with the borrowed value. They never
+    /// reach ORS, so an execution with no stdout/stderr still records its
+    /// observation, and an execution with streams records their identity,
+    /// locator, exact digests and typed state without their payload.
     fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
         let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
         let record =
-            ProcessEvidenceRecord::from_evidence(evidence, self.owner.clone(), observed_at_ms)
+            ProcessEvidenceRecord::from_evidence(&evidence, self.owner.clone(), observed_at_ms)
                 .map_err(|error| eliot_process::EvidenceSinkError {
                     message: error.to_string(),
                 })?;
