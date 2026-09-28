@@ -587,6 +587,51 @@ impl InstrumentRun {
         }
     }
 
+    /// Finalizes one launched stage whose supervising lane retained the exact
+    /// raw bytes under an immutable artifact handle.
+    ///
+    /// The sealed `tool` identity, the admission `grant`, and the
+    /// `executable_digest` are observations the supervising lane made at
+    /// launch and termination; this constructor records them without
+    /// inventing a launch, a command, or an exit outcome. A malformed
+    /// operation identity or executable digest is refused instead of
+    /// recorded, so no retained handle can claim an identity no producer
+    /// observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileRunError::InvalidText`] for a malformed operation
+    /// identity or executable digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_retained(
+        route: &TestExecutionPlaneRoute,
+        operation_id: String,
+        grant: &InstrumentAdmissionGrant,
+        target_layout: Option<StageTargetLayout>,
+        artifact: eliot_contracts::ArtifactId,
+        byte_len: u64,
+        tool: RetainedToolIdentity,
+        executable_digest: String,
+    ) -> Result<Self, ProfileRunError> {
+        validate_text(&executable_digest, "executable_digest")?;
+        let stage = route.stage().clone().bound(operation_id)?;
+        Ok(Self {
+            stage,
+            plane: TestExecutionPlaneRoute::plane(),
+            testd_dispatchable: route.dispatchable_via_testd(),
+            execution: ExecutionStatus::Succeeded,
+            evidence: StageEvidence::Retained {
+                artifact,
+                byte_len,
+                tool,
+            },
+            executable_digest: Some(executable_digest),
+            grant_digest: Some(grant.grant_digest.clone()),
+            candidate_identity: None,
+            target_layout,
+        })
+    }
+
     /// Whether the run may count toward a successful aggregate.
     ///
     /// Success requires successful execution, retained raw evidence, and an
