@@ -1384,11 +1384,11 @@ impl AuditEventDraft {
     /// Returns the cancellation-confirmed draft for one exact parent
     /// (issue #1839).
     ///
-    /// `outcome` is `cancelled` when the parent transitioned, `fenced_unknown`
-    /// when the parent had passed the cancellable window, or
-    /// `already_terminal` when no transition was needed. The durable ORS
-    /// transition precedes the observation; the record never claims a
-    /// cancellation the store refused.
+    /// `outcome` is `cancelled` only after the atomic ORS transition proves
+    /// no possible effect, `fenced_unknown` when a claimed attempt remains
+    /// unresolved, `reconciling` for an existing recovery, or
+    /// `already_terminal` for an already closed parent. The durable ORS
+    /// observation precedes this audit record.
     #[must_use]
     pub fn cancel_confirmed(
         envelope: &HostRequestEnvelope,
