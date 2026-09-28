@@ -7,7 +7,7 @@ license.workspace = true
 description = "Deterministic in-memory reference implementation for the ELIOT store contracts"
 
 [package.metadata.eliot]
-workspace_admission = "non-runtime implementation-support reference per #1715; validates the same admitted named-operation and protocol-generation set as eliot-store-api; no production binary selects it as a storage fallback"
+workspace_admission = "non-runtime implementation-support reference per #1715; validates the same admitted named-operation and protocol-generation set as eliot-store-api; no production binary selects it as a storage fallback. #1141 disposition: BOUNDED REFERENCE/TEST FIXTURE with an explicit non-production ceiling - all three current edges are dev-dependency edges (bins/eliot-kernel, crates/kernel/eliot-kernel-service unit tests, eliot-backup integration tests), there is no production caller, and it must never become a second production canonical writer (A0.3) or share a production root or credentials with the Surreal bridge"
 
 [dependencies]
 eliot-kernel-core.workspace = true
