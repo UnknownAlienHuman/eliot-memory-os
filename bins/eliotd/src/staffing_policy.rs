@@ -35,10 +35,31 @@
 //! candidate: a lane route the receipt did not authorize — including a
 //! same-family or paid substitute for an unavailable independent audit — is
 //! refused instead of dispatched.
+//!
+//! The bridge never supplies a policy input the live request did not prove.
+//! Three inputs are the Human's and the owner's, never the bridge's, and each
+//! one is refused when the request does not carry it:
+//!
+//! * the assurance/cost preset is the Human's selection (I3.6), so the bridge
+//!   reads it from the request and never infers it from the recipe's shape;
+//! * a route is placed in a route class only where the request itself declares
+//!   that class, so one route can never be offered for a class its owner never
+//!   bound it to;
+//! * route-local privacy admission is a property of the route (I3.4), so it is
+//!   read from route-local evidence and never defaulted to admitting.
+//!
+//! I3.4 requires the same discipline of the registry itself: "Capability is
+//! not a boolean" and "legacy bool → `declared/imported_legacy`, never
+//! verified". A check that cannot fail proves nothing, so an absent input is
+//! refused with a named [`StaffingPolicyError`] instead of being filled in
+//! locally.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
 use eliot_agent_coordinator::{
-    CoordinatorConfig, RouteCandidateEvidence, StaffingPlanCandidate, StaffingPlanRequest,
+    CoordinatorConfig, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
+    StaffingPlanRequest,
 };
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
@@ -788,48 +809,77 @@ fn coordinator_plan_budget(
     Ok(ceiling)
 }
 
-/// Task-class `ModelRolePolicy` for one frozen coordinator recipe, plus
-/// whether that recipe asks for an independent review lane.
+/// Refusal issued when the request carries no Human-selected preset.
+const HUMAN_PRESET_ABSENT: &str = "staffing plan requires the Human-selected assurance/cost preset on the request; \
+StaffingPlanRequest carries no such field, so no preset is inferred from the recipe's role-profile count \
+(I3.6: the Human selects assurance and cost intent)";
+
+/// Task-class `ModelRolePolicy` for one frozen coordinator request, selected
+/// from the exact Human preset the request carries, plus whether that preset
+/// requires an independent review lane.
 ///
-/// The live coordinator request carries no human assurance/cost field, so the
-/// recipe's own declared staffing shape selects the preset: a recipe declaring
-/// more than one role profile asks for a writer plus a review lane, which is
-/// the I3.6 `assurance` shape ("one writer plus mandatory blind cross-family
-/// audit"); a single-role recipe is `balanced` ("one writer plus conditional
-/// independent review"). No provider proportion is ever read: the preset is a
-/// decision policy and the per-job budget is the plan ceiling from
-/// [`coordinator_plan_budget`]. Lane and writer counts above the policy
-/// bounds are refused rather than widened.
+/// The preset is the Human's decision — I3.6, "Human selects **assurance and
+/// cost intent**, not a permanent model proportion" — so it is data the request
+/// must carry and never a property this bridge infers. The live
+/// `eliot_agent_coordinator::StaffingPlanRequest` has no assurance/cost field:
+/// its fields are `candidate_id`, `launch`, `recipe`, `task_revision`,
+/// `plan_revision`, `state_fence`, `privacy_class`, `work_class` and `lanes`
+/// (`crates/agent/eliot-agent-coordinator/src/model.rs`), and
+/// `eliot_agent_api::AgentLaunchRequest` carries no such selection either
+/// (`privacy_profile` is a launch-level profile, not a Human preset). The
+/// selection is therefore absent evidence and this refuses.
+///
+/// The shape-derived rule that used to stand here — more than one role profile
+/// ⇒ `assurance`, otherwise `balanced` — is gone: it left `economy`,
+/// `research` and `incident` unselectable, never consumed the Human's cost
+/// intent, and read no provider proportion either, so it proved nothing.
+///
+/// # Errors
+///
+/// Returns [`StaffingPolicyError::Contract`] when the request carries no
+/// Human-selected preset. That refusal is deliberate and fail-closed: the
+/// preset is the Human's assurance/cost decision, and I3.4's "Capability is not
+/// a boolean / never verified" rule forbids recording an unverified one.
+///
+/// BLOCKED-BY scope `crates/agent/eliot-agent-coordinator/src/model.rs::StaffingPlanRequest`:
+/// it needs a Human-selection field (for example
+/// `human_staffing_preset: StaffingPreset`) that the Human surface sets, after
+/// which all five presets — [`ModelRolePolicy::economy`],
+/// [`ModelRolePolicy::balanced`], [`ModelRolePolicy::assurance`],
+/// [`ModelRolePolicy::research`] and [`ModelRolePolicy::incident`] — become
+/// selectable here. The preset's `per_job_budget` is then the Human's cost
+/// intent, and the plan's own ask stays separate in
+/// [`coordinator_constraints`], so [`plan_staffing`] still really checks that
+/// the ask sits within the intent.
 fn coordinator_recipe_policy(
-    request: &StaffingPlanRequest,
+    _request: &StaffingPlanRequest,
 ) -> Result<(ModelRolePolicy, bool), StaffingPolicyError> {
-    let review_requested = request.recipe.role_profiles.len() > 1;
-    let budget = coordinator_plan_budget(request)?;
-    let policy = if review_requested {
-        ModelRolePolicy::assurance(budget)?
-    } else {
-        ModelRolePolicy::balanced(budget)?
-    };
-    if request.lanes.len() > usize::from(policy.max_active_lanes) {
-        return Err(StaffingPolicyError::Contract(format!(
-            "recipe requests {} lanes above the policy active-lane bound {}",
-            request.lanes.len(),
-            policy.max_active_lanes
-        )));
-    }
-    let mutation_capable = request
-        .recipe
-        .role_profiles
-        .iter()
-        .filter(|profile| profile.mutation_capable)
-        .count();
-    if mutation_capable > usize::from(policy.max_writers_per_deliverable) {
-        return Err(StaffingPolicyError::Contract(format!(
-            "recipe declares {mutation_capable} mutation-capable roles above the policy writer bound {}",
-            policy.max_writers_per_deliverable
-        )));
-    }
-    Ok((policy, review_requested))
+    Err(StaffingPolicyError::Contract(
+        HUMAN_PRESET_ABSENT.to_owned(),
+    ))
+}
+
+/// Whether one offered route admits the task privacy class, from route-local
+/// evidence only.
+///
+/// I3.4 places privacy admission on the route: `RuntimeRoute.privacy_classes` is
+/// the fact that admits a task privacy class on one specific route, and the
+/// plan-level ceiling in [`StaffingConstraints`] is a different, weaker
+/// statement. `RouteCandidateEvidence` and `RouteFingerprint` carry no such
+/// field, so no offered route proves it and no candidate is admitted for any
+/// lane. I3.4 requires exactly this asymmetry — "Capability is not a boolean"
+/// and "legacy bool → `declared/imported_legacy`, never verified": an absent
+/// proof is a refusal, never an assumed `true`.
+///
+/// The previous hard-coded `privacy_admits: true` made this the one admission
+/// dimension a candidate could never fail, so it proved nothing.
+///
+/// BLOCKED-BY scope `crates/agent/eliot-agent-coordinator/src/model.rs::RouteCandidateEvidence`:
+/// it needs the I3.4 `RuntimeRoute.privacy_classes` of the offered route, after
+/// which this reads the route's own declared classes and a route that admits
+/// the class becomes staffable.
+fn coordinator_route_admits_privacy(_candidate: &RouteCandidateEvidence) -> bool {
+    false
 }
 
 /// One live route candidate as the policy consumes it.
@@ -839,11 +889,8 @@ fn coordinator_recipe_policy(
 /// silently satisfy an unavailable independent-audit requirement. Quota
 /// admission is the coordinator's own active capacity window: the candidate
 /// must carry the exact `capacity_identity`/`capacity_revision` of the live
-/// [`CoordinatorConfig`]. Route-local privacy admission is not carried by the
-/// live request; the task privacy class is the plan ceiling and the policy's
-/// local-only data classes close external lanes before any candidate is
-/// considered, so a candidate that cannot admit the task class never reaches
-/// the planner.
+/// [`CoordinatorConfig`]. Route-local privacy admission is derived from
+/// route-local evidence by [`coordinator_route_admits_privacy`], never assumed.
 fn coordinator_route_candidate(
     config: &CoordinatorConfig,
     candidate: &RouteCandidateEvidence,
@@ -865,18 +912,60 @@ fn coordinator_route_candidate(
             quota_admits: candidate.capacity_identity == config.capacity_identity
                 && candidate.capacity_revision == config.capacity_revision,
             capacity_admits: candidate.capacity_limit > 0,
-            privacy_admits: true,
+            privacy_admits: coordinator_route_admits_privacy(candidate),
         },
         evidence_ref,
     })
 }
 
+/// The I3.6 capability classes the request itself binds to one staffing lane.
+///
+/// I3.6 makes the default route classes capability-based (`bulk_implementation`,
+/// `independent_blind_audit`, …), so a class is eligible for a route only where
+/// the owner declared that class. The coordinator's own admission already
+/// requires a lane's candidates to be admitted by the recipe, by the lane's
+/// role profile, and by the launch, so all three declarations are intersected
+/// here and a class survives only when every one of them names it exactly.
+///
+/// Nothing maps a provider or adapter label onto a capability class, so a
+/// request whose declared vocabulary carries adapter labels (`codex-app-server`,
+/// `claude.agent-sdk.local-sidecar`, `provider-model-a`) proves no I3.6 class at
+/// all and every class is refused. A lane whose role profile is absent from the
+/// frozen recipe likewise proves nothing.
+fn coordinator_lane_class_binding(
+    request: &StaffingPlanRequest,
+    lane: &StaffingLaneRequest,
+) -> BTreeSet<String> {
+    let Some(profile) = request
+        .recipe
+        .role_profiles
+        .iter()
+        .find(|profile| profile.role_id == lane.role_id)
+    else {
+        return BTreeSet::new();
+    };
+    request
+        .recipe
+        .eligible_route_classes
+        .iter()
+        .filter(|class| {
+            profile.allowed_route_classes.contains(class)
+                && request.launch.allowed_route_classes.contains(class)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The live request's route candidates as capability evidence per I3.6 class.
 ///
-/// Every class the policy can staff or disposition draws from the same live
-/// candidate pool, so the policy — not the caller — decides which class a
-/// route may serve. The same route offered by several lanes is recorded once,
-/// in lane then candidate order, so the evidence is deterministic.
+/// A route is placed in a class only where the request itself bound it to that
+/// class, so the same candidate pool is no longer copied into every worker,
+/// auditor and Dreamer class: a route with no owner-proven class binding is
+/// offered for no class at all, and its class then carries the explicit typed
+/// [`UnavailableClassDisposition`] the policy already records instead of a
+/// silently borrowed candidate. The same route offered by several lanes is
+/// recorded once per class, in lane then candidate order, so the evidence is
+/// deterministic.
 fn coordinator_route_evidence(
     config: &CoordinatorConfig,
     request: &StaffingPlanRequest,
@@ -888,18 +977,28 @@ fn coordinator_route_evidence(
     classes.sort();
     classes.dedup();
 
-    let mut records = Vec::with_capacity(classes.len());
-    for class in classes {
-        let mut candidates: Vec<RouteCandidate> = Vec::new();
-        for lane in &request.lanes {
-            for candidate in &lane.route_candidates {
-                let mapped = coordinator_route_candidate(config, candidate)?;
-                if candidates.iter().any(|seen| seen.route == mapped.route) {
-                    continue;
+    let bindings: Vec<BTreeSet<String>> = request
+        .lanes
+        .iter()
+        .map(|lane| coordinator_lane_class_binding(request, lane))
+        .collect();
+
+    let mut placed: BTreeMap<String, Vec<RouteCandidate>> = BTreeMap::new();
+    for (lane, binding) in request.lanes.iter().zip(&bindings) {
+        for candidate in &lane.route_candidates {
+            let mapped = coordinator_route_candidate(config, candidate)?;
+            for class in binding {
+                let candidates = placed.entry(class.clone()).or_default();
+                if !candidates.iter().any(|seen| seen.route == mapped.route) {
+                    candidates.push(mapped.clone());
                 }
-                candidates.push(mapped);
             }
         }
+    }
+
+    let mut records = Vec::with_capacity(classes.len());
+    for class in classes {
+        let candidates = placed.remove(&class).unwrap_or_default();
         let mut evidence_refs: Vec<String> = candidates
             .iter()
             .map(|item| item.evidence_ref.clone())
@@ -916,12 +1015,18 @@ fn coordinator_route_evidence(
 }
 
 /// Budget/privacy constraints the plan receipt binds, taken verbatim from the
-/// live request: the plan budget ceiling, the request's own privacy class, and
-/// every capability evidence reference the request carries.
+/// live request: the plan budget ceiling this request's lanes actually ask for,
+/// the request's own privacy class, and every capability evidence reference the
+/// request carries.
+///
+/// The lane budgets are the *plan's* ask and the policy's `per_job_budget` is
+/// the Human's cost intent, so they stay separate inputs: [`plan_staffing`]
+/// then really checks that the ask sits within the intent instead of comparing
+/// the intent with itself.
 fn coordinator_constraints(
     request: &StaffingPlanRequest,
-    budget: &BudgetEnvelope,
-) -> StaffingConstraints {
+) -> Result<StaffingConstraints, StaffingPolicyError> {
+    let budget = coordinator_plan_budget(request)?;
     let mut evidence_refs = request.launch.evidence_capability_refs.clone();
     for lane in &request.lanes {
         for candidate in &lane.route_candidates {
@@ -930,11 +1035,11 @@ fn coordinator_constraints(
     }
     evidence_refs.sort();
     evidence_refs.dedup();
-    StaffingConstraints {
-        budget: budget.clone(),
+    Ok(StaffingConstraints {
+        budget,
         privacy_ceiling: request.privacy_class,
         evidence_refs,
-    }
+    })
 }
 
 /// Plans task-class staffing for the live coordinator request (I3.6).
@@ -947,18 +1052,29 @@ fn coordinator_constraints(
 /// the selected route classes, the selected routes, the budget/privacy
 /// constraints it was computed under, and the evidence inputs used.
 ///
+/// The bridge supplies no policy input the request did not prove. The
+/// Human-selected preset ([`coordinator_recipe_policy`]), the owner-proven
+/// route-class binding ([`coordinator_lane_class_binding`]) and route-local
+/// privacy admission ([`coordinator_route_admits_privacy`]) are read from the
+/// request, and each is refused when the request does not carry it. Refusing
+/// here is the point: a staffing plan that cannot show its own evidence is not
+/// an acceptable plan, and I3.6's requirement that an unavailable class yield
+/// an explicit defer/degrade/escalate disposition rather than a silent
+/// substitution is only honest if the evidence behind each disposition is real.
+///
 /// # Errors
 ///
 /// Returns the planner rejection unchanged, including
-/// [`StaffingPolicyError::NoWriterRoute`] when no writer route clears quota,
-/// capacity and privacy admission under current evidence.
+/// [`StaffingPolicyError::Contract`] when the request carries no Human-selected
+/// preset, and [`StaffingPolicyError::NoWriterRoute`] when no writer route
+/// clears quota, capacity and privacy admission under current evidence.
 pub fn plan_coordinator_staffing(
     config: &CoordinatorConfig,
     request: &StaffingPlanRequest,
 ) -> Result<StaffingPlanReceipt, StaffingPolicyError> {
     let (policy, review_requested) = coordinator_recipe_policy(request)?;
     let evidence = coordinator_route_evidence(config, request, &policy)?;
-    let constraints = coordinator_constraints(request, &policy.per_job_budget);
+    let constraints = coordinator_constraints(request)?;
     plan_staffing(
         &policy,
         request.work_class.as_wire_str(),
