@@ -477,40 +477,87 @@ def history_matches(root: Path, path: Path, expected_sha256: str) -> list[dict[s
 def validate_originals(
     audit: Audit,
     reconstructed: dict[str, bytes],
+    pair: dict[str, Any],
 ) -> None:
-    matches_by_key: dict[str, list[dict[str, str]]] = {}
+    """Prove the adoption chain of each book against an independent source.
+
+    I00-14 states that the Implementation never contains its own final digest as
+    authority and that "handshakes, cutovers and audits use the external pair
+    receipt", so the CURRENT stream is bound by digest to `docs/normative-pair.toml`
+    (already checked against the manifest by `validate_pair`/`validate_manifest`).
+    The receipt also names the stream it SUPERSEDES, and `historical_material_location`
+    is "git-history-and-issue-pr-records-only", so that predecessor must exist verbatim
+    as a committed version of the legacy path. That predecessor witness is the
+    independent check: it is read out of Git history and cannot be produced by
+    rewriting the working tree, and it is bound per book to the same repository.
+
+    The legacy paths themselves are compact compatibility maps (docs/ARCHITECTURE_CONTRACT.md)
+    and must never carry the payload, so the current stream is deliberately NOT
+    required to appear at that path in history: a fragment amendment would otherwise
+    have to re-adopt the monolith, and under squash-merge the adopt-then-restore
+    pair that produces such a witness collapses to no change at all.
+    """
+    matches_by_key: dict[str, set[str]] = {}
     for key, data in reconstructed.items():
         if not data:
             continue
         path = LEGACY_PATHS[key]
-        matches = history_matches(audit.root, path, sha256(data))
-        matches_by_key[key] = matches
-        if not matches:
+
+        adopted = str(pair.get(f"{key}_sha256", ""))
+        reconstructed_sha = sha256(data)
+        if adopted != reconstructed_sha:
             audit.error(
-                "DOC-ORIGINAL-NOT-FOUND",
-                "no Git-history version of the monolith matches reconstructed bytes",
+                "DOC-ORIGINAL-ADOPTED-DIGEST",
+                "pair receipt does not adopt the reconstructed byte stream",
                 path=path,
-                detail={"reconstructed_sha256": sha256(data)},
+                detail={"receipt_sha256": adopted, "reconstructed_sha256": reconstructed_sha},
+            )
+        audit.evidence[f"{key}_adopted_sha256"] = adopted
+        audit.evidence[f"{key}_reconstructed_blob"] = git_blob_id(audit.root, data)
+
+        superseded = str(pair.get(f"supersedes_{key}_sha256", ""))
+        # Registered before the shape check so a malformed digest still leaves this
+        # book with no witness, and the pair check below reports the missing common
+        # commit instead of being skipped.
+        matches_by_key[key] = set()
+        if not re.fullmatch(r"[0-9a-f]{64}", superseded):
+            audit.error(
+                "DOC-ORIGINAL-SUPERSEDES-DIGEST",
+                f"supersedes_{key}_sha256 is not a SHA-256 digest",
+                path=PAIR_PATH,
+                detail={"value": superseded},
             )
             continue
-        reconstructed_blob = git_blob_id(audit.root, data)
-        if reconstructed_blob not in {record["blob"] for record in matches}:
+        matches = history_matches(audit.root, path, superseded)
+        commits = {record["commit"] for record in matches}
+        matches_by_key[key] = commits
+        if not matches:
             audit.error(
-                "DOC-ORIGINAL-BLOB",
-                "reconstructed Git blob ID differs from all matching history blobs",
+                "DOC-ORIGINAL-SUPERSEDES-NOT-FOUND",
+                "no Git-history version of the monolith matches the superseded byte stream",
                 path=path,
+                detail={"superseded_sha256": superseded},
             )
-        audit.evidence[f"{key}_original_matches"] = matches
-        audit.evidence[f"{key}_reconstructed_blob"] = reconstructed_blob
+            continue
+        # A content match is not enough: the witness must be the SAME Git object the
+        # receipt's digest names, so history cannot supply a look-alike blob.
+        if len({record["blob"] for record in matches}) != 1:
+            audit.error(
+                "DOC-ORIGINAL-SUPERSEDES-BLOB",
+                "the superseded byte stream matches more than one distinct Git blob",
+                path=path,
+                detail={"blobs": sorted({record["blob"] for record in matches})},
+            )
+        audit.evidence[f"{key}_superseded_sha256"] = superseded
+        audit.evidence[f"{key}_supersedes_matches"] = matches
 
     if set(matches_by_key) == {"architecture", "implementation"}:
-        architecture_commits = {item["commit"] for item in matches_by_key["architecture"]}
-        implementation_commits = {item["commit"] for item in matches_by_key["implementation"]}
-        common = sorted(architecture_commits & implementation_commits)
+        common = sorted(matches_by_key["architecture"] & matches_by_key["implementation"])
         if not common:
             audit.error(
                 "DOC-ORIGINAL-PAIR-COMMIT",
-                "Architecture and Implementation do not share a Git commit with both adopted byte streams",
+                "Architecture and Implementation do not share a Git commit carrying both "
+                "superseded byte streams",
             )
         else:
             audit.evidence["common_original_commits"] = common
@@ -1159,10 +1206,12 @@ def render_markdown(payload: dict[str, Any]) -> str:
     ]
     evidence = payload.get("evidence", {})
     for key in ("architecture", "implementation"):
-        matches = evidence.get(f"{key}_original_matches", [])
+        matches = evidence.get(f"{key}_supersedes_matches", [])
         lines.append(
             f"- {key}: reconstructed blob `{evidence.get(f'{key}_reconstructed_blob', 'UNKNOWN')}`; "
-            f"matching historical versions: {len(matches)}."
+            f"adopted by the pair receipt `{evidence.get(f'{key}_adopted_sha256', 'UNKNOWN')}`; "
+            f"superseded stream `{evidence.get(f'{key}_superseded_sha256', 'UNKNOWN')}` has "
+            f"{len(matches)} matching historical version(s)."
         )
     common = evidence.get("common_original_commits", [])
     lines.append(f"- Common exact original commits: {', '.join(f'`{value}`' for value in common) or 'none' }.")
@@ -1232,7 +1281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     path=PAIR_PATH,
                 )
 
-    validate_originals(audit, reconstructed)
+    validate_originals(audit, reconstructed, pair)
     handles = validate_handle_index(audit, manifests)
     anchors = parse_decision_anchors(audit)
     validate_anchor_index(audit, anchors, pair, handles)
