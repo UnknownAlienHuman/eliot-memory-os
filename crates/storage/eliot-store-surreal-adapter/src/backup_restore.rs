@@ -3993,28 +3993,33 @@ impl SurrealStoreAdapter {
         document: &RestoreRecordDocument,
         batch: &CanonicalRestoreBatch,
     ) -> Result<RestoreValidationReceipt, StoreError> {
-        let first = document.members.first().ok_or(StoreError::InvalidReceipt)?;
+        // The rows are bound to this batch's members by identity, never by
+        // position: a same-operation replay that carries a different member set
+        // conflicts here, and every disposition below is read from the row this
+        // very member was recorded with. They come back in batch member order,
+        // which is the order the planned-set consumers below are indexed in.
+        let recorded = recorded_members_by_identity(batch, document)?;
+        let first = recorded.first().ok_or(StoreError::InvalidReceipt)?;
         let domains = RestoreDomains {
             residency: first.residency_domain.clone(),
             privacy: first.privacy_domain.clone(),
             retention: first.retention_domain.clone(),
         };
-        if document.members.len() != batch.members.len() {
-            return Err(StoreError::InvalidReceipt);
-        }
-        let mut dispositions = Vec::with_capacity(document.members.len());
-        let mut evidence = Vec::with_capacity(document.members.len());
-        for member in &document.members {
+        let mut dispositions = Vec::with_capacity(recorded.len());
+        let mut dispositions_by_member: BTreeMap<String, MemberDisposition> =
+            BTreeMap::with_capacity(recorded.len());
+        let mut evidence = Vec::with_capacity(recorded.len());
+        for row in &recorded {
             // Only a claim that names a closed class, a record address *and* the
             // content digest this operation committed can be looked up in the
             // destination. A metadata-only record written before canonical import
             // named none of them, so it stays bookkeeping evidence: it is re-read
             // as `Unresolved` rather than being certified as imported data.
             let observed = match (
-                member.disposition,
-                member.imported_class.as_deref(),
-                member.imported_record_id.as_deref(),
-                member.imported_digest.as_deref(),
+                row.disposition,
+                row.imported_class.as_deref(),
+                row.imported_record_id.as_deref(),
+                row.imported_digest.as_deref(),
             ) {
                 (
                     MemberDisposition::Restored,
@@ -4038,19 +4043,24 @@ impl SurrealStoreAdapter {
                 }
                 _ => None,
             };
-            dispositions.push(match observed {
+            let disposition = match observed {
                 Some(_) => MemberDisposition::Restored,
-                None => match member.disposition {
+                None => match row.disposition {
                     MemberDisposition::Suppressed => MemberDisposition::Suppressed,
                     MemberDisposition::Rejected => MemberDisposition::Rejected,
                     MemberDisposition::Restored | MemberDisposition::Unresolved => {
                         MemberDisposition::Unresolved
                     }
                 },
-            });
+            };
+            dispositions.push(disposition);
+            // The closure guard reads dispositions by the member identity the row
+            // was recorded under, so a disposition observed for one member can
+            // never be examined against another member's reference edge.
+            dispositions_by_member.insert(row.member_ref.clone(), disposition);
             evidence.push(observed);
         }
-        validate_reference_closure_against(batch, &dispositions)?;
+        validate_reference_closure_against(batch, &dispositions_by_member)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let members = member_records(
