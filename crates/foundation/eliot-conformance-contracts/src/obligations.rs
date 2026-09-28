@@ -517,9 +517,7 @@ impl ActiveObligationHotsetEntry {
             .iter()
             .any(|lineage| lineage.donor_ref.is_some())
         {
-            let Some(stage) = obligation.adoption_stage else {
-                return None;
-            };
+            let stage = obligation.adoption_stage?;
             if stage == AdoptionStage::StageA || obligation.stage_gate_evidence_ref.is_none() {
                 return None;
             }
