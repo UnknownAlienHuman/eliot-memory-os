@@ -276,6 +276,42 @@
 //! to be three rosters that agree, with a duplicate, foreign or missing outcome
 //! refused rather than de-duplicated. `reconcile_lost_import_response` stays
 //! historical: it re-evaluates the two recorded halves and reads no live state.
+//!
+//! The same issue then found the exhausted axis being RESTARTED rather than
+//! finished. Each continuation said "no cursor left" by carrying `None`, and the
+//! page loop had nothing to hand the following page in that case, so it left the
+//! axis's PRE-PAGE cursor in force and the next page re-read the axis from there.
+//! Issue #2967 had already fixed that for the operational window alone; the
+//! families kept the defect in its exact form, so a family that closed on page N
+//! was re-emitted on page N+1 while a later family carried the snapshot forward,
+//! and every page digest still agreed because nothing in a page said which STATE
+//! its axis was in — only that a cursor was missing.
+//!
+//! What changed, in the existing continuation contract rather than beside it:
+//! - `OrsAxisState::{Open, Exhausted}` replaces `next: Option<Cursor>` on both
+//!   the operational continuation and the family continuation, and each arm names
+//!   the boundary it means: the resume point, or the walk's FINAL frontier. The
+//!   incoming cursor stays a separate field, so a page still states what it read.
+//! - `operational_segment` and `family_segment` retain that frontier on EVERY
+//!   return and refuse to declare exhaustion below the frozen denominator, so only
+//!   an owner-established final frontier can close an axis; a page or byte limit
+//!   stays `Open` with the exact frontier to resume from. The operational
+//!   `operational_tail` field is gone — it was the parallel cursor the new state
+//!   replaces.
+//! - `operational_page` and `family_page` skip an already-exhausted axis without
+//!   spending any of the page's row or byte allowance, after re-proving its
+//!   revision and its durable-key prefix, so the whole remaining admission goes
+//!   to the axes that are still open.
+//! - `export_pages_in` attaches every axis's frontier on BOTH arms, which is what
+//!   makes an exhausted axis stay inert instead of restarting, and
+//!   `export_snapshot` publishes an outstanding cursor only for an `Open` axis.
+//! - `snapshot_completeness` requires every required axis to be EXPLICITLY
+//!   exhausted at the denominator it was opened with, and a family that was never
+//!   given a denominator stays a third, unknown-coverage condition.
+//! - `export_snapshot` now calls the existing `OrsBackupSnapshot::validate` on
+//!   the fully assembled archive before returning it. That is a guard on the
+//!   state machine above, not a substitute for it, and it is what would have
+//!   caught the repeated-read archive the audit's counterexample produces.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -290,12 +326,12 @@ use super::storage;
 use crate::backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason,
     CurrentOwnerValidation, KnownZeroVerdict, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES,
-    MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest,
-    OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor,
-    OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
-    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
-    RowFamilyKind, RowPayloadState, StoredEffectClass, check_canonical_frozen,
-    validate_import_binding,
+    MAX_BACKUP_PAGE_LIFETIME_MS, OrsAxisState, OrsBackupEntry, OrsBackupImportReceipt,
+    OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot,
+    OrsFamilyContinuation, OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity,
+    OrsOperationalContinuation, OrsOperationalCursor, OrsOperationalSnapshotIdentity,
+    PerEntryOutcome, RowDisposition, RowFamilyDisposition, RowFamilyKind, RowPayloadState,
+    StoredEffectClass, check_canonical_frozen, validate_import_binding,
 };
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
@@ -2134,7 +2170,10 @@ fn family_row_refused(record_type: &'static str, record_key: &str, reason: &str)
 /// - a row that cannot fit the caller's declared budget at all is a bounded
 ///   refusal naming that exact row, and the enumeration stops there instead of
 ///   scanning the remainder of the family to decide what to do with it;
-/// - `next` is `None` only when the enumeration reached the end of the family.
+/// - the axis is left `Open` whenever a row is still behind the boundary, and
+///   `Exhausted` only when the enumeration reached the end of the FROZEN family
+///   denominator; the two are cross-checked so the measuring pass and the walking
+///   pass cannot silently disagree.
 fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize>(
     family: RowFamilyKind,
     table: &redb::ReadOnlyTable<&str, &str>,
@@ -2217,16 +2256,48 @@ fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize
             payload_state: RowPayloadState::Obtained,
         });
     }
+    // ONE assembly of the boundary this page's family walk ended at. Built
+    // unconditionally, because an exhausted family HAS a real terminal frontier
+    // and the pages that follow exist only to carry the other axes and must still
+    // be read under it (issue #953). When the page emitted nothing the chain is
+    // resumed from the in-force cursor's own commitment and every field is that
+    // cursor's, so an exhausted empty page re-reads to the same empty segment
+    // rather than a second copy of the walk.
+    let frontier = OrsFamilyCursor {
+        version: cursor.version,
+        identity: cursor.identity.clone(),
+        after_key,
+        emitted_rows,
+        emitted_bytes,
+        emitted_prefix_digest: chain.link().to_owned(),
+    };
+    if !family_open && frontier.emitted_rows != cursor.identity.family_row_count {
+        // The family was re-measured by `check_family_revision_frozen` and its
+        // emitted prefix re-proved by `check_family_cursor_boundary` on this same
+        // read transaction, so the two passes cannot legitimately disagree. If
+        // they do, the walk would be about to declare itself exhausted against a
+        // denominator it never reached, which is the "Complete from row presence"
+        // defect in its exact form, so it is refused by name instead.
+        return Err(family_row_refused(
+            record_type,
+            &frontier.after_key,
+            &format!(
+                "the family walk stopped at {} emitted row(s) against a frozen denominator of {}",
+                frontier.emitted_rows, cursor.identity.family_row_count
+            ),
+        ));
+    }
+    // Only an owner-established terminal frontier may close the axis; a page or
+    // byte limit that merely spent this page's admission stays `Open` and hands
+    // on the exact frontier to resume from.
+    let state = if family_open {
+        OrsAxisState::Open(frontier)
+    } else {
+        OrsAxisState::Exhausted(frontier)
+    };
     let continuation = OrsFamilyContinuation {
         cursor: cursor.clone(),
-        next: family_open.then(|| OrsFamilyCursor {
-            version: cursor.version,
-            identity: cursor.identity.clone(),
-            after_key,
-            emitted_rows,
-            emitted_bytes,
-            emitted_prefix_digest: chain.link().to_owned(),
-        }),
+        state,
     };
     Ok((entries, continuation, page_bytes))
 }
@@ -2235,29 +2306,17 @@ fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize
 struct OperationalSegment {
     /// Entries emitted from the operational walk on this page.
     entries: Vec<OrsBackupEntry>,
-    /// The page's in-force cursor and the exact next one.
+    /// The page's in-force cursor and the axis's exact outgoing state.
+    ///
+    /// The outgoing boundary is reached through
+    /// [`OrsOperationalContinuation::frontier`] on BOTH states, so there is no
+    /// second, parallel cursor to keep in step with it: the durable key and the
+    /// chained prefix digest are over the key the owner walked under, which a
+    /// page's `OrsBackupEntry` does not carry, and the walk is the only place that
+    /// has both, so the state carries them (issue #2967, W6/A2; #953).
     continuation: OrsOperationalContinuation,
     /// Encoded bytes this segment charged to the page.
     page_bytes: u64,
-    /// The cursor naming the walk's tail after this page's rows, whether or not an
-    /// eligible row is still behind it (issue #2967, W6/A2).
-    ///
-    /// Equal to `continuation.next` while the walk is still OPEN, and the
-    /// MATERIALIZED exhausted tail once it is not. The two are deliberately not the
-    /// same field: `next` is what the page OWES the snapshot (and is `None` the
-    /// moment the frozen denominator is reached, so a `Complete` snapshot declares no
-    /// outstanding operational cursor), while this is what a FOLLOWING page must be
-    /// read under. When the walk is exhausted the following pages exist only to carry
-    /// the family axes, and they must still be read under the operational walk's real
-    /// tail rather than under its start, or the walk is re-read and every operational
-    /// row is exported twice.
-    ///
-    /// It is materialized here rather than at the call site because it cannot be
-    /// recovered downstream: the durable key and the chained prefix digest are over
-    /// the key the owner walked under, which a page's `OrsBackupEntry` does not carry
-    /// (an entry carries the record id, the order and the payload digest). The walk
-    /// is the only place that has both, and it already has them.
-    operational_tail: OrsOperationalCursor,
 }
 
 /// The walk's running state as this page advanced it (issue #2967).
@@ -2458,9 +2517,10 @@ fn operational_walk(
 /// - a row that does not fit the page's remaining budget is not emitted and not
 ///   dropped: it stays behind `next`, so the following page carries it and the walk
 ///   cannot be silently truncated;
-/// - `next` is `None` only when the walk reached the end of the FROZEN denominator,
-///   never because this scan happened to find nothing, and the two are cross-checked
-///   here so the measuring pass and the walking pass cannot silently disagree.
+/// - the axis is closed only when the walk reached the end of the FROZEN
+///   denominator, never because this scan happened to find nothing, and the two are
+///   cross-checked here so the measuring pass and the walking pass cannot silently
+///   disagree.
 fn operational_segment(
     table: &redb::ReadOnlyTable<&str, &str>,
     cursor: &OrsOperationalCursor,
@@ -2494,12 +2554,12 @@ fn operational_segment(
     }
     // ONE assembly of the boundary this page's walk ended at, read two ways. Built
     // unconditionally, because an exhausted walk still HAS a real boundary and the
-    // next page has to be read under it; `next` below is then only the question of
-    // whether that boundary is still owed. When the page emitted nothing at all the
-    // chain is resumed from the in-force cursor's own commitment and every field is
-    // that cursor's, so an exhausted empty page re-reads to the same empty segment
+    // next page has to be read under it; the state below is then only the question
+    // of whether that boundary is still owed. When the page emitted nothing at all
+    // the chain is resumed from the in-force cursor's own commitment and every field
+    // is that cursor's, so an exhausted empty page re-reads to the same empty segment
     // rather than a second copy of the walk.
-    let operational_tail = OrsOperationalCursor {
+    let frontier = OrsOperationalCursor {
         version: cursor.version,
         identity: cursor.identity.clone(),
         after_order: progress.after_order,
@@ -2508,15 +2568,18 @@ fn operational_segment(
         emitted_bytes: progress.emitted_bytes,
         emitted_prefix_digest: progress.chain.link().to_owned(),
     };
-    let next = progress.open.then(|| operational_tail.clone());
+    let state = if progress.open {
+        OrsAxisState::Open(frontier)
+    } else {
+        OrsAxisState::Exhausted(frontier)
+    };
     Ok(OperationalSegment {
         entries: progress.entries,
         continuation: OrsOperationalContinuation {
             cursor: cursor.clone(),
-            next,
+            state,
         },
         page_bytes: progress.page_bytes,
-        operational_tail,
     })
 }
 
@@ -2684,6 +2747,15 @@ fn resolve_operational_cursor(
 /// has been charged yet on this page; the walk does not get a private allowance, so
 /// paging it can never raise the per-page ceiling, and it is charged first precisely
 /// so it can never take more than the page's ceiling either.
+///
+/// An axis that a previous page already closed is SKIPPED (issue #953): its
+/// verified terminal frontier is re-proved against durable state and carried
+/// forward unchanged, it emits zero rows, and it charges zero of this page's
+/// allowance, which is then available in full to the families. Only an
+/// owner-established frontier takes that path — the cursor must name the
+/// owner-emitted prefix of the frozen window, which
+/// `check_operational_cursor_boundary` re-derives from durable keys — so a
+/// caller cannot declare exhaustion by counting.
 fn operational_page(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -2692,13 +2764,25 @@ fn operational_page(
     let table = read
         .open_table(super::OPERATIONAL_HISTORY)
         .map_err(storage)?;
-    let segment = operational_segment(
-        &table,
-        &cursor,
-        usize::from(request.page_entries),
-        request.max_bytes,
-        request.max_bytes,
-    );
+    let segment = if cursor.emitted_rows == cursor.identity.operational_row_count {
+        check_operational_cursor_boundary(&table, &cursor)?;
+        Ok(OperationalSegment {
+            entries: Vec::new(),
+            continuation: OrsOperationalContinuation {
+                cursor: cursor.clone(),
+                state: OrsAxisState::Exhausted(cursor),
+            },
+            page_bytes: 0,
+        })
+    } else {
+        operational_segment(
+            &table,
+            &cursor,
+            usize::from(request.page_entries),
+            request.max_bytes,
+            request.max_bytes,
+        )
+    };
     drop(table);
     segment
 }
@@ -2721,6 +2805,15 @@ fn operational_page(
 ///
 /// Returns the page's family entries, its continuation (`None` when the request
 /// declared none for this family) and the encoded bytes it charged to the page.
+///
+/// A family a previous page already closed is SKIPPED (issue #953): its verified
+/// terminal frontier is re-proved against durable state and carried forward
+/// unchanged, it emits zero rows, and it charges none of this page's row or byte
+/// allowance, so every remaining slot goes to the axes that are still open. The
+/// two checks that make the frontier OWNER-ESTABLISHED rather than caller-asserted
+/// still run on this path: the family's durable revision must be the frozen one,
+/// and the presented cursor must name the owner-emitted durable-key prefix, so a
+/// caller-selected row count cannot declare a family exhausted.
 fn family_page(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -2732,6 +2825,21 @@ fn family_page(
         return Ok((Vec::new(), None, 0));
     };
     check_family_revision_frozen(read, cursor)?;
+    if cursor.emitted_rows == cursor.identity.family_row_count {
+        let table = read
+            .open_table(family_table_definition(family)?)
+            .map_err(storage)?;
+        check_family_cursor_boundary(&table, cursor)?;
+        drop(table);
+        return Ok((
+            Vec::new(),
+            Some(OrsFamilyContinuation {
+                cursor: cursor.clone(),
+                state: OrsAxisState::Exhausted(cursor.clone()),
+            }),
+            0,
+        ));
+    }
     let row_budget = usize::from(request.page_entries)
         .checked_sub(charged_entries)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
@@ -2781,7 +2889,7 @@ struct PageFamilySegments {
     recovery: Option<OrsFamilyContinuation>,
     /// Versioned-artifact continuation, or `None` when none was declared.
     artifacts: Option<OrsFamilyContinuation>,
-    /// True when ANY declared family still has rows behind its `next`.
+    /// True when ANY declared family still has rows behind its frontier.
     open: bool,
 }
 
@@ -2911,33 +3019,13 @@ pub(super) fn export_page(
     // produced at all. It is the same transaction as the page, so it describes
     // the same moment (issue #953, A5).
     check_row_family_census(&read)?;
-    // The walk's end boundary is dropped here deliberately, and not by oversight: a
-    // single-page export has no following page, so no later read is ever made under
-    // this boundary. The multi-page loop in `export_pages_in` is the only caller that
-    // needs it, and it takes it directly.
-    let page = export_page_in(&read, request, page_index, &observation)?.page;
+    // The walk's end boundary needs no separate hand-off here, and not by
+    // oversight: it travels on the page itself, inside the axis's outgoing state.
+    // A single-page export has no following page, and a multi-page one reads the
+    // boundary straight off each page.
+    let page = export_page_in(&read, request, page_index, &observation)?;
     drop(read);
     Ok(page)
-}
-
-/// One page as it leaves the builder, plus the operational boundary the walk it
-/// just performed actually reached (issue #2967, W6/A2).
-///
-/// The page alone does not carry its own walk's end boundary, because a page's
-/// contract is what it OWES — an exhausted walk reports no next cursor — while the
-/// page LOOP needs the boundary a FOLLOWING page must be read under even when the
-/// walk is already finished and the following pages carry nothing but family rows.
-/// Those are two different questions with two different answers, and the one that
-/// must not be answered wrongly is the loop's: reading the next page under the
-/// walk's START instead of its TAIL re-emits every operational row the snapshot has
-/// already exported. The builder therefore returns both, and the single-page
-/// entrypoint ([`export_page`]) drops the boundary for the honest reason that a
-/// one-page export has no following page to be read under.
-struct ExportedPage {
-    /// The validated, digested page itself.
-    page: OrsBackupPage,
-    /// The operational walk's boundary after this page's rows, exhausted or not.
-    operational_tail: OrsOperationalCursor,
 }
 
 /// Builds one backup page under the caller's capture transaction (issue #953).
@@ -2971,7 +3059,9 @@ struct ExportedPage {
 /// paged through its OWN request slot in durable-key order, sharing this page's
 /// remaining row and byte budget so the per-page ceiling is unchanged. Each family
 /// segment is admitted from what the previous one actually spent, so a page can
-/// never exceed `page_entries` or `max_bytes` by running three segments.
+/// never exceed `page_entries` or `max_bytes` by running three segments. An axis an
+/// earlier page already closed emits nothing here and spends none of that
+/// admission (issue #953).
 /// `is_last` is the conjunction of the operational walk having no continuation left
 /// and BOTH families having no continuation left, so a page that still owes rows on
 /// any axis is never final.
@@ -2980,7 +3070,7 @@ fn export_page_in(
     request: &OrsBackupRequest,
     page_index: u32,
     observation: &StoreFenceObservation,
-) -> Result<ExportedPage, OrsError> {
+) -> Result<OrsBackupPage, OrsError> {
     if request.page_entries == 0 {
         return Err(OrsError::InvalidField {
             field: "backup.page_entries",
@@ -3073,10 +3163,7 @@ fn export_page_in(
     };
     page.page_digest = page.expected_page_digest();
     page.validate_binding()?;
-    Ok(ExportedPage {
-        page,
-        operational_tail: operational.operational_tail,
-    })
+    Ok(page)
 }
 
 /// The page loop's whole output, gathered under the caller's capture
@@ -3111,17 +3198,19 @@ struct SnapshotPages {
 /// or the page budget is spent. Holding one transaction across the whole loop is
 /// what makes the pages one moment.
 ///
-/// EVERY axis advances by EXACTLY the owner-issued cursor its own previous page
-/// ended with, and each advance is dispatched on that cursor's own axis, so one
-/// axis's next cursor can only ever land in that axis's request slot. The
-/// operational axis is the one this issue adds: page N+1 is read under page N's
-/// actual emitted tail, so the walk neither repeats nor skips a row in the sparse
-/// order domain, and the loop can no longer spend its whole page budget re-reading
-/// a stride window. The tail is carried even when the walk is already EXHAUSTED and
-/// page N therefore owes no continuation: the pages after an exhausted walk carry
-/// the family axes alone, and they are read under the walk's real boundary rather
-/// than its start, so "the walk finished early" never degrades into "the walk runs
-/// again" (issue #2967, W6/A2).
+/// EVERY axis advances by EXACTLY the frontier its own previous page ended with,
+/// and each advance is dispatched on that frontier's own axis, so one axis's cursor
+/// can only ever land in that axis's request slot. The frontier is carried on BOTH
+/// outgoing states (issue #953), and that is the fix for the restarted axis: with a
+/// single `Option<Cursor>` the loop had nothing to carry once an axis closed, so it
+/// left that axis's PRE-PAGE cursor in force and the next page re-read the axis
+/// from there — the whole operational window, or the whole family, re-emitted while
+/// a later axis carried the snapshot forward. Attaching the frontier on both arms
+/// makes an exhausted axis stay exhausted and inert, and an open axis resume.
+///
+/// The operational axis keeps the property issue #2967 established — page N+1 is
+/// read under page N's actual emitted tail, so the walk neither repeats nor skips a
+/// row in the sparse order domain — and gains the family twin of it (issue #953).
 fn export_pages_in(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -3132,51 +3221,27 @@ fn export_pages_in(
     let mut entry_count: u64 = 0;
     let mut last_page_was_final = false;
     for index in 0..u32::from(request.max_pages) {
-        let ExportedPage {
-            page,
-            operational_tail,
-        } = export_page_in(read, &continuing, index, observation)?;
+        let page = export_page_in(read, &continuing, index, observation)?;
         entry_count = entry_count
             .checked_add(page.entries.len() as u64)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
-        let next_operational = page.operational_continuation.next.clone();
+        // The exact outgoing boundary of every axis, whatever state it is in. Read
+        // off the page itself so there is no second copy to keep in step with it.
+        let next_operational = page.operational_continuation.frontier().clone();
         let next_recovery = page
             .family_continuation
             .as_ref()
-            .and_then(|continuation| continuation.next.clone());
+            .map(|continuation| continuation.frontier().clone());
         let next_artifact = page
             .versioned_artifact_continuation
             .as_ref()
-            .and_then(|continuation| continuation.next.clone());
+            .map(|continuation| continuation.frontier().clone());
         last_page_was_final = page.is_last;
         pages.push(page);
         if last_page_was_final {
             break;
         }
-        if let Some(next) = next_operational {
-            continuing = continuing.with_operational_cursor(next)?;
-        } else {
-            // The walk is EXHAUSTED, not merely unfinished: `next` is `None` because
-            // the frozen denominator was reached, which `operational_segment` has
-            // already cross-checked against a second measuring pass on this same read
-            // transaction. The next page therefore exists only to carry the family
-            // axes, and it must still be read under the operational walk's real TAIL,
-            // which is why the tail was materialized during the walk and is carried
-            // here.
-            //
-            // This used to carry the in-force START cursor forward instead, on the
-            // stated ground that "re-reading an exhausted window yields the same empty
-            // segment". That was false of the code beneath it and it re-emitted the
-            // whole walk: `check_operational_cursor_boundary` is a no-op at
-            // `emitted_rows == 0`, so a start cursor is not merely cheaper to re-read
-            // but indistinguishable from a legitimate one, and `operational_seek`
-            // then seeks the frozen lower bound and walks the entire window again.
-            // Every operational row this snapshot had already exported was exported a
-            // second time under a fresh `record_id`-bearing entry, and the crate's own
-            // page-chain rule refused the result. Carrying the tail is what makes the
-            // remaining pages carry families alone (issue #2967, W6/A2).
-            continuing = continuing.with_operational_cursor(operational_tail)?;
-        }
+        continuing = continuing.with_operational_cursor(next_operational)?;
         if let Some(next) = next_recovery {
             continuing = attach_family_cursor(continuing, next)?;
         }
@@ -3188,20 +3253,24 @@ fn export_pages_in(
         return Err(OrsError::ProjectionLimitExceeded);
     }
     // The last page is the authority on whether EACH axis is finished: a page that
-    // ended an axis leaves no continuation for it even when an earlier page did, so
-    // a snapshot is never left claiming an outstanding cursor it has already
-    // emitted past.
+    // ended an axis leaves no outstanding cursor for it even when an earlier page
+    // did, so a snapshot is never left claiming an outstanding cursor it has
+    // already emitted past. An EXHAUSTED axis publishes nothing — its terminal
+    // frontier stays on the page and is not converted into an outstanding cursor a
+    // caller could resume from (issue #953).
     let outstanding_of = |page: Option<&OrsBackupPage>, family: RowFamilyKind| {
         page.and_then(|page| match family {
             RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
             RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
             _ => None,
         })
-        .and_then(|continuation| continuation.next.clone())
+        .and_then(OrsFamilyContinuation::open_cursor)
+        .cloned()
     };
     let last = pages.last();
     Ok(SnapshotPages {
-        outstanding_operational: last.and_then(|page| page.operational_continuation.next.clone()),
+        outstanding_operational: last
+            .and_then(|page| page.operational_continuation.open_cursor().cloned()),
         outstanding_recovery: outstanding_of(last, RowFamilyKind::ProcessStreamRecovery),
         outstanding_artifact: outstanding_of(last, RowFamilyKind::VersionedArtifacts),
         pages,
@@ -3211,7 +3280,8 @@ fn export_pages_in(
     })
 }
 
-/// Derives the snapshot's completeness from EXHAUSTION on every axis (issue #2967).
+/// Derives the snapshot's completeness from EXHAUSTION on every axis (issue #2967,
+/// made EXPLICIT by #953).
 ///
 /// `Complete` used to be a function of row presence and of the process-stream
 /// family's continuation alone, so a one-page budget that stopped on a non-final
@@ -3221,11 +3291,22 @@ fn export_pages_in(
 /// value makes rather than a substring a caller has to parse (W13).
 ///
 /// The arms, in order:
-/// 1. the operational walk still owes rows, or a cursor-paged family does;
-/// 2. a cursor-paged family was never given a denominator at all, which is unknown
-///    coverage rather than an empty complete family (I05-16);
+/// 1. an axis is still OPEN — the operational walk or a cursor-paged family. The
+///    reported reason carries that axis's exact open frontier, which is what a
+///    caller resumes from. A byte or page limit lands here and can never be
+///    reported as exhaustion (issue #953);
+/// 2. a cursor-paged family was never given a denominator at all, which is the
+///    THIRD condition — unknown coverage, not an exhausted axis — and never an
+///    empty complete family (I05-16);
 /// 3. the declared operational window is empty, which is also unknown coverage;
-/// 4. otherwise, and only then, `Complete` — and only with a non-empty aggregate and
+/// 4. every required axis is EXPLICITLY exhausted at the denominator it was opened
+///    with. This is where issue #953's guarantee lives: the check is not "no
+///    outstanding cursor" but "each axis stated [`OrsAxisState::Exhausted`] and
+///    that terminal frontier accounts for exactly its frozen row count". The
+///    segment builders already refuse to declare exhaustion below a denominator,
+///    so this arm is a producer-side statement of the same rule rather than a
+///    second measurement;
+/// 5. otherwise, and only then, `Complete` — and only with a non-empty aggregate and
 ///    a final last page, because a final page is the conjunction of every axis
 ///    having no continuation left.
 ///
@@ -3235,9 +3316,9 @@ fn export_pages_in(
 /// a partial would state a reason the snapshot does not have.
 fn snapshot_completeness(
     operational_history: &OrsOperationalSnapshotIdentity,
-    outstanding_operational: Option<&OrsOperationalCursor>,
-    outstanding_recovery: Option<&OrsFamilyCursor>,
-    outstanding_artifact: Option<&OrsFamilyCursor>,
+    last_operational: &OrsOperationalContinuation,
+    last_recovery: Option<&OrsFamilyContinuation>,
+    last_artifact: Option<&OrsFamilyContinuation>,
     continuing: &OrsBackupRequest,
     entry_count: u64,
     last_page_was_final: bool,
@@ -3251,7 +3332,7 @@ fn snapshot_completeness(
                 .family_row_count
                 .saturating_sub(cursor.emitted_rows),
         };
-    if let Some(next) = outstanding_operational {
+    if let Some(next) = last_operational.open_cursor() {
         return Ok(BackupCompleteness::Partial {
             reason: BackupPartialReason::OperationalContinuationOutstanding {
                 high_water_order: next.identity.high_water_order,
@@ -3263,12 +3344,12 @@ fn snapshot_completeness(
             },
         });
     }
-    if let Some(next) = outstanding_recovery {
+    if let Some(next) = last_recovery.and_then(OrsFamilyContinuation::open_cursor) {
         return Ok(BackupCompleteness::Partial {
             reason: family_outstanding(next, RowFamilyKind::ProcessStreamRecovery),
         });
     }
-    if let Some(next) = outstanding_artifact {
+    if let Some(next) = last_artifact.and_then(OrsFamilyContinuation::open_cursor) {
         return Ok(BackupCompleteness::Partial {
             reason: family_outstanding(next, RowFamilyKind::VersionedArtifacts),
         });
@@ -3290,6 +3371,23 @@ fn snapshot_completeness(
     if operational_history.operational_row_count == 0 {
         return Ok(BackupCompleteness::Partial {
             reason: BackupPartialReason::EmptyDenominator,
+        });
+    }
+    // Arm 4: explicit exhaustion at the denominators the axes were opened with.
+    let operational_exhausted = last_operational
+        .exhausted_cursor()
+        .is_some_and(|cursor| cursor.emitted_rows == operational_history.operational_row_count);
+    let family_exhausted = |continuation: Option<&OrsFamilyContinuation>| {
+        continuation
+            .and_then(OrsFamilyContinuation::exhausted_cursor)
+            .is_some_and(|cursor| cursor.emitted_rows == cursor.identity.family_row_count)
+    };
+    let recovery_exhausted = family_exhausted(last_recovery);
+    let artifact_exhausted = family_exhausted(last_artifact);
+    if !(operational_exhausted && recovery_exhausted && artifact_exhausted) {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "backup_axis_exhaustion",
+            reason: "a complete snapshot requires every required axis to be explicitly exhausted at the denominator it was opened with".to_owned(),
         });
     }
     if entry_count > 0 && last_page_was_final {
@@ -3463,18 +3561,27 @@ pub(super) fn export_snapshot(
     }
     // THE frozen operational identity, read off the LAST page's in-force cursor:
     // the last page is the authority on which window the walk was read under, for
-    // the same reason it is the authority on which families are finished.
-    let operational_history = pages
-        .last()
-        .map(|page| page.operational_continuation.cursor.identity.clone())
-        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    // the same reason it is the authority on which families are finished. The
+    // last page's three outgoing STATES are carried beside it for the same reason
+    // (issue #953): `Complete` is a statement about exhaustion, not about row
+    // presence.
+    let (operational_history, last_operational, last_recovery, last_artifact) = {
+        let last = pages.last().ok_or(OrsError::ProjectionLimitExceeded)?;
+        (
+            last.operational_continuation.cursor.identity.clone(),
+            last.operational_continuation.clone(),
+            last.family_continuation.clone(),
+            last.versioned_artifact_continuation.clone(),
+        )
+    };
     // `Complete` is derived from EXHAUSTION on every axis, never from row presence
-    // (issue #2967, W8).
+    // (issue #2967, W8), and from EXPLICIT exhaustion at the denominators the axes
+    // were opened with (issue #953).
     let completeness = snapshot_completeness(
         &operational_history,
-        outstanding_operational.as_ref(),
-        outstanding_recovery.as_ref(),
-        outstanding_artifact.as_ref(),
+        &last_operational,
+        last_recovery.as_ref(),
+        last_artifact.as_ref(),
         &continuing,
         entry_count,
         last_page_was_final,
@@ -3501,6 +3608,15 @@ pub(super) fn export_snapshot(
         next_versioned_artifact_cursor: outstanding_artifact,
     };
     snapshot.denominator_digest = snapshot.snapshot_digest();
+    // THE producer runs its own contract before handing the archive over
+    // (issue #953). This function used to set the denominator and return
+    // `Ok(snapshot)`, so nothing stopped it returning a snapshot its own
+    // validator rejects — the repeated-read transition this same issue repaired
+    // produced exactly such an archive, and only a RECEIVER running
+    // `validate()` would ever have found it. The check is a guard on the state
+    // machine above, never a substitute for it, and it runs after the digest is
+    // assigned so the denominator it re-derives is the real one.
+    snapshot.validate()?;
     Ok(snapshot)
 }
 

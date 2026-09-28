@@ -91,6 +91,32 @@
 //!   `Complete` snapshot. Four distinct typed outcomes, because the operator
 //!   action differs in each case and one generic failure would hide that.
 //!
+//! The same issue then found the EXHAUSTED axis, which the contracts above left
+//! unrepresentable. Both continuations carried `next: Option<Cursor>`, and `None`
+//! said only "this page is done with the axis"; it did not carry the axis's
+//! terminal boundary, so a page that followed to carry another axis had to be
+//! built under a boundary reconstructed somewhere else — and reconstructing it
+//! from the axis's own pre-page cursor RE-READ the axis, emitting its rows a
+//! second time while every digest in the archive still agreed. Three contract
+//! changes carry the repair:
+//! - [`OrsAxisState`] replaces the option on both continuations. `Open` names the
+//!   cursor a following page resumes from; `Exhausted` names the walk's FINAL
+//!   frontier, which the pages after it carry unchanged while emitting nothing
+//!   further for that axis. The INCOMING cursor stays a separate field, because a
+//!   page's own boundary and the boundary it hands on are two different facts.
+//! - The state and its frontier are folded into the page digest and the
+//!   denominator under their own names, so an exhausted axis can never hash like
+//!   an open one and a changed terminal boundary moves the value.
+//! - [`check_operational_pages`] and the new [`check_family_pages`] validate the
+//!   two transitions separately. `Open` must advance to the exact next cursor;
+//!   `Exhausted` may be followed only by pages that carry the same final
+//!   frontier, stay exhausted, and emit zero further rows for that axis. Refusing
+//!   exhausted-to-open, a changed terminal boundary, a repeated row and a skipped
+//!   prefix are what make an exhausted axis inert rather than restarted. The
+//!   families previously had NO cross-page chain at all — only the last page's
+//!   declared state was compared with the snapshot's own fields — which is
+//!   precisely the "last-page equality alone" the audit names.
+//!
 //! Storage-free: no `redb`, no filesystem, no `eliot-backup` dependency.
 //! Distinct from `snapshot_model`; every new name starts `OrsBackup`/`Backup`.
 
@@ -169,7 +195,25 @@ use crate::OrsError;
 /// [`OrsBackupSnapshot::validate`] additionally requires an operational identity and
 /// no outstanding operational continuation for `Complete`, which a v4 value cannot
 /// express in the first place.
-pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
+///
+/// Issue #953 bumps this from `5` to `6` because the v5 continuation contract
+/// cannot express the EXHAUSTED state. Both [`OrsOperationalContinuation`] and
+/// [`OrsFamilyContinuation`] carried `next: Option<Cursor>`, and `None` said only
+/// "this page is done with the axis" — it did not carry the axis's terminal
+/// boundary, so a page that followed to carry another axis had to be built under a
+/// boundary reconstructed elsewhere, and reconstructing it from the axis's own
+/// pre-page cursor RE-READ the axis. A v5 value therefore has no way to say "this
+/// axis is finished, at this exact frontier, and owes nothing more", which is the
+/// one fact a cross-page validator needs to tell an exhausted axis from an axis
+/// that merely has not been paged yet. v6 replaces the option with
+/// [`OrsAxisState`], whose `Exhausted` arm carries that frontier and is folded
+/// into the page digest and the denominator under its own name. The bump is a WIRE
+/// constant, not durable schema: no table, column or row changes, nothing is
+/// rewritten, and no migration is introduced. A v5 request or snapshot is refused
+/// at construction and at import by the unchanged
+/// [`OrsError::MigrationRequired`] refusal, and is never reinterpreted as a v6
+/// value that claims an exhausted axis it never measured.
+pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 /// Hard ceiling for entries in one backup page (mirrors `MAX_RECOVERY_PAGE`).
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
@@ -962,7 +1006,85 @@ impl OrsOperationalCursor {
     }
 }
 
-/// Per-page operational continuation state (issue #2967).
+/// The outgoing state of one backup axis after a page (issue #953).
+///
+/// ONE continuation contract for both the operational axis and the two
+/// cursor-paged family axes, parameterised by the axis's own cursor type. It
+/// exists because `Option<Cursor>` cannot say three different things.
+///
+/// `None` meant "this page is finished with the axis", and the producer that
+/// wrote it had to reconstruct the axis's real outgoing boundary from somewhere
+/// else to build the next page — which is how an exhausted axis got RE-STARTED:
+/// the page that follows was built under the axis's pre-page cursor, re-emitted
+/// the axis's rows, and a family whose `next` was `None` silently kept its old
+/// request cursor while a later family continued. The restart was invisible to
+/// every page digest, because nothing in the page said which state the axis was
+/// in, only that a cursor was missing.
+///
+/// Two named states say it instead, and each carries the boundary it names:
+///
+/// - [`Self::Open`] — the axis still owes rows, and the cursor is the exact one a
+///   following page must be read under.
+/// - [`Self::Exhausted`] — the axis reached the frozen denominator it was opened
+///   with, and the cursor is its FINAL frontier: the exact durable-key/order
+///   boundary the walk actually reached. It is retained rather than discarded
+///   because a page that follows to carry another axis must still be read under
+///   this boundary, and because the terminal commitment must come from the walk
+///   that emitted the rows rather than from a guess.
+///
+/// The INCOMING cursor stays a separate field on each continuation. Substituting
+/// it for the outgoing one would invalidate what the current page says it read:
+/// a page's own boundary and the boundary it hands on are two different facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrsAxisState<C> {
+    /// The axis still owes rows; this is the exact cursor a following page is
+    /// read under.
+    Open(C),
+    /// The axis reached its frozen denominator; this is its final frontier and
+    /// every later page of the same frozen snapshot carries it unchanged while
+    /// emitting nothing further for the axis.
+    Exhausted(C),
+}
+impl<C> OrsAxisState<C> {
+    /// The exact cursor a following page is read under, on both arms: the open
+    /// cursor while the axis owes rows, and the retained final frontier once it
+    /// does not. This is the ONE read point the page loop uses, so a producer
+    /// cannot advance one arm and drop the other.
+    #[must_use]
+    pub fn frontier(&self) -> &C {
+        match self {
+            Self::Open(cursor) | Self::Exhausted(cursor) => cursor,
+        }
+    }
+    /// The outstanding cursor while the axis is open, and `None` once it is
+    /// exhausted. This is the outstanding-cursor projection a snapshot publishes:
+    /// a limit that stopped the walk retains the exact open frontier, and an
+    /// exhausted axis publishes nothing.
+    #[must_use]
+    pub fn open_cursor(&self) -> Option<&C> {
+        match self {
+            Self::Open(cursor) => Some(cursor),
+            Self::Exhausted(_) => None,
+        }
+    }
+    /// Whether the axis still owes rows.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open(_))
+    }
+    /// Whether the axis is explicitly exhausted, and the terminal frontier if it
+    /// is.
+    #[must_use]
+    pub fn exhausted_cursor(&self) -> Option<&C> {
+        match self {
+            Self::Exhausted(cursor) => Some(cursor),
+            Self::Open(_) => None,
+        }
+    }
+}
+
+/// Per-page operational continuation state (issue #2967, extended by #953).
 ///
 /// The operational twin of [`OrsFamilyContinuation`], and deliberately a separate
 /// type with a separate field on the page: operational rows are ordered by
@@ -970,45 +1092,99 @@ impl OrsOperationalCursor {
 /// is ordered by its own durable key under its own frozen revision. One cursor can
 /// never stand in for the other, so neither the wire nor the digest can either.
 ///
-/// `next` is the exact cursor for the next operational page and is `None` only when
-/// the walk reached the frozen denominator. The boundary it names is the page's
-/// ACTUAL last emitted row, so a sparse order domain neither duplicates nor skips
-/// rows across pages.
+/// `state` is the ONE outgoing state of the axis, and it names its own boundary
+/// (see [`OrsAxisState`]). The boundary is the page's ACTUAL last emitted row, so
+/// a sparse order domain neither duplicates nor skips rows across pages, and an
+/// axis that reached its frozen denominator keeps that final frontier instead of
+/// handing the next page its own start.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsOperationalContinuation {
     /// Cursor in force for this page.
     pub cursor: OrsOperationalCursor,
-    /// Exact next operational cursor; `None` when the walk is exhausted here.
-    pub next: Option<OrsOperationalCursor>,
+    /// The axis's exact outgoing state and its boundary.
+    pub state: OrsAxisState<OrsOperationalCursor>,
 }
 impl OrsOperationalContinuation {
-    /// Reports whether the operational walk still has rows behind `next`.
+    /// Reports whether the operational walk still has rows behind its frontier.
     #[must_use]
     pub fn operational_open(&self) -> bool {
-        self.next.is_some()
+        self.state.is_open()
     }
-    /// Validate the in-force cursor and the next cursor.
+    /// The axis's exact outgoing boundary, open or exhausted.
+    #[must_use]
+    pub fn frontier(&self) -> &OrsOperationalCursor {
+        self.state.frontier()
+    }
+    /// The outstanding cursor while the axis is open, and `None` once it is
+    /// explicitly exhausted (issue #953).
+    #[must_use]
+    pub fn open_cursor(&self) -> Option<&OrsOperationalCursor> {
+        self.state.open_cursor()
+    }
+    /// The retained terminal frontier while the axis is explicitly exhausted, and
+    /// `None` while it is still open (issue #953).
+    #[must_use]
+    pub fn exhausted_cursor(&self) -> Option<&OrsOperationalCursor> {
+        self.state.exhausted_cursor()
+    }
+    /// The axis's digest material: the state NAME plus the exact boundary it
+    /// names, so a page that flipped from open to exhausted, or moved its
+    /// terminal boundary, moves its digest. Folded into both the page digest and
+    /// the snapshot denominator.
+    #[must_use]
+    pub fn state_material(&self) -> String {
+        axis_state_material(&self.state, OrsOperationalCursor::fence_token)
+    }
+    /// Validate the in-force cursor and the outgoing state.
+    ///
+    /// Both arms check the same two cross-cursor facts — the outgoing cursor must
+    /// stay inside the same frozen operational identity and must not reset the
+    /// emitted prefix — and the `Exhausted` arm adds the one that is specific to
+    /// it: the final frontier must account for exactly the frozen denominator,
+    /// so "exhausted" can only ever be the truthful statement that the walk
+    /// finished and never a way to stop early. A page or byte LIMIT is the `Open`
+    /// arm, which retains the exact frontier to resume from.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.cursor.validate()?;
-        match &self.next {
-            Some(next) => {
-                next.validate()?;
-                if next.identity != self.cursor.identity {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "next operational cursor left the frozen operational snapshot",
-                    });
-                }
-                if next.emitted_rows < self.cursor.emitted_rows {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "operational continuation must not reset its emitted prefix",
-                    });
-                }
-                Ok(())
-            }
-            None => Ok(()),
+        let frontier = self.state.frontier();
+        frontier.validate()?;
+        if frontier.identity != self.cursor.identity {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "the outgoing operational cursor left the frozen operational snapshot",
+            });
         }
+        if frontier.emitted_rows < self.cursor.emitted_rows {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "operational continuation must not reset its emitted prefix",
+            });
+        }
+        if let Some(final_cursor) = self.state.exhausted_cursor()
+            && final_cursor.emitted_rows != self.cursor.identity.operational_row_count
+        {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_continuation",
+                reason: "an exhausted operational walk must account for exactly the frozen operational denominator",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The digest material of one axis state: the state name and the fence token of
+/// the exact boundary it names (issue #953).
+///
+/// ONE derivation for all three axes, so a producer and a validator cannot
+/// disagree about one axis's fold while agreeing about another's, and the label
+/// keeps an exhausted frontier from ever hashing like an open one.
+fn axis_state_material<C, T>(state: &OrsAxisState<C>, token: T) -> String
+where
+    T: Fn(&C) -> String,
+{
+    match state {
+        OrsAxisState::Open(cursor) => format!("open:{}", token(cursor)),
+        OrsAxisState::Exhausted(cursor) => format!("exhausted:{}", token(cursor)),
     }
 }
 /// Stored effect class per backup entry (bytes stay in the store).
@@ -1319,50 +1495,87 @@ pub struct OrsBackupEntry {
     /// Whether this member's payload was obtained (issue #953, A6).
     pub payload_state: RowPayloadState,
 }
-/// Per-page family continuation state (issue #2884).
+/// Per-page family continuation state (issue #2884, extended by #1971 and #953).
 ///
 /// `cursor` is the family cursor the page was read under, so a page always
-/// states which frozen family snapshot and which emitted prefix produced it.
-/// `next` is the exact cursor for the next family page and is `None` only when
-/// this page carried the family's final segment. Operational-history paging and
-/// family paging therefore never share a cursor: the operational walk is bounded
-/// by its own frozen high-water under [`OrsOperationalContinuation`] and each family
-/// keeps its own durable-key bound.
+/// states which frozen family snapshot and which emitted prefix produced it, and
+/// it stays the INCOMING boundary: a page that carried the family's final segment
+/// still says which prefix it was read under, which the outgoing frontier is not.
+/// `state` is the ONE outgoing state of the family, and it names its own boundary
+/// (see [`OrsAxisState`]), so a family that closed on this page hands the next
+/// page its terminal frontier rather than leaving its own pre-page cursor in
+/// force. Operational-history paging and family paging never share a cursor: the
+/// operational walk is bounded by its own frozen high-water under
+/// [`OrsOperationalContinuation`] and each family keeps its own durable-key bound.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsFamilyContinuation {
     /// Cursor in force for this page.
     pub cursor: OrsFamilyCursor,
-    /// Exact next family cursor; `None` when the family is exhausted here.
-    pub next: Option<OrsFamilyCursor>,
+    /// The family's exact outgoing state and its boundary.
+    pub state: OrsAxisState<OrsFamilyCursor>,
 }
 impl OrsFamilyContinuation {
-    /// Reports whether the family still has rows behind `next`.
+    /// Reports whether the family still has rows behind its frontier.
     #[must_use]
     pub fn family_open(&self) -> bool {
-        self.next.is_some()
+        self.state.is_open()
     }
-    /// Validate the in-force cursor and the next cursor.
+    /// The family's exact outgoing boundary, open or exhausted.
+    #[must_use]
+    pub fn frontier(&self) -> &OrsFamilyCursor {
+        self.state.frontier()
+    }
+    /// The outstanding cursor while the family is open, and `None` once it is
+    /// explicitly exhausted (issue #953).
+    #[must_use]
+    pub fn open_cursor(&self) -> Option<&OrsFamilyCursor> {
+        self.state.open_cursor()
+    }
+    /// The retained terminal frontier while the family is explicitly exhausted,
+    /// and `None` while it is still open (issue #953).
+    #[must_use]
+    pub fn exhausted_cursor(&self) -> Option<&OrsFamilyCursor> {
+        self.state.exhausted_cursor()
+    }
+    /// The family's digest material: the state name plus the exact boundary it
+    /// names. One derivation, shared with the operational axis through
+    /// [`axis_state_material`], so a family that flipped from open to exhausted
+    /// moves its digest and cannot be laundered into the other.
+    #[must_use]
+    pub fn state_material(&self) -> String {
+        axis_state_material(&self.state, OrsFamilyCursor::fence_token)
+    }
+    /// Validate the in-force cursor and the outgoing state.
+    ///
+    /// The operational twin of the same rule, and for the same reason: the
+    /// `Exhausted` arm requires the final frontier to account for exactly the
+    /// frozen `family_row_count`, so only an owner-established terminal frontier
+    /// can close the axis and a limit that merely spent the page budget cannot.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.cursor.validate()?;
-        match &self.next {
-            Some(next) => {
-                next.validate()?;
-                if next.identity != self.cursor.identity {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_family_continuation",
-                        reason: "next family cursor left the frozen family snapshot",
-                    });
-                }
-                if next.emitted_rows < self.cursor.emitted_rows {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_family_continuation",
-                        reason: "family continuation must not reset its emitted prefix",
-                    });
-                }
-                Ok(())
-            }
-            None => Ok(()),
+        let frontier = self.state.frontier();
+        frontier.validate()?;
+        if frontier.identity != self.cursor.identity {
+            return Err(OrsError::InvalidField {
+                field: "backup_family_continuation",
+                reason: "the outgoing family cursor left the frozen family snapshot",
+            });
         }
+        if frontier.emitted_rows < self.cursor.emitted_rows {
+            return Err(OrsError::InvalidField {
+                field: "backup_family_continuation",
+                reason: "family continuation must not reset its emitted prefix",
+            });
+        }
+        if let Some(final_cursor) = self.state.exhausted_cursor()
+            && final_cursor.emitted_rows != self.cursor.identity.family_row_count
+        {
+            return Err(OrsError::InvalidField {
+                field: "backup_family_continuation",
+                reason: "an exhausted family walk must account for exactly the frozen family denominator",
+            });
+        }
+        Ok(())
     }
 }
 /// One page of a backup snapshot.
@@ -1460,14 +1673,18 @@ impl OrsBackupPage {
     /// [`RowPayloadState`], so the page digest moves when a member's payload
     /// availability moves and an unavailable member can never be laundered into
     /// an available one behind an unchanged digest. The `v2`→`v3` label change
-    /// is that addition, and issue #2967's `v3` to `v4` label change is the
-    /// operational segment; each is a wire constant, not durable schema, and the
-    /// pre-existing [`OrsError::MigrationRequired`] refusal is the migration
-    /// story.
+    /// is that addition, issue #2967's `v3` to `v4` label change is the
+    /// operational segment, and the `v4` to `v5` label change is issue #953's
+    /// EXPLICIT EXHAUSTED axis state: each continuation segment now folds the
+    /// state NAME together with the exact boundary it names, replacing the
+    /// `no-next` / `no-next-operational` sentinels a page used to carry when an
+    /// axis simply had no cursor to hand on. Each is a wire constant, not durable
+    /// schema, and the pre-existing [`OrsError::MigrationRequired`] refusal is the
+    /// migration story.
     #[must_use]
     pub fn expected_page_digest(&self) -> String {
         let mut material = format!(
-            "eliot.ors.backup_page.v4|{}|{}|{}|{}|{}|{}|",
+            "eliot.ors.backup_page.v5|{}|{}|{}|{}|{}|{}|",
             self.fence_token,
             self.page_index,
             self.is_last,
@@ -1478,10 +1695,7 @@ impl OrsBackupPage {
         material.push_str("operational-axis=");
         material.push_str(&self.operational_continuation.cursor.fence_token());
         material.push(':');
-        match &self.operational_continuation.next {
-            Some(next) => material.push_str(&next.fence_token()),
-            None => material.push_str("no-next-operational"),
-        }
+        material.push_str(&self.operational_continuation.state_material());
         material.push(':');
         push_family_continuation_material(
             &mut material,
@@ -1573,10 +1787,7 @@ fn push_family_continuation_material(
     if let Some(continuation) = continuation {
         material.push_str(&continuation.cursor.fence_token());
         material.push(':');
-        match &continuation.next {
-            Some(next) => material.push_str(&next.fence_token()),
-            None => material.push_str("no-next"),
-        }
+        material.push_str(&continuation.state_material());
     } else {
         material.push_str("no-family");
     }
@@ -1805,10 +2016,7 @@ impl OrsBackupSnapshot {
             material.push_str("operational-axis=");
             material.push_str(&page.operational_continuation.cursor.fence_token());
             material.push(':');
-            match &page.operational_continuation.next {
-                Some(next) => material.push_str(&next.fence_token()),
-                None => material.push_str("no-next-operational"),
-            }
+            material.push_str(&page.operational_continuation.state_material());
             material.push(':');
             push_family_continuation_material(
                 &mut material,
@@ -1929,10 +2137,24 @@ impl OrsBackupSnapshot {
         // Cross-page operational continuity, over the whole page sequence. It runs
         // on BOTH completeness arms, not only on `Complete`: a truncated snapshot
         // is still a statement about which rows it walked and in what order, and a
-        // repeated or out-of-window row is a contradiction on either arm. The
-        // family continuations get the same treatment through
-        // `check_declared_family`, which is why the two domains stay independent.
+        // repeated or out-of-window row is a contradiction on either arm. Each
+        // cursor-paged family gets the SAME treatment on its own axis (issue #953),
+        // because comparing only the last page's declared family state is exactly
+        // "last-page equality alone" and let a middle page re-read a family or flip
+        // it back to open without anything noticing. The three domains stay
+        // independent: each is checked against its own frozen identity and its own
+        // entries.
         check_operational_pages(&self.pages, &self.operational_history)?;
+        check_family_pages(
+            &self.pages,
+            RowFamilyKind::ProcessStreamRecovery,
+            self.process_stream_recovery_family.as_ref(),
+        )?;
+        check_family_pages(
+            &self.pages,
+            RowFamilyKind::VersionedArtifacts,
+            self.versioned_artifact_family.as_ref(),
+        )?;
         if counted != self.entry_count {
             return Err(OrsError::InvalidField {
                 field: "backup_entry_count",
@@ -2022,10 +2244,15 @@ impl OrsBackupSnapshot {
 /// Requires a `Complete` snapshot to declare every family denominator and to owe
 /// nothing on either family axis (issue #2967, W8).
 ///
-/// The operational half of the same precondition needs no page, so it stays
-/// directly in [`OrsBackupSnapshot::validate`]; these two need the declared family
-/// slots, and splitting them out keeps the whole completeness precondition readable
-/// as one list instead of an arm buried in the middle of a long function.
+/// Since issue #953 "owes nothing" is EXPLICIT: with the last page's declared
+/// outstanding cursor required to equal that page's own open frontier
+/// ([`check_declared_family`]), an absent cursor means the last page stated
+/// [`OrsAxisState::Exhausted`] — and
+/// [`OrsFamilyContinuation::validate`], run on every page by
+/// `check_page_shape`, has already required that terminal frontier to account for
+/// exactly the frozen `family_row_count`. So the denominator a `Complete` snapshot
+/// certifies is the same one the axis was opened with, and a family the exporter
+/// never looked at still cannot certify completeness.
 ///
 /// Each missing denominator is refused by its own name, because the reason they are
 /// required is a compatibility rule and the operator needs to know WHICH family the
@@ -2125,7 +2352,11 @@ fn check_declared_operational(
             reason: "declared operational denominator is not the frozen operational snapshot the last page was read under",
         });
     }
-    if last.next.as_ref() != declared_next {
+    // The declared outstanding cursor is the last page's OPEN frontier, so an
+    // exhausted last page (issue #953) publishes nothing and an open one publishes
+    // exactly the frontier the page itself carries. A byte or page LIMIT is the open
+    // arm and is never converted to exhausted.
+    if last.open_cursor() != declared_next {
         return Err(OrsError::InvalidField {
             field: "backup_next_operational_cursor",
             reason: "declared operational continuation does not match the last page",
@@ -2204,106 +2435,129 @@ fn measure_operational_tail(
 }
 
 /// Checks a page's OWN operational continuation against the tail its entries
-/// measured (issue #2967).
+/// measured (issue #2967, extended by #953).
 ///
-/// A page that declares a next cursor must have moved the walk — otherwise the page
-/// budget would be spent without the walk ever moving — and that cursor must be
-/// derived from the page's exact emitted tail, in both its order and its row count.
-/// A page that declares none must instead have consumed the frozen denominator
-/// exactly, so "no continuation" is only ever the truthful statement that the walk
-/// finished, never a way to stop early.
+/// A page that leaves the walk OPEN must have moved it — otherwise the page
+/// budget would be spent without the walk ever moving — and its frontier must be
+/// derived from the page's exact emitted tail, in both its order and its row
+/// count. A page that leaves it EXHAUSTED must instead have consumed the frozen
+/// denominator exactly, and must say so with the frontier the walk actually
+/// reached, so "exhausted" is only ever the truthful statement that the walk
+/// finished and never a way to stop early.
+///
+/// Both arms additionally require the frontier to BE the page's tail. That is the
+/// fact the previous shape could not state: with `next: Option<Cursor>` a page
+/// that emitted the last operational row had nothing to hand on, and the only
+/// boundary a following page could be built under was the axis's own pre-page
+/// cursor — which re-read the whole walk.
 fn check_operational_continuation(
     continuation: &OrsOperationalContinuation,
     tail: &OperationalPageTail,
     identity: &OrsOperationalSnapshotIdentity,
 ) -> Result<(), OrsError> {
-    match &continuation.next {
-        Some(next) => {
-            if tail.emitted == 0 {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_continuation",
-                    reason: "a page must not declare an operational continuation without emitting an operational row",
-                });
-            }
-            if next.after_order != tail.last_order {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_continuation",
-                    reason: "the next operational cursor is not derived from the page's last operational member",
-                });
-            }
-            if next.emitted_rows != tail.walked {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_continuation",
-                    reason: "the next operational cursor does not account for exactly the rows this page emitted",
-                });
-            }
+    let refused = |reason: &'static str| -> OrsError {
+        OrsError::InvalidField {
+            field: "backup_operational_continuation",
+            reason,
         }
-        None => {
-            if tail.walked != identity.operational_row_count {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_continuation",
-                    reason: "the walk stopped without a continuation before the frozen operational denominator was reached",
-                });
+    };
+    let frontier = continuation.frontier();
+    if frontier.after_order != tail.last_order {
+        return Err(refused(
+            "the outgoing operational cursor is not derived from the page's last operational member",
+        ));
+    }
+    if frontier.emitted_rows != tail.walked {
+        return Err(refused(
+            "the outgoing operational cursor does not account for exactly the rows this page emitted",
+        ));
+    }
+    match &continuation.state {
+        OrsAxisState::Open(_) => {
+            if tail.emitted == 0 {
+                return Err(refused(
+                    "a page must not declare an operational continuation without emitting an operational row",
+                ));
             }
+            Ok(())
+        }
+        OrsAxisState::Exhausted(_) => {
+            if tail.walked != identity.operational_row_count {
+                return Err(refused(
+                    "the walk declared itself exhausted before the frozen operational denominator was reached",
+                ));
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Requires the page that follows `page` to have been read under the boundary `page`
-/// actually reached (issue #2967, W6/A2).
+/// actually reached (issue #2967, W6/A2; split by explicit state in #953).
 ///
 /// The arm is chosen by what `page` OWES, not by how many rows it happened to emit,
 /// and the two are not the same question:
 ///
-/// - `page` declares a next cursor, so the walk is still OPEN. The successor must
-///   present exactly that cursor, and its refusal is the truncation refusal.
-/// - `page` declares none, so the walk is EXHAUSTED — and "declares none" is a proof
-///   of that, not an assumption: [`check_operational_continuation`]'s `None` arm has
-///   already established `walked == identity.operational_row_count`. There is no
-///   outstanding operational cursor to present, the pages that follow exist only to
-///   carry the family axes, and this is the "only the family continuation" state that
-///   `next_operational_cursor`'s own documentation names ("a snapshot may carry both,
-///   either, or neither"). It is the one of the four states the chain used to reject,
-///   and refusing it is what made the store's own family-only multi-page output
-///   unvalidatable.
+/// - `page` leaves the axis OPEN, so the successor must present exactly the frontier
+///   `page` named, and its refusal is the truncation refusal.
+/// - `page` leaves it EXHAUSTED, and "declares itself exhausted" is a PROOF of
+///   that, not an assumption: [`check_operational_continuation`]'s exhausted arm has
+///   already established `walked == identity.operational_row_count`. The successor
+///   must then present the SAME final frontier, must itself still be exhausted, and
+///   must emit ZERO further operational rows. Those three obligations together are
+///   what make an exhausted axis inert: a successor that resumed the walk, that
+///   re-opened it, or that read it again is refused.
 ///
-/// The exhausted arm is NOT "no requirement", and that is the point of the split. The
-/// successor must still present the walk's real TAIL, never its start, and the two
-/// differ exactly when the walk finished early: a start cursor is what the previous
-/// incarnation of the exporter carried, and it re-read the frozen lower bound and
-/// re-emitted every operational row the snapshot had already exported. The chain is
-/// therefore the only structural defence against that, because
-/// [`check_observed_members`] — which refuses a member observed twice — runs on the
-/// `Complete` arm only, so on a `Partial` snapshot nothing else would. The tail is
-/// checked on the two bounds a pure validator can re-derive from the pages themselves;
-/// the durable key and the prefix commitment stay out of scope for the same reason they
-/// are out of scope in [`check_operational_pages`], and are proved at the read boundary
-/// instead.
+/// The exhausted arm is therefore not "no requirement". The successor must carry
+/// the walk's real TAIL and nothing else, and the two differ exactly when the walk
+/// finished early: a start cursor is what the previous incarnation of the exporter
+/// carried, and it re-read the frozen lower bound and re-emitted every operational
+/// row the snapshot had already exported. The chain is the structural defence
+/// against that, because [`check_observed_members`] — which refuses a member
+/// observed twice — runs on the `Complete` arm only, so on a `Partial` snapshot
+/// nothing else would. The frontier is checked on the two bounds a pure validator
+/// can re-derive from the pages themselves; the durable key and the prefix
+/// commitment stay out of scope for the same reason they are out of scope in
+/// [`check_operational_pages`], and are proved at the read boundary instead.
 fn check_operational_successor(
-    tail: &OperationalPageTail,
     continuation: &OrsOperationalContinuation,
     next_page: &OrsBackupPage,
+    next_tail: &OperationalPageTail,
 ) -> Result<(), OrsError> {
-    let successor = &next_page.operational_continuation.cursor;
-    if let Some(next) = &continuation.next {
-        if next != successor {
-            return Err(OrsError::InvalidField {
-                field: "backup_operational_continuation",
-                reason: "the next page did not continue from this page's exact emitted operational tail",
-            });
-        }
-    } else if successor.emitted_rows != tail.walked || successor.after_order != tail.last_order {
-        return Err(OrsError::InvalidField {
+    let refused = |reason: &'static str| -> OrsError {
+        OrsError::InvalidField {
             field: "backup_operational_continuation",
-            reason: "a page after the exhausted operational walk did not resume from the walk's exact tail",
+            reason,
+        }
+    };
+    let successor = &next_page.operational_continuation;
+    if successor.cursor != *continuation.frontier() {
+        return Err(match &continuation.state {
+            OrsAxisState::Open(_) => refused(
+                "the next page did not continue from this page's exact emitted operational tail",
+            ),
+            OrsAxisState::Exhausted(_) => refused(
+                "a page after the exhausted operational walk did not resume from the walk's exact final frontier",
+            ),
         });
+    }
+    if let OrsAxisState::Exhausted(_) = &continuation.state {
+        if successor.state.is_open() {
+            return Err(refused(
+                "an exhausted operational walk may not become open again",
+            ));
+        }
+        if next_tail.emitted != 0 {
+            return Err(refused(
+                "an exhausted operational walk must emit no further operational rows",
+            ));
+        }
     }
     Ok(())
 }
 
 /// Proves cross-page operational continuity independently of the family axes
-/// (issue #2967, A11/A12).
+/// (issue #2967, A11/A12; explicit open/exhausted split in #953).
 ///
 /// Every page is checked against the SAME frozen identity, and the pages must form
 /// ONE exact chain:
@@ -2312,10 +2566,9 @@ fn check_operational_successor(
 ///   [`check_operational_successor`], which is what makes duplication and skipping
 ///   structurally impossible rather than merely unlikely: page N+1 cannot re-read
 ///   anything page N emitted, and cannot start anywhere other than where page N
-///   actually stopped, because the boundary it must present IS page N's emitted tail.
-///   It has two arms because a page that owes no continuation has no `next` to compare
-///   against and is not thereby exempt — see that function for the exhausted arm and
-///   why the tail is still required there.
+///   actually stopped, because the boundary it must present IS page N's emitted
+///   tail. Its two arms are the OPEN and EXHAUSTED states, and the exhausted one
+///   additionally forbids re-opening the axis or emitting into it again.
 /// - The first page starts the walk: its in-force cursor must have emitted nothing.
 ///   A chain that is exact from page 1 onward can still under-report coverage if
 ///   page 0 opens in the middle, which is the same defect as a stride window with a
@@ -2327,8 +2580,8 @@ fn check_operational_successor(
 ///   is A5: a row above the high-water belongs to a successor snapshot and cannot
 ///   appear under the older fence even though it may have been durable and stable
 ///   before the export began.
-/// - A page that declares no next cursor must have exactly consumed the frozen
-///   denominator, and a page that does declare one must have made strict progress.
+/// - A page that declares the walk exhausted must have exactly consumed the frozen
+///   denominator, and a page that leaves it open must have made strict progress.
 ///   Without the progress rule a page could emit no operational rows at all while
 ///   pointing at the same boundary, and the page budget would be spent without the
 ///   walk ever moving.
@@ -2344,6 +2597,13 @@ fn check_operational_pages(
     pages: &[OrsBackupPage],
     identity: &OrsOperationalSnapshotIdentity,
 ) -> Result<(), OrsError> {
+    // Measured once for the whole sequence, because the successor rule needs the
+    // NEXT page's tail as well as this page's: "an exhausted axis emits nothing
+    // further" is a statement about the successor's entries.
+    let tails: Vec<OperationalPageTail> = pages
+        .iter()
+        .map(|page| measure_operational_tail(page, identity))
+        .collect::<Result<Vec<_>, _>>()?;
     for (index, page) in pages.iter().enumerate() {
         let continuation = &page.operational_continuation;
         if continuation.cursor.identity != *identity {
@@ -2363,14 +2623,214 @@ fn check_operational_pages(
                 reason: "the first page must start the walk, not continue one that is already under way",
             });
         }
-        let tail = measure_operational_tail(page, identity)?;
-        check_operational_continuation(continuation, &tail, identity)?;
+        let tail = &tails[index];
+        check_operational_continuation(continuation, tail, identity)?;
         if let Some(next_page) = pages.get(index + 1) {
-            check_operational_successor(&tail, continuation, next_page)?;
+            check_operational_successor(continuation, next_page, &tails[index + 1])?;
         }
     }
     Ok(())
 }
+
+/// What one page's own entries say about one cursor-paged family's walk
+/// (issue #953).
+///
+/// The family twin of [`OperationalPageTail`], and the same measurement rather
+/// than a trust: the declared side is the frozen `family_row_count` the owner
+/// measured when it opened the family, and the observed side is what this page
+/// actually carries for that family. A family row's `order` is a reporting value
+/// (its observation time, or its artifact generation) and carries no order
+/// information, so only the COUNT is re-derivable from a page — which is exactly
+/// what the cross-page chain needs, since the boundary itself is proved at the
+/// read boundary by `check_family_cursor_boundary`.
+struct FamilyPageTail {
+    /// Rows of this family this page emitted.
+    emitted: u64,
+    /// The in-force cursor's row count plus this page's emitted rows.
+    walked: u64,
+}
+/// Measures one page's family tail from its own entries.
+fn measure_family_tail(
+    page: &OrsBackupPage,
+    family: RowFamilyKind,
+) -> Result<FamilyPageTail, OrsError> {
+    let emitted: u64 = page
+        .entries
+        .iter()
+        .filter(|entry| entry.family == family)
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let base = page_family_continuation(page, family)
+        .map_or(0, |continuation| continuation.cursor.emitted_rows);
+    let walked = base
+        .checked_add(emitted)
+        .ok_or(OrsError::InvalidField {
+            field: "backup_family_continuation",
+            reason: "emitted family row count overflow",
+        })?;
+    Ok(FamilyPageTail { emitted, walked })
+}
+/// The one page's continuation for `family`, or `None` when the page declares no
+/// denominator for it.
+fn page_family_continuation<'a>(
+    page: &'a OrsBackupPage,
+    family: RowFamilyKind,
+) -> Option<&'a OrsFamilyContinuation> {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
+        RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
+        _ => None,
+    }
+}
+/// Checks one page's OWN family continuation against the tail its entries measured
+/// (issue #953).
+///
+/// The family twin of [`check_operational_continuation`]. The OPEN arm requires
+/// the frontier to account for exactly the rows this page emitted, so a page
+/// cannot claim to owe a boundary it did not reach; the EXHAUSTED arm requires it
+/// to account for exactly those rows AND for the frozen `family_row_count`, so
+/// only an owner-established terminal frontier can close the axis.
+///
+/// Unlike the operational axis there is deliberately NO progress requirement on
+/// the open arm. A family that shares a page with an open operational walk whose
+/// segment already spent the whole row budget emits nothing and legitimately owes
+/// the same boundary, and refusing that would make a family unpaginable whenever
+/// the operational walk is the longer of the two.
+fn check_family_continuation(
+    family: RowFamilyKind,
+    continuation: &OrsFamilyContinuation,
+    tail: &FamilyPageTail,
+    identity: &OrsFamilySnapshotIdentity,
+) -> Result<(), OrsError> {
+    let field = family_continuation_field(family);
+    let frontier = continuation.frontier();
+    if frontier.emitted_rows != tail.walked {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "the outgoing family cursor does not account for exactly the rows this page emitted",
+        });
+    }
+    if let Some(final_cursor) = continuation.state.exhausted_cursor()
+        && final_cursor.emitted_rows != identity.family_row_count
+    {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "the family declared itself exhausted before the frozen family denominator was reached",
+        });
+    }
+    Ok(())
+}
+/// Requires the page that follows `page` to have been read under the boundary
+/// `page` actually reached, on one family axis (issue #953).
+///
+/// The exact family twin of [`check_operational_successor`], on the same
+/// cross-page chain the operational axis has always had. Before this the families
+/// had NO cross-page chain at all: only the LAST page's declared state was compared
+/// with the snapshot's own fields, which is exactly "last-page equality alone",
+/// so a middle page could re-read a family's rows, skip a durable-key prefix, or
+/// flip a family from exhausted back to open and nothing in the validator noticed.
+fn check_family_successor(
+    family: RowFamilyKind,
+    continuation: &OrsFamilyContinuation,
+    next_page: &OrsBackupPage,
+    next_tail: &FamilyPageTail,
+) -> Result<(), OrsError> {
+    let field = family_continuation_field(family);
+    let refused = |reason: &'static str| -> OrsError {
+        OrsError::InvalidField {
+            field,
+            reason,
+        }
+    };
+    let Some(successor) = page_family_continuation(next_page, family) else {
+        return Err(refused(
+            "a page after a declared cursor-paged family must carry that family's continuation",
+        ));
+    };
+    if successor.cursor != *continuation.frontier() {
+        return Err(match &continuation.state {
+            OrsAxisState::Open(_) => refused(
+                "the next page did not continue from this page's exact emitted family tail",
+            ),
+            OrsAxisState::Exhausted(_) => refused(
+                "a page after an exhausted family did not resume from the family's exact final frontier",
+            ),
+        });
+    }
+    if let OrsAxisState::Exhausted(_) = &continuation.state {
+        if successor.state.is_open() {
+            return Err(refused("an exhausted family axis may not become open again"));
+        }
+        if next_tail.emitted != 0 {
+            return Err(refused("an exhausted family axis must emit no further rows"));
+        }
+    }
+    Ok(())
+}
+/// The field name one family's continuation is refused under, so no two axes'
+/// refusals read alike.
+fn family_continuation_field(family: RowFamilyKind) -> &'static str {
+    match family {
+        RowFamilyKind::VersionedArtifacts => "backup_versioned_artifact_family_continuation",
+        _ => "backup_family_continuation",
+    }
+}
+/// Proves cross-page continuity for ONE cursor-paged family independently of the
+/// operational axis and of the other family (issue #953).
+///
+/// A snapshot that declares no denominator for `family` has nothing to prove here:
+/// the third condition — a family the request never asked about — is UNKNOWN
+/// COVERAGE, not an exhausted axis, and it is [`check_declared_family`] and
+/// [`check_complete_denominators`] that keep it from reading as one. A snapshot
+/// that DOES declare the denominator must carry that family's continuation on
+/// EVERY page, must run it under the one declared frozen identity, and must form
+/// the same exact chain the operational axis forms.
+///
+/// The opening-boundary rule the operational axis has is deliberately absent here,
+/// and the asymmetry is a real difference rather than an omission: a snapshot
+/// publishes a family's outstanding cursor precisely so a caller can RESUME a
+/// truncated family export, while the operational walk is explicitly re-opened as
+/// a new window instead (`export_page_in` refuses a page 0 with a non-start
+/// operational cursor). Resuming a family mid-way is therefore representable here
+/// and is bounded instead by [`check_declared_members`], which counts a `Complete`
+/// snapshot's family rows against the frozen `family_row_count` and so cannot be
+/// satisfied by a suffix.
+fn check_family_pages(
+    pages: &[OrsBackupPage],
+    family: RowFamilyKind,
+    declared: Option<&OrsFamilySnapshotIdentity>,
+) -> Result<(), OrsError> {
+    let Some(identity) = declared else {
+        return Ok(());
+    };
+    let field = family_continuation_field(family);
+    let tails: Vec<FamilyPageTail> = pages
+        .iter()
+        .map(|page| measure_family_tail(page, family))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, page) in pages.iter().enumerate() {
+        let Some(continuation) = page_family_continuation(page, family) else {
+            return Err(OrsError::InvalidField {
+                field,
+                reason: "a declared cursor-paged family must carry its continuation on every page",
+            });
+        };
+        if continuation.cursor.identity != *identity {
+            return Err(OrsError::InvalidField {
+                field,
+                reason: "a page was read under a different frozen family snapshot than the snapshot declares",
+            });
+        }
+        let tail = &tails[index];
+        check_family_continuation(family, continuation, tail, identity)?;
+        if let Some(next_page) = pages.get(index + 1) {
+            check_family_successor(family, continuation, next_page, &tails[index + 1])?;
+        }
+    }
+    Ok(())
+}
+
 /// Checks one paged family's declared snapshot state against the last page's
 /// continuation for that SAME family (issue #2884, extended to the second
 /// cursor-paged family by #1971).
@@ -2428,7 +2888,7 @@ fn check_declared_family(
         });
     }
     if let Some(continuation) = last
-        && continuation.next.as_ref() != declared_next
+        && continuation.open_cursor() != declared_next
     {
         return Err(OrsError::InvalidField {
             field: next_field,
