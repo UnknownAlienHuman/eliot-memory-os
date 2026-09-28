@@ -67,6 +67,18 @@ pub const REQUIRED_PEER_ENVELOPE_FIELDS: &[&str] = &[
 pub const OPTIONAL_PEER_ENVELOPE_FIELDS: &[&str] =
     &["delta_kind", "scope", "revision", "expiry", "privacy"];
 
+/// Reference kind labels that would silently promote a referenced blackboard
+/// item to a decision, truth, acceptance, or write authority. Live-peer
+/// references are ID-only pointers; these labels are rejected fail-closed at
+/// admission (I10.18: point, do not duplicate or promote).
+pub const LIVE_PEER_PROMOTION_REFERENCE_KINDS: &[&str] = &[
+    "decision",
+    "decisions",
+    "truth",
+    "acceptance",
+    "write_authority",
+];
+
 /// Closed normative mailbox vocabulary (I10.18 message kinds plus the
 /// note/evidence/request/response/objection/review family). Work assignment
 /// is deliberately absent: peers cannot assign work through this channel.
@@ -1149,6 +1161,17 @@ fn validate_live_peer_payload(
                 .is_ok_and(|entry| entry.work_item_id.as_str() == draft.work_item_id)
         })
     {
+        return Err(CoordinationError::InvalidField("live_peer_payload"));
+    }
+    // A live-peer reference is an ID-only pointer, never a promotion
+    // vehicle: a kind label claiming decision, truth, acceptance, or write
+    // authority would silently promote the referenced blackboard item, so it
+    // is rejected fail-closed.
+    if payload.evidence_refs.iter().any(|reference| {
+        LIVE_PEER_PROMOTION_REFERENCE_KINDS
+            .iter()
+            .any(|denied| reference.kind.trim().eq_ignore_ascii_case(denied))
+    }) {
         return Err(CoordinationError::InvalidField("live_peer_payload"));
     }
     let payload_bytes = eliot_contracts::canonical_json_bytes(payload)
