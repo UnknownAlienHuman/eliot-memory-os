@@ -18,8 +18,8 @@ pub use revocation_digest::{
 };
 pub use surface_types::*;
 pub use validation::{
-    SecurityContractError, import_legacy_selection_receipt_v1, selection_member_digest,
-    validate_selection_pipeline,
+    SecurityContractError, import_legacy_selection_receipt_v1, selection_chain_head_digest,
+    selection_claim_ceiling, selection_member_digest, validate_selection_pipeline,
 };
 
 /// Stable identity of this contract surface.

@@ -32,7 +32,8 @@ use eliot_receipts::{
 pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
     DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
-    RevocationReason, SelectionIntegrityReceipt, SourceAssurance, TransformationLineage,
+    RevocationReason, SelectionChainHead, SelectionChainSeal, SelectionIntegrityReceipt,
+    SourceAssurance, TransformationLineage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -4174,6 +4175,26 @@ pub struct SecurityContext {
     pub influence_closure: Option<InfluenceDependencyClosure>,
     pub purge_entry: Option<PurgeLedgerEntry>,
     pub selection_integrity: Option<SelectionIntegrityReceipt>,
+    /// Rebuildable head of the selection chain this transition appends to
+    /// (issue #1728 step 4).
+    ///
+    /// `None` only for a transition that carries no selection chain at all.
+    /// When a `selection_integrity` receipt is present the head is required,
+    /// and its digest is recomputed from the receipt's own stages rather than
+    /// accepted as presented — a well-formed but foreign head, or a head whose
+    /// ordinal is outside this chain, is refused. The head travels inside the
+    /// hash-bound `CanonicalRequestView.security`, so it cannot be swapped
+    /// after admission, and its `chain_revision` is the compare-and-swap
+    /// expectation for the head this append advances.
+    pub selection_chain_head: Option<SelectionChainHead>,
+    /// Exact seal between the selection chain and the delivered output
+    /// (issue #1728 step 6).
+    ///
+    /// Present exactly when the transition delivers a packet or export the
+    /// chain produced; the store verifies it against `selection_integrity`
+    /// before the receipt is issued, so a changed packet with the same member
+    /// count or a valid unrelated chain cannot substitute.
+    pub selection_chain_seal: Option<SelectionChainSeal>,
 }
 
 impl SecurityContext {
@@ -4202,9 +4223,74 @@ impl SecurityContext {
         if let Some(selection) = &self.selection_integrity {
             selection.validate().map_err(StoreError::Security)?;
             ensure_same_fence(state_fence, &selection.state_fence)?;
+            // Issue #1728 step 4: a recorded chain is never appended or
+            // delivered without the head that names its stage prefix. The
+            // authoritative side is the receipt's own stage list; the head is
+            // the compared value, and its digest is recomputed rather than
+            // trusted.
+            let Some(head) = &self.selection_chain_head else {
+                return Err(StoreError::InvalidField {
+                    field: "security.selection_chain_head",
+                    reason: "a selection chain requires its append head",
+                });
+            };
+            selection
+                .verify_chain_head(head)
+                .map_err(StoreError::Security)?;
+            // Issue #1728 step 6: a delivered output is bound to the chain
+            // that produced it. The seal's shape is checked here; the seal's
+            // content is compared with this chain by
+            // `verify_selection_chain_seal`, which also takes the delivered
+            // bytes.
+            if let Some(seal) = &self.selection_chain_seal {
+                seal.validate().map_err(StoreError::Security)?;
+            }
+        } else if self.selection_chain_head.is_some() || self.selection_chain_seal.is_some() {
+            return Err(StoreError::InvalidField {
+                field: "security.selection_integrity",
+                reason: "a selection head or seal requires its selection chain receipt",
+            });
         }
         Ok(())
     }
+}
+
+/// Verifies one selection chain seal against the delivered bytes and handles.
+///
+/// The chain carried by this `SecurityContext` is authoritative: the seal's
+/// presented chain-head digest, recipe revision, and ordered final membership
+/// are compared with the chain that recomputes them, and the seal's packet
+/// digest is compared with the exact bytes this caller is about to deliver. The
+/// receipt is validated through the original `validate()` first, so a fresh
+/// checksum over tampered stages cannot stand in for the recorded proof.
+///
+/// # Errors
+///
+/// Returns the typed security error naming the exact failed binding, or
+/// [`StoreError::InvalidField`] when the transition carries no chain to verify.
+pub fn verify_selection_chain_seal(
+    security: &SecurityContext,
+    delivered_packet_bytes: &[u8],
+    delivered_expansion_handle_ids: &[String],
+) -> Result<(), StoreError> {
+    let Some(selection) = &security.selection_integrity else {
+        return Err(StoreError::InvalidField {
+            field: "security.selection_integrity",
+            reason: "no selection chain is carried by this transition",
+        });
+    };
+    let Some(seal) = &security.selection_chain_seal else {
+        return Err(StoreError::InvalidField {
+            field: "security.selection_chain_seal",
+            reason: "a delivered selection output requires its chain seal",
+        });
+    };
+    seal.verify_against(
+        selection,
+        delivered_packet_bytes,
+        delivered_expansion_handle_ids,
+    )
+    .map_err(StoreError::Security)
 }
 
 /// Atomic event/projection/relation intent carried by one transaction.
