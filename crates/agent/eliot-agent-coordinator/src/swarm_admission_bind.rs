@@ -10,8 +10,27 @@
 //! selection digests, catalogue/policy pins, attempt/lease/fence identities,
 //! and admitted routes stay owned by their exact owners; this module only
 //! admits exact values present in the supplied envelope and records the
-//! resulting binding. The current external receipt contracts expose no
-//! expiry field, so this module cannot establish their time currency.
+//! resulting binding.
+//!
+//! Time currency is a typed Contract Challenge, not prose (issue #486
+//! `## Required pre-gate`). Neither external admission surface carries a
+//! time bound — [`ProviderAdmissionReceipt`] (this crate's `model.rs`) and
+//! [`AdmittedLaneReceipt`] beside it, and
+//! [`AdmittedRouteReceipt`] in `eliot-agent-api`, and [`StateFence`] in
+//! `eliot-contracts`, expose no `issued`/`expires`/`valid_until` field — so
+//! this compiler cannot compare the recorded external bytes against any
+//! owner-issued bound and therefore cannot reject an expired receipt. Rather
+//! than compare the request's observation instant against a locally invented
+//! deadline (which would be a local authority world the issue forbids), every
+//! compiled plan carries a [`SwarmAdmissionCurrencyChallenge`]: the exact
+//! owner-side field that must be added, its exact required shape, the typed
+//! reason, and the recorded admission identity the challenge is bound to. The
+//! challenge is digest-sealed and re-checked on every validation, so the
+//! unproven bound can never be dropped, restated, or satisfied locally. See
+//! [`ADMISSION_RECEIPT_CURRENCY_OWNER_TYPE`],
+//! [`ADMISSION_RECEIPT_CURRENCY_OWNER_FIELD`], and
+//! [`ADMISSION_RECEIPT_CURRENCY_FIELD_TYPE`] for the exact owner decision this
+//! records, and [`SwarmAdmissionCurrencyReason`] for the reason code.
 //!
 //! Fail-closed binding, in deterministic precedence:
 //!
@@ -50,8 +69,14 @@
 //!     external route receipt. Lease and attempt identity must match the
 //!     route receipt and supplied envelope exactly, and the lane's recorded
 //!     routing digest must equal the receipt's admitted candidate digest, so
-//!     a receipt crossed into a foreign lane fails. Expiry cannot be checked
-//!     without a time-bound field from the external receipt owner.
+//!     a receipt crossed into a foreign lane fails;
+//! 11. receipt-currency challenge closure: the plan's recorded
+//!     [`SwarmAdmissionCurrencyChallenge`] must re-derive from the stored
+//!     external envelope's ORIGINAL recorded identities and the recorded
+//!     observation instant, so a challenge cannot be transplanted onto another
+//!     admission or restated as a satisfied bound. Expiry is unprovable until
+//!     the external receipt owner issues a time bound, so the challenge is the
+//!     fail-closed outcome, never a locally supplied deadline.
 //!
 //! The output is structurally candidate-only: `candidate_only` is true,
 //! `dispatch_authority` is false, execution counters are zero, and the value
@@ -90,6 +115,10 @@ use crate::swarm_staffing::{
 /// Schema identity for the candidate-only admission-plan value.
 pub const SWARM_ADMISSION_PLAN_VERSION: &str = "eliot.agent-swarm-admission-plan/v1";
 
+/// Schema identity for the receipt-currency Contract Challenge value.
+pub const SWARM_ADMISSION_CURRENCY_CHALLENGE_VERSION: &str =
+    "eliot.agent-swarm-admission-currency-challenge/v1";
+
 /// Fail-closed admission-binding errors. Every production path returns these
 /// instead of panicking; a malformed, unauthorized, stale, mismatched, or
 /// conflicting binding is rejected, never repaired.
@@ -115,6 +144,232 @@ pub enum SwarmAdmissionBindError {
     StaleGeneration,
     #[error("swarm admission binding identity conflict: same id with changed bytes")]
     IdentityConflict,
+}
+
+/// Exact owner contract that must issue the time bound the binding cannot
+/// establish locally.
+///
+/// The admission receipt that feeds this compiler is issued by the external
+/// admission owner and carried verbatim as
+/// [`ProviderAdmissionReceipt`](crate::model::ProviderAdmissionReceipt). That
+/// type, the [`AdmittedLaneReceipt`](crate::model::AdmittedLaneReceipt) beside
+/// it, the [`AdmittedRouteReceipt`] it pins per lane, and the [`StateFence`]
+/// they all share expose no issued/expires/validity field, so no owner-issued
+/// bound exists for this compiler to compare the recorded bytes against.
+pub const ADMISSION_RECEIPT_CURRENCY_OWNER_TYPE: &str =
+    "crates/agent/eliot-agent-coordinator/src/model.rs::ProviderAdmissionReceipt";
+
+/// Exact field the admission receipt owner must add.
+///
+/// Absent today: this is the named owner decision, not a field this crate may
+/// populate. The coordinator stores and validates the receipt; it never mints
+/// one, so a field added here without an issuing owner would be an invented
+/// producer.
+pub const ADMISSION_RECEIPT_CURRENCY_OWNER_FIELD: &str = "admission_expires_at_unix_ms";
+
+/// Exact typed shape the added field must have.
+///
+/// `u64` Unix milliseconds, matching the crate's existing owner-issued time
+/// bounds ([`ModelCatalogueSnapshot::expires_at_unix_ms`](crate::model_control::ModelCatalogueSnapshot::expires_at_unix_ms),
+/// [`BillingEvidence::expires_at_unix_ms`](crate::model_control::BillingEvidence::expires_at_unix_ms)).
+/// A bare string is not acceptable: the receipt's owner-facing wires already
+/// moved time fields to typed values.
+pub const ADMISSION_RECEIPT_CURRENCY_FIELD_TYPE: &str = "u64 Unix milliseconds, owner-issued";
+
+/// Typed reason the external admission receipt's time currency is unproven.
+///
+/// There is exactly one reason today, and it is a contract gap rather than a
+/// runtime condition: no owner-issued time bound exists to evaluate. A receipt
+/// that is merely stale, foreign, or mismatched fails through the epoch,
+/// generation, route, fence, and lane checks; only age is unprovable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SwarmAdmissionCurrencyReason {
+    /// The external admission receipt owner issues no expiry, so an
+    /// expired-but-present receipt cannot be distinguished from a current one.
+    NoOwnerIssuedExpiry,
+}
+
+/// Deterministic, digest-sealed Contract Challenge recording that the external
+/// admission receipt carries no owner-issued time bound.
+///
+/// This value is the fail-closed outcome for issue #486 I2/I5's expiry leg: it
+/// names the exact owner decision required, the exact field and shape it must
+/// take, and binds that challenge to the ORIGINAL recorded admission identity
+/// and the recorded observation instant. It grants nothing, and there is no
+/// field by which a caller could mark the bound satisfied: doing so is the
+/// owner extension this challenge exists to request, not a local edit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmAdmissionCurrencyChallenge {
+    pub schema_version: String,
+    /// Owner type that must issue the time bound.
+    pub missing_owner_type: String,
+    /// Field on that owner that is absent today.
+    pub missing_owner_field: String,
+    /// Typed shape that field must take once issued.
+    pub required_field_type: String,
+    /// Typed reason the bound is unproven.
+    pub reason: SwarmAdmissionCurrencyReason,
+    /// The external admission identity this challenge is bound to, copied
+    /// verbatim from the supplied receipt.
+    pub admission_id: AdmissionId,
+    pub task_id: TaskId,
+    pub controller_epoch: EpochId,
+    pub coordinator_lease: WorkLeaseId,
+    /// The instant the challenge was recorded at. It is the observation point,
+    /// never a deadline: no owner-issued bound exists for it to be compared
+    /// against, and it is sealed into the challenge digest so a replayed plan
+    /// cannot be restated against a different observation.
+    pub challenged_at_unix_ms: u64,
+    /// Canonical digest over every field above, including the owner decision.
+    pub challenge_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwarmAdmissionCurrencyChallengeFields {
+    schema_version: String,
+    missing_owner_type: String,
+    missing_owner_field: String,
+    required_field_type: String,
+    reason: SwarmAdmissionCurrencyReason,
+    admission_id: AdmissionId,
+    task_id: TaskId,
+    controller_epoch: EpochId,
+    coordinator_lease: WorkLeaseId,
+    challenged_at_unix_ms: u64,
+    challenge_digest: String,
+}
+
+impl<'de> Deserialize<'de> for SwarmAdmissionCurrencyChallenge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = SwarmAdmissionCurrencyChallengeFields::deserialize(deserializer)?;
+        let challenge = Self {
+            schema_version: fields.schema_version,
+            missing_owner_type: fields.missing_owner_type,
+            missing_owner_field: fields.missing_owner_field,
+            required_field_type: fields.required_field_type,
+            reason: fields.reason,
+            admission_id: fields.admission_id,
+            task_id: fields.task_id,
+            controller_epoch: fields.controller_epoch,
+            coordinator_lease: fields.coordinator_lease,
+            challenged_at_unix_ms: fields.challenged_at_unix_ms,
+            challenge_digest: fields.challenge_digest,
+        };
+        challenge.validate().map_err(serde::de::Error::custom)?;
+        Ok(challenge)
+    }
+}
+
+impl SwarmAdmissionCurrencyChallenge {
+    fn digest(&self) -> Result<String, ModelControlError> {
+        canonical_digest(&(
+            SWARM_ADMISSION_CURRENCY_CHALLENGE_VERSION,
+            self.schema_version.as_str(),
+            self.missing_owner_type.as_str(),
+            self.missing_owner_field.as_str(),
+            self.required_field_type.as_str(),
+            self.reason,
+            &self.admission_id,
+            &self.task_id,
+            &self.controller_epoch,
+            &self.coordinator_lease,
+            self.challenged_at_unix_ms,
+        ))
+    }
+
+    /// Validates the recorded owner decision, the bound identities, and digest
+    /// closure. The owner decision fields are pinned to the exact constants:
+    /// a caller cannot restate the challenge against a different owner, field,
+    /// or shape, and a zero observation instant is rejected.
+    pub fn validate(&self) -> Result<(), SwarmAdmissionBindError> {
+        if self.schema_version != SWARM_ADMISSION_CURRENCY_CHALLENGE_VERSION {
+            return Err(SwarmAdmissionBindError::ModelControl(
+                ModelControlError::UnsupportedSchema("swarm_admission_currency_challenge"),
+            ));
+        }
+        if self.missing_owner_type != ADMISSION_RECEIPT_CURRENCY_OWNER_TYPE
+            || self.missing_owner_field != ADMISSION_RECEIPT_CURRENCY_OWNER_FIELD
+            || self.required_field_type != ADMISSION_RECEIPT_CURRENCY_FIELD_TYPE
+        {
+            return Err(SwarmAdmissionBindError::InvalidField(
+                "admission.currency_owner_decision",
+            ));
+        }
+        if self.challenged_at_unix_ms == 0 {
+            return Err(SwarmAdmissionBindError::InvalidField(
+                "admission.challenged_at_unix_ms",
+            ));
+        }
+        validate_canonical_digest(&self.challenge_digest, "admission.challenge_digest")?;
+        if self.challenge_digest != self.digest()? {
+            return Err(SwarmAdmissionBindError::InvalidField(
+                "admission.challenge_digest",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Typed reason the bound is unproven. There is no "satisfied" variant:
+    /// closing this challenge is the owner extension above, not a local edit.
+    #[must_use]
+    pub const fn reason(&self) -> SwarmAdmissionCurrencyReason {
+        self.reason
+    }
+
+    /// Owner type that must issue the time bound.
+    #[must_use]
+    pub fn missing_owner_type(&self) -> &str {
+        &self.missing_owner_type
+    }
+
+    /// Field on that owner that is absent today.
+    #[must_use]
+    pub fn missing_owner_field(&self) -> &str {
+        &self.missing_owner_field
+    }
+
+    /// Typed shape that field must take once issued.
+    #[must_use]
+    pub fn required_field_type(&self) -> &str {
+        &self.required_field_type
+    }
+
+    /// The external admission identity this challenge is bound to.
+    #[must_use]
+    pub fn admission_id(&self) -> &AdmissionId {
+        &self.admission_id
+    }
+}
+
+/// Builds the exact challenge for one external admission envelope. The bound
+/// identities are copied verbatim from the ORIGINAL recorded receipt bytes; the
+/// instant is the observation point, never a deadline.
+fn currency_challenge(
+    admission: &ProviderAdmissionReceipt,
+    observed_at_unix_ms: u64,
+) -> Result<SwarmAdmissionCurrencyChallenge, SwarmAdmissionBindError> {
+    let mut challenge = SwarmAdmissionCurrencyChallenge {
+        schema_version: SWARM_ADMISSION_CURRENCY_CHALLENGE_VERSION.to_owned(),
+        missing_owner_type: ADMISSION_RECEIPT_CURRENCY_OWNER_TYPE.to_owned(),
+        missing_owner_field: ADMISSION_RECEIPT_CURRENCY_OWNER_FIELD.to_owned(),
+        required_field_type: ADMISSION_RECEIPT_CURRENCY_FIELD_TYPE.to_owned(),
+        reason: SwarmAdmissionCurrencyReason::NoOwnerIssuedExpiry,
+        admission_id: admission.admission_id.clone(),
+        task_id: admission.task_id.clone(),
+        controller_epoch: admission.controller_epoch.clone(),
+        coordinator_lease: admission.coordinator_lease.clone(),
+        challenged_at_unix_ms: observed_at_unix_ms,
+        challenge_digest: String::new(),
+    };
+    challenge.challenge_digest = challenge.digest()?;
+    challenge.validate()?;
+    Ok(challenge)
 }
 
 /// One immutable admission-binding input per staffed role slot.
@@ -143,9 +398,10 @@ pub struct SwarmSlotAdmission {
 
 /// Exact binding input: the complete staffing candidate, the current external
 /// admission envelope, one [`SwarmSlotAdmission`] per staffed slot, and the
-/// non-zero observation instant the binding is recorded against. Current
-/// external admission contracts have no expiry field, so the instant cannot
-/// establish receipt freshness.
+/// non-zero observation instant the binding is recorded against. The current
+/// external admission contracts carry no expiry field, so the instant is
+/// recorded as the challenge's observation point and cannot establish receipt
+/// freshness; see [`SwarmAdmissionCurrencyChallenge`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmAdmissionBindRequest {
@@ -153,8 +409,9 @@ pub struct SwarmAdmissionBindRequest {
     pub staffing: SwarmStaffingCandidate,
     pub admission: ProviderAdmissionReceipt,
     pub bindings: Vec<SwarmSlotAdmission>,
-    /// Must be non-zero. The supplied external receipt has no expiry field,
-    /// so this timestamp cannot establish its time currency.
+    /// Must be non-zero. The supplied external receipt has no owner-issued
+    /// expiry, so this timestamp is the observation point sealed into the
+    /// receipt-currency challenge, never a locally asserted deadline.
     pub now_unix_ms: u64,
 }
 
@@ -271,6 +528,12 @@ pub struct SwarmAdmissionPlanCandidate {
     /// The current external admission envelope this plan was compiled
     /// against, stored verbatim so validation is self-contained.
     pub admission: ProviderAdmissionReceipt,
+    /// Fail-closed Contract Challenge for the external receipt's time
+    /// currency, sealed into `plan_digest`. It records that the external
+    /// admission owner issues no expiry, so this plan makes no expiry claim:
+    /// the challenge is the only representable outcome until that owner
+    /// extends its contract.
+    pub receipt_currency: SwarmAdmissionCurrencyChallenge,
     pub execution: ZeroModelExecutionCounters,
     pub candidate_only: bool,
     pub dispatch_authority: bool,
@@ -293,6 +556,7 @@ struct SwarmAdmissionPlanCandidateFields {
     slots: Vec<SwarmBoundSlot>,
     staffing: SwarmStaffingCandidate,
     admission: ProviderAdmissionReceipt,
+    receipt_currency: SwarmAdmissionCurrencyChallenge,
     execution: ZeroModelExecutionCounters,
     candidate_only: bool,
     dispatch_authority: bool,
@@ -319,6 +583,7 @@ impl<'de> Deserialize<'de> for SwarmAdmissionPlanCandidate {
             slots: fields.slots,
             staffing: fields.staffing,
             admission: fields.admission,
+            receipt_currency: fields.receipt_currency,
             execution: fields.execution,
             candidate_only: fields.candidate_only,
             dispatch_authority: fields.dispatch_authority,
@@ -341,6 +606,7 @@ impl SwarmAdmissionPlanCandidate {
             self.plan_id.as_str(),
             self.staffing_digest.as_str(),
             envelope_digest.as_str(),
+            self.receipt_currency.challenge_digest.as_str(),
             self.admission_id.as_str(),
             self.task_id.as_str(),
             self.task_revision.as_str(),
@@ -352,11 +618,11 @@ impl SwarmAdmissionPlanCandidate {
     }
 
     /// Validates identity, staffing completeness, envelope structure,
-    /// slot/route/fence/epoch/lane binding, digest closure, and the
-    /// candidate-only ceiling. Called on deserialization and after
-    /// compilation. Full compilation against fresh caller inputs requires
-    /// [`compile_swarm_admission_plan`]; this check covers internal
-    /// consistency of the stored value only.
+    /// slot/route/fence/epoch/lane binding, the receipt-currency challenge,
+    /// digest closure, and the candidate-only ceiling. Called on
+    /// deserialization and after compilation. Full compilation against fresh
+    /// caller inputs requires [`compile_swarm_admission_plan`]; this check
+    /// covers internal consistency of the stored value only.
     pub fn validate(&self) -> Result<(), SwarmAdmissionBindError> {
         if self.schema_version != SWARM_ADMISSION_PLAN_VERSION {
             return Err(SwarmAdmissionBindError::ModelControl(
@@ -372,6 +638,7 @@ impl SwarmAdmissionPlanCandidate {
         }
         validate_envelope(&self.admission)?;
         self.validate_pins()?;
+        self.validate_receipt_currency()?;
         self.validate_slots()?;
         if !self.candidate_only || self.dispatch_authority {
             return Err(SwarmAdmissionBindError::InvalidField("admission.authority"));
@@ -401,6 +668,27 @@ impl SwarmAdmissionPlanCandidate {
             || self.coordinator_lease != self.admission.coordinator_lease
         {
             return Err(SwarmAdmissionBindError::InvalidField("admission.envelope"));
+        }
+        Ok(())
+    }
+
+    /// The stored challenge must re-derive from the ORIGINAL recorded
+    /// admission envelope: same admission, task, authority epoch, and
+    /// coordinator lease, compared against the values the supplied receipt
+    /// actually carries. A challenge transplanted onto another admission, or
+    /// stripped of its owner decision, fails closed. The challenge itself
+    /// carries no satisfied state, so this check can never be used to assert
+    /// that the receipt is unexpired.
+    fn validate_receipt_currency(&self) -> Result<(), SwarmAdmissionBindError> {
+        self.receipt_currency.validate()?;
+        if self.receipt_currency.admission_id != self.admission.admission_id
+            || self.receipt_currency.task_id != self.admission.task_id
+            || self.receipt_currency.controller_epoch != self.admission.controller_epoch
+            || self.receipt_currency.coordinator_lease != self.admission.coordinator_lease
+        {
+            return Err(SwarmAdmissionBindError::InvalidField(
+                "admission.currency_binding",
+            ));
         }
         Ok(())
     }
@@ -460,6 +748,17 @@ impl SwarmAdmissionPlanCandidate {
         true
     }
 
+    /// The receipt-currency Contract Challenge this plan was compiled under.
+    ///
+    /// Reading it asserts nothing about the receipt's age: it names the
+    /// external owner field that must be added before expiry is provable. A
+    /// caller that needs currency must obtain the owner-issued bound from
+    /// [`ADMISSION_RECEIPT_CURRENCY_OWNER_TYPE`]; it cannot obtain it here.
+    #[must_use]
+    pub const fn receipt_currency_challenge(&self) -> &SwarmAdmissionCurrencyChallenge {
+        &self.receipt_currency
+    }
+
     /// Exact-replay/conflict rule: identical canonical bytes replay, a reused
     /// plan id with changed bytes conflicts, and a different plan id is a new
     /// plan rather than a replay.
@@ -500,9 +799,10 @@ fn has_duplicate_slot_ids(slots: &[SwarmBoundSlot]) -> bool {
 /// Structural validation of the external admission envelope: receipt refs are
 /// non-blank, the envelope fence validates, the provider identity validates
 /// through its exact owner, and the lane denominator is non-empty and
-/// bounded. The external contract has no expiry/currentness field, so this
+/// bounded. The external contract exposes no expiry/currentness field, so this
 /// function cannot establish time currency; the compiler pins these exact
-/// bytes into the plan digest and never mints a newer admission.
+/// bytes into the plan digest, records the gap as a
+/// [`SwarmAdmissionCurrencyChallenge`], and never mints a newer admission.
 fn validate_envelope(admission: &ProviderAdmissionReceipt) -> Result<(), SwarmAdmissionBindError> {
     validate_text(&admission.task_revision, "admission.task_revision")?;
     validate_text(
@@ -607,7 +907,8 @@ fn check_bound_slot(
 /// must equal the bound route. A triple the supplied envelope does not
 /// admit — rotated or foreign — fails closed, as does a receipt crossed
 /// into a lane admitted for another candidate; this compiler does not mint
-/// replacements or establish envelope freshness.
+/// replacements. Envelope age is a separate axis and stays unproven — see
+/// [`SwarmAdmissionCurrencyChallenge`].
 fn check_lane_currency(
     bound: &SwarmBoundSlot,
     admission: &ProviderAdmissionReceipt,
@@ -641,9 +942,10 @@ fn check_lane_currency(
 /// Pure and deterministic: no provider/model call, no process launch or
 /// cancel, no lease/fence/attempt/route issuance, no Task write, no mailbox
 /// mutation, no fallback. Any missing, extra, duplicate, stale, mismatched,
-/// or tampered binding fails closed. The external receipt owner currently
-/// exposes no expiry field, so this candidate compiler cannot reject solely
-/// on receipt age.
+/// or tampered binding fails closed. The external receipt owner exposes no
+/// expiry field, so this compiler cannot reject solely on receipt age; it
+/// records that gap as a [`SwarmAdmissionCurrencyChallenge`] on every plan
+/// instead of accepting a caller-supplied deadline as if it were authority.
 pub fn compile_swarm_admission_plan(
     request: &SwarmAdmissionBindRequest,
 ) -> Result<SwarmAdmissionPlanCandidate, SwarmAdmissionBindError> {
@@ -658,6 +960,7 @@ pub fn compile_swarm_admission_plan(
         return Err(SwarmAdmissionBindError::IncompleteStaffing);
     }
     validate_envelope(&request.admission)?;
+    let receipt_currency = currency_challenge(&request.admission, request.now_unix_ms)?;
     let slots = admit_all_slots(request)?;
     let mut plan = SwarmAdmissionPlanCandidate {
         schema_version: SWARM_ADMISSION_PLAN_VERSION.to_owned(),
@@ -674,6 +977,7 @@ pub fn compile_swarm_admission_plan(
         slots,
         staffing: request.staffing.clone(),
         admission: request.admission.clone(),
+        receipt_currency,
         execution: ZeroModelExecutionCounters::zero(),
         candidate_only: true,
         dispatch_authority: false,
