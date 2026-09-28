@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod act_owner_input;
 mod canonical_tool_source;
 mod contract;
 mod core;
@@ -15,6 +16,7 @@ mod schema;
 mod semantic_profile;
 mod surface_decision;
 
+pub use act_owner_input::*;
 pub use contract::*;
 pub use core::*;
 pub use host::*;

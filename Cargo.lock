@@ -1134,6 +1134,7 @@ name = "eliot-context-admission"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
+ "eliot-authority",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",

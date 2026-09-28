@@ -21,6 +21,8 @@ pub mod closure;
 pub mod decision;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod learning_gate;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod material_floor;
 
 pub use closure::{ClosureParts, assemble_closure};
 
@@ -35,6 +37,13 @@ pub use decision::{
 pub use learning_gate::{
     LearningSubject, admit_context_with_learning, screen_admission_input_learning,
     screen_learning_subjects,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use material_floor::{
+    AdmittedDecisionFloor, AffectedLineageReference, AllowedFloorAction, ApplicableFloor,
+    DecisionFloorRefusal, FloorAtomPolicy, FloorEvidenceStatus, MaterialDecisionRefusal,
+    OperationOwnerInputs, RequiredFloorAtom, admit_material_decision, derive_applicable_floor,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
