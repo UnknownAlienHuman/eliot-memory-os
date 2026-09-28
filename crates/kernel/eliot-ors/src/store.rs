@@ -86,14 +86,14 @@ use crate::{
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry, RecoveryInboxRecoveryPage,
-    RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage, RecoveryPayload,
-    RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, RecoveryProblemRecoveryCursor,
-    RecoveryProblemRecoveryPage, RecoveryWriteBinding, ReservationRecord, ReservationRequest,
-    ReservationState, ReservedScope, RetryState, RootTransitionCommit,
-    RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
-    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
-    StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
+    RecoveryInboxReceipt, RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry,
+    RecoveryInboxRecoveryPage, RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage,
+    RecoveryPayload, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind,
+    RecoveryProblemRecoveryCursor, RecoveryProblemRecoveryPage, RecoveryWriteBinding,
+    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
+    RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
+    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
+    StreamRecoveryActivation, StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
@@ -22045,6 +22045,10 @@ impl RedbRecoveryStore {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the retained idempotency identity is checked as one atomic admission path"
+    )]
     fn existing_token(
         write: &redb::WriteTransaction,
         request: &ReservationRequest,
@@ -22384,7 +22388,7 @@ impl RedbRecoveryStore {
             let observed_revision = observed.revision_for(source);
             if expected_revision != observed_revision {
                 return Err(OrsError::RecoverySnapshotMoved {
-                    source,
+                    inventory_source: source,
                     expected_revision,
                     observed_revision,
                 });
@@ -25237,6 +25241,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Self::validate_recovery_inventory_snapshot_in_read(&read, snapshot)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three reservation index phases share one snapshot-bound cursor"
+    )]
     fn scan_write_reservations(
         &self,
         cursor: WriteReservationRecoveryCursor,
@@ -25279,14 +25287,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         });
                     }
                     let order_key = format!("{:020}", token.reservation_order);
-                    if !orders
+                    if orders
                         .get(order_key.as_str())
                         .map_err(storage)?
-                        .is_some_and(|value| value.value() == token.reservation_id.as_str())
-                        || !operations
+                        .is_none_or(|value| value.value() != token.reservation_id.as_str())
+                        || operations
                             .get(token.operation_id.as_str())
                             .map_err(storage)?
-                            .is_some_and(|value| value.value() == token.reservation_id.as_str())
+                            .is_none_or(|value| value.value() != token.reservation_id.as_str())
                     {
                         return Err(OrsError::IntegrityProblem {
                             record_type: "recovery_reservation_inventory",
@@ -25297,10 +25305,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     if let Some(binding) = token.write_binding.as_ref() {
                         binding.validate()?;
                         if !write_binding_matches_token(binding, token)
-                            || !idempotency
+                            || idempotency
                                 .get(write_idempotency_index_key(binding).as_str())
                                 .map_err(storage)?
-                                .is_some_and(|value| value.value() == token.operation_id.as_str())
+                                .is_none_or(|value| value.value() != token.operation_id.as_str())
                         {
                             return Err(OrsError::IntegrityProblem {
                                 record_type: "recovery_reservation_inventory",
@@ -25659,6 +25667,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one snapshot-bound index page validates each retained operation mapping"
+    )]
     fn scan_write_idempotency(
         &self,
         cursor: WriteIdempotencyRecoveryCursor,
@@ -27480,6 +27492,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .transpose()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "durable staging and exact envelope readback form one acceptance boundary"
+    )]
     fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError> {
         request.validate()?;
         let token = self

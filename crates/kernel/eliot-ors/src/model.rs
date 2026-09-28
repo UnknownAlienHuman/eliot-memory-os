@@ -4218,10 +4218,10 @@ pub enum OrsError {
     #[error("recovery cursor limit must be between 1 and {MAX_RECOVERY_PAGE}")]
     InvalidCursorLimit,
     #[error(
-        "recovery inventory source {source:?} moved from revision {expected_revision} to {observed_revision}"
+        "recovery inventory source {inventory_source:?} moved from revision {expected_revision} to {observed_revision}"
     )]
     RecoverySnapshotMoved {
-        source: RecoveryInventorySource,
+        inventory_source: RecoveryInventorySource,
         expected_revision: u64,
         observed_revision: u64,
     },
@@ -4400,7 +4400,7 @@ pub enum OrsError {
     #[error("opaque operation could not be durably staged, ACCEPTED_PENDING is forbidden: {0}")]
     StagingNotDurable(String),
     #[error(
-        "redb commit outcome is unresolved for operation {operation_id} and reservation {reservation_id}; commit error: {commit_error}; readback error: {readback_error:?}"
+        "redb commit outcome is unresolved for operation {operation_id:?} and reservation {reservation_id:?}; commit error: {commit_error}; readback error: {readback_error:?}"
     )]
     StagingCommitOutcomeUnknown {
         operation_id: OperationIdentity,
@@ -4409,7 +4409,7 @@ pub enum OrsError {
         readback_error: Option<Box<OrsError>>,
     },
     #[error(
-        "Recovery Problem could not be persisted for operation {operation_id} and reservation {reservation_id}; original cause: {original}; recorder failure: {recorder}"
+        "Recovery Problem could not be persisted for operation {operation_id:?} and reservation {reservation_id:?}; original cause: {original}; recorder failure: {recorder}"
     )]
     RecoveryProblemRecordFailed {
         operation_id: OperationIdentity,
