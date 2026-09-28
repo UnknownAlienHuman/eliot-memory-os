@@ -122,7 +122,20 @@ pub struct IntegrationReport {
     pub hook_event_gaps: Vec<String>,
     /// The runtime handshake was observed.
     pub handshake_ok: bool,
+    /// Installation status recorded by the expectation's own source record, or
+    /// `None` when that record states none.
+    ///
+    /// This is reported beside, and separately from, the read-back evidence
+    /// above: it is the delivery's own statement about whether the
+    /// installation ran, never this crate's verdict. `installed` is gated on
+    /// it, so a receipt recording an install that did not complete can never
+    /// yield `installed: true` however well the target bytes happen to match.
+    pub installation: Option<InstallStatus>,
     /// Static install surface is complete.
+    ///
+    /// Requires, in addition to the read-back evidence above, that the
+    /// expectation's source record either states no installation status (a
+    /// plain expectation) or records a completed installation.
     pub installed: bool,
     /// Install surface plus live handshake.
     pub live: bool,
