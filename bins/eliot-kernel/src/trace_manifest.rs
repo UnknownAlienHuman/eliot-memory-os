@@ -6,20 +6,25 @@
 //!
 //! A [`TraceManifest`] is the Kernel-owned replayable record for one bound
 //! result, keyed by trace/operation ID. It binds the Task/Action contract and
-//! State Fence; principal/Session/lease/policy snapshots; the requested and
-//! actual route; the local-port call with immutable input/output handles;
+//! State Fence; the presenting caller and its semantic Session; the lease
+//! attempt; the policy snapshot when the fence is policy-bound; the requested
+//! and actual route; the local-port call with immutable input/output handles;
 //! observed side effects; canonical receipts; the finish decision; and an
-//! explicit missing-parts list. Slots this path cannot produce (principal,
-//! policy snapshot without a policy-bound fence, Active View/packet manifest,
-//! independent verifier result) are enumerated in `unavailable`: missing
-//! evidence limits replay and is never silently treated as success.
+//! explicit missing-parts list. I16.12 slots this path cannot produce (the
+//! semantic principal, a policy snapshot without a policy-bound fence, the
+//! Active View/packet manifest, the independent verifier result, and the
+//! executor identity when the owner does not name one) are enumerated in
+//! `unavailable`: missing evidence limits replay and is never silently
+//! treated as success.
 //!
 //! Persistence reuses the single #1837 audit chain: the manifest seals as one
 //! [`AuditEventKind::TRACE_MANIFEST_SEALED`](crate::kernel_audit::AuditEventKind::TRACE_MANIFEST_SEALED)
 //! record through the composition's one [`KernelAuditChain`](crate::kernel_audit::KernelAuditChain)
 //! handle, covered by the same BLAKE3 linkage and anchor sink. There is no
 //! second manifest store, no parallel chain, and no alternate receipt scheme.
-//! Replay reads the sealed body back with [`TraceManifest::find_sealed`].
+//! Replay reads the sealed body back with [`TraceManifest::find_sealed`],
+//! which serves the recorded body only when its recorded completion claim is
+//! carried by the slots that body itself records.
 //!
 //! Posture matches the audit chain: sealing is observational and never
 //! changes a submit disposition (the durable ORS record owns lifecycle
@@ -310,8 +315,15 @@ impl TraceManifest {
     ///
     /// Scans retained chain records for the newest
     /// `trace.manifest_sealed` entry bound to `operation_id` and decodes its
-    /// sealed body. Returns `None` when no seal exists or the sealed body
-    /// does not decode: replay is then limited, never invented.
+    /// sealed body. Returns `None` when no seal exists, when the sealed body
+    /// does not decode, when it carries a foreign
+    /// [`TRACE_MANIFEST_FORMAT_VERSION`], or when the recorded completion
+    /// claim is not supported by the slots that very body records: replay is
+    /// then limited, never invented.
+    ///
+    /// The check reads only the recorded body. It never re-derives the
+    /// classification from live request state, so a readback either
+    /// reproduces the sealed record or reports no manifest.
     #[must_use]
     pub fn find_sealed(records: &[AuditRecord], operation_id: &str) -> Option<Self> {
         records
@@ -322,43 +334,58 @@ impl TraceManifest {
                     && record.lineage.operation_id.as_deref() == Some(operation_id)
             })
             .and_then(|record| serde_json::from_value(record.event_body.clone()).ok())
+            .filter(Self::records_supported_completion)
+    }
+
+    /// Returns true when the recorded completion claim is carried by the
+    /// recorded required slots.
+    ///
+    /// The guarantee is one-directional on purpose: a recorded
+    /// [`TraceFinish::VerifiedComplete`] whose own slots leave a required
+    /// absence is a self-contradicting body and is refused, so replay never
+    /// serves an unqualified success. A recorded degraded or partial
+    /// classification over complete slots is conservative, never an
+    /// over-claim, so it is served as recorded.
+    fn records_supported_completion(&self) -> bool {
+        self.format_version == TRACE_MANIFEST_FORMAT_VERSION
+            && (!self.finish.is_complete() || self.missing_parts().is_empty())
     }
 
     /// Returns the required slots with no value, in stable order.
+    ///
+    /// Enumerated from [`TRACE_MANIFEST_REQUIRED_SLOTS`] itself, so the
+    /// required set has exactly one declaration: a slot added there is
+    /// enforced here without a second list to keep in step. An unrecognized
+    /// required name resolves absent, which fails closed into
+    /// [`TraceFinish::DegradedNoProof`] rather than into a completion claim.
     fn missing_parts(&self) -> Vec<String> {
-        let mut missing = Vec::new();
-        if self.capability.is_none() || self.payload_digest.is_none() {
-            missing.push("action_contract".to_owned());
+        TRACE_MANIFEST_REQUIRED_SLOTS
+            .iter()
+            .filter(|slot| !self.required_slot_present(slot))
+            .map(|slot| (*slot).to_owned())
+            .collect()
+    }
+
+    /// Returns true when one required slot carries a value.
+    fn required_slot_present(&self, slot: &str) -> bool {
+        match slot {
+            "action_contract" => self.capability.is_some() && self.payload_digest.is_some(),
+            "state_fence" => self.state_fence.is_some(),
+            // A1 names caller AND session: the presenting transport
+            // connection alone does not identify the semantic caller, so
+            // withholding the session leaves the slot absent.
+            "caller_session" => self.connection_id.is_some() && self.session_id.is_some(),
+            "lease" => self.lease_attempt_id.is_some(),
+            "requested_route" => self.requested_route.is_some(),
+            "actual_route" => self.actual_route.is_some(),
+            "invoked_operation" => self.invoked_operation.is_some(),
+            "input_handle" => self.input_handle.is_some(),
+            "output_handle" => self.output_handle.is_some(),
+            "side_effects" => self.side_effects.is_some(),
+            "adapter_identity" => self.adapter_identity.is_some(),
+            "result_receipt" => self.result_digest.is_some() && self.durable_state.is_some(),
+            _ => false,
         }
-        for (slot, name) in [
-            (self.state_fence.is_some(), "state_fence"),
-            (self.connection_id.is_some(), "caller_session"),
-            (self.lease_attempt_id.is_some(), "lease"),
-            (self.requested_route.is_some(), "requested_route"),
-            (self.actual_route.is_some(), "actual_route"),
-            (self.invoked_operation.is_some(), "invoked_operation"),
-            (self.input_handle.is_some(), "input_handle"),
-            (self.output_handle.is_some(), "output_handle"),
-            (self.side_effects.is_some(), "side_effects"),
-            (self.adapter_identity.is_some(), "adapter_identity"),
-            (
-                self.result_digest.is_some() && self.durable_state.is_some(),
-                "result_receipt",
-            ),
-        ] {
-            if !slot {
-                missing.push(name.to_owned());
-            }
-        }
-        debug_assert_eq!(
-            missing
-                .iter()
-                .filter(|slot| TRACE_MANIFEST_REQUIRED_SLOTS.contains(&slot.as_str()))
-                .count(),
-            missing.len(),
-            "missing parts must name required slots only"
-        );
-        missing
     }
 
     /// Returns the I16.12 evidence slots this path cannot produce.
