@@ -1736,6 +1736,30 @@ impl DaemonComposition {
         Ok(eliot_contracts::sha256_hex(&bytes))
     }
 
+    /// Returns the authenticated Kernel-owned bounded maintenance recovery
+    /// projection retained by the Governor recovery snapshot. Continuation
+    /// tokens are available to this owner-facing reader and are not emitted to
+    /// general startup diagnostics.
+    #[must_use]
+    pub fn maintenance_trigger_recovery(
+        &self,
+    ) -> &eliot_governor::MaintenanceTriggerRecoveryProjection {
+        &self.governor.recovery().maintenance_trigger_recovery
+    }
+
+    /// Resumes the bounded authenticated Kernel recovery scan from retained
+    /// opaque cursors. Kernel validates that each continuation belongs to the
+    /// admitted session and fence before returning another page.
+    pub fn maintenance_trigger_recovery_page(
+        &self,
+        claim_continuation: Option<&str>,
+        pending_continuation: Option<&str>,
+    ) -> Result<eliot_governor::MaintenanceTriggerRecoveryProjection, DaemonError> {
+        self.governor
+            .maintenance_trigger_recovery_page(claim_continuation, pending_continuation)
+            .map_err(DaemonError::Composition)
+    }
+
     /// Returns the exact readiness state.
     #[must_use]
     pub const fn readiness(&self) -> CompositionReadiness {
