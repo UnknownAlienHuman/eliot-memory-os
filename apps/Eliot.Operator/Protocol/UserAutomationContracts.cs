@@ -509,7 +509,9 @@ public sealed record UserAutomationNormalizedSchedule(
     [property: JsonPropertyName("dst_gap")] string DstGap,
     [property: JsonPropertyName("start_at")] string StartAt,
     [property: JsonPropertyName("end_at")] string? EndAt,
-    [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences)
+    [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences,
+    [property: JsonPropertyName("normalization_receipt")]
+        UserAutomationScheduleNormalizationReceipt NormalizationBinding)
 {
     /// <summary>
     /// Validates the bounded wire shape and the exact supported contract version
@@ -566,6 +568,7 @@ public sealed record UserAutomationNormalizedSchedule(
         {
             throw new InvalidOperationException("ONE_SHOT schedules require one next occurrence.");
         }
+        NormalizationBinding.Validate();
         UserAutomationScheduleMirror.ReadOwnerSchedule(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
     }
@@ -591,6 +594,82 @@ public sealed record UserAutomationNormalizedSchedule(
         Validate();
         return UserAutomationScheduleMirror.ReadOwnerSchedule(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
+    }
+}
+
+/// <summary>
+/// The owner-issued normalization evidence the owner's schedule contract now
+/// REQUIRES on every normalized revision.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The owner side of this record is <c>deny_unknown_fields</c>, so this member
+/// is not optional: without it a 1.2.0 revision cannot round-trip through the
+/// Operator at all. It is owner-issued evidence over the compiled occurrence
+/// set, not an Operator claim about it.
+/// </para>
+/// <para>
+/// <b>Why the C# member on the schedule is named <c>NormalizationBinding</c>
+/// while the JSON name is <c>normalization_receipt</c>.</b>
+/// <c>UserAutomationNormalizedSchedule</c> already exposes a
+/// <c>NormalizationReceipt()</c> METHOD that projects the parsed owner schedule,
+/// and C# forbids a property and a method sharing one name in a type. The JSON
+/// property name is what the wire contract depends on, so it stays exactly
+/// <c>normalization_receipt</c>; only the C# identifier is renamed, and no call
+/// site in another file has to move.
+/// </para>
+/// <para>
+/// Every member below is checked for closed shape ONLY. The two digests are
+/// SHA-256 values over the owner's canonical JSON encoding of an expression
+/// language this surface does not own, and the receipt id is the identity of a
+/// receipt envelope the owner derives from its own bytes. The Operator can
+/// therefore reproduce none of them, and it does not: it never claims the
+/// occurrence set is the compiled result of the expression, never recomputes a
+/// digest, and never treats a locally well-formed receipt as normalization
+/// evidence. Whether the set is actually the compiled result of the declared
+/// expression is the owner's decision, enforced by the owner.
+/// </para>
+/// </remarks>
+public sealed record UserAutomationScheduleNormalizationReceipt(
+    [property: JsonPropertyName("receipt_id")] string ReceiptId,
+    [property: JsonPropertyName("normalizer_authority")] string NormalizerAuthority,
+    [property: JsonPropertyName("source_digest")] string SourceDigest,
+    [property: JsonPropertyName("zone_database_revision")] string ZoneDatabaseRevision,
+    [property: JsonPropertyName("occurrences_digest")] string OccurrencesDigest)
+{
+    /// <summary>
+    /// Checks the closed owner shape of the receipt and nothing about its
+    /// authority.
+    /// </summary>
+    /// <remarks>
+    /// The pinned zone database revision is the one the owner admits, checked
+    /// against the generated constant rather than a second copy of the token.
+    /// The two digest members are held to the owner's own 64-hex digest shape
+    /// so a malformed value is refused here instead of travelling to the owner,
+    /// but their CONTENTS are unverified: this surface cannot recompute either
+    /// one and never asserts that the occurrence set matches the expression.
+    /// </remarks>
+    public void Validate()
+    {
+        UserAutomationContract.RequireText(ReceiptId, "schedule.normalization_receipt.receipt_id");
+        UserAutomationContract.RequireText(
+            NormalizerAuthority, "schedule.normalization_receipt.normalizer_authority");
+        RequireDigest(SourceDigest, "schedule.normalization_receipt.source_digest");
+        RequireDigest(
+            OccurrencesDigest, "schedule.normalization_receipt.occurrences_digest");
+        UserAutomationContract.RequireOneOf(
+            ZoneDatabaseRevision,
+            "schedule.normalization_receipt.zone_database_revision",
+            OperatorScheduleContract.PINNED_ZONE_DATABASE_RELEASE);
+    }
+
+    private static void RequireDigest(string value, string field)
+    {
+        UserAutomationContract.RequireText(value, field);
+        if (value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character)))
+        {
+            throw new InvalidOperationException($"{field} must be a 64-character hex digest.");
+        }
     }
 }
 
