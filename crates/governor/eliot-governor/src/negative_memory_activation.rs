@@ -51,15 +51,20 @@
 //!   accepting a conservative guard can never be read as a claim of mechanism
 //!   because no admitted activation asserts one.
 //!
-//! # Scope and privacy
+//! # Scope
 //!
-//! [`NegativeMemoryActivationRequest::affected_scope_digest`] and
-//! [`NegativeMemoryActivationRequest::privacy_profile_ref`] must match the
-//! retained `NegativeMemoryAffectedScope` on the record. The point is narrow
-//! and explicit: a rule may only acquire blocking power inside the exact
-//! scope/environment its record names, and a rule may not be published for a
-//! privacy profile the record was not admitted under. This is a content
-//! comparison against the recorded value, not a shape check.
+//! [`NegativeMemoryActivationRequest::affected_scope_digest`] is compared
+//! **content-wise** against the retained `NegativeMemoryAffectedScope` on the
+//! record: the presented digest must equal the digest computed over exactly
+//! that recorded value, so a rule may only acquire blocking power inside the
+//! exact task, scope, environment and resources its record names. There is
+//! deliberately no privacy-profile input on this request. `NegativeMemoryFingerprint`
+//! and its `NegativeMemoryAffectedScope` carry no privacy/disclosure identity
+//! at all (a case-insensitive sweep for one finds nothing), so a privacy
+//! comparison here could only ever be a shape test against a field nothing
+//! records. This module does not assert a privacy binding it cannot check; the
+//! privacy ceiling that does exist on the record is its own `causal` ceiling,
+//! enforced by `NegativeMemoryFingerprint::validate`.
 //!
 //! # The write path
 //!
@@ -83,10 +88,11 @@
 //! The **expected revision** is the `RevisionHeadExpectation` the caller passes
 //! for the activation key; the store arbitrates it under a compare-and-set.
 //! The **immutable receipt** is the `WriteReceipt` returned by the commit,
-//! checked here for status, operation identity, idempotency key and fence
-//! agreement — the same freshness check the sibling commit paths apply — and
-//! then returned to the caller as
-//! [`NegativeMemoryActivationReceipt`], which additionally names the exact
+//! checked here for status, operation identity, idempotency key, fence
+//! agreement, and — exactly as the sibling commit paths apply — revision-head
+//! base agreement and ordering-head advance, so a stale projection can never
+//! surface as a healthy activation. The receipt is then returned to the caller
+//! as [`NegativeMemoryActivationReceipt`], which additionally names the exact
 //! rule revision and content digest that are now live.
 
 use eliot_canonical::CanonicalWriteEnvelope;
@@ -193,8 +199,8 @@ pub enum NegativeMemoryActivationRefusal {
         /// The verifier the record requires.
         required_verifier: String,
     },
-    /// The activation's scope or privacy binding does not equal the recorded
-    /// one. This is a content comparison, not a shape check.
+    /// The activation's scope or horizon/reopen binding does not equal the
+    /// recorded one. This is a content comparison, not a shape check.
     ScopeOrPrivacyMismatch {
         /// Exact refusal detail.
         detail: String,
@@ -215,10 +221,24 @@ pub struct NegativeMemoryActivationRequest {
     pub policy: NegativeMemoryActionPolicy,
     /// Supporting evidence the owner proved before requesting activation.
     pub evidence: NegativeMemoryActivationEvidence,
-    /// The exact action class/parameters the policy gates, in the owner's
-    /// closed spelling. Recorded verbatim on the durable document.
+    /// The owner-facing action class the policy gates, in the owner's closed
+    /// spelling. Recorded verbatim on the durable document and covered by its
+    /// digest.
+    ///
+    /// This is *not* the record's action identity. The closed action identity
+    /// the matcher compares is `record.failed_action` — the full
+    /// `FailureAction { action_id, operation_id, attempt_id, target_id,
+    /// input_schema, input_digest, effect_id, effect_class, owner,
+    /// contract_revision, contract_digest }` — and that is already carried,
+    /// bound and validated by `record`, by `policy.validate_binding`, and by
+    /// the gate's own `NegativeMemorySubject.action` comparison. These two
+    /// fields are a human/owner-readable annotation of the same activation
+    /// and are admitted on shape only; defining a closed mapping from them onto
+    /// `FailureAction`'s fields would be a second action-identity scheme, which
+    /// this owner does not introduce.
     pub action_class: String,
-    /// The exact action parameters the policy gates, recorded verbatim.
+    /// The owner-facing action parameters the policy gates, recorded verbatim
+    /// and admitted on shape only, exactly as [`Self::action_class`].
     pub action_parameters: Vec<String>,
     /// The validity horizon, in the record's own clock/revision domain.
     pub validity_horizon: NegativeMemoryHorizon,
@@ -226,8 +246,6 @@ pub struct NegativeMemoryActivationRequest {
     pub reopen: NegativeMemoryReopenCondition,
     /// Digest over the recorded `affected` scope the request was admitted for.
     pub affected_scope_digest: String,
-    /// The privacy profile the rule was admitted under.
-    pub privacy_profile_ref: String,
     /// Owner-issued admission reference recorded on the durable document.
     pub admission_ref: String,
 }
@@ -286,8 +304,8 @@ fn owner_error(detail: impl std::fmt::Display) -> CompositionError {
 ///    reading;
 /// 7. the evidence join — non-empty, duplicate-free, a subset of the record's
 ///    retained evidence, and naming the record's required verifier;
-/// 8. the scope/privacy join — the presented `affected` and privacy bindings
-///    must equal the recorded ones;
+/// 8. the scope/privacy join — the presented `affected` binding must equal the
+///    recorded one;
 /// 9. the horizon and reopen joins — the presented horizon domain and the
 ///    presented reopen condition must equal the recorded ones, so an activation
 ///    cannot silently widen or shorten either.
@@ -361,11 +379,6 @@ pub fn validate_negative_memory_activation(
     {
         return Err(NegativeMemoryActivationRefusal::ScopeOrPrivacyMismatch {
             detail: "activation does not bind the record's exact affected scope".to_owned(),
-        });
-    }
-    if request.privacy_profile_ref.trim().is_empty() {
-        return Err(NegativeMemoryActivationRefusal::ScopeOrPrivacyMismatch {
-            detail: "activation names no privacy profile".to_owned(),
         });
     }
     if request.validity_horizon != request.record.do_not_repeat {
@@ -711,7 +724,7 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
         security: SecurityContext::default(),
         required_proof_and_approval_refs: proof_refs,
         expected_revision_heads: expected_revision_heads.clone(),
-        expected_ordering_heads,
+        expected_ordering_heads: expected_ordering_heads.clone(),
     };
     let receipt = composition.commit_canonical(identity, envelope).await?;
     check_activation_commit_freshness(
@@ -719,6 +732,8 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
         &operation_id,
         &decoded.idempotency_key,
         &envelope_fence,
+        &expected_revision_heads,
+        &expected_ordering_heads,
     )?;
     let expected_revision_head = expected_revision_heads
         .into_iter()
@@ -740,13 +755,25 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
 /// request, with no stale projection reported healthy.
 ///
 /// Identity and fence agreement mirror the store's own receipt-identity rule;
-/// this is the same freshness check the sibling commit paths apply, named for
-/// this leg.
+/// head agreement follows the owner CAS contract exactly as
+/// `learning_record_commit::check_learning_commit_freshness` applies it
+/// (expectations are validated against current store state at execution; both
+/// providers advance heads as `before = current`, `after = before + 1`): the
+/// returned `revision_before_after` entry for every expected revision key must
+/// report the arbitrated base revision, and the returned `ordering_sequences`
+/// entry for every expected ordering scope must report a sequence advanced
+/// strictly past the expectation. The same `if let Some(..) &&` match semantics
+/// are mirrored, including their consequence: a key or scope the receipt does
+/// not report at all is not itself a stale reading here, and the receipt's own
+/// `validate()` is what requires the head set to be well formed. This is the
+/// sibling freshness check in full, not a weaker spelling of it.
 fn check_activation_commit_freshness(
     receipt: &WriteReceipt,
     operation_id: &OperationId,
     idempotency_key: &str,
     envelope_fence: &StateFence,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<(), CompositionError> {
     receipt
         .validate()
@@ -765,6 +792,36 @@ fn check_activation_commit_freshness(
         return Err(owner_error(
             "activation receipt fence does not match the committed envelope fence",
         ));
+    }
+    for expected in expected_revision_heads {
+        if let Some(delta) = receipt
+            .revision_before_after
+            .iter()
+            .find(|delta| delta.key == expected.key)
+            && delta.before != expected.expected_revision
+        {
+            return Err(owner_error(format!(
+                "activation receipt revision is stale for {}: expected base {}, observed {}",
+                expected.key.as_str(),
+                expected.expected_revision,
+                delta.before,
+            )));
+        }
+    }
+    for expected in expected_ordering_heads {
+        if let Some(head) = receipt
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope == expected.scope)
+            && head.sequence <= expected.expected_sequence
+        {
+            return Err(owner_error(format!(
+                "activation receipt ordering is stale for {}: expected advance past {}, observed {}",
+                expected.scope.as_str(),
+                expected.expected_sequence,
+                head.sequence,
+            )));
+        }
     }
     Ok(())
 }
