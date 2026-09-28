@@ -70,6 +70,21 @@
 //!   owns. A clean stop of this loop never upgrades it: a guest child
 //!   without an observed exit stays unresolved for its owner.
 //!
+//! Observation, local stdout write, owner acknowledgement, and permission to
+//! reclaim are four more states kept apart (issue #2787, external audit
+//! comment 5868395275). The loop's claim-bound [`ObservedResultRetention`]
+//! writes the exact bounded sequence to the existing #2786 result record
+//! *before* any of it reaches stdout, so a publication that fails, or a
+//! cleanup that fails after a successful one, still leaves the observed guest
+//! result on disk. A restart reads that record back through the real per-frame
+//! and stream validators over the original recorded bytes, and only a
+//! complete sequence is republished through this same owner on the new
+//! transport — without admitting a request, issuing a permit, spawning a
+//! worker, or deleting anything. The loop's own handoff ([`RequestLoopReport`])
+//! carries the retained sequence next to the disposition that ended the loop,
+//! so a failure never travels alone and an observation is never discarded
+//! because something later failed.
+//!
 //! The execution deadline, the drain deadline, and the shutdown grace all
 //! come from one owner: the admitted guest ceilings
 //! ([`ceilings`](crate::dispatch_material::ValidatedGuestCeilings)), which
@@ -172,6 +187,18 @@ pub const MAX_RESULT_SEQUENCE: u64 = 8;
 
 /// Bounded result-byte budget: the largest result frame the loop publishes.
 pub const MAX_RESULT_FRAME_BYTES: usize = 64 * 1024;
+
+/// Retained-owner byte budget for one operation's whole result-event
+/// aggregate (#2787 audit defect 2).
+///
+/// It is the served-result record's own allocation guard, so the aggregate is
+/// measured against the record that must actually hold it. The aggregate is
+/// checked against this budget while it is being built, one event at a time,
+/// and a stream that would exceed it fails as an explicit typed capacity
+/// error: no prefix is ever dropped to fit, and no event is ever partially
+/// retained.
+pub const MAX_RETAINED_RESULT_STREAM_BYTES: usize =
+    crate::dispatch_material::SERVED_RESULT_MAX_BYTES;
 
 /// Control-loop poll cadence while a command is outstanding. It bounds how
 /// long the loop can go without re-checking the authority window; it starts
@@ -311,6 +338,18 @@ pub enum LoopError {
         /// Exact observation whose delivery failed.
         observation: &'static str,
     },
+    /// An observed result event could not be written to the existing
+    /// claim-bound durable result record before it was exposed
+    /// (#2787 audit defect 3). This is never reported as a safe refusal and
+    /// never authorizes re-executing the guest: the original claim stays
+    /// uncertain, the claimed set is not reclaimed, and the observed bytes
+    /// stay in the loop's retained sequence for the bounded recovery
+    /// handoff. A later observation retries the same whole-sequence write, so
+    /// a transient fault still lands the full sequence.
+    ResultRetentionFailed {
+        /// Exact observation that could not be retained durably.
+        observation: &'static str,
+    },
     /// An accepted control frame was delivered to the worker but no reply
     /// arrived within the admitted bounds. The request is not reissued: the
     /// operation's uncertain effect is handed to the owner that may still
@@ -367,6 +406,7 @@ impl LoopError {
             }
             Self::OutcomeChannelDisconnected { .. } => "REQUEST_LOOP_OUTCOME_CHANNEL_DISCONNECTED",
             Self::ResultPublicationFailed { .. } => "REQUEST_LOOP_RESULT_PUBLICATION_FAILED",
+            Self::ResultRetentionFailed { .. } => "REQUEST_LOOP_RESULT_RETENTION_FAILED",
             Self::ContainmentUnresolved { .. } => "REQUEST_LOOP_CONTAINMENT_UNRESOLVED",
             Self::OperationContainmentUnresolved { .. } => {
                 "REQUEST_LOOP_OPERATION_CONTAINMENT_UNRESOLVED"
@@ -392,6 +432,7 @@ impl fmt::Display for LoopError {
                 write!(formatter, "{}:{command}", self.code())
             }
             Self::ResultPublicationFailed { observation }
+            | Self::ResultRetentionFailed { observation }
             | Self::OperationContainmentUnresolved {
                 operation_id: observation,
             } => write!(formatter, "{}:{observation}", self.code()),
@@ -1192,6 +1233,73 @@ fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), LoopErro
     }
 }
 
+/// Commitment to the exact bytes of one retained result-event sequence
+/// (#2787 audit defect 2).
+///
+/// It is computed over the ORIGINAL stored values, never over a re-projection
+/// of live frames, so the writer and the reader commit to the same bytes and a
+/// record whose stored bytes were altered after the fact fails closed.
+fn retained_stream_digest(stored: &[serde_json::Value]) -> Result<String, LoopError> {
+    let mut commitment = String::new();
+    for value in stored {
+        let bytes = serde_json::to_vec(value).map_err(|_| invalid("result-stream"))?;
+        commitment.push_str(&sha256_hex(&bytes));
+    }
+    Ok(sha256_hex(commitment.as_bytes()))
+}
+
+/// Builds the bounded durable representation of one operation's retained
+/// result-event sequence (#2787 audit defect 2), for the existing #2786
+/// result record — not a second record and not a second database.
+///
+/// The three bounds are checked BEFORE the aggregate is allocated or
+/// serialized, in this order:
+///
+/// 1. the event count against [`MAX_RESULT_SEQUENCE`], from the length alone;
+/// 2. each event against [`MAX_RESULT_FRAME_BYTES`];
+/// 3. the running total against [`MAX_RETAINED_RESULT_STREAM_BYTES`], the
+///    retained owner's own budget, after that event's own bytes are measured
+///    but before it is joined to the aggregate.
+///
+/// A sequence that cannot fit produces an explicit typed capacity failure.
+/// No prefix is ever dropped to make room and no event is ever partially
+/// retained: the only alternative to the whole sequence is the failure.
+fn build_retained_result_stream(
+    events: &[OrdinaryOutcome],
+) -> Result<crate::dispatch_material::RetainedResultStream, LoopError> {
+    if events.is_empty() {
+        return Err(invalid("result-stream"));
+    }
+    let count = u64::try_from(events.len()).map_err(|_| LoopError::ResultTooLarge)?;
+    if count > MAX_RESULT_SEQUENCE {
+        return Err(LoopError::ResultTooLarge);
+    }
+    let mut stored: Vec<serde_json::Value> = Vec::with_capacity(events.len());
+    let mut total = 0usize;
+    for event in events {
+        let value = serde_json::to_value(event).map_err(|_| invalid("result-stream"))?;
+        let bytes = serde_json::to_vec(&value).map_err(|_| invalid("result-stream"))?;
+        if bytes.len() > MAX_RESULT_FRAME_BYTES {
+            return Err(LoopError::ResultTooLarge);
+        }
+        total = total.saturating_add(bytes.len());
+        if total > MAX_RETAINED_RESULT_STREAM_BYTES {
+            return Err(LoopError::ResultTooLarge);
+        }
+        stored.push(value);
+    }
+    let terminal_sequence = events
+        .last()
+        .filter(|event| event.terminal)
+        .map(|event| event.sequence);
+    let stream_digest = retained_stream_digest(&stored)?;
+    Ok(crate::dispatch_material::RetainedResultStream {
+        events: stored,
+        terminal_sequence,
+        stream_digest,
+    })
+}
+
 /// Terminal frame for a worker command the runtime refused, or for a
 /// request refused before execution. The frame carries the exact operation
 /// and phase of what was attempted — never a hardcoded Invoke — the stable
@@ -1415,6 +1523,27 @@ pub trait WasmHostRequestChannel {
     /// acceptance; failure retains the observed result in the loop for
     /// drain accounting, never an ad hoc fallback.
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError>;
+
+    /// Publishes an exact retained result-event sequence in order, through
+    /// this channel's own serializer, validator, and emitter, and returns
+    /// the terminal event it emitted.
+    ///
+    /// This is the one replay-publication path. A freshly observed event and
+    /// an event read back from durable retention are both emitted by the same
+    /// owner, so a replay is the original sequence on a new transport rather
+    /// than a second, differently-projected copy. The sequence must prove its
+    /// stream shape before any of it is exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ResultInvalid`] when the sequence or any of its
+    /// events fails validation, [`LoopError::ChannelUnavailable`] when the
+    /// stream cannot be written (or stays contended past a caller timeout),
+    /// or [`LoopError::ResultTooLarge`] when an event exceeds the budget.
+    fn publish_retained_sequence(
+        &mut self,
+        events: &[WasmHostResultFrame],
+    ) -> Result<WasmHostResultFrame, LoopError>;
 }
 
 /// Maps an owner control kind onto the loop's closed operation vocabulary.
@@ -2397,6 +2526,67 @@ impl DeliverySetChannel {
         self
     }
 
+    /// Binds a channel that can only republish an exact retained
+    /// result-event sequence.
+    ///
+    /// It admits no request, carries no admitted delivery, and installs no
+    /// Kernel control reader, so [`WasmHostRequestChannel::next_frame`]
+    /// reports exhaustion from its first poll. A cross-restart replay
+    /// therefore reuses this owner's serializer, validator, and emitter
+    /// without constructing an `AdmittedRuntime`, issuing a one-shot permit,
+    /// spawning a worker, or touching staged evidence.
+    #[must_use]
+    pub fn replay_only() -> Self {
+        Self {
+            admitted: None,
+            delivered: true,
+            control: None,
+            emission_broken: false,
+            pending_helper: None,
+        }
+    }
+
+    /// The one serializer, validator, and emitter behind every result event
+    /// this owner publishes, whether the event was just observed by a worker
+    /// or read back from durable retention for replay.
+    ///
+    /// Internal consistency first: a frame that cannot prove itself is never
+    /// emitted, and a publication failure retains the observed result
+    /// through the loop's drain accounting, never an ad hoc fallback. A
+    /// successful write plus flush below is an observed local stream write,
+    /// not proof the owner durably accepted the result.
+    fn emit_validated(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+        validate_frame(frame)?;
+        if self.emission_broken {
+            // A previous emission confirmed its write failed; the stream
+            // state is unusable, so every later frame fails closed here.
+            return Err(LoopError::ChannelUnavailable);
+        }
+        // Tracked helper termination: reap a retained helper only once it
+        // actually finished — a reaped handle is joined, never dropped
+        // running. While it still runs, the contended stream is never
+        // reused: the caller timeout is reported as a timeout, never as
+        // bounded writer termination.
+        if self.reap_output_helper() {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
+        if bytes.len() > MAX_RESULT_FRAME_BYTES {
+            return Err(LoopError::ResultTooLarge);
+        }
+        match emit_frame_bounded(bytes)? {
+            BoundedEmission::Written => Ok(()),
+            BoundedEmission::WriteFailed => {
+                self.emission_broken = true;
+                Err(LoopError::ChannelUnavailable)
+            }
+            BoundedEmission::CallerTimedOut { helper } => {
+                self.pending_helper = Some(helper);
+                Err(LoopError::ChannelUnavailable)
+            }
+        }
+    }
+
     /// Reaps a retained stdout helper that has finished, reporting whether
     /// a still-unfinished one is holding the contended stream. The helper
     /// handle is only ever joined once observed finished, so no reap path
@@ -2489,41 +2679,26 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     }
 
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
-        // Internal consistency first: a frame that cannot prove itself is
-        // never emitted, and a publication failure retains the observed
-        // result through the loop's drain accounting, never an ad hoc
-        // fallback. A successful write plus flush below is an observed
-        // local stream write, not proof the owner durably accepted the
-        // result.
-        validate_frame(frame)?;
-        if self.emission_broken {
-            // A previous emission confirmed its write failed; the stream
-            // state is unusable, so every later frame fails closed here.
-            return Err(LoopError::ChannelUnavailable);
+        self.emit_validated(frame)
+    }
+
+    fn publish_retained_sequence(
+        &mut self,
+        events: &[WasmHostResultFrame],
+    ) -> Result<WasmHostResultFrame, LoopError> {
+        // The stream proves its shape before any of it is exposed: one wire
+        // identity and version, gapless sequences from 0, exactly one closing
+        // terminal event, and one consistent parent identity across the whole
+        // sequence. A corrupted retained sequence fails closed instead of
+        // republishing.
+        validate_result_stream(events)?;
+        for event in events {
+            self.emit_validated(event)?;
         }
-        // Tracked helper termination: reap a retained helper only once it
-        // actually finished — a reaped handle is joined, never dropped
-        // running. While it still runs, the contended stream is never
-        // reused: the caller timeout is reported as a timeout, never as
-        // bounded writer termination.
-        if self.reap_output_helper() {
-            return Err(LoopError::ChannelUnavailable);
-        }
-        let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
-        if bytes.len() > MAX_RESULT_FRAME_BYTES {
-            return Err(LoopError::ResultTooLarge);
-        }
-        match emit_frame_bounded(bytes)? {
-            BoundedEmission::Written => Ok(()),
-            BoundedEmission::WriteFailed => {
-                self.emission_broken = true;
-                Err(LoopError::ChannelUnavailable)
-            }
-            BoundedEmission::CallerTimedOut { helper } => {
-                self.pending_helper = Some(helper);
-                Err(LoopError::ChannelUnavailable)
-            }
-        }
+        events
+            .last()
+            .cloned()
+            .ok_or_else(|| invalid("result-stream"))
     }
 }
 
@@ -2813,6 +2988,12 @@ pub struct BoundedRequestLoop {
     /// both survive, and an exact replay republishes the same bounded
     /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`].
     retained: BTreeMap<String, Vec<WasmHostResultFrame>>,
+    /// The claim-bound durable owner of the observed result sequence
+    /// (#2787 audit defect 3). Every observed event is written through it
+    /// before it can be exposed on stdout, so retention, local publication,
+    /// owner acknowledgement, and permission to reclaim stay four separate
+    /// states.
+    retention: ObservedResultRetention,
     /// Retained sequence to republish when a request is an exact replay.
     replay: Option<Vec<WasmHostResultFrame>>,
     /// Next event sequence number for this operation, from 0, gapless.
@@ -2857,14 +3038,19 @@ pub struct BoundedRequestLoop {
 
 impl BoundedRequestLoop {
     /// Creates the loop state from the granted binding, engine mode,
-    /// live authority cell, and the admitted guest ceilings that bound the
-    /// drain.
+    /// live authority cell, the claim-bound result retention owner, and the
+    /// admitted guest ceilings that bound the drain.
+    ///
+    /// Retention is required, not optional: a loop that could be built
+    /// without a durable owner would have no way to persist an observation
+    /// before exposing it, which is exactly the ordering this loop enforces.
     #[must_use]
     pub fn new(
         binding: AdmittedBinding,
         engine: EngineBinding,
         live: Arc<LiveAuthority>,
         drain_deadline: Duration,
+        retention: ObservedResultRetention,
     ) -> Self {
         Self {
             binding,
@@ -2872,6 +3058,7 @@ impl BoundedRequestLoop {
             live,
             max_in_flight: 1,
             retained: BTreeMap::new(),
+            retention,
             replay: None,
             next_sequence: 0,
             delivery: None,
@@ -2906,6 +3093,34 @@ impl BoundedRequestLoop {
     #[must_use]
     pub fn published(&self) -> Option<&WasmHostResultFrame> {
         self.published.as_ref()
+    }
+
+    /// The exact bounded result-event sequence observed for this operation,
+    /// in observation order (#2787 audit defect 2).
+    ///
+    /// Every retained event of this operation carries the one sealed request
+    /// digest this loop's binding names, so the operation's sequence is that
+    /// key's whole entry — never a merge across digests, and never a single
+    /// terminal event standing in for the sequence that produced it.
+    #[must_use]
+    pub fn retained_sequence(&self) -> Vec<WasmHostResultFrame> {
+        self.retained
+            .get(&self.binding.request_digest)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Writes the exact observed sequence through the claim-bound result
+    /// owner, before any of it can be exposed on stdout (#2787 audit
+    /// defect 3).
+    ///
+    /// The write always carries the WHOLE sequence observed so far, so a
+    /// later observation still lands the earlier ones that a transient
+    /// failure kept off disk. A failure is a typed capacity failure or the
+    /// retention failure itself; the caller keeps the original claim
+    /// uncertain, reclaims nothing, and never re-executes the guest.
+    fn retain_observed(&self) -> Result<(), LoopError> {
+        self.retention.retain(&self.retained_sequence())
     }
 
     /// Returns the terminal denial, when the loop refused before executing.
@@ -3369,6 +3584,14 @@ impl BoundedRequestLoop {
             .entry(frame.request_digest.clone())
             .or_default()
             .push(frame.clone());
+        // The error-path observation is retained before it is exposed, on
+        // the same terms as any other (#2787 audit defect 3). A retention
+        // failure here becomes this loop's first bounded residual and the
+        // emission is still attempted: the loss is what the caller reports,
+        // and the claim is never reclaimed on either path.
+        if let Err(error) = self.retain_observed() {
+            self.record_residual(error);
+        }
         let _ = channel.publish(&frame);
     }
 }
@@ -3386,7 +3609,153 @@ fn install_interrupt_handle(
     }
 }
 
-/// Runs the bounded ordinary request loop over one granted execution.
+/// The claim-bound durable owner of this operation's observed result
+/// sequence (#2787 audit defect 3).
+///
+/// It reaches exactly one place — the existing #2786 served-result record,
+/// under the exact staged identity this drive claimed — and it is the only
+/// writer of that record on the ordinary path. Threading it into the loop is
+/// what makes retention and exposure two separate states: an event is written
+/// here before it is published on stdout, so a publication that then fails,
+/// or a loop that then fails, still leaves the exact observed bytes on disk
+/// for the owner's recovery handoff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedResultRetention {
+    directory: PathBuf,
+    identity: crate::dispatch_material::StagedDeliveryIdentity,
+}
+
+impl ObservedResultRetention {
+    /// Binds retention to the exact claimed identity beside this
+    /// installation. It is derived from the claim, never from argv, stdin, or
+    /// the environment, so it can only ever name the delivery this drive
+    /// actually claimed.
+    #[must_use]
+    pub fn new(directory: &Path, claim: &crate::dispatch_material::DeliveryClaim) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            identity: claim.identity().clone(),
+        }
+    }
+
+    /// Writes the exact bounded sequence observed so far.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ResultTooLarge`] when the sequence cannot fit its
+    /// bounds — an explicit capacity failure, never a dropped prefix — and
+    /// [`LoopError::ResultRetentionFailed`] when the record itself cannot be
+    /// written. Neither is ever reported as a safe refusal of the operation.
+    fn retain(&self, events: &[OrdinaryOutcome]) -> Result<(), LoopError> {
+        let stream = build_retained_result_stream(events)?;
+        crate::dispatch_material::write_served_result(
+            &self.directory,
+            &self.identity,
+            crate::dispatch_material::ServedResultPayload::Stream(stream),
+            edge_now_ms(),
+        )
+        .map_err(|_| LoopError::ResultRetentionFailed {
+            observation: events
+                .last()
+                .map_or(EXECUTE_COMMAND, |event| observed_command_name(event)),
+        })
+    }
+}
+
+/// How the ordinary request loop ended, together with the execution, cleanup,
+/// and delivery dispositions it reached (#2787 audit defect 2).
+///
+/// The served disposition carries no frame of its own. The terminal event is
+/// the last event of the retained sequence the report already holds — it is
+/// always appended to that sequence before it is published — so naming it
+/// again beside the sequence would duplicate a whole result frame, and a
+/// duplicate is exactly the drift this handoff exists to prevent: a served
+/// report can no longer describe a terminal other than the one in its own
+/// sequence. It also keeps this type free of any heap allocation, so no
+/// disposition depends on a `Box` that aborts the process when an allocation
+/// fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopCompletion {
+    /// The loop published one terminal frame and closed its own execution,
+    /// cleanup, and delivery accounting. That terminal is the last event of
+    /// the report's retained sequence; read it with
+    /// [`RequestLoopReport::served_terminal`].
+    Served,
+    /// The loop failed. The failure is never returned alone: an observation
+    /// this loop made may be the only copy of a guest result, and discarding
+    /// it because something later failed would destroy the only record of it.
+    Failed {
+        /// The exact loop failure that ended the loop.
+        failure: LoopError,
+    },
+}
+
+/// What the ordinary request loop leaves behind: the exact bounded retained
+/// result-event sequence for this operation, next to the disposition that
+/// ended the loop.
+///
+/// The handoff exists so execution evidence, cleanup evidence, and delivery
+/// disposition are read together and never in place of one another, and so a
+/// failure can never travel without the observations that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestLoopReport {
+    retained: Vec<OrdinaryOutcome>,
+    completion: LoopCompletion,
+}
+
+impl RequestLoopReport {
+    /// The exact bounded retained result-event sequence, in observation
+    /// order, for the operation this loop served. It is present on every
+    /// disposition, including a failure before any event was observed, where
+    /// it is empty.
+    #[must_use]
+    pub fn retained(&self) -> &[OrdinaryOutcome] {
+        &self.retained
+    }
+
+    /// Whether the loop published a terminal frame or failed, and with what.
+    #[must_use]
+    pub fn completion(&self) -> &LoopCompletion {
+        &self.completion
+    }
+
+    /// The exact terminal frame the loop published, or `None` when the loop
+    /// failed.
+    ///
+    /// It is a borrow of the last event of the sequence this report already
+    /// carries, so reading it copies nothing and cannot disagree with the
+    /// sequence. `None` here means the loop failed, not that the result was
+    /// lost: a failure still carries every observation through
+    /// [`Self::retained`].
+    #[must_use]
+    pub fn served_terminal(&self) -> Option<&OrdinaryOutcome> {
+        match &self.completion {
+            LoopCompletion::Served => self.retained.last(),
+            LoopCompletion::Failed { .. } => None,
+        }
+    }
+
+    /// The report for a loop that published a terminal frame.
+    #[must_use]
+    fn served(retained: Vec<OrdinaryOutcome>) -> Self {
+        Self {
+            retained,
+            completion: LoopCompletion::Served,
+        }
+    }
+
+    /// The report for a failed loop, carrying every observation it made.
+    #[must_use]
+    fn failed(retained: Vec<OrdinaryOutcome>, failure: LoopError) -> Self {
+        Self {
+            retained,
+            completion: LoopCompletion::Failed { failure },
+        }
+    }
+}
+
+/// Runs the bounded ordinary request loop over one granted execution, and
+/// returns what it observed next to how it ended.
 ///
 /// The control phase always runs (authority refresh, drain, revocation,
 /// containment, external control intake), the request phase admits at most
@@ -3405,13 +3774,22 @@ fn install_interrupt_handle(
 ///    read the operation's containment disposition back from the outer
 ///    process-containment owner.
 ///
-/// Every return path — success, denial, drain failure, and the
-/// process-level containment path — runs all three steps, so no return path
-/// can leave a live join handle unreported.
+/// Every disposition — success, denial, drain failure, and the
+/// process-level containment path — runs all three steps, so no path can
+/// leave a live join handle unreported.
+///
+/// Every observed result event is written through `retention` — the existing
+/// claim-bound result owner — before it is published on stdout, and the whole
+/// observed sequence travels back with the loop's disposition, so an
+/// observation is never lost to a later failure. The loop's own failure is a
+/// [`LoopCompletion::Failed`] disposition beside that sequence rather than a
+/// `Result` error, because an error arm returning only the failure would
+/// throw away the only copy of an observed guest result.
 pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
-) -> Result<WasmHostResultFrame, LoopError> {
+    retention: ObservedResultRetention,
+) -> RequestLoopReport {
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
     let mut channel = DeliverySetChannel::new(request_frame);
@@ -3423,6 +3801,7 @@ pub fn run_request_loop(
         runtime.engine_binding.clone(),
         Arc::clone(&runtime.live),
         drain_bound(material),
+        retention,
     );
     state = install_interrupt_handle(state, &runtime.runner);
     // The operation-bound process-termination projection is read on this
@@ -3441,15 +3820,26 @@ pub fn run_request_loop(
     drain_and_shutdown_request_worker(&mut state, &mut channel, &termination, worker, drive)
 }
 
+/// The report for a failed loop edge: the exact bounded sequence observed so
+/// far beside the exact failure.
+///
+/// Every failing edge of the drain reports the same way. Nothing there returns
+/// a bare error, because the sequence may be the only copy of an observation
+/// that never reached stdout.
+fn failed_loop_report(state: &BoundedRequestLoop, failure: LoopError) -> RequestLoopReport {
+    RequestLoopReport::failed(state.retained_sequence(), failure)
+}
+
 /// Drains accepted work, shuts down and joins the worker, then returns the
-/// exact terminal result of the ordinary request loop.
+/// exact retained result-event sequence of the ordinary request loop together
+/// with the disposition that ended it.
 fn drain_and_shutdown_request_worker(
     state: &mut BoundedRequestLoop,
     channel: &mut DeliverySetChannel,
     termination: &ProcessTermination,
     worker: EngineWorker,
     drive: Result<(), LoopError>,
-) -> Result<WasmHostResultFrame, LoopError> {
+) -> RequestLoopReport {
     // Close Execute admission and keep draining (issue #2785 W1): intake
     // returns on close or exhaustion with a command possibly accepted, so
     // replies are polled until the worker idles. Joining with a command
@@ -3524,7 +3914,8 @@ fn drain_and_shutdown_request_worker(
         // shutdown. The retained operation record is this process's written
         // handover to that owner: the loop ends with an explicit unresolved
         // result rather than an implicit stop.
-        return Err(contained_failure(state, channel));
+        let contained = contained_failure(state, channel);
+        return failed_loop_report(state, contained);
     }
     let shutdown_observed = shutdown_sent
         && state.accepted_command() != Some(WorkerCommand::Shutdown)
@@ -3549,15 +3940,18 @@ fn drain_and_shutdown_request_worker(
         .or_else(|| drive.err())
         .or_else(|| state.denial())
     {
-        return Err(error);
+        return failed_loop_report(state, error);
     }
     // Explicit termination accounting (#2785): a worker that never took
     // `Shutdown` or never joined left guest work untracked; that is a
     // failed loop, never a silent success.
     if !shutdown_sent {
-        return Err(LoopError::CommandChannelDisconnected {
-            command: "shutdown",
-        });
+        return failed_loop_report(
+            state,
+            LoopError::CommandChannelDisconnected {
+                command: "shutdown",
+            },
+        );
     }
     // An accepted Shutdown must be observed to reply. A missing reply is a
     // retained residual, never a silent success; the lost-response
@@ -3568,16 +3962,16 @@ fn drain_and_shutdown_request_worker(
         };
         state.publish_lost_response(channel, error);
         state.record_residual(error);
-        return Err(error);
+        return failed_loop_report(state, error);
     }
     if !joined {
-        return Err(LoopError::ChannelUnavailable);
+        return failed_loop_report(state, LoopError::ChannelUnavailable);
     }
     // A Shutdown ack that could not be staged fails the loop honestly: the
     // delivery stays unacknowledged and the owner must reconcile it, rather
     // than the child reporting success it cannot prove.
     if let Some(error) = confirm_error {
-        return Err(error);
+        return failed_loop_report(state, error);
     }
     // Child termination, kept separate from cleanup evidence and from the
     // result delivery (issue #2785 I6, audit defect 2): "the worker stopped"
@@ -3594,11 +3988,21 @@ fn drain_and_shutdown_request_worker(
         ProcessTerminationObservation::Unknown => Some(false),
     };
     if state.guest_child_exited != Some(true) {
-        return Err(LoopError::OperationContainmentUnresolved {
-            operation_id: UNATTESTED_OPERATION,
-        });
+        return failed_loop_report(
+            state,
+            LoopError::OperationContainmentUnresolved {
+                operation_id: UNATTESTED_OPERATION,
+            },
+        );
     }
-    state.published().cloned().ok_or(denied("no-request"))
+    // A loop that published a terminal always appended it to the retained
+    // sequence first, so the served report names that terminal as its own
+    // last event. The `None` arm keeps the exact refusal this loop has always
+    // reported for a terminal it cannot name, rather than inventing a new one.
+    match state.published() {
+        Some(_) => RequestLoopReport::served(state.retained_sequence()),
+        None => failed_loop_report(state, denied("no-request")),
+    }
 }
 
 /// Joins the terminated worker and confirms its observed Shutdown outcome.
@@ -3942,15 +4346,12 @@ fn drive_loop(
             state.replay = None;
             // Exact replay republishes the retained bounded sequence in
             // order — same events, same sequence numbers, same terminal —
-            // without executing again. The terminal projection is the last
+            // without executing again, through the one owner that also emits
+            // a freshly observed event. The terminal projection is the last
             // retained event. The retained sequence is consumed here, so it
             // proves its stream shape first: a corrupted retained sequence
             // fails closed instead of republishing.
-            validate_result_stream(&replay)?;
-            for event in &replay {
-                channel.publish(event)?;
-            }
-            state.published = replay.last().cloned();
+            state.published = Some(channel.publish_retained_sequence(&replay)?);
             state.close_admission();
             break;
         }
@@ -4058,6 +4459,15 @@ fn consume_worker_outcome(
     // Preserve any Requested(Cancel/Reconcile) created by on_outcome: the
     // slot now holds that successor, never the command just settled.
     if let Some(frame) = frame.as_ref() {
+        // Order of the four states, and the reason for it (#2787 audit
+        // defect 3): the outcome is observed, then that exact observation is
+        // retained through the claim-bound result owner, then the local
+        // stdout write happens, and the owner acknowledgement follows what
+        // the worker actually did. Retention comes first because a stdout
+        // write that succeeds and a later cleanup that fails must still
+        // leave the observed result on disk; where it cannot, the claim
+        // stays uncertain and the guest is never re-executed.
+        state.retain_observed()?;
         // The exact outcome is observed here: complete the accepted
         // control before publishing, so the ack is durable ahead of
         // the best-effort emission the drain may still record.
@@ -4332,17 +4742,27 @@ fn seal_inflight_claim(
 }
 
 /// Seals the durable served evidence for one terminal outcome (#2786 step
-/// 7): the served marker first, then the exact terminal frame, both before
-/// physical reclaim. The pre-execution `InFlight` marker is already durable,
-/// so a failed seal still replays on restart instead of re-executing. Any
-/// failure preserves the claimed set and reports its original identity as
-/// unresolved instead of claiming success.
+/// 7): the served marker first, then the exact retained result-event
+/// sequence, both before physical reclaim.
+///
+/// This is a finalization, not a first write. Every observed event was
+/// already written through the claim-bound result owner before it could be
+/// exposed on stdout, so sealing here finalizes a sequence that is already
+/// durable rather than recording a result for the first time. The sequence
+/// must be a closed, valid stream first: sealing a prefix would advertise as
+/// complete a record whose predecessors were never retained. The
+/// pre-execution `InFlight` marker is already durable, so a failed seal
+/// still replays on restart instead of re-executing. Any failure preserves
+/// the claimed set and reports its original identity as unresolved instead
+/// of claiming success.
 fn seal_served_outcome(
     directory: &std::path::Path,
     claim: &crate::dispatch_material::DeliveryClaim,
-    frame: &OrdinaryOutcome,
+    events: &[OrdinaryOutcome],
     now_ms: u64,
 ) -> Result<(), OrdinaryDriveError> {
+    validate_result_stream(events).map_err(OrdinaryDriveError::Loop)?;
+    let stream = build_retained_result_stream(events).map_err(OrdinaryDriveError::Loop)?;
     if crate::dispatch_material::write_served_marker(directory, claim.identity(), now_ms).is_err() {
         let identity = claim.identity();
         return Err(OrdinaryDriveError::DeliveryInProgress {
@@ -4351,16 +4771,13 @@ fn seal_served_outcome(
             claim_id: identity.claim_id.clone(),
         });
     }
-    let retained = serde_json::to_value(frame).map_err(|_| {
-        let identity = claim.identity();
-        OrdinaryDriveError::DeliveryInProgress {
-            operation_id: identity.operation_id.clone(),
-            generation: identity.generation,
-            claim_id: identity.claim_id.clone(),
-        }
-    })?;
-    if crate::dispatch_material::write_served_result(directory, claim.identity(), &retained, now_ms)
-        .is_err()
+    if crate::dispatch_material::write_served_result(
+        directory,
+        claim.identity(),
+        crate::dispatch_material::ServedResultPayload::Stream(stream),
+        now_ms,
+    )
+    .is_err()
     {
         let identity = claim.identity();
         return Err(OrdinaryDriveError::DeliveryInProgress {
@@ -4372,38 +4789,176 @@ fn seal_served_outcome(
     Ok(())
 }
 
-/// Reads back the durably retained terminal result for exactly the staged
-/// replay identity (#2786 step 7). Returns the original frame only when the
-/// retained record names this identity verbatim, the frame parses under the
-/// closed result contract, and the frame's own operation/claim/grant and
-/// proven digests bind back to the same identity; anything else — absent,
-/// unreadable, oversize, malformed, foreign-identity, non-terminal, or
-/// wire-mismatched — answers `None` so the caller reports identity-only
-/// in-progress with all evidence preserved. Never executes, never deletes.
+/// Typed readback of the durable result record for exactly one staged replay
+/// identity (#2787 audit defect 4).
+///
+/// Every outcome keeps its own state instead of collapsing into "no record",
+/// because they are not the same fact: an absent record says nothing, a
+/// foreign or self-contradicting one is a conflict, and a bounded prefix with
+/// no closing event is a real observation whose missing events are simply not
+/// known. Only a complete, validated sequence is eligible for complete replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServedResultReadback {
+    /// A complete result-event sequence for exactly this identity, every
+    /// event validated over the original recorded value.
+    Complete {
+        /// The exact recorded events, in recorded order.
+        events: Vec<OrdinaryOutcome>,
+    },
+    /// The record names this identity but retains only a bounded prefix of
+    /// the stream: the events it never stored are not synthesized here, so
+    /// this is never a complete replay.
+    Incomplete,
+    /// The record contradicts the staged identity or itself.
+    Conflict,
+    /// No usable retained result: absent, unreadable, oversize, malformed,
+    /// or wire-mismatched.
+    Unavailable,
+}
+
+/// Reads back the durably retained result for exactly the staged replay
+/// identity and classifies it (#2786 step 7, #2787 audit defect 4).
+///
+/// Validation runs the REAL validators over the ORIGINAL recorded values:
+/// each event is decoded and then proved to re-encode to exactly the bytes
+/// that were stored, and the stream is then checked with
+/// [`validate_result_stream`]. A recomputed substitute is never validated in
+/// place of what is on disk. Never executes, never deletes.
 fn read_back_served_result(
     directory: &std::path::Path,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
-) -> Option<OrdinaryOutcome> {
-    let record = crate::dispatch_material::read_served_result(directory).ok()??;
+) -> ServedResultReadback {
+    // An absent record, an unreadable or oversize one, and a malformed one
+    // all answer the same typed state: this identity has no usable retained
+    // result. That mapping is unchanged by reading it as a `let ... else`.
+    let Ok(Some(record)) = crate::dispatch_material::read_served_result(directory) else {
+        return ServedResultReadback::Unavailable;
+    };
     if !record.names(identity) {
-        return None;
+        return ServedResultReadback::Conflict;
     }
-    let frame: OrdinaryOutcome = serde_json::from_value(record.frame).ok()?;
-    if frame.wire_id != WASM_HOST_RESULT_WIRE_ID
-        || frame.wire_version != WASM_HOST_RESULT_WIRE_VERSION
-        || !frame.terminal
-    {
-        return None;
+    let crate::dispatch_material::ServedResultRecord { frame, stream, .. } = record;
+    match stream {
+        // The legacy terminal-only payload is reconstructed into the very
+        // payload type a writer names, from the value this read already owns,
+        // so the v1 case is a shape the classifier really sees rather than a
+        // branch that can never be reached. Nothing is copied to do it, and
+        // the reader has already proved exactly one payload is present.
+        None => match frame {
+            Some(frame) => read_back_terminal_only_record(
+                crate::dispatch_material::ServedResultPayload::TerminalFrame { frame },
+                identity,
+            ),
+            None => ServedResultReadback::Unavailable,
+        },
+        Some(stream) => read_back_retained_result_stream(&stream, identity),
     }
-    if frame.operation_id != identity.operation_id
-        || frame.claim_id != identity.claim_id
-        || frame.grant_digest != identity.grant_digest
-        || frame.artifact_digest != identity.artifact_digest
-        || frame.input_digest != identity.input_digest
-    {
-        return None;
+}
+
+/// Classifies the #2786 v1 payload, which retained the terminal frame alone.
+///
+/// It is a complete single-event stream only when that frame is genuinely the
+/// whole stream: the first event, naming no predecessors. A terminal that
+/// names predecessors was never retained together with them, so the record
+/// stays explicitly incomplete and those events are never synthesized.
+fn read_back_terminal_only_record(
+    payload: crate::dispatch_material::ServedResultPayload,
+    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+) -> ServedResultReadback {
+    // A record without a stream cannot present any other payload shape, so
+    // this arm is unreachable; a mismatched shape is reported as the
+    // contradiction it is rather than being read as a terminal frame.
+    let crate::dispatch_material::ServedResultPayload::TerminalFrame { frame: recorded } = payload
+    else {
+        return ServedResultReadback::Conflict;
+    };
+    let Ok(frame) = decode_recorded_frame(&recorded) else {
+        return ServedResultReadback::Conflict;
+    };
+    if !frame_binds_to_identity(&frame, identity) || validate_frame(&frame).is_err() {
+        return ServedResultReadback::Conflict;
     }
-    Some(frame)
+    if frame.sequence != 0 || !frame.observation_predecessors.is_empty() {
+        return ServedResultReadback::Incomplete;
+    }
+    ServedResultReadback::Complete {
+        events: vec![frame],
+    }
+}
+
+/// Classifies the #2787 v2 payload, the exact retained result-event sequence.
+///
+/// The commitment is recomputed from the ORIGINAL recorded values, every
+/// event proves itself through the real per-frame validator, and only then
+/// does the real stream validator decide whether the whole sequence is a
+/// closed, gapless stream for this one identity.
+fn read_back_retained_result_stream(
+    stream: &crate::dispatch_material::RetainedResultStream,
+    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+) -> ServedResultReadback {
+    match retained_stream_digest(&stream.events) {
+        Ok(digest) if digest == stream.stream_digest => {}
+        Ok(_) | Err(_) => return ServedResultReadback::Conflict,
+    }
+    let mut events: Vec<OrdinaryOutcome> = Vec::with_capacity(stream.events.len());
+    for recorded in &stream.events {
+        let Ok(frame) = decode_recorded_frame(recorded) else {
+            return ServedResultReadback::Conflict;
+        };
+        if !frame_binds_to_identity(&frame, identity) || validate_frame(&frame).is_err() {
+            return ServedResultReadback::Conflict;
+        }
+        events.push(frame);
+    }
+    // Every retained event is a real, valid observation of this operation,
+    // but no event closed the stream. That is an explicit incomplete prefix,
+    // not a conflict and not an absence: the closing event and anything after
+    // it were never retained and are never invented here.
+    if stream.terminal_sequence.is_none() {
+        return ServedResultReadback::Incomplete;
+    }
+    // A recorded terminal that is not the closing event, or is not present in
+    // the record's own events, contradicts the record itself.
+    match (
+        events.last().filter(|event| event.terminal),
+        stream.terminal_sequence,
+    ) {
+        (Some(closed), Some(recorded)) if closed.sequence == recorded => {}
+        _ => return ServedResultReadback::Conflict,
+    }
+    if validate_result_stream(&events).is_err() {
+        return ServedResultReadback::Conflict;
+    }
+    ServedResultReadback::Complete { events }
+}
+
+/// Decodes one recorded result event and proves it is the ORIGINAL recorded
+/// value: the decoded frame must re-encode to exactly those bytes.
+///
+/// Without this, a record that needed a defaulted, dropped, or substituted
+/// field to decode would be validated as if it were the value that was
+/// stored.
+fn decode_recorded_frame(recorded: &serde_json::Value) -> Result<OrdinaryOutcome, LoopError> {
+    let frame: OrdinaryOutcome =
+        serde_json::from_value(recorded.clone()).map_err(|_| invalid("result-frame"))?;
+    if serde_json::to_value(&frame).map_err(|_| invalid("result-frame"))? != *recorded {
+        return Err(invalid("result-frame"));
+    }
+    Ok(frame)
+}
+
+/// Whether one recorded event binds back to the exact staged replay identity:
+/// the same operation, claim, grant, artifact, and input the owner staged. A
+/// recorded event naming another identity is never republished under this one.
+fn frame_binds_to_identity(
+    frame: &OrdinaryOutcome,
+    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+) -> bool {
+    frame.operation_id == identity.operation_id
+        && frame.claim_id == identity.claim_id
+        && frame.grant_digest == identity.grant_digest
+        && frame.artifact_digest == identity.artifact_digest
+        && frame.input_digest == identity.input_digest
 }
 
 /// Runs the ordinary governed path for this process: binds the owner
@@ -4463,17 +5018,36 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
                 // Terminal-unacknowledged read-back: a fresh drive (no
-                // in-process outcome) returns the original retained
-                // terminal result for exactly this identity when one is
-                // durably retained, before any evidence is touched — the
-                // replay path deletes nothing. Absent, unreadable, or
-                // foreign records fall through to the identity-only
-                // in-progress report below; same-drive replays keep the
-                // in-process projection, never a file read-back.
+                // in-process outcome) returns the original retained result
+                // for exactly this identity when one is durably retained,
+                // before any evidence is touched — the replay path deletes
+                // nothing. A retained stream that is complete, and that the
+                // real per-frame and stream validators accepted over the
+                // recorded values themselves, is republished through the
+                // ordinary result owner's own serializer and emitter: the
+                // original events, in order, on this process's new
+                // transport. That path admits no request, issues no permit,
+                // spawns no worker, and touches no staged evidence.
+                // Anything else — absent, unreadable, foreign, malformed, or
+                // a prefix whose missing events are not known — falls
+                // through to the identity-only in-progress report below;
+                // same-drive replays keep the in-process projection, never a
+                // file read-back.
                 if outcome.is_none()
-                    && let Some(frame) = read_back_served_result(&directory, &identity)
+                    && let ServedResultReadback::Complete { events } =
+                        read_back_served_result(&directory, &identity)
                 {
-                    return Ok(frame);
+                    let mut replay_owner = DeliverySetChannel::replay_only();
+                    let terminal = replay_owner
+                        .publish_retained_sequence(&events)
+                        .map_err(OrdinaryDriveError::Loop)?;
+                    // Tracked termination of the replay emission: a helper
+                    // still holding stdout is reported to the process owner
+                    // rather than reported as a clean republication.
+                    replay_owner
+                        .cleanup_output_helper()
+                        .map_err(OrdinaryDriveError::Loop)?;
+                    return Ok(terminal);
                 }
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay, and an InFlight-named set as
@@ -4515,26 +5089,44 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
         seal_inflight_claim(&directory, &claim, edge_now_ms())?;
-        let frame = run_request_loop(runtime, &material);
+        // The claim-bound result owner is threaded into the loop itself, so
+        // each observed event is durable before it can be exposed and the
+        // whole observed sequence comes back with the loop's disposition. The
+        // sequence is borrowed from that report for the whole arm below, so
+        // the drive never seals or returns a copy that could differ from the
+        // one the loop actually observed.
+        let report = run_request_loop(
+            runtime,
+            &material,
+            ObservedResultRetention::new(&directory, &claim),
+        );
         // The delivery set is one-shot: a published terminal outcome reclaims
         // exactly the claimed generation, so a leftover is a fresh-drive
         // signal rather than a silent reuse. Unknown execution, failed
         // publication, lost response, or failed drain retains the exact
         // operation/generation evidence for recovery and never reclaims. The
-        // in-memory retention of the terminal frame below is the readback
-        // path, not a second execution.
-        match frame {
-            Ok(ok_frame) => {
+        // in-memory retention of the sequence below is the readback path,
+        // not a second execution.
+        match report.completion() {
+            LoopCompletion::Served => {
+                // The served terminal is the last event of the sequence this
+                // same report carries, so the frame sealed below and the frame
+                // returned below cannot be a different observation. A served
+                // report without one is the exact refusal the loop has always
+                // reported for a terminal it cannot name.
+                let Some(terminal) = report.served_terminal() else {
+                    return Err(OrdinaryDriveError::Loop(denied("no-request")));
+                };
                 // Containment evidence is the loop's own terminal condition:
-                // it only returns a frame once the operation's effect is
+                // it only reports served once the operation's effect is
                 // attested as settled, so reclaiming here never races an
                 // unresolved guest child.
                 //
-                // The served marker and the exact terminal frame seal
+                // The served marker and the exact retained sequence seal
                 // durably before physical reclaim, so restart reconciles
-                // terminal-unacknowledged state by returning the original
-                // result instead of re-executing.
-                seal_served_outcome(&directory, &claim, &ok_frame, edge_now_ms())?;
+                // terminal-unacknowledged state by republishing the original
+                // sequence instead of re-executing.
+                seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
                 let reclamation = consume_delivery_set(&claim);
                 // The served marker is now durable, so the pre-execution
                 // InFlight evidence is redundant: drop it best-effort. A
@@ -4561,10 +5153,17 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                     }
                 };
                 served.push(claim.into_identity());
-                outcome = Some(ok_frame);
+                outcome = Some(terminal.clone());
             }
-            Err(loop_error) => {
-                return Err(OrdinaryDriveError::Loop(loop_error));
+            LoopCompletion::Failed { failure } => {
+                // Nothing about the observation is lost here and nothing is
+                // reclaimed: every event this loop observed is already
+                // durable through the claim-bound owner, written before it
+                // could be exposed, so restart replays the exact retained
+                // sequence under the still-live InFlight marker instead of
+                // re-executing the guest. The failure is reported as itself,
+                // never as a safe refusal of the operation.
+                return Err(OrdinaryDriveError::Loop(*failure));
             }
         }
     }
@@ -4575,8 +5174,9 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     // result or re-executing under its spent grant. A same-grant replay for
     // another identity cannot borrow that result. Cross-restart
     // terminal-unacknowledged state with a durably retained result already
-    // returned that original frame from the replay arm above; only a replay
-    // without a retained result reports in-progress with its exact identity.
+    // republished that original sequence from the replay arm above; only a
+    // replay whose retained record is absent, incomplete, or conflicting
+    // reports in-progress with its exact identity.
     // Only a drive that observed nothing staged reports absence.
     match (outcome, replayed) {
         (Some(frame), None) => Ok(frame),
