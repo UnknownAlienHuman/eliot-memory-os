@@ -28,9 +28,10 @@
 //!   inventing a diagnosis (I16.7, I16.9).
 //!
 //! Every brief carries the exact [`StateFence`] observed with the trigger and
-//! one closed [`BriefInvalidation`] condition. Affected scope, trace context,
-//! and unknown fields are read from the existing `AuditLineage` owner
-//! including its `missing_fields` declarations, and severity is the existing
+//! the closed [`BriefInvalidation`] conditions that actually govern it.
+//! Affected scope, trace context, and unknown fields are read from the
+//! existing `AuditLineage` owner including its `missing_fields`
+//! declarations, and severity is the existing
 //! [`AuditEventKind::assurance_class`] I16.9 assurance class. This module
 //! therefore adds no second lineage, fence, severity, or lifecycle owner.
 
@@ -605,6 +606,20 @@ pub enum BriefInvalidation {
 }
 
 impl BriefInvalidation {
+    /// Every closed invalidation condition, in the order
+    /// [`BriefStateFence::observe_invalidation`] checks them.
+    ///
+    /// This is the one list the brief's declared
+    /// `invalidation_conditions` is filled from, so the set a brief declares
+    /// is exactly the set the reader evaluates: a brief can no longer name one
+    /// arm while being governed by all three (I16.7: a brief has a State Fence
+    /// and an invalidation condition).
+    pub const ALL: &'static [Self] = &[
+        Self::StateFenceSuperseded,
+        Self::AuditChainAdvanced,
+        Self::LogWindowNotRetained,
+    ];
+
     /// Returns the stable wire code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -616,7 +631,13 @@ impl BriefInvalidation {
     }
 }
 
-/// The brief's State Fence and the condition that invalidates it.
+/// The brief's State Fence and the conditions that invalidate it.
+///
+/// The declared `invalidation_conditions` is the closed set
+/// [`BriefStateFence::observe_invalidation`] actually evaluates, not a
+/// single representative arm: the compiler cannot know which of the three
+/// fires first, so declaring one of them would be a claim it has not
+/// observed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BriefStateFence {
@@ -624,8 +645,8 @@ pub struct BriefStateFence {
     pub state_fence: StateFence,
     /// Canonical audit sequence the brief's evidence was compiled from.
     pub compiled_at_audit_seq: u64,
-    /// Closed invalidation condition.
-    pub invalidation: BriefInvalidation,
+    /// Closed invalidation conditions, in the order they are checked.
+    pub invalidation_conditions: Vec<BriefInvalidation>,
 }
 
 impl BriefStateFence {
@@ -635,6 +656,13 @@ impl BriefStateFence {
     /// stable. A superseding authority epoch outranks a chain advance, because
     /// a new epoch invalidates every decision taken under the old one
     /// regardless of what else moved (I1.5, I16.7).
+    ///
+    /// The checked set is exactly
+    /// [`BriefStateFence::invalidation_conditions`], which the compiler fills
+    /// from [`BriefInvalidation::ALL`]: a reader and a serialized brief can
+    /// never disagree about which conditions govern it. `log_windows_retained`
+    /// is the caller's observed answer for the referenced windows, never a
+    /// constant.
     #[must_use]
     pub fn observe_invalidation(
         &self,
@@ -852,7 +880,7 @@ pub fn compile_diagnostic_brief(
         fence: BriefStateFence {
             state_fence,
             compiled_at_audit_seq: problem.window.last_audit_seq,
-            invalidation: BriefInvalidation::AuditChainAdvanced,
+            invalidation_conditions: BriefInvalidation::ALL.to_vec(),
         },
     })
 }
@@ -1216,21 +1244,27 @@ impl crate::KernelComposition {
     /// Returns the retained brief while its State Fence still authorizes it.
     ///
     /// The brief is retained under its invalidation condition (I16.7): a
-    /// superseding authority epoch, an advanced audit head, or an
-    /// unretained log window drops it and reads `None`, so a stale brief
-    /// is never served as current. Log-window retention is vacuously true
-    /// here because this wiring retains no log windows to lose (see
-    /// [`Self::observe_diagnostic_problem`]). An unreadable policy or
-    /// audit head fails closed to `None` without dropping the retained
+    /// superseding authority epoch, an advanced audit head, or a referenced
+    /// log window whose retention is no longer established drops it and reads
+    /// `None`, so a stale brief is never served as current. Retention is read
+    /// off the brief's own [`DiagnosticBrief::log_window_refs`] instead of
+    /// asserted: a window whose retention disposition is
+    /// [`LogWindowRetention::Unestablished`] is exactly the "not retained"
+    /// case, and claiming otherwise would check nothing. An unreadable policy
+    /// or audit head fails closed to `None` without dropping the retained
     /// brief; only an observed invalidation clears it, and only when the
     /// slot still holds that same brief.
     pub(crate) fn retained_diagnostic_brief(&self) -> Option<DiagnosticBrief> {
         let retained = self.diagnostic_brief.lock().ok()?.clone()?;
         let current = self.current_state_fence()?;
         let (head_seq, _) = self.audit_head()?;
+        let log_windows_retained = retained
+            .log_window_refs
+            .iter()
+            .all(|window| window.retention != LogWindowRetention::Unestablished);
         if retained
             .fence
-            .observe_invalidation(&current, head_seq, true)
+            .observe_invalidation(&current, head_seq, log_windows_retained)
             .is_some()
         {
             if let Ok(mut slot) = self.diagnostic_brief.lock()
