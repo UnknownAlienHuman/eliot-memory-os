@@ -6,8 +6,12 @@
 //! inspects expected file hashes, active registration state, observed hook
 //! events, and a handshake result, then reports installation separately from
 //! runtime liveness. A successful config installation with no handshake is
-//! reported as installed but not live. This module executes no repair, mints
-//! no authority, and mutates no store.
+//! reported as installed but not live. When the expectation is the install
+//! receipt, the installation status the delivery itself recorded
+//! (`status`/`code`/`completed`) is reported under its own `installation` key
+//! and gates `installed`: an install the record says did not complete is
+//! `NOT_INSTALLED` even when every target byte matches. This module executes
+//! no repair, mints no authority, and mutates no store.
 
 use std::collections::BTreeMap;
 use std::path::Path;
