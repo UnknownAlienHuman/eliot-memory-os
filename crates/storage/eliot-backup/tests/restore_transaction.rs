@@ -206,6 +206,15 @@ fn receipt_for(operation: &str, _event_id: &str) -> WriteReceipt {
         admission_digest: "e".repeat(64),
         mutation_plan_digest: "f".repeat(64),
         semantic_source_revisions: Vec::new(),
+        // I5.19: no `PreparedTransition` is in scope in this fixture, so the
+        // record is built explicitly from the store API's own in-force
+        // constants. `source_fence()` carries no policy binding, so
+        // `policy_revision` is `None` and still agrees with the fence.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: source_fence().policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000949".to_owned()),

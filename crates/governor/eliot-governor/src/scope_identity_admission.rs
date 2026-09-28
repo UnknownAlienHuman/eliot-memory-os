@@ -135,22 +135,6 @@ pub fn check_task_observation(
     }
 }
 
-/// Maps a non-allow trigger report to the fail-closed composition error.
-///
-/// The retained binding is untouched; the detail names the trigger and the
-/// identity outcome so the caller asks the cheapest discriminative question
-/// instead of retrying against another candidate.
-pub(crate) fn guard_recovery_error(report: &TriggerReport, context: &str) -> CompositionError {
-    let disposition = report.receipt.as_ref().map_or_else(
-        || format!("{:?}", report.identity),
-        |receipt| format!("{:?}", receipt.disposition),
-    );
-    CompositionError::Recovery(format!(
-        "{context}: scope guard withheld at trigger {:?} ({disposition})",
-        report.trigger
-    ))
-}
-
 /// Requires the retained binding to be fresh and `MATCHED` at `fence`.
 ///
 /// This is the retained-data leg installed at every trigger point that has no

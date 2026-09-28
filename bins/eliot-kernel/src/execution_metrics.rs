@@ -35,15 +35,17 @@ use std::time::Duration;
 
 use eliot_contracts::sha256_hex;
 use eliot_observability_runtime::{
-    BinaryIdentity, ExecutionPathMetrics, LocalPortOutcome, LocalPortPhase, MetricError,
-    MetricLabelError, MetricSubject, MetricsRegistry, ModuleHealthOutcome, ModuleIdentity,
-    ObservabilityConfig, ObservabilityConfigError, ObservabilityInstall, RollingLogPolicy,
-    RouteFingerprintId, RouteOutcome, RuntimeProfile, SpoolPolicy, WorkClass,
-    WorkTerminationOutcome, install,
+    AuditSinkOutcome, BinaryIdentity, ExecutionPathMetrics, LocalPortOutcome, LocalPortPhase,
+    MetricError, MetricLabelError, MetricSubject, MetricsRegistry, ModuleHealthOutcome,
+    ModuleIdentity, ObservabilityConfig, ObservabilityConfigError, ObservabilityInstall,
+    RollingLogPolicy, RouteFingerprintId, RouteOutcome, RuntimeProfile, SpoolPolicy,
+    TraceCompletenessOutcome, WorkClass, WorkTerminationOutcome, install,
 };
 
 use crate::KernelConfig;
+use crate::audit_fallback::AuditFallbackOutcome;
 use crate::kernel_build_contract::AuthorityDescriptorContour;
+use crate::trace_manifest::TraceManifest;
 
 /// Tracing target for this module's own refusals.
 const EXECUTION_METRICS_TARGET: &str = "eliot_kernel_execution_metrics";
@@ -383,6 +385,91 @@ impl KernelMetricRecorder {
         })
     }
 
+    /// Records the chain stage that carried one audit submission.
+    ///
+    /// The outcome is the fallback cascade's own terminal: stage 1 is
+    /// `NormalAudit`, stage 2 is `EventSpool`, stage 3 is
+    /// `LastResortEventLog`, and every unretained terminal is `ControlLoss`.
+    /// The sample carries no record identity, detail or content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricRecordRefusal`] when the sample is refused.
+    pub fn record_audit_fallback_outcome(
+        &self,
+        outcome: &AuditFallbackOutcome,
+    ) -> Result<(), MetricRecordRefusal> {
+        let outcome = match outcome {
+            AuditFallbackOutcome::Appended(_) => AuditSinkOutcome::NormalAudit,
+            AuditFallbackOutcome::Spooled { .. } => AuditSinkOutcome::EventSpool,
+            AuditFallbackOutcome::LastResort { .. } => AuditSinkOutcome::LastResortEventLog,
+            AuditFallbackOutcome::ControlLoss { .. }
+            | AuditFallbackOutcome::Unretainable { .. } => AuditSinkOutcome::ControlLoss,
+        };
+        let route = route_fingerprint_id(&["kernel.audit_fallback"])?;
+        self.edit(|metrics| {
+            metrics.record_audit_fallback(
+                &self.subject(ModuleIdentity::InternalRust, WorkClass::Control, route),
+                outcome,
+            )
+        })
+    }
+
+    /// Records one sealed trace manifest and its missing-part count.
+    ///
+    /// The outcome is the seal's own finish: a proof-bearing seal is
+    /// `Replayable`, anything else is explicitly not claimed. The gauge carries
+    /// how many required parts the seal listed as missing, never which request
+    /// they belong to. Neither value is re-derived here, so the metric cannot
+    /// disagree with the retained chain record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricRecordRefusal`] when a sample is refused.
+    pub fn record_trace_seal(&self, manifest: &TraceManifest) -> Result<(), MetricRecordRefusal> {
+        let outcome = if manifest.finish.is_complete() {
+            TraceCompletenessOutcome::Replayable
+        } else {
+            TraceCompletenessOutcome::DegradedNoProof
+        };
+        let route = route_fingerprint_id(&["kernel.trace_seal"])?;
+        let subject = self.subject(
+            ModuleIdentity::LocalHttpAdapter,
+            WorkClass::Interactive,
+            route,
+        );
+        let missing = u8::try_from(manifest.missing_parts.len()).unwrap_or(u8::MAX);
+        self.edit(|metrics| {
+            metrics.record_trace_completeness(&subject, outcome)?;
+            metrics.record_trace_missing_parts(&subject, missing)
+        })
+    }
+
+    /// Records the daemon's health as the Kernel's supervision observes it.
+    ///
+    /// The subject binary is the daemon: this is the Kernel's observation of
+    /// `eliotd` health for the Kernel scrape, distinct from the daemon's own
+    /// readiness sample in the daemon registry. The outcome is decided by the
+    /// supervision-renewal hook from the renewal decision, never here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricRecordRefusal`] when the sample is refused.
+    pub fn record_daemon_health(
+        &self,
+        outcome: ModuleHealthOutcome,
+    ) -> Result<(), MetricRecordRefusal> {
+        let route = route_fingerprint_id(&["kernel.daemon_supervision"])?;
+        let subject = MetricSubject {
+            binary: BinaryIdentity::Daemon,
+            module: ModuleIdentity::InternalRust,
+            work_class: WorkClass::Control,
+            route,
+            profile: self.profile,
+        };
+        self.edit(|metrics| metrics.record_module_health(&subject, outcome))
+    }
+
     /// Runs one catalogue recorder against the shared registry.
     fn edit(
         &self,
@@ -504,7 +591,11 @@ pub fn install_kernel_execution_metrics(
         otlp_endpoint: None,
     };
     let outcome = install(&observability)?;
-    let endpoint = match observability.metrics_listen {
+    // The endpoint is the served install's bound address, never this call's
+    // configuration: a second install returns `AlreadyInstalled` with the
+    // first owner's handles, so deriving from the local config would report a
+    // listener that was never bound.
+    let endpoint = match outcome.handles().metrics_endpoint.clone() {
         Some(address) => MetricsEndpoint::Bound(address),
         None => MetricsEndpoint::Absent,
     };

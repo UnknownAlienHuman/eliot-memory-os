@@ -30,12 +30,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ContractError, canonical_json_bytes, sha256_hex};
 
-/// Wire revision of this selector contract. A decoder that does not know
+/// Wire revision of the keyed selector contract. A decoder that does not know
 /// this revision refuses the selector instead of guessing its meaning.
-pub const BRIDGE_RECOVERY_SELECTOR_VERSION: u64 = 1;
+pub const BRIDGE_RECOVERY_SELECTOR_VERSION: u64 = 2;
 
 /// Wire revision for the owner-scoped process-restart resume selector.
-/// Existing keyed page selectors remain revision 1.
+/// Resume remains revision 2 and does not carry a continuation proof.
 pub const BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION: u64 = 2;
 
 /// Key separator that may not appear inside a selector text field, because
@@ -83,6 +83,9 @@ pub enum BridgeRecoverySelector {
         version: u64,
         /// The owner-issued recovery window this page belongs to.
         window_key: String,
+        /// Owner-authenticated proof of this exact continuation cursor,
+        /// encoded as 64 lowercase hexadecimal characters.
+        continuation_proof: String,
         /// Owner list position the page must advance past (exclusive).
         after_stream: String,
         /// Declared outer page bound for this dimension.
@@ -94,6 +97,9 @@ pub enum BridgeRecoverySelector {
         version: u64,
         /// The owner-issued recovery window this page belongs to.
         window_key: String,
+        /// Owner-authenticated proof of this exact continuation cursor,
+        /// encoded as 64 lowercase hexadecimal characters.
+        continuation_proof: String,
         /// Stream identity inside the window's owner scope.
         stream_id: String,
         /// Stream incarnation bound when the window cut it; a successor
@@ -125,6 +131,9 @@ pub enum BridgeRecoverySelector {
         version: u64,
         /// The owner-issued recovery window this page belongs to.
         window_key: String,
+        /// Owner-authenticated proof of this exact continuation cursor,
+        /// encoded as 64 lowercase hexadecimal characters.
+        continuation_proof: String,
         /// Owner namespace this unscoped-gap page starts after.
         after_gap_scope: String,
         /// Unscoped-gap cursor (exclusive offset).
@@ -168,11 +177,46 @@ impl BridgeRecoverySelector {
     /// two selectors that do not.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContractError> {
         let tagged = CanonicalBridgeRecoverySelector {
-            domain: "eliot.bridge-event.recovery-selector.v1",
+            domain: "eliot.bridge-event.recovery-selector.v2",
             selector: self,
         };
         canonical_json_bytes(&tagged).map_err(|_| ContractError::Blank {
             field: "bridge_recovery_selector",
+        })
+    }
+
+    /// Returns canonical, domain-separated bytes for the unsigned keyed
+    /// continuation selector used as an ORS MAC preimage.
+    ///
+    /// The keyed variants are validated first, then their required proof
+    /// field is blanked before serialization. `Resume` has no cursor proof
+    /// and cannot be used as a keyed continuation preimage.
+    pub fn continuation_bytes(&self) -> Result<Vec<u8>, ContractError> {
+        self.validate()?;
+        let mut unsigned = self.clone();
+        match &mut unsigned {
+            Self::Resume { .. } => {
+                return Err(ContractError::Blank {
+                    field: "bridge_recovery_selector.continuation_proof",
+                });
+            }
+            Self::Streams {
+                continuation_proof, ..
+            }
+            | Self::Stream {
+                continuation_proof, ..
+            }
+            | Self::UnscopedGaps {
+                continuation_proof, ..
+            } => continuation_proof.clear(),
+        }
+
+        let tagged = CanonicalBridgeRecoverySelector {
+            domain: "eliot.bridge-event.recovery-selector-continuation.v2",
+            selector: &unsigned,
+        };
+        canonical_json_bytes(&tagged).map_err(|_| ContractError::Blank {
+            field: "bridge_recovery_selector.continuation_proof",
         })
     }
 
@@ -188,11 +232,16 @@ impl BridgeRecoverySelector {
             Self::Resume { .. } => {}
             Self::Streams {
                 window_key,
+                continuation_proof,
                 after_stream,
                 stream_limit,
                 ..
             } => {
                 validate_digest(window_key, "bridge_recovery_selector.window_key")?;
+                validate_digest(
+                    continuation_proof,
+                    "bridge_recovery_selector.continuation_proof",
+                )?;
                 validate_text(after_stream, "bridge_recovery_selector.after_stream")?;
                 if *stream_limit == 0 || *stream_limit > BRIDGE_RECOVERY_SELECTOR_STREAM_LIMIT {
                     return Err(ContractError::Blank {
@@ -202,6 +251,7 @@ impl BridgeRecoverySelector {
             }
             Self::Stream {
                 window_key,
+                continuation_proof,
                 stream_id,
                 owner_incarnation,
                 owner_revision,
@@ -215,6 +265,10 @@ impl BridgeRecoverySelector {
                 ..
             } => {
                 validate_digest(window_key, "bridge_recovery_selector.window_key")?;
+                validate_digest(
+                    continuation_proof,
+                    "bridge_recovery_selector.continuation_proof",
+                )?;
                 validate_text(stream_id, "bridge_recovery_selector.stream_id")?;
                 if stream_id.contains(SELECTOR_KEY_SEPARATOR) {
                     return Err(ContractError::Blank {
@@ -252,12 +306,17 @@ impl BridgeRecoverySelector {
             }
             Self::UnscopedGaps {
                 window_key,
+                continuation_proof,
                 after_gap_scope,
                 gap_offset,
                 gap_limit,
                 ..
             } => {
                 validate_digest(window_key, "bridge_recovery_selector.window_key")?;
+                validate_digest(
+                    continuation_proof,
+                    "bridge_recovery_selector.continuation_proof",
+                )?;
                 validate_digest(after_gap_scope, "bridge_recovery_selector.after_gap_scope")?;
                 if *gap_limit == 0
                     || *gap_limit > BRIDGE_RECOVERY_SELECTOR_GAP_LIMIT

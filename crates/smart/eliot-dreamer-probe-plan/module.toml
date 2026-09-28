@@ -67,3 +67,67 @@ forbid_unsafe = true
 required_exports = []
 required_tests = []
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+
+# I2.10 classification of this functional capability cell. Every value below is
+# an explicit declaration of THIS cell, recorded per I2.10:124 ("The decision
+# and rejected alternatives are recorded in the Module Catalog") and I0.12:18
+# (the contour decision is generated from the Module contract and manifest).
+# No value is derived from a crate, bundle, source-layer or runtime-layer name
+# (I2.10:3), and an undetermined field is recorded as undetermined with its
+# reason instead of being defaulted (I2.10:3, I2.20:63).
+[i2_10]
+# Functional capability cell: smart.dreamer.probe_plan
+cell = "smart.dreamer.probe_plan"
+# I2.10:12 and W4 admit the development classifications only for cells
+# that are never required by the production runtime. This cell declares a
+# production runtime bundle, an admitted product consumption path and no
+# generator, fuzzer, benchmark, simulation or migration-tool purpose, so
+# it is production-required and carries neither development_only nor
+# development_tool. I2.10:3 forbids inferring this from a layer name.
+production_required = true
+# I2.10:45-48 defines `stateless` as no state surviving request or
+# process. This cell declares
+#   owned_mutable_state = []
+#   allowed_effects      = []
+# so no state and no effect survive the call and `stateless` is the only
+# admitted class; host_state_externalized, rebuildable,
+# checkpointed_operational and external_canonical_adapter each require
+# owned or externally-anchored state this cell does not declare. Read
+# from the declared state and effect sets, not from the pre-existing
+# top-level `state_class` string or any crate/bundle/layer name.
+state_class = "STATELESS"
+# I2.10:62-63 states that canonical storage, semantic admission and
+# mechanical fencing remain one path with separated responsibilities, and
+# that no hot-replaceable module declares canonical_semantic. This cell
+# declares no canonical write, persistence or authority role in its
+# declared non-goals, so it claims none. A hot-replaceable cell that
+# claimed it would be refused with
+# CellManifestError::HotReplaceableCanonicalSemantic.
+canonical_semantic = "NOT_CLAIMED"
+# I2.10:9 and I14.19:21-28 admit the wasm_component contour for pure
+# bounded logic with a narrow capability surface; I0.12:8-9 makes it
+# the default first contour for a prototype and I2.10:108-109 selects
+# it for pure and bounded host calls. The least-privilege reason below
+# records why.
+execution_contour = "WASM_COMPONENT"
+least_privilege_reason = "I2.10:108 selects the least privileged contour that can express the capability and I0.12:8-9 / I14.19:3 make the capability-limited component contour the default for pure bounded logic. This cell declares one pure bounded responsibility (\"Convert explicit unknowns and rival disagreements into a bounded ordered set of candidate discriminative probes with visible cost, risk, authority and expected discrimination dimensions.\") with allowed_effects = [] and owned_mutable_state = [], and its declared non-goal \"execute tools or research\" together with the rest of its declared non-goals excludes OS, tool, credential and unbounded async I/O work, so the sandboxed component contour is the least privileged contour that can express the capability (I14.19:21-28, 43)."
+promotion_path = "This contour is the documented default first contour for a pure bounded capability (I0.12:8-9, I14.19:3), so no promotion is owed and promotion to native is not a required maturity stage (I14.19:123). The cell follows the generational chain contract/conformance -> replay -> effect-free shadow -> bounded canary -> ORS cutover and new epoch -> drain / forward rollback (I0.12:30-37) with rollback as routing to the prior compatible generation (I14.19:114-117). A later change of contour is a governed promotion, never an invisible build optimization (I2.10:124): isolated native process only on a measured material benefit with the same contract, differential, fault, shadow and rollback proofs (I14.19:121-123); static native only with a stable interface, trusted supply chain, hot-path profiling and a normal binary release/rollback (I14.19:121); in-process dynamic unloading is never an intermediate step (I14.19:125)."
+
+# Contours considered and rejected, with the reason each does
+# not express this capability (I2.10:124). The chosen contour is
+# never among them.
+rejected_alternatives = [
+  { contour = "native_process", reason = "I2.10:10 admits a native process for OS, Cargo, Git, LSP, browser, native-library, credential or long-CPU work behind a separate process/Job Object. This cell declares no such work and its declared non-goal \"execute tools or research\" forbids it, so a separate process would add IPC latency and a duplicated state owner for no capability (I2.10:86)." },
+  { contour = "static_native", reason = "I2.10:20-21 and I0.12:14-15 admit a static native release only for a trusted control path or a measured stable hot path, and I14.19:121 requires hot-path profiling, a stable interface, a trusted supply chain and a normal binary release. No measurement is recorded for this cell and static native is not a default reward for maturity." },
+  { contour = "development_only", reason = "I2.10:12 admits development_only for generators, fuzzers, benchmarks, simulations and migration/test utilities that are never required by the production runtime. This cell declares a production runtime bundle and an admitted product consumption path, so it is production-required and the development_only contour is refused for it by CellManifestError::DevelopmentClassifiedProductionRequired." },
+]
+
+# Fields the documentation does not determine for this cell. They
+# stay undeclared on purpose: manifest generation refuses an
+# absent classification with CellManifestError::MissingField
+# instead of accepting a synthesized value (I2.10:3, I2.20:63).
+undetermined = [
+  { field = "runtime_class", reason = "I2.10:29-41 enumerates eleven runtime roles of runtime modules. I14.19:62 states that the semantic core lives outside Wasmtime and has no runtime dependency, and I2.20:22 recognises a stateless cross-owner contracts/primitives island as a distinct cell kind; the vocabulary states no class for a contour-independent semantic core, for a WASM component guest, or for a contract island, and I2.10:3 forbids synthesizing one." },
+  { field = "replacement_class", reason = "I2.10:69-84 names the cutover of a sandboxed component generation, a native process generation, a daemon generation, the external Host/SCM cutover, or an offline release with an explicit owner/reason/recovery. This cell declares no cutover contract for its runtime, I0.12:18-25 requires an explicit capability/isolation reason for a non-default contour that the documentation does not record, and the class must not be read off the hosting bundle name (I2.10:3)." },
+  { field = "iteration_lane", reason = "I2.20:50-63 requires a ProofLatencyProfile carrying the measured p50/p95/p99/max, the exact machine/toolchain/build fingerprint and an expected_lane. No such profile is recorded for this cell, and I2.20:63 states that missing proof-latency evidence disables automatic assignment to the interactive lane without naming a substitute lane, so every lane value here would be invented." }
+]

@@ -4,9 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use eliot_wasm_host::{
-    CliError, PrototypeContourDecision, TypedWorld, admit_generation, admit_prototype,
-    default_experimental_limits, execute_describe_experimental, experimental_manifest, parse_args,
-    read_bounded_artifact, run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
+    CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
+    admit_prototype, default_experimental_limits, execute_describe_experimental,
+    experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
+    run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -57,17 +58,43 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     let _ = stdout.flush();
 }
 
+/// Keep the contour denial category without echoing guest-controlled names or
+/// fields from its diagnostic payload.
+fn contour_gate_code(error: &ContourGateError) -> &'static str {
+    match error {
+        ContourGateError::MissingDecision => "CONTOUR_DECISION_REQUIRED",
+        ContourGateError::StaticNativeNotFirstContour => "STATIC_NATIVE_NOT_FIRST_CONTOUR",
+        ContourGateError::NativeReasonRequired => "NATIVE_REASON_REQUIRED",
+        ContourGateError::UnsupportedTarget(_) => "UNSUPPORTED_TARGET",
+        ContourGateError::IncompleteManifest(_) => "INCOMPLETE_MANIFEST",
+        ContourGateError::UndeclaredImport(_) | ContourGateError::CapabilityNotGranted(_) => {
+            "CAPABILITY_INTRODUCTION_REQUIRED"
+        }
+        ContourGateError::GovernorAuthorizationRequired(_) => "GOVERNOR_AUTHORIZATION_REQUIRED",
+        ContourGateError::HostCallLimitExceeded(_) => "HOST_CALL_LIMIT_EXCEEDED",
+        ContourGateError::ContourNotServedHere(_) => "CONTOUR_NOT_SERVED_HERE",
+        ContourGateError::AdmittedDigestMismatch(_) => "ADMITTED_DIGEST_MISMATCH",
+        ContourGateError::ComponentNotAdmitted(_) => "COMPONENT_NOT_ADMITTED",
+        ContourGateError::InputLimitExceeded(_) => "INPUT_LIMIT_EXCEEDED",
+    }
+}
+
 fn main() {
     let config = match parse_args(std::env::args().skip(1)) {
         Ok(config) => config,
         Err(error) => {
             let (code, detail) = match error {
                 CliError::MissingProfile => ("MISSING_PROFILE", "--profile is required".to_owned()),
-                CliError::UnsupportedProfile(profile) => ("UNSUPPORTED_PROFILE", profile),
-                CliError::MalformedArgument(argument) => ("MALFORMED_ARGUMENT", argument),
-                CliError::RemoteTransportForbidden(transport) => {
-                    ("REMOTE_TRANSPORT_FORBIDDEN", transport)
+                CliError::UnsupportedProfile(_) => {
+                    ("UNSUPPORTED_PROFILE", "profile is unsupported".to_owned())
                 }
+                CliError::MalformedArgument(_) => {
+                    ("MALFORMED_ARGUMENT", "argument is malformed".to_owned())
+                }
+                CliError::RemoteTransportForbidden(_) => (
+                    "REMOTE_TRANSPORT_FORBIDDEN",
+                    "transport must be local".to_owned(),
+                ),
                 CliError::MissingExperimentalComponent => (
                     "MISSING_EXPERIMENTAL_COMPONENT",
                     "--world requires --experimental-typed-component".to_owned(),
@@ -76,7 +103,7 @@ fn main() {
                     "MISSING_EXPERIMENTAL_WORLD",
                     "--experimental-typed-component requires --world".to_owned(),
                 ),
-                CliError::UnknownWorld(world) => ("UNKNOWN_WORLD", world),
+                CliError::UnknownWorld(_) => ("UNKNOWN_WORLD", "world is unknown".to_owned()),
             };
             emit_error(code, &detail);
             std::process::exit(INVALID_ARGUMENT_EXIT);
@@ -129,7 +156,7 @@ fn main() {
 /// from the governed lane and never stands in for it.
 fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     let Some(world) = TypedWorld::parse(world_name) else {
-        emit_error("UNKNOWN_WORLD", world_name);
+        emit_error("UNKNOWN_WORLD", "world is unknown");
         std::process::exit(INVALID_ARGUMENT_EXIT);
     };
     let (artifact, preflight) = match read_bounded_artifact(component_path) {
@@ -151,7 +178,7 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     );
     let decision = PrototypeContourDecision::default_for_new_prototype();
     if let Err(error) = admit_prototype(Some(&decision), &manifest) {
-        emit_error("ADMISSION_DENIED", &error.to_string());
+        emit_error("ADMISSION_DENIED", contour_gate_code(&error));
         std::process::exit(ADMISSION_REQUIRED_EXIT);
     }
     match execute_describe_experimental(world, &artifact, &limits) {
@@ -162,7 +189,7 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
             if let Err(error) =
                 admit_generation(Some(&decision), &manifest, &receipt.actual_imports)
             {
-                emit_error("ADMISSION_DENIED", &error.to_string());
+                emit_error("ADMISSION_DENIED", contour_gate_code(&error));
                 std::process::exit(ADMISSION_REQUIRED_EXIT);
             }
             let output_bytes = receipt.output_bytes.to_string();

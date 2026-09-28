@@ -22,6 +22,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::canary_removal::{
     CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalOperation, CanaryRemovalOperationVersion,
+    canary_removal_operation_id,
 };
 use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
 use super::{
@@ -1079,6 +1080,23 @@ impl RedbInstallationTransactionStore {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(Some(operation))
+    }
+
+    /// Loads the durable canary-removal operation admitted for one installed
+    /// generation, when one exists.
+    ///
+    /// The removal identity is a pure function of the original installation
+    /// transaction and the target generation, so the admission fence resolves
+    /// the exact in-flight record with one point load instead of a store scan.
+    /// The read is short-lived and read-only, exactly like `load`.
+    pub(crate) fn load_canary_removal_for_generation(
+        &self,
+        install_transaction_id: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<Option<CanaryRemovalOperation>, InstallationError> {
+        let removal_transaction_id =
+            canary_removal_operation_id(install_transaction_id, generation)?;
+        self.load_canary_removal_operation(&removal_transaction_id)
     }
 
     /// Persists one freshly admitted canary-removal operation.

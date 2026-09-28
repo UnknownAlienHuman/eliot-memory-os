@@ -42,6 +42,15 @@
   "admission_digest": "518c987ac99c5a9083306e91cc5ca295ecde7020f34bfb96433456bc5b088bb4",
   "mutation_plan_digest": "9033e7bfdc20de7263977195f0c60f40e89fa152e4d13a7cf580e5c6d2430cfb",
   "semantic_source_revisions": [],
+  "policy_config_schema_versions": {
+    "policy_revision": null,
+    "config_profile": "eliot.storage.operation-profile.v1",
+    "schema_revision": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    }
+  },
   "error_code": null,
   "resubmission": "none",
   "committed_at": "commit-sequence-0000000000000001",

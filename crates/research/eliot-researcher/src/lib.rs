@@ -23,10 +23,17 @@ use eliot_research_exchange_api::{
 // The coverage-account vocabulary `R6` publishes on its records: the observed
 // population the account learns, the owner-bound absence preconditions and the
 // verdict they produce. Referenced, never redefined here.
+//
+// `NoMatchEvaluationParams` is deliberately absent from this list. It is
+// crate-private with `NoMatchEvaluation::issue`, because a public one is a
+// public way to hand-assemble the record that
+// `NoMatchEvaluationIssuer::issue_for` exists to issue. `NoMatchEvaluation`
+// itself stays public because a consumer reads the record off
+// `AbsencePreconditions`; it can no longer be constructed from outside.
 pub use evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, ManifestSource,
     MemberNoMatchResult, NoMatchApplicability, NoMatchDimension, NoMatchEvaluation,
-    NoMatchEvaluationParams, ObservedOutsideScope, UnsupportedPrecisionItem,
+    ObservedOutsideScope, UnsupportedPrecisionItem,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
@@ -66,8 +73,9 @@ pub use inquiry_obligations::{
     TaskGraphCompilationInputs,
 };
 pub use source_admissibility::{
-    GovernorSourceTransitionRequest, SourceAdmissibilityReason, SourceAdmissibilityRecord,
-    SourceEligibility, SourceIndependence, SourceLimits, SourceTaint,
+    GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
+    SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility, SourceIndependence,
+    SourceLimits, SourceTaint, admits_record_reference, record_references,
 };
 
 pub struct Researcher<B> {

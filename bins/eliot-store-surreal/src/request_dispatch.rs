@@ -174,14 +174,12 @@ fn failure_context_for_operation(
 /// Builds the typed-failure identity context for one admitted backup
 /// envelope (issue #975).
 ///
-/// The stable mutation identity comes from the operation payload itself:
-/// capture/restore/reconcile operations carry their `OperationIdentity`,
-/// page/close carry the owner-issued handle identity, and status carries
-/// the queried operation. Isolated-destination preparation carries no
-/// mutation identity by construction, so the destination digest stands in
-/// as the correlation ref — mirroring `failure_context_for_recovery` —
-/// with `operation_id` left `None`. The fence always comes from the
-/// admitted envelope context, never from payload mirrors.
+/// The stable mutation identity comes from the operation payload when it is
+/// present: capture/restore/reconcile operations carry their
+/// `OperationIdentity`, page/close carry the owner-issued handle identity, and
+/// status carries the queried operation. Isolated-destination preparation has
+/// no payload identity, so it uses the admitted envelope identity. The fence
+/// always comes from the admitted envelope context, never from payload mirrors.
 pub(crate) fn failure_context_for_backup(
     request: &StoreBackupRequest,
 ) -> StoreFailureIdentityContext {
@@ -194,11 +192,9 @@ pub(crate) fn failure_context_for_backup(
             Some(handle.operation_id.clone()),
             Some(handle.idempotency_key.clone()),
         ),
-        StoreBackupOperation::PrepareDestination(destination) => (
-            None,
-            canonical_json_bytes(destination)
-                .ok()
-                .map(|bytes| sha256_hex(&bytes)),
+        StoreBackupOperation::PrepareDestination(_) => (
+            Some(request.identity.operation_id.clone()),
+            Some(request.identity.idempotency_key.clone()),
         ),
         StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => (
             Some(batch.operation.operation_id.clone()),
@@ -769,6 +765,15 @@ mod reconcile_mapping_tests {
             admission_digest: "e".repeat(64),
             mutation_plan_digest: "f".repeat(64),
             semantic_source_revisions: Vec::new(),
+            // I5.19: standalone seed with no `PreparedTransition` in scope, so
+            // the record is built explicitly from the store API's own in-force
+            // constants. `test_fence()` carries no policy binding, so
+            // `policy_revision` is `None` and still agrees with the fence.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+                policy_revision: test_fence().policy_revision,
+                config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+                schema_revision: eliot_store_api::CONTRACT_VERSION,
+            },
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

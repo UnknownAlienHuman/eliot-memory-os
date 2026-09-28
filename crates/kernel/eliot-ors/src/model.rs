@@ -5532,6 +5532,54 @@ pub struct HostRequestAttempt {
     pub phase: HostRequestAttemptPhase,
 }
 
+/// The exact parent attempt observed when one durable cancellation operation
+/// first records its intent. `None` represents an explicit observation that
+/// the parent had no claimed attempt in the same ORS transaction.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestCancellationAttempt {
+    pub attempt_id: OpaqueLabel,
+    pub generation: u64,
+}
+
+/// The parent target and observed disposition durably bound to one
+/// cancellation operation row. The operation row itself supplies the
+/// cancellation operation identity and request digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestCancellationTarget {
+    pub parent_operation_id: OperationIdentity,
+    pub parent_request_digest: String,
+    pub attempt: Option<HostRequestCancellationAttempt>,
+    pub parent_disposition: HostRequestState,
+}
+
+impl HostRequestCancellationTarget {
+    fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            self.parent_operation_id.as_str(),
+            "host_request_cancellation_parent_operation_id",
+        )?;
+        validate_digest(
+            &self.parent_request_digest,
+            "host_request_cancellation_parent_request_digest",
+        )?;
+        if let Some(attempt) = &self.attempt {
+            validate_text(
+                attempt.attempt_id.as_str(),
+                "host_request_cancellation_attempt_id",
+            )?;
+            if attempt.generation == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_cancellation_attempt_generation",
+                    reason: "must be non-zero",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Durable execution phase for a daemon attempt.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -5995,6 +6043,12 @@ pub struct HostRequestRecord {
     /// replacement cannot free ownership by losing its local queue entry.
     #[serde(default)]
     pub attempt: Option<HostRequestAttempt>,
+    /// Set exactly once by ORS when this Cancellation operation is first
+    /// applied to its parent. It binds retries to the same parent digest and
+    /// attempt observation, so replay cannot cancel a later attempt.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_target: Option<HostRequestCancellationTarget>,
     pub result_digest: Option<String>,
     /// Exact bounded result body for `ResultReceived`/`Terminal` readback
     /// (Implements #18: local read result).
@@ -6089,34 +6143,7 @@ impl HostRequestRecord {
 
     /// Validates identity shape and state/result coherence.
     pub fn validate(&self) -> Result<(), OrsError> {
-        if self.contract_version != CONTRACT_VERSION {
-            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
-        }
-        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
-        validate_text(self.request_id.as_str(), "host_request_request_id")?;
-        self.validate_correlation_projection()?;
-        validate_text(
-            self.idempotency_key.as_str(),
-            "host_request_idempotency_key",
-        )?;
-        validate_text(
-            self.cancellation_id.as_str(),
-            "host_request_cancellation_id",
-        )?;
-        if let Some(parent) = &self.parent_operation_id {
-            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
-            if parent == &self.operation_id {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_parent_operation_id",
-                    reason: "must not reference the enclosing operation",
-                });
-            }
-        }
-        validate_digest(&self.request_digest, "host_request_request_digest")?;
-        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
-        if let Some(attempt) = &self.attempt {
-            attempt.validate(&self.fence_digest)?;
-        }
+        self.validate_identity_and_cancellation_binding()?;
         validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
         for (value, field) in [
             (self.session_ref.as_ref(), "host_request_session_ref"),
@@ -6201,6 +6228,51 @@ impl HostRequestRecord {
                 field: "host_request_commit_order",
                 reason: "non-terminal states must not carry a commit order",
             });
+        }
+        Ok(())
+    }
+
+    fn validate_identity_and_cancellation_binding(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        validate_text(self.request_id.as_str(), "host_request_request_id")?;
+        self.validate_correlation_projection()?;
+        validate_text(
+            self.idempotency_key.as_str(),
+            "host_request_idempotency_key",
+        )?;
+        validate_text(
+            self.cancellation_id.as_str(),
+            "host_request_cancellation_id",
+        )?;
+        if let Some(parent) = &self.parent_operation_id {
+            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
+            if parent == &self.operation_id {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_parent_operation_id",
+                    reason: "must not reference the enclosing operation",
+                });
+            }
+        }
+        validate_digest(&self.request_digest, "host_request_request_digest")?;
+        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        if let Some(attempt) = &self.attempt {
+            attempt.validate(&self.fence_digest)?;
+        }
+        if let Some(target) = &self.cancellation_target {
+            if self.kind != HostRequestKind::Cancellation
+                || self.state == HostRequestState::Requested
+                || self.parent_operation_id.as_ref().map(OpaqueLabel::as_str)
+                    != Some(target.parent_operation_id.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_cancellation_target",
+                    reason: "must be ORS progression on a Cancellation row linked to the same parent operation",
+                });
+            }
+            target.validate()?;
         }
         Ok(())
     }

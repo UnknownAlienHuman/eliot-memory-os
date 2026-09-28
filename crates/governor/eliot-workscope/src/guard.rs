@@ -31,7 +31,7 @@ use super::{
     ScopeRelocationKind, ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner,
     WorkScopeDescriptor, WorkScopeError, counter, text,
 };
-use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -306,6 +306,31 @@ impl QuarantinedScopeRecord {
             "quarantine.observed_root_identity",
         )?;
         Ok(())
+    }
+
+    /// Derives the stable owner-neutral operation identity for this record
+    /// (issue #1787, AUD1 identity leg).
+    ///
+    /// The idempotency key is the SHA-256 of the canonical record bytes, so
+    /// the same conflicting evidence always maps to the same key while a
+    /// corrected payload maps to a new one; the operation id names the
+    /// quarantine family plus that key. The durable owner keys its
+    /// write/readback receipt on this pair; the in-process projection uses
+    /// the key for history-wide duplicate suppression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record is invalid or does not serialize
+    /// to canonical bytes.
+    pub fn operation_identity(&self) -> Result<(String, String), WorkScopeError> {
+        self.validate()?;
+        let digest = sha256_hex(
+            &canonical_json_bytes(self).map_err(|_| WorkScopeError::InvalidSourceEvidence)?,
+        );
+        Ok((
+            format!("scope-quarantine/{digest}"),
+            format!("scope-quarantine:{digest}"),
+        ))
     }
 }
 

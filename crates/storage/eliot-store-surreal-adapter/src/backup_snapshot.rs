@@ -142,12 +142,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
-    BlobResidency, BlobResidencyDomain, EcxfExportRequest, MAX_SNAPSHOT_BYTES,
-    MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OperationId,
-    OperationIdentity, OrderingHead, RequestMeta, RevisionHead, ScopeId, SnapshotBeginRequest,
-    SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotMember, SnapshotMemberType, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
-    sha256_hex,
+    BlobResidency, BlobResidencyDomain, EcxfExportRequest, MAX_RECOVERY_RECORD_BYTES,
+    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES,
+    OperationId, OperationIdentity, OrderingHead, RequestMeta, RevisionHead, ScopeId,
+    SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
+    StateFence, StoreError, canonical_json_bytes, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -425,7 +425,11 @@ pub(crate) struct MemberClass {
     key_fields: &'static [&'static str],
     /// Store-owned content-digest column carried forward as the member
     /// residency digest. Never recomputed here: this crate is not a
-    /// Blob-root owner, so no residency digest can be re-derived.
+    /// Blob-root owner, so no residency digest can be re-derived. `Some` also
+    /// declares that the row carries a payload column the recorded digest
+    /// attests, which `row_residency_digest` checks; `None` means the class has
+    /// no owner-issued residency digest and the member carries the digest of its
+    /// own captured canonical bytes.
     digest_field: Option<&'static str>,
     /// The typed edge this class contributes, when it is a reference.
     reference: Option<MemberReference>,
@@ -2178,33 +2182,94 @@ fn row_joined_key(class: &MemberClass, row: &Map<String, Value>) -> Result<Strin
     Ok(parts.join("\u{1f}"))
 }
 
-/// The store-owned content digest carried forward as the residency digest.
+/// The payload column a `recovery_owner`/`recovery_job` row's recorded store-owned
+/// digest attests.
+///
+/// Read by its physical column name rather than by decoding the row into
+/// `eliot_store_api::RecoveryRecord`: the member batch reads whole records with
+/// `SELECT *`, so a row also carries the provider's record `id`, which
+/// `RecoveryRecord`'s `deny_unknown_fields` would refuse.
+const RECOVERY_PAYLOAD_FIELD: &str = "payload";
+
+/// The residency evidence of one observed row.
 ///
 /// A13.7 and `crates/storage/AGENTS.md`: a Blob residency digest cannot be
-/// re-derived here (this crate is not a Blob-root owner), so the store's own
-/// digest column is carried forward opaquely and the digest of the exact
-/// captured canonical bytes is the fallback. The residency *domain* — never the
-/// digest — is what keeps same-content-different-domain members distinct.
+/// re-derived here (this crate is not a Blob-root owner). A class that declares a
+/// store-owned digest column therefore carries that column's recorded value, and
+/// that recorded value is checked against the row's own recorded payload rather
+/// than being accepted on shape or replaced by a fresh checksum. A recorded
+/// digest that does not describe the captured payload refuses the capture; a
+/// recorded value that cannot be read refuses it too, because inventing a digest
+/// here would certify bytes no owner ever attested.
+///
+/// A class with no declared digest column has no owner-issued residency digest,
+/// so the digest of the row's own exact canonical bytes is carried forward, which
+/// is the same value `row_content_digest` computes for the member's
+/// `content_digest`. The residency *domain* — never the digest — is what keeps
+/// same-content-different-domain members distinct.
 fn row_residency_digest(
     class: &MemberClass,
     row: &Map<String, Value>,
     content_digest: &str,
-) -> String {
-    class
-        .digest_field
-        .and_then(|field| row.get(field))
+) -> Result<String, StoreError> {
+    let Some(field) = class.digest_field else {
+        return Ok(content_digest.to_owned());
+    };
+    // The recorded digest is read from the row's own declared column and
+    // compared with the digest of the row's own recorded payload — the same
+    // digest-versus-payload comparison `eliot_store_api::RecoveryRecord::validate`
+    // applies to this exact column pair, and the one `backup_restore.rs` and
+    // `apply/read_boundary.rs` already apply to these two tables. The row is NOT
+    // decoded into `RecoveryRecord` itself: the member batch reads whole records
+    // with `SELECT *`, so the row also carries the provider's record `id`, which
+    // `RecoveryRecord`'s `deny_unknown_fields` would refuse. Reading the two
+    // declared columns is what keeps the comparison possible at all.
+    //
+    // Two consequences are deliberate. The digest is never replaced by one
+    // recomputed over what this crate holds: a fresh checksum over the same
+    // bytes is not a check of the recorded one, and a recorded value that cannot
+    // be read is refused rather than invented. And only the digest-versus-payload
+    // comparison is applied here, not the whole owner check, because
+    // `revision`, the address text, the schema text and the state fence are not
+    // this leaf's fields to interpret — they are `recovery_*` operational state
+    // whose validity is the write path's and the restore path's concern.
+    let recorded = row
+        .get(field)
         .and_then(Value::as_str)
-        .filter(|value| is_lowercase_sha256(value))
-        .unwrap_or(content_digest)
-        .to_owned()
-}
-
-/// Reports whether `value` is a lowercase hexadecimal SHA-256 digest.
-fn is_lowercase_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        .ok_or(StoreError::InvalidField {
+            field: "snapshot.residency_digest",
+            reason: "captured row does not carry its declared store-owned digest column",
+        })?;
+    let payload = row
+        .get(RECOVERY_PAYLOAD_FIELD)
+        .and_then(Value::as_array)
+        .ok_or(StoreError::InvalidField {
+            field: "snapshot.payload",
+            reason: "captured row does not carry its declared payload column",
+        })?;
+    let payload = payload
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or(StoreError::InvalidField {
+                    field: "snapshot.payload",
+                    reason: "captured payload is not a byte sequence",
+                })
+        })
+        .collect::<Result<Vec<u8>, StoreError>>()?;
+    if payload.is_empty() || payload.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::Empty {
+            field: "snapshot.payload",
+        });
+    }
+    if sha256_hex(&payload) != recorded {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.residency_digest",
+            reason: "recorded store-owned digest does not describe the captured payload",
+        });
+    }
+    Ok(recorded.to_owned())
 }
 
 /// Maps one observed row of one captured class to its snapshot member.
@@ -2214,7 +2279,7 @@ fn member_for_row(
 ) -> Result<SnapshotMember, StoreError> {
     let content_digest = row_content_digest(row)?;
     let member_id = row_member_id(class, row)?;
-    let residency_digest = row_residency_digest(class, row, &content_digest);
+    let residency_digest = row_residency_digest(class, row, &content_digest)?;
     let bytes = canonical_json_bytes(row).map_err(snapshot_serialization_error)?;
     let byte_count = u64::try_from(bytes.len())
         .map_err(|_| StoreError::PayloadTooLarge)?
@@ -2341,9 +2406,19 @@ fn resolve_member_references(
 ///
 /// The snapshot analogue of `crate::backup_restore::validate_reference_closure`:
 /// every `SnapshotMemberType::Reference` member must name the exact
-/// `content_digest` of another member in the same capture. This is an
-/// independent re-proof over a different observation than the enumeration used
-/// (the key index), so a member set that lost its target still fails closed.
+/// `content_digest` of another member in the same capture.
+///
+/// It is not a second, independent proof of closure, and the two checks it does
+/// run are not equal in strength. The closure itself is discharged by the
+/// key-index resolution in [`resolve_member_references`], which refuses a typed
+/// edge whose target is absent from the observed rows; and the
+/// reference/member-type coupling is discharged by the `member.validate()` that
+/// every member already passed on the way out of that same function. What is
+/// left here, and what the key index genuinely cannot express, is the
+/// self-reference case: a `Reference` member whose own `content_digest` is the
+/// digest it claims to point at, which would make an edge its own target. The
+/// missing-reference arm is retained so the invariant is checked at the point
+/// the closure is claimed, not only at the point the member is built.
 fn validate_reference_closure(members: &[SnapshotMember]) -> Result<(), StoreError> {
     let present: BTreeSet<&str> = members
         .iter()
@@ -2639,21 +2714,31 @@ fn scope_projection_document(
     ])
 }
 
-/// Refuses two observed heads for the same key.
+/// Refuses two observed heads for the same key within one head table.
 ///
-/// The admitted DDL declares a unique index per head key, so a duplicate means
-/// the observation is not faithful and no projection may be exported from it.
+/// The admitted DDL declares one unique index per head table — `rh_key` over
+/// `revision_key` on `revision_head` and `oh_scope` over `ordering_scope` on
+/// `ordering_head` — and the API treats the two key spaces as distinct
+/// (`ScopeRevisionView::validate` uniques each vector separately). A
+/// `revision_head` keyed `"main"` and an `ordering_head` scoped `"main"` are
+/// therefore not a duplicate. Each key is checked against its own table's
+/// observed set, so a reported duplicate means the observation contradicts a
+/// unique index that table declares, and no projection may be exported from it.
 fn ensure_unique_head_keys(
     observed_revisions: &[RevisionHead],
     observed_orderings: &[OrderingHead],
 ) -> Result<(), StoreError> {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for key in observed_revisions
-        .iter()
-        .map(|head| head.key.as_str())
-        .chain(observed_orderings.iter().map(|head| head.scope.as_str()))
-    {
-        if !seen.insert(key) {
+    let mut revision_keys: BTreeSet<&str> = BTreeSet::new();
+    for head in observed_revisions {
+        if !revision_keys.insert(head.key.as_str()) {
+            return Err(StoreError::Duplicate {
+                field: SCOPE_PROJECTION_FIELD,
+            });
+        }
+    }
+    let mut ordering_scopes: BTreeSet<&str> = BTreeSet::new();
+    for head in observed_orderings {
+        if !ordering_scopes.insert(head.scope.as_str()) {
             return Err(StoreError::Duplicate {
                 field: SCOPE_PROJECTION_FIELD,
             });
@@ -3557,7 +3642,7 @@ pub(crate) async fn begin_snapshot(
     // path below; replay cannot renew it and cannot admit a new live capture.
     refuse_unservable_window(adapter, &request, started_at_ms)?;
     // The acting principal is named, not assumed, before any protected read.
-    bind_capture_principal(adapter, SNAPSHOT_BEGIN_OPERATION)?;
+    bind_capture_principal(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION)?;
     verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
     // Bounded opportunistic maintenance: `begin` is the one path a client that
     // never pages and never closes still reaches, so expiry progresses on

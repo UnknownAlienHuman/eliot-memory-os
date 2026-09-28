@@ -85,7 +85,8 @@ pub use module::control_reserve_front_door::{
     PermitOperation,
 };
 pub use module::control_reserve_profile_compiler::{
-    BottleneckOwnerEvidence, ControlReserveProfileIdentity, compile_control_reserve_profile,
+    BottleneckOwnerEvidence, ControlReserveProfileIdentity, ControlReserveStatusRow,
+    ControlReserveStatusSnapshot, compile_control_reserve_profile, project_control_reserve_status,
 };
 pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
 pub use module::generation_readiness::{

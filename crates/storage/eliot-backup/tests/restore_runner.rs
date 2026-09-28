@@ -136,6 +136,15 @@ fn receipt_for(operation: &str) -> eliot_store_api::WriteReceipt {
         admission_digest: "e".repeat(64),
         mutation_plan_digest: "f".repeat(64),
         semantic_source_revisions: Vec::new(),
+        // I5.19: standalone fixture with no `PreparedTransition` in scope, so
+        // the record is built explicitly from the store API's own in-force
+        // constants. `fence()` carries no policy binding, so
+        // `policy_revision` is `None` and still agrees with the fence.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: fence().policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
         error_code: None,
         resubmission: eliot_store_api::Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),

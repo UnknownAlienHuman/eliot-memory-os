@@ -14,8 +14,8 @@ use eliot_contracts::{
     ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId, TransactionSequence,
 };
 pub use eliot_contracts::{
-    ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
-    canonical_json_bytes, sha256_hex,
+    ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, RequestMetadata,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
 pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_learning_contracts::{
@@ -4759,6 +4759,24 @@ pub fn bind_issue18_receipt(
     receipt.semantic_source_revisions = render_semantic_source_revisions(expected_revision_heads);
 }
 
+/// Binds the terminal receipt's I5.19 `policy_config_schema_versions` member
+/// from the admitted transition.
+///
+/// The policy revision is copied exactly from the admitted
+/// `StateFence::policy_revision`; the configuration and schema identities come
+/// from this crate's own in-force constants. Nothing is caller-supplied and
+/// nothing is defaulted. Equality with the derived binding is then enforced by
+/// the receipt-issuing path ([`issue_store_receipt_envelope`] through
+/// `validate_receipt_inputs`, and the genesis path through
+/// `check_genesis_receipt_bindings`), so a receipt that skips or diverges
+/// from this binding fails closed instead of shipping a weaker record.
+pub fn bind_policy_config_schema_versions(
+    transition: &PreparedTransition,
+    receipt: &mut WriteReceipt,
+) {
+    receipt.policy_config_schema_versions = PolicyConfigSchemaVersions::bound_to(transition);
+}
+
 /// Builds the one provider-independent manifest admitted for Store genesis.
 /// The digest is derived from the complete manifest shape and is shared by
 /// every adapter; no provider name or zero digest is accepted as a substitute.
@@ -5061,6 +5079,84 @@ pub struct RevisionDelta {
 /// rehydrating state from a receipt.
 pub const ERASURE_STATE_IRREVERSIBLE_CONSTRAINT: &str = "ERASURE_STATE_IRREVERSIBLE";
 
+/// The policy, configuration and schema version identities in force for the
+/// admitted transition (I5.19 `policy_config_schema_versions`).
+///
+/// I5.19 enumerates this as its own terminal-receipt member. It is distinct
+/// from [`WriteReceipt::semantic_source_revisions`], which is the issue-#18 set
+/// of bound semantic source revision heads, and distinct from
+/// `ReceiptEnvelope.contract`, which is `eliot.foundation.receipts`' own
+/// envelope-family identity — the schema of the receipt itself, not the policy
+/// and configuration the write was admitted under. This record is not a second
+/// policy snapshot: it carries no settings, no fences, no owner and no
+/// snapshot identity.
+///
+/// No existing owner type in this workspace carries the three identities
+/// together, so this is a plain self-contained record:
+///
+/// * It is deliberately **not** bound to `eliot_config::ConfigPolicySnapshot`.
+///   Measured on this branch, `eliot-store-api` does not depend on
+///   `eliot-config` (`crates/storage/eliot-store-api/Cargo.toml`), and
+///   `ConfigPolicySnapshot` (`crates/governor/eliot-config/src/lib.rs`) has no
+///   configuration-revision member and no schema-revision member, so it cannot
+///   express the I5.19 triple. Reaching it would add a new hard internal
+///   dependency, which `docs/DEPENDENCY_POLICY.md` admits only with an ADR.
+/// * The policy and schema identities reuse the owner types this crate already
+///   depends on: [`PolicyRevision`] and [`ContractVersion`].
+/// * The configuration identity is the store-owned operation catalogue profile
+///   ([`OPERATION_CATALOGUE_PROFILE`]). That constant is a direct field of the
+///   canonical shape hashed by [`operation_manifest_set_digest`], so the value
+///   is digest-bound: the set digest the transition carries as
+///   `admission_contract_set_digest` / `operation_manifest_digest` changes if
+///   the profile ever changes. The Governor's human-owned configuration
+///   snapshot revision is **not** carried; that gap is a named residual, not a
+///   silent substitution.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfigSchemaVersions {
+    /// Policy revision in force for the admitted transition, copied exactly
+    /// from the admitted `StateFence::policy_revision`. `None` when the
+    /// transition was admitted without a policy binding.
+    pub policy_revision: Option<PolicyRevision>,
+    /// Store operation-catalogue profile in force for the admitted
+    /// transition.
+    pub config_profile: String,
+    /// Store contract revision in force when this receipt was written: the
+    /// in-crate [`CONTRACT_VERSION`] of the `eliot.storage.store-api`
+    /// contract surface.
+    pub schema_revision: ContractVersion,
+}
+
+impl PolicyConfigSchemaVersions {
+    /// Derives the version identity in force for one admitted transition.
+    ///
+    /// Every value is copied from the admitted transition or from this crate's
+    /// own in-force constants; none is defaulted, sampled or invented.
+    #[must_use]
+    pub fn bound_to(transition: &PreparedTransition) -> Self {
+        Self {
+            policy_revision: transition.state_fence.policy_revision,
+            config_profile: OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: CONTRACT_VERSION,
+        }
+    }
+
+    /// Validates the recordable shape of the three identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] when the configuration profile is
+    /// blank or carries a control character. [`PolicyRevision`] rejects zero
+    /// and [`ContractVersion`] admits no invalid state, so neither needs a
+    /// further shape check.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(
+            &self.config_profile,
+            "policy_config_schema_versions.config_profile",
+        )
+    }
+}
+
 /// Immutable canonical write receipt.  It proves durable store transport only.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5091,6 +5187,15 @@ pub struct WriteReceipt {
     /// `expected_revision_heads`; fence-scoped erasure and frozen fixtures
     /// record `[]` explicitly.
     pub semantic_source_revisions: Vec<String>,
+    /// Policy, configuration and schema version identities in force for the
+    /// admitted transition (I5.19 `policy_config_schema_versions`).
+    ///
+    /// Bound by [`bind_policy_config_schema_versions`] exactly the way
+    /// `admission_digest` and `mutation_plan_digest` are bound: copied from
+    /// the admitted transition, never supplied by the caller, and checked
+    /// against the derived binding by the receipt-issuing path. Terminal and
+    /// immutable — nothing may rewrite it after the receipt is issued.
+    pub policy_config_schema_versions: PolicyConfigSchemaVersions,
     pub error_code: Option<ErrorCode>,
     pub resubmission: Resubmission,
     pub committed_at: Option<String>,
@@ -5109,6 +5214,12 @@ impl WriteReceipt {
         validate_digest(&self.admission_digest, "admission_digest")?;
         validate_digest(&self.mutation_plan_digest, "mutation_plan_digest")?;
         validate_semantic_source_revisions(&self.semantic_source_revisions)?;
+        // I5.19: the receipt names the policy revision in force, so it may not
+        // disagree with the fence the transition was admitted under.
+        self.policy_config_schema_versions.validate()?;
+        if self.policy_config_schema_versions.policy_revision != self.state_fence.policy_revision {
+            return Err(StoreError::InvalidReceipt);
+        }
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -5333,6 +5444,12 @@ fn check_genesis_receipt_bindings(
     {
         return Err(StoreError::InvalidReceipt);
     }
+    // I5.19: the genesis receipt carries the same version identity in force as
+    // every other terminal receipt, derived from the canonical genesis
+    // transition.
+    if receipt.policy_config_schema_versions != PolicyConfigSchemaVersions::bound_to(transition) {
+        return Err(StoreError::InvalidReceipt);
+    }
     Ok(())
 }
 
@@ -5380,6 +5497,8 @@ fn validate_receipt_inputs(
         && receipt.admission_digest == transition.admission_digest
         && receipt.mutation_plan_digest == transition.mutation_plan_digest
         && receipt.semantic_source_revisions == transition.semantic_source_revisions
+        && receipt.policy_config_schema_versions
+            == PolicyConfigSchemaVersions::bound_to(transition)
         && receipt.status == WriteReceiptStatus::Committed
         && receipt.commit_id.is_some()
         && receipt.committed_at.as_deref() == Some(expected_committed_at.as_str())
@@ -5694,6 +5813,10 @@ pub enum StoreError {
     },
     #[error("receipt envelope is missing; write outcome is unknown")]
     MissingReceiptEnvelope,
+    /// A submitted write may have taken effect; reconcile only this admitted
+    /// operation identity before any further mutation.
+    #[error("receipt envelope is missing; write outcome is unknown")]
+    UnknownOutcome { operation_id: OperationId },
     #[error("payload exceeds named-operation limit")]
     PayloadTooLarge,
     #[error("store unavailable")]
@@ -6384,12 +6507,16 @@ mod tests {
             admission_digest: String::new(),
             mutation_plan_digest: String::new(),
             semantic_source_revisions: Vec::new(),
+            // I5.19: bound from the same canonical transition through the
+            // production receipt binder, never defaulted.
+            policy_config_schema_versions: PolicyConfigSchemaVersions::bound_to(&transition),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
             envelope: None,
         };
         bind_issue18_receipt(&transition, &mut receipt, &[]);
+        bind_policy_config_schema_versions(&transition, &mut receipt);
         receipt.envelope = Some(issue_genesis_receipt_envelope(
             context,
             request,
@@ -6747,6 +6874,15 @@ mod tests {
             admission_digest: "a".repeat(64),
             mutation_plan_digest: "b".repeat(64),
             semantic_source_revisions: Vec::new(),
+            // I5.19: no `PreparedTransition` is in scope in this fixture, so the
+            // record is built explicitly from the crate's own in-force
+            // constants. `fence()` carries no policy binding, so the policy
+            // revision is `None` and still agrees with the fence below.
+            policy_config_schema_versions: PolicyConfigSchemaVersions {
+                policy_revision: fence().policy_revision,
+                config_profile: OPERATION_CATALOGUE_PROFILE.to_owned(),
+                schema_revision: CONTRACT_VERSION,
+            },
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

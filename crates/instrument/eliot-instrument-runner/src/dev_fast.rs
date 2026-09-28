@@ -15,13 +15,24 @@
 //! present; a partial slice never closes #1813/#1814 and grants no
 //! Product/Release proof.
 
-use eliot_contracts::sha256_hex;
-use eliot_instrument_api::InstrumentKind;
+use eliot_contracts::{ArtifactId, canonical_json_bytes, sha256_hex};
+use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentKind, VerificationOutcome};
+use eliot_process::ProcessExecutor;
 use eliot_test_selection::{FrozenDisposition, FrozenSelection, TestSelectionReceipt};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::InstrumentRunner;
 use crate::profile::{InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError};
-use crate::profile_run::{AggregateStatus, ProfileAggregate, StageOrchestrator, StagePlan};
+use crate::profile_run::{
+    AggregateStatus, InstrumentRun, ProfileAggregate, RetainedExitOutcome, RetainedToolIdentity,
+    StageEvidence, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
+    TestExecutionPlaneRoute,
+};
+use crate::registry::SupplyChainReceipt;
+use crate::verification_profile::{
+    ParityVerdict, VerificationProfileReceipt, verify_profile_parity,
+};
 
 /// Canonical `dev-fast` profile name (I18.6).
 pub const DEV_FAST_PROFILE: &str = "dev-fast";
@@ -48,7 +59,43 @@ pub const DEV_FAST_STAGE_RUSTFMT: &str = "rustfmt-check";
 pub const DEV_FAST_FIRST_PACKAGE: &str = "eliot-test-selection";
 /// Version of the persisted `VerificationProfileRun` semantics (I18.6 step
 /// 9).
-pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v2";
+///
+/// This is the current record semantics version. It moves whenever the
+/// record's own meaning or its digest preimage changes, so a retained
+/// record is only ever interpreted under the encoding that produced it
+/// (I5.27 `canonical_encoding_version`).
+pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v3";
+
+/// Retired record encoding whose `run_digest` is not a commitment.
+///
+/// The `v2` encoding hashed a NUL-joined field list whose raw-reference
+/// vector was flattened with `join(",")` while `validate_text` admits
+/// commas inside a reference. Two distinct admitted vectors —
+/// `["raw:a,raw:b", "raw:c"]` and `["raw:a", "raw:b,raw:c"]` — therefore
+/// produced identical preimages, so `run_digest` did not bind list
+/// boundaries and readback could not detect a rewritten vector. A `v2`
+/// digest is an unversioned hash of caller spelling (I5.27), so it is
+/// never re-derived, compared, or certified under the current encoding:
+/// [`VerificationProfileRun::check_digest`] and
+/// [`VerificationProfileRun::resolve_lost_ack`] refuse the retired
+/// version before recomputing anything. Such a record stays readable as
+/// its own historical evidence; it is never re-interpreted as a
+/// current record.
+pub const VERIFICATION_PROFILE_RUN_LEGACY_VERSION: &str = "eliot-verification-profile-run-v2";
+
+/// Domain separator of the profile-run digest preimage (I5.27
+/// `domain_separator`).
+const PROFILE_RUN_PREIMAGE_DOMAIN: &str = "eliot-verification-profile-run-digest";
+
+/// Canonical encoding version of the profile-run digest preimage (I5.27
+/// `canonical_encoding_version`).
+///
+/// The preimage is the project's canonical serialization of the complete
+/// record with object keys sorted recursively, so every scalar field keeps
+/// its own JSON encoding and every vector stays an actual JSON array. No
+/// field is joined by a character a field may itself contain, so no two
+/// distinct admitted records can share a preimage.
+const PROFILE_RUN_PREIMAGE_ENCODING: &str = "v1";
 
 /// Failures raised while binding, freezing, or aggregating `dev-fast`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -108,10 +155,27 @@ pub enum DevFastError {
     /// The dev-fast admission or registry build failed.
     #[error("dev-fast admission failed: {0}")]
     Admission(String),
+    /// A retained stage capture is not a well-formed message stream of the
+    /// stage's admitted parser, so no normalized outcome exists for it.
+    #[error("stage '{stage}' capture is not well-formed {parser} output: {detail}")]
+    StageParse {
+        /// Stage whose capture failed to parse.
+        stage: String,
+        /// Admitted parser the capture was offered to.
+        parser: &'static str,
+        /// Owning-parser detail text (evidence, never control flow).
+        detail: String,
+    },
 }
 
 impl From<ProfileError> for DevFastError {
     fn from(error: ProfileError) -> Self {
+        Self::Admission(error.to_string())
+    }
+}
+
+impl From<crate::profile_run::ProfileRunError> for DevFastError {
+    fn from(error: crate::profile_run::ProfileRunError) -> Self {
         Self::Admission(error.to_string())
     }
 }
@@ -661,6 +725,22 @@ pub(crate) fn dev_fast_profile() -> Result<InstrumentProfile, ProfileError> {
     )
 }
 
+/// Surfaces every run the aggregate did not count as success (issue #1802
+/// A5).
+///
+/// Failed, partial, cancelled, blocked, unknown, omitted, and missing runs
+/// stay in the aggregate by construction; this accessor returns exactly those
+/// runs in plan order so reporters and the evidence commit persist them
+/// visibly instead of re-deriving success. An empty result means every
+/// planned stage succeeded.
+pub fn dev_fast_unresolved_runs(aggregate: &ProfileAggregate) -> Vec<&InstrumentRun> {
+    aggregate
+        .runs
+        .iter()
+        .filter(|run| !run.is_success())
+        .collect()
+}
+
 /// Refuses an expected-nonzero selection that executed zero tests.
 ///
 /// A complete known expected-nonzero selection with zero execution is
@@ -839,6 +919,280 @@ pub fn dev_fast_caller_plan(
     Ok(plan)
 }
 
+/// Normalized outcome of one retained `dev-fast` stage capture.
+///
+/// The outcome is the admitted parser's reading of real tool output only:
+/// it never synthesizes a result, and anything the parser cannot answer
+/// stays [`DevFastStageOutcome::Unknown`], never a pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevFastStageOutcome {
+    /// The admitted parser read real tool output as a pass.
+    Pass,
+    /// The admitted parser read real tool output as a failure.
+    Fail,
+    /// The admitted parser read real tool output with no passing verdict
+    /// (empty, truncated, or cancelled stream).
+    Unknown,
+}
+
+/// Normalizes one retained `dev-fast` stage capture through the stage's
+/// admitted real-output parser (issue #1852 W3).
+///
+/// Every `dev-fast` stage has exactly one owner per fact: discovery through
+/// the nextest inventory parser, affected diagnostics through the Clippy lint
+/// parser plus the Cargo build projection over the same stream (Cargo owns
+/// the build facts, Clippy owns the lint facts — never two normalizers over
+/// one fact), selected execution through the nextest run-event parser, and
+/// the format check through the rustfmt parser. The raw bytes stay retained
+/// under the caller's artifact handle; this projection adds no verdict of
+/// its own beyond the parser's reading.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::InvalidText`] for an undeclared stage identity
+/// and [`DevFastError::StageParse`] when the capture is not a well-formed
+/// stream of the admitted parser.
+pub fn normalize_dev_fast_stage_bytes(
+    stage_id: &str,
+    bytes: &[u8],
+    exit: RetainedExitOutcome,
+) -> Result<DevFastStageOutcome, DevFastError> {
+    if stage_id == DEV_FAST_STAGE_LIST {
+        let inventory = eliot_instrument_nextest::parse_list_json(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "nextest-list",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(if inventory.is_empty() {
+            DevFastStageOutcome::Unknown
+        } else {
+            DevFastStageOutcome::Pass
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_CLIPPY {
+        let build = eliot_instrument_cargo::parse_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "cargo-build",
+                detail: error.to_string(),
+            }
+        })?;
+        let lints = eliot_instrument_rustc::parse_clippy_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "clippy-lint",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(match (build.outcome(), lints.outcome()) {
+            (VerificationOutcome::Fail, _) | (_, VerificationOutcome::Fail) => {
+                DevFastStageOutcome::Fail
+            }
+            (VerificationOutcome::Pass, VerificationOutcome::Pass) => DevFastStageOutcome::Pass,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_RUN {
+        let report = eliot_instrument_nextest::parse_jsonl(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "nextest-run",
+                detail: error.to_string(),
+            }
+        })?;
+        return Ok(match report.outcome() {
+            VerificationOutcome::Pass => DevFastStageOutcome::Pass,
+            VerificationOutcome::Fail => DevFastStageOutcome::Fail,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    if stage_id == DEV_FAST_STAGE_RUSTFMT {
+        let report = eliot_instrument_rustfmt::parse_output(bytes).map_err(|error| {
+            DevFastError::StageParse {
+                stage: stage_id.to_owned(),
+                parser: "rustfmt-check",
+                detail: error.to_string(),
+            }
+        })?;
+        // `RetainedExitOutcome::sealed` admits only a completed exit with a
+        // code or an unknown outcome without one; cancellation is never a
+        // retained dev-fast capture, so `cancelled` stays false here.
+        let outcome = report.outcome(exit.code, false);
+        return Ok(match outcome {
+            VerificationOutcome::Pass => DevFastStageOutcome::Pass,
+            VerificationOutcome::Fail => DevFastStageOutcome::Fail,
+            _ => DevFastStageOutcome::Unknown,
+        });
+    }
+    Err(DevFastError::InvalidText { field: "stage_id" })
+}
+
+/// Finalizes one launched `dev-fast` stage whose supervising lane retained
+/// the exact raw bytes under an immutable artifact handle (issue #1852 W2).
+///
+/// The sealed tool identity is bound here, at finalization, from the
+/// executable, argument vector, environment projection digest, and terminal
+/// exit outcome the lane observed — never reconstructed later from the
+/// bytes. The returned run is the first production constructor of
+/// [`StageEvidence::Retained`](crate::profile_run::StageEvidence).
+///
+/// # Errors
+///
+/// Returns [`DevFastError::Admission`] when the tool identity, the operation
+/// binding, or the executable digest is not an observed sealed value.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_dev_fast_stage(
+    route: &TestExecutionPlaneRoute,
+    operation_id: String,
+    grant: &InstrumentAdmissionGrant,
+    target_layout: Option<StageTargetLayout>,
+    artifact: ArtifactId,
+    byte_len: u64,
+    executable: &str,
+    arguments: &[String],
+    environment_digest: &str,
+    exit: RetainedExitOutcome,
+    executable_digest: String,
+) -> Result<InstrumentRun, DevFastError> {
+    let tool = RetainedToolIdentity::sealed(executable, arguments, environment_digest, exit)?;
+    Ok(InstrumentRun::finalize_retained(
+        route,
+        operation_id,
+        grant,
+        target_layout,
+        artifact,
+        byte_len,
+        tool,
+        executable_digest,
+    )?)
+}
+
+/// Runs the closed versioned `dev-fast` profile end to end through the one
+/// shared [`InstrumentRunner`]/[`ProcessExecutor`] path (issue #1852 W1).
+///
+/// Every caller — local verify, agent verifier requests, Justfile wrappers,
+/// CI, `FinishService` — reaches the same admitted revision, the same
+/// candidate-bound stage plan, and the same aggregate shape through this one
+/// function; there is no second admission path (I10.8.4: no fifth
+/// verification path). The owning composition root supplies the runner
+/// around the production process executor and the [`StageLauncher`] that
+/// turns the admitted plan into launches; transports differ only in how they
+/// provision those two values, never in which profile they run.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::Admission`] when the registry, the compilation,
+/// or the candidate binding fails. Launch, admission, and invocation
+/// failures of individual stages never surface here: they become explicit
+/// missing runs inside the returned aggregate.
+pub async fn run_dev_fast_profile<E: ProcessExecutor + 'static>(
+    runner: &InstrumentRunner<E>,
+    generation: u64,
+    receipts: Vec<SupplyChainReceipt>,
+    candidate: &DevFastCandidate,
+    launcher: &dyn StageLauncher,
+) -> Result<ProfileAggregate, DevFastError> {
+    let registry = dev_fast_registry(generation, receipts)?;
+    let plan = dev_fast_caller_plan(&registry, candidate)?;
+    let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+    Ok(ProfileAggregate::assemble(&plan, runs))
+}
+
+/// Confirms one `dev-fast` run as the canonical finish input: real tool
+/// failures block, nothing else passes (issue #1852 A2).
+///
+/// [`dev_fast_disposition`] reads the aggregate the shared runner assembled
+/// over retained stage evidence plus the frozen selection and its receipt;
+/// an intentionally introduced Clippy, nextest, or rustfmt failure surfaces
+/// here as a failed or missing mandatory stage and is refused. Only a passed
+/// disposition assembles the persisted [`VerificationProfileRun`], whose raw
+/// references are derived from the aggregate's own retained artifact
+/// handles — never invented. Persistence still never upgrades a failed
+/// aggregate into a pass.
+///
+/// # Errors
+///
+/// Returns the [`dev_fast_disposition`] refusal when the run is not the
+/// admitted revision, a mandatory stage did not succeed, the receipt does
+/// not bind the frozen selection and candidate identity, or execution was
+/// incomplete.
+pub fn confirm_dev_fast_finish(
+    candidate: &DevFastCandidate,
+    aggregate: &ProfileAggregate,
+    receipt: &TestSelectionReceipt,
+    frozen: &FrozenSelection,
+) -> Result<VerificationProfileRun, DevFastError> {
+    dev_fast_disposition(aggregate, receipt, candidate, frozen)?;
+    let raw_refs = aggregate
+        .runs
+        .iter()
+        .filter_map(|run| match &run.evidence {
+            StageEvidence::Retained { artifact, .. } => Some(artifact.as_str().to_owned()),
+            StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    VerificationProfileRun::assemble(
+        candidate,
+        aggregate,
+        receipt,
+        raw_refs,
+        DEV_FAST_SLICE_PARTIAL,
+    )
+}
+
+/// Requires local/CI parity over one named `dev-fast` profile run (issue
+/// #1852 A1).
+///
+/// Both receipts must record the same profile name, revision, definition and
+/// stage-graph digests, tool identities, and aggregate shape through the one
+/// shared receipt schema; any divergence — including a CI verifier command
+/// the local receipt never declared — refuses parity instead of passing
+/// silently. A non-PASS normalized outcome on either side is never parity.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::ReceiptMismatch`] when either receipt is
+/// internally inconsistent or the two receipts diverge.
+pub fn require_dev_fast_parity(
+    local: &VerificationProfileReceipt,
+    ci: &VerificationProfileReceipt,
+) -> Result<(), DevFastError> {
+    let verdict = verify_profile_parity(local, ci)
+        .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+    match verdict {
+        ParityVerdict::Pass { .. } => Ok(()),
+        ParityVerdict::NonPass { reason } => Err(DevFastError::ReceiptMismatch(reason)),
+    }
+}
+
+/// Executes the candidate-bound `dev-fast` plan and aggregates its canonical
+/// stages (issue #1802 step 5).
+///
+/// The plan must be the admitted `dev-fast` revision, normally compiled by
+/// [`dev_fast_caller_plan`], which binds the complete candidate/configuration
+/// identity the aggregate inherits. Launching walks the existing total
+/// orchestrator: admitted stages launch through the executing composition
+/// root's [`StageLauncher`] provisions, and every refusal, failure, or
+/// unlaunched dependency becomes an explicit missing run the aggregate keeps
+/// visible. The executor behind `runner` belongs to the owning supervision
+/// lane (Kernel/`testd`); this entry supplies orchestration only and invents
+/// no invocation, process, or verdict.
+pub async fn dev_fast_execute<E: ProcessExecutor + 'static>(
+    runner: &InstrumentRunner<E>,
+    plan: &StagePlan,
+    launcher: &dyn StageLauncher,
+) -> Result<ProfileAggregate, DevFastError> {
+    if plan.profile != DEV_FAST_PROFILE || plan.revision != DEV_FAST_PROFILE_REVISION {
+        return Err(DevFastError::Admission(
+            "stage plan is not the admitted dev-fast revision".to_owned(),
+        ));
+    }
+    let runs = StageOrchestrator::launch_plan(runner, plan, launcher).await;
+    Ok(ProfileAggregate::assemble(plan, runs))
+}
+
 /// One persisted dev-fast profile run bound to its aggregate, receipt,
 /// and retained raw outputs (I18.6 step 9).
 ///
@@ -847,7 +1201,17 @@ pub fn dev_fast_caller_plan(
 /// evidence while only `FinishService` decides completion. A lost
 /// acknowledgement resolves through [`VerificationProfileRun::resolve_lost_ack`]
 /// against the retained inputs; it never reruns build/test effects.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The record serializes to the evidence owner (I18.6 step 9) as canonical
+/// JSON. Unknown fields are refused on readback, so a record written by a
+/// newer semantics version fails closed instead of decoding as this version.
+/// `run_digest` is a versioned canonical commitment over the complete record
+/// (I5.27): the raw references are hashed as an actual array, so list
+/// boundaries, order, and content are bound and a rewritten vector fails
+/// readback. The retired [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`] encoding
+/// is refused, never re-interpreted under the current preimage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationProfileRun {
     /// Record semantics version.
     pub version: String,
@@ -871,9 +1235,10 @@ pub struct VerificationProfileRun {
     pub status: AggregateStatus,
     /// Slice completeness label ([`DEV_FAST_SLICE_PARTIAL`]).
     pub slice: String,
-    /// Raw retained output references bound to the run.
+    /// Raw retained output references bound to the run, as an actual array.
     pub raw_refs: Vec<String>,
-    /// Stable digest binding the complete record.
+    /// Stable digest binding the complete record, including the
+    /// raw-reference list boundaries.
     pub run_digest: String,
 }
 
@@ -943,27 +1308,100 @@ impl VerificationProfileRun {
             raw_refs,
             run_digest: String::new(),
         };
-        record.run_digest = record.compute_digest();
+        record.run_digest = record.compute_digest()?;
         Ok(record)
     }
 
     /// Computes the digest binding every record field.
-    fn compute_digest(&self) -> String {
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}",
-            self.version,
-            self.run_id,
-            self.candidate,
-            self.candidate_identity,
-            self.profile,
-            self.profile_revision,
-            self.aggregate_digest,
-            self.receipt_digest,
-            self.status,
-            self.slice,
-            self.raw_refs.join(","),
+    ///
+    /// The preimage is the project's canonical serialization
+    /// ([`canonical_json_bytes`]) of this record with `run_digest` itself
+    /// blanked, prefixed by the preimage domain separator and its
+    /// encoding version. Two consequences matter for readback:
+    ///
+    /// * the raw references are hashed as an actual JSON array of their
+    ///   own strings, so list boundaries, order, and content are all
+    ///   bound; changing only a boundary produces a different preimage;
+    /// * every scalar field keeps its own JSON encoding, so no field can
+    ///   be shifted across a separator by embedding one.
+    ///
+    /// The preimage carries the record's own `version` field, so a digest
+    /// produced by another encoding can never be reproduced here. The
+    /// digest owner remains the single [`sha256_hex`] helper this module
+    /// already used; no second digest authority is introduced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DevFastError::Admission`] when the record cannot be
+    /// serialized to its canonical preimage. It never falls back to an
+    /// unversioned or delimiter-joined encoding.
+    fn compute_digest(&self) -> Result<String, DevFastError> {
+        let mut preimage = self.clone();
+        preimage.run_digest = String::new();
+        let canonical = canonical_json_bytes(&preimage).map_err(|error| {
+            DevFastError::Admission(format!(
+                "profile run canonical preimage could not be serialized: {error}"
+            ))
+        })?;
+        let mut material = Vec::with_capacity(
+            PROFILE_RUN_PREIMAGE_DOMAIN.len()
+                + PROFILE_RUN_PREIMAGE_ENCODING.len()
+                + canonical.len()
+                + 2,
         );
-        sha256_hex(material.as_bytes())
+        material.extend_from_slice(PROFILE_RUN_PREIMAGE_DOMAIN.as_bytes());
+        material.push(0);
+        material.extend_from_slice(PROFILE_RUN_PREIMAGE_ENCODING.as_bytes());
+        material.push(0);
+        material.extend_from_slice(&canonical);
+        Ok(sha256_hex(&material))
+    }
+
+    /// Verifies the record still binds every field it carries.
+    ///
+    /// Readback calls this before trusting a deserialized record: a record
+    /// under the retired [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`], whose
+    /// digest never bound the raw-reference list boundaries, is refused
+    /// here without being recomputed, and a digest that no longer matches
+    /// the fields of a current record fails here instead of travelling on
+    /// as retained evidence.
+    pub fn check_digest(&self) -> Result<(), DevFastError> {
+        self.require_current_encoding()?;
+        if self.compute_digest()? != self.run_digest {
+            return Err(DevFastError::ReceiptMismatch(
+                "profile run record digest does not bind its fields".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses any record not written under the current encoding.
+    ///
+    /// The persisted encoding version is the record's own disposition:
+    /// [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`] is not re-interpreted
+    /// under the current preimage, and a newer unknown version fails
+    /// closed the same way. Nothing here inspects a retired digest, so an
+    /// old encoding can never certify the current interpretation.
+    fn require_current_encoding(&self) -> Result<(), DevFastError> {
+        if self.version == VERIFICATION_PROFILE_RUN_VERSION {
+            return Ok(());
+        }
+        // The retired version is named rather than treated as an anonymous
+        // mismatch, so the disposition of retained `v2` evidence is explicit
+        // in the refusal itself.
+        let disposition = if self.version == VERIFICATION_PROFILE_RUN_LEGACY_VERSION {
+            "it is the retired encoding whose preimage did not bind \
+             raw-reference list boundaries, and it is never re-interpreted \
+             under the current one"
+        } else {
+            "it is an unknown encoding and is never re-interpreted under the \
+             current one"
+        };
+        Err(DevFastError::ReceiptMismatch(format!(
+            "profile run record encoding '{}' is not the current encoding \
+             '{}': {disposition}",
+            self.version, VERIFICATION_PROFILE_RUN_VERSION,
+        )))
     }
 
     /// Resolves a lost acknowledgement against retained inputs without
@@ -973,8 +1411,9 @@ impl VerificationProfileRun {
     /// retained candidate/configuration identity, aggregate, and receipt:
     /// when it names this exact record, the caller reuses the retained record
     /// as the answer. A renamed candidate, changed configuration, different
-    /// aggregate, or rebound receipt fails here instead of reconstructing an
-    /// answer by rerunning build/test effects.
+    /// aggregate, rebound receipt, or record under a non-current encoding
+    /// fails here instead of reconstructing an answer by rerunning build/test
+    /// effects.
     pub fn resolve_lost_ack(
         &self,
         candidate: &DevFastCandidate,
@@ -984,6 +1423,7 @@ impl VerificationProfileRun {
         receipt
             .validate()
             .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+        self.require_current_encoding()?;
         let candidate_identity = candidate.digest();
         let expected = profile_run_id(
             &candidate.candidate,
@@ -1011,7 +1451,7 @@ impl VerificationProfileRun {
             || receipt.profile_digest != aggregate.profile_digest
             || receipt.dag_digest != aggregate.dag_digest
             || receipt.receipt_digest != self.receipt_digest
-            || self.compute_digest() != self.run_digest
+            || self.compute_digest()? != self.run_digest
         {
             return Err(DevFastError::ReceiptMismatch(
                 "lost acknowledgement does not resolve the retained profile run".to_owned(),
@@ -1019,6 +1459,26 @@ impl VerificationProfileRun {
         }
         Ok(())
     }
+}
+
+/// Replays the retained profile run without starting any process (issue
+/// #1802 A5).
+///
+/// The retained record resolves against the retained candidate, aggregate,
+/// and receipt through [`VerificationProfileRun::resolve_lost_ack`]; when
+/// they name this exact record, the retained record itself is the answer.
+/// The signature takes no executor, launcher, or process handle, so replay
+/// cannot rerun build/test effects to reconstruct an answer: a renamed
+/// candidate, changed configuration, different aggregate, or rebound receipt
+/// fails instead.
+pub fn dev_fast_replay(
+    retained: &VerificationProfileRun,
+    candidate: &DevFastCandidate,
+    aggregate: &ProfileAggregate,
+    receipt: &TestSelectionReceipt,
+) -> Result<VerificationProfileRun, DevFastError> {
+    retained.resolve_lost_ack(candidate, aggregate, receipt)?;
+    Ok(retained.clone())
 }
 
 /// Deterministic profile-run identity over candidate/configuration identity,

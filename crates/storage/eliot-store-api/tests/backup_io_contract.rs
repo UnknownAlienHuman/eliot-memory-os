@@ -956,6 +956,14 @@ fn possible_mutation_or_unknown_receipt_is_neither_no_write_nor_pass() {
         admission_digest: hex('d'),
         mutation_plan_digest: hex('c'),
         semantic_source_revisions: Vec::new(),
+        // I5.19: no `PreparedTransition` is in scope here, so the record is
+        // built explicitly from the crate's own in-force constants. `fence()`
+        // carries no policy binding, so `policy_revision` is `None`.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: fence().policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: None,

@@ -46,8 +46,8 @@ use eliot_instrument_runner::profile_run::{
 };
 use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
 use eliot_instrument_runner::{
-    AvailabilityInputs, ProviderDispatch, ProviderDisposition, compose_provider_dispatch,
-    host_platform,
+    AvailabilityInputs, DEV_FAST_PROFILE, ProviderDispatch, ProviderDisposition,
+    compose_provider_dispatch, dev_fast_registry, host_platform,
 };
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
@@ -353,7 +353,7 @@ impl GovernedProfileService {
     ///
     /// Returns [`EngineError`] when the builtin profile registry is unavailable.
     pub fn compile_governed(&self, name: &str) -> Result<Option<AdmittedProfile>, EngineError> {
-        let registry = builtin_registry()?;
+        let registry = governed_registry_for(name, BUILTIN_REGISTRY_GENERATION)?;
         let compiled = ProfileCompiler::new(&registry).compile(name);
         Ok(compiled.admitted().ok().cloned())
     }
@@ -413,7 +413,7 @@ impl GovernedProfileService {
         runs: Vec<InstrumentRun>,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
-        let registry = builtin_registry()?;
+        let registry = governed_registry_for(name, BUILTIN_REGISTRY_GENERATION)?;
         let resolved = ProfileCompiler::new(&registry)
             .resolve_admitted(
                 name,
@@ -534,9 +534,25 @@ impl GovernedProfileService {
     }
 }
 
-/// Loads the builtin registry shared with the other compiler lanes.
-fn builtin_registry() -> Result<InstrumentRegistry, EngineError> {
-    InstrumentRegistry::with_builtin_profiles(BUILTIN_REGISTRY_GENERATION).map_err(|error| {
+/// Loads the registry that admits one governed profile name (issue #1802
+/// step 7).
+///
+/// The builtin registry admits the compiler and test profiles. `dev-fast`
+/// resolves through its closed versioned registry, which carries the same
+/// builtin specs, compiler/test profiles, generation, and receipts plus the
+/// dev-fast definition, so the verify entries compile it through the single
+/// shared compiler with no second admission path. Every other name keeps the
+/// exact builtin registry, so existing resolutions are byte-identical.
+fn governed_registry_for(name: &str, generation: u64) -> Result<InstrumentRegistry, EngineError> {
+    if name == DEV_FAST_PROFILE {
+        return dev_fast_registry(generation, Vec::new()).map_err(|error| {
+            rejected(
+                "governed-profile",
+                &format!("dev-fast profile registry is unavailable: {error}"),
+            )
+        });
+    }
+    InstrumentRegistry::with_builtin_profiles(generation).map_err(|error| {
         rejected(
             "governed-profile",
             &format!("builtin profile registry is unavailable: {error}"),
@@ -632,8 +648,8 @@ fn unattested_fingerprints() -> InvalidationSet {
 /// compared: a resolution that does not describe the admitted definition is
 /// refused instead of being planned.
 fn admitted_from_resolution(resolved: &ResolvedProfile) -> Result<AdmittedProfile, String> {
-    let registry = InstrumentRegistry::with_builtin_profiles(resolved.registry_generation)
-        .map_err(|error| format!("builtin profile registry is unavailable: {error}"))?;
+    let registry = governed_registry_for(&resolved.name, resolved.registry_generation)
+        .map_err(|error| format!("governed profile registry is unavailable: {error}"))?;
     let compiled = ProfileCompiler::new(&registry)
         .compile_exact(&resolved.name, resolved.revision)
         .map_err(|error| format!("exact revision is not admitted: {error}"))?;

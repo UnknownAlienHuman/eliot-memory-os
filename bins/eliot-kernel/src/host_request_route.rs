@@ -52,6 +52,7 @@
 //! ticket, parent, or operation is `UnknownRequest`; an elapsed absolute
 //! deadline is `Timeout`. No error prose drives routing.
 
+use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::AuditEventDraft;
 use super::trace_manifest::TraceManifest;
 use super::{
@@ -130,6 +131,19 @@ fn observe_local_read_queue_gauges(
         u32::try_from(queued).unwrap_or(u32::MAX),
         u32::try_from(live_claims).unwrap_or(u32::MAX),
     ));
+}
+
+/// Publishes one sealed trace manifest's completeness (I16.5, #1841).
+///
+/// The outcome is the seal's own finish — a proof-bearing seal is replayable
+/// and anything else is explicitly not claimed — and the missing-part count is
+/// the seal's own tally. Both are read from the sealed manifest, never
+/// re-derived, so the metric cannot disagree with the retained chain record.
+fn observe_trace_seal(manifest: &TraceManifest) {
+    let Some(metrics) = crate::execution_metrics::kernel_metrics() else {
+        return;
+    };
+    metrics.record(metrics.record_trace_seal(manifest));
 }
 
 /// Typed frame operations carrying one [`HostRequestEnvelope`] through the
@@ -1459,7 +1473,11 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::orphan_connection_fenced(
             connection_id,
             outstanding.len(),
+            self.current_state_fence().as_ref(),
         ));
+        // Issue #1844: an orphan fencing is a security/integration gap;
+        // compile its brief.
+        self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
     }
 
     /// Verifies the envelope arrives on a currently retained bridge
@@ -1800,7 +1818,13 @@ impl KernelComposition {
         let settled = self
             .generation_gateway
             .ors
-            .cancel_host_request_parent(&parent_operation, &parent_digest)
+            .cancel_host_request_parent(
+                &OperationIdentity::new(host_request_operation_id(envelope))
+                    .map_err(|_| TransportError::SessionFenced)?,
+                &envelope.envelope_sha256,
+                &parent_operation,
+                &parent_digest,
+            )
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         let disposition = match settled.state {
@@ -2630,6 +2654,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::OwnerMismatch.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2658,6 +2685,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::Superseded.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2679,6 +2709,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Superseded.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2699,6 +2732,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Unclaimed.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2839,9 +2875,12 @@ impl KernelComposition {
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
-        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
-        ));
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // I16.5 (issue #1841): the sealed finish is also the
+        // trace-completeness metric sample, counted once per seal.
+        observe_trace_seal(&manifest);
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(&manifest));
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
         // completes the chain from it); a failed persist likewise leaves the
@@ -3585,6 +3624,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::OwnerMismatch.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -3609,6 +3651,9 @@ impl KernelComposition {
                         lane,
                         StaleLocalReadReason::Superseded.as_str(),
                     ));
+                    // Issue #1844: a stale quarantine is a security/integration
+                    // gap; compile its brief.
+                    self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -3630,6 +3675,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Superseded.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -3650,6 +3698,9 @@ impl KernelComposition {
                     lane,
                     StaleLocalReadReason::Unclaimed.as_str(),
                 ));
+                // Issue #1844: a stale quarantine is a security/integration
+                // gap; compile its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -3750,9 +3801,12 @@ impl KernelComposition {
         ));
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain.
-        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
-            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
-        ));
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // I16.5 (issue #1841): the sealed finish is also the
+        // trace-completeness metric sample, counted once per seal.
+        observe_trace_seal(&manifest);
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(&manifest));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
         self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
@@ -4175,6 +4229,7 @@ pub(crate) fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        cancellation_target: None,
         result_digest: None,
         result_response: None,
         result_evidence: None,
@@ -5166,7 +5221,14 @@ impl KernelComposition {
     /// facts are observation legs and remain in the preimage. The consumer
     /// strips exactly the key and the two later mutation-receipt legs before
     /// re-hashing. Pure read calls report truthful zero/empty mutation legs
-    /// without running either mutation.
+    /// without running either mutation. The consumed-acknowledgement and
+    /// per-handoff operation/receipt legs ride beside this reconciliation
+    /// object and never enter its read commitment. If the committed ack is
+    /// followed by an unavailable owner read, the answer carries the exact
+    /// ack receipt with `reconciliation_status: "unknown"` rather than
+    /// collapsing the write into the read transport error. A later handoff or
+    /// maintenance failure likewise returns every receipt already obtained
+    /// and marks only the unresolved mutation leg unknown.
     ///
     /// Issue #2731 runs the bounded handoff maintenance after the reconcile
     /// loop on the same recovery path: per presented namespace it retires
@@ -5214,6 +5276,7 @@ impl KernelComposition {
         let presenter = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_connection": evidence.connection,
         });
         let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
@@ -5223,6 +5286,8 @@ impl KernelComposition {
         // ordinary reconcile with no consumed entries still reaches owner
         // maintenance for its presented namespace inventory.
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
+        let mut batch_receipt_items: Vec<serde_json::Value> =
+            Vec::with_capacity(scope.consumed.len());
         let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
             Vec::with_capacity(scope.consumed.len());
         if !pure_read {
@@ -5259,38 +5324,130 @@ impl KernelComposition {
                     "owner_authority_lineage": evidence.authority_lineage,
                     "owner_principal": evidence.principal,
                 }));
+                // The ORS request deliberately stays at its existing closed
+                // shape. This parallel leg carries the exact stream identity
+                // that the Bridge must join to its verified producer tuple;
+                // ORS currently returns namespace/cursor outcomes only.
+                batch_receipt_items.push(serde_json::json!({
+                    "stream_id": stream_id,
+                    "namespace": namespace,
+                    "sequence": sequence,
+                    "expected_revision": revision,
+                    "expected_incarnation": incarnation,
+                    "owner_authority_lineage": evidence.authority_lineage,
+                    "owner_principal": evidence.principal,
+                }));
             }
         }
+        // A mutation receipt keeps the exact operation identity separate from
+        // the later owner read. Its operation id is request-stable, while its
+        // receipt id binds the exact returned outcome: an ORS replay may
+        // legitimately report a different prune/reconciled count even though
+        // it is the same monotonic operation. The two identities therefore
+        // preserve both retry lineage and exact committed evidence.
+        let mutation_receipt = |kind: &'static str,
+                                request: &serde_json::Value,
+                                outcome: &serde_json::Value|
+         -> Result<serde_json::Value, TransportError> {
+            let request_bytes = eliot_contracts::canonical_json_bytes(request)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let request_sha256 = eliot_contracts::sha256_hex(&request_bytes);
+            let operation_material = serde_json::json!({
+                "kind": kind,
+                "request_sha256": request_sha256,
+            });
+            let operation_bytes = eliot_contracts::canonical_json_bytes(&operation_material)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let operation_sha256 = eliot_contracts::sha256_hex(&operation_bytes);
+            let operation_id = format!("{kind}:operation:{operation_sha256}");
+            let outcome_bytes = eliot_contracts::canonical_json_bytes(outcome)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let outcome_sha256 = eliot_contracts::sha256_hex(&outcome_bytes);
+            let receipt_material = serde_json::json!({
+                "operation_id": operation_id.clone(),
+                "outcome": outcome,
+            });
+            let receipt_bytes = eliot_contracts::canonical_json_bytes(&receipt_material)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let receipt_sha256 = eliot_contracts::sha256_hex(&receipt_bytes);
+            let receipt_id = format!("{kind}:receipt:{receipt_sha256}");
+            Ok(serde_json::json!({
+                "version": 1,
+                "kind": kind,
+                "status": "committed",
+                "operation_id": operation_id,
+                "receipt_id": receipt_id,
+                "request_sha256": request_sha256,
+                "operation_sha256": operation_sha256,
+                "outcome_sha256": outcome_sha256,
+                "receipt_sha256": receipt_sha256,
+                "request": request,
+                "outcome": outcome,
+            }))
+        };
+        let mut acknowledgement: Option<serde_json::Value> = None;
         // One ORS write transaction applies the accepted batch; validation
         // precedes commit inside it, so any failure leaves every cursor
         // and payload untouched. A commit failure surfaces as a transport
         // failure — an unknown/replayable result, never evidence that
         // nothing happened.
         if !batch_items.is_empty() {
-            self.generation_gateway
+            let ors_request = serde_json::json!({ "items": batch_items });
+            let outcome = self
+                .generation_gateway
                 .ors
-                .acknowledge_bridge_event_batch(&serde_json::json!({ "items": batch_items }))
+                .acknowledge_bridge_event_batch(&ors_request)
                 .map_err(|error| match error {
                     OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
                         TransportError::Backpressure
                     }
                     _ => TransportError::SessionFenced,
                 })?;
+            let receipt_request = serde_json::json!({ "items": batch_receipt_items });
+            acknowledgement = Some(mutation_receipt(
+                "bridge-event-ack",
+                &receipt_request,
+                &outcome,
+            )?);
         }
-        let mut reconciliation = self
+        let mut reconciliation = match self
             .generation_gateway
             .ors
             .reconcile_bridge_events_for_owner(
                 &presenter,
                 live_generation,
                 scope.recovery_scope.as_ref(),
-            )
-            .map_err(|error| match error {
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                    TransportError::Backpressure
+            ) {
+            Ok(reconciliation) => reconciliation,
+            Err(error) => {
+                // The ORS acknowledgement has already returned successfully,
+                // so its durable effect must remain visible even when the
+                // following owner read cannot be served. The read is a
+                // separate commitment; returning only its transport error
+                // would discard the exact ack identity and force the Bridge
+                // to guess whether replay is safe.
+                if let Some(acknowledgement) = acknowledgement.as_ref() {
+                    return Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "accepted": true,
+                            "reconciliation_status": "unknown",
+                            "handoff_reconciliation_status": "not_run",
+                            "handoff_maintenance_status": "not_run",
+                            "reconciliation": serde_json::Value::Null,
+                            "acknowledgement": acknowledgement,
+                            "handoff_receipts": [],
+                        },
+                    }));
                 }
-                _ => TransportError::SessionFenced,
-            })?;
+                return Err(match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                });
+            }
+        };
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
         reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
@@ -5312,35 +5469,95 @@ impl KernelComposition {
             reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
             return Ok(serde_json::json!({ "status": "known", "value": {
                 "accepted": true,
+                "reconciliation_status": "known",
+                "handoff_reconciliation_status": "not_run",
+                "handoff_maintenance_status": "not_run",
+                "acknowledgement": acknowledgement,
+                "handoff_receipts": [],
                 "reconciliation": reconciliation,
             } }));
         }
         let mut handoffs_reconciled = 0_u64;
-        for (namespace, _, sequence, _, _) in &batch_namespaces {
-            let marked = self
+        let mut handoff_receipts: Vec<serde_json::Value> =
+            Vec::with_capacity(batch_namespaces.len());
+        let mut handoff_failure = false;
+        for (namespace, stream_id, sequence, revision, incarnation) in &batch_namespaces {
+            let Ok(marked) = self
                 .generation_gateway
                 .ors
                 .reconcile_bridge_event_handoffs_checked(namespace, *sequence, &reconcile_key)
-                .map_err(|_| TransportError::SessionFenced)?;
+            else {
+                handoff_failure = true;
+                break;
+            };
             handoffs_reconciled += marked
                 .get("reconciled")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            let handoff_request = serde_json::json!({
+                "namespace": namespace,
+                "stream_id": stream_id,
+                "sequence": sequence,
+                "expected_revision": revision,
+                "expected_incarnation": incarnation,
+                "reconcile_key": reconcile_key,
+            });
+            let Ok(receipt) = mutation_receipt("bridge-event-handoff", &handoff_request, &marked)
+            else {
+                handoff_failure = true;
+                break;
+            };
+            handoff_receipts.push(receipt);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
+        if handoff_failure {
+            // Some handoff mutations may already have committed. Preserve
+            // their exact receipts and the ack receipt, while explicitly
+            // leaving the remaining handoff scope unresolved for replay.
+            reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
+            return Ok(serde_json::json!({ "status": "known", "value": {
+                "accepted": true,
+                "reconciliation_status": "known",
+                "handoff_reconciliation_status": "unknown",
+                "handoff_maintenance_status": "not_run",
+                "acknowledgement": acknowledgement,
+                "handoff_receipts": handoff_receipts,
+                "reconciliation": reconciliation,
+            } }));
+        }
         // Drive maintenance from the authenticated owner inventory as well
         // as this request's consumed frontiers. Quiet streams still need
         // bounded repair/retirement slices after their cursor stops moving.
         // Resolve each stream again after acknowledgement so maintenance
         // uses its current owner namespace, revision, and incarnation.
-        let handoff_maintenance = self.maintain_bridge_event_handoffs_for_owner(
+        let Ok(handoff_maintenance) = self.maintain_bridge_event_handoffs_for_owner(
             &presenter,
             &reconciliation,
             &batch_namespaces,
-        )?;
+        ) else {
+            // Retirement/repair is a separate ORS mutation family. If
+            // it fails after the ack and handoffs above, retain every
+            // completed receipt and expose maintenance as unknown so a
+            // later reconcile can safely converge it.
+            reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
+            return Ok(serde_json::json!({ "status": "known", "value": {
+                "accepted": true,
+                "reconciliation_status": "known",
+                "handoff_reconciliation_status": "known",
+                "handoff_maintenance_status": "unknown",
+                "acknowledgement": acknowledgement,
+                "handoff_receipts": handoff_receipts,
+                "reconciliation": reconciliation,
+            } }));
+        };
         reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
+            "reconciliation_status": "known",
+            "handoff_reconciliation_status": "known",
+            "handoff_maintenance_status": "known",
+            "acknowledgement": acknowledgement,
+            "handoff_receipts": handoff_receipts,
             "reconciliation": reconciliation,
         } }))
     }
@@ -5724,6 +5941,7 @@ fn watchdog_intent_projection_record(
         deadline_unix_ms: payload.expires_at_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        cancellation_target: None,
         result_digest: None,
         result_response: None,
         result_evidence: None,

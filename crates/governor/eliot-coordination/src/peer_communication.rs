@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_contracts::{
     CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
-    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES,
+    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, RequestedReaction,
 };
 use eliot_contracts::{
     BoardEntryState, ClockReading, EpochId, EpochRelation, PeerBoardKind, StateFence,
@@ -220,6 +220,16 @@ const fn live_delta_kind(kind: LivePeerMessageKind) -> LiveDeltaKind {
         LivePeerMessageKind::PlanContradiction => LiveDeltaKind::PlanContradiction,
         LivePeerMessageKind::Obstacle => LiveDeltaKind::Obstacle,
         LivePeerMessageKind::AbandonedDeadEnd => LiveDeltaKind::AbandonedDeadEnd,
+    }
+}
+
+/// Stable wire name of a live-peer route profile for diagnostics.
+const fn live_profile_name(profile: DeliveryPolicy) -> &'static str {
+    match profile {
+        DeliveryPolicy::EventIntegrated => "event_integrated",
+        DeliveryPolicy::ToolOnly => "tool_only",
+        DeliveryPolicy::OfflineWorker => "offline_worker",
+        DeliveryPolicy::Unavailable => "unavailable",
     }
 }
 
@@ -595,6 +605,21 @@ pub trait PeerDeliveryPort {
     fn attempt(&mut self, target: &PeerDeliveryTarget) -> PeerDeliveryAttempt;
 }
 
+/// Injected safe-boundary source for live-peer delivery. The host attests
+/// whether the recipient currently sits at a boundary where the given route
+/// profile may observe an admitted delta. The mailbox never interrupts a
+/// running model/tool step: without an open boundary the item is retained
+/// with a visible degraded record and no delivery is claimed.
+pub trait PeerSafeBoundaryPort {
+    /// Returns whether profile delivery may proceed for this stream now.
+    fn boundary_open(
+        &self,
+        profile: DeliveryPolicy,
+        recipient_session_id: &str,
+        work_item_id: &str,
+    ) -> bool;
+}
+
 /// Recorded durability ceiling of one admitted peer record.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -920,6 +945,89 @@ pub struct PeerConsumeReceipt {
     pub by_session: String,
 }
 
+/// Rejection code for a live delta whose payload plan/wave revision is not
+/// the frozen map revision. The rejected draft is never admitted and never
+/// reports acknowledgement or awareness.
+pub const LIVE_PEER_REJECTION_PLAN_MISMATCH: &str = "plan_revision_mismatch";
+
+/// Closed revalidation/pause vocabulary created by urgent live deltas. An
+/// obligation is a visible recipient duty only; it carries no truth,
+/// authority, completion, plan revision, or write-scope expansion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePeerObligationKind {
+    Revalidate,
+    PauseDependentEffect,
+}
+
+/// One revalidation/pause obligation left by a delivered urgent live delta.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerObligation {
+    pub message_id: String,
+    pub recipient_session_id: String,
+    pub work_item_id: String,
+    pub obligation: LivePeerObligationKind,
+    pub created_at: u64,
+}
+
+/// One visible rejected live-delta admission. Rejections are keyed by the
+/// draft request identity and are separate from delivery and acknowledgement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerRejection {
+    pub request_id: String,
+    pub message_id: String,
+    pub reason_code: String,
+    pub detail: String,
+    pub recorded_at: u64,
+}
+
+/// One public-use observation: the recipient used a delivered live delta in
+/// a decision or artifact. Use never follows from delivery or acknowledgement
+/// alone; it requires an explicit artifact handle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerUseObservation {
+    pub message_id: String,
+    pub by_session: String,
+    pub artifact_handle: String,
+    pub recorded_at: u64,
+}
+
+/// Receipt for one recorded public-use observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerUseReceipt {
+    pub message_id: String,
+    pub artifact_handle: String,
+    pub by_session: String,
+    pub replayed: bool,
+}
+
+/// One outcome-helpfulness observation: a later outcome comparison judged a
+/// delivered live delta helpful or not. Helpfulness is never inferred from
+/// delivery, acknowledgement, or use.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerHelpfulnessObservation {
+    pub message_id: String,
+    pub by_session: String,
+    pub helpful: bool,
+    pub basis_handle: String,
+    pub recorded_at: u64,
+}
+
+/// Receipt for one recorded outcome-helpfulness observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerHelpfulnessReceipt {
+    pub message_id: String,
+    pub helpful: bool,
+    pub by_session: String,
+    pub replayed: bool,
+}
+
 /// Endpoint-loss report: messages that became unknown and stay reconcilable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1005,6 +1113,16 @@ fn validate_live_peer_payload(
     payload
         .validate_against_map(map)
         .map_err(|_| CoordinationError::InvalidField("live_peer_payload"))?;
+    // The sender must be the currently assigned attempt of its claimed work
+    // item: off-plan or forged senders are rejected fail-closed.
+    let sender_assigned = map
+        .entries
+        .iter()
+        .find(|entry| entry.work_item_id == payload.sender_work_item_id)
+        .and_then(|entry| entry.assigned_attempt_id.as_ref());
+    if sender_assigned != Some(&payload.sender_attempt_id) {
+        return Err(CoordinationError::InvalidField("live_peer_payload"));
+    }
     // Live-peer payload references are `PublicReference` handles and carry no
     // blackboard record body. The common checks below bind reference IDs to
     // the draft's evidence/artifact handle lists.
@@ -1067,13 +1185,21 @@ fn build_peer_message(
         })
         .collect();
     let state = if let Some(live) = &live {
-        let reason = if live.profile == DeliveryPolicy::Unavailable {
-            "route profile is unavailable; mailbox item retained without passive awareness"
+        if live.profile == DeliveryPolicy::Unavailable {
+            PeerMessageState::Unavailable {
+                reason:
+                    "route profile is unavailable; mailbox item retained without passive awareness"
+                        .to_owned(),
+            }
+        } else if !recipient_live {
+            PeerMessageState::Unavailable {
+                reason: format!(
+                    "recipient session {} is not active",
+                    draft.recipient_session_id
+                ),
+            }
         } else {
-            "safe-boundary delivery integration is unavailable; mailbox item retained"
-        };
-        PeerMessageState::Unavailable {
-            reason: reason.to_owned(),
+            PeerMessageState::Staged
         }
     } else if recipient_live {
         PeerMessageState::Staged
@@ -1575,6 +1701,20 @@ impl CoordinationOwner {
         }
         let now = clock.now_ms();
         let recipient_live = self.validate_enqueue_draft(draft, now)?;
+        if payload.plan_revision != map.plan_revision || payload.wave_revision != map.wave_revision
+        {
+            self.live_peer_rejections.insert(
+                draft.request_id.clone(),
+                LivePeerRejection {
+                    request_id: draft.request_id.clone(),
+                    message_id: draft.message_id.clone(),
+                    reason_code: LIVE_PEER_REJECTION_PLAN_MISMATCH.to_owned(),
+                    detail: "payload plan/wave revision is not the frozen map revision".to_owned(),
+                    recorded_at: now,
+                },
+            );
+            return Err(CoordinationError::InvalidField("live_peer_payload"));
+        }
         validate_live_peer_payload(draft, payload, map)?;
         if let Some(replayed) = self.replay_live_peer_delta(draft, payload, profile)? {
             return Ok(replayed);
@@ -1775,6 +1915,190 @@ impl CoordinationOwner {
         })
     }
 
+    /// Delivers one admitted live delta at an attested safe boundary.
+    ///
+    /// Delivery profiles behave explicitly: `Unavailable` never calls the
+    /// delivery port and retains a visible degraded record; the remaining
+    /// profiles proceed only while the boundary port attests an open
+    /// boundary for the stream, otherwise retaining a visible degraded
+    /// record. The generic delivery path keeps refusing live deltas so only
+    /// this boundary-gated path can observe them, never interrupting the
+    /// current step. Redelivery of an observed message is a counted late
+    /// duplicate. A delivered urgent delta leaves a revalidation/pause
+    /// obligation and nothing else: no truth, authority, completion, plan
+    /// revision, or write-scope expansion is created.
+    pub fn deliver_live_peer_delta(
+        &mut self,
+        message_id: &str,
+        endpoint: &str,
+        boundary: &dyn PeerSafeBoundaryPort,
+        clock: &dyn PeerClockPort,
+        delivery: &mut dyn PeerDeliveryPort,
+    ) -> Result<PeerDeliveryReceipt, CoordinationError> {
+        peer_text(message_id, "message_id")?;
+        peer_text(endpoint, "endpoint")?;
+        let now = clock.now_ms();
+        if self.peer_expire_if_due(message_id, now).is_err() {
+            return Err(CoordinationError::PeerExpired(message_id.to_owned()));
+        }
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "peer_message",
+                id: message_id.to_owned(),
+            }
+        })?;
+        if snapshot.kind != PeerMessageKind::LivePeerDelta {
+            return Err(CoordinationError::InvalidField("kind"));
+        }
+        let Some(payload) = snapshot.live_peer_payload.clone() else {
+            return Err(CoordinationError::InvalidState);
+        };
+        let Some(profile) = snapshot.live_delivery_profile else {
+            return Err(CoordinationError::InvalidState);
+        };
+        match &snapshot.state {
+            PeerMessageState::Delivered { .. }
+            | PeerMessageState::Acknowledged { .. }
+            | PeerMessageState::Consumed { .. } => {
+                return self.push_live_peer_duplicate(message_id, endpoint, now);
+            }
+            PeerMessageState::Cancelled { .. } => {
+                return Err(CoordinationError::InvalidState);
+            }
+            PeerMessageState::Expired { .. } => {
+                return Err(CoordinationError::PeerExpired(message_id.to_owned()));
+            }
+            PeerMessageState::Staged
+            | PeerMessageState::DeliveryAttempted { .. }
+            | PeerMessageState::Unavailable { .. }
+            | PeerMessageState::Unknown { .. } => {}
+        }
+        let outcome = if profile == DeliveryPolicy::Unavailable {
+            PeerDeliveryAttempt::Unavailable {
+                reason:
+                    "route profile is unavailable; mailbox item retained without passive awareness"
+                        .to_owned(),
+            }
+        } else if !boundary.boundary_open(
+            profile,
+            &snapshot.stream.recipient_session_id,
+            &snapshot.stream.work_item_id,
+        ) {
+            PeerDeliveryAttempt::Unavailable {
+                reason: format!(
+                    "no safe boundary is open for profile {}; mailbox item retained",
+                    live_profile_name(profile)
+                ),
+            }
+        } else {
+            let target = PeerDeliveryTarget {
+                message_id: message_id.to_owned(),
+                recipient_session_id: snapshot.stream.recipient_session_id.clone(),
+                endpoint: endpoint.to_owned(),
+                stream_seq: snapshot.stream_seq,
+            };
+            delivery.attempt(&target)
+        };
+        self.peer_push_attempt(message_id, now, outcome.clone())?;
+        let stored = self
+            .peer_messages
+            .get_mut(message_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        stored.state = match &outcome {
+            PeerDeliveryAttempt::Delivered { endpoint } => PeerMessageState::Delivered {
+                endpoint: endpoint.clone(),
+            },
+            PeerDeliveryAttempt::Unavailable { reason } => PeerMessageState::Unavailable {
+                reason: reason.clone(),
+            },
+            PeerDeliveryAttempt::Unknown { reason } => PeerMessageState::Unknown {
+                reason: reason.clone(),
+            },
+        };
+        let attempts = stored.attempts;
+        let seq = stored.stream_seq;
+        if matches!(outcome, PeerDeliveryAttempt::Delivered { .. }) {
+            self.create_live_peer_obligation(message_id, &payload, &snapshot.stream, now);
+        }
+        Ok(PeerDeliveryReceipt {
+            message_id: message_id.to_owned(),
+            stream_seq: seq,
+            outcome,
+            attempts,
+            duplicate: false,
+        })
+    }
+
+    /// Records a counted late duplicate for an already observed live
+    /// delta without creating a second obligation or calling the port.
+    fn push_live_peer_duplicate(
+        &mut self,
+        message_id: &str,
+        endpoint: &str,
+        now: u64,
+    ) -> Result<PeerDeliveryReceipt, CoordinationError> {
+        self.peer_push_attempt(
+            message_id,
+            now,
+            PeerDeliveryAttempt::Delivered {
+                endpoint: endpoint.to_owned(),
+            },
+        )?;
+        let stored = self
+            .peer_messages
+            .get_mut(message_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        stored.duplicate_deliveries = stored.duplicate_deliveries.saturating_add(1);
+        let attempts = stored.attempts;
+        let seq = stored.stream_seq;
+        Ok(PeerDeliveryReceipt {
+            message_id: message_id.to_owned(),
+            stream_seq: seq,
+            outcome: PeerDeliveryAttempt::Delivered {
+                endpoint: endpoint.to_owned(),
+            },
+            attempts,
+            duplicate: true,
+        })
+    }
+
+    /// Records the revalidation/pause obligation of a delivered urgent live
+    /// delta. Only `assumption_invalidated`, `plan_contradiction`, and
+    /// `before_next_dependent_effect` deltas qualify, and only the
+    /// obligation record is written: truth, authority, completion, plan
+    /// revision, and write scope are untouched.
+    fn create_live_peer_obligation(
+        &mut self,
+        message_id: &str,
+        payload: &LivePeerMessagePayload,
+        stream: &PeerStreamId,
+        now: u64,
+    ) {
+        let qualifies = matches!(
+            payload.kind,
+            LivePeerMessageKind::AssumptionInvalidated | LivePeerMessageKind::PlanContradiction
+        ) || payload.urgency == MessageUrgency::BeforeNextDependentEffect;
+        if !qualifies || self.live_peer_obligations.contains_key(message_id) {
+            return;
+        }
+        let obligation = match payload.requested_reaction {
+            RequestedReaction::PauseDependentEffect => LivePeerObligationKind::PauseDependentEffect,
+            RequestedReaction::Inform
+            | RequestedReaction::Revalidate
+            | RequestedReaction::Reply => LivePeerObligationKind::Revalidate,
+        };
+        self.live_peer_obligations.insert(
+            message_id.to_owned(),
+            LivePeerObligation {
+                message_id: message_id.to_owned(),
+                recipient_session_id: stream.recipient_session_id.clone(),
+                work_item_id: stream.work_item_id.clone(),
+                obligation,
+                created_at: now,
+            },
+        );
+    }
+
     /// Acknowledges one exact message revision.
     ///
     /// Acknowledgement proves only that revision reached the recipient; it
@@ -1905,6 +2229,197 @@ impl CoordinationOwner {
             evidence_handle: evidence_handle.to_owned(),
             by_session: by_session.to_owned(),
         })
+    }
+
+    /// Records one public-use observation for a delivered live delta.
+    ///
+    /// Use is separate from delivery and acknowledgement: it requires the
+    /// recipient session, a seen state, and an explicit artifact handle.
+    /// The mailbox state is unchanged; only the use journal grows.
+    pub fn record_live_peer_use(
+        &mut self,
+        message_id: &str,
+        by_session: &str,
+        artifact_handle: &str,
+        clock: &dyn PeerClockPort,
+    ) -> Result<LivePeerUseReceipt, CoordinationError> {
+        peer_text(message_id, "message_id")?;
+        peer_text(by_session, "by_session")?;
+        peer_text(artifact_handle, "artifact_handle")?;
+        let now = clock.now_ms();
+        if self.peer_expire_if_due(message_id, now).is_err() {
+            return Err(CoordinationError::PeerExpired(message_id.to_owned()));
+        }
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "peer_message",
+                id: message_id.to_owned(),
+            }
+        })?;
+        if snapshot.kind != PeerMessageKind::LivePeerDelta || snapshot.live_peer_payload.is_none() {
+            return Err(CoordinationError::InvalidField("kind"));
+        }
+        if snapshot.stream.recipient_session_id != by_session {
+            return Err(CoordinationError::LeaseOwnerMismatch {
+                holder: snapshot.stream.recipient_session_id.clone(),
+            });
+        }
+        match &snapshot.state {
+            PeerMessageState::Delivered { .. }
+            | PeerMessageState::Acknowledged { .. }
+            | PeerMessageState::Consumed { .. } => {}
+            PeerMessageState::Unknown { .. } => {
+                return Err(CoordinationError::PeerDeliveryUnknown(
+                    message_id.to_owned(),
+                ));
+            }
+            PeerMessageState::Staged
+            | PeerMessageState::DeliveryAttempted { .. }
+            | PeerMessageState::Unavailable { .. }
+            | PeerMessageState::Expired { .. }
+            | PeerMessageState::Cancelled { .. } => {
+                return Err(CoordinationError::InvalidState);
+            }
+        }
+        let uses = self
+            .live_peer_uses
+            .entry(message_id.to_owned())
+            .or_default();
+        if uses.iter().any(|existing| {
+            existing.by_session == by_session && existing.artifact_handle == artifact_handle
+        }) {
+            return Ok(LivePeerUseReceipt {
+                message_id: message_id.to_owned(),
+                artifact_handle: artifact_handle.to_owned(),
+                by_session: by_session.to_owned(),
+                replayed: true,
+            });
+        }
+        uses.push(LivePeerUseObservation {
+            message_id: message_id.to_owned(),
+            by_session: by_session.to_owned(),
+            artifact_handle: artifact_handle.to_owned(),
+            recorded_at: now,
+        });
+        Ok(LivePeerUseReceipt {
+            message_id: message_id.to_owned(),
+            artifact_handle: artifact_handle.to_owned(),
+            by_session: by_session.to_owned(),
+            replayed: false,
+        })
+    }
+
+    /// Records one outcome-helpfulness observation for a delivered live
+    /// delta. Helpfulness is separate from delivery, acknowledgement, and
+    /// use: it requires the recipient session, a seen state, and an
+    /// explicit outcome basis handle. A changed re-record conflicts.
+    pub fn record_live_peer_helpfulness(
+        &mut self,
+        message_id: &str,
+        by_session: &str,
+        helpful: bool,
+        basis_handle: &str,
+        clock: &dyn PeerClockPort,
+    ) -> Result<LivePeerHelpfulnessReceipt, CoordinationError> {
+        peer_text(message_id, "message_id")?;
+        peer_text(by_session, "by_session")?;
+        peer_text(basis_handle, "basis_handle")?;
+        let now = clock.now_ms();
+        if self.peer_expire_if_due(message_id, now).is_err() {
+            return Err(CoordinationError::PeerExpired(message_id.to_owned()));
+        }
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "peer_message",
+                id: message_id.to_owned(),
+            }
+        })?;
+        if snapshot.kind != PeerMessageKind::LivePeerDelta || snapshot.live_peer_payload.is_none() {
+            return Err(CoordinationError::InvalidField("kind"));
+        }
+        if snapshot.stream.recipient_session_id != by_session {
+            return Err(CoordinationError::LeaseOwnerMismatch {
+                holder: snapshot.stream.recipient_session_id.clone(),
+            });
+        }
+        match &snapshot.state {
+            PeerMessageState::Delivered { .. }
+            | PeerMessageState::Acknowledged { .. }
+            | PeerMessageState::Consumed { .. } => {}
+            PeerMessageState::Unknown { .. } => {
+                return Err(CoordinationError::PeerDeliveryUnknown(
+                    message_id.to_owned(),
+                ));
+            }
+            PeerMessageState::Staged
+            | PeerMessageState::DeliveryAttempted { .. }
+            | PeerMessageState::Unavailable { .. }
+            | PeerMessageState::Expired { .. }
+            | PeerMessageState::Cancelled { .. } => {
+                return Err(CoordinationError::InvalidState);
+            }
+        }
+        if let Some(existing) = self.live_peer_helpfulness.get(message_id) {
+            if existing.by_session == by_session
+                && existing.helpful == helpful
+                && existing.basis_handle == basis_handle
+            {
+                return Ok(LivePeerHelpfulnessReceipt {
+                    message_id: message_id.to_owned(),
+                    helpful,
+                    by_session: by_session.to_owned(),
+                    replayed: true,
+                });
+            }
+            return Err(CoordinationError::PeerSemanticConflict(
+                message_id.to_owned(),
+            ));
+        }
+        self.live_peer_helpfulness.insert(
+            message_id.to_owned(),
+            LivePeerHelpfulnessObservation {
+                message_id: message_id.to_owned(),
+                by_session: by_session.to_owned(),
+                helpful,
+                basis_handle: basis_handle.to_owned(),
+                recorded_at: now,
+            },
+        );
+        Ok(LivePeerHelpfulnessReceipt {
+            message_id: message_id.to_owned(),
+            helpful,
+            by_session: by_session.to_owned(),
+            replayed: false,
+        })
+    }
+
+    /// Returns the revalidation/pause obligation left by a live delta, if any.
+    #[must_use]
+    pub fn live_peer_obligation(&self, message_id: &str) -> Option<&LivePeerObligation> {
+        self.live_peer_obligations.get(message_id)
+    }
+
+    /// Returns the visible rejection of a live-delta draft, if any.
+    #[must_use]
+    pub fn live_peer_rejection(&self, request_id: &str) -> Option<&LivePeerRejection> {
+        self.live_peer_rejections.get(request_id)
+    }
+
+    /// Returns the recorded public-use observations of a live delta.
+    #[must_use]
+    pub fn live_peer_use_observations(&self, message_id: &str) -> &[LivePeerUseObservation] {
+        self.live_peer_uses
+            .get(message_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the recorded outcome-helpfulness observation, if any.
+    #[must_use]
+    pub fn live_peer_helpfulness(
+        &self,
+        message_id: &str,
+    ) -> Option<&LivePeerHelpfulnessObservation> {
+        self.live_peer_helpfulness.get(message_id)
     }
 
     /// Cancels one staged message. Only the sender cancels, and cancellation

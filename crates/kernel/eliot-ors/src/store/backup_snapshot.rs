@@ -2219,6 +2219,25 @@ struct OperationalSegment {
     continuation: OrsOperationalContinuation,
     /// Encoded bytes this segment charged to the page.
     page_bytes: u64,
+    /// The cursor naming the walk's tail after this page's rows, whether or not an
+    /// eligible row is still behind it (issue #2967, W6/A2).
+    ///
+    /// Equal to `continuation.next` while the walk is still OPEN, and the
+    /// MATERIALIZED exhausted tail once it is not. The two are deliberately not the
+    /// same field: `next` is what the page OWES the snapshot (and is `None` the
+    /// moment the frozen denominator is reached, so a `Complete` snapshot declares no
+    /// outstanding operational cursor), while this is what a FOLLOWING page must be
+    /// read under. When the walk is exhausted the following pages exist only to carry
+    /// the family axes, and they must still be read under the operational walk's real
+    /// tail rather than under its start, or the walk is re-read and every operational
+    /// row is exported twice.
+    ///
+    /// It is materialized here rather than at the call site because it cannot be
+    /// recovered downstream: the durable key and the chained prefix digest are over
+    /// the key the owner walked under, which a page's `OrsBackupEntry` does not carry
+    /// (an entry carries the record id, the order and the payload digest). The walk
+    /// is the only place that has both, and it already has them.
+    operational_tail: OrsOperationalCursor,
 }
 
 /// The walk's running state as this page advanced it (issue #2967).
@@ -2453,7 +2472,14 @@ fn operational_segment(
             ),
         ));
     }
-    let next = progress.open.then(|| OrsOperationalCursor {
+    // ONE assembly of the boundary this page's walk ended at, read two ways. Built
+    // unconditionally, because an exhausted walk still HAS a real boundary and the
+    // next page has to be read under it; `next` below is then only the question of
+    // whether that boundary is still owed. When the page emitted nothing at all the
+    // chain is resumed from the in-force cursor's own commitment and every field is
+    // that cursor's, so an exhausted empty page re-reads to the same empty segment
+    // rather than a second copy of the walk.
+    let operational_tail = OrsOperationalCursor {
         version: cursor.version,
         identity: cursor.identity.clone(),
         after_order: progress.after_order,
@@ -2461,7 +2487,8 @@ fn operational_segment(
         emitted_rows: progress.emitted_rows,
         emitted_bytes: progress.emitted_bytes,
         emitted_prefix_digest: progress.chain.link().to_owned(),
-    });
+    };
+    let next = progress.open.then(|| operational_tail.clone());
     Ok(OperationalSegment {
         entries: progress.entries,
         continuation: OrsOperationalContinuation {
@@ -2469,6 +2496,7 @@ fn operational_segment(
             next,
         },
         page_bytes: progress.page_bytes,
+        operational_tail,
     })
 }
 
@@ -2863,9 +2891,33 @@ pub(super) fn export_page(
     // produced at all. It is the same transaction as the page, so it describes
     // the same moment (issue #953, A5).
     check_row_family_census(&read)?;
-    let page = export_page_in(&read, request, page_index, &observation)?;
+    // The walk's end boundary is dropped here deliberately, and not by oversight: a
+    // single-page export has no following page, so no later read is ever made under
+    // this boundary. The multi-page loop in `export_pages_in` is the only caller that
+    // needs it, and it takes it directly.
+    let page = export_page_in(&read, request, page_index, &observation)?.page;
     drop(read);
     Ok(page)
+}
+
+/// One page as it leaves the builder, plus the operational boundary the walk it
+/// just performed actually reached (issue #2967, W6/A2).
+///
+/// The page alone does not carry its own walk's end boundary, because a page's
+/// contract is what it OWES — an exhausted walk reports no next cursor — while the
+/// page LOOP needs the boundary a FOLLOWING page must be read under even when the
+/// walk is already finished and the following pages carry nothing but family rows.
+/// Those are two different questions with two different answers, and the one that
+/// must not be answered wrongly is the loop's: reading the next page under the
+/// walk's START instead of its TAIL re-emits every operational row the snapshot has
+/// already exported. The builder therefore returns both, and the single-page
+/// entrypoint ([`export_page`]) drops the boundary for the honest reason that a
+/// one-page export has no following page to be read under.
+struct ExportedPage {
+    /// The validated, digested page itself.
+    page: OrsBackupPage,
+    /// The operational walk's boundary after this page's rows, exhausted or not.
+    operational_tail: OrsOperationalCursor,
 }
 
 /// Builds one backup page under the caller's capture transaction (issue #953).
@@ -2892,7 +2944,7 @@ pub(super) fn export_page(
 /// [`MAX_BACKUP_BYTES`], so the transaction's lifetime is bounded work, not
 /// unbounded wait (A13.9: no unbounded wait may be held).
 ///
-/// The operational-history walk is the page's FIRST segment and is paged by its
+/// The operational-history walk is this page's FIRST segment and is paged by its
 /// own owner-issued cursor under its own frozen window (issue #2967). Neither
 /// cursor-paged family (#269 process-stream recovery, #1971 versioned artifacts)
 /// shares that cursor: their rows carry no canonical operation order, so each is
@@ -2908,7 +2960,7 @@ fn export_page_in(
     request: &OrsBackupRequest,
     page_index: u32,
     observation: &StoreFenceObservation,
-) -> Result<OrsBackupPage, OrsError> {
+) -> Result<ExportedPage, OrsError> {
     if request.page_entries == 0 {
         return Err(OrsError::InvalidField {
             field: "backup.page_entries",
@@ -3001,7 +3053,10 @@ fn export_page_in(
     };
     page.page_digest = page.expected_page_digest();
     page.validate_binding()?;
-    Ok(page)
+    Ok(ExportedPage {
+        page,
+        operational_tail: operational.operational_tail,
+    })
 }
 
 /// The page loop's whole output, gathered under the caller's capture
@@ -3042,7 +3097,11 @@ struct SnapshotPages {
 /// operational axis is the one this issue adds: page N+1 is read under page N's
 /// actual emitted tail, so the walk neither repeats nor skips a row in the sparse
 /// order domain, and the loop can no longer spend its whole page budget re-reading
-/// a stride window.
+/// a stride window. The tail is carried even when the walk is already EXHAUSTED and
+/// page N therefore owes no continuation: the pages after an exhausted walk carry
+/// the family axes alone, and they are read under the walk's real boundary rather
+/// than its start, so "the walk finished early" never degrades into "the walk runs
+/// again" (issue #2967, W6/A2).
 fn export_pages_in(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -3053,12 +3112,14 @@ fn export_pages_in(
     let mut entry_count: u64 = 0;
     let mut last_page_was_final = false;
     for index in 0..u32::from(request.max_pages) {
-        let page = export_page_in(read, &continuing, index, observation)?;
+        let ExportedPage {
+            page,
+            operational_tail,
+        } = export_page_in(read, &continuing, index, observation)?;
         entry_count = entry_count
             .checked_add(page.entries.len() as u64)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
         let next_operational = page.operational_continuation.next.clone();
-        let in_force_operational = page.operational_continuation.cursor.clone();
         let next_recovery = page
             .family_continuation
             .as_ref()
@@ -3075,13 +3136,26 @@ fn export_pages_in(
         if let Some(next) = next_operational {
             continuing = continuing.with_operational_cursor(next)?;
         } else {
-            // The operational axis always carries a cursor forward, even when the
-            // walk is already exhausted, because an exhausted walk is still a real
-            // boundary and the next page is a family page. Dropping the cursor here
-            // would leave the request with none, and the page function would have to
-            // refuse a page it can answer exactly - re-reading an exhausted window
-            // yields the same empty segment, at the cost of one seek.
-            continuing = continuing.with_operational_cursor(in_force_operational)?;
+            // The walk is EXHAUSTED, not merely unfinished: `next` is `None` because
+            // the frozen denominator was reached, which `operational_segment` has
+            // already cross-checked against a second measuring pass on this same read
+            // transaction. The next page therefore exists only to carry the family
+            // axes, and it must still be read under the operational walk's real TAIL,
+            // which is why the tail was materialized during the walk and is carried
+            // here.
+            //
+            // This used to carry the in-force START cursor forward instead, on the
+            // stated ground that "re-reading an exhausted window yields the same empty
+            // segment". That was false of the code beneath it and it re-emitted the
+            // whole walk: `check_operational_cursor_boundary` is a no-op at
+            // `emitted_rows == 0`, so a start cursor is not merely cheaper to re-read
+            // but indistinguishable from a legitimate one, and `operational_seek`
+            // then seeks the frozen lower bound and walks the entire window again.
+            // Every operational row this snapshot had already exported was exported a
+            // second time under a fresh `record_id`-bearing entry, and the crate's own
+            // page-chain rule refused the result. Carrying the tail is what makes the
+            // remaining pages carry families alone (issue #2967, W6/A2).
+            continuing = continuing.with_operational_cursor(operational_tail)?;
         }
         if let Some(next) = next_recovery {
             continuing = attach_family_cursor(continuing, next)?;

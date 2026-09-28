@@ -6,10 +6,10 @@ use eliot_contracts::ArtifactId;
 use eliot_learning_contracts::{
     ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus,
     AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate, CampaignLearningStateView,
-    ContractBinding, DeliverySection, DimensionAssessment, DimensionStatus,
+    ContractBinding, DeliverySection, DeliveryStatus, DimensionAssessment, DimensionStatus,
     HarnessActivationReceiptCandidate, LearningAssessmentCandidate, LearningStateViewRecipe,
-    MetricObservation, RetrievalSection, StageDisposition, StageObservation, TargetId,
-    identity::validate_external_id,
+    MetricObservation, OverlayEligibility, RetrievalSection, RetrievalStatus, StageDisposition,
+    StageObservation, TargetId, identity::validate_external_id, overlay_eligibility,
 };
 
 use crate::{
@@ -20,6 +20,117 @@ use crate::{
         MissingAssessmentField,
     },
 };
+
+/// What an owner actually observed about eligibility and retrieval.
+///
+/// A caller supplies the observation, never the resulting
+/// [`RetrievalStatus`]: [`derive_retrieval`] runs the canonical
+/// [`overlay_eligibility`] predicate over the sealed overlay's own
+/// invalidation, expiry, and campaign fields and then combines it with
+/// whether the surface was retrieved and whether an expansion/tool-query
+/// actually happened. Nothing here can assert eligibility.
+#[derive(serde::Serialize)]
+pub struct ObservedRetrieval<'a> {
+    /// Campaign this attempt belongs to, used as the requesting campaign.
+    pub requesting_campaign_id: &'a str,
+    /// Whether the requesting binding matches the admitted overlay scope.
+    pub binding_compatible: bool,
+    /// Owner wall-clock observation in Unix milliseconds.
+    pub now_ms: u64,
+    /// Fresh governed cross-task admission, when one was issued.
+    pub cross_task: Option<&'a eliot_learning_contracts::CrossTaskAdmission>,
+    /// Whether the surface was actually retrieved for this attempt.
+    pub retrieved: bool,
+    /// Expansion or tool-query refs backing an expanded retrieval.
+    pub expansion_or_tool_query_refs: &'a [ArtifactId],
+}
+
+/// What an owner actually observed about delivery.
+///
+/// A caller supplies the observation, never the resulting
+/// [`DeliveryStatus`]. [`derive_delivery`] maps a delivered packet position
+/// alone to [`DeliveryStatus::Partial`], because a position with no
+/// serialized digest is not a complete delivery, and a delivered surface with
+/// no packet facts at all to [`DeliveryStatus::Missing`], because a delivery
+/// whose bytes are unrecorded is not evidence of delivery.
+#[derive(serde::Serialize)]
+pub struct ObservedDelivery<'a> {
+    /// Whether any delivery was attempted for this attempt.
+    pub attempted: bool,
+    /// Position of the delivered packet, when recorded.
+    pub packet_position: Option<u64>,
+    /// Serialized digest of the delivered packet, when recorded.
+    pub serialized_digest: Option<&'a str>,
+    /// Serialized byte size of the delivered packet, when recorded.
+    pub bytes: Option<u64>,
+    /// Actual measured tokens of the delivered packet, when recorded.
+    pub actual_tokens: Option<u64>,
+    /// Acknowledgement the receiving surface returned, when one exists.
+    pub acknowledgement_ref: Option<&'a ArtifactId>,
+}
+
+/// What an owner actually observed about qualifying observable use.
+///
+/// This is the ONLY input to `activation.status`. A caller cannot supply a
+/// use reference, and an acknowledgement can never enter here:
+/// [`derive_activation`] reads only `first_qualifying_use_ref`, and
+/// `activation.status = OBSERVED` additionally requires a real delivery
+/// status. An acknowledgement is carried separately in
+/// [`ActivationSection::acknowledgement_ref`] and is never a use reference.
+#[derive(serde::Serialize)]
+pub struct ObservedUse<'a> {
+    /// Whether an owner actually observed any qualifying use at all.
+    ///
+    /// `false` is the honest "no qualifying activation evidence was
+    /// observed" observation; it does not prove non-use.
+    pub observed_any: bool,
+    /// The first qualifying observable use an owner recorded.
+    ///
+    /// This is the evidence itself. It is never derived, defaulted,
+    /// substituted, or filled in from an acknowledgement.
+    pub first_qualifying_use_ref: Option<&'a ArtifactId>,
+    /// Whether the attempt surface could be observed for qualifying use.
+    ///
+    /// `false` means observability was missing or inconclusive, which is
+    /// `UNKNOWN` and never presumed either compliant or non-use.
+    pub observable: bool,
+}
+
+/// What an owner actually observed about adherence.
+///
+/// A caller supplies checkpoint, action, and verifier evidence, never the
+/// resulting [`AdherenceStatus`]. [`derive_adherence`] records an observed
+/// disposition only when qualifying use was itself observed AND both
+/// evidence classes are non-empty; a disagreement between the checkpoint
+/// signal and the recorded action/verifier evidence is
+/// [`AdherenceStatus::ObservedViolated`] with both sets of refs retained.
+/// Any absent or inconclusive evidence stays `UNKNOWN`.
+#[derive(serde::Serialize)]
+pub struct ObservedAdherence<'a> {
+    /// Explicit early/mid/final checkpoint signal the owner recorded.
+    pub checkpoint_status: AdherenceStatus,
+    /// Checkpoint refs backing the recorded signal.
+    pub checkpoint_refs: &'a [ArtifactId],
+    /// Prescribed-or-avoided action and required verifier refs the owner
+    /// recorded.
+    pub action_and_verifier_refs: &'a [ArtifactId],
+    /// The explicit violation disposition an owner observed.
+    pub observed_violation: Option<AdherenceStatus>,
+}
+
+/// The five orthogonal receipt sections derived from observed evidence.
+pub(crate) struct DerivedSections {
+    /// Eligibility reason plus the derived retrieval section.
+    pub eligibility_and_retrieval_reason: Option<String>,
+    /// Derived retrieval section.
+    pub retrieval: RetrievalSection,
+    /// Derived delivery section.
+    pub delivery: DeliverySection,
+    /// Derived observable-activation section.
+    pub activation: ActivationSection,
+    /// Derived adherence section.
+    pub adherence: AdherenceSection,
+}
 
 /// Exact immutable evidence and lineage supplied to one assessment call.
 pub struct AssessmentInput<'a> {
@@ -77,16 +188,16 @@ pub struct AssessmentInput<'a> {
     pub procedure_refs: &'a [ArtifactId],
     /// Preserved success set or constraints ref, when one applies.
     pub preserved_success_ref: Option<&'a ArtifactId>,
-    /// Eligibility and retrieval reason for this attempt.
-    pub eligibility_and_retrieval_reason: Option<&'a str>,
-    /// Retrieval evidence; orthogonal to delivery/activation/adherence.
-    pub retrieval: &'a RetrievalSection,
-    /// Delivery evidence; orthogonal to retrieval/activation/adherence.
-    pub delivery: &'a DeliverySection,
-    /// Observable-activation evidence; orthogonal to the other sections.
-    pub activation: &'a ActivationSection,
-    /// Adherence evidence; orthogonal to the other sections.
-    pub adherence: &'a AdherenceSection,
+    /// Retrieval observations; `RetrievalStatus` is DERIVED from them.
+    pub retrieval: ObservedRetrieval<'a>,
+    /// Delivery observations; `DeliveryStatus` is DERIVED from them.
+    pub delivery: ObservedDelivery<'a>,
+    /// Observable-use observations; `ActivationStatus` is DERIVED from them
+    /// together with the derived delivery status.
+    pub observable_use: ObservedUse<'a>,
+    /// Checkpoint/action/verifier observations; `AdherenceStatus` is DERIVED
+    /// from them together with the derived activation status.
+    pub adherence: ObservedAdherence<'a>,
     /// Conflict, suppression or compaction-loss refs for this attempt.
     pub conflicts_suppression_or_compaction_loss: &'a [ArtifactId],
     /// Downstream decision, action, artifact and verifier refs.
@@ -105,7 +216,8 @@ pub fn assess_learning_activation(
     validate_identity(input)?;
     let missing = missing_mandatory_ids(input);
     if !missing.is_empty() {
-        let snapshot = snapshot(input)?;
+        let sections = derive_sections(input)?;
+        let snapshot = snapshot(input, &sections)?;
         let incomplete = IncompleteAssessment {
             input: snapshot,
             binding: input.binding.clone(),
@@ -125,11 +237,12 @@ pub fn assess_learning_activation(
     }
     validate_owner_lineage(input)?;
     validate_activation_sections(input)?;
+    let sections = derive_sections(input)?;
     prove_overlay_displayable(input)?;
-    let input_snapshot = snapshot(input)?;
+    let input_snapshot = snapshot(input, &sections)?;
     let stages = expected_stages(input.stages, input.policy)?;
     let dimensions = expected_dimensions(input.dimensions, input.policy)?;
-    let activation = build_activation_candidate(input, stages)?;
+    let activation = build_activation_candidate(input, stages, sections)?;
     let mut assessment = LearningAssessmentCandidate {
         binding: input.binding.clone(),
         target: input.target.clone(),
@@ -170,16 +283,265 @@ pub fn assess_learning_activation(
     Ok(outcome)
 }
 
-/// Build the immutable activation receipt candidate from caller evidence.
+/// Derive the eligibility verdict and the retrieval section from evidence.
 ///
-/// All harness, compiler, retrieval, delivery, activation, adherence, and
-/// downstream fields are cloned from the supplied input without synthesis;
-/// the guards in [`validate_activation_sections`] and the canonical
-/// [`HarnessActivationReceiptCandidate::validate_against_lineage`] reject
-/// ack-as-use substitution and evidence-free observed adherence.
+/// Eligibility is never supplied: it is the canonical
+/// [`overlay_eligibility`] predicate evaluated over the sealed overlay's own
+/// `invalidated`, `expires_at_ms`, and `campaign_id` fields, the requesting
+/// campaign, the binding-compatibility observation, and any fresh governed
+/// cross-task admission. A non-eligible surface can never be reported as
+/// eligible, because the caller has no field that could say so.
+///
+/// Retrieval is then derived from eligibility plus what was actually
+/// observed, and stays orthogonal to delivery: an eligible surface that was
+/// never retrieved is `ELIGIBLE_NOT_RETRIEVED`, and retrieval evidence is
+/// recorded for an ineligible surface only as the explicit refusal.
+fn derive_retrieval(
+    input: &AssessmentInput<'_>,
+) -> Result<(Option<String>, RetrievalSection), ActivationAssessmentError> {
+    let overlay = input.overlay;
+    let eligibility = overlay_eligibility(
+        overlay.campaign_id.as_str(),
+        input.retrieval.requesting_campaign_id,
+        overlay.invalidated,
+        overlay.expires_at_ms,
+        input.retrieval.now_ms,
+        input.retrieval.binding_compatible,
+        input.retrieval.cross_task,
+    );
+    // An ineligible surface that a caller also claims to have retrieved is
+    // contradictory evidence, not a status to pick a rung for: refuse
+    // instead of silently downgrading to a retrieval status.
+    if !matches!(eligibility, OverlayEligibility::Eligible) && input.retrieval.retrieved {
+        return Err(ActivationAssessmentError::LineageMismatch {
+            field: "retrieval.eligibility",
+        });
+    }
+    ensure_unique_local(
+        input.retrieval.expansion_or_tool_query_refs,
+        "retrieval.expansion_or_tool_query_refs",
+    )?;
+    let (reason, status) = match eligibility {
+        OverlayEligibility::NotEligible { reason } => {
+            (Some(reason.to_owned()), RetrievalStatus::NotEligible)
+        }
+        OverlayEligibility::Eligible if !input.retrieval.retrieved => {
+            (None, RetrievalStatus::EligibleNotRetrieved)
+        }
+        OverlayEligibility::Eligible if input.retrieval.expansion_or_tool_query_refs.is_empty() => {
+            (None, RetrievalStatus::Retrieved)
+        }
+        OverlayEligibility::Eligible => (None, RetrievalStatus::Expanded),
+    };
+    Ok((
+        reason,
+        RetrievalSection {
+            status,
+            expansion_or_tool_query_refs: input.retrieval.expansion_or_tool_query_refs.to_vec(),
+        },
+    ))
+}
+
+/// Derive the delivery section from observed delivery facts.
+///
+/// A caller cannot name a delivery status. An attempt that never attempted
+/// delivery is [`DeliveryStatus::NotDelivered`] with no packet facts, and
+/// crucially carries NO activation evidence requirement: the derived
+/// activation section in [`derive_activation`] refuses `OBSERVED` for any
+/// non-delivered status, so an eligible-but-undelivered surface can never
+/// claim activation. Full delivery requires a recorded serialized digest,
+/// because a position and a byte count without the packet's own digest is
+/// not a complete delivery.
+fn derive_delivery(input: &AssessmentInput<'_>) -> DeliverySection {
+    let observed = &input.delivery;
+    if !observed.attempted {
+        return DeliverySection {
+            status: DeliveryStatus::NotDelivered,
+            packet_position: None,
+            serialized_digest: None,
+            bytes: None,
+            actual_tokens: None,
+        };
+    }
+    // A recorded, non-blank serialized digest is the packet's own bytes and
+    // the only evidence of a full delivery. Without one, a genuinely assembled
+    // and placed packet is Partial, and an attempt that placed nothing is
+    // Missing. A blank digest is never a delivery, whatever weaker packet
+    // facts exist, so it takes the same path as no digest at all.
+    let recorded_digest = observed
+        .serialized_digest
+        .filter(|digest| !digest.trim().is_empty());
+    let has_packet_fact = observed.packet_position.is_some()
+        || observed.bytes.is_some()
+        || observed.actual_tokens.is_some();
+    let status = if recorded_digest.is_some() {
+        DeliveryStatus::Full
+    } else if has_packet_fact {
+        DeliveryStatus::Partial
+    } else {
+        DeliveryStatus::Missing
+    };
+    DeliverySection {
+        status,
+        packet_position: observed.packet_position,
+        serialized_digest: recorded_digest.map(str::to_owned),
+        bytes: observed.bytes,
+        actual_tokens: observed.actual_tokens,
+    }
+}
+
+/// Derive the observable-activation section from real use evidence only.
+///
+/// `OBSERVED` requires BOTH an actual qualifying observable-use reference
+/// from the observability owner AND a delivered surface. The reference is
+/// carried through unchanged and is never synthesized, defaulted, or taken
+/// from the acknowledgement. When an owner observed nothing qualifying the
+/// status is `NOT_OBSERVED`, which records absence of evidence and proves
+/// nothing about non-use; when the attempt surface could not be observed at
+/// all the status is `UNKNOWN`, which is never presumed either way. The
+/// acknowledgement is recorded on its own field and stays orthogonal.
+fn derive_activation(
+    input: &AssessmentInput<'_>,
+    delivery_status: DeliveryStatus,
+) -> ActivationSection {
+    let observed = &input.observable_use;
+    let delivered = matches!(
+        delivery_status,
+        DeliveryStatus::Full | DeliveryStatus::Partial
+    );
+    let use_ref = observed.first_qualifying_use_ref;
+    let qualifying_use = observed.observed_any
+        && use_ref.is_some_and(|id| !id.as_str().trim().is_empty())
+        // An acknowledgement is a delivery/attention signal only. Even if a
+        // caller pointed the use field at it, that is not qualifying use.
+        && use_ref != input.delivery.acknowledgement_ref;
+    let status = if qualifying_use && delivered {
+        ActivationStatus::Observed
+    } else if !observed.observable {
+        ActivationStatus::Unknown
+    } else {
+        ActivationStatus::NotObserved
+    };
+    ActivationSection {
+        status,
+        acknowledgement_ref: input.delivery.acknowledgement_ref.cloned(),
+        observation_limit_reason: (!observed.observable)
+            .then(|| "attempt surface was not observable for qualifying use".to_owned()),
+        // A use reference is retained exactly when it qualifies. Without
+        // qualifying use there is no use reference to record, so none is
+        // fabricated.
+        first_qualifying_observable_use_ref: if qualifying_use {
+            use_ref.cloned()
+        } else {
+            None
+        },
+    }
+}
+
+/// Derive the adherence section from checkpoint, action, and verifier
+/// evidence only.
+///
+/// An observed disposition is recorded ONLY when qualifying use was itself
+/// observed and both evidence classes are non-empty. An explicit observed
+/// violation is `OBSERVED_VIOLATED` and keeps the observed action and
+/// checkpoint refs that show it. Anything absent, or any adherence claim
+/// without a qualifying use, stays `UNKNOWN` and is never inferred
+/// compliance.
+fn derive_adherence(
+    input: &AssessmentInput<'_>,
+    activation_status: ActivationStatus,
+) -> Result<AdherenceSection, ActivationAssessmentError> {
+    let observed = &input.adherence;
+    ensure_unique_local(
+        observed.checkpoint_refs,
+        "adherence.early_mid_final_checkpoint_refs",
+    )?;
+    ensure_unique_local(
+        observed.action_and_verifier_refs,
+        "adherence.prescribed_or_avoided_action_and_required_verifier_refs",
+    )?;
+    // An adherence claim about a surface that was never qualifying-observed
+    // in use cannot be evidence of following the prescription.
+    let assessed = activation_status == ActivationStatus::Observed
+        && !observed.checkpoint_refs.is_empty()
+        && !observed.action_and_verifier_refs.is_empty();
+    if !assessed {
+        return Ok(AdherenceSection {
+            status: AdherenceStatus::Unknown,
+            early_mid_final_checkpoint_refs: Vec::new(),
+            prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
+        });
+    }
+    let status = match observed.observed_violation {
+        // An owner-recorded violation is the disposition, and it is kept
+        // together with the action/checkpoint refs that observed it.
+        Some(AdherenceStatus::ObservedViolated) => AdherenceStatus::ObservedViolated,
+        Some(_) | None => match observed.checkpoint_status {
+            AdherenceStatus::ObservedFollowed => AdherenceStatus::ObservedFollowed,
+            AdherenceStatus::ObservedPartial => AdherenceStatus::ObservedPartial,
+            AdherenceStatus::ObservedViolated => AdherenceStatus::ObservedViolated,
+            // NotAssessed and Unknown are not compliance.
+            AdherenceStatus::NotAssessed | AdherenceStatus::Unknown => AdherenceStatus::Unknown,
+        },
+    };
+    if matches!(
+        status,
+        AdherenceStatus::ObservedFollowed
+            | AdherenceStatus::ObservedPartial
+            | AdherenceStatus::ObservedViolated
+    ) {
+        return Ok(AdherenceSection {
+            status,
+            early_mid_final_checkpoint_refs: observed.checkpoint_refs.to_vec(),
+            prescribed_or_avoided_action_and_required_verifier_refs: observed
+                .action_and_verifier_refs
+                .to_vec(),
+        });
+    }
+    Ok(AdherenceSection {
+        status: AdherenceStatus::Unknown,
+        early_mid_final_checkpoint_refs: Vec::new(),
+        prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
+    })
+}
+
+/// Derive all five orthogonal sections in dependency order.
+///
+/// The order is the orthogonality rule made mechanical: eligibility and
+/// retrieval come from the sealed overlay plus the retrieval observation,
+/// delivery comes from the delivery observation alone, activation comes from
+/// real use evidence plus the derived delivery, and adherence comes from
+/// checkpoint/action/verifier evidence plus the derived activation. No
+/// section reads a caller-supplied status.
+fn derive_sections(
+    input: &AssessmentInput<'_>,
+) -> Result<DerivedSections, ActivationAssessmentError> {
+    let (eligibility_and_retrieval_reason, retrieval) = derive_retrieval(input)?;
+    let delivery = derive_delivery(input);
+    let activation = derive_activation(input, delivery.status);
+    let adherence = derive_adherence(input, activation.status)?;
+    Ok(DerivedSections {
+        eligibility_and_retrieval_reason,
+        retrieval,
+        delivery,
+        activation,
+        adherence,
+    })
+}
+
+/// Build the immutable activation receipt candidate from derived evidence.
+///
+/// The harness, compiler, and reference slices are cloned from the supplied
+/// input without synthesis. The five lifecycle sections are NOT cloned: they
+/// are derived by [`derive_sections`] from the observed evidence in
+/// [`AssessmentInput`], and the canonical
+/// [`HarnessActivationReceiptCandidate::validate_against_lineage`] then
+/// re-checks the ack-as-use substitution and evidence-free observed
+/// adherence rules on the derived values.
 fn build_activation_candidate(
     input: &AssessmentInput<'_>,
     stages: Vec<StageObservation>,
+    sections: DerivedSections,
 ) -> Result<HarnessActivationReceiptCandidate, ActivationAssessmentError> {
     let mut activation = HarnessActivationReceiptCandidate {
         binding: input.binding.clone(),
@@ -210,11 +572,11 @@ fn build_activation_candidate(
         memory_refs: input.memory_refs.to_vec(),
         procedure_refs: input.procedure_refs.to_vec(),
         preserved_success_ref: input.preserved_success_ref.cloned(),
-        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason.map(str::to_owned),
-        retrieval: input.retrieval.clone(),
-        delivery: input.delivery.clone(),
-        activation: input.activation.clone(),
-        adherence: input.adherence.clone(),
+        eligibility_and_retrieval_reason: sections.eligibility_and_retrieval_reason,
+        retrieval: sections.retrieval,
+        delivery: sections.delivery,
+        activation: sections.activation,
+        adherence: sections.adherence,
         conflicts_suppression_or_compaction_loss: input
             .conflicts_suppression_or_compaction_loss
             .to_vec(),
@@ -404,11 +766,10 @@ pub(crate) fn validate_activation_sections(
         memory_refs: &'a [ArtifactId],
         procedure_refs: &'a [ArtifactId],
         preserved_success_ref: Option<&'a ArtifactId>,
-        eligibility_and_retrieval_reason: Option<&'a str>,
-        retrieval: &'a RetrievalSection,
-        delivery: &'a DeliverySection,
-        activation: &'a ActivationSection,
-        adherence: &'a AdherenceSection,
+        retrieval: &'a ObservedRetrieval<'a>,
+        delivery: &'a ObservedDelivery<'a>,
+        observable_use: &'a ObservedUse<'a>,
+        adherence: &'a ObservedAdherence<'a>,
         conflicts_suppression_or_compaction_loss: &'a [ArtifactId],
         downstream_refs: &'a [ArtifactId],
         receipt_completeness_and_missing_fields: &'a [String],
@@ -424,11 +785,10 @@ pub(crate) fn validate_activation_sections(
         memory_refs: input.memory_refs,
         procedure_refs: input.procedure_refs,
         preserved_success_ref: input.preserved_success_ref,
-        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason,
-        retrieval: input.retrieval,
-        delivery: input.delivery,
-        activation: input.activation,
-        adherence: input.adherence,
+        retrieval: &input.retrieval,
+        delivery: &input.delivery,
+        observable_use: &input.observable_use,
+        adherence: &input.adherence,
         conflicts_suppression_or_compaction_loss: input.conflicts_suppression_or_compaction_loss,
         downstream_refs: input.downstream_refs,
         receipt_completeness_and_missing_fields: input.receipt_completeness_and_missing_fields,
@@ -452,60 +812,11 @@ pub(crate) fn validate_activation_sections(
         "conflicts_suppression_or_compaction_loss",
     )?;
     ensure_unique_local(input.downstream_refs, "downstream_refs")?;
-    ensure_unique_local(
-        &input.retrieval.expansion_or_tool_query_refs,
-        "retrieval.expansion_or_tool_query_refs",
-    )?;
-    ensure_unique_local(
-        &input.adherence.early_mid_final_checkpoint_refs,
-        "adherence.early_mid_final_checkpoint_refs",
-    )?;
-    ensure_unique_local(
-        &input
-            .adherence
-            .prescribed_or_avoided_action_and_required_verifier_refs,
-        "adherence.prescribed_or_avoided_action_and_required_verifier_refs",
-    )?;
-    // An acknowledgement never substitutes for the first qualifying observable
-    // use ref: Observed activation requires a distinct, non-blank use ref.
-    if input.activation.status == ActivationStatus::Observed {
-        let qualifies = matches!(
-            &input.activation.first_qualifying_observable_use_ref,
-            Some(id)
-                if !id.as_str().trim().is_empty()
-                    && Some(id) != input.activation.acknowledgement_ref.as_ref()
-        );
-        if !qualifies {
-            return Err(ActivationAssessmentError::LineageMismatch {
-                field: "activation.first_qualifying_observable_use_ref",
-            });
-        }
-    }
-    // Observed adherence requires checkpoint and action/verifier evidence.
-    validate_observation_guards(input)?;
-    Ok(())
-}
-
-fn validate_observation_guards(
-    input: &AssessmentInput<'_>,
-) -> Result<(), ActivationAssessmentError> {
-    // Observed adherence requires checkpoint and action/verifier evidence;
-    // missing or inconclusive observability stays UNKNOWN upstream.
-    if matches!(
-        input.adherence.status,
-        AdherenceStatus::ObservedFollowed
-            | AdherenceStatus::ObservedPartial
-            | AdherenceStatus::ObservedViolated
-    ) && (input.adherence.early_mid_final_checkpoint_refs.is_empty()
-        || input
-            .adherence
-            .prescribed_or_avoided_action_and_required_verifier_refs
-            .is_empty())
-    {
-        return Err(ActivationAssessmentError::LineageMismatch {
-            field: "adherence.evidence",
-        });
-    }
+    // The five lifecycle sections carry no caller-supplied status, so the
+    // ack-as-use and evidence-free-observed-adherence guards now live where
+    // the statuses are produced — in `derive_activation` and
+    // `derive_adherence` — and are re-enforced by the canonical
+    // `HarnessActivationReceiptCandidate::validate` on the derived receipt.
     Ok(())
 }
 
@@ -522,8 +833,14 @@ fn ensure_unique_local(
     Ok(())
 }
 
+/// Retain the complete bounded input together with the DERIVED sections.
+///
+/// The snapshot stores what the receipt actually carries, so the result can
+/// never outlive the evidence it was derived from: the retained sections are
+/// the derived ones, not the observations they came from.
 fn snapshot(
     input: &AssessmentInput<'_>,
+    sections: &DerivedSections,
 ) -> Result<crate::contracts::AssessmentInputSnapshot, ActivationAssessmentError> {
     let mut snapshot = crate::contracts::AssessmentInputSnapshot {
         recipe: input.recipe.clone(),
@@ -553,11 +870,11 @@ fn snapshot(
         memory_refs: input.memory_refs.to_vec(),
         procedure_refs: input.procedure_refs.to_vec(),
         preserved_success_ref: input.preserved_success_ref.cloned(),
-        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason.map(str::to_owned),
-        retrieval: input.retrieval.clone(),
-        delivery: input.delivery.clone(),
-        activation: input.activation.clone(),
-        adherence: input.adherence.clone(),
+        eligibility_and_retrieval_reason: sections.eligibility_and_retrieval_reason.clone(),
+        retrieval: sections.retrieval.clone(),
+        delivery: sections.delivery.clone(),
+        activation: sections.activation.clone(),
+        adherence: sections.adherence.clone(),
         conflicts_suppression_or_compaction_loss: input
             .conflicts_suppression_or_compaction_loss
             .to_vec(),

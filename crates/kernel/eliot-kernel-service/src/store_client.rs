@@ -495,9 +495,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await
         {
             Ok(receipt) => Err(DreamerCommitEvidence::Reconciled(Box::new(receipt))),
-            Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
-                Err(DreamerCommitEvidence::Unknown)
-            }
+            Err(
+                StoreError::MissingReceiptEnvelope
+                | StoreError::UnknownOutcome { .. }
+                | StoreError::Unavailable,
+            ) => Err(DreamerCommitEvidence::Unknown),
             Err(error) => Err(DreamerCommitEvidence::Refused(error)),
         }
     }
@@ -1615,12 +1617,19 @@ mod tests {
             admission_digest: transition.admission_digest.clone(),
             mutation_plan_digest: transition.mutation_plan_digest.clone(),
             semantic_source_revisions: Vec::new(),
+            // I5.19: bound from the canonical genesis transition, never
+            // defaulted; equality is enforced by the genesis receipt-issuing
+            // path.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+                &transition,
+            ),
             error_code: None,
             resubmission: eliot_store_api::Resubmission::None,
             committed_at: Some(format!("commit-sequence-{0:016}", 1)),
             envelope: None,
         };
         eliot_store_api::bind_issue18_receipt(&transition, &mut receipt, &[]);
+        eliot_store_api::bind_policy_config_schema_versions(&transition, &mut receipt);
         assert_eq!(context.state_fence, transition.state_fence);
         assert_eq!(context.state_fence, receipt.state_fence);
         assert_eq!(receipt.operation_id, transition.identity.operation_id);
@@ -1743,6 +1752,11 @@ mod tests {
             admission_digest: transition.admission_digest.clone(),
             mutation_plan_digest: transition.mutation_plan_digest.clone(),
             semantic_source_revisions: transition.semantic_source_revisions.clone(),
+            // I5.19: bound from the admitted transition, never defaulted;
+            // equality is enforced by the receipt-issuing path below.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+                transition,
+            ),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -2419,6 +2433,11 @@ mod tests {
             admission_digest: transition.admission_digest.clone(),
             mutation_plan_digest: transition.mutation_plan_digest.clone(),
             semantic_source_revisions: transition.semantic_source_revisions.clone(),
+            // I5.19: bound from the admitted transition, never defaulted;
+            // equality is enforced by the receipt-issuing path below.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+                transition,
+            ),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

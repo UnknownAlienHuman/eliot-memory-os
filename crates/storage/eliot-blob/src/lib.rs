@@ -869,6 +869,22 @@ fn native_capacity_error(
 #[derive(Clone, Copy, Debug)]
 struct InvalidCapacityEvidence;
 
+/// Whether an effect demands reconciliation of the *same* operation before any
+/// new attempt may be issued.
+///
+/// This is the same split `BlobCapacityFailure::validate` enforces when it
+/// rejects a `recovery` that does not match effect certainty, restated here so
+/// the binding rule below and the contract the bound record must satisfy cannot
+/// disagree.
+fn effect_requires_reconciliation(effect: BlobCapacityEffect) -> bool {
+    matches!(
+        effect,
+        BlobCapacityEffect::PossibleMutation
+            | BlobCapacityEffect::PossiblePublication { .. }
+            | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+    )
+}
+
 fn bind_platform_capacity_attempt(
     error: BlobError,
     stage: BlobCapacityStage,
@@ -897,8 +913,9 @@ fn bind_platform_capacity_attempt(
 ///
 /// The caller states `JournalWrite` because the *journal* is the object being
 /// written; whether the port failed while writing the journal or while flushing
-/// it is the port's own observation and is preserved by
-/// [`bind_platform_capacity_with_effect`]'s stage rule (issue #864: "Wrapped
+/// it is the port's own observation, and both the stage and the effect that
+/// observation carries are preserved by
+/// [`bind_platform_capacity_with_effect`]'s boundary rules (issue #864: "Wrapped
 /// ports must preserve typed cause/code and stage"). The serialized buffer
 /// length is likewise only a caller-side default, so a port that observed its
 /// own progress keeps that observation rather than having it restated as the
@@ -964,9 +981,47 @@ fn bind_journal_capacity(
 /// that can author a root-lease stage is `claim_root`, whose stage the caller
 /// states identically.
 ///
-/// The rule drops nothing: a port stage the rule does not prefer is still the
-/// same value the caller would have supplied, and the port's cause, native code
-/// and effect evidence are carried through untouched either way.
+/// The same asymmetry decides the *effect*, but only in the direction that can
+/// lose information. A caller states the effect of the operation it asked for;
+/// it cannot state what its bytes or its directory entry became inside a port
+/// call, and `BlobCapacityEffect` is defined as the owner's own observation
+/// ("whether the owner also left a possible physical effect"). A caller-side
+/// default must therefore never *overwrite* a port observation; the rule below
+/// only ever declines to overwrite:
+///
+/// ```text
+/// port reported a durability boundary (FileFlush | DirectoryFlush),
+///   and the caller's default requires same-operation reconciliation,
+///   and the port's own effect does not
+///   → the caller's effect stands; the port's weaker statement is not
+///     substituted for it.
+/// otherwise
+///   → the caller's effect applies, exactly as before.
+/// ```
+///
+/// The first row is the loss issue #864 names. A directory/publication sync
+/// failure the owner reports at its own `FileFlush`/`DirectoryFlush` boundary
+/// carries the effect that boundary actually produced — typically
+/// `DurabilityUnconfirmed { possible_effect: true }`, a possible installed effect
+/// whose durability is unconfirmed. Restating that as the caller's
+/// `NotAttempted` or `PartialWriteUnknown` default would drop the possible effect
+/// *and* its unconfirmed-durability axis, and would downgrade the recovery
+/// disposition from same-operation reconciliation to a bare capacity
+/// revalidation — exactly the blind new attempt the issue forbids ("if commit is
+/// possible, reconcile that same operation first even after space is freed").
+///
+/// The rule is deliberately one-directional. A port whose own boundary
+/// observation is the *stronger* one is never overwritten either, so the
+/// preserved `DurabilityUnconfirmed`/`PossibleMutation` statements survive; and a
+/// port observation is never promoted or reinterpreted, because the owner is the
+/// only party that can know what its own flush did. Only the one substitution
+/// that would destroy the caller's stronger reconciliation claim is declined.
+///
+/// Nothing else is dropped: the port's cause, native code and attempted-byte
+/// observation are carried through untouched in every case, and
+/// [`effect_requires_reconciliation`] is the same effect/recovery split
+/// `BlobCapacityFailure::validate` enforces on the bound record, so the two
+/// cannot disagree.
 fn bind_platform_capacity_with_effect(
     error: BlobError,
     stage: BlobCapacityStage,
@@ -977,20 +1032,32 @@ fn bind_platform_capacity_with_effect(
         return Ok(error);
     };
     let mut evidence = failure.evidence;
-    if let Some(effect) = effect_override {
+    let port_reported_durability_boundary = failure.stage.reports_durability_boundary();
+    if let Some(effect) = effect_override
+        && !port_reported_durability_boundary
+    {
         evidence.effect = effect;
     }
-    let recovery = match evidence.effect {
-        BlobCapacityEffect::PossiblePublication { .. }
-        | BlobCapacityEffect::DurabilityUnconfirmed { .. }
-        | BlobCapacityEffect::PossibleMutation => {
-            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
-        }
-        BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
-            BlobCapacityRecovery::CapacityRevalidationRequired
+    let recovery = if effect_requires_reconciliation(evidence.effect) {
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    } else {
+        match evidence.effect {
+            BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+                BlobCapacityRecovery::CapacityRevalidationRequired
+            }
+            // Unreachable by construction: the predicate above already selected
+            // every reconciling effect, and the vocabulary is closed. Spelled
+            // out rather than left implicit so an added variant cannot silently
+            // become a capacity revalidation while its own predicate says it
+            // needs reconciliation.
+            BlobCapacityEffect::PossibleMutation
+            | BlobCapacityEffect::PossiblePublication { .. }
+            | BlobCapacityEffect::DurabilityUnconfirmed { .. } => {
+                BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+            }
         }
     };
-    let stage = if failure.stage.reports_durability_boundary() {
+    let stage = if port_reported_durability_boundary {
         failure.stage
     } else {
         stage

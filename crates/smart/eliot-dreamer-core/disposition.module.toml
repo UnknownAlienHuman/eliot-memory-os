@@ -53,8 +53,20 @@ public_items = 37
 migrate = 4
 bounded_fixture = 0
 delete = 33
+removed_in_work_item_4 = 8
 denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-dreamer-core/src/{lib.rs,advice_gate.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions. The eight `advice_gate` items re-exported by lib.rs are counted once each at their definition site."
 bounded_fixture_zero_reason = "The issue defines a bounded fixture as retained 'only for an identified current consumer'. No current consumer was identified, so no item can honestly qualify. Recording a fixture row would be fabricated retention authority."
+work_item_4_removed_set = [
+  "CONTRACT_NAME",
+  "CONTRACT_VERSION",
+  "MAX_TEXT",
+  "MAX_ITEMS",
+  "MAX_SOURCES",
+  "Requester",
+  "PrivacyClass",
+  "DreamBudget (+ DreamBudget::validate)",
+]
+work_item_4_removal_rule = "A `delete` row was executed only when all three held: (1) its named current owner already carries the behaviour in admitted source, (2) its measured production call-site set is empty (`git grep` over crates/bins finds no reference outside this package, and the package has zero Cargo reverse-dependents), and (3) removing it cannot drop a proof, because the only reader was a fixture assertion about the duplicate itself. The 25 remaining `delete` rows fail at least one of those tests and are recorded, not executed; each names its blocker below."
 
 [metadata_references_to_close_before_any_delete]
 # Work item 6 owns the actual removal. Measured 2026-09-27 at a318023b.
@@ -99,8 +111,8 @@ generated_doc_indexes = ["docs/code-navigation/PACKAGE_DOCS_INDEX.md", "docs/cod
 generated_serde_registry = "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
 
 [removal_precondition]
-statement = "No `delete` row may be executed in this pass. Before any future deletion, the EDGE-DRM-1143 differential in `mod differential_1143` must be relocated into the owning cells' own suites, otherwise deletion drops the only live assertion that generation on the canonical shapes stays candidate-only."
-blocking_residue = "Root `Cargo.toml:113` member line, the `Cargo.lock` own-entry and the fourteen shipped-serde-boundary rows. #1100/#11 still cannot run with aggregate fallback disabled."
+statement = "Work item 4 removed the eight duplicate owners listed in `[counts].work_item_4_removed_set`. The 25 remaining `delete` rows are recorded, not executed, because each still fails at least one test in `[counts].work_item_4_removal_rule`."
+blocking_residue = "Root `Cargo.toml:113` member line, the `Cargo.lock` own-entry, the shipped-serde-boundary rows for the eight removed types, and the whole package removal itself. No consumer has migrated (work item 5 found zero production call sites), so the package is still a workspace member and #1100/#11 still cannot run with aggregate fallback disabled."
 separate_issues = "work items 4 (duplicate owners), 5 (consumer-edge migration) and 6 (residue removal) of #1143; #1924 owns the advice change-control gate acceptance."
 
 # ------------------------------------------------- CrateExtractionDecision ---
@@ -136,52 +148,52 @@ additions_from_this_ledger = [
 [[item_disposition]]
 item = "CONTRACT_NAME"
 kind = "const"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:189 pub const CONTRACT_NAME: &str = \"eliot.smart.dreamer.contracts\""
-basis = "A second contract-name string for the same capability. The owner spelling already differs (`eliot.smart.dreamer` vs `eliot.smart.dreamer.contracts`) and is never equated with it."
-removal_condition = "Delete with CONTRACT_VERSION once no replay or diagnostic consumer names the facade string. Wire schema identities are never merged."
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:189 pub const CONTRACT_NAME: &str = \"eliot.smart.dreamer.contracts\"; removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4 (branch refactor/1143-legacy-cue-owners-W2)"
+basis = "A second contract-name string for the same capability. The owner spelling already differs (`eliot.smart.dreamer` vs `eliot.smart.dreamer.contracts`), so the facade constant was a second wire-schema identity that no owner, replay record or diagnostic consumer ever named. Measured production call-site set was empty; the only reader was the crate's own `differential_1143` assertion that the two strings are not equal, which asserts nothing about owner behaviour."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. `eliot_dreamer_contracts::CONTRACT_NAME` is now the only contract-name identity in the workspace for this capability; two identities can no longer drift or be equated."
 
 [[item_disposition]]
 item = "CONTRACT_VERSION"
 kind = "const"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:191 pub const CONTRACT_VERSION: &str = \"1.0.0\"; crates/smart/eliot-dreamer-contracts/src/job.rs:26 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1"
-basis = "Divergence D-DRM-6: a `ContractVersion(1,0,0)` triple is not the same wire identity as the owner `&str \"1.0.0\"` plus the u32 job schema version. No current consumer."
-removal_condition = "With CONTRACT_NAME."
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:191 pub const CONTRACT_VERSION: &str = \"1.0.0\"; crates/smart/eliot-dreamer-contracts/src/job.rs:26 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1; removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Divergence D-DRM-6: a `ContractVersion(1,0,0)` triple is not the same wire identity as the owner `&str \"1.0.0\"` plus the u32 job schema version. Measured production call-site set was empty. Removing the facade triple closes D-DRM-6 by construction: with one identity present the divergence is inexpressible, so it can no longer drift or be equated."
+removal_condition = "Satisfied 2026-09-28: removed with CONTRACT_NAME in work item 4."
 
 [[item_disposition]]
 item = "MAX_TEXT"
 kind = "const"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "Per-field `check_text` bounds across the owner contract modules (for example crates/smart/eliot-dreamer-contracts/src/curation.rs:75 check_text(h, \"targets\", MAX_TEXT)), plus `check_vec_bound` collection ceilings in bundle.rs and assembly/material.rs"
-basis = "A single coarse ceiling (16384) cannot express per-field or per-collection limits, so it is a duplicate bound, not an owner. No current consumer."
-removal_condition = "After bundle and candidate-validation own every bound the facade claimed."
+owner_evidence = "Per-field `check_text` bounds across the owner contract modules (for example crates/smart/eliot-dreamer-contracts/src/curation.rs:75 check_text(h, \"targets\", MAX_TEXT)), plus `check_vec_bound` collection ceilings in bundle.rs and assembly/material.rs; removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "A single coarse ceiling (16384) cannot express per-field or per-collection limits, so it was a duplicate bound rather than an owner. It was never read by any production code path: `CandidateGenerator::generate` enforced the canonical `budget_units` and delegated every bound to owner `validate`. Its only reader was the crate's own fixture asserting the constant equalled its own literal."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. The owner per-field `check_text` bounds are the only text bounds."
 
 [[item_disposition]]
 item = "MAX_ITEMS"
 kind = "const"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "Per-collection `MAX_ITEMS` bounds in the owner kind-family contracts, e.g. crates/smart/eliot-dreamer-contracts/src/classification/input.rs:311-312"
-basis = "Duplicate collection ceiling. Owner bounds are per collection; the facade value is global and cannot be enforced across the independent kind families."
-removal_condition = "After candidate-validation owns every bound the facade claimed."
+owner_evidence = "Per-collection `MAX_ITEMS` bounds in the owner kind-family contracts, e.g. crates/smart/eliot-dreamer-contracts/src/classification/input.rs:311-312; removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Duplicate collection ceiling. Owner bounds are per collection; the facade value was global and could not be enforced across the independent kind families. It was read by no production code path; its only reader was the crate's own fixture asserting the constant equalled its own literal."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. Owner per-collection `check_vec_bound` ceilings are the only item bounds."
 
 [[item_disposition]]
 item = "MAX_SOURCES"
 kind = "const"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "Lineage and source-width bounds owned by the owner contracts, e.g. crates/smart/eliot-dreamer-contracts/src/candidate.rs:245 check_vec_bound(self.source_handles.len(), 1024, \"source_handles\")"
-basis = "Duplicate lineage ceiling. The generator's own handle-closure check is stricter and derived, never granted from this constant."
-removal_condition = "After candidate-validation owns every bound the facade claimed."
+owner_evidence = "Lineage and source-width bounds owned by the owner contracts, e.g. crates/smart/eliot-dreamer-contracts/src/candidate.rs:245 check_vec_bound(self.source_handles.len(), 1024, \"source_handles\"); removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Duplicate lineage ceiling. The generator's own handle-closure check was stricter and derived, never granted from this constant, and the constant was read by no production code path; its only reader was the crate's own fixture asserting the constant equalled its own literal."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. Owner lineage `check_vec_bound` ceilings are the only source bounds."
 
 [[item_disposition]]
 item = "DreamerError"
@@ -196,12 +208,12 @@ removal_condition = "After the pipeline reports owner errors directly. It is the
 [[item_disposition]]
 item = "Requester"
 kind = "enum"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "crates/smart/eliot-dreamer-contracts/src/job.rs:86 pub enum RequesterOrigin; crates/smart/eliot-dreamer-contracts/src/job.rs:107 pub struct Requester (origin + principal/session binding)"
-basis = "Divergence D-DRM-4. A flat four-variant SCREAMING_SNAKE enum carries no binding model text cannot rewrite. Only Human/human is an exact correspondence; the rest is a proposed mapping, never asserted. Canonical `DreamJobInput::requester` is a plain string, so this enum is not even wired into the live path."
-removal_condition = "After intake owns requester binding on the canonical job shape. No current consumer."
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/job.rs:86 pub enum RequesterOrigin; crates/smart/eliot-dreamer-contracts/src/job.rs:107 pub struct Requester (origin + principal/session binding); removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Divergence D-DRM-4, closed by removal. A flat four-variant SCREAMING_SNAKE enum carried no origin or principal/session binding that model text could not rewrite, so it was a second requester-binding vocabulary rather than an owner. Canonical `DreamJobInput::requester` is a plain string, so the facade enum was not wired into the live generation path at all; measured production call-site set was empty and the only reader was the crate's own fixture serialising the four wire spellings. With the second vocabulary gone the D-DRM-4 divergence is inexpressible and can no longer be equated with the owner binding."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. `eliot_dreamer_contracts::job::{RequesterOrigin, Requester}` is the only requester-binding owner."
 
 [[item_disposition]]
 item = "CandidateKind"
@@ -216,32 +228,32 @@ removal_condition = "After curation dispatch and the 14 typed handlers admit eve
 [[item_disposition]]
 item = "PrivacyClass"
 kind = "enum"
-disposition = "delete"
+disposition = "removed"
 current_owner = "eliot-security-contracts (foundation)"
 owner_package = "eliot-security-contracts"
-owner_evidence = "crates/foundation/eliot-security-contracts/src/surface_types.rs:475 pub enum PrivacyClass; canonical admission lives as a `privacy_profile: String` on the owner job contract (crates/smart/eliot-dreamer-contracts/src/job.rs:167,195,288-294)"
-basis = "Fifth definition of the same two-class privacy vocabulary in the workspace (the others are eliot-coordination, eliot-source-assurance and eliot-context-contracts). It is a duplicate contract, not an owner, and it is not used by the canonical intake shape."
-removal_condition = "With the rest of the superseded shape set. Not a work-item-4 blocker: it is pure duplication, not a second semantic owner."
+owner_evidence = "crates/foundation/eliot-security-contracts/src/surface_types.rs:475 pub enum PrivacyClass; canonical admission lives as a `privacy_profile: String` on the owner job contract (crates/smart/eliot-dreamer-contracts/src/job.rs:167,195,288-294); removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Fifth definition of the same two-class privacy vocabulary in the workspace (the others are eliot-coordination, eliot-source-assurance and eliot-context-contracts). It was pure duplication, not an owner: it is not used by the canonical intake shape, and measured production call-site set was empty. Its only reader was the crate's own fixture asserting two SCREAMING_SNAKE wire spellings, so removing it cannot change any admission decision."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. `eliot_security_contracts::PrivacyClass` plus the owner `privacy_profile` binding are the only privacy-class surfaces."
 
 [[item_disposition]]
 item = "DreamBudget"
 kind = "struct"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:141 pub struct BudgetLimits (11 independent dimensions, each with its own class ceiling and zero rule at lines 172-190)"
-basis = "Divergence D-DRM-5. Four coarse u32 fields cannot express 11 independent limits with no cross-subsidy. The coarse zero-rejection rule it encodes is already preserved by the owner `Some(0)` rejection, and `route_cost_units` is a passthrough, never an authorization."
-removal_condition = "After real jobs carry owner `BudgetLimits`. The migrated generation path asserts budget ceilings from the canonical `budget_units`, not from this struct."
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:141 pub struct BudgetLimits (11 independent dimensions, each with its own class ceiling and zero rule at lines 172-190); removed from crates/smart/eliot-dreamer-core/src/lib.rs in #1143 work item 4"
+basis = "Divergence D-DRM-5, closed by removal. Four coarse u32 fields could not express 11 independent limits with no cross-subsidy, so the struct was a duplicate grant surface rather than an owner. `CandidateGenerator::generate` never read it: the migrated generation path enforced the canonical `input.budget_units` (a `DREAM-...` owner field) and delegated the zero rule to owner `DreamJobInput::validate`. `route_cost_units` was a passthrough that no code path read, so it was never an authorization in practice. Measured production call-site set was empty; the only readers were the crate's own fixtures."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. `BudgetLimits` plus the canonical `budget_units` gate are the only budget surfaces; `route_cost_units` no longer exists on any facade shape."
 
 [[item_disposition]]
 item = "DreamBudget::validate"
 kind = "method"
-disposition = "delete"
+disposition = "removed"
 current_owner = "smart.dreamer.contracts"
 owner_package = "eliot-dreamer-contracts"
-owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:172 pub fn validate (and require_exact) on BudgetLimits"
-basis = "Coarse three-field zero check, strictly weaker than the owner 11-dimension rule. Not the migrated path: mod differential_1143 asserts the owner budget gate directly, including `budget_units == 0` refusing at generation."
-removal_condition = "With DreamBudget."
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:172 pub fn validate (and require_exact) on BudgetLimits; removed with DreamBudget in #1143 work item 4"
+basis = "Coarse three-field zero check, strictly weaker than the owner 11-dimension rule. It was not on the migrated path: mod differential_1143 asserts the owner budget gate directly, including `budget_units == 0` refusing at generation, and that assertion is retained unchanged after this removal."
+removal_condition = "Satisfied 2026-09-28: removed with DreamBudget in work item 4."
 
 [[item_disposition]]
 item = "PreservationReport"

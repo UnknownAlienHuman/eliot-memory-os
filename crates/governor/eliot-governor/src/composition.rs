@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::negative_memory_gate::{self, NegativeMemoryGateInput, evaluate_negative_memory_gate};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -27,9 +28,7 @@ use crate::owner_closure_feed::{
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
-use crate::scope_identity_admission::{
-    ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
-};
+use crate::scope_identity_admission::{ensure_snapshot_fresh, require_fresh_matched_binding};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -4827,14 +4826,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Reads the retained binding at the retained fence, evaluates `observed`
     /// at `trigger` with the caller-retained source closure, and returns the
-    /// current snapshot only when the verdict is `Allow` (full `MATCHED`
-    /// receipt). Any other verdict fails closed with the trigger and
-    /// disposition; the retained binding, task state, and project memory are
-    /// untouched.
+    /// current snapshot only when the report is `MATCHED` (identity-clear
+    /// `Allow` with a full `MATCHED` receipt). Any other report withholds
+    /// with the structured [`CompositionError::ScopeGuardWithheld`] carrying
+    /// the exact trigger report; an identity mismatch is additionally
+    /// retained in the bounded process-local diagnostic projection before
+    /// withholding. The retained binding, task state, and project memory
+    /// are untouched on any failure.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn require_scope_guard_for_observed(
-        &self,
+        &mut self,
         observed: &ScopeBinding,
         source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
         trigger: GuardTrigger,
@@ -4855,7 +4857,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if report.is_matched() {
             Ok(snapshot)
         } else {
-            Err(guard_recovery_error(&report, "scope guard withheld"))
+            if report.identity != IdentityLegOutcome::IdentityClear {
+                self.push_scope_quarantine_record(
+                    &snapshot.binding,
+                    observed,
+                    &report,
+                    fence.resource_generation.value(),
+                )?;
+            }
+            Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: snapshot.binding.scope.scope_ref.clone(),
+                observed_scope: observed.scope.scope_ref.clone(),
+                trigger: report.trigger,
+                identity: report.identity,
+                verdict: report.verdict,
+                report: Box::new(report),
+            })
         }
     }
 
@@ -5054,13 +5071,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Builds the [`QuarantinedScopeRecord`] for `report` through its
     /// existing constructor and validator, then appends it instead of
-    /// overwriting: an exact repeat of the latest record adds no new
-    /// evidence, anything else appends with oldest-first eviction at
+    /// overwriting: a record whose stable idempotency identity is already
+    /// retained adds no new evidence, anything else appends with
+    /// oldest-first eviction at
     /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`]. The retained binding,
-    /// task state, and project memory stay untouched. Construction
-    /// failure is never silent: it fails closed here so the conflicting
-    /// evidence cannot disappear while the write is withheld. This
-    /// projection is not durable, rehydrated, or an authority for
+    /// task state, and project memory stay untouched. Construction or
+    /// identity failure is never silent: it fails closed here so the
+    /// conflicting evidence cannot disappear while the write is withheld.
+    /// This projection is not durable, rehydrated, or an authority for
     /// rebind; durable quarantine still belongs to the `WorkScope`
     /// owner path.
     fn push_scope_quarantine_record(
@@ -5082,13 +5100,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 report.trigger
             ))
         })?;
+        let (_, idempotency_key) = record.operation_identity().map_err(|error| {
+            CompositionError::Recovery(format!(
+                "scope guard withheld at trigger {:?} after scope mismatch, but its quarantine identity could not be derived: {error}",
+                report.trigger
+            ))
+        })?;
         // Preserve every unresolved conflict instead of overwriting one
-        // slot: an exact repeat of the latest record adds no new
-        // evidence, anything else appends with oldest-first eviction at
-        // the bound. The retained binding, task state, and project
-        // memory stay untouched; durable quarantine still belongs to
-        // the WorkScope owner path.
-        if self.scope_quarantine.last() != Some(&record) {
+        // slot: a record whose stable idempotency identity is already
+        // retained anywhere in the bounded history adds no new evidence,
+        // anything else appends with oldest-first eviction at the bound.
+        // The retained binding, task state, and project memory stay
+        // untouched; durable quarantine still belongs to the WorkScope
+        // owner path.
+        let already_retained = self.scope_quarantine.iter().any(|retained| {
+            retained
+                .operation_identity()
+                .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
+        });
+        if !already_retained {
             if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
                 self.scope_quarantine.remove(0);
             }
@@ -5548,6 +5578,47 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .canonical
             .commit(self.kernel.as_ref(), identity, envelope)
             .await
+    }
+
+    /// Applies one Canonical-admitted transition only after the governed
+    /// negative-memory gate admits the effect (issue #1731 W4, I12.19).
+    ///
+    /// This is the mechanical gate application I1.8 names for the semantic
+    /// layer: the Governor — the owner allowed to interpret policy — evaluates
+    /// the bounded pure matcher over the caller-resolved rule snapshot, and a
+    /// refusing decision fails the write **before** any `PreparedTransition` is
+    /// built or handed to Kernel. Nothing here is interpreted downstream: Kernel
+    /// still performs only its own mechanical authority/fence/order checks
+    /// (`crates/kernel/AGENTS.md`), and the store still persists only an already
+    /// prepared transition.
+    ///
+    /// The gate is evaluated through [`evaluate_negative_memory_gate`], which is
+    /// total and pure. Its inputs (`gate`) are the caller's own owner-resolved
+    /// snapshot, dispatch revalidation and admitted policies: this method
+    /// re-reads nothing and invents no rule, but it also **cannot** skip the
+    /// gate, because the gate input is a required parameter rather than an
+    /// option. A caller that has not resolved a rule snapshot therefore cannot
+    /// reach this method at all, and one that resolved an incomplete or
+    /// revision-moved snapshot is refused rather than allowed through.
+    ///
+    /// A `Proceed` decision — including a near-match warning — returns without
+    /// error and lets the ordinary authorization path run unchanged; the warning
+    /// confers nothing and is available to the caller through `gate`'s own
+    /// subject. A `Block`, `RequireCheck` or `Unavailable` decision becomes a
+    /// typed [`CompositionError::Recovery`] carrying the exact rule revision,
+    /// admitted policy identity or required discriminating check, so the refusal
+    /// is never reduced to an opaque failure.
+    pub async fn commit_canonical_gated_by_negative_memory(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        gate: &NegativeMemoryGateInput<'_>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let decision = evaluate_negative_memory_gate(gate);
+        if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
+            return Err(refusal);
+        }
+        self.commit_canonical(identity, envelope).await
     }
 
     /// Admits one scope-sensitive effect under material readiness
@@ -7604,6 +7675,11 @@ mod tests {
                     admission_digest: transition.admission_digest.clone(),
                     mutation_plan_digest: transition.mutation_plan_digest.clone(),
                     semantic_source_revisions: transition.semantic_source_revisions.clone(),
+                    // I5.19: bound from the admitted transition, never
+                    // defaulted; equality is enforced by the receipt-issuing
+                    // path below.
+                    policy_config_schema_versions:
+                        eliot_store_api::PolicyConfigSchemaVersions::bound_to(&transition),
                     error_code: None,
                     resubmission: Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
@@ -9257,6 +9333,16 @@ mod tests {
             admission_digest: "e".repeat(64),
             mutation_plan_digest: "f".repeat(64),
             semantic_source_revisions: Vec::new(),
+            // I5.19: standalone seed with no `PreparedTransition` in scope, so
+            // the record is built explicitly from the store API's own in-force
+            // constants. `fence` is in scope, so its policy binding is used and
+            // the record still agrees with the fence, keeping `validate()`
+            // below passing.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+                policy_revision: fence.policy_revision,
+                config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+                schema_revision: eliot_store_api::CONTRACT_VERSION,
+            },
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

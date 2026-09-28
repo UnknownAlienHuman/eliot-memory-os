@@ -38,5 +38,39 @@ pub use set::{ApplicableMemory, ApplicableMemorySet, ExcludedMemory, ExclusionRe
 /// Stable wire name for this contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.memory-projection-contracts";
 /// Current wire revision for this contract family.
+///
+/// # Compatibility decision
+///
+/// 0.1.0 -> 0.2.0 is a **minor** bump, and the component names in
+/// [`ContractVersion`](eliot_contracts::ContractVersion) say why: minor is the
+/// additive component. The single change is one new
+/// [`ExclusionReason::InfluenceIneligible`] variant. No field is removed,
+/// retyped, or given a new meaning, so every value written under 0.1.0 still
+/// decodes unchanged under 0.2.0; the new reason is a strict superset.
+///
+/// The bump is still required rather than cosmetic, because
+/// `ExclusionReason` is `#[serde(tag = "rule", deny_unknown_fields)]` and its
+/// consumers match it exhaustively. A 0.1.0 reader meeting 0.2.0 data fails
+/// closed on deserialization instead of misreading the new rule, and an
+/// in-tree consumer with an outdated exhaustive match fails to compile. Both
+/// are the intended divergence signal; the minor bump is what makes the
+/// divergence *declared* rather than silent, and it names the change class
+/// (I0.4 cross-module, shared contract) for the compatibility suite.
+///
+/// A `major` bump would be wrong: nothing 0.1.0 consumers rely on was
+/// withdrawn, and it would overstate a superset change as a contract
+/// replacement. A `patch` bump would be wrong: a patch is a
+/// backwards-compatible correction to the existing shape, and a new variant is
+/// a new member of a closed set.
+///
+/// Two records of the prior revision are deliberately left for their owners
+/// rather than edited here: the byte-pinned static freeze
+/// `crates/smart/cognitive-rev12-contract-schema-freeze.toml`, whose
+/// `contract_version = "0.1.0"` row and `ExclusionReason` field list are a
+/// frozen snapshot whose own `[readback].rule` makes a byte change a new freeze
+/// candidate, and the generated serde boundary registry
+/// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`,
+/// which records `set.rs` span and file digests. Both are recorded handoffs to
+/// the freeze and registry owners (CC-W2-FREEZE-REPIN; #929).
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
-    eliot_contracts::ContractVersion::new(0, 1, 0);
+    eliot_contracts::ContractVersion::new(0, 2, 0);

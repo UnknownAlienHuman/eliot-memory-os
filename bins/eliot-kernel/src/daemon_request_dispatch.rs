@@ -3463,14 +3463,30 @@ impl KernelComposition {
     /// admitted generation rebinds; a later `ProbeReady` or heartbeat cannot
     /// revive it.
     #[cfg(windows)]
-    fn revoke_supervision_expired_effect_admission(&self) -> Result<(), TransportError> {
+    fn revoke_supervision_expired_effect_admission(
+        &self,
+        lease_id: &str,
+    ) -> Result<(), TransportError> {
         self.promote_agent_bridge_profile(None)?;
         observe_daemon_request(
             "kernel.daemon.supervision_expired_effects_revoked",
             "success",
         );
-        // Issue #1837: durable audit evidence for lease expiry.
-        self.audit_observe(AuditEventDraft::lease_supervision_expired());
+        // Issue #1837: durable audit evidence for lease expiry. The expired
+        // head's binding fence is read best-effort: observation never fails
+        // the revocation.
+        let snapshot = self
+            .supervision_lease_authority
+            .as_ref()
+            .and_then(|authority| authority.current_snapshot(lease_id).ok().flatten());
+        self.audit_observe(AuditEventDraft::lease_supervision_expired(
+            snapshot.as_ref(),
+        ));
+        // Issue #1844: a forced lease expiry is the repeated-no-progress
+        // signal; compile its brief.
+        self.observe_diagnostic_problem(
+            super::diagnostic_brief::DiagnosticTrigger::RepeatedFailureOrNoProgress,
+        );
         Ok(())
     }
 
@@ -3583,7 +3599,7 @@ impl KernelComposition {
                     Some(expired),
                 )?;
                 if expired {
-                    self.revoke_supervision_expired_effect_admission()?;
+                    self.revoke_supervision_expired_effect_admission(&lease_id)?;
                 }
                 return self.progress_refusal_answer(&lease_id, &error);
             }
@@ -6409,24 +6425,38 @@ impl KernelComposition {
         // effect, so a refusal never reaches the Store backend below. An
         // admitted resubmission presenting exactly the corrected identity a
         // retained refusal issued additionally returns its verified correction
-        // lineage, which travels on the commit response below.
-        let verified_correction = {
+        // lineage, which travels on the commit response below. The retained
+        // refusals are the Kernel-owned durable pre-stage journal (issue
+        // #1796 F1): they are restored from disk when the process starts
+        // with an empty cache and persisted write-ahead of the commit they
+        // authorize, so a restart replays the same lineage. The response
+        // stays a projection of that record, never a second ledger.
+        restore_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache);
+        let (gate_outcome, pending_journal) = {
             let mut cache = self
                 .pre_stage_identity_cache
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            match eliot_kernel_service::pre_stage_check(
+            let gate_outcome = eliot_kernel_service::pre_stage_check(
                 &mut cache,
                 &operation.context,
                 &operation.transition,
                 &operation.expected_revision_heads,
                 &operation.expected_ordering_heads,
-            ) {
-                Err(rejection) => {
-                    return Ok(Self::pre_stage_rejection_response(&rejection));
-                }
-                Ok(link) => link,
+            );
+            // Taken, not written, under the lock: the file write below never
+            // holds the cache across I/O.
+            let pending_journal = cache.take_journal_snapshot();
+            (gate_outcome, pending_journal)
+        };
+        if let Some(snapshot) = pending_journal {
+            persist_pre_stage_corrections(&self.work_root, &snapshot);
+        }
+        let verified_correction = match gate_outcome {
+            Err(rejection) => {
+                return Ok(Self::pre_stage_rejection_response(&rejection));
             }
+            Ok(link) => link,
         };
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
@@ -8879,6 +8909,81 @@ fn store_genesis_response(receipt: &WriteReceipt) -> serde_json::Value {
 /// linked to the rejected operation it corrects. Any other write renders
 /// exactly the historical shape: lineage is never stamped without the
 /// gate's verified link.
+///
+/// Durable pre-stage journal file (issue #1796 F1) backing the restore and
+/// persist helpers below: every retained refusal, so a restart replays the
+/// same lineage. The response stays a projection of that record, never a
+/// second decision ledger (I06-11:7).
+#[cfg(windows)]
+const PRE_STAGE_CORRECTION_JOURNAL_FILE: &str = "pre-stage-correction-journal.json";
+
+/// Resolves the durable pre-stage journal path under the daemon work root.
+#[cfg(windows)]
+fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::PathBuf {
+    work_root
+        .join(".eliot")
+        .join(PRE_STAGE_CORRECTION_JOURNAL_FILE)
+}
+
+/// Restores retained refusals from the Kernel-owned durable pre-stage
+/// journal into a freshly started, still-empty gate cache (issue #1796 F1).
+///
+/// Merging is a union over deterministic records, so a retain that landed
+/// after the journal was read is never lost by the merge. Best-effort: a
+/// missing or unreadable journal starts empty, which is exactly the
+/// pre-journal behavior, and a cache that already holds a live refusal is
+/// never overwritten by stale disk state. No store, receipt, or envelope
+/// format is touched.
+#[cfg(windows)]
+fn restore_pre_stage_corrections(
+    work_root: &std::path::Path,
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
+) {
+    let Ok(bytes) = std::fs::read(pre_stage_correction_journal_path(work_root)) else {
+        return;
+    };
+    let Ok(snapshot) =
+        serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
+    else {
+        return;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+    if guard.is_empty() {
+        guard.restore(snapshot);
+    }
+}
+
+/// Persists retained refusals to the Kernel-owned durable pre-stage journal
+/// (issue #1796 F1).
+///
+/// Called write-ahead of the commit the retain authorizes, so a restart
+/// between commit and response still replays the lineage. Best-effort: a
+/// failed write keeps the in-memory behavior and never fails the write it
+/// records. The tmp-plus-rename keeps a crash from leaving a half-written
+/// journal behind.
+#[cfg(windows)]
+fn persist_pre_stage_corrections(
+    work_root: &std::path::Path,
+    snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
+) {
+    let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
+        return;
+    };
+    let path = pre_stage_correction_journal_path(work_root);
+    if path
+        .parent()
+        .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
+    {
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&tmp, &path);
+}
 fn store_apply_response(
     receipt: &WriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,

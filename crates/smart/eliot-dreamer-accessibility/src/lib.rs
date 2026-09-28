@@ -661,8 +661,12 @@ pub struct AdjustmentProposal {
     pub expiry_ms: Option<u64>,
     /// Renewal condition naming what reopens review.
     pub renewal_condition: String,
-    /// Deterministic digest binding the proposal inputs.
+    /// Deterministic digest binding the complete validated proposal input and
+    /// the settled disposition.
     pub proposal_digest: String,
+    /// Format and version that produced `proposal_digest`; a result produced
+    /// under an older format is not a current input commitment.
+    pub proposal_digest_format: String,
     /// Bounded machine-readable note.
     pub note: String,
 }
@@ -1371,13 +1375,28 @@ fn validate_shapes(request: &AdjustmentRequest) -> Result<(), AccessibilityError
 }
 
 // ---------------------------------------------------------------------------
-// Outcome helpers.
+// Proposal identity: digest format and complete input commitment.
 // ---------------------------------------------------------------------------
 
-/// String bindings carried into one settled proposal outcome.
-struct Settlement<'a> {
-    /// Terminal outcome for the settled proposal.
-    outcome: AdjustmentOutcome,
+/// Domain label bound into every [`AdjustmentProposal::proposal_digest`].
+pub const PROPOSAL_DIGEST_FORMAT: &str = "eliot.smart.dreamer.accessibility.proposal";
+
+/// Current [`PROPOSAL_DIGEST_FORMAT`] version.
+///
+/// Version 1 hashed only labels, standings, owner refs, disposition handles and
+/// the selected adjustment text. It covered no attributed evidence, no
+/// subject-record revision, no State Fence and no frozen bundle/manifest, so a
+/// version 1 hash is not evidence of a version 2 input commitment. Version 2
+/// binds the validated canonical attribution/outcome content, the exact
+/// subject-record revision and State Fence, the frozen bundle/manifest and the
+/// A-05 validation identity, plus the settled disposition. Formats are never
+/// reconciled by rewriting history: a stored version 1 digest stays version 1
+/// and a result that does not carry the current stamp does not deserialize as
+/// a current result.
+pub const PROPOSAL_DIGEST_FORMAT_VERSION: u32 = 2;
+
+/// Selected-axis text bindings carried into one settled proposal outcome.
+struct ProposalBindings<'a> {
     /// Expected observable proving the move took effect.
     observable: &'a str,
     /// Verifier that checks the observable.
@@ -1390,20 +1409,34 @@ struct Settlement<'a> {
     expiry_ms: Option<u64>,
     /// Renewal condition naming what reopens review.
     renewal_condition: &'a str,
-    /// Deterministic digest binding the proposal inputs.
-    digest: &'a str,
-    /// Bounded machine-readable note.
-    note: &'a str,
 }
+
+/// Bindings of a request whose move never started: the move proposes nothing,
+/// so every selected-axis text binding stays empty.
+const UNCHANGED_BINDINGS: ProposalBindings<'static> = ProposalBindings {
+    observable: "",
+    verifier: "",
+    window_note: "",
+    inverse_note: "",
+    expiry_ms: None,
+    renewal_condition: "",
+};
+
+// ---------------------------------------------------------------------------
+// Outcome helpers.
+// ---------------------------------------------------------------------------
 
 fn ok_proposal(
     request: &AdjustmentRequest,
     before: AxisStateSnapshot,
     proposed: AxisStateSnapshot,
-    settlement: &Settlement<'_>,
+    outcome: AdjustmentOutcome,
+    bindings: &ProposalBindings<'_>,
+    digest: &str,
+    note: &str,
 ) -> AdjustmentProposal {
     AdjustmentProposal {
-        outcome: settlement.outcome,
+        outcome,
         axis: request.policy.axis,
         subject_handle: request.projection.subject_handle.clone(),
         subject_revision: request.projection.subject_revision.clone(),
@@ -1412,14 +1445,17 @@ fn ok_proposal(
         before_owners: request.projection.owners.clone(),
         proposed_owners: request.projection.owners.clone(),
         dispositions: request.dispositions.clone(),
-        observable: redact(settlement.observable),
-        verifier: redact(settlement.verifier),
-        window_note: redact(settlement.window_note),
-        inverse_note: redact(settlement.inverse_note),
-        expiry_ms: settlement.expiry_ms,
-        renewal_condition: redact(settlement.renewal_condition),
-        proposal_digest: settlement.digest.to_owned(),
-        note: redact(settlement.note),
+        observable: redact(bindings.observable),
+        verifier: redact(bindings.verifier),
+        window_note: redact(bindings.window_note),
+        inverse_note: redact(bindings.inverse_note),
+        expiry_ms: bindings.expiry_ms,
+        renewal_condition: redact(bindings.renewal_condition),
+        proposal_digest: digest.to_owned(),
+        proposal_digest_format: format!(
+            "{PROPOSAL_DIGEST_FORMAT}/v{PROPOSAL_DIGEST_FORMAT_VERSION}"
+        ),
+        note: redact(note),
     }
 }
 
@@ -1434,33 +1470,33 @@ fn unchanged_proposal(
         accessibility: request.projection.accessibility,
         influence: request.projection.influence,
     };
-    let digest = proposal_digest(request, snapshot, snapshot, "", "", "", None)?;
-    Ok(ok_proposal(
+    settled_proposal(
         request,
         snapshot,
         snapshot,
-        &Settlement {
-            outcome,
-            observable: "",
-            verifier: "",
-            window_note: "",
-            inverse_note: "",
-            expiry_ms: None,
-            renewal_condition: "",
-            digest: &digest,
-            note,
-        },
-    ))
+        &UNCHANGED_BINDINGS,
+        outcome,
+        note,
+    )
 }
 
 /// Canonical digest view binding every identity the proposal depends on.
 #[derive(Serialize)]
 struct DigestView<'a> {
+    digest_format: &'static str,
+    digest_format_version: u32,
+    settled_outcome: AdjustmentOutcome,
     subject_handle: &'a str,
     subject_revision: &'a str,
+    subject_record_revision: &'a TaskRevision,
     scope_id: &'a str,
     task_id: &'a str,
     policy_id: &'a str,
+    state_fence: &'a StateFence,
+    frozen_bundle_digest: &'a str,
+    frozen_manifest_digest: &'a str,
+    receipt: &'a ValidationReceipt,
+    attributed_evaluation: AttributedMemoryEvaluation,
     axis: &'a Axis,
     operation: &'a AdjustmentOperation,
     direction: &'a AdjustmentDirection,
@@ -1476,14 +1512,20 @@ struct DigestView<'a> {
     expiry_ms: Option<u64>,
 }
 
+/// Computes the complete input commitment of one settled proposal.
+///
+/// The attributed evaluation is embedded as the canonical projection the
+/// evaluation contract itself publishes, so the digest covers the validated
+/// content and its own identity/content commitments rather than an unchecked
+/// caller-supplied digest string. Set-like families stay order-independent
+/// because canonicalization orders them; every ordinal sequence is hashed in
+/// the order the request supplied it.
 fn proposal_digest(
     request: &AdjustmentRequest,
     before: AxisStateSnapshot,
     proposed: AxisStateSnapshot,
-    observable: &str,
-    verifier: &str,
-    inverse_note: &str,
-    expiry_ms: Option<u64>,
+    bindings: &ProposalBindings<'_>,
+    settled_outcome: AdjustmentOutcome,
 ) -> Result<String, AccessibilityError> {
     let mut disposition_handles: Vec<&str> = request
         .dispositions
@@ -1492,11 +1534,20 @@ fn proposal_digest(
         .collect();
     disposition_handles.sort_unstable();
     let view = DigestView {
+        digest_format: PROPOSAL_DIGEST_FORMAT,
+        digest_format_version: PROPOSAL_DIGEST_FORMAT_VERSION,
+        settled_outcome,
         subject_handle: request.projection.subject_handle.as_str(),
         subject_revision: request.projection.subject_revision.as_str(),
+        subject_record_revision: &request.projection.subject_record_revision,
         scope_id: request.projection.scope_id.as_str(),
         task_id: request.projection.task_id.as_str(),
         policy_id: request.policy.policy_id.as_str(),
+        state_fence: &request.projection.state_fence,
+        frozen_bundle_digest: request.frozen_bundle_digest.as_str(),
+        frozen_manifest_digest: request.frozen_manifest_digest.as_str(),
+        receipt: &request.receipt,
+        attributed_evaluation: request.attributed_evaluation.canonicalized(),
         axis: &request.policy.axis,
         operation: &request.policy.operation,
         direction: &request.policy.direction,
@@ -1506,10 +1557,10 @@ fn proposal_digest(
         proposed_influence: &proposed.influence,
         owners: &request.projection.owners,
         disposition_handles,
-        observable,
-        verifier,
-        inverse_note,
-        expiry_ms,
+        observable: bindings.observable,
+        verifier: bindings.verifier,
+        inverse_note: bindings.inverse_note,
+        expiry_ms: bindings.expiry_ms,
     };
     canonical_json_bytes(&view)
         .map(|bytes| sha256_hex(&bytes))
@@ -1517,6 +1568,24 @@ fn proposal_digest(
             phase: "digest".to_owned(),
             detail: "proposal inputs cannot be canonically serialized".to_owned(),
         })
+}
+
+/// The single settlement path: builds the complete input commitment for the
+/// settled disposition and returns the proposal envelope. Every result path —
+/// the `unchanged_proposal` short circuits and every `settle` branch — goes
+/// through here, so no branch can carry a weaker or per-branch digest.
+fn settled_proposal(
+    request: &AdjustmentRequest,
+    before: AxisStateSnapshot,
+    proposed: AxisStateSnapshot,
+    bindings: &ProposalBindings<'_>,
+    outcome: AdjustmentOutcome,
+    note: &str,
+) -> Result<AdjustmentProposal, AccessibilityError> {
+    let digest = proposal_digest(request, before, proposed, bindings, outcome)?;
+    Ok(ok_proposal(
+        request, before, proposed, outcome, bindings, &digest, note,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1842,6 +1911,15 @@ fn check_closure_completeness(request: &AdjustmentRequest) -> Option<(Adjustment
 /// only half present, and the unselected axis keeps its exact projected
 /// standing and owner references in the returned proposal.
 ///
+/// Every result path returns the same kind of identity:
+/// [`AdjustmentProposal::proposal_digest`] is the
+/// [`PROPOSAL_DIGEST_FORMAT`] version 2 commitment over the complete validated
+/// input — including the canonical attributed evaluation, the subject-record
+/// revision, the exact State Fence, the frozen bundle/manifest and the A-05
+/// validation identity — together with the settled [`AdjustmentOutcome`]. Two
+/// requests that differ in the evidence they were judged on, or in the
+/// disposition they received, therefore never share a proposal identity.
+///
 /// # Errors
 ///
 /// Returns [`AccessibilityError`] when any bound, shape, ordering, receipt,
@@ -2058,34 +2136,18 @@ pub fn propose_accessibility_or_influence_adjustment(
                 )
             }
         };
-    let digest = proposal_digest(
-        request,
-        before,
-        proposed,
-        &observable,
-        &verifier,
-        &inverse_note,
+    let bindings = ProposalBindings {
+        observable: &observable,
+        verifier: &verifier,
+        window_note: &window_note,
+        inverse_note: &inverse_note,
         expiry_ms,
-    )?;
+        renewal_condition: &renewal_condition,
+    };
     let settle = |outcome: AdjustmentOutcome,
                   note: &str|
      -> Result<AdjustmentProposal, AccessibilityError> {
-        Ok(ok_proposal(
-            request,
-            before,
-            proposed,
-            &Settlement {
-                outcome,
-                observable: &observable,
-                verifier: &verifier,
-                window_note: &window_note,
-                inverse_note: &inverse_note,
-                expiry_ms,
-                renewal_condition: &renewal_condition,
-                digest: &digest,
-                note,
-            },
-        ))
+        settled_proposal(request, before, proposed, &bindings, outcome, note)
     };
 
     // Half-specific semantics run before protections so the returned note

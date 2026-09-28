@@ -85,7 +85,7 @@ pub use installed_binary::{
 };
 pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
-pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime};
+pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime, drive_parent_runtime};
 pub use request_loop::{
     AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopError, MAX_RESULT_FRAME_BYTES,
     MAX_RESULT_SEQUENCE, OP_CANCEL, OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError,

@@ -121,8 +121,9 @@ pub(super) fn terminated_prior_kernel(
 }
 
 /// I1.9 A1 gate: permits a Host-managed Kernel restart only when the valid
-/// journal `Kernel` record carries both this relaunch's approved artifact
-/// and the full process lineage for that approval.
+/// journal `Kernel` record carries this relaunch's approved artifact and
+/// full process lineage for that approval, the relaunch config is the
+/// approved config, and the record is owned by the current activation fence.
 ///
 /// The record is the original journal recording: it is revalidated with the
 /// existing [`KernelRecord::validate`], never replaced by a freshly
@@ -130,12 +131,29 @@ pub(super) fn terminated_prior_kernel(
 /// the exact digest the relaunch is about to start; the required lineage is
 /// the record's own generation/Job/process binding (`kernel_generation`,
 /// `candidate_job_binding`, `process`), which must be present in that same
-/// record. Absence, invalidity, an artifact mismatch, or missing lineage
-/// refuses the restart as manual recovery instead of reconstructing or
+/// record. The approved config bound here joins the relaunch descriptor to
+/// the active manifest: `materialized_config_digest` (the Phase-B config the
+/// relaunch will actually start) must equal `approved_config` (the active
+/// manifest's approved config digest), mirroring the Store leg's
+/// `approved_config_hash` requirement digest bind. The fence bind requires
+/// the record's `RecordFence` to equal the fence recomputed from the
+/// current Host installation epoch, activation id and activation generation,
+/// so a stale-activation record cannot authorize a restart. Absence,
+/// invalidity, an artifact or config mismatch, missing lineage, or a foreign
+/// fence refuses the restart as manual recovery instead of reconstructing or
 /// approximating state from a live PID or a directory listing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restart join keeps retained approval, relaunch descriptor and owner fence explicit so no binding is inferred"
+)]
 pub(super) fn require_journal_kernel_restart_record(
     current: &KernelRecord,
     kernel_artifact: &PlatformHandle,
+    approved_config: &PlatformHandle,
+    materialized_config_digest: &PlatformHandle,
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
 ) -> Result<(), HostError> {
     current.validate().map_err(|error| {
         HostError::RecoveryRequired(format!(
@@ -148,9 +166,21 @@ pub(super) fn require_journal_kernel_restart_record(
                 .to_owned(),
         ));
     }
+    if *approved_config != *materialized_config_digest {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: relaunch config is not the approved config; manual recovery required"
+                .to_owned(),
+        ));
+    }
     if current.candidate_job_binding.is_none() || current.process.is_none() {
         return Err(HostError::RecoveryRequired(
             "Kernel restart refused: durable Kernel record carries no PID/Job lineage for the approved artifact; manual recovery required"
+                .to_owned(),
+        ));
+    }
+    if current.fence != record_fence(host, activation_id, activation_generation) {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: durable Kernel record is not owned by the current activation fence; manual recovery required"
                 .to_owned(),
         ));
     }
@@ -329,6 +359,14 @@ pub(super) fn transition_activation_record(
     }
     if state == ActivationState::StoppedClean {
         next.timestamps.stopped_at = Some(fresh_identity("host-stopped-at")?);
+        // I1.5 W4 release: a clean stop ends the generation's fenced
+        // authority, so the generation releases the runtime-lease references
+        // it held. The obligations were snapshotted into the
+        // `DrainCommitRecord` at linearization
+        // (`drain_commit_record_for_stop`); recovery terminals (`Failed`,
+        // `DegradedRecovery`) keep their refs because reconciliation is still
+        // owed there.
+        next.runtime_lease_refs = Vec::new();
     }
     Ok(next)
 }

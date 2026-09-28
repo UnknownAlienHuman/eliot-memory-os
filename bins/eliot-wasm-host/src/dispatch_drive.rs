@@ -41,6 +41,7 @@ use eliot_runtime_contracts::{HealthDimension, HealthVector};
 use eliot_security_contracts::PrivacyClass;
 use eliot_wasm_runtime::lifecycle::{
     CoreOutcome, DeterministicEchoCore, ErrorClass, InFlightDisposition, SemanticCore,
+    ShadowComparatorOutcome, reconcile_shadow,
 };
 use eliot_wasm_runtime::{
     ArtifactAccessLimits, CancellationPolicy, CapabilityId, EffectProposal, EpochPolicy,
@@ -150,6 +151,14 @@ pub struct DispatchDriveResponse {
     /// owner-supplied digest set with no reference values to compare field
     /// by field, so no comparison is claimed.
     pub conformance: Option<ConformanceRecord>,
+    /// Isolated no-effect shadow comparator outcome for the same run,
+    /// covering semantic, invariant, effect-proposal, latency, memory,
+    /// host-call, and nondeterminism divergence (I14.19). `Some` exactly
+    /// when `conformance` is `Some`: only the registered component carries
+    /// reference values to reconcile field by field. Persisted here so the
+    /// activation-record response carries every comparator family, not just
+    /// the digest-level divergence legs.
+    pub shadow_comparator: Option<ShadowComparatorOutcome>,
 }
 
 /// WASM-versus-declared-core-reference conformance comparison for one
@@ -187,7 +196,10 @@ pub struct ConformanceRecord {
 impl ConformanceRecord {
     /// Holds exactly when every carried leg compares equal. One differing
     /// value fails the whole record; no leg is ever partially accepted.
-    fn holds(&self) -> bool {
+    /// Public so any production consumer of the activation record can read
+    /// the identical verdict the acceptance criterion requires.
+    #[must_use]
+    pub fn holds(&self) -> bool {
         self.wasm_result == self.reference_result
             && self.wasm_error_class == self.reference_error_class
             && self.wasm_effects == self.reference_effects
@@ -775,7 +787,8 @@ pub fn assemble_owner_records(
 /// every other verdict fails closed with unknown outcome preserved.
 /// Lifecycle and seated verdicts evaluate over the same retained result,
 /// and the registered conformance component additionally carries the
-/// WASM-versus-declared-core-reference comparison on the response.
+/// WASM-versus-declared-core-reference comparison plus the reconciled
+/// isolated no-effect shadow comparator outcome on the response.
 ///
 /// # Errors
 ///
@@ -828,6 +841,8 @@ pub(crate) fn map_invocation_result(
         .epoch_ticks
         .ok_or(DriveError::Execution { stage: "metering" })?;
     let conformance = conformance_record(result, &output, material)?;
+    let shadow_comparator =
+        shadow_comparator_for_record(result, &output, &usage, conformance.as_ref());
     Ok(DispatchDriveResponse {
         operation_id: material.operation_id.clone(),
         component_id: material.ceilings.component_id.clone(),
@@ -843,7 +858,62 @@ pub(crate) fn map_invocation_result(
         verdicts: evaluate_lifecycle_verdicts(result),
         seated: evaluate_seated_verdicts(result),
         conformance,
+        shadow_comparator,
     })
+}
+
+/// Reconciles the isolated no-effect shadow comparator outcome for the same
+/// run the conformance comparison covers (I14.19: exact, semantic,
+/// invariant, effect-proposal, latency, memory, host-call, and
+/// nondeterminism divergence).
+///
+/// Returns `Some` exactly when `conformance` is `Some`: only the registered
+/// component carries reference values to reconcile field by field. The WASM
+/// leg is built from the retained invocation result (observed output,
+/// error class, proposed effects, observed state delta, and executor
+/// metering); the reference leg reuses the comparison's own declared
+/// reference values, with resource observations staying explicitly unknown
+/// (the pure core observes none, never zero). The repeat leg is the WASM
+/// leg itself: this drive performs one execution, so no same-seed repeat
+/// is observed and no nondeterminism is reported as detected.
+///
+/// Host-call identities are not retained on this path (only the executor's
+/// host-call count is): an observed count of zero reconciles against an
+/// explicitly empty identity list, while a nonzero count reconciles as
+/// explicit unknown rather than a fabricated list.
+fn shadow_comparator_for_record(
+    result: &InvocationResult,
+    output: &[u8],
+    usage: &eliot_wasm_runtime::EngineUsage,
+    conformance: Option<&ConformanceRecord>,
+) -> Option<ShadowComparatorOutcome> {
+    let record = conformance.as_ref()?;
+    let wasm_state_delta = result.observed_state_delta.as_deref()?;
+    let wasm = CoreOutcome {
+        result: output.to_vec(),
+        error_class: observed_error_class(result.receipt.disposition),
+        effects: result.proposed_effects.clone(),
+        state_delta: wasm_state_delta.to_vec(),
+        host_calls: if usage.host_calls == 0 {
+            Some(Vec::new())
+        } else {
+            None
+        },
+        fuel_consumed: Some(usage.fuel_consumed),
+        peak_memory_bytes: usage.peak_memory_bytes,
+        elapsed_ms: Some(usage.elapsed_ms),
+    };
+    let reference = CoreOutcome {
+        result: record.reference_result.clone(),
+        error_class: record.reference_error_class,
+        effects: record.reference_effects.clone(),
+        state_delta: record.reference_state_delta.clone(),
+        host_calls: None,
+        fuel_consumed: None,
+        peak_memory_bytes: None,
+        elapsed_ms: None,
+    };
+    Some(reconcile_shadow(&wasm, &wasm, &reference).comparator)
 }
 
 /// Learning-ticket screening hook: invoked pre-seating over the exact

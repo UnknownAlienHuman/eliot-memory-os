@@ -32,7 +32,7 @@ use eliot_wasm_runtime::{EngineBinding, InvocationRequest, Sha256Digest, WasmRun
 use crate::WasmHostRunner;
 use crate::admission::{LiveAuthority, PortGrantError, resolve_kernel_port_grant};
 use crate::contour::AdmittedGeneration;
-use crate::dispatch_drive::{DriveError, drive_admission};
+use crate::dispatch_drive::{DispatchDriveResponse, DriveError, drive_admission};
 use crate::dispatch_material::{
     ValidatedDispatchMaterial, WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
 };
@@ -337,4 +337,42 @@ pub fn build_admitted_runtime(
         live: grant.live,
         termination: grant.termination,
     })
+}
+
+/// Drives one owner-admitted P03 parent execution to the canonical
+/// activation-record response (issue #1956, I14.19).
+///
+/// Order: [`build_admitted_runtime`] (pure admission, installation binding,
+/// live port-set resolution, runner over exactly that port set), contour-gated
+/// execution of the sealed invocation through the live runner, then
+/// [`crate::dispatch_drive::map_invocation_result`] classification — which
+/// runs the WASM-versus-declared-core-reference conformance comparison and
+/// the isolated no-effect shadow comparator reconciliation over the retained
+/// result and fails the whole drive on mismatch. Nothing is minted: the
+/// invocation, limits, and seed are the admitted material's own, and a
+/// contour-gate refusal surfaces as [`DriveError::Admission`] with field
+/// `"contour-gate"` (fail-closed, existing taxonomy, no new error kinds).
+///
+/// This is the production producer of the by-value activation record: the
+/// ordinary request loop's digest-level divergence stays on the versioned
+/// wire frame, while this parent path carries the full compared values plus
+/// every shadow comparator family for the registered deterministic
+/// component on its fixed seed/input.
+///
+/// # Errors
+///
+/// Returns [`DriveError`] when admission, port resolution, contour-gated
+/// execution, or conformance/shadow reconciliation fails closed.
+pub fn drive_parent_runtime(
+    material: &ValidatedDispatchMaterial,
+    now_ms: u64,
+) -> Result<DispatchDriveResponse, DriveError> {
+    let mut runtime = build_admitted_runtime(material, now_ms)?;
+    let result = runtime
+        .runner
+        .execute_admitted(&runtime.admitted, runtime.invocation.clone())
+        .map_err(|_| DriveError::Admission {
+            field: "contour-gate",
+        })?;
+    crate::dispatch_drive::map_invocation_result(&result, material)
 }

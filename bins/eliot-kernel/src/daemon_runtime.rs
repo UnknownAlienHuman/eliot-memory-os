@@ -21,6 +21,7 @@ use eliot_process::{
     ProcessStartReceipt,
 };
 
+use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
     ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
@@ -687,6 +688,7 @@ impl KernelComposition {
             AuditEventKind::PROCESS_READY_PROVEN,
             receipt.as_ref(),
             "ready",
+            self.current_state_fence().as_ref(),
         ));
         Ok(())
     }
@@ -720,7 +722,10 @@ impl KernelComposition {
             AuditEventKind::PROCESS_DEGRADED,
             receipt.as_ref(),
             &detail,
+            self.current_state_fence().as_ref(),
         ));
+        // Issue #1844: a degradation opens a problem; compile its brief.
+        self.observe_diagnostic_problem(DiagnosticTrigger::ProblemOpenedOrUpdated);
         Ok(())
     }
 
@@ -773,7 +778,10 @@ impl KernelComposition {
             AuditEventKind::PROCESS_FAILED,
             receipt.as_ref(),
             reason,
+            self.current_state_fence().as_ref(),
         ));
+        // Issue #1844: a daemon crash compiles its brief.
+        self.observe_diagnostic_problem(DiagnosticTrigger::ModuleCrashOrRestartExhaustion);
         Ok(())
     }
 }

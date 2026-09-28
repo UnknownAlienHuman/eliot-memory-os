@@ -815,6 +815,12 @@ pub(crate) fn build_receipt(
         admission_digest: transition.admission_digest.clone(),
         mutation_plan_digest: transition.mutation_plan_digest.clone(),
         semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        // I5.19: the policy/configuration/schema versions in force are copied
+        // exactly from the admitted transition, never defaulted; equality is
+        // enforced by the receipt-issuing path.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            transition,
+        ),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),
@@ -949,6 +955,12 @@ pub(crate) fn build_receipt_with_expected_heads(
         admission_digest: transition.admission_digest.clone(),
         mutation_plan_digest: transition.mutation_plan_digest.clone(),
         semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        // I5.19: the policy/configuration/schema versions in force are copied
+        // exactly from the admitted transition, never defaulted; equality is
+        // enforced by the receipt-issuing path.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            transition,
+        ),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),

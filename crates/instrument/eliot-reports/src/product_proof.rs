@@ -492,6 +492,86 @@ pub struct ProductProofStatus {
 }
 
 impl ProductProofStatus {
+    /// Captures the current parked Windows run as one explicit I18.24 outcome.
+    ///
+    /// A parked run was never attempted, so the record carries no attempt and
+    /// no live evidence. The caller supplies the observed outcome, the factual
+    /// reason, the stop-imposing authority, the required evidence that is
+    /// still missing, the retained build handle, and the retained readback
+    /// evidence whose installed-route stage must be explicitly missing. A
+    /// parked outcome is never `PASS`: I18.24 never aggregates `UNKNOWN`,
+    /// `PARTIAL` or `BLOCKED` into a pass, and compilation alone leaves the
+    /// product `NOT_ACCEPTED / UNVERIFIED` until an identity-bound installed
+    /// Windows proof exists.
+    pub fn parked(
+        proof_id: impl Into<String>,
+        outcome: VerificationOutcome,
+        reason: impl Into<String>,
+        authority: ProductProofAuthority,
+        mut missing_evidence: Vec<String>,
+        build_evidence: Option<ProductProofBuildEvidence>,
+        retained: ProductProofRetainedEvidence,
+    ) -> Result<Self, ProductProofError> {
+        if outcome == VerificationOutcome::Pass {
+            return Err(ProductProofError::ParkedRunCannotPass);
+        }
+        if retained.installed_route_observed() {
+            return Err(ProductProofError::ParkedRunCannotObserveInstalledRoute);
+        }
+        missing_evidence.sort();
+        let status = Self {
+            proof_id: proof_id.into(),
+            contract: PRODUCT_PROOF_CONTRACT.to_owned(),
+            outcome,
+            reason: reason.into(),
+            authority,
+            missing_evidence,
+            live_evidence: Vec::new(),
+            build_evidence,
+            attempt: None,
+            retained,
+        };
+        status.validate()?;
+        Ok(status)
+    }
+
+    /// Updates this record from the next installed Windows run attempt.
+    ///
+    /// The attempt carries its own lifecycle position and, when it did not
+    /// complete, exactly one I18.22 failure class. The caller supplies the
+    /// observed I18.24 outcome, the factual reason, the still-missing
+    /// evidence, the observed live evidence, and the updated retained
+    /// evidence. Identity, authority, and build evidence are preserved;
+    /// prior attempts stay readable through the retained raw logs. The
+    /// fail-closed rule still applies: a `PASS` outcome validates only with
+    /// an observed installed-route execution, no missing evidence, and a
+    /// succeeded run.
+    pub fn record_attempt(
+        &self,
+        attempt: ProductProofRunAttempt,
+        outcome: VerificationOutcome,
+        reason: impl Into<String>,
+        mut missing_evidence: Vec<String>,
+        live_evidence: Vec<ProductProofEvidence>,
+        retained: ProductProofRetainedEvidence,
+    ) -> Result<Self, ProductProofError> {
+        missing_evidence.sort();
+        let status = Self {
+            proof_id: self.proof_id.clone(),
+            contract: PRODUCT_PROOF_CONTRACT.to_owned(),
+            outcome,
+            reason: reason.into(),
+            authority: self.authority.clone(),
+            missing_evidence,
+            live_evidence,
+            build_evidence: self.build_evidence.clone(),
+            attempt: Some(attempt),
+            retained,
+        };
+        status.validate()?;
+        Ok(status)
+    }
+
     /// Validates the record's internal consistency.
     ///
     /// Two refusals are structural rather than advisory:
@@ -705,4 +785,10 @@ pub enum ProductProofError {
     /// execution is absent or evidence is still missing.
     #[error("PASS requires an observed installed-route execution and no missing evidence")]
     PassWithoutInstalledRoute,
+    /// A parked run was recorded with a `PASS` outcome.
+    #[error("a parked run cannot carry a PASS outcome")]
+    ParkedRunCannotPass,
+    /// A parked run was recorded with an observed installed-route execution.
+    #[error("a parked run cannot observe an installed-route execution")]
+    ParkedRunCannotObserveInstalledRoute,
 }

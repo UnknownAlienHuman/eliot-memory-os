@@ -175,7 +175,11 @@ applicability.
 The current-main #2393 source adds three governed production edges from
 `eliot-governor` to `eliot-kernel-core`, `eliot-ors`, and `eliot-platform`.
 Their explicit dispositions describe the owner-closure provider and its public
-type exposure. The two `eliot-wasm-host` edges to `eliot-contracts` and
+type exposure. The `eliot-governor` -> `eliot-dreamer-failure` edge is a further
+selected production edge whose disposition describes the pure negative-memory
+semantic provider: it admits the owner-issued rule and runs the bounded pure
+matcher, exposes only semantic owner types, and stays outside the Kernel
+authority boundary. The two `eliot-wasm-host` edges to `eliot-contracts` and
 `eliot-platform` are also present in current source and have explicit
 dispositions; those rows do not establish that the separate WASM invocation
 path is complete. Other observed internal edges remain in the source-derived

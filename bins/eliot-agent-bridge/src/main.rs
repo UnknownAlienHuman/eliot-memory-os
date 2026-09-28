@@ -4,11 +4,11 @@ mod request_input;
 
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
-    CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile, TransportAdmissionError,
-    TransportProfile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
-    loopback_http_route, parse_args, reactive_runtime_composition, validate_credential,
-    validate_host, validate_origin,
+    CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
+    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile,
+    TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
+    kernel_ports_with_declaration, loopback_http_route, parse_args, reactive_runtime_composition,
+    validate_credential, validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -449,8 +449,8 @@ enum Response {
     /// [`Response::Cancellation`]: reusing the admitted/responded shape would
     /// let a preview be mistaken for kernel admission, which the bridge must
     /// never imply. The envelope stays normalized stdio framing carrying the
-    /// caller correlation, the unsupported disposition, the static effect
-    /// preview with its evidence/source, and the exact attach snapshot
+    /// caller correlation, the preview/unsupported disposition, the static
+    /// effect preview with its evidence/source, and the exact attach snapshot
     /// observed while constructing it.
     DryRun {
         correlation_id: String,
@@ -526,10 +526,22 @@ struct StopPendingIdentity {
 
 /// Stable identity of the bridge-local static dry-run preview contract.
 const DRY_RUN_PREVIEW_SOURCE: &str = "bridge-static-preview.v1";
+/// Disposition of a dry run over a read-only tool with real inert validation.
+const DRY_RUN_PREVIEW_DISPOSITION: &str = "DRY_RUN_PREVIEW";
 /// Honest disposition where the bridge owns no safe simulator (I7.17).
 const DRY_RUN_UNSUPPORTED_DISPOSITION: &str = "DRY_RUN_UNSUPPORTED";
 /// Route label used when no entry may be named as a would-be dispatch.
 const DRY_RUN_ROUTE_WITHHELD: &str = "withheld-no-simulator";
+
+/// Closed kernel entries that serve real dispatch, owned by
+/// `bins/eliot-kernel/src/host_request_route.rs`. Repeated here for dry-run
+/// route labeling only: a dry run never sends them, it only names which entry
+/// a validated read-only request would have ridden (the same rows the recorded
+/// dispatch map in `kernel_host_request_client.rs` routes live dispatch
+/// through: `eliot.state` rides submit, `eliot.packet`/`eliot.query` ride
+/// invoke-read).
+const DRY_RUN_SUBMIT_OPERATION: &str = "agent_host_request_submit";
+const DRY_RUN_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 
 /// Static effect preview for one dry run: what the validated request names,
 /// without any claim that the target accepted, staged, or simulated it.
@@ -542,7 +554,7 @@ struct DryRunPreview {
     operation_handle: Option<String>,
     /// `read-only`, `effectful`, or `cancellation-probe`.
     effect_class: &'static str,
-    /// `withheld-no-simulator`: this bridge has no operation simulator.
+    /// Would-be kernel entry, or `withheld-no-simulator`.
     route: &'static str,
     /// Caller deadline preference echoed verbatim; the kernel would own it.
     deadline_preference_ms: Option<u64>,
@@ -1299,6 +1311,15 @@ fn invocation_wire_result(
         return Ok(wire);
     }
     let preview_len = content.len().min(eliot_agent_bridge::MAX_PREVIEW_BYTES);
+    // I7.24 delivery disposition for this frame: the retained view's measured
+    // flag when present, else TRUNCATED — this branch withholds bytes behind
+    // a bounded preview by construction, so the frame never claims a full
+    // delivery. Token-measured receipts still project only from a route
+    // attestation (`project_produced_tool_result`), never here.
+    let delivery = evidence.map_or(
+        DeliveryStatus::Truncated,
+        BridgeRunner::observed_hot_delivery,
+    );
     let response = wire
         .get_mut("outcome")
         .and_then(|outcome| outcome.get_mut("response"))
@@ -1310,6 +1331,7 @@ fn invocation_wire_result(
             "preview_bytes": &content[..preview_len],
             "total_bytes": content.len(),
             "truncated": true,
+            "delivery": delivery,
         }),
     );
     let resource = evidence
@@ -1687,13 +1709,24 @@ fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
 
 /// Classifies one invocation tool for dry-run preview (I7.17).
 ///
-/// Classifies the static effect shape of one invocation. Although some tools
-/// are read-only, this bridge has no operation-level simulator or validation
-/// capability for any tool, so each path is `DRY_RUN_UNSUPPORTED`. Returns
-/// effect class, withheld route, and disposition in that order.
+/// Read-only projections (`eliot.state`, `eliot.packet`, `eliot.query`) carry
+/// no external effects, so the bridge answers them with a validated static
+/// preview naming the entry they would have ridden. Every other tool is
+/// effectful and the bridge owns no safe simulator for it, so the honest
+/// answer is `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route
+/// label, and the disposition in that order.
 fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
-    let effect_class = match tool {
-        ToolRequest::State(_) | ToolRequest::Packet(_) | ToolRequest::Query(_) => "read-only",
+    match tool {
+        ToolRequest::State(_) => (
+            "read-only",
+            DRY_RUN_SUBMIT_OPERATION,
+            DRY_RUN_PREVIEW_DISPOSITION,
+        ),
+        ToolRequest::Packet(_) | ToolRequest::Query(_) => (
+            "read-only",
+            DRY_RUN_INVOKE_READ_OPERATION,
+            DRY_RUN_PREVIEW_DISPOSITION,
+        ),
         ToolRequest::Observe(_)
         | ToolRequest::Act(_)
         | ToolRequest::Verify(_)
@@ -1701,30 +1734,36 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Finish(_)
         | ToolRequest::UserAutomation(_)
         | ToolRequest::SkillInject(_)
-        | ToolRequest::SkillDisplay(_) => "effectful",
-    };
-    (
-        effect_class,
-        DRY_RUN_ROUTE_WITHHELD,
-        DRY_RUN_UNSUPPORTED_DISPOSITION,
-    )
+        | ToolRequest::SkillDisplay(_) => (
+            "effectful",
+            DRY_RUN_ROUTE_WITHHELD,
+            DRY_RUN_UNSUPPORTED_DISPOSITION,
+        ),
+    }
 }
 
 /// Answers one invocation dry run with zero side effects (I7.17).
 ///
-/// Runs bridge-local request-shape validation so malformed input fails closed
-/// with the identical `HOST_REQUEST_INVALID` shape, then returns the
-/// normalized unsupported envelope with a static preview and its
-/// evidence/source. The gateway, trusted port and admitted transport are
-/// never called. Request-shape validation is not operation validation or
-/// simulation; no kernel simulation or external validation runs here.
+/// Runs the same bridge-local inert validation as a real invoke so malformed
+/// input fails closed with the identical `HOST_REQUEST_INVALID` shape, then
+/// returns the normalized dry-run envelope with the static preview and its
+/// evidence/source. The gateway, the trusted port, and the admitted transport
+/// are never called: no envelope is built, no replay entry is recorded, and
+/// the target state plus the external-effect ledger stay exactly unchanged.
+/// No kernel simulation or external validation runs on this path.
 fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) -> Response {
     if let Err(error) = request.validate() {
         return host_gateway_error(&HostGatewayError::from(error));
     }
     let (effect_class, route, disposition) = dry_run_invoke_plan(&request.tool);
-    let statement = "DRY_RUN_UNSUPPORTED: no operation validation or simulation ran; only bridge-local \
-         request-shape validation passed; no effects were issued and no transport bytes were sent";
+    let statement = if disposition == DRY_RUN_UNSUPPORTED_DISPOSITION {
+        "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
+         only bridge-local request-shape validation passed; no effects were issued and \
+         no transport bytes were sent"
+    } else {
+        "bridge-local inert validation passed; no kernel simulation or external validation \
+         ran; no effects were issued and no transport bytes were sent"
+    };
     Response::DryRun {
         correlation_id: request.correlation_id.as_str().to_owned(),
         operation: "invoke",
@@ -3558,12 +3597,16 @@ fn record_mcp_delivery(
         binding,
     );
     let preview = std::str::from_utf8(view.preview()).ok()?;
+    // I7.24 delivery disposition for this frame, observed from the recorded
+    // view's measured flag (never estimated; token-measured receipts still
+    // project only from a route attestation).
     Some(serde_json::json!({
         "uri": view.handle().uri().as_str(),
         "digest": view.handle().digest(),
         "preview": preview,
         "total_bytes": view.total_bytes(),
         "truncated": view.is_truncated(),
+        "delivery": BridgeRunner::observed_hot_delivery(&view),
     }))
 }
 

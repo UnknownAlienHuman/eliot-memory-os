@@ -39,6 +39,10 @@ pub enum ConformanceError {
     /// No evidence covers the required scope on the exact fingerprint.
     #[error("capability evidence scope mismatch")]
     ScopeMismatch,
+    /// No evidence carries the required proof ceiling on the exact
+    /// fingerprint.
+    #[error("capability evidence proof ceiling mismatch")]
+    ProofCeilingMismatch,
     /// No evidence names the exact active fingerprint.
     #[error("capability evidence fingerprint mismatch")]
     FingerprintMismatch,
@@ -289,7 +293,9 @@ pub enum AdmissionCoverage {
 /// [`EvidenceTier::ConformanceProbe`] evidence and live, scope-matching
 /// [`EvidenceTier::ProductionObservation`] evidence naming the exact active
 /// fingerprint. Anything less is candidate coverage. A quarantined
-/// fingerprint is always rejected.
+/// fingerprint is always rejected. Verified tool/enforcement claims must
+/// additionally match the applicable proof ceiling; see
+/// [`admit_coverage_for_claim`].
 pub fn admit_coverage(
     evidence: &[CapabilityEvidence],
     active: &HostFingerprint,
@@ -321,12 +327,56 @@ pub fn admit_coverage(
     }
 }
 
+/// Computes claim-qualified adapter admission coverage on the exact active
+/// fingerprint.
+///
+/// Like [`admit_coverage`], but each qualifying evidence item must also
+/// carry exactly the required proof ceiling: evidence issued for one
+/// capability ceiling cannot authorize another (I7.22 "confirm the same
+/// capability"; I7.16 proof ceiling). Ceiling equality is exact and
+/// fail-closed; the docs define no ceiling ordering.
+pub fn admit_coverage_for_claim(
+    evidence: &[CapabilityEvidence],
+    active: &HostFingerprint,
+    required_scope: &str,
+    required_proof_ceiling: &str,
+    now_unix_ms: u64,
+    quarantine: &FingerprintQuarantine,
+) -> Result<AdmissionCoverage, ConformanceError> {
+    active.validate()?;
+    if !is_token(required_scope) || !is_token(required_proof_ceiling) {
+        return Err(ConformanceError::InvalidInput);
+    }
+    let active_canonical = active.canonical();
+    if quarantine.is_quarantined(&active_canonical) {
+        return Err(ConformanceError::Quarantined);
+    }
+    let live_for_claim = |tier: EvidenceTier| {
+        evidence.iter().any(|item| {
+            item.tier() == tier
+                && item.fingerprint() == active_canonical
+                && item.scope() == required_scope
+                && item.proof_ceiling() == required_proof_ceiling
+                && item.is_live(now_unix_ms)
+        })
+    };
+    if live_for_claim(EvidenceTier::ConformanceProbe)
+        && live_for_claim(EvidenceTier::ProductionObservation)
+    {
+        Ok(AdmissionCoverage::Verified)
+    } else {
+        Ok(AdmissionCoverage::CandidateOnly)
+    }
+}
+
 /// Requires verified capability evidence for a tool/enforcement claim.
 ///
 /// Accepts only live, scope-matching probe plus production-observation
 /// evidence on the exact active fingerprint. Rejects stale, broken,
 /// scope-mismatched, fingerprint-mismatched, quarantined, or candidate-only
-/// evidence with a specific error.
+/// evidence with a specific error. Verified tool/enforcement claims must
+/// additionally match the applicable proof ceiling; see
+/// [`require_verified_capability_for_claim`].
 pub fn require_verified_capability(
     evidence: &[CapabilityEvidence],
     active: &HostFingerprint,
@@ -338,12 +388,67 @@ pub fn require_verified_capability(
     if !is_token(required_scope) {
         return Err(ConformanceError::InvalidInput);
     }
-    if quarantine.is_quarantined(&active.canonical()) {
+    let active_canonical = active.canonical();
+    if quarantine.is_quarantined(&active_canonical) {
         return Err(ConformanceError::Quarantined);
     }
+    verified_on_fingerprint(
+        evidence,
+        &active_canonical,
+        required_scope,
+        None,
+        now_unix_ms,
+    )
+}
+
+/// Requires verified capability evidence for one exact claim.
+///
+/// Like [`require_verified_capability`], but each qualifying evidence item
+/// must also carry exactly the required proof ceiling: evidence issued for
+/// one capability ceiling cannot authorize another (I7.22 "confirm the same
+/// capability"; I7.16 proof ceiling). Ceiling equality is exact and
+/// fail-closed; the docs define no ceiling ordering.
+pub fn require_verified_capability_for_claim(
+    evidence: &[CapabilityEvidence],
+    active: &HostFingerprint,
+    required_scope: &str,
+    required_proof_ceiling: &str,
+    now_unix_ms: u64,
+    quarantine: &FingerprintQuarantine,
+) -> Result<(), ConformanceError> {
+    active.validate()?;
+    if !is_token(required_scope) || !is_token(required_proof_ceiling) {
+        return Err(ConformanceError::InvalidInput);
+    }
+    let active_canonical = active.canonical();
+    if quarantine.is_quarantined(&active_canonical) {
+        return Err(ConformanceError::Quarantined);
+    }
+    verified_on_fingerprint(
+        evidence,
+        &active_canonical,
+        required_scope,
+        Some(required_proof_ceiling),
+        now_unix_ms,
+    )
+}
+
+/// Runs the exact-fingerprint evidence ladder without consulting quarantine.
+///
+/// Callers check quarantine first or, for reconciliation release, present
+/// revalidation evidence for the quarantined fingerprint itself. With
+/// `ceiling` set, each qualifying item must also carry exactly the required
+/// proof ceiling.
+fn verified_on_fingerprint(
+    evidence: &[CapabilityEvidence],
+    active_canonical: &str,
+    required_scope: &str,
+    ceiling: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<(), ConformanceError> {
     let exact: Vec<&CapabilityEvidence> = evidence
         .iter()
-        .filter(|item| item.fingerprint() == active.canonical())
+        .filter(|item| item.fingerprint() == active_canonical)
         .collect();
     if exact.is_empty() {
         return Err(ConformanceError::FingerprintMismatch);
@@ -356,25 +461,39 @@ pub fn require_verified_capability(
     if scoped.is_empty() {
         return Err(ConformanceError::ScopeMismatch);
     }
-    let probe = scoped
+    let qualified: Vec<&CapabilityEvidence> = match ceiling {
+        None => scoped,
+        Some(required) => {
+            let matching: Vec<&CapabilityEvidence> = scoped
+                .iter()
+                .filter(|item| item.proof_ceiling() == required)
+                .copied()
+                .collect();
+            if matching.is_empty() {
+                return Err(ConformanceError::ProofCeilingMismatch);
+            }
+            matching
+        }
+    };
+    let probe = qualified
         .iter()
         .any(|item| item.tier() == EvidenceTier::ConformanceProbe);
-    let observation = scoped
+    let observation = qualified
         .iter()
         .any(|item| item.tier() == EvidenceTier::ProductionObservation);
     if !probe || !observation {
         return Err(ConformanceError::CandidateOnlyWhereVerifiedRequired);
     }
-    let live_probe = scoped
+    let live_probe = qualified
         .iter()
         .any(|item| item.tier() == EvidenceTier::ConformanceProbe && item.is_live(now_unix_ms));
-    let live_observation = scoped.iter().any(|item| {
+    let live_observation = qualified.iter().any(|item| {
         item.tier() == EvidenceTier::ProductionObservation && item.is_live(now_unix_ms)
     });
     if live_probe && live_observation {
         return Ok(());
     }
-    let qualifying_broken = scoped.iter().any(|item| {
+    let qualifying_broken = qualified.iter().any(|item| {
         (item.tier() == EvidenceTier::ConformanceProbe
             || item.tier() == EvidenceTier::ProductionObservation)
             && item.is_invalidated()
@@ -397,11 +516,29 @@ pub enum RouteMismatchDisposition {
     RejectUse,
 }
 
+/// Requested-versus-actual route finding for one reconciled attempt.
+///
+/// An unknown actual route is not an observed mismatch: missing telemetry
+/// never manufactures a mismatch event (I7.22).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteFinding {
+    /// Observed route exactly equals the requested route.
+    Matched,
+    /// No actual route was observed. The result is candidate-only, but
+    /// nothing is invalidated or quarantined.
+    UnknownRoute,
+    /// A positively observed route differs from the requested route.
+    ObservedMismatch,
+}
+
 /// Outcome of requested-versus-actual route reconciliation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptRouteOutcome {
     /// True when observed route exactly equals the requested route.
     pub matches: bool,
+    /// Requested-versus-actual finding: match, unknown route, or observed
+    /// mismatch.
+    pub finding: RouteFinding,
     /// A mismatched attempt is candidate-only and can never satisfy a
     /// verified claim.
     pub candidate_only: bool,
@@ -414,12 +551,14 @@ pub struct AttemptRouteOutcome {
 /// Reconciles one completed attempt's observed route against its requested
 /// route.
 ///
-/// A mismatch marks the result candidate-only, invalidates every capability
-/// evidence entry bound to or explicitly dependent on the mismatched
-/// fingerprint (unrelated evidence stays live), and quarantines the mismatched
-/// fingerprint pending reconciliation (unless `disposition` specifies
-/// `RejectUse`). An unknown observed route (`None`) fails closed as a
-/// mismatch. A match changes nothing.
+/// An observed mismatch marks the result candidate-only, invalidates every
+/// capability evidence entry bound to or explicitly dependent on the
+/// mismatched fingerprint (unrelated evidence stays live), and quarantines
+/// the mismatched fingerprint pending reconciliation (unless `disposition`
+/// specifies `RejectUse`). An unknown observed route (`None`) marks the
+/// result candidate-only without invalidating or quarantining anything:
+/// missing telemetry never manufactures a mismatch event, and an unknown
+/// route cannot satisfy a verified claim. A match changes nothing.
 pub fn reconcile_attempt_route(
     requested_route: &str,
     observed_route: Option<&str>,
@@ -432,11 +571,25 @@ pub fn reconcile_attempt_route(
         return Err(ConformanceError::InvalidInput);
     }
     mismatched_fingerprint.validate()?;
-    let matches = observed_route == Some(requested_route);
-    if matches {
+    let finding = match observed_route {
+        Some(observed) if observed == requested_route => RouteFinding::Matched,
+        Some(_) => RouteFinding::ObservedMismatch,
+        None => RouteFinding::UnknownRoute,
+    };
+    if finding == RouteFinding::Matched {
         return Ok(AttemptRouteOutcome {
             matches: true,
+            finding,
             candidate_only: false,
+            invalidated_count: 0,
+            quarantined: false,
+        });
+    }
+    if finding == RouteFinding::UnknownRoute {
+        return Ok(AttemptRouteOutcome {
+            matches: false,
+            finding,
+            candidate_only: true,
             invalidated_count: 0,
             quarantined: false,
         });
@@ -467,6 +620,7 @@ pub fn reconcile_attempt_route(
     };
     Ok(AttemptRouteOutcome {
         matches: false,
+        finding,
         candidate_only: true,
         invalidated_count,
         quarantined,
@@ -516,8 +670,38 @@ impl FingerprintQuarantine {
 
     /// Reconciles one fingerprint, clearing its quarantine entry.
     /// Returns true when an entry was present.
+    ///
+    /// Production release must present exact current revalidation evidence
+    /// instead; see [`FingerprintQuarantine::reconcile_with_revalidation`].
     pub fn reconcile(&mut self, fingerprint_canonical: &str) -> bool {
         self.entries.remove(fingerprint_canonical).is_some()
+    }
+
+    /// Reconciles one fingerprint only against exact current revalidation
+    /// evidence: live probe plus production-observation evidence naming the
+    /// quarantined fingerprint in scope. Returns true when the entry was
+    /// released, false when no entry was present. A failed revalidation
+    /// leaves the entry quarantined and reports the exact evidence reason.
+    /// Release restores admissibility consideration only; every verified
+    /// claim still gates on its own evidence.
+    pub fn reconcile_with_revalidation(
+        &mut self,
+        active: &HostFingerprint,
+        revalidation: &[CapabilityEvidence],
+        required_scope: &str,
+        now_unix_ms: u64,
+    ) -> Result<bool, ConformanceError> {
+        active.validate()?;
+        if !is_token(required_scope) {
+            return Err(ConformanceError::InvalidInput);
+        }
+        let canonical = active.canonical();
+        if !self.is_quarantined(&canonical) {
+            return Ok(false);
+        }
+        verified_on_fingerprint(revalidation, &canonical, required_scope, None, now_unix_ms)?;
+        self.entries.remove(&canonical);
+        Ok(true)
     }
 
     /// Returns the number of quarantined fingerprints.
@@ -637,7 +821,11 @@ impl AttemptGate {
     }
 
     /// Creates the causally linked new attempt required after the boundary,
-    /// carrying the sealed handoff from this attempt.
+    /// carrying the sealed handoff from this attempt. Production
+    /// substitution must additionally verify target-route admission; see
+    /// [`AttemptGate::next_attempt_after_effect_for_admitted_target`].
+    /// Persisting the handoff and retaining source effects belong to the
+    /// dispatch/durable owners, not this shape gate.
     pub fn next_attempt_after_effect(
         &self,
         new_attempt_id: impl Into<String>,
@@ -670,6 +858,33 @@ impl AttemptGate {
             handoff: Some(handoff),
             rehydration_bundle: Some(rehydration_bundle),
         })
+    }
+
+    /// Creates the causally linked new attempt required after the boundary,
+    /// additionally requiring verified target-route admission on the exact
+    /// target fingerprint before the handoff is accepted. Link, bundle, and
+    /// identity checks are unchanged from
+    /// [`AttemptGate::next_attempt_after_effect`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_attempt_after_effect_for_admitted_target(
+        &self,
+        new_attempt_id: impl Into<String>,
+        handoff: HandoffCausalLink,
+        rehydration_bundle: RehydrationBundle,
+        target: &HostFingerprint,
+        target_evidence: &[CapabilityEvidence],
+        required_scope: &str,
+        now_unix_ms: u64,
+        quarantine: &FingerprintQuarantine,
+    ) -> Result<Self, ConformanceError> {
+        require_verified_capability(
+            target_evidence,
+            target,
+            required_scope,
+            now_unix_ms,
+            quarantine,
+        )?;
+        self.next_attempt_after_effect(new_attempt_id, handoff, rehydration_bundle)
     }
 }
 

@@ -746,6 +746,15 @@ impl StoreFailure {
                 StoreError::MissingReceiptEnvelope => {
                     return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
                 }
+                StoreError::UnknownOutcome { operation_id } => {
+                    if context.operation_id.as_ref() != Some(operation_id) {
+                        return Err(StoreFailureContractError::Invalid {
+                            field: "operation_id",
+                            reason: "unknown outcome identity differs from admitted operation",
+                        });
+                    }
+                    return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
+                }
                 StoreError::PayloadTooLarge => deterministic("PAYLOAD_TOO_LARGE"),
                 StoreError::Unavailable => (
                     StoreFailureDisposition::Unavailable,

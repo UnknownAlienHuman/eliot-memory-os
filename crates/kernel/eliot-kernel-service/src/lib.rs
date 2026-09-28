@@ -73,8 +73,8 @@ pub use capacity_evidence::{
     LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
 };
 pub use contract_rejection_gate::{
-    PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageRejection,
-    PreStageState, VerifiedCorrectionLink, derive_rejection_id, pre_stage_check,
+    PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageIdentitySnapshot,
+    PreStageRejection, PreStageState, VerifiedCorrectionLink, derive_rejection_id, pre_stage_check,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,

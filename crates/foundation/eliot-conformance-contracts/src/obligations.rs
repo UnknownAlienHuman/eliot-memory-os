@@ -36,6 +36,14 @@
 //! the existing I0.5 `ImplementationSupport` and `EvidenceExecutionStatus`
 //! values, and `ObligationStatus` names the obligation-level outcome itself.
 //!
+//! A body disagreement between two cold sources for the same owner/property is
+//! none of those three: the capability may be present and current, so asserting
+//! `TARGET` / `NOT_EXECUTED` or `STALE` would fabricate a disposition the
+//! sources do not justify. The compiler therefore demotes such a group to the
+//! explicit non-active [`ObligationStatus::Conflicted`] disposition, which
+//! retains every source lineage and names the first disagreeing field, instead
+//! of refusing the compilation and losing both lineages (issue #1921, A1).
+//!
 //! # Cold lineage versus the runtime hotset
 //!
 //! `ActiveObligationHotsetEntry` is a separate type with no `source_lineage`
@@ -85,9 +93,9 @@ use crate::{
 };
 
 /// Current serialized obligation-contract revision.
-pub const OBLIGATION_CONTRACT_VERSION: u16 = 2;
+pub const OBLIGATION_CONTRACT_VERSION: u16 = 3;
 /// Stable schema identity for [`ActiveConformanceObligation`].
-pub const OBLIGATION_SCHEMA: &str = "eliot.conformance.active-obligation.v2";
+pub const OBLIGATION_SCHEMA: &str = "eliot.conformance.active-obligation.v3";
 
 /// Closed obligation-level outcome. `TARGET` / `NOT_EXECUTED` / `STALE` are
 /// carried by the existing I0.5 support and execution axes on every row; this
@@ -116,6 +124,13 @@ pub enum ObligationStatus {
     /// executable, and distinct from terminal `Retired`: the gate may still
     /// open, while a retirement closes the obligation.
     InactiveResearchGate,
+    /// Body conflict (issue #1921, A1). Two or more cold sources for the same
+    /// owner/property disagree on the obligation body, so the group cannot
+    /// collapse into one `ACTIVE` row and neither `TARGET` / `NOT_EXECUTED`
+    /// nor `STALE` truthfully describes it. Never executable. The row retains
+    /// every source lineage and names the first disagreeing field in
+    /// `conflict_field` for the owning planner to resolve.
+    Conflicted,
 }
 
 impl ObligationStatus {
@@ -398,6 +413,9 @@ pub struct ActiveConformanceObligation {
     /// Retained reason for an INACTIVE Research Gate. Present exactly when
     /// `status` is `INACTIVE_RESEARCH_GATE`.
     pub inactive_gate_reason: Option<String>,
+    /// First body field on which the cold sources for this owner/property
+    /// disagreed. Present exactly when `status` is `CONFLICTED`.
+    pub conflict_field: Option<String>,
     /// Agreed I19.9 disposition of the source proofs that collapsed into this
     /// row, when classified.
     pub test_disposition: Option<TestDisposition>,
@@ -570,12 +588,6 @@ pub enum ObligationError {
         owner: String,
         property: String,
     },
-    #[error("{owner}/{property} has conflicting cold-source {field} across its lineages")]
-    ConflictingColdSource {
-        owner: String,
-        property: String,
-        field: &'static str,
-    },
     #[error("invalid obligation disposition: {reason}")]
     InvalidDisposition { reason: &'static str },
     #[error("duplicate compiled obligation for {owner}/{property}")]
@@ -611,7 +623,10 @@ pub enum ObligationError {
 ///
 /// Claims are deduplicated by current causal property and owner: every claim in
 /// a group that agrees on the whole obligation body collapses into one row that
-/// retains all of their lineages. A row is `ACTIVE` only when the capability
+/// retains all of their lineages. A group whose sources disagree on any body
+/// field is demoted to the explicit non-active `CONFLICTED` disposition, still
+/// retaining every lineage, instead of refusing the compilation. A row is
+/// `ACTIVE` only when the capability
 /// exists on `product_identity` and the claim names a nonzero discriminator and
 /// a selected proof profile. A capability absent from the product identity
 /// yields a `TARGET_NOT_EXECUTED` row with no executable test obligation.
@@ -772,6 +787,10 @@ pub fn validate_active_conformance_obligation(
         obligation.inactive_gate_reason.as_deref(),
     )?;
     validate_optional_text(
+        "obligation.conflict_field",
+        obligation.conflict_field.as_deref(),
+    )?;
+    validate_optional_text(
         "obligation.test_disposition_reason",
         obligation.test_disposition_reason.as_deref(),
     )?;
@@ -849,9 +868,12 @@ pub fn validate_obligation_set(
 }
 
 /// Merges one cold source into the compiled set, deduplicating by current
-/// causal property and owner while retaining every source lineage. A source
-/// that asserts an I17.19 stop/narrow condition refuses the whole compilation
-/// before any merge, on either the new-row or the existing-row path.
+/// causal property and owner while retaining every source lineage. A group
+/// whose sources disagree on the obligation body is demoted to the explicit
+/// non-active `CONFLICTED` disposition with every lineage retained, instead of
+/// refusing the compilation. A source that asserts an I17.19 stop/narrow
+/// condition refuses the whole compilation before any merge, on either the
+/// new-row or the existing-row path.
 fn merge_cold_source(
     obligations: &mut Vec<ActiveConformanceObligation>,
     source: ColdSourceClaim,
@@ -874,11 +896,20 @@ fn merge_cold_source(
     };
 
     if let Some(field) = conflicting_field(obligation, &source, product_identity) {
-        return Err(ObligationError::ConflictingColdSource {
-            owner: source.owner,
-            property: source.property,
-            field,
-        });
+        // A1: a body disagreement demotes the row to the explicit non-active
+        // CONFLICTED disposition instead of refusing the whole compilation, so
+        // neither source lineage is lost. The first disagreeing field is kept:
+        // sources arrive in stable owner/property order, so it is deterministic.
+        obligation.status = ObligationStatus::Conflicted;
+        if obligation.conflict_field.is_none() {
+            obligation.conflict_field = Some(field.to_string());
+        }
+        // The row now holds the `CONFLICTED` disposition, not the
+        // `INACTIVE_RESEARCH_GATE` one, so the gate reason it was retained
+        // under is dropped. A row names exactly one non-active disposition, and
+        // its `inactive_gate_reason` is meaningful only alongside that one; the
+        // conflict field and every source lineage are still retained.
+        obligation.inactive_gate_reason = None;
     }
     let lineage = ColdSourceLineage {
         source_issue_id: source.source_issue_id.clone(),
@@ -1014,6 +1045,7 @@ fn compile_obligation(
         adoption_stage: source.adoption_stage,
         stage_gate_evidence_ref: source.stage_gate_evidence_ref.clone(),
         inactive_gate_reason: source.inactive_gate_reason.clone(),
+        conflict_field: None,
         test_disposition: source.test_disposition,
         test_disposition_reason: source.test_disposition_reason.clone(),
         test_disposition_evidence_ref: source.test_disposition_evidence_ref.clone(),
@@ -1201,10 +1233,11 @@ fn validate_stop_conditions(conditions: &[DonorStopCondition]) -> Result<(), Obl
 /// an `ACTIVE` row carries a discriminator, a selected proof profile, and an
 /// oracle/evidence lineage. A donor-derived row always carries its adoption
 /// stage; Stage A is never executable; a Stage B+ `ACTIVE` row cites gate
-/// evidence; an `INACTIVE_RESEARCH_GATE` row retains its reason; and a removed,
-/// narrowed or retired test proof is never `ACTIVE`. Expiry is checked against
-/// the compilation boundary by [`validate_obligation_set`], which owns that
-/// boundary.
+/// evidence; an `INACTIVE_RESEARCH_GATE` row retains its reason, and only such
+/// a row does; a removed, narrowed or retired test proof is never `ACTIVE`; and
+/// a `CONFLICTED` row carries its conflict field, and only such a row does.
+/// Expiry is checked against the compilation boundary by
+/// [`validate_obligation_set`], which owns that boundary.
 fn validate_obligation_disposition(
     obligation: &ActiveConformanceObligation,
 ) -> Result<(), ObligationError> {
@@ -1237,6 +1270,28 @@ fn validate_obligation_disposition(
     {
         return Err(ObligationError::MissingEvidence {
             field: "obligation.inactive_gate_reason",
+        });
+    }
+    // The mirror of the check above: a gate reason is the marker of exactly one
+    // disposition, so a row that holds any other disposition must not also
+    // carry one. Without this, a group demoted to `CONFLICTED` would still
+    // advertise the INACTIVE Research Gate it no longer holds, and the two
+    // markers would name two dispositions for one row.
+    if obligation.status != ObligationStatus::InactiveResearchGate
+        && obligation.inactive_gate_reason.is_some()
+    {
+        return Err(ObligationError::InvalidDisposition {
+            reason: "only an INACTIVE Research Gate retains a gate reason",
+        });
+    }
+    if obligation.status == ObligationStatus::Conflicted && obligation.conflict_field.is_none() {
+        return Err(ObligationError::MissingEvidence {
+            field: "obligation.conflict_field",
+        });
+    }
+    if obligation.status != ObligationStatus::Conflicted && obligation.conflict_field.is_some() {
+        return Err(ObligationError::InvalidDisposition {
+            reason: "only a CONFLICTED obligation carries a conflict field",
         });
     }
     if obligation
