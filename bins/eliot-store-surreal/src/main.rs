@@ -316,9 +316,9 @@ fn enforce_store_compatibility(
 #[cfg(windows)]
 #[allow(clippy::print_stderr)]
 fn install_release_compatibility_decision() -> Result<bool, String> {
-    let Some(config_path) = std::env::var_os(COMPATIBILITY_CONFIG_VARIABLE).map(PathBuf::from)
-    else {
-        return Ok(false);
+    let config_path = match std::env::var_os(COMPATIBILITY_CONFIG_VARIABLE) {
+        Some(value) => PathBuf::from(value),
+        None => return Ok(false),
     };
     let record_path = owner_supplied_path(COMPATIBILITY_RECORD_VARIABLE)?;
     let evidence_path = owner_supplied_path(COMPATIBILITY_EVIDENCE_VARIABLE)?;
@@ -330,9 +330,7 @@ fn install_release_compatibility_decision() -> Result<bool, String> {
     let evidence_snapshot_bytes = std::fs::read(&evidence_path)
         .map_err(|error| format!("read the owner-supplied evidence snapshot: {error}"))?;
     install_compatibility_decision(&config_path, &record, &evidence_snapshot_bytes)?;
-    eprintln!(
-        "{SERVICE_NAME}: installed the installation-visible compatibility decision for {config_path:?}"
-    );
+    eprintln!("{SERVICE_NAME}: installed the installation-visible compatibility decision");
     Ok(true)
 }
 
