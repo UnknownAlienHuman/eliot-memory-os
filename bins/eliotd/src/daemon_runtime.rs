@@ -4534,13 +4534,18 @@ fn classify_submit_ack(
             ticket.ticket_id
         )));
     }
-    ack.validate_against_result(result).map_err(|error| {
-        ActivationDispatchError::Hard(format!(
-            "Kernel activation result ack payload mismatch: {error}"
-        ))
-    })?;
+    // #1115: the full accepted-payload validation belongs to the `Accepted`
+    // arm only, exactly as in reconcile classification. Running the
+    // accepted-result validator before this match rejected every closed
+    // `Unknown` acknowledgement as a payload mismatch and made the typed
+    // `Unknown` outcome below unreachable.
     match ack.outcome {
         AgentActivationResultAckOutcome::Accepted => {
+            ack.validate_against_result(result).map_err(|error| {
+                ActivationDispatchError::Hard(format!(
+                    "Kernel activation result ack payload mismatch: {error}"
+                ))
+            })?;
             // #740: ack record. Stable retained-result correlation is not
             // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
