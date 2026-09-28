@@ -166,6 +166,8 @@ pub enum ParameterShape {
     BlackboardItemLookup,
     /// Closed typed blackboard item revision and predecessor CAS for issue #1822.
     BlackboardItemRevision,
+    /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
+    InstrumentRegistrySnapshot,
 }
 
 impl ParameterShape {
@@ -183,6 +185,7 @@ impl ParameterShape {
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
+            Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
         }
     }
 }
@@ -701,6 +704,15 @@ static GET_RESOURCE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
     required: true,
 }];
 
+/// Opaque versioned registry snapshot carried by the unactivated instrument
+/// registry mutation. The expected owner revision is bound by the prepared
+/// transition's standard revision-head CAS, not duplicated in payload data.
+static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "snapshot_json",
+    shape: ParameterShape::InstrumentRegistrySnapshot,
+    required: true,
+}];
+
 /// Owner-approved user-automation mutation fields (issue #1779): the leg
 /// discriminator, the always-present automation identity, and the
 /// conditionally-required leg payloads. Leg completeness (which payload
@@ -1037,6 +1049,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetReactiveInjectionState => "GetReactiveInjectionState",
         NamedReadOperation::GetResourceSnapshot => "GetResourceSnapshot",
         NamedReadOperation::GetUserAutomationState => "GetUserAutomationState",
+        NamedReadOperation::GetInstrumentRegistryState => "GetInstrumentRegistryState",
         NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
         NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
         NamedReadOperation::GetBlackboardItem => "GetBlackboardItem",
@@ -1089,6 +1102,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetReactiveInjectionState" => Some(NamedReadOperation::GetReactiveInjectionState),
         b"GetResourceSnapshot" => Some(NamedReadOperation::GetResourceSnapshot),
         b"GetUserAutomationState" => Some(NamedReadOperation::GetUserAutomationState),
+        b"GetInstrumentRegistryState" => Some(NamedReadOperation::GetInstrumentRegistryState),
         b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
         b"GetBlackboardItem" => Some(NamedReadOperation::GetBlackboardItem),
@@ -1116,6 +1130,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyReactiveInjectionState => "ApplyReactiveInjectionState",
         NamedMutationOperation::ApplyResourceSnapshot => "ApplyResourceSnapshot",
         NamedMutationOperation::ApplyUserAutomationState => "ApplyUserAutomationState",
+        NamedMutationOperation::ApplyInstrumentRegistryState => "ApplyInstrumentRegistryState",
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
@@ -1142,6 +1157,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyReactiveInjectionState" => Some(NamedMutationOperation::ApplyReactiveInjectionState),
         b"ApplyResourceSnapshot" => Some(NamedMutationOperation::ApplyResourceSnapshot),
         b"ApplyUserAutomationState" => Some(NamedMutationOperation::ApplyUserAutomationState),
+        b"ApplyInstrumentRegistryState" => {
+            Some(NamedMutationOperation::ApplyInstrumentRegistryState)
+        }
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
@@ -1222,7 +1240,8 @@ pub const fn declared_read_parameters(
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetModuleCatalogState
         | NamedReadOperation::GetConformanceState
-        | NamedReadOperation::GetMailbox => &NO_PARAMETERS,
+        | NamedReadOperation::GetMailbox
+        | NamedReadOperation::GetInstrumentRegistryState => &NO_PARAMETERS,
     }
 }
 
@@ -1274,7 +1293,10 @@ pub const fn declared_read_parameters(
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
 /// `idempotency_key`; digest IS the immutable revision identity);
-/// every other variant declares none,
+/// `ApplyInstrumentRegistryState` declares the opaque versioned
+/// `snapshot_json` string; its expected current revision comes from the
+/// prepared transition's revision-head CAS. It remains unadvertised pending
+/// canonical store handlers. Every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -1300,6 +1322,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyReactiveInjectionState => &APPLY_REACTIVE_LEDGER_PARAMETERS,
         NamedMutationOperation::ApplyResourceSnapshot => &APPLY_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
+        NamedMutationOperation::ApplyInstrumentRegistryState => {
+            &APPLY_INSTRUMENT_REGISTRY_PARAMETERS
+        }
         NamedMutationOperation::CommitExperienceBank
         | NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
         NamedMutationOperation::RecordLearningRecord => &COMMIT_LEARNING_PARAMETERS,
@@ -1387,7 +1412,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignSourcePublications
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
-        | ParameterShape::BlackboardItemRevision => true,
+        | ParameterShape::BlackboardItemRevision
+        | ParameterShape::InstrumentRegistrySnapshot => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1523,6 +1549,7 @@ fn check_declared_shape(
             }
             Ok(())
         }
+        ParameterShape::InstrumentRegistrySnapshot => validate_instrument_registry_snapshot(value),
         ParameterShape::CampaignSourceLookup => {
             let lookup: crate::CampaignSourceRevisionLookup = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -1575,6 +1602,24 @@ fn check_declared_shape(
             revision.validate()
         }
     }
+}
+
+fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {
+    let snapshot_json = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "instrument registry snapshot must be a JSON string",
+    })?;
+    let snapshot: Value = serde_json::from_str(snapshot_json)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if snapshot.get("schema").and_then(Value::as_str) != Some("eliot.instrument.registry-snapshot")
+        || snapshot.get("version").and_then(Value::as_str) != Some("1.0.0")
+    {
+        return Err(StoreError::InvalidField {
+            field: "instrument_registry.snapshot_json",
+            reason: "unsupported instrument registry snapshot schema/version",
+        });
+    }
+    Ok(())
 }
 
 fn validate_blackboard_lookup_selector(
