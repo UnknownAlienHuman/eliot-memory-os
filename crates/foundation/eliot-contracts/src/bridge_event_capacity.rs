@@ -91,9 +91,9 @@ pub enum BridgeTransportBackpressureRecoveryAction {
     )]
     ReuseExactLiveRecoveryWindowOrWaitForExpiry,
     #[serde(
-        rename = "wait for expired recovery-window cut cleanup, then reissue the exact authenticated recovery selector"
+        rename = "after expired-window cleanup, retry the exact selector while its window is live; if expired, reopen authenticated recovery and use the new window"
     )]
-    WaitForExpiredRecoveryWindowCutCleanupThenRetryAuthenticatedSelector,
+    AfterExpiredWindowCleanupRetryLiveSelectorOrReopenAuthenticatedRecovery,
 }
 
 /// Closed descriptions of work shed or deferred by the front door.
@@ -186,7 +186,7 @@ impl BridgeTransportBackpressure {
                     BridgeTransportBackpressureShedWork::DeferredNewRecoveryWindowOpenExistingRecoveryRetained,
                 ) | (
                     BridgeTransportBackpressureDimension::BridgeRecoveryCuts,
-                    BridgeTransportBackpressureRecoveryAction::WaitForExpiredRecoveryWindowCutCleanupThenRetryAuthenticatedSelector,
+                    BridgeTransportBackpressureRecoveryAction::AfterExpiredWindowCleanupRetryLiveSelectorOrReopenAuthenticatedRecovery,
                     BridgeTransportBackpressureShedWork::DeferredNewRecoveryCutExistingRecoveryRetained,
                 )
             )
