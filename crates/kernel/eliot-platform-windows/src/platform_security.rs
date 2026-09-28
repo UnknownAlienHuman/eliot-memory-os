@@ -12,6 +12,190 @@ use crate::FileIdentity;
 use crate::ProtectedPathLease;
 use crate::WindowsAdapterError;
 
+/// Read-only retained proof of the current token's OS-resolved LocalAppData
+/// anchor. Unlike an Eliot-owned root this ambient known folder is not assigned
+/// Eliot's protected DACL, so this lease observes handle identity without
+/// changing or projecting its ACL.
+pub(crate) struct CurrentUserLocalAppDataRootLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    sid: String,
+    session_id: u32,
+    #[cfg(windows)]
+    handle: std::fs::File,
+}
+
+impl CurrentUserLocalAppDataRootLease {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    pub(crate) fn current_user_sid(&self) -> &str {
+        &self.sid
+    }
+
+    pub(crate) const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    pub(crate) fn verify_stable_identity(&self) -> Result<(), WindowsAdapterError> {
+        #[cfg(windows)]
+        {
+            let observed = crate::file_identity_from_handle(&self.handle)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+            if observed != self.identity {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(WindowsAdapterError::Unavailable)
+        }
+    }
+}
+
+/// Fixed provider-neutral input for a UserMode current-user Task Scheduler
+/// task. This is private to the Windows platform crate so callers cannot use
+/// it as a general command scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserModeProfileTaskSpec {
+    pub(crate) task_name: String,
+    pub(crate) installation_id: String,
+    pub(crate) installation_key: String,
+    pub(crate) component: String,
+    pub(crate) version: String,
+    pub(crate) generation: String,
+    pub(crate) roots_digest: String,
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
+    pub(crate) working_directory: PathBuf,
+    pub(crate) arguments: String,
+    pub(crate) expected_sid: String,
+    pub(crate) expected_session_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserModeProfileTaskCleanupRequired {
+    pub(crate) task_name: String,
+    pub(crate) requested_xml_sha256: String,
+    pub(crate) observed_xml_sha256: Option<String>,
+    pub(crate) spec: UserModeProfileTaskSpec,
+    pub(crate) cause: WindowsAdapterError,
+    pub(crate) cleanup_error: WindowsAdapterError,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserModeProfileTaskRegistrationError {
+    Rejected(WindowsAdapterError),
+    CleanupRequired(UserModeProfileTaskCleanupRequired),
+}
+
+impl From<WindowsAdapterError> for UserModeProfileTaskRegistrationError {
+    fn from(error: WindowsAdapterError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+/// Exact Task Scheduler state retained after registration/readback. The
+/// complete action and descriptor binding are carried through later run and
+/// cleanup calls rather than reconstructed from ambient values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserModeProfileTaskReceipt {
+    pub(crate) task_name: String,
+    pub(crate) installation_id: String,
+    pub(crate) installation_key: String,
+    pub(crate) component: String,
+    pub(crate) version: String,
+    pub(crate) generation: String,
+    pub(crate) roots_digest: String,
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
+    pub(crate) working_directory: PathBuf,
+    pub(crate) arguments: String,
+    pub(crate) sid: String,
+    pub(crate) session_id: u32,
+    pub(crate) task_xml_sha256: String,
+}
+
+/// One immediate Task Scheduler result tied to the registered task's exact
+/// action, SID/session and XML digest. `engine_process_id` identifies the Task
+/// Scheduler engine only; it is not the executable PID or a Host readiness
+/// proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserModeProfileTaskRunReceipt {
+    pub(crate) task_name: String,
+    pub(crate) sid: String,
+    pub(crate) session_id: u32,
+    pub(crate) engine_process_id: u32,
+    pub(crate) task_xml_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserModeProfileTaskInspection {
+    pub(crate) task_xml_sha256: String,
+    pub(crate) matches_request: bool,
+}
+
+/// Opens the exact LocalAppData directory returned by the Windows known-folder
+/// API for the current token and keeps its no-follow identity live for the
+/// caller's validation window.
+pub(crate) fn retain_current_user_local_app_data_root()
+-> Result<CurrentUserLocalAppDataRootLease, WindowsAdapterError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let path = crate::current_user_local_app_data_root()
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        crate::reject_reparse_chain(&path, true)
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let handle = options
+            .open(&path)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let metadata = handle
+            .metadata()
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        if !metadata.is_dir() || crate::is_reparse_point(&metadata) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let canonical = crate::final_windows_path_from_handle(&handle)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        if !crate::windows_paths_equal(&canonical, &path) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let identity = crate::file_identity_from_handle(&handle)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let current = crate::current_process_named_pipe_expectation()?;
+        let lease = CurrentUserLocalAppDataRootLease {
+            path: canonical,
+            identity,
+            sid: current.expected_sid().to_owned(),
+            session_id: current.expected_session_id(),
+            handle,
+        };
+        lease.verify_stable_identity()?;
+        Ok(lease)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
 /// Stable role of one admitted local named-pipe peer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NamedPipePeerKind {
@@ -932,6 +1116,801 @@ pub(super) fn watchdog_task_xml(registration: &WatchdogTaskRegistration) -> Stri
     </Exec>
   </Actions>
 </Task>"#
+    )
+}
+
+/// Registers a new installation-keyed UserMode Host task for the current
+/// interactive user. Registration is create-only: an existing predictable
+/// task requires a prior persisted ownership receipt and must be reconciled by
+/// the installation transaction. Registration uses an interactive token and
+/// `LeastPrivilege`; it does not request administrator or `ProgramData`
+/// authority.
+pub(crate) fn register_user_mode_profile_task(
+    spec: &UserModeProfileTaskSpec,
+) -> Result<UserModeProfileTaskReceipt, UserModeProfileTaskRegistrationError> {
+    validate_user_mode_profile_task_spec(spec)
+        .map_err(UserModeProfileTaskRegistrationError::Rejected)?;
+    #[cfg(windows)]
+    {
+        register_user_mode_profile_task_windows(spec)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = spec;
+        Err(UserModeProfileTaskRegistrationError::Rejected(
+            WindowsAdapterError::Unavailable,
+        ))
+    }
+}
+
+/// Requests the exact registered task to run and reads back its Scheduler
+/// engine PID. This does not prove that the action executable started or is
+/// ready; Host must use its authenticated runtime/process handshake for that.
+pub(crate) fn run_user_mode_profile_task(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<UserModeProfileTaskRunReceipt, WindowsAdapterError> {
+    validate_user_mode_profile_task_receipt(receipt)?;
+    #[cfg(windows)]
+    {
+        run_user_mode_profile_task_windows(receipt)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = receipt;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Reads the current Task Scheduler definition without changing it. A missing
+/// task/folder is returned only for recognized provider not-found HRESULTs;
+/// other COM failures remain unavailable rather than being mistaken for
+/// absence.
+pub(crate) fn inspect_user_mode_profile_task(
+    spec: &UserModeProfileTaskSpec,
+) -> Result<Option<UserModeProfileTaskInspection>, WindowsAdapterError> {
+    validate_user_mode_profile_task_spec(spec)?;
+    #[cfg(windows)]
+    {
+        inspect_user_mode_profile_task_windows(spec)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = spec;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Removes a UserMode task only while its exact action, owner and XML digest
+/// still match the registration receipt. The fixed Eliot folders are retained
+/// because they may contain tasks owned by another installation.
+pub(crate) fn unregister_user_mode_profile_task(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<(), WindowsAdapterError> {
+    validate_user_mode_profile_task_receipt(receipt)?;
+    #[cfg(windows)]
+    {
+        unregister_user_mode_profile_task_windows(receipt)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = receipt;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+fn validate_user_mode_profile_task_spec(
+    spec: &UserModeProfileTaskSpec,
+) -> Result<(), WindowsAdapterError> {
+    let expected_name = format!(
+        r"\Eliot\UserMode\{}",
+        crate::sha256_hex(
+            format!("{}\0{}", spec.installation_id, spec.installation_key).as_bytes()
+        )
+    );
+    let leaf = spec.task_name.rsplit('\\').next().unwrap_or_default();
+    if spec.task_name != expected_name
+        || !valid_security_identity(&spec.installation_id)
+        || !valid_security_identity(&spec.installation_key)
+        || !valid_security_identity(&spec.component)
+        || !valid_security_identity(&spec.version)
+        || !valid_security_identity(&spec.generation)
+        || !crate::valid_sha256_hex(&spec.roots_digest)
+        || !crate::valid_sha256_hex(&spec.executable_sha256)
+        || !crate::valid_sha256_hex(leaf)
+        || !spec.executable.is_absolute()
+        || !spec.working_directory.is_absolute()
+        || !crate::windows_paths_equal(
+            spec.executable
+                .parent()
+                .ok_or(WindowsAdapterError::InvalidInput)?,
+            &spec.working_directory,
+        )
+        || !spec
+            .executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("eliot-host.exe"))
+        || !spec
+            .arguments
+            .starts_with("--eliot-profile-supervisor user_mode ")
+        || spec.arguments.chars().any(char::is_control)
+        || spec.arguments.contains("--registration-nonce")
+        || spec.expected_sid.is_empty()
+        || spec.expected_sid.chars().any(char::is_control)
+        || spec.expected_session_id == 0
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_user_mode_profile_task_receipt(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<(), WindowsAdapterError> {
+    validate_user_mode_profile_task_spec(&UserModeProfileTaskSpec {
+        task_name: receipt.task_name.clone(),
+        installation_id: receipt.installation_id.clone(),
+        installation_key: receipt.installation_key.clone(),
+        component: receipt.component.clone(),
+        version: receipt.version.clone(),
+        generation: receipt.generation.clone(),
+        roots_digest: receipt.roots_digest.clone(),
+        executable: receipt.executable.clone(),
+        executable_sha256: receipt.executable_sha256.clone(),
+        working_directory: receipt.working_directory.clone(),
+        arguments: receipt.arguments.clone(),
+        expected_sid: receipt.sid.clone(),
+        expected_session_id: receipt.session_id,
+    })?;
+    if !crate::valid_sha256_hex(&receipt.task_xml_sha256) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        let current = crate::current_process_named_pipe_expectation()?;
+        if current.expected_sid() != receipt.sid
+            || current.expected_session_id() != receipt.session_id
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn valid_security_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+#[cfg(windows)]
+fn register_user_mode_profile_task_windows(
+    spec: &UserModeProfileTaskSpec,
+) -> Result<UserModeProfileTaskReceipt, UserModeProfileTaskRegistrationError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        CLSID_CTaskScheduler, ITaskService, TASK_CREATE, TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(UserModeProfileTaskRegistrationError::Rejected(
+            WindowsAdapterError::Unavailable,
+        ));
+    }
+    let result = (|| {
+        let current = crate::current_process_named_pipe_expectation()?;
+        if current.expected_sid() != spec.expected_sid
+            || current.expected_session_id() != spec.expected_session_id
+        {
+            return Err(UserModeProfileTaskRegistrationError::Rejected(
+                WindowsAdapterError::IdentityMismatch,
+            ));
+        }
+        let executable = validate_pinned_artifact(&spec.executable, &spec.executable_sha256)?;
+        if !crate::windows_paths_equal(&executable, &spec.executable) {
+            return Err(UserModeProfileTaskRegistrationError::Rejected(
+                WindowsAdapterError::IdentityMismatch,
+            ));
+        }
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let root = unsafe {
+            service
+                .GetFolder(&BSTR::from("\\"))
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        let folder = get_or_create_user_mode_task_folder(&root, &empty)?;
+        let leaf = spec
+            .task_name
+            .rsplit('\\')
+            .next()
+            .ok_or(WindowsAdapterError::InvalidInput)?;
+        match unsafe { folder.GetTask(&BSTR::from(leaf)) } {
+            Ok(_) => {
+                // Task paths are predictable. A matching name or public XML
+                // text is not an ownership receipt, so never adopt or update
+                // an existing object here. A separately retained prior
+                // receipt must drive any later exact replacement or cleanup.
+                return Err(UserModeProfileTaskRegistrationError::Rejected(
+                    WindowsAdapterError::IdentityMismatch,
+                ));
+            }
+            Err(error) if task_scheduler_object_missing(&error) => {}
+            Err(_) => {
+                return Err(UserModeProfileTaskRegistrationError::Rejected(
+                    WindowsAdapterError::Unavailable,
+                ));
+            }
+        }
+        let xml = user_mode_profile_task_xml(spec);
+        let requested_xml_sha256 = crate::sha256_hex(xml.as_bytes());
+        let registered = unsafe {
+            folder.RegisterTask(
+                &BSTR::from(leaf),
+                &BSTR::from(xml),
+                TASK_CREATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
+        }
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let actual_xml = match readback_user_mode_profile_task(&registered, spec) {
+            Ok(xml) => xml,
+            Err(cause) => {
+                let observed_xml_sha256 = read_user_mode_profile_task_xml(&registered)
+                    .ok()
+                    .map(|(_, actual_xml)| crate::sha256_hex(actual_xml.as_bytes()));
+                let cleanup_error = cleanup_created_user_mode_profile_task(
+                    &folder,
+                    leaf,
+                    &registered,
+                    spec,
+                    observed_xml_sha256.as_deref(),
+                )
+                .err();
+                return match cleanup_error {
+                    None => Err(UserModeProfileTaskRegistrationError::Rejected(cause)),
+                    Some(cleanup_error) => {
+                        Err(UserModeProfileTaskRegistrationError::CleanupRequired(
+                            UserModeProfileTaskCleanupRequired {
+                                task_name: spec.task_name.clone(),
+                                requested_xml_sha256,
+                                observed_xml_sha256,
+                                spec: spec.clone(),
+                                cause,
+                                cleanup_error,
+                            },
+                        ))
+                    }
+                };
+            }
+        };
+        Ok(UserModeProfileTaskReceipt {
+            task_name: spec.task_name.clone(),
+            installation_id: spec.installation_id.clone(),
+            installation_key: spec.installation_key.clone(),
+            component: spec.component.clone(),
+            version: spec.version.clone(),
+            generation: spec.generation.clone(),
+            roots_digest: spec.roots_digest.clone(),
+            executable: executable.clone(),
+            executable_sha256: spec.executable_sha256.clone(),
+            working_directory: spec.working_directory.clone(),
+            arguments: spec.arguments.clone(),
+            sid: spec.expected_sid.clone(),
+            session_id: spec.expected_session_id,
+            task_xml_sha256: crate::sha256_hex(actual_xml.as_bytes()),
+        })
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+#[cfg(windows)]
+fn run_user_mode_profile_task_windows(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<UserModeProfileTaskRunReceipt, WindowsAdapterError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        CLSID_CTaskScheduler, ITaskService, TASK_RUN_USE_SESSION_ID, TASK_STATE_RUNNING,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let result = (|| {
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let (folder, leaf) = open_user_mode_task_folder_and_leaf(&service, &receipt.task_name)?;
+        let task = unsafe {
+            folder
+                .GetTask(&BSTR::from(leaf.as_str()))
+                .map_err(|_| WindowsAdapterError::NotFound)?
+        };
+        let actual_xml = readback_user_mode_profile_task(&task, &receipt_as_spec(receipt))?;
+        if crate::sha256_hex(actual_xml.as_bytes()) != receipt.task_xml_sha256 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let session_id =
+            i32::try_from(receipt.session_id).map_err(|_| WindowsAdapterError::InvalidInput)?;
+        let running = unsafe {
+            task.RunEx(
+                &empty,
+                TASK_RUN_USE_SESSION_ID.0,
+                session_id,
+                &BSTR::from(receipt.sid.as_str()),
+            )
+        }
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let state = unsafe {
+            running
+                .State()
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        if state != TASK_STATE_RUNNING {
+            return Err(WindowsAdapterError::Unavailable);
+        }
+        let engine_process_id = unsafe {
+            running
+                .EnginePID()
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        if engine_process_id == 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let final_xml = readback_user_mode_profile_task(&task, &receipt_as_spec(receipt))?;
+        if crate::sha256_hex(final_xml.as_bytes()) != receipt.task_xml_sha256 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(UserModeProfileTaskRunReceipt {
+            task_name: receipt.task_name.clone(),
+            sid: receipt.sid.clone(),
+            session_id: receipt.session_id,
+            engine_process_id,
+            task_xml_sha256: receipt.task_xml_sha256.clone(),
+        })
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+#[cfg(windows)]
+fn unregister_user_mode_profile_task_windows(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<(), WindowsAdapterError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{CLSID_CTaskScheduler, ITaskService};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let result = (|| {
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let (folder, leaf) = open_user_mode_task_folder_and_leaf(&service, &receipt.task_name)?;
+        let task = unsafe {
+            folder
+                .GetTask(&BSTR::from(leaf.as_str()))
+                .map_err(|_| WindowsAdapterError::NotFound)?
+        };
+        let xml = readback_user_mode_profile_task(&task, &receipt_as_spec(receipt))?;
+        if crate::sha256_hex(xml.as_bytes()) != receipt.task_xml_sha256 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        unsafe {
+            folder
+                .DeleteTask(&BSTR::from(leaf.as_str()), 0)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        match unsafe { folder.GetTask(&BSTR::from(leaf.as_str())) } {
+            Ok(_) => return Err(WindowsAdapterError::IdentityMismatch),
+            Err(error) if task_scheduler_object_missing(&error) => {}
+            Err(_) => return Err(WindowsAdapterError::Unavailable),
+        }
+        Ok(())
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+#[cfg(windows)]
+fn inspect_user_mode_profile_task_windows(
+    spec: &UserModeProfileTaskSpec,
+) -> Result<Option<UserModeProfileTaskInspection>, WindowsAdapterError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{CLSID_CTaskScheduler, ITaskService};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let result = (|| {
+        let current = crate::current_process_named_pipe_expectation()?;
+        if current.expected_sid() != spec.expected_sid
+            || current.expected_session_id() != spec.expected_session_id
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let (folder, leaf) = match open_user_mode_task_folder_and_leaf(&service, &spec.task_name) {
+            Ok(value) => value,
+            Err(WindowsAdapterError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let task = match unsafe { folder.GetTask(&BSTR::from(leaf.as_str())) } {
+            Ok(task) => task,
+            Err(error) if task_scheduler_object_missing(&error) => return Ok(None),
+            Err(_) => return Err(WindowsAdapterError::Unavailable),
+        };
+        let (actual_path, actual_xml) = read_user_mode_profile_task_xml(&task)?;
+        Ok(Some(UserModeProfileTaskInspection {
+            task_xml_sha256: crate::sha256_hex(actual_xml.as_bytes()),
+            matches_request: actual_path == spec.task_name
+                && user_mode_profile_task_readback_matches(spec, &actual_xml),
+        }))
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+fn receipt_as_spec(receipt: &UserModeProfileTaskReceipt) -> UserModeProfileTaskSpec {
+    UserModeProfileTaskSpec {
+        task_name: receipt.task_name.clone(),
+        installation_id: receipt.installation_id.clone(),
+        installation_key: receipt.installation_key.clone(),
+        component: receipt.component.clone(),
+        version: receipt.version.clone(),
+        generation: receipt.generation.clone(),
+        roots_digest: receipt.roots_digest.clone(),
+        executable: receipt.executable.clone(),
+        executable_sha256: receipt.executable_sha256.clone(),
+        working_directory: receipt.working_directory.clone(),
+        arguments: receipt.arguments.clone(),
+        expected_sid: receipt.sid.clone(),
+        expected_session_id: receipt.session_id,
+    }
+}
+
+#[cfg(windows)]
+fn readback_user_mode_profile_task(
+    task: &windows::Win32::System::TaskScheduler::IRegisteredTask,
+    spec: &UserModeProfileTaskSpec,
+) -> Result<String, WindowsAdapterError> {
+    let (actual_path, actual_xml) = read_user_mode_profile_task_xml(task)?;
+    if actual_path != spec.task_name || !user_mode_profile_task_readback_matches(spec, &actual_xml)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(actual_xml)
+}
+
+#[cfg(windows)]
+fn read_user_mode_profile_task_xml(
+    task: &windows::Win32::System::TaskScheduler::IRegisteredTask,
+) -> Result<(String, String), WindowsAdapterError> {
+    // The Task Scheduler COM contract exposes the registered definition as
+    // XML but does not promise canonical byte serialization across Windows
+    // versions. Receipt identity is therefore the exact current readback;
+    // any later byte-level normalization change fails closed for reconciliation.
+    let actual_path = unsafe { task.Path().map_err(|_| WindowsAdapterError::Unavailable)? };
+    let actual_path =
+        String::try_from(&actual_path).map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    let actual_xml = unsafe { task.Xml().map_err(|_| WindowsAdapterError::Unavailable)? };
+    let actual_xml =
+        String::try_from(&actual_xml).map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    Ok((actual_path, actual_xml))
+}
+
+#[cfg(windows)]
+fn cleanup_created_user_mode_profile_task(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    leaf: &str,
+    registered: &windows::Win32::System::TaskScheduler::IRegisteredTask,
+    spec: &UserModeProfileTaskSpec,
+    initial_xml_sha256: Option<&str>,
+) -> Result<(), WindowsAdapterError> {
+    use windows::core::BSTR;
+
+    let initial_xml_sha256 = initial_xml_sha256.ok_or(WindowsAdapterError::Unavailable)?;
+    let (registered_path, registered_xml) = read_user_mode_profile_task_xml(registered)?;
+    if registered_path != spec.task_name
+        || crate::sha256_hex(registered_xml.as_bytes()) != initial_xml_sha256
+        || !user_mode_profile_task_readback_matches(spec, &registered_xml)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let current = unsafe {
+        folder
+            .GetTask(&BSTR::from(leaf))
+            .map_err(|_| WindowsAdapterError::NotFound)?
+    };
+    let (current_path, current_xml) = read_user_mode_profile_task_xml(&current)?;
+    if current_path != spec.task_name
+        || crate::sha256_hex(current_xml.as_bytes()) != initial_xml_sha256
+        || !user_mode_profile_task_readback_matches(spec, &current_xml)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    unsafe {
+        folder
+            .DeleteTask(&BSTR::from(leaf), 0)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+    }
+    match unsafe { folder.GetTask(&BSTR::from(leaf)) } {
+        Ok(_) => return Err(WindowsAdapterError::IdentityMismatch),
+        Err(error) if task_scheduler_object_missing(&error) => {}
+        Err(_) => return Err(WindowsAdapterError::Unavailable),
+    }
+    Ok(())
+}
+
+fn user_mode_profile_task_readback_matches(
+    spec: &UserModeProfileTaskSpec,
+    actual_xml: &str,
+) -> bool {
+    let Some(task) = xml_section(actual_xml, "Task") else {
+        return false;
+    };
+    let Some(registration_info) = xml_section(task, "RegistrationInfo") else {
+        return false;
+    };
+    let Some(triggers) = xml_section(task, "Triggers") else {
+        return false;
+    };
+    let Some(principals) = xml_section(task, "Principals") else {
+        return false;
+    };
+    let Some(settings) = xml_section(task, "Settings") else {
+        return false;
+    };
+    let Some(actions) = xml_section(task, "Actions") else {
+        return false;
+    };
+    if !has_exact_tag_shape(
+        task,
+        &[
+            ("Task", 1),
+            ("RegistrationInfo", 1),
+            ("Author", 1),
+            ("Description", 1),
+            ("URI", 1),
+            ("Triggers", 1),
+            ("LogonTrigger", 1),
+            ("Enabled", 1),
+            ("UserId", 2),
+            ("Principals", 1),
+            ("Principal", 1),
+            ("LogonType", 1),
+            ("RunLevel", 1),
+            ("Settings", 1),
+            ("MultipleInstancesPolicy", 1),
+            ("DisallowStartIfOnBatteries", 1),
+            ("StopIfGoingOnBatteries", 1),
+            ("AllowHardTerminate", 1),
+            ("StartWhenAvailable", 1),
+            ("ExecutionTimeLimit", 1),
+            ("Priority", 1),
+            ("Actions", 1),
+            ("Exec", 1),
+            ("Command", 1),
+            ("Arguments", 1),
+            ("WorkingDirectory", 1),
+        ],
+    ) {
+        return false;
+    }
+    let description = user_mode_profile_task_description(spec);
+    element_text(registration_info, "Author") == Some("Eliot Host")
+        && element_text(registration_info, "Description") == Some(description.as_str())
+        && element_text(actual_xml, "URI") == Some(spec.task_name.as_str())
+        && element_text(triggers, "Enabled") == Some("true")
+        && element_text(triggers, "UserId") == Some(spec.expected_sid.as_str())
+        && element_text(principals, "UserId") == Some(spec.expected_sid.as_str())
+        && element_text(principals, "LogonType") == Some("InteractiveToken")
+        && element_text(principals, "RunLevel") == Some("LeastPrivilege")
+        && element_text(settings, "MultipleInstancesPolicy") == Some("IgnoreNew")
+        && element_text(settings, "DisallowStartIfOnBatteries") == Some("false")
+        && element_text(settings, "StopIfGoingOnBatteries") == Some("false")
+        && element_text(settings, "AllowHardTerminate") == Some("true")
+        && element_text(settings, "StartWhenAvailable") == Some("true")
+        && element_text(settings, "ExecutionTimeLimit") == Some("PT0S")
+        && element_text(settings, "Priority") == Some("7")
+        && element_text(actions, "Command")
+            == Some(xml_escape(&spec.executable.display().to_string()).as_str())
+        && element_text(actions, "Arguments") == Some(xml_escape(&spec.arguments).as_str())
+        && element_text(actions, "WorkingDirectory")
+            == Some(xml_escape(&spec.working_directory.display().to_string()).as_str())
+}
+
+fn user_mode_profile_task_description(spec: &UserModeProfileTaskSpec) -> String {
+    format!(
+        "Eliot Host UserMode current-user supervisor; installation={}; key={}; component={}; version={}; generation={}; roots_sha256={}; artifact_sha256={}",
+        spec.installation_id,
+        spec.installation_key,
+        spec.component,
+        spec.version,
+        spec.generation,
+        spec.roots_digest,
+        spec.executable_sha256
+    )
+}
+
+fn user_mode_profile_task_xml(spec: &UserModeProfileTaskSpec) -> String {
+    let task_name = xml_escape(&spec.task_name);
+    let sid = xml_escape(&spec.expected_sid);
+    let description = xml_escape(&user_mode_profile_task_description(spec));
+    let executable = xml_escape(&spec.executable.display().to_string());
+    let arguments = xml_escape(&spec.arguments);
+    let working_directory = xml_escape(&spec.working_directory.display().to_string());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Eliot Host</Author>
+    <Description>{description}</Description>
+    <URI>{task_name}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{executable}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{working_directory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#
+    )
+}
+
+#[cfg(windows)]
+fn get_or_create_user_mode_task_folder(
+    root: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    empty: &windows::Win32::System::Variant::VARIANT,
+) -> Result<windows::Win32::System::TaskScheduler::ITaskFolder, WindowsAdapterError> {
+    use windows::core::BSTR;
+    let eliot = match unsafe { root.GetFolder(&BSTR::from("\\Eliot")) } {
+        Ok(folder) => folder,
+        Err(_) => unsafe {
+            root.CreateFolder(&BSTR::from("Eliot"), empty)
+                .or_else(|_| root.GetFolder(&BSTR::from("\\Eliot")))
+        }
+        .map_err(|_| WindowsAdapterError::Unavailable)?,
+    };
+    match unsafe { eliot.GetFolder(&BSTR::from("UserMode")) } {
+        Ok(folder) => Ok(folder),
+        Err(_) => unsafe {
+            eliot
+                .CreateFolder(&BSTR::from("UserMode"), empty)
+                .or_else(|_| eliot.GetFolder(&BSTR::from("UserMode")))
+        }
+        .map_err(|_| WindowsAdapterError::Unavailable),
+    }
+}
+
+#[cfg(windows)]
+fn open_user_mode_task_folder_and_leaf(
+    service: &windows::Win32::System::TaskScheduler::ITaskService,
+    task_name: &str,
+) -> Result<(windows::Win32::System::TaskScheduler::ITaskFolder, String), WindowsAdapterError> {
+    use windows::core::BSTR;
+    let expected_prefix = r"\Eliot\UserMode\";
+    let leaf = task_name
+        .strip_prefix(expected_prefix)
+        .filter(|leaf| crate::valid_sha256_hex(leaf))
+        .ok_or(WindowsAdapterError::InvalidInput)?;
+    let root = unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .map_err(|_| WindowsAdapterError::Unavailable)?
+    };
+    let eliot = unsafe { root.GetFolder(&BSTR::from("\\Eliot")) }.map_err(|error| {
+        if task_scheduler_object_missing(&error) {
+            WindowsAdapterError::NotFound
+        } else {
+            WindowsAdapterError::Unavailable
+        }
+    })?;
+    let folder = unsafe { eliot.GetFolder(&BSTR::from("UserMode")) }.map_err(|error| {
+        if task_scheduler_object_missing(&error) {
+            WindowsAdapterError::NotFound
+        } else {
+            WindowsAdapterError::Unavailable
+        }
+    })?;
+    Ok((folder, leaf.to_owned()))
+}
+
+#[cfg(windows)]
+fn task_scheduler_object_missing(error: &windows::core::Error) -> bool {
+    matches!(
+        error.code().0 as u32,
+        0x8007_0002 | 0x8007_0003
     )
 }
 

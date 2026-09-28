@@ -203,6 +203,27 @@ pub(super) fn persist_pending_recovery(
     reason: &str,
 ) -> Result<(), HostError> {
     host_epoch_observe("host.epoch pending recovery requested");
+    pending
+        .manifest
+        .runtime_launch
+        .validate()
+        .map_err(HostError::Installation)?;
+    if !crate::windows_paths_equal(
+        Path::new(
+            pending
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
+        host_state_root,
+    ) {
+        return Err(HostError::ProcessContour(
+            "pending recovery profile does not bind the selected Host root".to_owned(),
+        ));
+    }
+    let profile = pending.manifest.runtime_launch.profile;
     let expected_revision = registry.revision();
     let expected_post_revision = if registry.pending_activation().is_some_and(|current| {
         current.approval == pending.approval
@@ -224,7 +245,7 @@ pub(super) fn persist_pending_recovery(
         // #1339, A13.9: short-lived open-use-drop CAS; the handle is dropped
         // before the readback open below, so concurrent Watchdog/installer
         // readers never observe a Host-held exclusive lock.
-        let store = crate::open_registry_store_at(host_state_root)?;
+        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
         store.mark_pending_recovery(
             host_capability,
             expected_revision,
@@ -233,7 +254,7 @@ pub(super) fn persist_pending_recovery(
         )
     };
     let durable = {
-        let store = crate::open_registry_store_at(host_state_root)?;
+        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
         store.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
@@ -281,6 +302,7 @@ pub(super) fn persist_pending_recovery(
 pub(super) fn open_production_epoch(
     path: &Path,
     installation: PlatformHandle,
+    profile: eliot_installation::InstallationProfile,
     pending: Option<&eliot_installation::PendingActivation>,
     active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
     store_recovery_fences: &[StoreRecoveryReopenFence],
@@ -296,7 +318,14 @@ pub(super) fn open_production_epoch(
     HostError,
 > {
     host_epoch_observe("host.epoch production open requested");
-    let backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    let backend = match profile {
+        eliot_installation::InstallationProfile::SystemService => RedbJournalBackend::open_at(path),
+        eliot_installation::InstallationProfile::UserMode
+        | eliot_installation::InstallationProfile::PortableDev => {
+            RedbJournalBackend::open_user_owned_at(path)
+        }
+    }
+    .map_err(JournalError::Backend)?;
     host_epoch_observe("host.epoch backend open observed");
     open_production_epoch_from_backend(
         backend,

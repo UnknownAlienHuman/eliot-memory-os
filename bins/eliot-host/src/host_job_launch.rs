@@ -21,9 +21,9 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
-    observe_loopback_tcp_listener_owner,
+    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, ProfileRootPaths, ProfileRootRequest,
+    ProfileSelection, RunningJobChild, SuspendedJobChild, SuspendedLaunchSpec,
+    TcpListenerOwnerError, UserOwnedRootLease, observe_loopback_tcp_listener_owner,
 };
 
 #[cfg(windows)]
@@ -751,6 +751,20 @@ impl HostJobBranches {
                 host_launch_observe("host.launch typed rejection");
                 HostError::ProcessContour(error.to_string())
             })?;
+        if matches!(
+            launch.profile,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+        ) {
+            let request = profile_root_request(launch)?;
+            eliot_platform_windows::profile_supervision::validate_profile_roots(&request).map_err(
+                |error| {
+                    host_launch_observe("host.launch profile roots rejected");
+                    HostError::ProcessContour(format!(
+                        "profile-governed roots could not be retained: {error}"
+                    ))
+                },
+            )?;
+        }
         let portable_root = if launch.profile == InstallationProfile::PortableDev {
             let root = PathBuf::from(
                 launch
@@ -1049,6 +1063,97 @@ impl HostJobBranches {
             }
         }
     }
+}
+
+#[cfg(windows)]
+pub(super) fn profile_root_request(
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<ProfileRootRequest, HostError> {
+    launch
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let profile = match launch.profile {
+        InstallationProfile::UserMode => ProfileSelection::UserMode,
+        InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+        InstallationProfile::SystemService => {
+            return Err(HostError::ProcessContour(
+                "current-user root adapter cannot admit SystemService".to_owned(),
+            ));
+        }
+    };
+    let governed = &launch.profile_governed_roots;
+    if governed.runtime_state_roots != launch.runtime_state_roots {
+        return Err(HostError::ProcessContour(
+            "runtime roots differ from the digest-bound profile root set".to_owned(),
+        ));
+    }
+    let runtime = &governed.runtime_state_roots;
+    let runtime_state_roots = [
+        (
+            "runtime_state_roots.profile_anchor_root",
+            &runtime.profile_anchor_root,
+        ),
+        (
+            "runtime_state_roots.installation_root",
+            &runtime.installation_root,
+        ),
+        (
+            "runtime_state_roots.host_state_root",
+            &runtime.host_state_root,
+        ),
+        (
+            "runtime_state_roots.kernel_ors_root",
+            &runtime.kernel_ors_root,
+        ),
+        (
+            "runtime_state_roots.kernel_work_root",
+            &runtime.kernel_work_root,
+        ),
+        (
+            "runtime_state_roots.store_data_root",
+            &runtime.store_data_root,
+        ),
+        (
+            "runtime_state_roots.store_work_root",
+            &runtime.store_work_root,
+        ),
+        (
+            "runtime_state_roots.store_temp_root",
+            &runtime.store_temp_root,
+        ),
+        (
+            "runtime_state_roots.watchdog_state_root",
+            &runtime.watchdog_state_root,
+        ),
+    ]
+    .into_iter()
+    .map(|(role, path)| (role.to_owned(), PathBuf::from(path.as_str())))
+    .collect();
+    Ok(ProfileRootRequest {
+        profile,
+        installation_id: launch.installation_epoch.installation.as_str().to_owned(),
+        installation_key: launch
+            .profile_installation_key
+            .as_ref()
+            .map(|key| key.as_str().to_owned()),
+        component: launch.profile_component.as_str().to_owned(),
+        version: launch.profile_version.as_str().to_owned(),
+        generation: launch.generation.as_str().to_owned(),
+        authority_descriptor_path: PathBuf::from(launch.authority_descriptor_path.as_str()),
+        authority_descriptor_sha256: launch.authority_descriptor_digest.as_str().to_owned(),
+        authority_generation: launch.authority_generation.value(),
+        roots: ProfileRootPaths {
+            immutable_binaries: PathBuf::from(governed.immutable_binaries.as_str()),
+            durable_data: PathBuf::from(governed.durable_data.as_str()),
+            user_config: PathBuf::from(governed.user_config.as_str()),
+            user_cache: PathBuf::from(governed.user_cache.as_str()),
+            runtime_state_roots,
+        },
+        repository_root: launch
+            .portable_root
+            .as_ref()
+            .map(|root| PathBuf::from(root.as_str())),
+    })
 }
 
 #[cfg(all(test, windows))]
