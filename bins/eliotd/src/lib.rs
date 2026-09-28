@@ -2072,7 +2072,10 @@ impl DaemonComposition {
     /// The catalogue checks structural validation and live tool-basis drift,
     /// while the Governor owner binds the receipt to its exact
     /// promoted revision and package digest. A wire receipt alone is never
-    /// enough to make an installed Skill usable.
+    /// enough to make an installed Skill usable. A `Full`/`Partial` delivery
+    /// claim additionally resolves to the retained applied receiver-ack
+    /// record for the Skill revision (issue #1882 A3): installed is not
+    /// delivered, and only a real receiver ack establishes delivery.
     #[allow(clippy::result_large_err)]
     pub fn skill_admit_material_attempt(
         &self,
@@ -2099,6 +2102,16 @@ impl DaemonComposition {
                 return Err(eliot_skill::SkillError::InvalidField {
                     field: "entry.status",
                     reason: "unvalidated, stale, or retired Skills are blocked from Material use",
+                });
+            }
+            if matches!(
+                receipt.delivery,
+                eliot_skill::SkillDeliveryStatus::Full | eliot_skill::SkillDeliveryStatus::Partial
+            ) && !catalogue.applied_delivery_covers(&receipt.skill_id, &receipt.skill_revision)
+            {
+                return Err(eliot_skill::SkillError::InvalidField {
+                    field: "receipt.delivery",
+                    reason: "claimed delivery resolves to no applied receiver-ack record for this Skill revision",
                 });
             }
         }

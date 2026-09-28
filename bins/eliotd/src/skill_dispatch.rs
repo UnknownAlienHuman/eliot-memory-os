@@ -684,11 +684,15 @@ async fn read_capability_evidence_records(
 /// ORIGINAL recorded value and binds it to the stored view's exact revision
 /// and package.
 ///
-/// A candidate whose backing reads were partial, truncated or blocked never
-/// publishes a settled claim: it reports the unresolved coverage instead, so
-/// absence of evidence is never read as a finding. A candidate that cannot
-/// name the ingest it arrived on, or that carries a broken owner revision
-/// binding, is refused outright.
+/// The Material-use gate runs FIRST, before the coverage branch (issue #1882
+/// W2): an unvalidated, stale, or unknown Skill refuses on every leg, so even
+/// a partially-observed candidate can never publish an activated/delivered
+/// summary for a Skill the catalogue cannot show as usable. A candidate whose
+/// backing reads were partial, truncated or blocked never publishes a settled
+/// claim: it reports the unresolved coverage instead, so absence of evidence
+/// is never read as a finding. A candidate that cannot name the ingest it
+/// arrived on, or that carries a broken owner revision binding, is refused
+/// outright.
 fn commit_activation_candidate(
     composition: &mut DaemonComposition,
     candidate: &ActivationCandidate,
@@ -711,10 +715,6 @@ fn commit_activation_candidate(
                 reason: "activation evidence must bind every load-bearing owner revision to a named source",
             },
         ))
-    } else if !candidate.coverage.is_settled() {
-        Some(SkillResultEnvelope::attempt(
-            eliot_skill::derive_attempt_summary(&candidate.receipt),
-        ))
     } else {
         None
     };
@@ -722,13 +722,23 @@ fn commit_activation_candidate(
         Some(outcome) => outcome,
         None => match composition.skill_admit_material_attempt(&candidate.receipt) {
             Ok(_) => {
-                // The stage claims come from the admitted summary; usefulness
-                // is re-decided here from the owner records the plan actually
-                // resolved, never from the admission result and never from the
-                // presented string set. The resolved records stay in the
-                // private candidate, so a receiver sees the qualified verdict
-                // rather than a raw flag.
-                SkillResultEnvelope::attempt(candidate.qualified_summary())
+                if candidate.coverage.is_settled() {
+                    // The stage claims come from the admitted summary;
+                    // usefulness is re-decided here from the owner records the
+                    // plan actually resolved, never from the admission result
+                    // and never from the presented string set. The resolved
+                    // records stay in the private candidate, so a receiver sees
+                    // the qualified verdict rather than a raw flag.
+                    SkillResultEnvelope::attempt(candidate.qualified_summary())
+                } else {
+                    // Unresolved coverage still reports the raw fold, but only
+                    // for a Skill the gate above admitted: absence of evidence
+                    // stays unresolved, never a finding, and never an unusable
+                    // Skill rendered as activated.
+                    SkillResultEnvelope::attempt(eliot_skill::derive_attempt_summary(
+                        &candidate.receipt,
+                    ))
+                }
             }
             Err(error) => SkillResultEnvelope::refused(&error),
         },

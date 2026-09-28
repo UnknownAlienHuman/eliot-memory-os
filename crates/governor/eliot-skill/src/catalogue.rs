@@ -680,6 +680,30 @@ impl StructuralValidationReport {
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalogue {
     entries: BTreeMap<String, SkillCatalogueEntry>,
+    /// Latest verified applied delivery per Skill, keyed by `skill_id`.
+    /// Defaulted so snapshots written before delivery retention still decode;
+    /// excluded from [`SkillCatalogue::catalogue_digest`], which binds entries
+    /// only and must stay stable for already-issued receipts.
+    #[serde(default)]
+    applied_deliveries: BTreeMap<String, AppliedDeliveryRecord>,
+}
+
+/// Verified applied-delivery record for one Skill revision (issue #1882 A3).
+///
+/// Written only after the display boundary verified the exact receipt/ack
+/// triple, so a wire-claimed delivery the receiver never acknowledged has no
+/// record to resolve to. Activation admission binds `Full`/`Partial` delivery
+/// claims to this record; anything else fails closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedDeliveryRecord {
+    /// Body revision the receiver applied.
+    pub body_version: String,
+    /// Digest of the exact receipt the receiver acted on.
+    pub receipt_digest: String,
+    pub hotset_id: String,
+    /// Receiver identity from the applied ack.
+    pub receiver_id: String,
 }
 
 impl SkillCatalogue {
@@ -861,6 +885,55 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Marks the entry stale when a new install declaration pins different
+    /// host/profile versions than the standing entry (`I7.13`: a changed host
+    /// dependency marks the Skill stale).
+    ///
+    /// The entry keeps its pinned versions and gains a `Stale` status with a
+    /// reason naming each moved leg, blocking Material use and redelivery
+    /// until the reinstall revalidates it or governed review restores it.
+    /// Quarantined and already-stale entries report no change. Agreement on
+    /// both legs is a caller error, mirroring
+    /// [`mark_definition_drift_stale`](Self::mark_definition_drift_stale).
+    /// Returns `true` when the entry became stale.
+    pub fn mark_host_drift_stale(
+        &mut self,
+        skill_id: &str,
+        observed_host_version: &str,
+        observed_profile_version: &str,
+    ) -> Result<bool, SkillError> {
+        check_text(observed_host_version, "entry.host_version")?;
+        check_text(observed_profile_version, "entry.profile_version")?;
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        let mut moved = Vec::new();
+        if entry.host_version != observed_host_version {
+            moved.push(format!(
+                "host {} -> {observed_host_version}",
+                entry.host_version
+            ));
+        }
+        if entry.profile_version != observed_profile_version {
+            moved.push(format!(
+                "profile {} -> {observed_profile_version}",
+                entry.profile_version
+            ));
+        }
+        if moved.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "entry.host_version",
+                reason: "no host drift to mark",
+            });
+        }
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!("host drift: {}", moved.join("; ")));
+        entry.validate()?;
+        Ok(true)
+    }
+
     /// Promotes a provisional entry to current when the proportional depth
     /// rule holds (`I7.13`): one matching real route for host/task-specific
     /// Skills; two materially different routes plus approval for shared or
@@ -908,6 +981,57 @@ impl SkillCatalogue {
         self.entries
             .get(skill_id)
             .is_some_and(SkillCatalogueEntry::is_usable)
+    }
+
+    /// Records the applied delivery a successful display just verified.
+    ///
+    /// The caller passes the exact triple the display boundary bound —
+    /// `display` produced from `receipt` plus `ack` for `skill_id` — and the
+    /// record keeps the applied revision, receipt, Hotset, and receiver. An
+    /// inconsistent triple records nothing: it never passed the boundary, and
+    /// a missing record fails closed at admission (delivery claims without a
+    /// record refuse). Re-recording supersedes the previous delivery for the
+    /// Skill; a revised body leaves the old record behind because the revision
+    /// no longer matches.
+    pub fn record_applied_delivery(
+        &mut self,
+        skill_id: &str,
+        display: &ActivatedSkillDisplay,
+        receipt: &HotsetDeliveryReceipt,
+        ack: &HotsetDeliveryAck,
+    ) {
+        let consistent = display.skill_id == skill_id
+            && receipt.confirms_delivery(skill_id)
+            && ack.confirms_applied(receipt);
+        debug_assert!(
+            consistent,
+            "record_applied_delivery takes the verified display triple only"
+        );
+        if !consistent {
+            return;
+        }
+        self.applied_deliveries.insert(
+            skill_id.to_owned(),
+            AppliedDeliveryRecord {
+                body_version: display.body_version.clone(),
+                receipt_digest: receipt.receipt_digest.clone(),
+                hotset_id: receipt.hotset_id.clone(),
+                receiver_id: ack.receiver_id.clone(),
+            },
+        );
+    }
+
+    /// Resolves whether an applied receiver ack is on record for one Skill
+    /// revision (issue #1882 A3).
+    ///
+    /// `true` exactly when a verified display recorded an applied ack for
+    /// `skill_id` at `body_version`. A revised body, a never-displayed Skill,
+    /// and a receipt-only (unacknowledged) delivery all resolve to `false`.
+    #[must_use]
+    pub fn applied_delivery_covers(&self, skill_id: &str, body_version: &str) -> bool {
+        self.applied_deliveries
+            .get(skill_id)
+            .is_some_and(|record| record.body_version == body_version)
     }
 
     /// Builds the activated Skill view. Activation displays the one-line

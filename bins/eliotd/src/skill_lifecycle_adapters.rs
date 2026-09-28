@@ -664,8 +664,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// for this exact receipt reaches the catalogue boundary; anything else
     /// fails closed here without touching the catalogue. Before the boundary,
     /// a changed tool basis marks the entry stale and refuses: a removed tool
-    /// is never displayed as generally delivered. Synchronous: the
-    /// guard never crosses an await.
+    /// is never displayed as generally delivered. After the boundary, the
+    /// verified applied delivery is retained so activation admission can
+    /// resolve delivery claims to this ack record (issue #1882 A3).
+    /// Synchronous: each guard is taken and dropped in a closed scope and
+    /// never crosses an await.
     ///
     /// Receipt and ack travel by value, mirroring the `SkillLifecycleApi`
     /// display boundary: the injector caller relinquishes the pair it acted
@@ -683,8 +686,15 @@ impl<T> ForwardingSkillLifecycle<T> {
         }
         ack.validate()?;
         self.invalidate_unknown_tool_basis(skill_id, tools)?;
-        let catalogue = self.lock_catalogue();
-        catalogue.activation_display(skill_id, &receipt, &ack, tools)
+        let display = {
+            let catalogue = self.lock_catalogue();
+            catalogue.activation_display(skill_id, &receipt, &ack, tools)?
+        };
+        {
+            let mut catalogue = self.lock_catalogue();
+            catalogue.record_applied_delivery(skill_id, &display, &receipt, &ack);
+        }
+        Ok(display)
     }
 
     /// Binds the runtime receiver's ack to its exact receipt under the live
@@ -960,8 +970,17 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
         // Same standing-display invalidation as the injector path: a changed
         // tool basis marks the entry stale before the catalogue boundary.
         self.invalidate_unknown_tool_basis(&skill_id, tools)?;
-        let catalogue = self.lock_catalogue();
-        catalogue.activation_display(&skill_id, &receipt, &ack, tools)
+        let display = {
+            let catalogue = self.lock_catalogue();
+            catalogue.activation_display(&skill_id, &receipt, &ack, tools)?
+        };
+        // Same post-boundary retention as the injector path: the verified
+        // applied delivery is retained for activation-side chain resolution.
+        {
+            let mut catalogue = self.lock_catalogue();
+            catalogue.record_applied_delivery(&skill_id, &display, &receipt, &ack);
+        }
+        Ok(display)
     }
 }
 

@@ -525,6 +525,7 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// standing entry is marked stale before insert, so the drift is recorded
 /// even when the insert below refuses (unknown tools) — a refused reinstall
 /// must not leave the old pins looking current against the new declaration.
+/// The same pre-insert mark applies to host/profile declaration drift.
 /// Quarantined standing entries are left untouched (governed state).
 ///
 /// Re-installing a revised package replaces the entry wholesale
@@ -548,6 +549,13 @@ pub fn install_package(
     });
     if let Some(reason) = drift {
         catalogue.note_dependency_change(&skill_id, entry.dependencies.clone(), reason)?;
+    }
+    let host_moved = catalogue.get(&skill_id).is_some_and(|standing| {
+        standing.host_version != entry.host_version
+            || standing.profile_version != entry.profile_version
+    });
+    if host_moved {
+        catalogue.mark_host_drift_stale(&skill_id, &entry.host_version, &entry.profile_version)?;
     }
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
