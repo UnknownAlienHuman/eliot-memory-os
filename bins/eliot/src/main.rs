@@ -300,8 +300,8 @@ enum InstallationCommand {
     ///
     /// Reports the selected profile, its four resolved root roles, its
     /// supervision type, its enforced/unsupported guarantees, and the
-    /// structural proof that a non-service selection carries no SCM,
-    /// administrative or `ProgramData` dependency. Creates nothing, reserves
+    /// structural proof that a non-service selection requires no SCM,
+    /// administrative authority or ProgramData anchor. Creates nothing, reserves
     /// no service, and mutates nothing. An invalid profile, a missing or
     /// ambiguous anchor, or a write into the versioned immutable binaries root
     /// is a typed refusal.
@@ -392,6 +392,12 @@ enum InstallationCommand {
         store: PathBuf,
         #[arg(long)]
         generation: String,
+        /// I3.1 versioned immutable-root component name.
+        #[arg(long)]
+        component: String,
+        /// I3.1 versioned immutable-root component version.
+        #[arg(long)]
+        version: String,
         #[arg(long)]
         installation: String,
         #[arg(long)]
@@ -2185,6 +2191,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             output,
             store,
             generation,
+            component,
+            version,
             installation,
             lineage_id,
             sequence,
@@ -2211,6 +2219,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             output,
             store,
             generation,
+            component,
+            version,
             installation,
             lineage_id,
             sequence,
@@ -2452,9 +2462,7 @@ fn write_generation_output_reconciliation(reconciliation: &GenerationOutputRecon
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_installation_generate(
     source_root: PathBuf,
-    profile: InstallationProfile,
-    profile_anchor_root: PathBuf,
-    installation_key: Option<String>,
+    profile_selection: ProfileSelectionInput,
     installation: String,
     lineage_id: String,
     sequence: u64,
@@ -2476,11 +2484,9 @@ fn run_installation_generate(
                 lineage_id: cli_handle(lineage_id, "lineage_id")?,
                 sequence,
             },
-            profile,
-            profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-            installation_key: installation_key
-                .map(|value| cli_handle(value, "installation_key"))
-                .transpose()?,
+            profile: profile_selection.profile,
+            profile_anchor_root: profile_selection.profile_anchor_root.clone(),
+            installation_key: profile_selection.installation_key.clone(),
             generation: cli_handle(generation, "generation")?,
             source_root: cli_path_handle(&source_root, "source_root")?,
             staging_root: cli_path_handle(&staging_root, "staging_root")?,
@@ -2491,6 +2497,7 @@ fn run_installation_generate(
         output,
         store_path,
         source_publication,
+        profile_selection,
         write_transaction_artifact,
     )
 }
@@ -2500,13 +2507,16 @@ fn run_installation_generate_with_output_writer<F>(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    profile_selection: ProfileSelectionInput,
     write_output: F,
 ) -> Result<InstallationGenerationOutcome>
 where
     F: FnOnce(&Path, &InstallationTransaction) -> Result<(), std::io::Error>,
 {
-    let transaction = match GenerationPackagePlanner::plan_with_source_publication_binding(
+    let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
+        &profile_selection,
+        source_publication.profile_governed_roots,
         source_publication.source_identity,
         source_publication.files,
         source_publication.evidence_digest,
@@ -2697,6 +2707,8 @@ fn run_installation_materialize_source_bundle(
     output: PathBuf,
     store: PathBuf,
     generation: String,
+    component: String,
+    version: String,
     installation: String,
     lineage_id: String,
     sequence: u64,
@@ -2710,6 +2722,16 @@ fn run_installation_materialize_source_bundle(
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
 ) -> Result<i32> {
+    let profile_selection = profile_selection_input(ResolveProfileRequest {
+        profile,
+        profile_anchor_root: profile_anchor_root.clone(),
+        installation_key: installation_key.clone(),
+        component,
+        version,
+        generation: (profile == InstallationProfile::PortableDev).then(|| generation.clone()),
+        source_root: output_bundle.clone(),
+        staging_root: staging_root.clone(),
+    })?;
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2732,14 +2754,8 @@ fn run_installation_materialize_source_bundle(
             lineage_id: cli_handle(lineage_id.clone(), "lineage_id")?,
             sequence,
         },
-        profile,
-        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-        installation_key: installation_key
-            .clone()
-            .map(|value| cli_handle(value, "installation_key"))
-            .transpose()?,
+        profile_selection: profile_selection.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
-        staging_root: cli_path_handle(&staging_root, "staging_root")?,
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
@@ -2782,9 +2798,7 @@ fn run_installation_materialize_source_bundle(
         source_bundle_materializer::bridge_source_plan_for_receipt(&materialize_input, &receipt)?;
     let generated = run_installation_generate(
         output_bundle,
-        profile,
-        profile_anchor_root,
-        installation_key,
+        profile_selection,
         installation,
         lineage_id,
         sequence,
@@ -4034,8 +4048,12 @@ fn installation_profile_governance_projection(
             "root_roles": resolution.governance.roots,
             "enforced_guarantees": resolution.governance.enforced_guarantees,
             "unsupported_guarantees": resolution.governance.unsupported_guarantees,
-            "requires_admin": resolution.unprivileged_proof.requires_admin,
-            "compared_roots": resolution.unprivileged_proof.compared_roots,
+            "requires_admin": resolution.governance.profile.requires_admin(),
+            "no_service_authority_proof": resolution.no_service_authority_proof.as_ref(),
+            "verified_root_roles": resolution
+                .no_service_authority_proof
+                .as_ref()
+                .map(|proof| proof.verified_root_roles),
         }),
         Err(error) => json!({
             "state": "REHYDRATION_REFUSED",
@@ -4103,8 +4121,12 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             "root_roles": resolution.governance.roots,
             "enforced_guarantees": resolution.governance.enforced_guarantees,
             "unsupported_guarantees": resolution.governance.unsupported_guarantees,
-            "requires_admin": resolution.unprivileged_proof.requires_admin,
-            "compared_roots": resolution.unprivileged_proof.compared_roots,
+            "requires_admin": resolution.governance.profile.requires_admin(),
+            "no_service_authority_proof": resolution.no_service_authority_proof.as_ref(),
+            "verified_root_roles": resolution
+                .no_service_authority_proof
+                .as_ref()
+                .map(|proof| proof.verified_root_roles),
             "scope": INSTALLATION_SCOPE,
             "mutated": false,
         }))?
@@ -4166,10 +4188,11 @@ fn profile_selection_input(
 /// `system_service` needs `%ProgramFiles%` and `%ProgramData%`;
 /// `user_mode` and `portable_dev` need the current user's `%LocalAppData%`;
 /// `portable_dev` additionally needs the retained repository contour the
-/// caller named. Every OS-known anchor is read through the Windows adapter's
-/// known-folder lookup, and the caller's named anchor is checked against that
-/// same lookup rather than trusted, so a caller cannot point a profile at a
-/// contour the OS does not resolve.
+/// caller named. The system-service-only protected `%ProgramData%` lookup is
+/// performed only for `system_service`; other profiles do not depend on that
+/// contour. The caller's named anchor is checked against the selected profile's
+/// OS-resolved anchor rather than trusted, so a caller cannot point a profile
+/// at a contour the OS does not resolve.
 #[allow(
     clippy::too_many_arguments,
     reason = "the proved selection carries its complete explicit input set"
@@ -4202,12 +4225,12 @@ fn proved_profile_selection(
     let local_app_data = eliot_platform_windows::current_user_local_app_data_root()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
     let local_app_data = anchor_handle(&local_app_data, "local_app_data")?;
-    let program_data = eliot_platform_windows::protected_program_data_root()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let program_data = anchor_handle(&program_data, "program_data")?;
     let named_anchor = anchor_handle(profile_anchor_root, "profile_anchor_root")?;
     let (anchors, runtime_anchor) = match profile {
         InstallationProfile::SystemService => {
+            let program_data = eliot_platform_windows::protected_program_data_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let program_data = anchor_handle(&program_data, "program_data")?;
             if !eliot_platform_windows::windows_paths_equal(
                 profile_anchor_root,
                 Path::new(program_data.as_str()),
@@ -4242,7 +4265,7 @@ fn proved_profile_selection(
             (
                 ProfileRootAnchors {
                     program_files: None,
-                    program_data: Some(program_data),
+                    program_data: None,
                     local_app_data,
                     repository_root: None,
                 },
@@ -4252,7 +4275,7 @@ fn proved_profile_selection(
         InstallationProfile::PortableDev => (
             ProfileRootAnchors {
                 program_files: None,
-                program_data: Some(program_data),
+                program_data: None,
                 local_app_data,
                 repository_root: Some(named_anchor.clone()),
             },

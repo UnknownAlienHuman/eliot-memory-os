@@ -14,11 +14,11 @@ pub const INSTALLATION_ROOT_BINDING_VERSION: u32 = 1;
 
 /// Installation/package roots plus the typed mutable runtime topology.
 ///
-/// The binding carries the complete I3.1 four-root set: immutable versioned
-/// binaries, durable service/installation state, and the separate user
-/// configuration and user cache roots the `user_mode` and `portable_dev`
-/// profiles require. For `system_service`, whose I3.1 user root is a single
-/// `%LocalAppData%\Eliot`, configuration and cache name that same root.
+/// The binding carries the complete I3.1 four-role set: immutable versioned
+/// binaries, durable service/installation state, and user configuration/cache
+/// roles. `user_mode` and `portable_dev` use separate config/cache roots;
+/// `system_service` retains the single `%LocalAppData%\Eliot` user root in both
+/// role fields, as I3.1 specifies.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationRoots {
@@ -30,7 +30,8 @@ pub struct InstallationRoots {
     pub durable_data: String,
     /// User configuration root.
     pub user_config: String,
-    /// User cache root, persisted separately from configuration.
+    /// User cache root. It is separate from configuration for `user_mode` and
+    /// `portable_dev`, and equals it for the single `system_service` user root.
     pub user_cache: String,
     /// Explicit digest-bound runtime state topology.
     pub runtime_state_roots: RuntimeStateRoots,
@@ -78,10 +79,8 @@ impl InstallationRoots {
             text(value, field)?;
             parsed_roots.push((field, WindowsPathIdentity::parse_root(value, field)?));
         }
-        // Immutable, durable and configuration roots must never alias or
-        // overlap; the cache root must never alias the immutable or durable
-        // roots. Configuration and cache aliasing is governed by the profile
-        // below: only `system_service` names one shared user root.
+        // Every role has its own identity. Configuration and cache may be
+        // siblings, but neither may alias or contain the other role.
         for left in 0..3 {
             for right in left + 1..3 {
                 if parsed_roots[left]
@@ -107,21 +106,21 @@ impl InstallationRoots {
             }
         }
         match profile {
-            InstallationProfile::SystemService => {
-                if parsed_roots[2].1 != parsed_roots[3].1 {
-                    return Err(InstallationError::ProfileViolation(
-                        "system_service names one shared user configuration and cache root"
-                            .to_owned(),
-                    ));
-                }
+            InstallationProfile::SystemService if parsed_roots[2].1 != parsed_roots[3].1 => {
+                return Err(InstallationError::ProfileViolation(
+                    "system_service must retain one shared user configuration and cache root"
+                        .to_owned(),
+                ));
             }
-            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                if parsed_roots[2].1.aliases_or_overlaps(&parsed_roots[3].1) {
-                    return Err(InstallationError::ProfileViolation(
-                        "user configuration and cache roots must be separate".to_owned(),
-                    ));
-                }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+                if parsed_roots[2].1.aliases_or_overlaps(&parsed_roots[3].1) =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "user configuration and cache roots must be separate for this profile"
+                        .to_owned(),
+                ));
             }
+            _ => {}
         }
         if !profile.is_disposable()
             && self
@@ -139,6 +138,31 @@ impl InstallationRoots {
             ));
         }
         self.validate_durable_runtime_join(profile)?;
+        Ok(())
+    }
+
+    /// Refuses a source bundle that overlaps the selected immutable binaries
+    /// root. Source publication must remain separate from the final package
+    /// destination so only the planned `StagePackage` effect can write there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::InvalidField`] for a malformed source path
+    /// and [`InstallationError::ProfileViolation`] when its Windows path
+    /// identity equals, contains, or is contained by the immutable root.
+    pub fn validate_source_bundle_root(
+        &self,
+        source_bundle_root: &str,
+    ) -> Result<(), InstallationError> {
+        let source = WindowsPathIdentity::parse_root(source_bundle_root, "source_bundle_root")?;
+        let immutable =
+            WindowsPathIdentity::parse_root(&self.immutable_binaries, "immutable_binaries")?;
+        if source.aliases_or_overlaps(&immutable) {
+            return Err(InstallationError::ProfileViolation(
+                "source bundle root must be disjoint from the final immutable binaries root"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
