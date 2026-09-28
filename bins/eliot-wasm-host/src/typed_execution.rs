@@ -4,9 +4,14 @@
 //! (`KERNEL_ADMISSION_REQUIRED`). An explicitly selected local-experimental
 //! path instantiates and executes a typed component through the frozen WIT
 //! world with deny-by-default Wasmtime policy and zero ambient imports.
-//! Domain operations beyond the `describe` descriptor require #760's neutral
-//! capsule preparation, which is absent on main; this module implements
-//! everything up to that edge with real engine execution.
+//! After the `describe` identity gate, the experimental path consumes #760's
+//! neutral operation capsule ([`ModuleContractKit`] +
+//! [`ModuleTestCapsule`]): the kit binds package/world/ABI/artifact and the
+//! closed-world declaration, the capsule binds the exact world/operation and
+//! the input/output bounds, and the generated domain export is invoked
+//! exactly once under the same limits/cancellation policy. The typed terminal
+//! result (success, first-class incomplete, or guest error) is retained
+//! exactly; traps, limit, and output violations keep their own classes.
 
 use std::fmt;
 use std::sync::{
@@ -16,9 +21,13 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use eliot_wasm_runtime::capsule::{ModuleContractKit, ModuleTestCapsule};
+use eliot_wasm_runtime::component_contract::{
+    ProofCeiling, TYPED_ABI_REVISION, TYPED_PACKAGE_ID, TypedContractError,
+};
 use eliot_wasm_runtime::{
-    CancellationPolicy, EngineTermination, EpochPolicy, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS,
-    Sha256Digest,
+    CancellationPolicy, CapabilityId, EngineTermination, EpochPolicy, InvocationLimits,
+    MAX_EPOCH_DEADLINE_TICKS, ProofStage, Sha256Digest,
 };
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
@@ -100,6 +109,25 @@ pub struct TypedReceipt {
     pub output_digest: Sha256Digest,
     /// Measured descriptor output bytes (sum of reported string bytes).
     pub output_bytes: u64,
+    /// Configured per-invocation limit envelope enforced by the Stores.
+    pub configured: InvocationLimits,
+    /// Pipeline stages completed on the successful path, in order. The
+    /// describe-only path records every stage except `invoke`; the domain
+    /// path records all six.
+    pub stages: Vec<String>,
+    /// Domain operation invoked after the descriptor gate, or empty when
+    /// only the descriptor ran.
+    pub domain_operation: String,
+    /// Digest of the canonical domain-input encoding.
+    pub domain_input_digest: Sha256Digest,
+    /// Digest of the canonical domain-output encoding.
+    pub domain_output_digest: Sha256Digest,
+    /// Measured domain-output bytes (canonical encoding length).
+    pub domain_output_bytes: u64,
+    /// Neutral proof ceiling carried by the domain result, or empty when
+    /// the terminal outcome carries none (guest error) or no domain call
+    /// ran.
+    pub domain_ceiling: String,
     /// Fuel consumed by describe execution.
     pub fuel_consumed: u64,
     /// Peak memory bytes observed, when reported.
@@ -147,8 +175,8 @@ pub enum TypedExecutionError {
     Engine(String),
     /// Validated output violates size/schema/identity bounds.
     OutputViolation(String),
-    /// Domain operation requires #760's neutral capsule (absent on main).
-    DomainCapsuleRequired,
+    /// Neutral contract-kit/capsule validation denied the domain call.
+    CapsuleDenied(String),
 }
 
 impl fmt::Display for TypedExecutionError {
@@ -166,7 +194,7 @@ impl fmt::Display for TypedExecutionError {
             Self::LimitDenied(reason) => write!(formatter, "LIMIT_DENIED:{reason}"),
             Self::Engine(reason) => write!(formatter, "ENGINE:{reason}"),
             Self::OutputViolation(reason) => write!(formatter, "OUTPUT_VIOLATION:{reason}"),
-            Self::DomainCapsuleRequired => formatter.write_str("DOMAIN_CAPSULE_REQUIRED"),
+            Self::CapsuleDenied(reason) => write!(formatter, "CAPSULE_DENIED:{reason}"),
         }
     }
 }
@@ -187,10 +215,12 @@ pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
 
 /// Bounded default limits for the local-experimental path. The caller
 /// supplies the exact artifact digest allow-listed for this invocation.
+/// The input envelope fits the fixed canonical domain probe (below
+/// one kilobyte); it stays a finite bound, not an open tap.
 #[must_use]
 pub fn default_experimental_limits(artifact_digest: Sha256Digest) -> InvocationLimits {
     InvocationLimits {
-        max_input_bytes: 64,
+        max_input_bytes: 4_096,
         max_output_bytes: 16_384,
         max_host_calls: 1,
         max_fuel: 50_000,
@@ -310,12 +340,17 @@ fn semantic_digest(
     output_digest: &Sha256Digest,
     output_bytes: u64,
     terminal: &str,
+    domain_operation: &str,
+    domain_output_digest: &Sha256Digest,
+    domain_output_bytes: u64,
+    domain_ceiling: &str,
 ) -> Sha256Digest {
     let canonical = format!(
-        "758|{}|{}|{artifact_bytes}|{}|{output_bytes}|{terminal}|{}",
+        "758|{}|{}|{artifact_bytes}|{}|{output_bytes}|{terminal}|{domain_operation}|{}|{domain_output_bytes}|{domain_ceiling}|{}",
         world.world_name(),
         artifact_digest.as_str(),
         output_digest.as_str(),
+        domain_output_digest.as_str(),
         typed_wit_digest().as_str()
     );
     Sha256Digest::of_bytes(canonical.as_bytes())
@@ -328,8 +363,8 @@ fn semantic_digest(
 /// buffer is hashed (preflight) and compiled; the path is never reread.
 /// Zero ambient imports, full resource limits, and output checks apply to
 /// descriptor/initialization execution exactly like a domain call. The
-/// domain operation itself is available via [`domain_handoff`] until #760's
-/// neutral capsule lands.
+/// domain operation itself runs through [`execute_domain_experimental`],
+/// which reuses this descriptor gate before the single domain invocation.
 pub fn execute_describe_experimental(
     world: TypedWorld,
     artifact: &[u8],
@@ -340,13 +375,7 @@ pub fn execute_describe_experimental(
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
 
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(true);
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
+    let engine = configured_engine()?;
     let component = wasmtime::component::Component::new(&engine, artifact)
         .map_err(|error| map_compile_error(&error))?;
 
@@ -363,6 +392,7 @@ pub fn execute_describe_experimental(
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);
     let terminal = format!("{:?}", EngineTermination::Completed);
+    let empty_digest = Sha256Digest::of_bytes(&[]);
     let receipt = TypedReceipt {
         proof: ExecutionMode::LocalExperimental.proof().to_owned(),
         world: world.world_name().to_owned(),
@@ -376,6 +406,19 @@ pub fn execute_describe_experimental(
         input_digest,
         output_digest: output_digest.clone(),
         output_bytes,
+        configured: limits.clone(),
+        stages: vec![
+            "compile".to_owned(),
+            "instantiate".to_owned(),
+            "descriptor".to_owned(),
+            "output".to_owned(),
+            "cleanup".to_owned(),
+        ],
+        domain_operation: String::new(),
+        domain_input_digest: empty_digest.clone(),
+        domain_output_digest: empty_digest.clone(),
+        domain_output_bytes: 0,
+        domain_ceiling: String::new(),
         fuel_consumed: usage.fuel_consumed,
         peak_memory_bytes: usage.peak_memory_bytes,
         table_elements: usage.table_elements,
@@ -389,6 +432,10 @@ pub fn execute_describe_experimental(
             &output_digest,
             output_bytes,
             &terminal,
+            "",
+            &empty_digest,
+            0,
+            "",
         ),
     };
     Ok((receipt, descriptor))
@@ -564,6 +611,41 @@ fn component_function(
     }
 }
 
+/// Builds the single configured Wasmtime engine used by both the
+/// descriptor and the domain call. One engine per execution, never a second
+/// engine beside the provider path: describe and domain share it while each
+/// runs in its own Store under the same full limit envelope.
+fn configured_engine() -> Result<wasmtime::Engine, TypedExecutionError> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
+    wasmtime::Engine::new(&config)
+        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))
+}
+
+/// Canonical descriptor of the exact typed-engine settings enforced by
+/// [`configured_engine`]. The digest names these settings and changes if
+/// and only if they change; it is recomputed, never pasted.
+fn typed_configuration_descriptor() -> &'static [u8] {
+    b"wasmtime=47.0.4;component_model=true;typed=describe+domain;consume_fuel=true;epoch_interruption=true;max_wasm_stack=8192"
+}
+
+/// Provider binding carried for the typed path: the pinned implementation
+/// and version, the fixture-scoped engine identity (Wasmtime links
+/// statically, so no measured production engine artifact is claimed), the
+/// recomputed configuration digest, and the frozen WIT digest.
+fn typed_engine_binding() -> eliot_wasm_runtime::EngineBinding {
+    eliot_wasm_runtime::EngineBinding {
+        implementation_id: "wasmtime-component".to_owned(),
+        exact_version: ENGINE_VERSION.to_owned(),
+        engine_artifact_digest: Sha256Digest::of_bytes(b"wasmtime-component/47.0.4"),
+        engine_configuration_digest: Sha256Digest::of_bytes(typed_configuration_descriptor()),
+        wit_interface_digest: typed_wit_digest(),
+    }
+}
+
 fn map_compile_error(error: &wasmtime::Error) -> TypedExecutionError {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("expected component") || message.contains("expected a component") {
@@ -591,6 +673,7 @@ fn resource_limit_error(hit: ResourceLimitHit) -> TypedExecutionError {
 }
 
 fn map_call_error(
+    operation: &str,
     error: &wasmtime::Error,
     limit_hit: Option<ResourceLimitHit>,
 ) -> TypedExecutionError {
@@ -598,13 +681,13 @@ fn map_call_error(
         return resource_limit_error(hit);
     }
     let Some(trap) = error.downcast_ref::<wasmtime::Trap>() else {
-        return TypedExecutionError::Engine("describe:component-call".to_owned());
+        return TypedExecutionError::Engine(format!("{operation}:component-call"));
     };
     let termination = match *trap {
         wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
         wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
         wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
-        _ => return TypedExecutionError::Engine("describe:guest-trap".to_owned()),
+        _ => return TypedExecutionError::Engine(format!("{operation}:guest-trap")),
     };
     TypedExecutionError::Engine(format!("{termination:?}"))
 }
@@ -749,16 +832,16 @@ impl wasmtime::ResourceLimiter for StoreState {
     }
 }
 
-/// Runs one descriptor closure with fuel, memory/table/instance limits,
+/// Runs one guarded closure with fuel, memory/table/instance limits,
 /// and epoch interruption driven by both a tick pump and the wall
 /// deadline. No clock, randomness, or ambient capability reaches the guest.
-fn run_guarded(
+/// The descriptor call and the domain call each run under the same full
+/// envelope in their own Store; usage is observed per call.
+fn run_guarded<T>(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
-    invoke: impl FnOnce(
-        &mut wasmtime::Store<StoreState>,
-    ) -> Result<TypedDescriptor, TypedExecutionError>,
-) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
+    invoke: impl FnOnce(&mut wasmtime::Store<StoreState>) -> Result<T, TypedExecutionError>,
+) -> Result<(T, ObservedUsage), TypedExecutionError> {
     let mut store = new_store(engine, limits)?;
     let wall_deadline = Instant::now() + Duration::from_millis(limits.wall_deadline_ms);
     let stop = Arc::new(AtomicBool::new(false));
@@ -791,12 +874,12 @@ fn run_guarded(
     let limit_hit = store.data().limit_hit;
     let (peak_memory_bytes, table_elements) = store.data_mut().finish_measurements();
     match outcome {
-        Ok(descriptor) => {
+        Ok(value) => {
             if let Some(hit) = limit_hit {
                 Err(resource_limit_error(hit))
             } else {
                 Ok((
-                    descriptor,
+                    value,
                     ObservedUsage {
                         fuel_consumed,
                         peak_memory_bytes,
@@ -843,7 +926,7 @@ fn describe_context_admission(
         let raw = instance
             .eliot_current_admission()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -868,7 +951,7 @@ fn describe_context_assembly(
         let raw = instance
             .eliot_current_assembly()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -893,7 +976,7 @@ fn describe_cue_activation(
         let raw = instance
             .eliot_current_activation()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -918,7 +1001,7 @@ fn describe_dreamer_handler(
         let raw = instance
             .eliot_current_handler()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -943,7 +1026,7 @@ fn describe_memory_curation_screen(
         let raw = instance
             .eliot_current_screen()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -968,7 +1051,7 @@ fn describe_dreamer_cycle(
         let raw = instance
             .eliot_current_cycle()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error(&error, store.data().limit_hit))?;
+            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -980,13 +1063,285 @@ fn describe_dreamer_cycle(
     })
 }
 
-/// Domain-operation handoff: the typed domain call (`admit`/`assemble`/
-/// `activate`/`handle`/`screen`/`step`) requires #760's independently
-/// accepted public typed port/result/kit preparation, which is absent on
-/// main. This function records that edge explicitly instead of faking a
-/// domain result. Provenance: `crates/modules/eliot-wasm-runtime/src/ports.rs:84`
-/// defines only the untyped `ComponentEnginePort::invoke` over opaque
-/// `Vec<u8>`; no typed capsule/kit builder exists under `crates/` or `bins/`.
-pub fn domain_handoff() -> Result<(), TypedExecutionError> {
-    Err(TypedExecutionError::DomainCapsuleRequired)
+/// Retained terminal outcome of one typed domain invocation. A guest error
+/// or first-class incomplete outcome is a retained domain result, never a
+/// Host-success rewrite and never a trap: each keeps its own disposition
+/// class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainTerminal {
+    /// Domain operation invoked (`admit`, `assemble`, `activate`,
+    /// `handle`, `screen`, `step`).
+    pub operation: String,
+    /// Terminal disposition: `COMPLETED`, `INCOMPLETE:<code>`, or
+    /// `GUEST_ERROR:<case>`.
+    pub disposition: String,
+    /// Neutral proof ceiling carried by the result, or empty when the
+    /// terminal outcome carries none (guest error).
+    pub proof_ceiling: String,
+}
+
+/// Fixed canonical identity carried by every experimental domain probe.
+/// These values are Host-chosen constants: they bind no Kernel, task, or
+/// user identity and admit nothing. A result that echoes foreign
+/// operation/scope/fence identity is rejected.
+const PROBE_OPERATION_ID: &str = "758-experimental-probe";
+const PROBE_TASK_ID: &str = "758-experimental-task";
+const PROBE_ATTEMPT_ID: &str = "758-experimental-attempt";
+const PROBE_SCOPE_ID: &str = "758-experimental-scope";
+const PROBE_FENCE_EPOCH: &str = "758-experimental-fence";
+const PROBE_REQUEST_ID: &str = "758-experimental-request";
+/// Canonical "no measurement" digest-hex marker: 64 zero nibbles. A valid
+/// lowercase hex shape that claims no provenance.
+const PROBE_ZERO_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// Oracle identity bound into every experimental test capsule.
+const PROBE_ORACLE: &str = "eliot-wasm-host-experimental-probe";
+/// Stateless marker hashed into the experimental kit state-contract digest.
+const PROBE_STATELESS_MARKER: &[u8] = b"eliot-758-experimental-stateless/v1";
+
+/// Overflow of a bounded canonical encoding budget.
+struct CanonicalOverflow;
+
+/// Bounded canonical writer for typed domain inputs and outputs. Every byte
+/// is debited from a finite budget before it is stored, so a hostile
+/// lifted length can never allocate first and be checked later: exhaustion
+/// fails the encoding. Field order follows WIT declaration order;
+/// enum/variant discriminants are declaration-order indexes.
+struct CanonicalWriter {
+    bytes: Vec<u8>,
+    remaining: u64,
+}
+
+impl CanonicalWriter {
+    fn new(budget: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            remaining: budget,
+        }
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<(), CanonicalOverflow> {
+        let len = u64::try_from(bytes.len()).map_err(|_| CanonicalOverflow)?;
+        self.remaining = self.remaining.checked_sub(len).ok_or(CanonicalOverflow)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn val_bool(&mut self, value: bool) -> Result<(), CanonicalOverflow> {
+        self.put(&[u8::from(value)])
+    }
+
+    fn val_u8(&mut self, value: u8) -> Result<(), CanonicalOverflow> {
+        self.put(&[value])
+    }
+
+    fn val_u16(&mut self, value: u16) -> Result<(), CanonicalOverflow> {
+        self.put(&value.to_be_bytes())
+    }
+
+    fn val_u32(&mut self, value: u32) -> Result<(), CanonicalOverflow> {
+        self.put(&value.to_be_bytes())
+    }
+
+    fn val_u64(&mut self, value: u64) -> Result<(), CanonicalOverflow> {
+        self.put(&value.to_be_bytes())
+    }
+
+    fn val_i64(&mut self, value: i64) -> Result<(), CanonicalOverflow> {
+        self.put(&value.to_be_bytes())
+    }
+
+    fn val_str(&mut self, value: &str) -> Result<(), CanonicalOverflow> {
+        let bytes = value.as_bytes();
+        let len = u64::try_from(bytes.len()).map_err(|_| CanonicalOverflow)?;
+        self.put(&len.to_be_bytes())?;
+        self.put(bytes)
+    }
+
+    fn val_disc(&mut self, index: u32) -> Result<(), CanonicalOverflow> {
+        self.put(&index.to_be_bytes())
+    }
+
+    fn val_opt<T>(
+        &mut self,
+        value: Option<&T>,
+        encode: impl Fn(&mut Self, &T) -> Result<(), CanonicalOverflow>,
+    ) -> Result<(), CanonicalOverflow> {
+        match value {
+            None => self.put(&[0]),
+            Some(inner) => {
+                self.put(&[1])?;
+                encode(self, inner)
+            }
+        }
+    }
+
+    fn val_list<T>(
+        &mut self,
+        items: &[T],
+        encode: impl Fn(&mut Self, &T) -> Result<(), CanonicalOverflow>,
+    ) -> Result<(), CanonicalOverflow> {
+        let count = u64::try_from(items.len()).map_err(|_| CanonicalOverflow)?;
+        self.put(&count.to_be_bytes())?;
+        for item in items {
+            encode(self, item)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Maps a neutral contract error to a stable bounded denial code. Only the
+/// variant identity crosses into the receipt; no payload, path, or secret.
+fn capsule_denied(error: TypedContractError) -> TypedExecutionError {
+    let code = match error {
+        TypedContractError::UnknownWorld(_) => "unknown-world",
+        TypedContractError::LegacyRejected(_) => "legacy-rejected",
+        TypedContractError::PackageMismatch { .. } => "package",
+        TypedContractError::WorldMismatch { .. } => "world",
+        TypedContractError::VersionMismatch { .. } => "version",
+        TypedContractError::AbiMismatch { .. } => "abi",
+        TypedContractError::DescriptorField(_) => "descriptor-field",
+        TypedContractError::ImportMismatch => "import",
+        TypedContractError::ExportMismatch => "export",
+        TypedContractError::EngineMismatch => "engine",
+        TypedContractError::ArtifactMismatch => "artifact",
+        TypedContractError::InterfaceMismatch => "interface",
+        TypedContractError::LimitDenied => "limit",
+        TypedContractError::ReportMismatch => "report",
+        TypedContractError::EngineDenied => "engine-denied",
+        TypedContractError::EngineUnavailable => "engine-unavailable",
+        TypedContractError::EngineUnknown => "engine-unknown",
+        TypedContractError::EnvelopeTooLarge => "envelope",
+        TypedContractError::InvalidKit(_) => "kit",
+        TypedContractError::InvalidCapsule(_) => "capsule",
+        TypedContractError::Serialization(_) => "serialization",
+    };
+    TypedExecutionError::CapsuleDenied(code.to_owned())
+}
+
+/// Parses the neutral world for one Host-selected world through #760's own
+/// contract parser. The canonical WIT name is the only input; unknown or
+/// legacy spellings fail closed inside the neutral parser.
+fn neutral_world(world: TypedWorld) -> Result<eliot_wasm_runtime::component_contract::TypedWorld, TypedExecutionError> {
+    eliot_wasm_runtime::component_contract::TypedWorld::parse(world.world_name())
+        .map_err(capsule_denied)
+}
+
+/// Builds the Governor-free experimental contract kit for one world from
+/// the validated guest descriptor and the preflighted artifact. The kit is
+/// explicitly non-governed with a candidate-only ceiling: local experiments
+/// stay non-governed and can never imply admission. The declared
+/// import/export identity is the closed world (zero imports, one bare
+/// interface); the qualified engine-observed export is matched against it
+/// by the component-type preflight before this kit is built.
+fn experimental_kit(
+    world: TypedWorld,
+    descriptor: &TypedDescriptor,
+    artifact_digest: &Sha256Digest,
+    artifact_bytes: u64,
+) -> Result<ModuleContractKit, TypedExecutionError> {
+    let neutral = neutral_world(world)?;
+    let abi_digest =
+        Sha256Digest::new(descriptor.abi_digest.clone()).map_err(|_| {
+            TypedExecutionError::OutputViolation("abi-digest".to_owned())
+        })?;
+    let abi = eliot_wasm_runtime::component_contract::AbiDescriptor::new(
+        neutral,
+        descriptor.native_contract.clone(),
+        descriptor.native_revision.clone(),
+        abi_digest,
+    )
+    .map_err(capsule_denied)?;
+    let kit = ModuleContractKit {
+        package_id: TYPED_PACKAGE_ID.to_owned(),
+        world: neutral,
+        abi,
+        artifact_digest: artifact_digest.clone(),
+        artifact_len: artifact_bytes,
+        interface_digest: typed_wit_digest(),
+        declared_imports: Vec::new(),
+        declared_exports: vec![world.interface_name().to_owned()],
+        state_contract_digest: Sha256Digest::of_bytes(PROBE_STATELESS_MARKER),
+        proof_ceiling: ProofCeiling::CandidateOnly,
+        governed: false,
+    };
+    kit.validate().map_err(capsule_denied)?;
+    if kit.artifact_digest != *artifact_digest || kit.artifact_len != artifact_bytes {
+        return Err(TypedExecutionError::CapsuleDenied("artifact".to_owned()));
+    }
+    Ok(kit)
+}
+
+/// Builds the experimental test capsule binding one kit digest, the exact
+/// canonical probe-input bytes that will be executed, the enforced bounds,
+/// and the oracle identity. The capsule operation must be the world's
+/// domain operation; validation rejects any other binding.
+fn experimental_capsule(
+    world: TypedWorld,
+    kit: &ModuleContractKit,
+    limits: &InvocationLimits,
+    fixture: Vec<u8>,
+) -> Result<ModuleTestCapsule, TypedExecutionError> {
+    let neutral = neutral_world(world)?;
+    let component = CapabilityId::new(format!("758-experimental-{}", world.world_name()))
+        .map_err(|_| TypedExecutionError::CapsuleDenied("component".to_owned()))?;
+    let capsule = ModuleTestCapsule {
+        kit_digest: kit.digest().map_err(capsule_denied)?,
+        component,
+        world: neutral,
+        operation: world.domain_func().to_owned(),
+        stage: ProofStage::Invocation,
+        fixture,
+        expected: Vec::new(),
+        max_input_bytes: limits.max_input_bytes,
+        max_output_bytes: limits.max_output_bytes,
+        max_work: limits.max_fuel,
+        oracle: PROBE_ORACLE.to_owned(),
+    };
+    capsule.validate(kit).map_err(capsule_denied)?;
+    if capsule.max_input_bytes > limits.max_input_bytes
+        || capsule.max_output_bytes > limits.max_output_bytes
+        || capsule.max_work > limits.max_fuel
+    {
+        return Err(TypedExecutionError::CapsuleDenied("limit".to_owned()));
+    }
+    Ok(capsule)
+}
+
+/// Numeric rank of a neutral proof ceiling in declaration order. A guest
+/// result carrying a ceiling above the kit ceiling is an escalation and is
+/// rejected; candidate-only never implies admission.
+fn ceiling_rank(ceiling: ProofCeiling) -> u8 {
+    match ceiling {
+        ProofCeiling::Observation => 0,
+        ProofCeiling::CandidateOnly => 1,
+        ProofCeiling::Admission => 2,
+        ProofCeiling::Assembly => 3,
+        ProofCeiling::Activation => 4,
+        ProofCeiling::Screen => 5,
+        ProofCeiling::Cycle => 6,
+        ProofCeiling::Handler => 7,
+    }
+}
+
+/// Rejects a guest ceiling above the experimental candidate-only ceiling.
+fn check_ceiling(ceiling: ProofCeiling) -> Result<String, TypedExecutionError> {
+    if ceiling_rank(ceiling) > ceiling_rank(ProofCeiling::CandidateOnly) {
+        return Err(TypedExecutionError::OutputViolation(
+            "proof-ceiling".to_owned(),
+        ));
+    }
+    Ok(format!("{ceiling:?}"))
+}
+
+/// Rejects a result identity field that does not echo the probe identity.
+/// Only the fixed label crosses into the receipt; guest content never does.
+fn check_identity(field: &'static str, got: &str, want: &str) -> Result<(), TypedExecutionError> {
+    if got != want {
+        return Err(TypedExecutionError::OutputViolation(field.to_owned()));
+    }
+    Ok(())
 }
