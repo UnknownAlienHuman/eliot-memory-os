@@ -1067,6 +1067,10 @@ pub struct OnboardingReadinessReceipt {
     pub principal_ref: String,
     pub session_ref: String,
     pub scope: ScopeIdentity,
+    /// Descriptor revision carried by the validated onboarding candidate.
+    /// Readiness revalidation compares this expected revision with the current
+    /// owner descriptor supplied to the guard path.
+    pub scope_descriptor_revision: u64,
     pub instance: WorkspaceInstanceIdentity,
     pub lineage: Option<RepositoryLineageIdentity>,
     pub scope_resolution: ScopeResolutionState,
@@ -1137,6 +1141,10 @@ impl OnboardingReadinessReceipt {
         text(&self.lease_ref, "lease_ref")?;
         text(&self.principal_ref, "principal_ref")?;
         text(&self.session_ref, "session_ref")?;
+        counter(
+            self.scope_descriptor_revision,
+            "scope_descriptor_revision",
+        )?;
         text(&self.governing_source_set_ref, "governing_source_set_ref")?;
         counter(
             self.governing_source_generation,
@@ -1519,6 +1527,7 @@ impl ColdStartController {
             principal_ref,
             session_ref,
             scope: scope.clone(),
+            scope_descriptor_revision: candidate.descriptor_revision,
             instance: instance.clone(),
             lineage: lineage.cloned(),
             scope_resolution,
@@ -1790,6 +1799,10 @@ impl ColdStartController {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        counter(
+            candidate.descriptor_revision,
+            "candidate.descriptor_revision",
+        )?;
         if scope.lineage_ref.as_deref() != Some(lease.lineage_candidate_ref.as_str())
             || scope.instance_ref != lease.workspace_instance_candidate_ref
             || lease.governing_source_generation != sources.generation

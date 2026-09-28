@@ -110,7 +110,8 @@ pub enum ReadinessDisposition {
 /// The complete typed owner profiles remain attached so event disposition,
 /// ordering, completeness, proof ceiling, source, gaps, authorization, and
 /// freshness axes are not reduced to a label. The gap list is copied verbatim
-/// from the integration owner. It may be empty when the owner reports no
+/// from the integration owner as a bounded preview; the attached coverage
+/// profile retains every gap. It may be empty when the owner reports no
 /// profile-level gaps; absence of gaps does not itself claim readiness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,12 +139,10 @@ impl GovernanceEvidence {
     ///   authorization axes; all authorization and freshness fields remain in
     ///   the output. These structural checks do not authenticate the snapshot's
     ///   origin or prove its freshness; the owner transport remains STITCH;
-    /// - the gap evidence is copied verbatim from coverage, while all event
-    ///   dispositions, ordering, completeness, source, proof-ceiling, and event
-    ///   gaps remain in the copied `IntegrationCoverageProfile`. If the bounded
-    ///   gap preview exceeds its established bound, this constructor fails
-    ///   closed rather than silently dropping evidence. A complete profile
-    ///   with no limiting evidence is valid and carries an empty gap preview.
+    /// - the bounded gap preview copies the first owner gap handles verbatim;
+    ///   the attached `IntegrationCoverageProfile` retains every gap and all
+    ///   event dispositions, ordering, completeness, source and proof ceiling.
+    ///   A complete profile with no gaps carries an empty preview.
     ///
     /// `profile_ref` is the exact coverage fingerprint and
     /// `profile_revision` the canonical decimal Governor revision.
@@ -154,8 +153,7 @@ impl GovernanceEvidence {
     /// `GOVERNANCE_FINGERPRINT_MISMATCH`, `GOVERNANCE_COVERAGE_UNVERIFIED`,
     /// `GOVERNANCE_COMPLETENESS_MISMATCH`, or
     /// `GOVERNANCE_DERIVATION_MISMATCH` when the profile disagrees with the
-    /// coverage or its derivation axes, and `GOVERNANCE_EVIDENCE_BOUND` when
-    /// coverage gap evidence exceeds `MAX_EVIDENCE_HANDLES`.
+    /// coverage or its derivation axes.
     pub fn from_owner_profiles(
         coverage: &IntegrationCoverageProfile,
         profile: &GovernanceProfile,
@@ -197,8 +195,14 @@ impl GovernanceEvidence {
             ));
         }
         validate_governance_axes(coverage, profile)?;
-        let gaps = coverage.gaps.clone();
-        bounded_list(&gaps, "GOVERNANCE_EVIDENCE_BOUND", MAX_EVIDENCE_HANDLES)?;
+        // The complete gap set remains in coverage_profile. This list is only
+        // the bounded inline preview; a valid owner profile may have more gaps.
+        let gaps: Vec<String> = coverage
+            .gaps
+            .iter()
+            .take(MAX_EVIDENCE_HANDLES)
+            .cloned()
+            .collect();
         Ok(Self {
             profile_ref: coverage.fingerprint.clone(),
             profile_revision: profile.revision.to_string(),
@@ -799,7 +803,13 @@ fn validate_governance(governance: &GovernanceEvidence) -> Result<(), BootstrapE
         ));
     }
     validate_governance_axes(coverage, profile)?;
-    if governance.limiting_integration_evidence != coverage.gaps {
+    let expected_preview: Vec<String> = coverage
+        .gaps
+        .iter()
+        .take(MAX_EVIDENCE_HANDLES)
+        .cloned()
+        .collect();
+    if governance.limiting_integration_evidence != expected_preview {
         let code = if governance.limiting_integration_evidence.is_empty() && !coverage.gaps.is_empty()
         {
             "GOVERNANCE_EVIDENCE_MISSING"
