@@ -2934,23 +2934,28 @@ fn member_records(
                 purge_policy_revision: purge_revision,
                 imported_record_id: evidence.map(|evidence| evidence.record_id.clone()),
                 imported_class: evidence.map(|evidence| evidence.class_token.to_owned()),
-                imported_digest: evidence.and_then(|evidence| evidence.digest.clone()),
+                imported_digest: evidence.map(|evidence| evidence.digest.clone()),
             })
         })
         .collect()
 }
 
-/// One member's canonical import: the address the commit wrote and, once the
-/// destination has been read back, the digest it serves.
+/// One member's canonical import: the address the commit wrote, the closed class
+/// it was written into, and the digest of exactly the bytes that were written.
+///
+/// The digest is fixed *before* the commit — it is the digest of the resolved
+/// payload this operation bound into its own transaction, validated at
+/// resolution against the archive owner's attested value. The readback then has
+/// to reproduce it, so the receipt answers "the destination serves these exact
+/// bytes at this exact address", not merely "some row exists there".
 struct ImportedMemberEvidence {
     /// Destination record address the import wrote.
     record_id: String,
     /// Closed class the record was imported into.
     class_token: &'static str,
-    /// Digest of the bytes the destination returned for that record. It is
-    /// absent before the readback, so a pre-write record can name the import it
-    /// plans without claiming an import it has not observed.
-    digest: Option<String>,
+    /// Digest of the bytes this operation bound for this member. A readback
+    /// that does not reproduce it is not this member's import.
+    digest: String,
 }
 
 /// Builds one per-phase receipt entry for the destination fence document.
@@ -3764,6 +3769,7 @@ impl SurrealStoreAdapter {
             &record_row_key,
             &placement_key_value,
             &fence,
+            &ctx.state_fence,
             batch,
             &purge_observed,
             &imports,
@@ -4040,6 +4046,14 @@ struct SourceBinding {
 /// per-operation record row and the archive-placement exclusivity row. All of
 /// them are bound values: no row content and no identifier is interpolated into
 /// statement text.
+///
+/// Two different fences are bound, and they are not interchangeable:
+/// `restore_expected_destination_fence` is the destination row's own fence, the
+/// value the fence compare-and-set must observe, while
+/// `restore_expected_state_fence` is the state fence *this request* was admitted
+/// under — the generation the batch's own expected heads were validated against
+/// by [`check_expected_state`] and the value the in-transaction head guards
+/// compare a destination head against.
 #[allow(clippy::too_many_arguments)]
 fn bookkeeping_bindings(
     destination_row: &RecoveryRecord,
@@ -4048,6 +4062,7 @@ fn bookkeeping_bindings(
     record_row_key: &str,
     placement_row_key: &str,
     fence: &DestinationFence,
+    expected_state_fence: &StateFence,
     bindings: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), StoreError> {
     bindings.insert(
@@ -4094,7 +4109,7 @@ fn bookkeeping_bindings(
     );
     bindings.insert(
         "restore_expected_state_fence".to_owned(),
-        serde_json::to_value(&fence.state_fence)
+        serde_json::to_value(expected_state_fence)
             .map_err(|error| AdapterError::Serialization(error.to_string()).into_store_error())?,
     );
     Ok(())
@@ -4182,6 +4197,7 @@ fn apply_bindings(
     record_row_key: &str,
     placement_row_key: &str,
     fence: &DestinationFence,
+    expected_state_fence: &StateFence,
     batch: &CanonicalRestoreBatch,
     purge_observed: &[(String, u64)],
     imports: &[&ResolvedArchiveMember],
@@ -4200,6 +4216,7 @@ fn apply_bindings(
         record_row_key,
         placement_row_key,
         fence,
+        expected_state_fence,
         &mut bindings,
     )?;
     precondition_bindings(batch, purge_observed, imports, &mut bindings)?;
