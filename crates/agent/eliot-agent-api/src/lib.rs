@@ -751,12 +751,11 @@ impl CancelRequest {
 /// Legacy quarantine boundary (issue #371, T4 S6): the generic
 /// `normalized_payload: serde_json::Value` wire is not a closed normalized
 /// contract and must not gain new policy, authority, completion, or
-/// capability consumers. New producers and consumers use the closed,
+/// capability consumers. Every producer and consumer uses the closed,
 /// versioned owner in [`host_event::NormalizedHostEventEnvelope`]
 /// (`eliot-agent-api/host-event-v7`); old wires never deserialize as that
-/// schema. This enum and [`HostEventEnvelope`] keep their names and no Serde
-/// change was made to the payload member, so existing codex/bridge consumers
-/// keep compiling.
+/// schema. This enum keeps its name and no Serde change was made to it, so
+/// existing codex/bridge consumers keep compiling.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostEventKind {
@@ -774,86 +773,6 @@ pub enum HostEventKind {
     Completed,
     Failed,
     Unknown,
-}
-
-/// Legacy host-event wire retained as the quarantine boundary (issue #371,
-/// T4 S6, hardened by #228 A6). The generic `normalized_payload:
-/// serde_json::Value` member stays on the wire as raw quarantine evidence and
-/// is never itself a policy input, but the wire may drive policy, authority,
-/// reactive-injection, or terminal-reduction logic only through the closed,
-/// versioned owner it carries in `normalized`.
-///
-/// `normalized` is required on the wire and is never defaulted: a legacy wire
-/// that carries no typed normalization does not deserialize at all, so no host
-/// can drive a sink with untyped JSON alone. [`Self::validate`] and
-/// [`Self::normalized`] both run the existing owner's
-/// [`host_event::validate_legacy_carry`], which validates the closed envelope
-/// (schema version, identities, adapter binding, causal predecessors, payload
-/// kind, raw-source handle/digest, normalization receipt with its recomputed
-/// output digest, loss/privacy/ceiling invariants, clock, and lineage) and
-/// requires the wire's `event_id`/`cursor`/`sequence` to equal the normalized
-/// observation's by value.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HostEventEnvelope {
-    pub event_id: EventId,
-    #[deprecated(note = "use lineage; attempt_id is legacy and rejected for attribution")]
-    pub attempt_id: AttemptId,
-    pub sequence: u64,
-    pub cursor: EventCursor,
-    pub kind: HostEventKind,
-    pub route: RouteFingerprint,
-    pub raw_payload_digest: String,
-    pub normalized_payload: serde_json::Value,
-    pub parent_event_id: Option<EventId>,
-    pub observed_at: String,
-    /// Provenance lineage for this observation. `None` is a legacy
-    /// thread-only wire: session observation only, rejected for attribution
-    /// (see [`ProviderObservationLineage::attributable_binding`]).
-    #[serde(default)]
-    pub lineage: Option<ProviderObservationLineage>,
-    /// The closed, versioned, bounded ELIOT-owned normalized observation this
-    /// wire carries. Required, never defaulted, and validated by the existing
-    /// owner before any sink reads this envelope (see
-    /// [`host_event::validate_legacy_carry`]).
-    pub normalized: host_event::NormalizedHostEventEnvelope,
-}
-
-impl HostEventEnvelope {
-    /// Validates the legacy wire's own framing and its required binding to the
-    /// closed normalized observation it carries.
-    ///
-    /// The generic `normalized_payload` is never interpreted here: it stays
-    /// raw quarantine evidence. Admission to a policy, authority,
-    /// reactive-injection, or terminal-reduction sink comes from
-    /// [`Self::normalized`], which is this envelope's only typed, versioned,
-    /// bounded, owner-validated view of the observation.
-    pub fn validate(&self) -> Result<(), ContractError> {
-        self.route.validate()?;
-        if self.sequence == 0 {
-            return Err(ContractError::ZeroLimit { field: "sequence" });
-        }
-        for (field, value) in [
-            ("raw_payload_digest", &self.raw_payload_digest),
-            ("observed_at", &self.observed_at),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ContractError::EmptyField(field));
-            }
-        }
-        self.normalized()?;
-        Ok(())
-    }
-
-    /// Returns the closed, owner-validated normalized observation this wire
-    /// carries.
-    ///
-    /// Fails closed when the carried observation does not validate, so a
-    /// consumer reads typed fields from the closed owner instead of from this
-    /// wire's generic JSON or its host-chosen `kind`.
-    pub fn normalized(&self) -> Result<&host_event::NormalizedHostEventEnvelope, ContractError> {
-        host_event::validate_legacy_carry(self)
-    }
 }
 
 /// Route/usage facts observed after execution.  Unknown values remain typed.
@@ -2520,8 +2439,6 @@ mod tests {
         assert!(source.contains("deny_unknown_fields"));
         // Effect trio hardening landed; legacy string effect fields are gone.
         let legacy_payload = ["pub payload_digest", ": String"].concat();
-        // `raw_payload_digest: String` is the intentional legacy host-event
-        // quarantine (`HostEventEnvelope`), not the effect trio.
         assert!(!source.contains(&legacy_payload));
         assert!(source.contains("governor `eliot-authority::EffectReceipt`"));
         assert!(source.contains("no unilateral rename"));

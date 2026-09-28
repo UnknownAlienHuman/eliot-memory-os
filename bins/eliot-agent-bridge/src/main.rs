@@ -13,7 +13,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    CoverageGap, DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
+    CoverageGap, DemandId, FencingToken, Generation, NormalizedHostEventEnvelope,
+    ReconnectRequest,
     RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{
@@ -163,7 +164,7 @@ enum Request {
         request: HostCancellationRequest,
     },
     ForwardHook {
-        event: HostEventEnvelope,
+        event: NormalizedHostEventEnvelope,
     },
     ForwardEvent {
         event: EventEnvelope,
@@ -1473,14 +1474,17 @@ fn forward_receipt_error(error: &BridgeError) -> Response {
 /// this consumer only carries them to the host. Returns the response with
 /// whether the failure (if any) was a provider failure for exit accounting.
 ///
-/// #228 A6: the delivery point is reached only after
+/// #228 A6 / #1709: the delivery point is reached only after
 /// [`BridgeRunner::forward_hook`] admitted the event, and that admission
-/// requires the closed, versioned, bounded normalized observation the wire
-/// carries (validated by its owner) to agree with the wire's event identity,
-/// cursor, and sequence. The host's own untyped identifier therefore never
-/// names a delivery point on its own: a wire with no typed normalization is
+/// requires the closed, versioned, bounded normalized observation to validate
+/// as a session observation under its own owner. The host's own untyped
+/// identifier therefore never names a delivery point on its own: an
+/// observation that is not a closed, owner-validated session observation is
 /// refused before any pending injection moves.
-fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
+fn handle_forward_hook(
+    runner: &mut BridgeRunner,
+    event: &NormalizedHostEventEnvelope,
+) -> (Response, bool) {
     match runner.forward_hook(event) {
         Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
             Ok(receipts) => (
@@ -5254,14 +5258,13 @@ mod tests {
             ClockReading, CoverageGap, DemandId, EventCursor, EventEnvelope, EventId,
             EventPortOutcome, FencingToken, Generation, HOST_EVENT_CONTRACT_VERSION,
             HOST_EVENT_DIGEST_ALGORITHM, HostActivationPort, HostEventDeliveryDisposition,
-            HostEventEnvelope, HostEventNormalizationReceipt, HostEventPrivacyClass,
-            LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator,
-            NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-            PrincipalId, ProviderFailure, ProviderObservationLineage, ProviderReadiness,
-            QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome,
-            RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation,
-            SessionLifecycleTransition, SessionObservation, TaskId, UnsupportedDisposition,
-            WorkUnitId,
+            HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256,
+            McpForwardingPort, NativeSession, NativeSessionLocator, NormalizationCoverage,
+            NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId, ProviderFailure,
+            ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest, RawSourceRecord,
+            ReconciliationPortOutcome, RestrictedRawSourceHandle, SessionId,
+            SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+            UnsupportedDisposition, WorkUnitId,
         };
         use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
         use eliot_integration_coverage::{
@@ -5299,7 +5302,7 @@ mod tests {
             fn forward_hook(
                 &mut self,
                 _binding: &AttachBinding,
-                _event: &HostEventEnvelope,
+                _event: &NormalizedHostEventEnvelope,
             ) -> Result<(), ProviderFailure> {
                 Ok(())
             }
@@ -5384,9 +5387,9 @@ mod tests {
             runner
         }
 
-        /// #228 A6 fixture seam: the legacy quarantine wire is admissible only
-        /// while it carries a closed, versioned, bounded normalized
-        /// observation bound to the wire's own identity, cursor, and sequence.
+        /// #228 A6 fixture seam: the journal entry is the closed, versioned,
+        /// bounded normalized observation itself, sealed against its own
+        /// identity, cursor and sequence.
         fn normalized_observation(hook_id: &str) -> Result<NormalizedHostEventEnvelope, String> {
             fn digest(bytes: &[u8]) -> Result<LowercaseSha256, String> {
                 serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(bytes)))
@@ -5450,38 +5453,10 @@ mod tests {
             Ok(envelope)
         }
 
-        fn hook_event(hook_id: &str) -> HostEventEnvelope {
-            let mut wire = serde_json::json!({
-                "event_id": hook_id,
-                "attempt_id": "attempt-consumer-1",
-                "sequence": 1,
-                "cursor": "cursor-consumer-1",
-                "kind": "tool_result",
-                "route": {
-                    "host_family": "test",
-                    "adapter": "test",
-                    "protocol_transport": "stdio",
-                    "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "provider": "provider",
-                    "model": "model",
-                    "auth_billing": "test",
-                    "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                    "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-                    "reasoning_mode": "test",
-                    "continuation_behavior": "fresh",
-                    "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-                },
-                "raw_payload_digest": "digest-consumer-1",
-                "normalized_payload": {},
-                "parent_event_id": null,
-                "observed_at": "2026-09-21T00:00:00Z"
-            });
-            wire["normalized"] = serde_json::to_value(
-                normalized_observation(hook_id).expect("valid normalized observation"),
-            )
-            .expect("normalized observation serializes");
-            serde_json::from_value(wire).expect("valid hook fixture")
+        /// #1709: the hook wire is the closed, versioned, bounded normalized
+        /// observation itself; there is no generic payload or host-chosen kind.
+        fn hook_event(hook_id: &str) -> NormalizedHostEventEnvelope {
+            normalized_observation(hook_id).expect("valid normalized observation")
         }
 
         fn live_derivation() -> GovernorCoverageDerivation {

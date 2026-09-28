@@ -32,7 +32,7 @@
 //! `docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md`.
 
 use anyhow::Context as _;
-use eliot_agent_bridge_core::TransportEdgeKind;
+use eliot_agent_bridge_core::{ClockReading, TransportEdgeKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -787,8 +787,9 @@ pub(crate) struct HostObservationEvidence {
     pub(crate) cursor: String,
     /// Digest over the canonical event bytes, for replay/conflict checks.
     pub(crate) event_digest: String,
-    /// Host-observed time carried by the event.
-    pub(crate) observed_at: String,
+    /// Typed host-observed time carried by the event. Kept whole so an
+    /// unknown reading stays unknown and no observed time is dropped.
+    pub(crate) observed_at: ClockReading,
     /// Applicable observation deadline, when the owner admitted one.
     pub(crate) deadline_unix_ms: Option<u64>,
 }

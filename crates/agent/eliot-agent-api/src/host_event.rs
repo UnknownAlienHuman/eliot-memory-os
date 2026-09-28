@@ -28,10 +28,10 @@
 //!   [`ProofCeiling::Observation`](eliot_receipts::ProofCeiling); there is no
 //!   `CompletionProof`, Finish, `VerifiedComplete`, or acceptance state here.
 //!
-//! The legacy [`HostEventEnvelope`](crate::HostEventEnvelope) with its generic
-//! `normalized_payload: serde_json::Value` wire is untouched and remains the
-//! quarantine boundary for old producers. Old wires never deserialize as this
-//! schema: the Rust type is distinct, unknown fields are denied, and the
+//! This is the single normalized host-event wire: the legacy generic
+//! `normalized_payload: serde_json::Value` quarantine envelope and its
+//! carrier were deleted by #1709, so no wire can carry untyped JSON. Old
+//! wires never deserialize as this schema: unknown fields are denied and the
 //! schema version gate rejects the v6 lineage.
 
 use schemars::JsonSchema;
@@ -47,9 +47,9 @@ use eliot_contracts::{
 };
 use eliot_receipts::ProofCeiling;
 
-/// Wire revision of the closed normalized host-event schema. The v6
-/// [`HostEventEnvelope`](crate::HostEventEnvelope) wire is untouched; this
-/// version gates the new closed owner only.
+/// Wire revision of the closed normalized host-event schema. This version
+/// gates the single normalized wire; a v6 generic wire never deserializes
+/// here.
 pub const HOST_EVENT_CONTRACT_VERSION: &str = "eliot-agent-api/host-event-v7";
 /// Algorithm/version qualifier required on every canonical source digest bound
 /// by this schema. A digest string alone never substitutes for this qualifier
@@ -1244,44 +1244,6 @@ impl NormalizedHostEventEnvelope {
             reason: HostEventQuarantineReason::ConflictingFraming,
         })
     }
-}
-
-/// Binds one legacy quarantine wire to the closed normalized observation it
-/// carries, and returns that observation (issue #228 A6).
-///
-/// [`crate::HostEventEnvelope`] stays the quarantine wire for old producers,
-/// but a quarantine record may drive policy, authority, reactive-injection, or
-/// terminal-reduction logic only when it carries a closed typed observation
-/// and that observation validates. This is the single place the binding is
-/// decided; the closed owner validates its own schema version, identities,
-/// adapter binding, causal predecessors, payload kind, raw-source
-/// handle/digest, normalization receipt (including the recomputed output
-/// digest), loss/privacy/ceiling invariants, clock, and lineage. The wire's
-/// `event_id`, `cursor`, and `sequence` must then equal the normalized
-/// observation's by value, so the legacy wire's own identifier can never name
-/// a different observation than the one it carries.
-///
-/// The bridge host-hook intake holds no #361 `ProviderExecutionBinding` and no
-/// #369 `AdmittedRouteReceipt`, so the only admission the closed owner can
-/// perform here is [`NormalizedHostEventEnvelope::validate_as_session_observation`]:
-/// session-lifecycle and typed-quarantine observations. An execution-unit
-/// observation fails closed instead of being admitted on the wire's own
-/// framing, so arbitrary host JSON never becomes an attributable event.
-///
-/// Returns the validated observation so the consumer reads typed fields from
-/// the owner rather than from the legacy wire's generic JSON.
-pub fn validate_legacy_carry(
-    wire: &crate::HostEventEnvelope,
-) -> Result<&NormalizedHostEventEnvelope, ContractError> {
-    let normalized = &wire.normalized;
-    normalized.validate_as_session_observation()?;
-    if wire.event_id != normalized.event_id
-        || wire.cursor != normalized.cursor
-        || wire.sequence != normalized.sequence
-    {
-        return Err(ContractError::BindingMismatch);
-    }
-    Ok(normalized)
 }
 
 /// Durable-to-intake conversion view for one committed journal record (issues

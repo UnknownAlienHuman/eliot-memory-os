@@ -1,9 +1,9 @@
 //! Issue #9 Slice A transport evidence for terminal reconciliation.
 //!
 //! This module carries the MGR01 half of Antigravity terminal
-//! reconciliation: fingerprint passthrough, raw/normalized host-event
-//! history with sequences and cursors, attempt state transitions, typed
-//! recovery directives, candidate canonical-write references, and the
+//! reconciliation: closed, versioned normalized host-event history with
+//! sequences and cursors, attempt state transitions, typed recovery
+//! directives, candidate canonical-write references, and the
 //! timeout/cancel/parse/late-success/duplicate/unknown/disconnect edges.
 //!
 //! Everything here is transport evidence. The stale UI/CLI display, an
@@ -20,7 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::{BridgeError, OutstandingDeliveryView, validate_text};
 
-use eliot_agent_api::{AttemptState, HostEventEnvelope, RouteFingerprint};
+use eliot_agent_api::{AttemptState, NormalizedHostEventEnvelope};
 
 /// Bounded transport journal capacity for observed host events.
 ///
@@ -413,8 +413,7 @@ impl CoverageFlags {
 /// flags for the reducer to honor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalReductionInputs {
-    fingerprint: Option<RouteFingerprint>,
-    history: Vec<HostEventEnvelope>,
+    history: Vec<NormalizedHostEventEnvelope>,
     attempt_transitions: Vec<AttemptTransition>,
     recovery_directives: Vec<RecoveryDirective>,
     stale_ui_disposition: Option<String>,
@@ -429,8 +428,7 @@ pub struct TerminalReductionInputs {
 impl TerminalReductionInputs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        fingerprint: Option<RouteFingerprint>,
-        history: Vec<HostEventEnvelope>,
+        history: Vec<NormalizedHostEventEnvelope>,
         attempt_transitions: Vec<AttemptTransition>,
         recovery_directives: Vec<RecoveryDirective>,
         stale_ui_disposition: Option<String>,
@@ -442,7 +440,6 @@ impl TerminalReductionInputs {
         outstanding: Vec<OutstandingDeliveryView>,
     ) -> Self {
         Self {
-            fingerprint,
             history,
             attempt_transitions,
             recovery_directives,
@@ -456,15 +453,9 @@ impl TerminalReductionInputs {
         }
     }
 
-    /// Route fingerprint passed through from the most recent observed host
-    /// event, if any. The transport never invents or rewrites it.
-    pub const fn fingerprint(&self) -> Option<&RouteFingerprint> {
-        self.fingerprint.as_ref()
-    }
-
     /// Immutable host-event history in observation order, including earlier
     /// recoverable errors. A later success never removes entries here.
-    pub fn history(&self) -> &[HostEventEnvelope] {
+    pub fn history(&self) -> &[NormalizedHostEventEnvelope] {
         &self.history
     }
 

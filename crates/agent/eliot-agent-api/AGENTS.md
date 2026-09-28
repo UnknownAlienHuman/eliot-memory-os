@@ -266,20 +266,17 @@ proof.
 Landed (S6): producers/consumers use the closed, versioned
 `NormalizedHostEventEnvelope` (`host-event-v7`). #1709 deleted the ACP
 adapter's deprecated `AcpEvent::into_host_event` quarantine conversion and its
-compatibility test, so no producer in this cell can mint the generic wire. The
-generic `HostEventEnvelope` type, its `impl` block and the deprecated
-`attempt_id` field are still present pending #1709's remaining work: their
-remaining consumers (`crates/surfaces/eliot-agent-bridge-core` and
-`crates/eliot-app`) are outside that slice's mutable scope, so the type cannot
-be deleted until they migrate. `NormalizedHostEventEnvelope` is already the
-only wire every producer in this cell emits; do not add a new producer or
-consumer of the generic type, and do not add an alias, a `From` impl or an
-"accepts both" phase.
+compatibility test, and then deleted the generic `HostEventEnvelope` type, its
+`impl` block and the deprecated `attempt_id` field outright. The legacy
+generic-payload wire is gone: the bridge's `forward_hook` path, the bridge-core
+host journal and the app's host-observation join all read the closed typed
+observation directly. Do not add a new producer or consumer of a generic host
+event, and do not add an alias, a `From` impl or an "accepts both" phase.
 
-Historical note: `HostEventEnvelope.normalized_payload: serde_json::Value` was
-not a closed policy/control contract. Do not reintroduce it, and do not add
-policy, authority, completion or capability logic that interprets arbitrary keys
-inside a normalized payload.
+Historical note: the former `HostEventEnvelope.normalized_payload:
+serde_json::Value` was not a closed policy/control contract. Do not reintroduce
+it, and do not add policy, authority, completion or capability logic that
+interprets arbitrary keys inside a normalized payload.
 
 The contract wave must provide typed event payload families or one bounded
 versioned extension envelope with:

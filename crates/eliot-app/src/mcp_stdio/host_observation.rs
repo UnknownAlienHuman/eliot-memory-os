@@ -4,8 +4,9 @@
 //! state from inside its own process. This adapter normalizes one event from
 //! the owning Agent Bridge journal into a typed [`HostTerminalObservation`],
 //! binding host integration identity, installation/session/process
-//! generation, correlation identity, route fingerprint, terminal state, event
-//! identity/sequence/cursor, observed time, and the applicable deadline.
+//! generation, correlation identity, the event's own route admission
+//! reference, terminal state, event identity/sequence/cursor, observed time,
+//! and the applicable deadline.
 //!
 //! The adapter verifies everything verifiable in the envelope (validity,
 //! terminal kind, route digest) and joins the *event's own* observed session
@@ -23,7 +24,10 @@
 //! `super::bridge_join`). UI-only screenshots and free text are not machine
 //! authority and never enter the observation.
 
-use eliot_agent_bridge_core::{HostEventEnvelope, HostEventKind, ProviderObservationLineage};
+use eliot_agent_bridge_core::{
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage,
+    ProviderTerminalStatus,
+};
 
 use super::correlation::{
     HostObservationEvidence, HostTerminalObservation, HostTerminalState, sha256_hex,
@@ -89,7 +93,7 @@ pub(crate) struct HostOwnerBinding {
 pub(crate) enum HostObservationReject {
     /// The envelope failed structural validation.
     InvalidEnvelope(String),
-    /// The event kind attests no terminal invocation state.
+    /// The event payload attests no terminal invocation state.
     NonTerminalKind(String),
     /// The event arrived on a different route than the correlation expects.
     RouteMismatch {
@@ -120,7 +124,7 @@ impl std::fmt::Display for HostObservationReject {
             Self::NonTerminalKind(kind) => {
                 write!(
                     formatter,
-                    "host event kind {kind} attests no terminal invocation state"
+                    "host event payload {kind} attests no terminal invocation state"
                 )
             }
             Self::RouteMismatch { expected, observed } => write!(
@@ -143,34 +147,41 @@ impl std::error::Error for HostObservationReject {}
 
 /// Normalizes one owner-nominated host event into a terminal observation.
 ///
-/// Verifies envelope validity, terminal kind, and the exact route digest, then
-/// joins the event's *own* observed generation against the owner's live
-/// current session: the observed side is read from the closed, versioned
+/// Verifies envelope validity, the terminal payload class, and the exact route
+/// digest, then joins the event's *own* observed session against the owner's
+/// live current session: the observed side is read from the closed, versioned
 /// normalized observation the envelope carries (never from caller input and
 /// never from the wire's generic JSON), the expected side is the owner's own
 /// live attach binding and its own observed route fingerprint
-/// ([`HostOwnerBinding`]). The evidence records that owner-sourced generation
-/// verbatim, so a correlation never carries a generation the join caller
-/// asserted. Non-terminal kinds, foreign routes, unattributable lineage, and
-/// stale generations are rejected: missing or mismatched telemetry is never
-/// relabeled as a host fault.
+/// ([`HostOwnerBinding`]). The evidence records that owner-sourced session
+/// verbatim, so a correlation never carries a session the join caller asserted.
+/// Non-terminal payloads, foreign routes, unattributable lineage, and stale
+/// sessions are rejected: missing or mismatched telemetry is never relabeled as
+/// a host fault.
 #[allow(
     dead_code,
     reason = "owner seam: invoked by the bridge-owning process with live journal events; the facade observes no host events itself (#2899)"
 )]
 pub(crate) fn normalize_terminal_observation(
-    event: &HostEventEnvelope,
+    event: &NormalizedHostEventEnvelope,
     keys: &HostEventJoinKeys,
     owner: &HostOwnerBinding,
 ) -> Result<HostTerminalObservation, HostObservationReject> {
     event
-        .validate()
+        .validate_as_session_observation()
         .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
-    let state = match event.kind {
-        HostEventKind::Completed => HostTerminalState::InvocationCompleted,
-        HostEventKind::Error | HostEventKind::Failed => HostTerminalState::InvocationError,
+    let state = match &event.payload {
+        NormalizedHostEventPayload::ProviderTerminalObserved(terminal) => match terminal.status {
+            ProviderTerminalStatus::CompletedObserved => HostTerminalState::InvocationCompleted,
+            ProviderTerminalStatus::FailedObserved | ProviderTerminalStatus::CancelledObserved => {
+                HostTerminalState::InvocationError
+            }
+        },
         other => {
-            return Err(HostObservationReject::NonTerminalKind(format!("{other:?}")));
+            return Err(HostObservationReject::NonTerminalKind(format!(
+                "{}",
+                other.payload_type_tag()
+            )));
         }
     };
     let route_json = event
@@ -225,7 +236,7 @@ pub(crate) fn normalize_terminal_observation(
             sequence: event.sequence,
             cursor: event.cursor.as_str().to_owned(),
             event_digest: sha256_hex(event_json.as_bytes()),
-            observed_at: event.observed_at.clone(),
+            observed_at: event.observed_at,
             deadline_unix_ms: keys.deadline_unix_ms,
         }),
     })

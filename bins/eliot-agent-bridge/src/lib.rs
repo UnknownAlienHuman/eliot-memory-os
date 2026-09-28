@@ -15,7 +15,7 @@ use eliot_agent_bridge_core::{
     AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
     ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
     EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
+    McpForwardingPort, NormalizedHostEventEnvelope, OutstandingDeliveryView, ProviderFailure,
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
     RecoveredGapFact, RecoveredPendingView, RecoveredSourceKind, RecoveredSourceProjection,
@@ -3332,7 +3332,7 @@ fn check_expected_continuation(
 ///
 /// | method | provider normalizer | Governor ingest | result readback |
 /// |---|---|---|---|
-/// | `forward_hook` | closed typed observation required and validated by its owner (`HostEventEnvelope::validate` -> `HostEventEnvelope::normalized`); the wire's generic `normalized_payload` is never interpreted (issue #228 A6) | none (transport observation) | RECEIVED echo bound to the hook digest |
+/// | `forward_hook` | the closed, versioned, bounded observation itself, validated by its own owner (`NormalizedHostEventEnvelope::validate_as_session_observation`); there is no generic payload to interpret (issues #228 A6, #1709) | none (transport observation) | RECEIVED echo bound to the hook digest |
 /// | `forward_event` | `normalize_acp_event` for raw producer bytes (ACP owner); forwarded `EventEnvelope` linkage re-validated Kernel-side | coordinator `observe_committed_intake` over `CommittedHostEventIntake` (ACP/commit path) | owner phase/disposition/cursors from the ORS row |
 /// | `forward_gap` | gap identity/interval validation (no normalization) | none (coverage accounting) | gap acceptance bound to the gap identity |
 /// | `reconcile_external` | none (read path) | none (read path) | ownership/cursor/page facts plus the bound reconciliation key |
@@ -4088,12 +4088,13 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     fn forward_hook(
         &mut self,
         binding: &AttachBinding,
-        event: &HostEventEnvelope,
+        event: &NormalizedHostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
-        if event.validate().is_err() {
+        if event.validate_as_session_observation().is_err() {
             return Err(event_shape_failure(
-                "hook envelope refused: host event envelope failed closed validation (identity, \
-                 sequence, or route); nothing staged, nothing forwarded",
+                "hook envelope refused: normalized host observation failed closed validation \
+                 (schema version, identity, sequence, or receipt coherence); nothing staged, nothing \
+                 forwarded",
             ));
         }
         self.check_continuity(binding)?;
@@ -5004,7 +5005,7 @@ impl BridgeRunner {
     pub fn recovered_pending(&self) -> Vec<RecoveredPendingView> {
         self.core.recovered_pending()
     }
-    pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+    pub fn forward_hook(&mut self, event: &NormalizedHostEventEnvelope) -> Result<(), BridgeError> {
         self.core.forward_hook(event)
     }
     pub fn forward_event(
@@ -5058,9 +5059,9 @@ impl BridgeRunner {
     /// hook invocation, issuing one Delivery/Injection Receipt per item.
     ///
     /// `hook_event_id` must be the exact identity of the forwarded
-    /// [`HostEventEnvelope`] that carries the delivery (`event_id`), so each
-    /// receipt names a real owner-observed delivery point. An empty pending
-    /// set drains to an empty receipt list without error.
+    /// [`NormalizedHostEventEnvelope`] that carries the delivery (`event_id`),
+    /// so each receipt names a real owner-observed delivery point. An empty
+    /// pending set drains to an empty receipt list without error.
     pub fn deliver_reactive_pending_via_hook(
         &mut self,
         hook_event_id: &str,
@@ -6611,9 +6612,8 @@ mod tests {
         use super::super::{
             AdmissionBasis, AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId,
             CueOrigin, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
-            HostEventEnvelope, ItemDisposition, McpForwardingPort, NormalizedCue, Profile,
-            ProviderFailure, ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity,
-            UseOutcome,
+            ItemDisposition, McpForwardingPort, NormalizedCue, Profile, ProviderFailure,
+            ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
         };
         use super::test_epoch;
         use eliot_agent_bridge_core::{
@@ -6651,7 +6651,7 @@ mod tests {
             fn forward_hook(
                 &mut self,
                 _binding: &AttachBinding,
-                _event: &HostEventEnvelope,
+                _event: &NormalizedHostEventEnvelope,
             ) -> Result<(), ProviderFailure> {
                 Ok(())
             }
@@ -6821,38 +6821,8 @@ mod tests {
             Ok(envelope)
         }
 
-        fn hook_event(hook_id: &str, sequence: u64) -> HostEventEnvelope {
-            let mut wire = serde_json::json!({
-                "event_id": hook_id,
-                "attempt_id": "attempt-reactive-1",
-                "sequence": sequence,
-                "cursor": "cursor-reactive-1",
-                "kind": "tool_result",
-                "route": {
-                    "host_family": "test",
-                    "adapter": "test",
-                    "protocol_transport": "stdio",
-                    "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "provider": "provider",
-                    "model": "model",
-                    "auth_billing": "test",
-                    "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                    "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-                    "reasoning_mode": "test",
-                    "continuation_behavior": "fresh",
-                    "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-                },
-                "raw_payload_digest": "digest-reactive-1",
-                "normalized_payload": {},
-                "parent_event_id": null,
-                "observed_at": "2026-09-21T00:00:00Z"
-            });
-            wire["normalized"] = serde_json::to_value(
-                normalized_observation(hook_id, sequence).expect("valid normalized observation"),
-            )
-            .expect("normalized observation serializes");
-            serde_json::from_value(wire).expect("valid hook fixture")
+        fn hook_event(hook_id: &str, sequence: u64) -> NormalizedHostEventEnvelope {
+            normalized_observation(hook_id, sequence).expect("valid normalized observation")
         }
 
         fn attention_ids(runner: &BridgeRunner) -> Vec<String> {
@@ -7102,8 +7072,8 @@ mod tests {
     mod resource_runner_tests {
         use super::super::{
             AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId, DeliveryStatus,
-            DemandId, EventEnvelope, HostActivationPort, HostEventEnvelope, McpForwardingPort,
-            Profile, ProviderFailure, ProviderReadiness, ResourceUri,
+            DemandId, EventEnvelope, HostActivationPort, McpForwardingPort,
+            NormalizedHostEventEnvelope, Profile, ProviderFailure, ProviderReadiness, ResourceUri,
         };
         use super::test_epoch;
         use eliot_agent_bridge_core::{
@@ -7131,7 +7101,7 @@ mod tests {
             fn forward_hook(
                 &mut self,
                 _binding: &AttachBinding,
-                _event: &HostEventEnvelope,
+                _event: &NormalizedHostEventEnvelope,
             ) -> Result<(), ProviderFailure> {
                 Ok(())
             }
