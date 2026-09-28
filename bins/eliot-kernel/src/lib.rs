@@ -41,6 +41,10 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+/// Kernel-owned audit-fallback interface (issue #1840; I16.11): the
+/// independently persisted audit spool, the last-resort channel, the
+/// visible control-loss state, and reconciliation with receipts.
+pub mod audit_fallback;
 mod backup_capture;
 mod backup_capture_ports;
 mod backup_restore;
@@ -85,6 +89,12 @@ pub mod trace_manifest;
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
+pub use audit_fallback::{
+    AuditFallbackOutcome, AuditLastResortChannel, AuditReconcileDisposition, AuditReconcileFailure,
+    AuditReconcileReceipt, AuditReconcileReport, AuditSpoolBinding, AuditSpoolDisposition,
+    AuditSpoolProtection, AuditSpoolRecord, AuditSpoolRedaction, KernelAuditFallback,
+    audit_spool_dir,
+};
 pub use backup_capture::{
     ARCHIVE_FENCE_RELATION_CONTRACT_VERSION, ArchiveFenceProof, ArchiveFenceRelation,
     CaptureEvidenceLevel, CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture,
@@ -700,6 +710,11 @@ pub struct KernelComposition {
     /// once at assembly below the canonical work root; every boundary
     /// appends through [`KernelComposition::audit_observe`].
     pub(crate) kernel_audit: Mutex<KernelAuditChain>,
+    /// The single Kernel-owned audit-fallback handle (issue #1840; I16.11).
+    /// Locked after `kernel_audit`, never before it; the fallback itself
+    /// acquires no other Kernel lock. Opened once at assembly over the
+    /// audit-spool directory; failed appends retain through it.
+    pub(crate) audit_fallback: Mutex<KernelAuditFallback>,
 }
 
 impl KernelComposition {
