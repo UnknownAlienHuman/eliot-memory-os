@@ -468,7 +468,7 @@ pub fn admit_task_bound_with_observed_scope(
     expected_fence: &StateFence,
     compatibility: CompatibilityDisposition,
 ) -> Result<(), TaskBindingError> {
-    let Some(evidence) = selection else {
+    if selection.is_none() {
         return admit_task_bound(
             None,
             expected_task_ref,
@@ -476,7 +476,7 @@ pub fn admit_task_bound_with_observed_scope(
             expected_fence,
             compatibility,
         );
-    };
+    }
     let observed_binding = eliot_workscope::observed_scope_binding(
         expected,
         observed,
@@ -744,9 +744,11 @@ pub fn admit_canonical_write(
         || carries(NamedMutationOperation::RecordFinishEvidence);
     let selection_resolution = resolve_task_selection(receipt);
     let (selection, candidate_count) = match selection_resolution {
-        Ok(TaskSelectionDisposition::Absent)
-        | Ok(TaskSelectionDisposition::Exploratory { .. })
-        | Ok(TaskSelectionDisposition::Stale { .. }) => (None, 0_usize),
+        Ok(
+            TaskSelectionDisposition::Absent
+            | TaskSelectionDisposition::Exploratory { .. }
+            | TaskSelectionDisposition::Stale { .. },
+        ) => (None, 0_usize),
         Ok(TaskSelectionDisposition::Ambiguous(candidate_handles)) => {
             (None, candidate_handles.len())
         }
@@ -766,7 +768,7 @@ pub fn admit_canonical_write(
         return match admit_capture(
             candidate_id,
             context.state_fence.clone(),
-            selection,
+            selection.as_ref(),
             candidate_count,
             compatibility,
         )? {
@@ -827,7 +829,7 @@ pub fn admit_canonical_write(
             ));
         }
         admit_task_bound(
-            selection,
+            selection.as_ref(),
             expected_task_ref,
             envelope.scope_id.as_str(),
             write_fence,

@@ -3138,10 +3138,11 @@ impl DaemonComposition {
         .map_err(DaemonError::from)?
         {
             task_binding_admission::TaskSelectionDisposition::Absent => {
-                let intake = GovernorComposition::task_selection_intake_shape(
-                    receipt.scope.scope_ref.as_str(),
-                )
-                .map_err(DaemonError::Composition)?;
+                let intake =
+                    GovernorComposition::<dyn KernelGenerationPort>::task_selection_intake_shape(
+                        receipt.scope.scope_ref.as_str(),
+                    )
+                    .map_err(DaemonError::Composition)?;
                 Ok(task_binding_admission::TaskSelectionResponse::Absent(intake))
             }
             task_binding_admission::TaskSelectionDisposition::Exploratory {
