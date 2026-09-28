@@ -668,6 +668,7 @@ dependencies = [
  "eliot-agent-api",
  "eliot-backup",
  "eliot-bootstrap",
+ "eliot-build-test-graph",
  "eliot-cli",
  "eliot-config",
  "eliot-contracts",
