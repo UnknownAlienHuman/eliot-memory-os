@@ -1427,11 +1427,22 @@ impl AuditEventDraft {
     }
 
     /// Returns the connection-fenced orphan-cleanup draft.
+    ///
+    /// `state_fence` is the Kernel's currently admitted authority observed
+    /// with the fencing decision; `None` keeps the previous fenceless shape
+    /// when that authority is unreadable.
     #[must_use]
-    pub fn orphan_connection_fenced(connection_id: &str, fenced_operations: usize) -> Self {
+    pub fn orphan_connection_fenced(
+        connection_id: &str,
+        fenced_operations: usize,
+        state_fence: Option<&StateFence>,
+    ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.adapter_instance = Some(connection_id.to_owned());
         lineage.controller = Some("kernel".to_owned());
+        if let Some(fence) = state_fence {
+            lineage.state_fence = Some(fence.clone());
+        }
         Self {
             kind: AuditEventKind::ORPHAN_CONNECTION_FENCED,
             lineage,
@@ -1499,10 +1510,19 @@ impl AuditEventDraft {
     }
 
     /// Returns the supervision-expired draft.
+    ///
+    /// `snapshot` is the expired lease's durable head: its binding fence is
+    /// the exact authority observed with the expiry decision, so the record
+    /// carries it (I16.7: a brief is fenced by its trigger record).
+    /// `None` keeps the previous fenceless shape when the head is
+    /// unreadable; observation never fails the revocation.
     #[must_use]
-    pub fn lease_supervision_expired() -> Self {
+    pub fn lease_supervision_expired(snapshot: Option<&SupervisionLeaseSnapshot>) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.controller = Some("kernel".to_owned());
+        if let Some(snapshot) = snapshot {
+            lineage.fill_supervision_snapshot(snapshot);
+        }
         Self {
             kind: AuditEventKind::LEASE_SUPERVISION_EXPIRED,
             lineage,
@@ -1676,10 +1696,20 @@ impl AuditEventDraft {
     }
 
     /// Returns the launch-failed draft with its stable terminal code.
+    ///
+    /// `state_fence` is the Kernel's currently admitted authority observed
+    /// with the failed launch; `None` keeps the previous fenceless shape
+    /// when that authority is unreadable.
     #[must_use]
-    pub fn process_launch_failed(terminal_code: &'static str) -> Self {
+    pub fn process_launch_failed(
+        terminal_code: &'static str,
+        state_fence: Option<&StateFence>,
+    ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.controller = Some("kernel".to_owned());
+        if let Some(fence) = state_fence {
+            lineage.state_fence = Some(fence.clone());
+        }
         Self {
             kind: AuditEventKind::PROCESS_LAUNCH_FAILED,
             lineage,
@@ -1713,17 +1743,25 @@ impl AuditEventDraft {
     }
 
     /// Returns the daemon-status draft for one lifecycle transition.
+    ///
+    /// `state_fence` is the Kernel's currently admitted authority observed
+    /// with the transition; `None` keeps the previous fenceless shape when
+    /// that authority is unreadable.
     #[must_use]
     pub fn process_daemon_status(
         kind: &'static str,
         receipt: Option<&ProcessStartReceipt>,
         detail: &str,
+        state_fence: Option<&StateFence>,
     ) -> Self {
         let mut lineage = AuditLineage::empty();
         if let Some(receipt) = receipt {
             lineage.fill_process_receipt(receipt);
         } else {
             lineage.controller = Some("kernel".to_owned());
+        }
+        if let Some(fence) = state_fence {
+            lineage.state_fence = Some(fence.clone());
         }
         Self {
             kind,
@@ -2653,6 +2691,19 @@ fn append_missing_result_leg(
 }
 
 impl crate::KernelComposition {
+    /// Returns the Kernel's currently admitted authority fence, if readable.
+    ///
+    /// Best-effort like every observation: `None` on a poisoned policy lock.
+    /// Trigger drafts fence themselves with this authority so the
+    /// Diagnostic Brief compiler can attribute them (I16.7); a `None` here
+    /// yields the previous fenceless record shape, never a refusal.
+    pub(crate) fn current_state_fence(&self) -> Option<StateFence> {
+        self.front_door_policy
+            .lock()
+            .ok()
+            .map(|policy| policy.module_generation.state_fence.clone())
+    }
+
     /// Observes one audit event through the I16.11 fallback cascade.
     ///
     /// Uniform observational posture: best-effort, never changes an

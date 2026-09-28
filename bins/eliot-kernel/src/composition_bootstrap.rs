@@ -1490,6 +1490,7 @@ impl KernelComposition {
             p07_ors: Arc::clone(&ors),
             kernel_audit: Mutex::new(kernel_audit),
             audit_fallback: Mutex::new(audit_fallback),
+            diagnostic_brief: Mutex::new(None),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,

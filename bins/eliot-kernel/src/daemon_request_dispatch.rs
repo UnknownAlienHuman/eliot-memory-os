@@ -3463,14 +3463,30 @@ impl KernelComposition {
     /// admitted generation rebinds; a later `ProbeReady` or heartbeat cannot
     /// revive it.
     #[cfg(windows)]
-    fn revoke_supervision_expired_effect_admission(&self) -> Result<(), TransportError> {
+    fn revoke_supervision_expired_effect_admission(
+        &self,
+        lease_id: &str,
+    ) -> Result<(), TransportError> {
         self.promote_agent_bridge_profile(None)?;
         observe_daemon_request(
             "kernel.daemon.supervision_expired_effects_revoked",
             "success",
         );
-        // Issue #1837: durable audit evidence for lease expiry.
-        self.audit_observe(AuditEventDraft::lease_supervision_expired());
+        // Issue #1837: durable audit evidence for lease expiry. The expired
+        // head's binding fence is read best-effort: observation never fails
+        // the revocation.
+        let snapshot = self
+            .supervision_lease_authority
+            .as_ref()
+            .and_then(|authority| authority.current_snapshot(lease_id).ok().flatten());
+        self.audit_observe(AuditEventDraft::lease_supervision_expired(
+            snapshot.as_ref(),
+        ));
+        // Issue #1844: a forced lease expiry is the repeated-no-progress
+        // signal; compile its brief.
+        self.observe_diagnostic_problem(
+            super::diagnostic_brief::DiagnosticTrigger::RepeatedFailureOrNoProgress,
+        );
         Ok(())
     }
 
@@ -3583,7 +3599,7 @@ impl KernelComposition {
                     Some(expired),
                 )?;
                 if expired {
-                    self.revoke_supervision_expired_effect_admission()?;
+                    self.revoke_supervision_expired_effect_admission(&lease_id)?;
                 }
                 return self.progress_refusal_answer(&lease_id, &error);
             }

@@ -37,6 +37,7 @@ use super::ProcessTreeId;
 use super::ResourceLimits;
 use super::SessionId;
 use super::current_process_named_pipe_expectation;
+use super::diagnostic_brief::DiagnosticTrigger;
 use super::eliotd_launch_attempt_identity;
 use super::eliotd_operation_id;
 use super::kernel_audit::AuditEventDraft;
@@ -106,7 +107,10 @@ impl KernelComposition {
                 // Issue #1837: durable audit evidence for process lifecycle.
                 self.audit_observe(AuditEventDraft::process_launch_failed(
                     daemon_launch_terminal_code(&error),
+                    self.current_state_fence().as_ref(),
                 ));
+                // Issue #1844: a launch failure compiles its brief.
+                self.observe_diagnostic_problem(DiagnosticTrigger::ModuleCrashOrRestartExhaustion);
                 Err(error)
             }
         }
