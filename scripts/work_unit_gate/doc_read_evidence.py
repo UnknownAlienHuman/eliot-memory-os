@@ -18,6 +18,15 @@ A body-supplied ID is NEVER accepted without recomputing it here against the
 final merge candidate. Prose cannot make an empty, fabricated, stale,
 partial-path, duplicate-block or placeholder envelope pass.
 
+The conditional work-unit/checklist state (issue #2965 item 10) is a SEPARATE,
+four-valued condition: ``not_required``, ``required_verified``,
+``required_missing`` and ``stale``. Whether a checklist is required is a fact of
+the committed assignment contract, decided from that contract's active rows and
+never guessed from a filesystem path; the contract's active issue set is also the
+independent expected set the recorded state is judged against, never a set the
+envelope itself supplied. A missing required checklist blocks the merge with the
+checklist cause alone and is never conflated with a documentation-read failure.
+
 The OUTER envelope is versioned ``eliot-doc-read-pr-evidence-v2``; commit
 semantics are never silently added to ``eliot-doc-read-v1``. Every recorded
 field is compared against a fresh recomputation for the given base/candidate.
@@ -143,9 +152,28 @@ class EvidenceFailure(str, Enum):
 class ChecklistState(str, Enum):
     """Conditional work-unit/checklist state (issue #2965 item 10).
 
-    Requirement is decided from the committed assignment contract, never from a
-    guessed filesystem path. This state is a SEPARATE cause from any
-    documentation-read failure.
+    The four values are exhaustive and mutually exclusive; every work unit lands
+    in exactly one of them:
+
+    ``not_required``
+        The committed assignment contract declares no active row that would
+        require a checklist record for the delivered work unit.
+    ``required_verified``
+        The contract requires one, the envelope names exactly that issue, and the
+        record is bound to the FINAL candidate tree. Established by verification
+        against the contract, never by the presence of a record.
+    ``required_missing``
+        The contract requires one and the envelope supplies no record verified
+        against the final candidate tree (unrecorded, unbound, or no work unit
+        identified at all while the contract carries an active row).
+    ``stale``
+        The contract requires one, the envelope records it, and the record is
+        bound to a different candidate tree than the final one.
+
+    Whether a checklist is required is a fact of the committed assignment
+    contract, never a guess from a filesystem path. This state is a SEPARATE
+    cause from any documentation-read failure: it is decided from contract rows
+    and is reported as its own typed code.
     """
 
     NOT_REQUIRED = "not_required"
@@ -410,7 +438,7 @@ def _compare(
     changed: Sequence[str],
     candidate_root: Path,
     work_issue: int | None = None,
-) -> ChecklistState:
+) -> tuple[ChecklistState, dict[int, bool]]:
     _compare_identity(envelope, base_tree, candidate_tree, changed, candidate_root)
     _compare_router_input(envelope, recomputed)
     _compare_required(envelope["required_items"], recomputed)
@@ -418,7 +446,8 @@ def _compare(
     _compare_optional(envelope["optional_expansions"], recomputed)
     _compare_contract_inputs(envelope["contract_inputs"], candidate_root)
     _compare_attestation(envelope["attestation"])
-    return _checklist_state(envelope["checklist"], candidate_root, candidate_tree, work_issue)
+    state = _checklist_state(envelope["checklist"], candidate_root, candidate_tree, work_issue)
+    return state, _assignment_contract(candidate_root)
 
 
 def _compare_identity(
@@ -662,14 +691,30 @@ _ACTIVE_DISPOSITIONS = ("assigned", "planned", "blocked")
 def _checklist_state(
     recorded: Any, candidate_root: Path, candidate_tree: str, work_issue: int | None = None
 ) -> ChecklistState:
-    """Conditional checklist state; a trusted controller issue overrides the body selector.
+    """The four-valued conditional checklist state, decided by the contract.
 
-    When the merge controller supplies its own assigned work-issue ID, the
-    requirement lookup uses that trusted ID and the body selector must agree
-    with it; disagreement fails closed as CHECKLIST_REQUIRED_MISSING so a
-    body-supplied null/unassigned number cannot select a not-required row.
-    Without a trusted ID the body selector is used (legacy path); the
-    controller stitch that supplies the trusted ID remains BLOCKED-BY.
+    Requirement is a fact of the committed assignment contract
+    (:func:`_assignment_contract`), never a guess from a filesystem path: the
+    contract is read first, for its own declared rows, and only its declared
+    dispositions decide whether a record is required. A body-supplied number
+    never decides requirement and never selects which rule applies.
+
+    Four mutually exclusive outcomes, in the only order that never reports a
+    weaker state than the facts support:
+
+    * the contract requires no record for the identified work unit ->
+      ``not_required``;
+    * no work unit is identified at all while the contract declares rows, the
+      contract has no row for the named work unit, or a required record is not
+      bound to the final candidate tree -> ``required_missing``;
+    * a required record is bound to a different tree -> ``stale``;
+    * a required record is recorded and bound to the final candidate tree ->
+      ``required_verified``, established by that verification and never by the
+      mere presence of a record.
+
+    An unassigned number is not a way out: a body cannot name an issue outside
+    the contract and thereby declare its own checklist unnecessary. That is
+    exactly the substitution ``not_required`` is forbidden to make.
     """
     checklist = _closed(recorded, ("issue", "recorded", "bound_candidate_tree"), "checklist")
     issue = checklist["issue"]
@@ -690,37 +735,67 @@ def _checklist_state(
             )
         issue = work_issue
 
-    required, _unit = _assignment_requires_checklist(candidate_root, issue)
-    if not required:
+    contract = _assignment_contract(candidate_root)
+    if not contract:
+        # No contract declares any row, so it requires no record.
         return ChecklistState.NOT_REQUIRED
-    if not checklist["recorded"]:
+    if issue is None:
+        # No work unit is identified, so the contract cannot be asked whether
+        # this delivery requires a record. While the contract declares active
+        # rows, a withheld selector must never manufacture not_required.
         return ChecklistState.REQUIRED_MISSING
-    if bound_tree is not None and bound_tree != _tree_digest(candidate_tree):
+    if issue not in contract:
+        # The body names a work unit the contract does not declare. Absence of
+        # a row is not permission: the body cannot clear its own checklist by
+        # pointing at an issue the contract never assigned.
+        return ChecklistState.REQUIRED_MISSING
+    if not contract[issue]:
+        return ChecklistState.NOT_REQUIRED
+    if not checklist["recorded"] or bound_tree is None:
+        return ChecklistState.REQUIRED_MISSING
+    if bound_tree != _tree_digest(candidate_tree):
         return ChecklistState.STALE
     return ChecklistState.REQUIRED_VERIFIED
 
 
-def _assignment_requires_checklist(candidate_root: Path, issue: int | None) -> tuple[bool, str]:
-    """Requirement is read from the committed assignment contract, not a path guess."""
+def _assignment_contract(candidate_root: Path) -> dict[int, bool]:
+    """Each issue the committed contract declares, mapped to requirement.
+
+    The value is whether that row's own disposition makes a checklist/work-unit
+    record required. The mapping is read from the contract rows themselves, so
+    it is the independent expected set a recorded state is judged against,
+    never a set the envelope supplied.
+
+    A repository whose candidate commits no contract, or an unreadable one,
+    declares no rows and therefore no requirement: that is a fact about the
+    contract, not an inference from a path. Delivering a cohort whose contract
+    row is not committed needs the merge controller's trusted work-issue
+    (see :func:`merge_integration_status`), which is a controller action this
+    module never invents.
+    """
     lock = candidate_root / COHORT_LOCK_PATH
-    if not lock.is_file() or issue is None:
-        return False, ""
+    if not lock.is_file():
+        return {}
     try:
         with lock.open("rb") as stream:
             document = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError):
-        return False, ""
+        return {}
     rows = document.get("row")
     if type(rows) is not list:
-        return False, ""
+        return {}
+    declared: dict[int, bool] = {}
     for entry in rows:
-        if type(entry) is not dict or entry.get("issue") != issue:
+        if type(entry) is not dict:
+            continue
+        number = entry.get("issue")
+        if type(number) is not int or number <= 0:
             continue
         disposition = entry.get("disposition")
-        unit = entry.get("unit")
-        unit_text = str(unit) if type(unit) is str else ""
-        return (type(disposition) is str and disposition in _ACTIVE_DISPOSITIONS, unit_text)
-    return False, ""
+        declared[number] = (
+            type(disposition) is str and disposition in _ACTIVE_DISPOSITIONS
+        )
+    return declared
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +874,7 @@ def verify(
     try:
         topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH)
         recomputed = _recompute(candidate_root, changed, topic)
-        checklist_state = _compare(
+        checklist_state, assignment_contract = _compare(
             envelope, recomputed, base_tree, candidate_tree, changed, candidate_root,
             work_issue,
         )
@@ -829,7 +904,14 @@ def verify(
         "required_items": len(recomputed.read_receipt["required"]),
         "changed_paths": list(changed),
         "bundle_sha256": str(recomputed.read_receipt["bundle_sha256"]),
+        # The four-valued conditional checklist state, and the independent
+        # contract rows it was decided from, reported separately from the
+        # documentation-read result above. A missing required checklist blocks
+        # the result with the checklist cause alone; it is never folded into a
+        # documentation-read failure, and a documentation-read failure is never
+        # reported as a checklist state.
         "checklist_state": checklist_state.value,
+        "assignment_contract": sorted(assignment_contract),
         "proof_ceiling": PROOF_CEILING,
         "merge_integration": merge_integration_status(root),
     }
@@ -959,8 +1041,9 @@ def _write_seed(root: Path) -> None:
         'pair_key = "sha256:' + "0" * 64 + '"\n',
         encoding="utf-8", newline="\n",
     )
-    # A committed assignment contract whose active row makes a checklist record
-    # required for the seeded issue; the reader/gate never guesses this from a path.
+    # A committed assignment contract whose active rows make a checklist record
+    # required for the seeded issues, and whose terminal rows make none required;
+    # the reader/gate reads requirement from these rows, never from a path guess.
     (root / ".github" / "work-unit-cohort.toml").write_text(
         'schema_version = "eliot-work-unit-cohort-v1"\n'
         "\n"
@@ -973,6 +1056,13 @@ def _write_seed(root: Path) -> None:
         'unit = "SEED-UNIT"\n'
         'body_sha256 = "' + hashlib.sha256(b"seed-body").hexdigest() + '"\n'
         'disposition = "assigned"\n'
+        "prerequisites = []\n"
+        "\n"
+        "[[row]]\n"
+        "issue = 4000\n"
+        'unit = "SEED-TERMINAL-UNIT"\n'
+        'body_sha256 = "' + hashlib.sha256(b"terminal-body").hexdigest() + '"\n'
+        'disposition = "superseded"\n'
         "prerequisites = []\n",
         encoding="utf-8", newline="\n",
     )
@@ -1118,6 +1208,26 @@ def _apply_mutation(valid_body: str, mutation: str) -> str:
     elif mutation == "unrecord_checklist":
         mutated["checklist"]["recorded"] = False
         mutated["checklist"]["bound_candidate_tree"] = None
+    elif mutation == "withhold_checklist_issue":
+        # The owner's #2965 counterexample: the body withholds the number that
+        # selects the contract row. The contract still requires a record, so
+        # this is required_missing, never not_required.
+        mutated["checklist"]["issue"] = None
+        mutated["checklist"]["recorded"] = False
+        mutated["checklist"]["bound_candidate_tree"] = None
+    elif mutation == "unassigned_checklist_issue":
+        # Identical outcome with an unassigned number substituted for null.
+        mutated["checklist"]["issue"] = 999999
+        mutated["checklist"]["recorded"] = False
+        mutated["checklist"]["bound_candidate_tree"] = None
+    elif mutation == "terminal_checklist_issue":
+        # The contract declares no active row for this issue, so a missing
+        # record does not block: this is the not_required state.
+        mutated["checklist"]["issue"] = 4000
+        mutated["checklist"]["recorded"] = False
+        mutated["checklist"]["bound_candidate_tree"] = None
+    elif mutation == "rebind_checklist_tree":
+        mutated["checklist"]["bound_candidate_tree"] = "sha256:" + "0" * 64
     elif mutation == "optional_none":
         mutated["optional_expansions"] = "none"
     elif mutation == "unknown_field":
@@ -1173,8 +1283,16 @@ def run_acceptance(_live_root: Path) -> int:
              "a missing explicit reading attestation fails; an attestation never substitutes for machine fields"),
             ("checklist-missing", "unrecord_checklist", EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
              "a missing checklist blocks a MET claim only when the assignment contract requires one"),
-            ("optional-none", "optional_none", EvidenceFailure.REQUIRED_ITEM_MISMATCH,
-             "optional 'none' is invalid when routing offered optional material"),
+            ("checklist-issue-null", "withhold_checklist_issue", EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+             "a null checklist.issue cannot skip an active contract row and report not_required"),
+            ("checklist-issue-unassigned", "unassigned_checklist_issue", EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+             "an unassigned checklist.issue number cannot skip an active contract row either"),
+            ("checklist-stale-tree", "rebind_checklist_tree", EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+             "a checklist bound to a different candidate tree is stale, a separate state from missing"),
+            ("checklist-not-required", "terminal_checklist_issue", None,
+             "a missing checklist does not block when the contract requires none"),
+            ("optional-none", "optional_none", None,
+             "optional 'none' is valid when routing offered optional material the author did not open"),
             ("unknown-field", "unknown_field", EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
              "an unknown envelope field is rejected"),
         )
@@ -1277,6 +1395,8 @@ def _emit(result: dict[str, Any], as_json: bool) -> None:
     print(f"  changed_paths={len(result['changed_paths'])}")
     print(f"  bundle_sha256={result['bundle_sha256']}")
     print(f"  checklist_state={result['checklist_state']}")
+    contract = ",".join(str(issue) for issue in result["assignment_contract"]) or "none"
+    print(f"  assignment_contract={contract}")
     print(f"  proof_ceiling={result['proof_ceiling']}")
     merge = result["merge_integration"]
     print(f"  merge_in_repository_consumers={','.join(merge['in_repository_merge_consumers']) or 'none'}")
