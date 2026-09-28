@@ -3587,12 +3587,19 @@ impl BoundedRequestLoop {
             .or_default()
             .push(frame.clone());
         // The error-path observation is retained before it is exposed, on
-        // the same terms as any other (#2787 audit defect 3). A retention
-        // failure here becomes this loop's first bounded residual and the
-        // emission is still attempted: the loss is what the caller reports,
-        // and the claim is never reclaimed on either path.
+        // the same terms as any other (#2787 audit defect 3), and the
+        // exposure is GATED on that retention rather than following it. A
+        // stdout write that reached the owner with nothing durable behind it
+        // is exactly the state the audit named, so when the claim-bound
+        // result owner cannot take these bytes the emission does not happen
+        // at all. The persistence failure becomes this loop's first bounded
+        // residual and the caller still reports the loss itself, so the claim
+        // stays uncertain, the observed bytes stay in the retained sequence
+        // for the bounded recovery handoff, and the guest is never
+        // re-executed.
         if let Err(error) = self.retain_observed() {
             self.record_residual(error);
+            return;
         }
         let _ = channel.publish(&frame);
     }
@@ -4652,15 +4659,33 @@ fn observe_residual_outcome(
             command: command_name(requested),
         });
     }
-    // A publication failure is recorded against the observation that lost
-    // its delivery; the exact stream fault is the loop's channel fault, and
-    // what matters here is which observation never reached the owner.
-    if let Some(frame) = &frame
-        && channel.publish(frame).is_err()
-    {
-        state.record_residual(LoopError::ResultPublicationFailed {
-            observation: observed_command_name(frame),
-        });
+    // This path projects a REAL result event — an observed guest outcome —
+    // and therefore owes it the same four separate states every other
+    // publication owes, in the same order (#2787 audit defect 3): the outcome
+    // is observed above, that exact observation (or bounded prefix) is
+    // retained through the existing claim-bound result owner HERE, the local
+    // stdout write happens only after that, and the owner acknowledgement
+    // and the permission to reclaim stay with their own later states. The
+    // retention is the gate, not a prelude: a persistence failure keeps the
+    // original claim uncertain, records the failure as this loop's bounded
+    // residual, preserves the observed bytes in the retained sequence for
+    // the bounded recovery handoff, and publishes nothing — never a safe
+    // refusal of the operation and never a re-execution of the guest.
+    if let Some(frame) = &frame {
+        if let Err(error) = state.retain_observed() {
+            state.record_residual(error);
+            return;
+        }
+        // A publication failure is recorded against the observation that
+        // lost its delivery; the exact stream fault is the loop's channel
+        // fault, and what matters here is which observation never reached
+        // the owner. The observation is already durable, so this is a
+        // delivery residual and never a loss of the observed bytes.
+        if channel.publish(frame).is_err() {
+            state.record_residual(LoopError::ResultPublicationFailed {
+                observation: observed_command_name(frame),
+            });
+        }
     }
 }
 
@@ -4747,10 +4772,15 @@ fn seal_inflight_claim(
 /// 7): the served marker first, then the exact retained result-event
 /// sequence, both before physical reclaim.
 ///
-/// This is a finalization, not a first write. Every observed event was
-/// already written through the claim-bound result owner before it could be
-/// exposed on stdout, so sealing here finalizes a sequence that is already
-/// durable rather than recording a result for the first time. The sequence
+/// This is a finalization, not a first write, and that is now structural
+/// rather than incidental: every observed event is written through the same
+/// claim-bound result owner BEFORE it can be exposed on stdout, and both
+/// publication gates refuse to emit when that write did not land — the drain
+/// path in [`consume_worker_outcome`] and the shutdown-supervisor path in
+/// [`observe_residual_outcome`] and [`BoundedRequestLoop::publish_lost_response`].
+/// A stream that reaches this function has therefore already been persisted,
+/// and the write below re-affirms that exact sequence under the served
+/// marker; it never records a guest result for the first time. The sequence
 /// must be a closed, valid stream first: sealing a prefix would advertise as
 /// complete a record whose predecessors were never retained. The
 /// pre-execution `InFlight` marker is already durable, so a failed seal
@@ -4789,6 +4819,27 @@ fn seal_served_outcome(
         });
     }
     Ok(())
+}
+
+/// Hands the exact retained sequence to the claim-bound result owner one
+/// last time on the failure edge (#2787 audit defect 3).
+///
+/// The report's retained sequence is the only remaining copy of a guest
+/// observation once the loop has failed, and the loop's own in-memory state
+/// dies with it. Offering those exact bytes to the SAME owner the loop writes
+/// through is what keeps a transient retention failure from silently
+/// discarding the only copy, and it is a bounded finalization of
+/// already-observed bytes — not a second write scheme, not a first write, and
+/// not a new acknowledgement. Whether it lands changes nothing else: the
+/// claim stays uncertain, nothing is reclaimed, the original failure is still
+/// what the caller is told, and the guest is never re-executed.
+fn hand_off_observed_sequence(
+    directory: &std::path::Path,
+    claim: &crate::dispatch_material::DeliveryClaim,
+    events: &[OrdinaryOutcome],
+) {
+    let handoff = ObservedResultRetention::new(directory, claim);
+    let _handoff_retained = handoff.retain(events);
 }
 
 /// Typed readback of the durable result record for exactly one staged replay
@@ -5165,6 +5216,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // sequence under the still-live InFlight marker instead of
                 // re-executing the guest. The failure is reported as itself,
                 // never as a safe refusal of the operation.
+                hand_off_observed_sequence(&directory, &claim, report.retained());
                 return Err(OrdinaryDriveError::Loop(*failure));
             }
         }
