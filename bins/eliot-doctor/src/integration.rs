@@ -452,7 +452,11 @@ pub fn evaluate(
 /// The expectation may be the install receipt minted by `eliot plugin
 /// install`: its digest-bound embedded preview then becomes the expectation,
 /// so verification checks the installation against the record it was
-/// previewed with rather than a retyped copy.
+/// previewed with rather than a retyped copy, and the installation status it
+/// recorded is reported separately as `installation` and withholds
+/// `installed` when the receipt says the install did not complete. A receipt
+/// that omits `status`/`code`/`completed` is a typed input error, never an
+/// assumed install.
 ///
 /// Authority rule: file hashes come from real readback — every named target
 /// is re-hashed here and the caller-supplied `actual_file_hashes` map never
