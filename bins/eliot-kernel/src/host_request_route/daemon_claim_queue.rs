@@ -257,7 +257,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -279,7 +279,7 @@ impl KernelComposition {
                 {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
                     continue;
                 }
                 campaign_packet_admission(envelope, tool)?;
@@ -330,7 +330,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -350,7 +350,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
@@ -521,7 +521,7 @@ impl KernelComposition {
     ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, FinishAttempt)>, TransportError>
     {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -541,7 +541,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
                     continue;
                 }
                 finish_admission(envelope, tool)?;

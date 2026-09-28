@@ -2964,6 +2964,84 @@ impl DaemonComposition {
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
     }
 
+    /// Runs the retained `WorkScope` guard at one I4.2.1 use boundary from a
+    /// real workspace observation (issue #1746, W3).
+    ///
+    /// This is the daemon's use-boundary entry for the guard, and it owns
+    /// exactly one step: it reads the caller's explicit absolute root
+    /// mechanically through
+    /// [`task_binding_admission::observe_explicit_workspace`] — filesystem,
+    /// VCS, and project facts, never a caller cwd or a normalized path string
+    /// — and hands that live observation to the Governor's real guard owner,
+    /// [`eliot_governor::GovernorComposition::check_work_scope_at_use_boundary`].
+    /// The Governor derives the observed `ScopeBinding` against the scope it
+    /// actually retains, runs the guard at the supplied trigger, and returns
+    /// the fresh `MATCHED` report or a typed refusal that preserves the exact
+    /// disposition.
+    ///
+    /// Boundaries: session attach/resume, first tool/process event for a task,
+    /// agent/process launch, a root/worktree/cwd/editor-workspace change, and a
+    /// scope-sensitive canonical write or Material effect. The trigger is
+    /// supplied by the boundary and never guessed here.
+    ///
+    /// A withheld or quarantined outcome changes nothing: the retained
+    /// binding, task state, and every scope's project memory are untouched, a
+    /// mismatching observation never silently moves a historical task, and
+    /// relocation still requires its explicit owner receipt through
+    /// [`Self::admit_scope_attach`]. Scope uncertainty therefore permits only
+    /// the already-defined quarantined capture route
+    /// ([`task_binding_admission::admit_capture`]), never a task-bound write.
+    ///
+    /// # Scope-revision limit
+    ///
+    /// The current retained snapshot exposes `owner_revision`, while its
+    /// `ScopeBinding` and guard receipt carry no `WorkScopeDescriptor` revision;
+    /// `ObservedScopeResources` likewise has no observed descriptor revision.
+    /// This entry therefore revalidates actual instance, lineage, resource
+    /// generation, privacy, source closure, and the current Kernel fence, but
+    /// cannot compare expected and observed scope revisions. It does not
+    /// reinterpret `owner_revision` as a descriptor revision.
+    ///
+    /// # Live status
+    ///
+    /// `caller: STITCH`. The admission boundary implementation is present but
+    /// has no production callers. The attach/resume, launch, and write
+    /// ingresses that would supply an
+    /// explicit workspace root, the admitted privacy class, the retained source
+    /// generation, and the source closure are owned by the attach-transport and
+    /// operation-wiring issues, so nothing in `eliotd` can call this yet. A
+    /// startup attach was deliberately not added to manufacture a caller.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "use-boundary driver joins the explicit root, privacy, source generation, closure, and trigger"
+    )]
+    pub fn run_work_scope_guard_at_use_boundary(
+        &mut self,
+        explicit_root: &std::path::Path,
+        observed_privacy_class: eliot_security_contracts::PrivacyClass,
+        governing_source_generation: u64,
+        source_closure: Option<(
+            &eliot_governor::GoverningSourceSet,
+            &eliot_governor::PrivacyProfile,
+        )>,
+        trigger: eliot_workscope::GuardTrigger,
+    ) -> Result<eliot_workscope::TriggerReport, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let fence = self.governor.kernel_snapshot().state_fence();
+        let observed = task_binding_admission::observe_explicit_workspace(explicit_root, &fence)?;
+        self.governor
+            .check_work_scope_at_use_boundary(
+                &observed,
+                observed_privacy_class,
+                governing_source_generation,
+                source_closure,
+                trigger,
+            )
+            .map_err(DaemonError::Composition)
+    }
+
     /// Admits one explicit workspace instance as an attach to the retained
     /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
     ///
@@ -3051,6 +3129,102 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
+    }
+
+    /// Resolves the current, applicable task selection for admission from the
+    /// Governor's own state (issue #1746, W4).
+    ///
+    /// The daemon adds no resolver of its own: it asks the Governor for the
+    /// activation snapshot and the owner-compiled readiness receipt through
+    /// [`eliot_governor::GovernorComposition::current_task_selection`] — the
+    /// unique live work lease, the live owner session, the durable
+    /// `TaskContract` revision, the installed `MATCHED` `WorkScope`, and the
+    /// receipt whose `task_binding` carries the acceptance digest and the
+    /// selection source — and then applies the applicability recheck through
+    /// [`task_binding_admission::bind_current_task_selection`]. A request that
+    /// supplies its own `TaskSelectionEvidence` is never read.
+    ///
+    /// The typed answer is preserved exactly: `Current` with the exact
+    /// evidence, `Absent` with the retained scope's task-intake shape when no
+    /// task is selected, `Exploratory` with the exact read-only binding,
+    /// `Stale` with the exact old task/revision for owner refresh/rebind, or
+    /// `Ambiguous` with the owner-issued bounded candidate handles when
+    /// several survived task selection. Task-candidate ambiguity remains
+    /// distinct from active-work scope ambiguity, which the Governor's
+    /// activation route returns through its existing typed error.
+    /// No task is created to remove ambiguity and no cold capture is attached
+    /// retroactively here; that remains a separate admitted binding
+    /// transition.
+    ///
+    /// # Live status
+    ///
+    /// `caller: STITCH`. The dispatch ingresses that would supply the lease
+    /// key terms are owned by the attach-transport and operation-wiring issues
+    /// (`GovernorComposition::current_task_selection` is reached from no live
+    /// path because the retained cold-start lease itself has no producer yet).
+    /// No synthetic caller was added.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "selection resolution joins the activation route, the compiled receipt, and the live fence in one fail-closed entry"
+    )]
+    pub fn resolve_current_task_selection(
+        &self,
+        now: u64,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: eliot_security_contracts::PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Result<task_binding_admission::TaskSelectionResponse, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let (activation, receipt) = self.governor.current_task_selection(
+            now,
+            lineage_candidate_ref,
+            workspace_instance_candidate_ref,
+            privacy_class,
+            governing_source_generation,
+        )?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        match task_binding_admission::bind_current_task_selection(
+            activation.as_ref(),
+            &receipt,
+            &live_fence,
+        )
+        .map_err(DaemonError::from)?
+        {
+            task_binding_admission::TaskSelectionDisposition::Absent => {
+                let intake = GovernorComposition::task_selection_intake_shape(
+                    receipt.scope.scope_ref.as_str(),
+                )
+                .map_err(DaemonError::Composition)?;
+                Ok(task_binding_admission::TaskSelectionResponse::Absent(intake))
+            }
+            task_binding_admission::TaskSelectionDisposition::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => Ok(task_binding_admission::TaskSelectionResponse::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            }),
+            task_binding_admission::TaskSelectionDisposition::Ambiguous(candidate_handles) => {
+                Ok(task_binding_admission::TaskSelectionResponse::Ambiguous(
+                    candidate_handles,
+                ))
+            }
+            task_binding_admission::TaskSelectionDisposition::Stale {
+                task_ref,
+                task_revision,
+            } => Ok(task_binding_admission::TaskSelectionResponse::Stale {
+                task_ref,
+                task_revision,
+            }),
+            task_binding_admission::TaskSelectionDisposition::Current(evidence) => {
+                Ok(task_binding_admission::TaskSelectionResponse::Current(evidence))
+            }
+        }
     }
 
     /// Compiles and retains the reconciliation receipt for one attach of an

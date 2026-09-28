@@ -50,6 +50,7 @@ use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    fences_match_exact,
 };
 use eliot_coordination::{
     ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
@@ -883,6 +884,15 @@ pub enum CompositionError {
         trigger: GuardTrigger,
         missing_observed_binding: bool,
         missing_source_closure: bool,
+    },
+    /// A live workspace observation named several instances at a use boundary,
+    /// so the scope stays `AMBIGUOUS` and no candidate is selected (I4.2.1).
+    #[error(
+        "scope guard withheld {trigger:?}: {observed_instances} observed workspace instances, none selected"
+    )]
+    ScopeObservationAmbiguous {
+        trigger: GuardTrigger,
+        observed_instances: usize,
     },
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
@@ -4066,27 +4076,65 @@ pub struct AuthorityRevocationReconciliation {
 /// Agent- and Human-facing projection of one retained terminal cold-start
 /// receipt (issue #1790, cold-start surface production type).
 ///
-/// This carries only the values
-/// [`GovernorComposition::cold_start_surface_for_lease`] reads off the
-/// retained terminal [`eliot_workscope::OnboardingReadinessReceipt`] and its
-/// [`eliot_workscope::ReadinessSurface`]: the receipt reference, the canonical
-/// readiness token, the smallest missing question, the lease deadline, the
-/// receipt revision, and the workspace-instance and projection identity the
-/// receipt was compiled for. `readiness` is the `SCREAMING_SNAKE_CASE`
+/// Besides the compact readiness surface, this carries the receipt's typed
+/// principal/session, scope/instance/lineage, task-selection, fence and source
+/// bindings so a downstream #8 response can compare owner projections rather
+/// than joining by display labels. Source references and generations remain
+/// distinct fields; an opaque governance-profile reference is not a coverage
+/// fingerprint or a profile revision. The complete bounded source-status
+/// lists, proof disposition and recovery prompts preserve unavailable,
+/// conflicting and no-proof states rather than reducing them to a readiness
+/// token.
+///
+/// This is a projection, not an authenticated receipt or an integrity proof.
+/// `OnboardingReadinessReceipt::validate` checks structure and internal
+/// consistency but does not verify a stored payload digest, and `receipt_ref`
+/// is not such a digest. Correct origin and freshness therefore depend on the
+/// retained `OnboardingSingleFlight` owner and #8's authenticated live
+/// producer. This projection has no clock input, so it cannot independently
+/// establish that the lease has not expired or been revoked; the live #8
+/// caller must revalidate those facts before using readiness. `readiness` is
+/// the `SCREAMING_SNAKE_CASE`
 /// [`eliot_workscope::ReadinessLifecycle`] token (`UNSEEN`, `SCANNING`,
 /// `NEEDS_SCOPE`, `NEEDS_TASK`, `NEEDS_SOURCES`, `READY_READ_ONLY`,
-/// `READY_MATERIAL`, `DEGRADED`, `CONFLICTED`), so the bridge transport parses
-/// it fail-closed without naming workscope types. The Governor never invents
-/// these values: every field is copied off a compiled receipt the retained
-/// single-flight registry published.
+/// `READY_MATERIAL`, `DEGRADED`, `CONFLICTED`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ColdStartSurfaceView {
     pub receipt_ref: String,
+    pub lease_ref: String,
+    pub principal_ref: String,
+    pub session_ref: String,
+    pub scope: ScopeIdentity,
+    pub scope_descriptor_revision: u64,
+    pub instance: WorkspaceInstanceIdentity,
+    pub lineage: Option<RepositoryLineageIdentity>,
+    pub scope_resolution: eliot_workscope::ScopeResolutionState,
+    pub task_binding: TaskBindingState,
+    pub state_fence: StateFence,
+    pub governing_source_set_ref: String,
+    pub governing_source_generation: u64,
+    pub governance_profile_ref: String,
+    pub limiting_integration_evidence: Vec<String>,
+    pub route_profile_ref: String,
+    pub serializer_id: String,
+    pub serializer_version: String,
+    pub serializer_options_digest: String,
+    pub tokenizer_id: String,
+    pub tokenizer_version: String,
+    pub tokenizer_hash: String,
     pub readiness: String,
     pub smallest_missing_question: Option<String>,
     pub lease_deadline: u64,
     pub receipt_revision: u64,
+    pub proof_readiness: eliot_workscope::ProofReadiness,
+    pub missing_inputs: Vec<String>,
+    pub next_safe_action: String,
+    pub discovered_source_refs: Vec<String>,
+    pub admitted_source_refs: Vec<String>,
+    pub conflicting_source_refs: Vec<String>,
+    pub unavailable_source_refs: Vec<String>,
+    pub scan_receipt_ref: Option<String>,
     pub workspace_instance_ref: String,
     pub projection_source_ref: String,
     pub projection_generation: u64,
@@ -5136,6 +5184,219 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// mismatches append to the bounded process-local diagnostic projection
     /// (no silent overwrite, no state or memory transfer); durable quarantine
     /// and restart recovery remain partial (W6).
+    /// Runs the retained `WorkScope` guard at one I4.2.1 use boundary from a
+    /// live resource observation (issue #1746, W3).
+    ///
+    /// This is the guard at every boundary the architecture names — session
+    /// attach/resume, first tool/process event for a task, agent/process
+    /// launch, a root/worktree/cwd/editor-workspace change, and a
+    /// scope-sensitive canonical write or Material effect — not only at the
+    /// canonical-write boundary [`Self::check_canonical_write_work_scope`]
+    /// already covered. The trigger is supplied by the boundary, never guessed.
+    ///
+    /// The comparison input is derived from the observation itself:
+    /// [`eliot_workscope::observed_scope_binding`] builds the observed
+    /// [`ScopeBinding`] from the live instance/lineage/generation the caller
+    /// read plus the *retained* scope reference, so a caller cwd, a normalized
+    /// path string, or a caller-chosen scope label can never stand in for a real
+    /// workspace read. An observation of several instances is refused as
+    /// [`CompositionError::ScopeObservationAmbiguous`] without picking one.
+    ///
+    /// The verdict is preserved in full. On success the fresh `MATCHED`
+    /// [`TriggerReport`] is returned; otherwise the typed
+    /// [`CompositionError::ScopeGuardWithheld`] carries the exact identity leg
+    /// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, `STALE_BINDING`) and the
+    /// receipt disposition (`MATCHED`, `STALE_BINDING`, `DIFFERENT_INSTANCE`,
+    /// `AMBIGUOUS`, `CONFLICTED`), and every non-identity-clear outcome also
+    /// retains the conflicting lineage in the bounded process-local quarantine
+    /// projection. A mismatching observation never moves the retained binding,
+    /// a task, or any scope's memory, and it never re-binds silently: a
+    /// relocation still needs its explicit owner receipt through
+    /// [`Self::admit_scope_relocation`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "use-boundary guard joins the observation, privacy, source closure, and trigger in one fail-closed entry"
+    )]
+    pub fn check_work_scope_at_use_boundary(
+        &mut self,
+        observed: &ObservedScopeResources,
+        observed_privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerReport, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; scope-guarded work is unavailable".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ensure_snapshot_fresh(&snapshot, "use-boundary WorkScope is not fresh")?;
+        let observed_binding = eliot_workscope::observed_scope_binding(
+            &snapshot.binding,
+            observed,
+            observed_privacy_class,
+            governing_source_generation,
+        )
+        .map_err(|error| match error {
+            eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
+                CompositionError::ScopeObservationAmbiguous {
+                    trigger,
+                    observed_instances,
+                }
+            }
+            other => CompositionError::Recovery(other.to_string()),
+        })?;
+        let report = check_at_trigger(
+            &snapshot.binding,
+            &observed_binding,
+            source_closure,
+            trigger,
+        );
+        if !report.is_matched() {
+            if report.identity != IdentityLegOutcome::IdentityClear {
+                self.push_scope_quarantine_record(
+                    &snapshot.binding,
+                    &observed_binding,
+                    &report,
+                    fence.resource_generation.value(),
+                )?;
+            }
+            return Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: snapshot.binding.scope.scope_ref.clone(),
+                observed_scope: observed_binding.scope.scope_ref.clone(),
+                trigger: report.trigger,
+                identity: report.identity,
+                verdict: report.verdict,
+                report: Box::new(report),
+            });
+        }
+        Ok(report)
+    }
+
+    /// Resolves the Governor's retained task binding for admission (issue
+    /// #1746, W4).
+    ///
+    /// The exact task binding and acceptance digest come from Governor's
+    /// retained cold-start terminal, never from a request-supplied
+    /// `TaskSelectionEvidence`. The retained receipt does not carry a typed
+    /// task-selection source, so this method does not synthesize one from an
+    /// unrelated profile reference. Before returning a selection disposition,
+    /// this method validates the retained receipt and exact lease key against
+    /// the live Governor fence and freshly matched `WorkScope`. A current task
+    /// contract is additionally joined to the unique live activation,
+    /// including principal, session, task id and revision.
+    ///
+    /// Valid no-task, exploratory, stale-selection and ambiguous dispositions
+    /// return `None` with the original receipt so the caller can retain the
+    /// typed intake response and bounded owner-issued handles. Active-work
+    /// ambiguity stays a separate activation outcome. This entry never
+    /// prefers the latest or most similar task, and it never creates one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Some(activation)` only for one current task contract. Invalid
+    /// or stale owner state is refused before the caller can admit a binding.
+    pub fn current_task_selection(
+        &self,
+        now: u64,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Result<
+        (
+            Option<GovernorActivationSnapshot>,
+            eliot_workscope::OnboardingReadinessReceipt,
+        ),
+        CompositionError,
+    > {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let live_fence = self.snapshot.state_fence();
+        let (lease, receipt) = self
+            .cold_start
+            .terminal_for_key(
+                lineage_candidate_ref,
+                workspace_instance_candidate_ref,
+                privacy_class,
+                governing_source_generation,
+            )
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "no terminal cold-start receipt for lease key".to_owned(),
+                )
+            })?;
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let scope = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .read_current(&live_fence)
+            .map_err(map_activation_scope_error)?;
+        ensure_snapshot_fresh(&scope, "task selection WorkScope is not freshly matched")?;
+        if receipt.lease_ref != lease.lease_ref
+            || lease.lineage_candidate_ref != lineage_candidate_ref
+            || lease.workspace_instance_candidate_ref != workspace_instance_candidate_ref
+            || lease.privacy_class != privacy_class
+            || lease.governing_source_generation != governing_source_generation
+            || receipt.governing_source_generation != governing_source_generation
+            || receipt.expiry_tick < now
+            || receipt.expiry_tick != lease.deadline
+            || !fences_match_exact(&receipt.state_fence, &live_fence)
+            || receipt.scope != scope.binding.scope
+            || receipt.instance.instance_ref != scope.binding.scope.instance_ref
+            || receipt.instance.root_identity != scope.binding.scope.root_identity
+            || receipt.instance.generation != scope.binding.scope.generation
+            || receipt.governing_source_generation != scope.binding.governing_source_generation
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        match receipt.task_binding.clone() {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                ..
+            } => {
+                if receipt.scope_resolution != eliot_workscope::ScopeResolutionState::Authenticated
+                    || receipt.readiness != eliot_workscope::ReadinessLifecycle::ReadyMaterial
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                let activation = self.read_unique_agent_activation(now)?;
+                if !fences_match_exact(&activation.state_fence, &live_fence)
+                    || receipt.principal_ref != activation.principal_id
+                    || receipt.session_ref != activation.session_id
+                    || receipt.scope.scope_ref != activation.work_scope_id
+                    || task_ref != activation.task_id.as_str()
+                    || task_revision != activation.task_revision
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                Ok((Some(activation), receipt))
+            }
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Stale { .. }
+            | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
+        }
+    }
+
+    /// Admits one scope-sensitive canonical write whose observed binding and
+    /// source closure the caller already holds (issue #1787).
     pub fn check_canonical_write_work_scope(
         &mut self,
         scope_id: &str,
@@ -5490,15 +5751,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Projects the retained terminal cold-start surface for one exact lease
     /// key (issue #1790, readiness-surface production caller).
     ///
-    /// Reads the terminal receipt the retained single-flight registry
-    /// published for the exact workspace filesystem/VCS identity, privacy
-    /// boundary and governing-source generation, and returns its
-    /// [`ColdStartSurfaceView`]: receipt reference, readiness token, smallest
-    /// missing question, lease deadline, receipt revision, and the instance
-    /// and projection identity the receipt was compiled for. Agent and Human
-    /// callers receive this compiled surface instead of a buried setup state;
-    /// a key with no published terminal fails closed here instead of
-    /// projecting an uncompiled disposition.
+    /// Reads and validates the terminal receipt the retained single-flight
+    /// registry published for the exact workspace filesystem/VCS identity,
+    /// privacy boundary and governing-source generation. The returned
+    /// [`ColdStartSurfaceView`] copies its principal/session, scope, task or
+    /// selection state, fence, profile/source references and generations,
+    /// readiness, source-status evidence and recovery prompts directly from
+    /// that receipt (plus the exact lease deadline). A key with no published
+    /// terminal fails closed instead of projecting an uncompiled disposition.
     /// Live status: owning thin entry for the bridge delivery path; the live
     /// bridge note path consumes no governor surface yet (BLOCKED-BY
     /// bridge-transport: `bins/eliot-agent-bridge` `BootstrapContext`
@@ -5526,15 +5786,81 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "no terminal cold-start receipt for lease key".to_owned(),
                 )
             })?;
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if lease.lineage_candidate_ref != lineage_candidate_ref
+            || lease.workspace_instance_candidate_ref != workspace_instance_candidate_ref
+            || lease.privacy_class != privacy_class
+            || lease.governing_source_generation != governing_source_generation
+            || receipt.lease_ref != lease.lease_ref
+            || receipt.governing_source_generation != lease.governing_source_generation
+            || receipt.expiry_tick != lease.deadline
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let live_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&receipt.state_fence, &live_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if let Some(owner) = self.owners.work_scope.as_ref() {
+            let scope = owner
+                .read_current(&live_fence)
+                .map_err(map_activation_scope_error)?;
+            ensure_snapshot_fresh(&scope, "cold-start surface WorkScope is not freshly matched")?;
+            if receipt.scope != scope.binding.scope
+                || receipt.instance.instance_ref != scope.binding.scope.instance_ref
+                || receipt.instance.root_identity != scope.binding.scope.root_identity
+                || receipt.instance.generation != scope.binding.scope.generation
+                || receipt.governing_source_generation
+                    != scope.binding.governing_source_generation
+            {
+                return Err(CompositionError::ActivationStaleFence);
+            }
+        } else if receipt.readiness == eliot_workscope::ReadinessLifecycle::ReadyMaterial {
+            return Err(CompositionError::ActivationScopeSelectionRequired);
+        }
         let surface = receipt
             .surface(&lease)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         Ok(ColdStartSurfaceView {
             receipt_ref: surface.receipt_ref,
+            lease_ref: receipt.lease_ref.clone(),
+            principal_ref: receipt.principal_ref.clone(),
+            session_ref: receipt.session_ref.clone(),
+            scope: receipt.scope.clone(),
+            scope_descriptor_revision: receipt.scope_descriptor_revision,
+            instance: receipt.instance.clone(),
+            lineage: receipt.lineage.clone(),
+            scope_resolution: receipt.scope_resolution,
+            task_binding: receipt.task_binding.clone(),
+            state_fence: receipt.state_fence.clone(),
+            governing_source_set_ref: receipt.governing_source_set_ref.clone(),
+            governing_source_generation: receipt.governing_source_generation,
+            governance_profile_ref: receipt.governance_profile_ref.clone(),
+            limiting_integration_evidence: receipt.limiting_integration_evidence.clone(),
+            route_profile_ref: receipt.route_profile_ref.clone(),
+            serializer_id: receipt.serializer_id.clone(),
+            serializer_version: receipt.serializer_version.clone(),
+            serializer_options_digest: receipt.serializer_options_digest.clone(),
+            tokenizer_id: receipt.tokenizer_id.clone(),
+            tokenizer_version: receipt.tokenizer_version.clone(),
+            tokenizer_hash: receipt.tokenizer_hash.clone(),
             readiness: cold_start_readiness_token(surface.readiness).to_owned(),
             smallest_missing_question: surface.smallest_missing_question,
             lease_deadline: surface.lease_deadline,
             receipt_revision: receipt.receipt_revision,
+            proof_readiness: receipt.proof_readiness,
+            missing_inputs: receipt.missing_inputs.clone(),
+            next_safe_action: receipt.next_safe_action.clone(),
+            discovered_source_refs: receipt.discovered_source_refs.clone(),
+            admitted_source_refs: receipt.admitted_source_refs.clone(),
+            conflicting_source_refs: receipt.conflicting_source_refs.clone(),
+            unavailable_source_refs: receipt.unavailable_source_refs.clone(),
+            scan_receipt_ref: receipt.scan_receipt_ref.clone(),
             workspace_instance_ref: receipt.instance.instance_ref.clone(),
             projection_source_ref: receipt.projection_source_ref.clone(),
             projection_generation: receipt.projection_generation,
