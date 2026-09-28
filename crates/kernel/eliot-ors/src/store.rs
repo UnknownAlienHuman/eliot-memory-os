@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
-    host_request_logical_key,
+    BridgeRecoveryWindowDisposition, EpochId, EpochRelation, EpochTransition,
+    HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
+    canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
@@ -102,7 +102,9 @@ use crate::{
 /// The versioned-artifact family rides the same ORS persistence codec as every
 /// other record family: no second codec, no second journal. `validate()` is the
 /// single fail-closed gate that re-establishes the exact canonical
-/// generation-addressed artifact identity and the drain-mark rule on readback.
+/// generation-addressed artifact identity, the row's own recorded I1.12
+/// compatibility verdict and the drain-mark rule on readback, so a restart
+/// re-derives the evidence a rollback is checked against from durable rows.
 impl persistence_codec::PersistedValue for VersionedArtifactEntry {
     const RECORD_TYPE: &'static str = "versioned_artifact_entry";
 
@@ -2579,6 +2581,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         target: crate::HostRequestState,
         result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically classifies cancellation of one exact host-request parent.
+    ///
+    /// A possibly-effected attempt is retained and fenced as `Unknown`; only
+    /// a pre-effect `Admitted`/`Routed` record with no claimed attempt (or an
+    /// explicit `DeferredNoEffect` attempt) may become `Cancelled`. Existing
+    /// `Unknown`/`Reconciling` and terminal rows are returned unchanged.
+    fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically records a daemon attempt before returning the executable
     /// claim. A different owner closes the row as `Unknown` while retaining
@@ -7375,6 +7388,86 @@ impl RedbRecoveryStore {
         next.validate()?;
         if next != existing {
             let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Atomically classifies cancellation against the durable attempt phase.
+    ///
+    /// The parent row and its attempt are read and updated in one write
+    /// transaction, so a cancellation cannot mark a claimed request as
+    /// effect-free after a separate caller-side read. The attempt and any
+    /// result evidence are never cleared. `Requested` has no direct
+    /// `Cancelled` edge, so it is conservatively fenced as `Unknown`.
+    pub fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+
+        let target = match existing.state {
+            crate::HostRequestState::ResultReceived
+            | crate::HostRequestState::Cancelled
+            | crate::HostRequestState::Expired
+            | crate::HostRequestState::Conflicted
+            | crate::HostRequestState::Terminal => existing.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling => {
+                existing.state
+            }
+            crate::HostRequestState::Requested
+            | crate::HostRequestState::Submitted
+            | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
+            crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
+                match existing.attempt.as_ref().map(|attempt| attempt.phase) {
+                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
+                        crate::HostRequestState::Cancelled
+                    }
+                    Some(crate::HostRequestAttemptPhase::Claimed) => {
+                        crate::HostRequestState::Unknown
+                    }
+                }
+            }
+        };
+        if target == existing.state {
+            write.commit().map_err(storage)?;
+            return Ok(Some(existing));
+        }
+
+        existing.state.transition_to(target)?;
+        let mut next = existing.clone();
+        next.state = target;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .insert(key.as_str(), payload.as_str())
@@ -18350,8 +18443,104 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
+    /// Converts a host request whose claimed owner vanished with the process
+    /// into the durable unknown-outcome state (issue #1853, I14.21, I1.4).
+    ///
+    /// A non-terminal row holding a `Claimed` attempt is a daemon that was
+    /// killed after it claimed writer ownership and may have issued effects. The
+    /// restart path must not leave it looking live, must not free the retained
+    /// attempt so a replacement can silently acquire ownership, and must not
+    /// retry: it advances the row to `Unknown` through the existing
+    /// [`crate::HostRequestState::transition_to`] edge, so exactly one result or
+    /// `UNKNOWN_OUTCOME` can still be bound later from reconciliation evidence.
+    /// The attempt is retained in place and its generation is untouched.
+    ///
+    /// A `Reconciling` row keeps its retained `Claimed` attempt and still has a
+    /// legal edge to `Unknown`, so it is a candidate too: the interrupted
+    /// reconciliation cannot be resumed across a restart, and the owning route
+    /// re-advances the row to `Reconciling` when the next reconciliation
+    /// envelope arrives.
+    ///
+    /// The original stored record is validated before it is trusted and is
+    /// never re-proved: the sweep reads the durable bytes, and a fresh proof
+    /// over data the sweep itself holds would let recovery invent authority.
+    /// Identity-index rows share `HOST_REQUESTS` and are told apart by the
+    /// same `request_digest` marker the reuse check uses, so only real
+    /// operation rows are candidates.
+    fn recover_interrupted_host_requests(&self) -> Result<(), OrsError> {
+        loop {
+            let write = self.database.begin_write().map_err(storage)?;
+            let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
+            {
+                let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                for row in table.iter().map_err(storage)? {
+                    let (key, value) = row.map_err(storage)?;
+                    let record: crate::HostRequestRecord = decode(value.value())?;
+                    if record.request_digest == HOST_REQUEST_IDENTITY_BINDING_DIGEST {
+                        continue;
+                    }
+                    if record.record_key() != key.value() {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "host_request",
+                            reason: "table key diverges from the retained host-request row"
+                                .to_owned(),
+                        });
+                    }
+                    record.validate()?;
+                    if record.state.is_terminal() {
+                        continue;
+                    }
+                    let claimed = record.attempt.as_ref().is_some_and(|attempt| {
+                        attempt.phase == crate::HostRequestAttemptPhase::Claimed
+                    });
+                    if !claimed {
+                        continue;
+                    }
+                    // A row already advanced to `Unknown`/`Reconciling` keeps
+                    // its retained `Claimed` attempt, so it still looks like a
+                    // candidate. The owner's own transition table decides
+                    // whether the row can still move forward; re-using it here
+                    // keeps the sweep idempotent across its own pages without
+                    // restating a second copy of the edge set.
+                    if record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    interrupted.push((key.value().to_owned(), record));
+                    if interrupted.len() == usize::from(crate::MAX_RECOVERY_PAGE) {
+                        break;
+                    }
+                }
+            }
+            if interrupted.is_empty() {
+                return Ok(());
+            }
+            {
+                let mut operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                for (key, interrupted_record) in &interrupted {
+                    let mut record = interrupted_record.clone();
+                    // The existing table already permits this advance; it is
+                    // the owner's transition, not a recovery-side rewrite.
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)?;
+                    record.validate()?;
+                    let payload = encode(&record)?;
+                    operations
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+            }
+            write.commit().map_err(storage)?;
+        }
+    }
+
     fn recover_interrupted_execution(&self) -> Result<(), OrsError> {
         self.reconcile_interrupted_activation_tickets()?;
+        self.recover_interrupted_host_requests()?;
         loop {
             let write = self.database.begin_write().map_err(storage)?;
             let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
@@ -19906,7 +20095,13 @@ impl RedbRecoveryStore {
     fn generation_operational_input(
         record: &RuntimeGenerationCutoverRecord,
     ) -> Result<OperationalRecordInput, OrsError> {
-        let epoch = record.old_epoch.value();
+        // The ORS row's own `EpochIdentity` contour is a non-authoritative
+        // locator (A13.6: ORS holds no authority), so it keeps the sequence.
+        // Lineage is never inferred from it: the canonical fence below binds
+        // the complete typed tuple, which `StateFenceSnapshot::validate_against_epoch`
+        // reads back as an exact `(lineage_id, sequence)` match, and the
+        // payload digest covers the same tuple.
+        let epoch = record.old_epoch.sequence.get();
         let authority_epoch = EpochLineage {
             current: EpochIdentity {
                 lineage_id: OpaqueLabel::new("generation-cutover")?,
@@ -19918,7 +20113,7 @@ impl RedbRecoveryStore {
             &json!({
                 "cutover_id": record.cutover_id,
                 "route_scope": record.route_scope,
-                "authority_epoch": epoch,
+                "authority_epoch": record.old_epoch,
             }),
             epoch,
         )?;
@@ -20213,8 +20408,19 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::InvalidTransition);
             }
-            if prior.new_epoch.value() > record.old_epoch.value()
-                || Some(prior.new_generation) != record.old_generation
+            // Scope fence: this scope's committed tuple may only be replaced by
+            // a tuple in its own lineage that is not older, because a live
+            // router re-fences a lagging scope to the current global tuple
+            // before cutting it over again. This is a fence-scope predecessor
+            // relation, NOT an authority grant: which tuple is currently active
+            // is decided by the exact global comparison below and, at dispatch,
+            // by the router's `is_same_authority`. A foreign lineage is
+            // unrelated and is denied here instead of being ordered by its
+            // number, and a backward step is denied too.
+            if !matches!(
+                record.old_epoch.relation_to(&prior.new_epoch),
+                EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageNewer
+            ) || Some(prior.new_generation) != record.old_generation
             {
                 return Err(OrsError::InvalidEpochLineage);
             }
@@ -20222,9 +20428,15 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidEpochLineage);
         }
 
+        // The global current epoch is the tuple of the most recently committed
+        // cutover, read in the ORS operation order that already orders these
+        // rows. A `max()` over bare sequences is undefined as soon as more than
+        // one lineage exists: equal sequences from different lineages are
+        // unrelated, and a foreign lineage's larger number must never decide
+        // which tuple is current.
         let global_epoch = {
             let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
-            let mut maximum = None;
+            let mut latest: Option<(u64, EpochId)> = None;
             for row in current.iter().map_err(storage)? {
                 let (_, value) = row.map_err(storage)?;
                 let candidate: DurableOperationalRecord =
@@ -20239,20 +20451,29 @@ impl RedbRecoveryStore {
                             reason: "active generation route is not committed".to_owned(),
                         });
                     }
-                    maximum = Some(maximum.map_or(cutover.new_epoch.value(), |value: u64| {
-                        value.max(cutover.new_epoch.value())
-                    }));
+                    if latest
+                        .as_ref()
+                        .is_none_or(|(order, _)| candidate.operation_order > *order)
+                    {
+                        latest = Some((candidate.operation_order, cutover.new_epoch));
+                    }
                 }
             }
-            maximum
+            latest.map(|(_, epoch)| epoch)
         };
-        if let Some(global_epoch) = global_epoch
-            && record.old_epoch.value() != global_epoch
+        if let Some(global_epoch) = &global_epoch
+            && !record.old_epoch.is_same_authority(global_epoch)
         {
             return Err(OrsError::InvalidEpochLineage);
         }
-        if global_epoch.is_none() && record.old_epoch.value() != 1 {
-            return Err(OrsError::InvalidEpochLineage);
+        if global_epoch.is_none() {
+            // With no committed cutover anywhere, the first one starts from the
+            // genesis of its own lineage. No lineage is invented and no bare
+            // number is accepted as a stand-in for a missing lineage.
+            let genesis = EpochTransition::genesis(record.old_epoch.lineage_id.clone()).current;
+            if !record.old_epoch.is_same_authority(&genesis) {
+                return Err(OrsError::InvalidEpochLineage);
+            }
         }
 
         let committed = RuntimeGenerationCutoverRecord {
@@ -23425,6 +23646,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::cancel_host_request_parent(self, operation_id, request_digest)
+    }
+
     fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -23961,6 +24190,16 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Atomically classifies cancellation using the current durable attempt.
+    pub fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .cancel_host_request_parent(operation_id, request_digest)
     }
 
     /// Persists a daemon attempt before returning its executable claim.

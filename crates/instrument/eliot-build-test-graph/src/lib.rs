@@ -250,6 +250,13 @@ impl BuildFingerprint {
 }
 
 /// Revision of a discoverable test capsule and its non-discoverable policy.
+///
+/// The graph projection references the same executable revision the neutral
+/// capsule contract (`eliot-contracts`, issue #1804) describes: [`Self::capsule_digest`]
+/// carries that revision's digest instead of a separately edited copy, and
+/// [`BuildTestGraph::capsules_for_cell`] resolves one cell to its bound
+/// projections. This crate owns neither the capsule vocabulary nor execution;
+/// it only projects what the owning producers supply.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ModuleTestCapsuleRevision {
     pub capsule_id: String,
@@ -258,6 +265,41 @@ pub struct ModuleTestCapsuleRevision {
     pub fixture_digest: String,
     pub oracle_digest: String,
     pub resource_classes: Vec<String>,
+    /// Cell the projected revision proves. Absent on projections emitted
+    /// before the cell binding existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    /// Revision of the cell contract surface under proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_revision: Option<String>,
+    /// Digest of the neutral executable capsule revision this projection
+    /// references. Equality with the descriptor digest is the same-revision
+    /// check; inequality means the projection is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capsule_digest: Option<String>,
+    /// Producer revision that emitted the referenced descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_revision: Option<String>,
+    /// Exact Instrument profile name the revision executes through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Exact admitted profile revision; zero never names a revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<u64>,
+    /// Compilation target the revision is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Required Cargo features.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Highest proof level the revision may claim, in the neutral
+    /// vocabulary owned by `eliot-contracts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_ceiling: Option<String>,
+    /// Supported-execution disposition in the neutral vocabulary owned by
+    /// `eliot-contracts`. This projection never re-decides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
 }
 
 impl ModuleTestCapsuleRevision {
@@ -270,7 +312,43 @@ impl ModuleTestCapsuleRevision {
             text(v, f)?;
         }
         digest(&self.fixture_digest, "fixture_digest")?;
-        digest(&self.oracle_digest, "oracle_digest")
+        digest(&self.oracle_digest, "oracle_digest")?;
+        self.validate_cell_binding()
+    }
+
+    fn validate_cell_binding(&self) -> Result<(), GraphError> {
+        for (value, field) in [
+            (&self.cell, "capsule_cell"),
+            (&self.cell_revision, "capsule_cell_revision"),
+            (&self.producer_revision, "capsule_producer_revision"),
+            (&self.profile, "capsule_profile"),
+            (&self.target, "capsule_target"),
+            (&self.proof_ceiling, "capsule_proof_ceiling"),
+            (&self.disposition, "capsule_disposition"),
+        ] {
+            if let Some(value) = value {
+                text(value, field)?;
+            }
+        }
+        if let Some(value) = &self.capsule_digest {
+            digest(value, "capsule_digest")?;
+        }
+        if self.profile_revision == Some(0) {
+            return Err(GraphError::Inconsistent(
+                "capsule profile_revision must be non-zero".to_owned(),
+            ));
+        }
+        for feature in &self.features {
+            text(feature, "capsule_feature")?;
+        }
+        Ok(())
+    }
+
+    /// Whether this projection references the neutral capsule revision
+    /// `digest`. Inequality means the projection is stale, never that the
+    /// descriptor moved.
+    pub fn binds_digest(&self, digest: &str) -> bool {
+        self.capsule_digest.as_deref() == Some(digest)
     }
 }
 
@@ -538,6 +616,18 @@ impl BuildTestGraph {
             source_commitments: commitments,
             not_applicable,
         })
+    }
+
+    /// Capsule projections bound to one cell, in capsule-id order.
+    ///
+    /// `BTreeMap` iteration is sorted, so the output is deterministic.
+    /// Multiple cells in one package stay separately attributable: each
+    /// projection names its own cell rather than the shared package.
+    pub fn capsules_for_cell(&self, cell: &str) -> Vec<&ModuleTestCapsuleRevision> {
+        self.capsules
+            .values()
+            .filter(|capsule| capsule.cell.as_deref() == Some(cell))
+            .collect()
     }
 
     /// Produces conservative affected-proof directives for changed graph nodes.

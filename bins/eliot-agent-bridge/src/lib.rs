@@ -55,6 +55,7 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
 
+mod bridge_contract;
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
@@ -65,6 +66,9 @@ pub mod reactive_runtime_composition;
 pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
+pub use bridge_contract::{
+    BridgeContractError, agent_bridge_contract, validate_agent_bridge_contract,
+};
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
@@ -171,9 +175,142 @@ struct KernelTransportOwner {
     /// reconcile replies. Held sequences at or below the base are pruned
     /// as owner-confirmed; the contiguous run always starts above it.
     owner_acked: BTreeMap<String, u64>,
+    /// Owner-confirmed `(producer, incarnation)` identity per stream,
+    /// adopted from the first confirming reply. A same-named successor
+    /// incarnation cannot advance the base or prune predecessor evidence;
+    /// successor adoption is core-owned (#2798), never inferred here.
+    /// Bounded by the same stream eviction as the held sequences.
+    owner_identity: BTreeMap<String, (String, u64)>,
+    /// At most one outstanding consumed-frontier offer (issue #2800).
+    /// While it is unresolved, every reconcile re-offers its exact bytes
+    /// under its exact identity; changed frontiers wait (deferred with
+    /// receipts preserved) instead of silently merging unknown custody. A
+    /// successor is installed only after this offer resolves, linked
+    /// through its predecessor identity. Process memory only, like the
+    /// held receipts: after restart the receipts rebuild through
+    /// redelivery and a fresh offer re-offers the contiguous suffix.
+    consumed_offer: Option<ConsumedFrontierOffer>,
 }
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
+
+/// Disposition of the one retained consumed-frontier offer (issue #2800).
+///
+/// `Prepared`, `HandedToTransport`, and `OutcomeUnknown` are unresolved:
+/// the exact frontier stays retryable under the same identity. Only the
+/// joint core/cache import moves an offer to `OwnerConfirmed`, and only
+/// after a fully validated owner reply proves the offer binding, the exact
+/// offered frontier, and acknowledged cursors at or beyond the accepted
+/// prefix. Transport custody (`Delivered`) never confirms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsumedOfferDisposition {
+    /// Prepared from a local snapshot; not yet handed to the transport.
+    Prepared,
+    /// Handed to the transport and answered; awaiting reply validation and
+    /// the joint core/cache import. Unconfirmed.
+    HandedToTransport,
+    /// Send failure, missing reply, or rejected answer; retryable under the
+    /// same identity. Unconfirmed.
+    OutcomeUnknown,
+    /// Terminal: confirmed inside the joint core/cache import.
+    OwnerConfirmed,
+}
+
+/// One exact consumed-frontier offer retained in the transport owner.
+struct ConsumedFrontierOffer {
+    /// Stable identity: `sha256` over the version tag, the presenting
+    /// connection, the live generation, and the ordered
+    /// stream-to-frontier legs.
+    identity: String,
+    /// Digest of the exact canonical consumed payload bytes.
+    content_digest: String,
+    /// Exact stream-to-frontier legs carried by the offer, already bounded.
+    frontiers: BTreeMap<String, u64>,
+    /// Presenting connection the offer was prepared under.
+    connection_id: String,
+    /// Live attach generation the offer was prepared under.
+    generation: u64,
+    /// Owner window key recorded by the most recent joint import, once any
+    /// lands. Informational binding only: walk continuity is core-owned,
+    /// so a changed window never rejects confirmation here — rejecting
+    /// across a window move would deadlock the re-offer — while a foreign
+    /// window still cannot reach confirmation past reply validation and
+    /// the core import gates. Re-recorded only when the confirming window
+    /// changes.
+    window_key: Option<String>,
+    /// Current [`ConsumedOfferDisposition`] of the retained offer.
+    disposition: ConsumedOfferDisposition,
+    /// Identity of the immediately preceding resolved offer, if any: the
+    /// bounded predecessor/replay relation. The single outstanding slot
+    /// bounds the chain to one live link; the successor-install path below
+    /// asserts the link never points at the successor itself, so a faulty
+    /// reinstall that should have reused the retained offer is caught
+    /// instead of forking custody.
+    predecessor: Option<String>,
+}
+
+/// Builds the stable identity for one consumed-frontier offer: `sha256`
+/// over the version tag, the presenting connection, the live generation,
+/// and the ordered stream-to-frontier legs.
+fn consumed_offer_identity(
+    connection_id: &str,
+    generation: u64,
+    frontiers: &BTreeMap<String, u64>,
+) -> String {
+    let mut preimage = String::from("consumed-offer/v1:");
+    preimage.push_str(connection_id);
+    preimage.push(':');
+    preimage.push_str(&generation.to_string());
+    for (stream_id, sequence) in frontiers {
+        preimage.push(':');
+        preimage.push_str(stream_id);
+        preimage.push('=');
+        preimage.push_str(&sequence.to_string());
+    }
+    sha256_hex(preimage.as_bytes())
+}
+
+/// Renders the exact consumed payload and frontier confirmations for one
+/// retained or candidate offer. Deterministic in the ordered legs, so an
+/// unchanged offer re-offers byte-identical payloads.
+fn consumed_offer_payload(
+    frontiers: &BTreeMap<String, u64>,
+) -> (Vec<serde_json::Value>, Vec<ReconciliationConsumedFrontier>) {
+    let confirmations = frontiers
+        .iter()
+        .map(|(stream_id, sequence)| {
+            ReconciliationConsumedFrontier::new(stream_id.clone(), *sequence)
+        })
+        .collect();
+    let payload = frontiers
+        .iter()
+        .map(|(stream_id, sequence)| {
+            serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
+        })
+        .collect();
+    (payload, confirmations)
+}
+
+/// Digests the exact canonical bytes of one rendered consumed payload.
+fn consumed_payload_digest(payload: &[serde_json::Value]) -> Result<String, ProviderFailure> {
+    let bytes =
+        canonical_json_bytes(&serde_json::json!(payload)).map_err(|_| event_transport_failure())?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Typed local-state-unavailable failure for the consumed-frontier path.
+///
+/// "Could not inspect pending receipts" is not "nothing to acknowledge":
+/// a borrow conflict surfaces here so the caller retries instead of
+/// sending an empty frontier the owner could mistake for a complete
+/// acknowledgement.
+fn local_state_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "reconciliation refused: bridge-local receipt state is unavailable; nothing inspected, \
+         nothing acknowledged; retry without treating this as an empty frontier",
+    )
+}
 
 impl KernelTransportOwner {
     /// Exchanges one bridge-event frame over the admitted transport.
@@ -1983,6 +2120,7 @@ impl KernelMcpForwardingPort {
         {
             owner.delivered_sequences.remove(&oldest);
             owner.owner_acked.remove(&oldest);
+            owner.owner_identity.remove(&oldest);
         }
         let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let held = owner
@@ -2002,23 +2140,50 @@ impl KernelMcpForwardingPort {
         held.insert(sequence);
     }
 
-    /// Builds the exact contiguous consumed frontier justified by the
-    /// receiving owner's receipts.
+    /// Prepares (or reuses) the one outstanding consumed-frontier offer.
     ///
-    /// Per stream, the frontier is the contiguous digest-verified durable
-    /// run above the owner-confirmed base: holes and unseen pages are
-    /// never acknowledged, and every unconfirmed frontier is re-offered.
-    /// The frontier remains pending locally until a verified reconciliation
-    /// reply reports the owner's acknowledged cursor. A lost, rejected, or
-    /// undecodable answer therefore offers the same exact sequence set on
-    /// the next call.
-    fn contiguous_consumed_payload(
-        &self,
-    ) -> (Vec<serde_json::Value>, Vec<ReconciliationConsumedFrontier>) {
-        let Ok(owner) = self.shared.try_borrow() else {
-            return (Vec::new(), Vec::new());
-        };
-        let mut frontiers: Vec<(String, u64)> = Vec::new();
+    /// Pure with respect to acknowledgement: preparing never advances a
+    /// confirmed base, prunes a receipt, or suppresses a frontier. While an
+    /// offer is unresolved under the live binding, this call re-offers its
+    /// exact bytes under its exact identity and changed frontiers wait with
+    /// their receipts preserved — there is no silent supersession of
+    /// unknown custody. A successor is installed only after the retained
+    /// offer resolves (owner-confirmed, fully satisfied by confirmed bases,
+    /// or bound to a replaced binding), linked through its predecessor
+    /// identity. An empty result is authoritative only because the borrow
+    /// succeeded; a borrow conflict is a typed local-state failure, never
+    /// an empty batch.
+    fn prepare_consumed_offer(
+        &mut self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<(Vec<serde_json::Value>, Vec<ReconciliationConsumedFrontier>), ProviderFailure>
+    {
+        let mut owner = self
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| local_state_failure())?;
+        if let Some(offer) = owner.consumed_offer.as_ref() {
+            let binding_matches =
+                offer.connection_id == connection_id && offer.generation == generation;
+            let satisfied = offer.frontiers.iter().all(|(stream_id, frontier)| {
+                owner.owner_acked.get(stream_id).copied().unwrap_or(0) >= *frontier
+            });
+            if binding_matches
+                && offer.disposition != ConsumedOfferDisposition::OwnerConfirmed
+                && !satisfied
+            {
+                let (payload, confirmations) = consumed_offer_payload(&offer.frontiers);
+                if let Ok(redigest) = consumed_payload_digest(&payload) {
+                    debug_assert_eq!(
+                        redigest, offer.content_digest,
+                        "retained offer must re-offer byte-identical payloads",
+                    );
+                }
+                return Ok((payload, confirmations));
+            }
+        }
+        let mut frontiers = BTreeMap::new();
         for (stream_id, held) in &owner.delivered_sequences {
             let acked = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
             let mut frontier = acked;
@@ -2029,24 +2194,129 @@ impl KernelMcpForwardingPort {
                 }
             }
             if frontier > acked {
-                frontiers.push((stream_id.clone(), frontier));
+                frontiers.insert(stream_id.clone(), frontier);
             }
         }
-        frontiers.sort_by(|left, right| left.0.cmp(&right.0));
-        frontiers.truncate(MAX_RECONCILE_CONSUMED_ENTRIES);
-        let confirmations = frontiers
-            .iter()
-            .map(|(stream_id, sequence)| {
-                ReconciliationConsumedFrontier::new(stream_id.clone(), *sequence)
-            })
-            .collect();
-        let payload = frontiers
-            .into_iter()
-            .map(|(stream_id, sequence)| {
-                serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
-            })
-            .collect();
-        (payload, confirmations)
+        while frontiers.len() > MAX_RECONCILE_CONSUMED_ENTRIES {
+            frontiers.pop_last();
+        }
+        let predecessor = owner.consumed_offer.take().map(|old| old.identity);
+        if frontiers.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let (payload, confirmations) = consumed_offer_payload(&frontiers);
+        let content_digest = consumed_payload_digest(&payload)?;
+        let identity = consumed_offer_identity(connection_id, generation, &frontiers);
+        owner.consumed_offer = Some(ConsumedFrontierOffer {
+            identity,
+            content_digest,
+            frontiers,
+            connection_id: connection_id.to_owned(),
+            generation,
+            window_key: None,
+            disposition: ConsumedOfferDisposition::Prepared,
+            predecessor,
+        });
+        debug_assert!(
+            owner
+                .consumed_offer
+                .as_ref()
+                .is_some_and(|offer| offer.predecessor.as_deref() != Some(offer.identity.as_str())),
+            "a successor offer must link a distinct predecessor, never itself",
+        );
+        Ok((payload, confirmations))
+    }
+
+    /// Records the transport observation for the retained offer: handed to
+    /// the transport once a reply frame arrives, outcome-unknown on send
+    /// failure, missing reply, or rejected answer.
+    ///
+    /// Never marks `OwnerConfirmed`: only the joint core/cache import
+    /// confirms, so transport custody can never impersonate owner
+    /// acknowledgement. A borrow conflict keeps the older disposition,
+    /// which is still unresolved — the safe direction on an already
+    /// failing path.
+    fn mark_consumed_offer_disposition(&mut self, disposition: ConsumedOfferDisposition) {
+        debug_assert_ne!(
+            disposition,
+            ConsumedOfferDisposition::OwnerConfirmed,
+            "transport observations never confirm an offer",
+        );
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        let Some(offer) = owner.consumed_offer.as_mut() else {
+            return;
+        };
+        if offer.disposition == ConsumedOfferDisposition::OwnerConfirmed {
+            return;
+        }
+        offer.disposition = disposition;
+    }
+
+    /// Retires the retained offer only when this joint-import result proves
+    /// it: the result must echo the exact offered legs (it answers the
+    /// request that carried them — continuation answers carry no echo and
+    /// retire nothing), the window must carry this offer's own
+    /// connection/generation binding (a lower or foreign reply retires
+    /// nothing), and every offered leg must show an owner-confirmed
+    /// acknowledged cursor at or beyond the offered frontier from a stream
+    /// fact proving the locally adopted (producer, incarnation) identity —
+    /// a same-named successor fact confirms nothing. A lower reply leaves
+    /// the offer unresolved; already-advanced bases stay advanced.
+    fn retire_consumed_offer_if_proven(&mut self, result: &ReconciliationPortResult) {
+        let echo = result.consumed_frontiers();
+        if echo.is_empty() {
+            return;
+        }
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        // Plain reborrow so the offer mutation and the adopted-identity
+        // read below borrow disjoint fields, not the whole guard.
+        let owner = &mut *owner;
+        let Some(offer) = owner.consumed_offer.as_mut() else {
+            return;
+        };
+        if offer.disposition == ConsumedOfferDisposition::OwnerConfirmed
+            || echo.len() != offer.frontiers.len()
+            || !echo
+                .iter()
+                .all(|leg| offer.frontiers.get(leg.stream_id()) == Some(&leg.sequence()))
+        {
+            return;
+        }
+        let Some(window) = result.window() else {
+            return;
+        };
+        if offer.connection_id != window.presenting_connection().as_str()
+            || offer.generation != window.live_generation().get()
+        {
+            return;
+        }
+        let adopted = &owner.owner_identity;
+        let proven = offer.frontiers.iter().all(|(stream_id, frontier)| {
+            window
+                .stream_facts()
+                .iter()
+                .find(|facts| facts.stream_id() == stream_id)
+                .is_some_and(|facts| {
+                    facts.acked_cursor() >= *frontier
+                        && facts
+                            .owner_identity()
+                            .is_some_and(|(producer, incarnation)| {
+                                adopted.get(stream_id).is_some_and(
+                                    |(known_producer, known_incarnation)| {
+                                        known_producer == producer
+                                            && *known_incarnation == incarnation
+                                    },
+                                )
+                            })
+                })
+        });
+        if proven {
+            offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
+        }
     }
 }
 
@@ -2207,7 +2477,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             ));
         }
         let now_ms = bridge_event_unix_ms()?;
-        let (consumed, consumed_frontiers) = self.contiguous_consumed_payload();
+        let (consumed, consumed_frontiers) = self.prepare_consumed_offer(
+            facts.connection_id.as_str(),
+            binding.activation_generation().get(),
+        )?;
         let correlation = format!("bridge-reconcile:{}", facts.connection_id);
         let frame = bridge_event_frame_for_operation(
             &correlation,
@@ -2218,9 +2491,28 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             }),
             now_ms,
         )?;
-        let reply = self.exchange(&frame)?;
-        let value = decode_bridge_event_reply(&reply, &frame)?;
-        decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None)
+        let reply = match self.exchange(&frame) {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        self.mark_consumed_offer_disposition(ConsumedOfferDisposition::HandedToTransport);
+        let value = match decode_bridge_event_reply(&reply, &frame) {
+            Ok(value) => value,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        match decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                Err(error)
+            }
+        }
     }
     /// Reads one bounded recovery page inside the declared window through
     /// the real reconcile route (issue #2732).
@@ -2289,7 +2581,9 @@ impl McpForwardingPort for KernelMcpForwardingPort {
 
     /// Jointly commits the transport half of one validated reconciliation
     /// import (issue #2799): the exact proposed owner ack bases plus
-    /// held-sequence pruning restricted to those confirmed bases.
+    /// held-sequence pruning restricted to those confirmed bases, with the
+    /// retained consumed-frontier offer retired jointly on exact owner
+    /// proof (issue #2800).
     ///
     /// The core calls this after its candidate recovery window applied off
     /// to the side and before the candidate publishes. Preparation runs on
@@ -2298,16 +2592,22 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// the confirmed base leave the held set; a lower cursor prunes only
     /// its proven prefix and never rolls state backward. All allocation
     /// happens before the mutable borrow is acquired; the commit itself
-    /// swaps two prepared maps, which cannot fail.
+    /// swaps prepared maps, which cannot fail.
+    ///
+    /// Only a live window for this exact binding confirms anything: a
+    /// moved/expired window or a foreign connection/generation commits
+    /// nothing and returns success with both halves untouched (the core
+    /// still publishes its own candidate, exactly as the pre-joint flow).
+    /// Each advancing stream must prove its adopted (producer, incarnation)
+    /// identity, so a same-named successor incarnation can neither advance
+    /// the predecessor base nor prune predecessor evidence.
     ///
     /// A borrow conflict or stale continuity commits nothing and returns a
     /// typed refusal naming the preserved state and the retry/recovery
     /// directive. Ack bases stay keyed by stream text here (BLOCKED-BY
     /// #2798: owner/window/revision/incarnation namespacing must land
     /// before a same-named replacement stream stops inheriting the
-    /// predecessor cursor), and no outstanding-offer state exists to retire
-    /// (BLOCKED-BY #2800: prepared/outstanding/confirmed consumed
-    /// frontiers must land before this commit can retire them jointly).
+    /// predecessor cursor).
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
@@ -2318,16 +2618,50 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         };
         // Typed continuity precheck before any snapshot work.
         self.check_continuity(binding)?;
-        let (mut owner_acked, mut delivered_sequences) = {
+        // Liveness gate: only the active window for this exact binding can
+        // confirm the retained offer or advance ack bases. Anything else is
+        // a benign no-op with both halves untouched.
+        if window.window_status() != RecoveryWindowStatus::Active {
+            return Ok(());
+        }
+        if window.presenting_connection().as_str() != binding.connection_id().as_str() {
+            return Ok(());
+        }
+        if window.live_generation().get() != binding.activation_generation().get() {
+            return Ok(());
+        }
+        let (mut owner_acked, mut delivered_sequences, mut owner_identity) = {
             let owner = self
                 .shared
                 .try_borrow()
                 .map_err(|_| reconciliation_import_borrow_refusal())?;
-            (owner.owner_acked.clone(), owner.delivered_sequences.clone())
+            (
+                owner.owner_acked.clone(),
+                owner.delivered_sequences.clone(),
+                owner.owner_identity.clone(),
+            )
         };
-        // Pure projection from the immutable snapshot: every allocation on
-        // this path happens here, before the owner is acquired for commit.
+        // Pure projection from the immutable snapshot (#2799 joint commit +
+        // #2800 identity proof): every allocation on this path happens here,
+        // before the owner is acquired for commit. A stream advances only
+        // when its confirming fact proves its owner (producer, incarnation)
+        // identity; a same-named successor incarnation cannot advance the
+        // predecessor base or prune predecessor evidence.
         for stream in window.stream_facts() {
+            let Some((producer, incarnation)) = stream.owner_identity() else {
+                continue;
+            };
+            if owner_identity.get(stream.stream_id()).is_some_and(
+                |(known_producer, known_incarnation)| {
+                    known_producer != producer || *known_incarnation != incarnation
+                },
+            ) {
+                continue;
+            }
+            owner_identity.insert(
+                stream.stream_id().to_owned(),
+                (producer.to_owned(), incarnation),
+            );
             let known = owner_acked.get(stream.stream_id()).copied().unwrap_or(0);
             let base = known.max(stream.acked_cursor());
             if base != known {
@@ -2365,6 +2699,19 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         // validation, or other fallible work follows on this path.
         owner.owner_acked = owner_acked;
         owner.delivered_sequences = delivered_sequences;
+        owner.owner_identity = owner_identity;
+        // Rebind the retained offer to this import's window key under the
+        // same held borrow (pure field write; cannot fail).
+        if let Some(offer) = owner.consumed_offer.as_mut()
+            && offer.window_key.as_deref() != Some(window.window_key())
+        {
+            offer.window_key = Some(window.window_key().to_owned());
+        }
+        drop(owner);
+        // Retire the retained offer only on exact owner proof, under its
+        // own borrow after the swap. On conflict the offer stays
+        // unresolved (safe direction; retried by the next import).
+        self.retire_consumed_offer_if_proven(result);
         Ok(())
     }
 }
@@ -2430,6 +2777,13 @@ pub fn kernel_ports_with_declaration(
 ) -> Result<KernelPorts, RuntimeBuildError> {
     let loaded = load_declaration(declaration_path)?;
     let declaration = &loaded.declaration;
+    // Build and validate the I6.5 bridge contract against the admitted
+    // declaration. The contract is bound to the admitted artifact/config/
+    // generation, not a self-reported version; a mismatch refuses composition.
+    let bridge_contract = agent_bridge_contract(declaration)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
+    validate_agent_bridge_contract(&bridge_contract, declaration)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
     let (current_sid, _current_session) = current_os_identity()?;
     let expectation = eliot_platform_windows::KernelFrontDoorServerExpectation::new(
         declaration.expected_kernel_sid.clone(),
@@ -2538,6 +2892,8 @@ fn kernel_faces_from_admission(
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
+        owner_identity: BTreeMap::new(),
+        consumed_offer: None,
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
@@ -3350,12 +3706,32 @@ mod tests {
             version: ContractVersion::new(1, 0, 0),
             artifact_id: artifact.clone(),
             protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+            capabilities: Vec::new(),
             required_capabilities: vec!["agent.bridge.activate".to_owned()],
             optional_capabilities: Vec::new(),
             advisory_capabilities: Vec::new(),
             state_owner: "eliot-agent-bridge".to_owned(),
             failure_domain: "agent-bridge".to_owned(),
+            owner: AGENT_BRIDGE_MODULE_ID.to_owned(),
             hot_replace: false,
+            startup_after: vec!["agent.bridge.activate".to_owned()],
+            drain_before: vec!["agent.bridge.activate".to_owned()],
+            invalidation_triggers: Vec::new(),
+            supervision_plan: "one_for_one".to_owned(),
+            child_restart: "transient".to_owned(),
+            restart_intensity: "3/10m".to_owned(),
+            resource_profile: "background-medium".to_owned(),
+            privacy_classes: vec!["PUBLIC".to_owned()],
+            permissions: Vec::new(),
+            health_contract: "health/agent-bridge-v1".to_owned(),
+            checkpoint_contract: "checkpoint/bridge-v1".to_owned(),
+            compatibility_state: "rebuildable".to_owned(),
+            independent_test_profile: "module/agent-bridge".to_owned(),
+            contract_fixture_set: "eliot.agent-bridge.v1/agent.bridge.activate".to_owned(),
+            affected_test_tags: vec!["agent-bridge".to_owned()],
+            architecture: Vec::new(),
+            telemetry: "telemetry/agent-bridge-v1".to_owned(),
+            removal_boundary: "agent-bridge".to_owned(),
         };
         let generation = ModuleGeneration {
             module_id: module,

@@ -165,6 +165,27 @@ impl AdmittedEventLogEvent {
             _ => Err(EventLogError::InvalidInput),
         }
     }
+
+    /// Closed Watchdog-audit rule (issue #1757): no Watchdog responsiveness
+    /// record — challenge, timeout, denied/budget-exhausted decision, SCM
+    /// request, or readback — is admitted under the fixed `EliotHost` source
+    /// from this port. Always false here; extending the installed
+    /// source/event contract is coordinated through its owners (issue #984
+    /// source owner, `bins/eliot-host#889` consumer) instead of impersonating
+    /// `EliotHost` or passing arbitrary source names.
+    #[must_use]
+    pub const fn admits_watchdog_audit() -> bool {
+        false
+    }
+
+    /// Owner to coordinate the installed Watchdog-audit source/event
+    /// extension with. Spool persistence and Event Log delivery stay
+    /// independent facts; sink failure must remain visible and must never
+    /// trigger a replayed SCM effect.
+    #[must_use]
+    pub const fn watchdog_audit_sink_owner() -> &'static str {
+        "issue #984 (Event Log source owner) via bins/eliot-host#889 (consumer)"
+    }
 }
 
 /// Typed failure for the local Event Log port.

@@ -85,13 +85,15 @@ pub struct IntegrationReport {
     pub installed: bool,
     /// Install surface plus live handshake.
     pub live: bool,
-    /// `UNVERIFIED_PLAN_GAP`, or `NOT_INSTALLED`.
+    /// `INSTALLED_NOT_LIVE`, `UNVERIFIED_PLAN_GAP`, or `NOT_INSTALLED`.
     ///
-    /// `LIVE` and `INSTALLED_NOT_LIVE` are computed by the explicitly
-    /// limited [`evaluate`] comparison only; the authoritative
-    /// [`verify_profile`] gate never emits them because the registration,
-    /// hook-event, and handshake observation ports are absent (PLAN_GAP
-    /// pending A-06 provider injection).
+    /// `LIVE` is computed by the explicitly limited [`evaluate`] comparison
+    /// only; the authoritative [`verify_profile`] gate never emits it because
+    /// the handshake runner is absent (`PLAN_GAP` pending A-06 provider
+    /// injection). `INSTALLED_NOT_LIVE` is emitted by [`verify_profile`] when
+    /// every read-back file hash matches and the expectation names no
+    /// registrations or hook events — the whole static surface is then
+    /// evidenced — while no handshake was observed.
     pub disposition: String,
 }
 
@@ -246,11 +248,13 @@ pub fn evaluate(
 /// Authority rule: file hashes come from real readback — every named target
 /// is re-hashed here and the caller-supplied `actual_file_hashes` map never
 /// enters the verdict. There is no observation port for registrations, hook
-/// events, or the handshake in this front door (PLAN_GAP pending A-06
-/// provider injection), so caller-supplied lists and booleans are capped to
-/// unverified and `installed`/`live` stay `false`:
-/// `UNVERIFIED_PLAN_GAP` when the read-back hashes match, `NOT_INSTALLED`
-/// otherwise. A forged `handshake_ok: true` can never yield a live verdict.
+/// events, or the handshake in this front door (`PLAN_GAP` pending A-06
+/// provider injection), so caller-supplied lists and booleans stay capped to
+/// unverified: any expected registration or hook event withholds `installed`
+/// (`UNVERIFIED_PLAN_GAP` when the read-back hashes match, `NOT_INSTALLED`
+/// otherwise), and `live` is never granted. A fully read-back static surface
+/// with no registration or hook-event expectation is `INSTALLED_NOT_LIVE`.
+/// A forged `handshake_ok: true` can never yield a live verdict.
 pub fn verify_profile(
     profile: &str,
     expectation_path: &Path,
@@ -288,17 +292,24 @@ pub fn verify_profile(
         handshake_ok: false,
     };
     let mut report = evaluate(profile, &expected, &capped);
-    // Authority cap: this front door observes file bytes only. Registration,
-    // hook-event, and handshake ports are absent, so no verdict here may
-    // claim installed or live, whatever the caller supplied.
-    report.installed = false;
+    // Authority cap, scoped to the axes this front door cannot observe.
+    // File hashes come from real readback above. Registrations and hook
+    // events have no observation port, so any expectation naming them stays
+    // unverified and withholds `installed`; the handshake has no runner, so
+    // `live` is never granted here. A fully read-back static surface with no
+    // registration or hook-event expectation is installed but not live; a
+    // forged caller-supplied `handshake_ok: true` can never yield live.
     report.live = false;
-    report.disposition = if report.file_hash_ok {
-        "UNVERIFIED_PLAN_GAP"
-    } else {
-        "NOT_INSTALLED"
+    let static_unverifiable =
+        !expected.expected_registrations.is_empty() || !expected.expected_hook_events.is_empty();
+    if static_unverifiable || !report.file_hash_ok {
+        report.installed = false;
+        if report.file_hash_ok {
+            "UNVERIFIED_PLAN_GAP".clone_into(&mut report.disposition);
+        } else {
+            "NOT_INSTALLED".clone_into(&mut report.disposition);
+        }
     }
-    .to_owned();
     Ok(report_json(&report))
 }
 
@@ -328,7 +339,7 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
-        "note": "file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06): installed and live are never granted here",
+        "note": "file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06): installed is granted only when every expected hash matches and nothing unverifiable is expected, live is never granted here",
     })
 }
 

@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{EpochId, ResourceGeneration};
+use eliot_runtime_contracts::HealthDimension;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -203,6 +204,26 @@ impl KernelRuntimeHealthEvidence {
     #[must_use]
     pub const fn compatibility_evidence(&self) -> &AcceptedCompatibilityEvidence {
         &self.compatibility_evidence
+    }
+}
+
+/// Projects the I1.10 supervision-coverage dimension from an independently
+/// verified Watchdog branch outcome.
+///
+/// The argument must be the outcome of the five-part Watchdog branch
+/// verification (signed active lease, validity window, exact
+/// fence/epoch/incarnation join): a verified branch is `Healthy`, and
+/// anything else stays `Unknown`, so a supervised claim is never projected
+/// from lease continuity or a heartbeat alone. The projected value feeds the
+/// process health vector as an input to capability readiness; readiness is
+/// decided from the per-capability dimension results, never inferred from
+/// transport `status`.
+#[must_use]
+pub const fn runtime_supervision_coverage(branch_verified: bool) -> HealthDimension {
+    if branch_verified {
+        HealthDimension::Healthy
+    } else {
+        HealthDimension::Unknown
     }
 }
 

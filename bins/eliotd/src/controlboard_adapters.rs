@@ -325,7 +325,8 @@ impl ControlBoardRefusal {
 /// or ordering side channel is introduced here. `Refused` reproduces the
 /// board's own exact typed failure, so a `PLAN_GAP` naming the missing owner
 /// reaches the caller as that same typed refusal instead of an empty current
-/// view. The two shapes are exhaustive and never interchangeable.
+/// view. A daemon composition gap is also returned as its existing typed
+/// refusal, never as a stale or success-empty board.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlBoardReadOutcome {
@@ -386,6 +387,23 @@ pub fn serve_controlboard_view(
     let outcome = controlboard_read_outcome(composition, envelope, attempt);
     controlboard_result_body(envelope, attempt, &outcome)
         .unwrap_or_else(|error| controlboard_refusal_body(envelope, attempt, &error))
+}
+
+/// Binds a failed live notification refresh to the claimed read without
+/// returning the composition's previous startup snapshot as current.
+pub fn controlboard_notification_refresh_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    reason: &str,
+) -> HostRequestResultBody {
+    controlboard_typed_refusal_body(
+        envelope,
+        attempt,
+        ControlBoardRefusal::CompositionUnavailable,
+        &format!(
+            "daemon controlboard composition unavailable because canonical notification inbox refresh failed: {reason}"
+        ),
+    )
 }
 
 /// Performs exactly one authenticated role-filtered read and returns the
@@ -462,6 +480,10 @@ pub fn controlboard_result_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: the board owner wires execution evidence for
+        // locally served reads; until then the sealed manifest honestly lists
+        // the absent evidence as missing parts.
+        evidence: None,
     };
     body.validate().map_err(|error| {
         ControlBoardError::Provider(format!("controlboard result body shape: {error}"))
@@ -485,9 +507,25 @@ fn controlboard_refusal_body(
     attempt: &LocalReadAttempt,
     error: &ControlBoardError,
 ) -> HostRequestResultBody {
+    controlboard_typed_refusal_body(
+        envelope,
+        attempt,
+        ControlBoardRefusal::from_board_error(error),
+        &error.to_string(),
+    )
+}
+
+/// Binds a typed refusal through the shared established detail bound and body
+/// validation path.
+fn controlboard_typed_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    refusal: ControlBoardRefusal,
+    detail: &str,
+) -> HostRequestResultBody {
     let outcome = ControlBoardReadOutcome::Refused {
-        refusal: ControlBoardRefusal::from_board_error(error),
-        detail: error.to_string().chars().take(512).collect::<String>(),
+        refusal,
+        detail: detail.chars().take(512).collect::<String>(),
     };
     controlboard_result_body(envelope, attempt, &outcome)
         .unwrap_or_else(|_| controlboard_unbound_refusal_body(envelope, attempt, &outcome))
@@ -528,6 +566,9 @@ fn controlboard_unbound_refusal_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: no execution evidence on the unbound refusal
+        // body; the sealed manifest lists it as missing parts.
+        evidence: None,
     };
     // The gate is run, not assumed; its verdict is the one already observed
     // above and is adjudicated by the submit leg, not by this arm.

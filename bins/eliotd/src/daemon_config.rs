@@ -6,10 +6,14 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{ArtifactId, StateFence, sha256_hex};
 use eliot_governor::GovernorLaunchConfig;
 use eliot_platform_windows::{
     ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
+};
+use eliot_runtime_contracts::{
+    AdmittedModuleManifest, admit_module_manifest, admitted_hot_artifact_map,
+    admitted_manifest_path,
 };
 
 use super::canonical_config_precedence::{
@@ -73,6 +77,56 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
         .collect();
     resolve_effective_configuration(&documents)
         .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
+}
+
+/// Loads and admits the immutable runtime `module.toml` shipped beside this
+/// admitted artifact.
+///
+/// `I6.4` obliges every hot module to ship that manifest and `I14.14` places it
+/// under `modules/<module_id>/<semver>/<artifact_hash>/`. The path is resolved
+/// from the admitted artifact location of the running image, never from the
+/// process working directory and never from a mutable source-tree copy, and the
+/// exact bytes are admitted against the accepted build identity. A missing,
+/// unreadable, substituted or unsupported manifest is refused.
+///
+/// This is the daemon's manifest admission entry point. It is deliberately not
+/// reached from the live startup path: no build/package owner emits
+/// `module.toml` beside the artifact yet, so a live call could only fail.
+pub fn admit_daemon_module_manifest(
+    accepted_artifact_sha256: &str,
+) -> Result<AdmittedModuleManifest, DaemonError> {
+    validate_sha256(accepted_artifact_sha256, "executable digest")?;
+    let artifact_id = ArtifactId::new(accepted_artifact_sha256)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    let admitted_artifact = std::env::current_exe().map_err(|error| {
+        DaemonError::LaunchConfig(format!(
+            "the admitted artifact location of the running daemon is unavailable: {error}"
+        ))
+    })?;
+    let manifest_path = admitted_manifest_path(&admitted_artifact)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    let lease = ProtectedRuntimePathLease::open_existing_absolute(&manifest_path)?;
+    if lease.path() != manifest_path {
+        return Err(DaemonError::LaunchConfig(
+            "admitted module manifest path is not the retained canonical runtime identity"
+                .to_owned(),
+        ));
+    }
+    let bytes = lease.read_bounded(MAX_CONFIG_BYTES)?;
+    let admitted = admit_module_manifest(&artifact_id, &bytes)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    // The frozen artifact-to-contract map is the finite admitted hot set. A
+    // module whose artifact is not in it stays visible as a refusal rather than
+    // quietly shrinking the admitted set.
+    let map = admitted_hot_artifact_map()
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    if map.record(&admitted.module_id).is_none() {
+        return Err(DaemonError::LaunchConfig(format!(
+            "module '{}' is not in the admitted hot artifact map",
+            admitted.module_id
+        )));
+    }
+    Ok(admitted)
 }
 
 /// Typed protected launch inputs. Production values are read from the exact

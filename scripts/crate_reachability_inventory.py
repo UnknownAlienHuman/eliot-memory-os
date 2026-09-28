@@ -7,6 +7,16 @@ support. It executes only fixed Git/Cargo/toolchain identity commands and reads
 tracked manifests and bounded Rust source below one repository root.
 
 Issue: https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1133
+
+The same checked-in registry also carries the second, disjoint CrateExtractionDecision
+denominator (issue #1721): the I2.23 "Canonical extraction decision" for every package
+an admission wave promoted out of the root `exclude` list, with `disposition` drawn from
+the six verbs I2.23 closes with. That layer is compared field by field against the crate
+each record names - the contour must exist and hold the package, the proof entrypoint
+must be a real symbol inside the package, and the record must carry either a real
+external consumer reached through a real Cargo edge or an unexpired migration expiry
+over a consumer the crate's own manifest declares. Its denominator is read from the
+tracked `module.toml` files, so deleting a record cannot shrink it.
 """
 
 from __future__ import annotations
@@ -39,6 +49,42 @@ OUTPUT_ROOT: Final = ".eliot"
 # source statistics; they are read from a declared, versioned, checked-in data file.
 DECISION_SCHEMA: Final = "eliot.crate-extraction-decision.v1"
 DECISION_DATA_RELPATH: Final = "scripts/testdata/crate-reachability/crate_extraction_decisions.toml"
+
+# Issue #1721 records the second, disjoint CrateExtractionDecision denominator in the
+# same canonical registry file: the I2.23 "Canonical extraction decision" for a package
+# an admission wave promoted out of the root `exclude` list. I2.23 fixes the record's
+# field names and I2.21 fixes the outcome vocabulary, which collapses onto exactly six
+# `disposition` values. The denominator is a different one from the `decision` array
+# above (an excluded package is not an unreachable workspace member, and four of the
+# packages below now have a real binary or service consumer), so the two layers get
+# their own arrays in one file rather than two registries beside each other.
+ADMISSION_DATA_KEY: Final = "admission_decision"
+ADMISSION_SCHEMA: Final = "eliot.crate-extraction-decision.i2.23"
+ADMISSION_FIELDS: Final[tuple[str, ...]] = (
+    "affected_functional_cells_and_lifecycle_owners",
+    "current_source_dependency_and_change_closure",
+    "proposed_package_boundary",
+    "public_contract_and_independent_test_entrypoint",
+    "first_real_consumer_or_time_bounded_migration_facade",
+    "source_maintenance_owner_and_vendor_type_boundary",
+    "dependency_security_license_and_build_isolation",
+    "expected_agent_workset_context_and_reverse_fanout_delta",
+    "expected_compile_test_integration_and_release_cost_delta",
+    "migration_reexport_rollback_removal_and_expiry",
+    "counter_risks_merge_or_rejoin_condition",
+    "evidence_status_and_review_owner",
+)
+# The admission waves issue #1721 resolves. A package enters the denominator when its own
+# `module.toml` records one of these as the wave that promoted it into membership, so
+# the denominator is derived from the tree and a record can never shrink it.
+ADMISSION_WAVE_RE: Final = re.compile(r"admitted via (#966|#967|#968)\b")
+# I2.3 names `/workspace/core` as the root production workspace carrying the daily
+# `default-members`; every contour below is resolved from a real manifest on disk.
+ROOT_CONTOUR: Final = "workspace/core"
+# A `path::symbol` reference, the only proof and consumer form this gate accepts.
+SYMBOL_REF_RE: Final = re.compile(
+    r"(?P<path>[A-Za-z0-9_][A-Za-z0-9_./-]*\.rs)::(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 class InventoryError(RuntimeError):
@@ -101,6 +147,23 @@ class CrateExtractionDecision(str, enum.Enum):
     OPTIONAL_CONTOUR = "OptionalContour"
 
 
+class CrateAdmissionDisposition(str, enum.Enum):
+    """The I2.23 admission dispositions for a wave-admitted package (#1721).
+
+    I2.21 lists the outcomes of a ``CrateScaleReview`` as keep, split, merge, extract
+    contract, move a heavy dependency to an adapter/workspace, create a thin facade,
+    mark a migration legacy with an expiry, and run an experiment before changing.
+    I2.23 closes its canonical record with exactly these six names.
+    """
+
+    KEEP = "keep"
+    SPLIT = "split"
+    MERGE = "merge"
+    EXTRACT_CONTRACT = "extract_contract"
+    ISOLATE_DEPENDENCY = "isolate_dependency"
+    EXPERIMENT = "experiment"
+
+
 class AdmissionDefect(str, enum.Enum):
     """Reasons a package is not legitimately admitted.
 
@@ -121,6 +184,13 @@ class AdmissionDefect(str, enum.Enum):
     DECLARED_CONTOUR_ABSENT = "DECLARED_CONTOUR_ABSENT"
     DUPLICATE_DECISION_IDENTITY = "DUPLICATE_DECISION_IDENTITY"
     DECISION_FOR_UNKNOWN_PACKAGE = "DECISION_FOR_UNKNOWN_PACKAGE"
+    ADMISSION_RECORD_MISSING = "ADMISSION_RECORD_MISSING"
+    ADMISSION_RECORD_FOR_UNKNOWN_PACKAGE = "ADMISSION_RECORD_FOR_UNKNOWN_PACKAGE"
+    ADMISSION_CONTOUR_ABSENT = "ADMISSION_CONTOUR_ABSENT"
+    ADMISSION_ENTRYPOINT_ABSENT = "ADMISSION_ENTRYPOINT_ABSENT"
+    ADMISSION_CONSUMER_ABSENT = "ADMISSION_CONSUMER_ABSENT"
+    ADMISSION_MIGRATION_UNBOUNDED = "ADMISSION_MIGRATION_UNBOUNDED"
+    ADMISSION_FIELD_MISMATCH = "ADMISSION_FIELD_MISMATCH"
 
 
 class Runner(Protocol):
@@ -380,6 +450,37 @@ class DecisionRecord:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class AdmissionDecisionRecord:
+    """One I2.23 canonical extraction decision for a wave-admitted package (#1721).
+
+    The field names are I2.23's own. Nothing here is inferred: `check_admission_decisions`
+    compares every one of them against the crate the record names.
+    """
+
+    package: str
+    disposition: CrateAdmissionDisposition
+    affected_functional_cells_and_lifecycle_owners: str
+    current_source_dependency_and_change_closure: str
+    proposed_package_boundary: str
+    public_contract_and_independent_test_entrypoint: str
+    first_real_consumer_or_time_bounded_migration_facade: str
+    source_maintenance_owner_and_vendor_type_boundary: str
+    dependency_security_license_and_build_isolation: str
+    expected_agent_workset_context_and_reverse_fanout_delta: str
+    expected_compile_test_integration_and_release_cost_delta: str
+    migration_reexport_rollback_removal_and_expiry: str
+    counter_risks_merge_or_rejoin_condition: str
+    evidence_status_and_review_owner: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "package": self.package,
+            "disposition": self.disposition.value,
+            **{field: getattr(self, field) for field in ADMISSION_FIELDS},
+        }
+
+
 def _require_str(value: Any, field: str, package: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' must be a non-empty string")
@@ -407,13 +508,8 @@ def _parse_iso_date(value: str, field: str, package: str) -> date:
         raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' is not a real date: {value!r}") from exc
 
 
-def load_decision_records(root: Path) -> tuple[str, str, tuple[DecisionRecord, ...]]:
-    """Read the declared CrateExtractionDecision registry.
-
-    The registry is the explicit record required by #1720. It is never synthesized
-    from source statistics: absent records simply stay unclassified and are reported
-    as admission defects. Malformed data fails closed.
-    """
+def _decision_document(root: Path) -> tuple[str, dict[str, Any]]:
+    """Read and parse the one canonical registry file, once, for both layers."""
     data_path = _inside(root, root / DECISION_DATA_RELPATH)
     raw = _read_bytes(root, data_path, max_bytes=BOUNDS.max_source_file_bytes)
     try:
@@ -426,6 +522,16 @@ def load_decision_records(root: Path) -> tuple[str, str, tuple[DecisionRecord, .
             "MALFORMED_DECISION_DATA",
             f"{DECISION_DATA_RELPATH}: expected schema {DECISION_SCHEMA!r}, got {schema!r}",
         )
+    return _sha256(raw), document
+
+
+def load_decision_records(document: Mapping[str, Any], decision_sha: str) -> tuple[str, str, tuple[DecisionRecord, ...]]:
+    """Read the declared CrateExtractionDecision registry.
+
+    The registry is the explicit record required by #1720. It is never synthesized
+    from source statistics: absent records simply stay unclassified and are reported
+    as admission defects. Malformed data fails closed.
+    """
     revision = _require_str(document.get("revision"), "revision", DECISION_DATA_RELPATH)
     entries = document.get("decision")
     if not isinstance(entries, list):
@@ -474,7 +580,57 @@ def load_decision_records(root: Path) -> tuple[str, str, tuple[DecisionRecord, .
                 source_ref=_require_str(entry.get("source_ref"), "source_ref", package),
             )
         )
-    return _sha256(raw), revision, tuple(sorted(records, key=lambda item: item.package))
+    return decision_sha, revision, tuple(sorted(records, key=lambda item: item.package))
+
+
+def load_admission_records(document: Mapping[str, Any]) -> tuple[AdmissionDecisionRecord, ...]:
+    """Read the I2.23 canonical admission decisions for the wave-admitted packages.
+
+    Every field name below is the one I2.23 fixes, and `disposition` must be one of
+    the six verbs it closes with. A missing or misspelled field is malformed data and
+    fails closed rather than degrading into an unchecked record.
+    """
+    entries = document.get(ADMISSION_DATA_KEY, [])
+    if not isinstance(entries, list):
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{DECISION_DATA_RELPATH}: '{ADMISSION_DATA_KEY}' must be an array")
+    records: list[AdmissionDecisionRecord] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise InventoryError("MALFORMED_DECISION_DATA", f"each '{ADMISSION_DATA_KEY}' entry must be a table")
+        package = _require_str(entry.get("package"), "package", "<admission entry>")
+        if package in seen:
+            raise InventoryError(
+                "DUPLICATE_DECISION_IDENTITY",
+                f"{DECISION_DATA_RELPATH}: duplicate admission decision for {package!r}",
+            )
+        seen.add(package)
+        raw_disposition = _require_str(entry.get("disposition"), "disposition", package)
+        try:
+            disposition = CrateAdmissionDisposition(raw_disposition)
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CrateAdmissionDisposition)
+            raise InventoryError(
+                "MALFORMED_DECISION_DATA",
+                f"{package}: I2.23 disposition must be one of [{allowed}], got {raw_disposition!r}",
+            ) from exc
+        undeclared = sorted(set(entry) - {"package", "disposition", *ADMISSION_FIELDS})
+        if undeclared:
+            raise InventoryError(
+                "MALFORMED_DECISION_DATA",
+                f"{package}: I2.23 record names fields it does not define: {undeclared}",
+            )
+        records.append(
+            AdmissionDecisionRecord(
+                package=package,
+                disposition=disposition,
+                **{
+                    field: _require_str(entry.get(field), field, package)
+                    for field in ADMISSION_FIELDS
+                },
+            )
+        )
+    return tuple(sorted(records, key=lambda item: item.package))
 
 
 def _tracked_manifests(root: Path, runner: Runner) -> tuple[str, ...]:
@@ -1380,6 +1536,252 @@ def classify_unreachable_packages(
     )
 
 
+def _read_toml(root: Path, path: Path) -> dict[str, Any]:
+    raw = _read_bytes(root, path, max_bytes=BOUNDS.max_source_file_bytes)
+    try:
+        return tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{_relative(root, path)} is not valid UTF-8 TOML") from exc
+
+
+def admission_denominator(root: Path, runner: Runner) -> dict[str, dict[str, Any]]:
+    """The tree-derived set of packages issue #1721 requires a decision for.
+
+    A package is in the denominator when its own ``module.toml`` records admission
+    wave #966, #967 or #968 as the wave that promoted it into root workspace
+    membership. The denominator is therefore read from the repository, never from the
+    registry, so deleting a record cannot shrink it and a record cannot invent a member.
+    """
+    raw = runner.run(root, ("git", "ls-files", "-z", "--", "module.toml", ":(glob)**/module.toml"))
+    denominator: dict[str, dict[str, Any]] = {}
+    for item in raw.split(b"\x00"):
+        if not item:
+            continue
+        relative = item.decode("utf-8")
+        document = _read_toml(root, _inside(root, root / relative))
+        admission = str((document.get("agent_task") or {}).get("workspace_admission") or "")
+        wave = ADMISSION_WAVE_RE.match(admission)
+        if wave is None:
+            continue
+        package = _require_str(document.get("crate"), "crate", relative)
+        denominator[package] = {
+            "module_path": relative,
+            "admission_wave": wave.group(1),
+            "workspace_admission": admission,
+            "lifecycle_owner": _require_str(document.get("lifecycle_owner"), "lifecycle_owner", relative),
+            "consumers": [str(item) for item in document.get("consumers") or []],
+            "integration_owner": _require_str(
+                (document.get("agent_task") or {}).get("integration_owner"),
+                "agent_task.integration_owner",
+                relative,
+            ),
+        }
+    return denominator
+
+
+def _named_contours(root: Path) -> dict[str, Path]:
+    """Workspace contours that physically exist, mapped to their own manifest.
+
+    I2.3 names ``/workspace/core`` as the root production workspace and requires the
+    other contours to appear only as their first real consumer does, so a contour that
+    has no ``[workspace]`` table on disk is not a contour this gate will accept.
+    """
+    contours: dict[str, Path] = {ROOT_CONTOUR: root / "Cargo.toml"}
+    directory = root / "workspace"
+    if directory.is_dir():
+        for manifest in sorted(directory.glob("*/Cargo.toml")):
+            if "workspace" in _read_toml(root, _inside(root, manifest)):
+                contours[_relative(root, manifest.parent)] = manifest
+    return contours
+
+
+def _contour_package_names(root: Path, manifest: Path) -> set[str]:
+    members = (_read_toml(root, manifest).get("workspace") or {}).get("members") or []
+    names: set[str] = set()
+    for member in members:
+        member_manifest = root / str(member) / "Cargo.toml"
+        if not member_manifest.is_file():
+            continue
+        names.add(str(_read_toml(root, member_manifest).get("package", {}).get("name", "")))
+    return {name for name in names if name}
+
+
+def _defines_function(root: Path, relative: str, symbol: str) -> bool:
+    path = _inside(root, root / relative)
+    if path.is_symlink() or not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return re.search(rf"\bfn\s+{re.escape(symbol)}\s*\(", text) is not None
+
+
+def _declared_symbols(value: str) -> list[tuple[str, str]]:
+    return [(match.group("path"), match.group("symbol")) for match in SYMBOL_REF_RE.finditer(value)]
+
+
+def _future_date(value: str, as_of: date) -> date | None:
+    """The first real, unexpired ISO-8601 date in ``value``, if it carries one."""
+    for candidate in ISO_DATE_RE.findall(value):
+        try:
+            parsed = date.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed >= as_of:
+            return parsed
+    return None
+
+
+def check_admission_decisions(
+    root: Path,
+    runner: Runner,
+    records: Sequence[AdmissionDecisionRecord],
+    packages: Sequence[Mapping[str, Any]],
+    source_files: Sequence[SourceFileEvidence],
+    *,
+    as_of: date,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Compare every recorded admission decision against the crate it names.
+
+    Returns ``(classifications, admission_defects)``. A record is not admitted by
+    existing: its target contour must be a real contour holding the package, its proof
+    entrypoint must be a real symbol inside the package, and it must carry either a
+    real external consumer reached through a real Cargo edge or an unexpired migration
+    expiry over a consumer the crate's own manifest declares.
+    """
+    member_names = {str(item["name"]) for item in packages if item.get("workspace_member")}
+    package_dir = {
+        str(item["name"]): str(Path(str(item["manifest_path"])).parent.as_posix())
+        for item in packages
+        if item.get("workspace_member")
+    }
+    owner_of_path = {item.path: item.package_name for item in source_files}
+    name_by_key = {str(item["package_key"]): str(item["name"]) for item in packages}
+    edges_by_package = {
+        str(item["name"]): {
+            name_by_key[str(edge["to_package"])]
+            for edge in item["dependency_edges"]
+            if str(edge["to_package"]) in name_by_key
+        }
+        for item in packages
+    }
+    contours = _named_contours(root)
+    contour_names = {name: _contour_package_names(root, manifest) for name, manifest in contours.items()}
+    denominator = admission_denominator(root, runner)
+    record_by_package = {record.package: record for record in records}
+
+    classifications: list[dict[str, Any]] = []
+    admission_defects: list[dict[str, Any]] = []
+    for package in sorted(denominator):
+        declared = denominator[package]
+        record = record_by_package.get(package)
+        defects: list[str] = []
+        entrypoint = None
+        consumer = None
+        if record is None:
+            defects.append(AdmissionDefect.ADMISSION_RECORD_MISSING.value)
+        elif package not in member_names:
+            defects.append(AdmissionDefect.ADMISSION_CONTOUR_ABSENT.value)
+        else:
+            boundary = record.proposed_package_boundary
+            contour, separator, boundary_package = boundary.partition(" :: ")
+            if (
+                not separator
+                or contour not in contours
+                or boundary_package.strip() != package
+                or package not in contour_names[contour]
+            ):
+                defects.append(AdmissionDefect.ADMISSION_CONTOUR_ABSENT.value)
+
+            proof = _declared_symbols(record.public_contract_and_independent_test_entrypoint.split(";")[0])
+            if len(proof) != 1:
+                defects.append(AdmissionDefect.ADMISSION_ENTRYPOINT_ABSENT.value)
+            else:
+                proof_path, proof_symbol = proof[0]
+                entrypoint = f"{proof_path}::{proof_symbol}"
+                if not _defines_function(root, proof_path, proof_symbol) or not (
+                    proof_path == package_dir[package] or proof_path.startswith(package_dir[package] + "/")
+                ):
+                    defects.append(AdmissionDefect.ADMISSION_ENTRYPOINT_ABSENT.value)
+
+            consumers = _declared_symbols(record.first_real_consumer_or_time_bounded_migration_facade)
+            if consumers:
+                for consumer_path, consumer_symbol in consumers:
+                    if (
+                        not _defines_function(root, consumer_path, consumer_symbol)
+                        or owner_of_path.get(consumer_path) == package
+                        or package not in edges_by_package.get(owner_of_path.get(consumer_path, ""), set())
+                    ):
+                        defects.append(AdmissionDefect.ADMISSION_CONSUMER_ABSENT.value)
+                consumer = ", ".join(f"{path}::{symbol}" for path, symbol in consumers)
+            else:
+                expiry = _future_date(record.first_real_consumer_or_time_bounded_migration_facade, as_of)
+                if expiry is None or not any(
+                    name in record.first_real_consumer_or_time_bounded_migration_facade
+                    for name in declared["consumers"]
+                ):
+                    defects.append(AdmissionDefect.ADMISSION_MIGRATION_UNBOUNDED.value)
+
+            functional_cell = str(
+                ((_read_toml(root, root / package_dir[package] / "Cargo.toml").get("package") or {}).get("metadata") or {})
+                .get("eliot", {})
+                .get("functional_cell", "")
+            )
+            for field, expected in (
+                ("affected_functional_cells_and_lifecycle_owners", (functional_cell, declared["lifecycle_owner"])),
+                ("source_maintenance_owner_and_vendor_type_boundary", (declared["integration_owner"],)),
+            ):
+                if not expected[0] or any(name not in getattr(record, field) for name in expected):
+                    defects.append(AdmissionDefect.ADMISSION_FIELD_MISMATCH.value)
+
+        classification = {
+            "package": package,
+            "module_path": declared["module_path"],
+            "admission_wave": declared["admission_wave"],
+            "contour": record.proposed_package_boundary.partition(" :: ")[0] if record else None,
+            "disposition": record.disposition.value if record else None,
+            "proof_entrypoint": entrypoint,
+            "first_consumer": consumer,
+            "admitted": not defects,
+            "defects": sorted(set(defects)),
+            "record": record.to_json() if record else None,
+        }
+        classifications.append(classification)
+        if defects:
+            admission_defects.append(
+                {
+                    "package": package,
+                    "admission_wave": declared["admission_wave"],
+                    "disposition": classification["disposition"],
+                    "defects": classification["defects"],
+                }
+            )
+
+    for record in records:
+        if record.package not in denominator:
+            orphan = {
+                "package": record.package,
+                "admission_wave": None,
+                "disposition": record.disposition.value,
+                "defects": [AdmissionDefect.ADMISSION_RECORD_FOR_UNKNOWN_PACKAGE.value],
+            }
+            classifications.append(
+                {
+                    "package": record.package,
+                    "module_path": None,
+                    "admission_wave": None,
+                    "contour": None,
+                    "disposition": record.disposition.value,
+                    "proof_entrypoint": None,
+                    "first_consumer": None,
+                    "admitted": False,
+                    "defects": orphan["defects"],
+                    "record": record.to_json(),
+                }
+            )
+            admission_defects.append(orphan)
+
+    return classifications, admission_defects
+
+
 def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | None = None) -> dict[str, Any]:
     root = _root(root)
     runner = runner or SubprocessRunner()
@@ -1403,13 +1805,21 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     lock_sha = _sha256(_read_bytes(root, lock_path, max_bytes=128 * 1024 * 1024)) if lock_path.is_file() else None
     # The decision registry is part of the evidence surface: binding its hash into
     # the aggregate means any edit to a disposition invalidates every row.
-    decision_path = _inside(root, root / DECISION_DATA_RELPATH)
-    decision_sha = _sha256(_read_bytes(root, decision_path, max_bytes=BOUNDS.max_source_file_bytes))
-    _, decision_revision, records = load_decision_records(root)
+    decision_sha, decision_document = _decision_document(root)
+    _, decision_revision, records = load_decision_records(decision_document, decision_sha)
+    admission_records = load_admission_records(decision_document)
     as_of = as_of or datetime_now.now(timezone.utc).date()
     classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
         packages,
         records,
+        as_of=as_of,
+    )
+    admission_classifications, admission_wave_defects = check_admission_decisions(
+        root,
+        runner,
+        admission_records,
+        packages,
+        source_files,
         as_of=as_of,
     )
     semantic = {
@@ -1450,6 +1860,18 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
                 for disposition in CrateExtractionDecision
             },
         },
+        "capability_admission": {
+            "schema": ADMISSION_SCHEMA,
+            "record_shape": "I2.23 canonical extraction decision",
+            "decision_data_path": DECISION_DATA_RELPATH,
+            "as_of": as_of.isoformat(),
+            "classifications": admission_classifications,
+            "admission_defects": admission_wave_defects,
+            "count_by_disposition": {
+                disposition.value: sum(item["disposition"] == disposition.value for item in admission_classifications)
+                for disposition in CrateAdmissionDisposition
+            },
+        },
         "source_files": [item.to_json() for item in source_files],
         "findings": findings,
         "summary": {
@@ -1468,6 +1890,8 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
             "unclassified_unreachable": sum(
                 AdmissionDefect.UNCLASSIFIED.value in item["defects"] for item in classifications
             ),
+            "admitted_wave_packages": sum(item["admitted"] for item in admission_classifications),
+            "admission_wave_defects": len(admission_wave_defects),
             "proof_ceiling": "CRATE_REACHABILITY_CLASSIFICATION_AND_SOURCE_SHAPE_EVIDENCE_ONLY",
         },
     }
@@ -1603,7 +2027,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "status": "ok" if not summary["admission_defects"] else "admission_defects",
+                "status": "ok"
+                if not summary["admission_defects"] and not summary["admission_wave_defects"]
+                else "admission_defects",
                 "output": str(output),
                 "packages": summary["packages"],
                 "manifests": summary["tracked_manifests"],
@@ -1616,13 +2042,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {"package": item["package"], "defects": item["defects"]}
                     for item in inventory["extraction_classification"]["admission_defects"]
                 ],
+                "admitted_wave_packages": summary["admitted_wave_packages"],
+                "admission_wave_defects": summary["admission_wave_defects"],
+                "admission_count_by_disposition": inventory["capability_admission"]["count_by_disposition"],
+                "admission_defect_packages": [
+                    {"package": item["package"], "defects": item["defects"]}
+                    for item in inventory["capability_admission"]["admission_defects"]
+                ],
                 "aggregate_sha256": inventory["aggregate_sha256"],
                 "proof_ceiling": summary["proof_ceiling"],
             },
             sort_keys=True,
         )
     )
-    if summary["admission_defects"] and not args.allow_admission_defects:
+    if (summary["admission_defects"] or summary["admission_wave_defects"]) and not args.allow_admission_defects:
         return 3
     return 0
 

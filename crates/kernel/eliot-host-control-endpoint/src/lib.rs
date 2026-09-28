@@ -42,6 +42,7 @@ use eliot_ipc::{NamedPipeServer, TransportLimits};
 use tokio::sync::oneshot;
 
 pub mod backup;
+pub mod responsiveness_challenge;
 pub use backup::{
     AcceptedOwnerMethod, BackupOperationKind, accepted_host_backup_methods, authority_matches,
     is_supported, register_backup_methods, rehearsal_resolves_cutover, requires_cutover_admission,

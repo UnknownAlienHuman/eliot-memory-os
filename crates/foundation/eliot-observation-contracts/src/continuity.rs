@@ -744,29 +744,51 @@ fn has_competent_evaluator(observation: &ContinuityObservation) -> bool {
 /// on either signal is a superset of refusing on the claim's declaration
 /// alone.
 ///
-/// `Measured` is the only status this gate binds, because it is the only one
-/// that is unconditionally a full measurement claim. `Degraded` is guarded
-/// instead by [`check_modality_status`], which refuses a degraded claim on a
-/// competence-requiring modality unless a competent evaluator exists — so
-/// prose cannot reach a partial measurement either, it can only sit behind a
-/// real evaluator or behind `Unknown`, which proves nothing.
+/// `Measured` is refused on either signal, because it is unconditionally a
+/// full measurement claim. `Degraded` is a partial-measurement claim — the
+/// admitted-status enum documents it as a competent measurement that is
+/// partial or lossy — so each claim it carries is bound per claim, not per
+/// source: a claim whose own modality needs a modality-competent evaluator
+/// must name an evaluator competent in that claim modality, mirroring
+/// [`check_modality_status`] for the source and [`check_gap_status`] for a
+/// representation gap. Source-modality competence alone is no proof about a
+/// different modality: an image evaluator never earns an acoustic property.
+/// `Unknown` proves nothing, so claims sitting behind it stay admissible as
+/// derived candidates; [`check_loss_warnings`] still requires their warning.
 fn check_prose_proof(observation: &ContinuityObservation) -> Result<(), ContinuityError> {
-    let measured = matches!(
-        observation.property_status,
-        ModalityPropertyStatus::Measured
-    );
-    if !measured || observation.derived_text_claims.is_empty() {
+    if observation.derived_text_claims.is_empty() {
         return Ok(());
     }
-    let claim_requires_evaluator = observation
-        .derived_text_claims
-        .iter()
-        .any(|claim| claim.modality.requires_modality_competent_evaluator());
-    let source_requires_evaluator = observation
-        .source_modality
-        .requires_modality_competent_evaluator();
-    if claim_requires_evaluator || source_requires_evaluator {
-        return Err(ContinuityError::ProseProof);
+    if matches!(
+        observation.property_status,
+        ModalityPropertyStatus::Measured
+    ) {
+        let claim_requires_evaluator = observation
+            .derived_text_claims
+            .iter()
+            .any(|claim| claim.modality.requires_modality_competent_evaluator());
+        let source_requires_evaluator = observation
+            .source_modality
+            .requires_modality_competent_evaluator();
+        if claim_requires_evaluator || source_requires_evaluator {
+            return Err(ContinuityError::ProseProof);
+        }
+        return Ok(());
+    }
+    if matches!(
+        observation.property_status,
+        ModalityPropertyStatus::Degraded
+    ) {
+        for claim in &observation.derived_text_claims {
+            if claim.modality.requires_modality_competent_evaluator()
+                && !observation
+                    .modality_evaluators
+                    .iter()
+                    .any(|evaluator| evaluator.modality == claim.modality)
+            {
+                return Err(ContinuityError::ProseProof);
+            }
+        }
     }
     Ok(())
 }

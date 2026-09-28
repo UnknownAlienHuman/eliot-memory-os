@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge_contract;
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
     BestEffortDropGap, BestEffortDropReason, DURABLE_INGEST_TRANSFORMATION_VERSION,
@@ -1611,16 +1612,30 @@ impl AcpResultEnvelope {
         admission: &AdmittedRouteReceipt,
         outcome: AcpResultOutcome,
     ) -> Result<AgentResult, AcpAdapterError> {
+        self.into_agent_result_with_diagnostic_caller(route, binding, admission, outcome, None)
+    }
+
+    fn into_agent_result_with_diagnostic_caller(
+        self,
+        route: RouteFingerprint,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        outcome: AcpResultOutcome,
+        diagnostic_caller: Option<eliot_agent_api::route_receipts::TrustedAdapterDiagnosticCaller>,
+    ) -> Result<AgentResult, AcpAdapterError> {
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
-        // Adapter-boundary sanitization (issue #369 W20/A21, hardened by
-        // issue #2641): the provider failure reason is untrusted text. It is
-        // sanitized once here so the unknown reason and the public error below
-        // never carry secrets or credentials, and the quarantine/recovery
-        // handle below carries only the owner-issued operation reference, so
-        // all three emitted fields stay bounded public diagnostics. Plain
-        // operational reasons pass through verbatim.
-        let unknown_reason = unknown_reason.map(|reason| sanitize_adapter_error(&reason));
+        // Adapter-boundary sanitization (issues #369 and #2641): provider
+        // prose is untrusted even when it byte-matches a fixed ELIOT reason.
+        // Only the real ACP terminal assembly site supplies caller provenance
+        // for its fixed non-terminal reason; generic/wire bytes never supply
+        // caller provenance and cannot qualify through exact text equality.
+        let unknown_reason = unknown_reason.map(|reason| {
+            let trusted_diagnostic = diagnostic_caller.and_then(|caller| {
+                eliot_agent_api::route_receipts::resolve_trusted_adapter_diagnostic(caller, &reason)
+            });
+            sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
+        });
         let usage = UsageReceipt {
             input_tokens: None,
             output_tokens: None,
@@ -1740,14 +1755,27 @@ impl AcpResultEnvelope {
                 eliot_agent_api::ContractError::BindingMismatch,
             ));
         }
-        let outcome = if self.terminal {
-            AcpResultOutcome::Completed
+        let (outcome, diagnostic_caller) = if self.terminal {
+            (AcpResultOutcome::Completed, None)
         } else {
-            AcpResultOutcome::Unknown {
-                reason: "acp result envelope is not terminal; outcome unreconciled".to_owned(),
-            }
+            (
+                AcpResultOutcome::Unknown {
+                    reason: "acp result envelope is not terminal; outcome unreconciled".to_owned(),
+                },
+                Some(
+                    eliot_agent_api::route_receipts::TrustedAdapterDiagnosticCaller::AcpTerminalAssembly,
+                ),
+            )
         };
-        self.into_agent_result(route, binding, admission, outcome)
+        // This source site creates the fixed non-terminal reason, so it alone
+        // supplies its diagnostic provenance.
+        self.into_agent_result_with_diagnostic_caller(
+            route,
+            binding,
+            admission,
+            outcome,
+            diagnostic_caller,
+        )
     }
 }
 

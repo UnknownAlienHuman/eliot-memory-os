@@ -43,9 +43,10 @@
 //! newer. A delayed replay is refused whole, so it displaces no record and
 //! clears no invalidation; and an invalidation is cleared only by a fresh
 //! requalification of the same key, so a known restriction or an applied
-//! scope change is not erased by an unrelated record. The retained bound
-//! therefore never lets stale evidence look current, and an empty registry
-//! still refuses rather than admits.
+//! scope change is not erased by an unrelated record. The registry never
+//! evicts a key's latest frontier: after the bound is reached, new keys are
+//! refused, and an unretained restriction fails production admission closed.
+//! An empty registry still refuses rather than admits.
 
 #![forbid(unsafe_code)]
 
@@ -57,9 +58,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Maximum retained evidence records. Insertion beyond the bound evicts the
-/// oldest record first, so the registry cannot grow without bound while a
-/// re-probe keeps the newest evidence for its key.
+/// Maximum retained evidence records. New keys beyond this bound are refused
+/// so no retained key's supersession frontier can be erased.
 pub const MAX_CAPABILITY_EVIDENCE_RECORDS: usize = 512;
 
 /// Claim status for one scoped capability record.
@@ -395,6 +395,16 @@ impl CapabilityEvidenceRecord {
         ) && self.source.is_admissible_evidence()
     }
 
+    /// Returns whether the status is a production restriction. This predicate
+    /// intentionally ignores freshness: if capacity prevents retaining a
+    /// negative record, the registry must fail closed.
+    fn is_restrictive_evidence(&self) -> bool {
+        matches!(
+            self.status,
+            CapabilityStatus::Degraded | CapabilityStatus::Broken | CapabilityStatus::Unsupported
+        )
+    }
+
     /// Returns true when this record is a fresh exact-fingerprint positive
     /// that may admit production work: `probe_passed` or `observed` from an
     /// admissible evidence source, time-fresh at `now`, on a scope the
@@ -497,11 +507,17 @@ pub enum SkillStanding {
 pub struct CapabilityRegistry {
     records: Vec<CapabilityEvidenceRecord>,
     /// Derived staleness: scope fingerprints invalidated by an applied
-    /// scope change. Records are never mutated in place; freshness is
-    /// derived from this set plus `observed_at`/`expires_at` at admission
-    /// time. Only [`insert`](Self::insert) removes an entry, and only for a
-    /// fresh requalification of the same key.
+    /// scope change. A record value is replaced only by newer evidence for
+    /// the same key; freshness is derived from this set plus
+    /// `observed_at`/`expires_at` at admission time. Only
+    /// [`insert`](Self::insert) clears an entry, and only for a fresh
+    /// requalification of the same key.
     invalidated_scopes: HashSet<RouteScopeFingerprint>,
+    /// Set only when a new restriction could not be retained because the
+    /// registry reached its record bound. Since that missing restriction's
+    /// scope cannot be represented without growing state, the registry
+    /// refuses all production admission for this instance's lifetime.
+    restriction_capacity_exhausted: bool,
 }
 
 impl CapabilityRegistry {
@@ -511,6 +527,7 @@ impl CapabilityRegistry {
         Self {
             records: Vec::new(),
             invalidated_scopes: HashSet::new(),
+            restriction_capacity_exhausted: false,
         }
     }
 
@@ -536,9 +553,15 @@ impl CapabilityRegistry {
     /// restriction or an applied scope change therefore stays stale until the
     /// evidence it staled is requalified, not until any record arrives.
     ///
-    /// Insertion beyond [`MAX_CAPABILITY_EVIDENCE_RECORDS`] evicts the oldest
-    /// record first.
-    pub fn insert(&mut self, record: CapabilityEvidenceRecord) {
+    /// A same-key replacement remains possible at capacity. A new key is
+    /// refused once the bound is reached, preserving every retained
+    /// supersession frontier. If the refused record is restrictive, the
+    /// registry enters a bounded fail-closed admission state because it cannot
+    /// retain the scope of that missing restriction.
+    ///
+    /// Returns `true` when the record was inserted or replaced, and `false`
+    /// when it was an equal/older replay or a new key exceeded capacity.
+    pub fn insert(&mut self, record: CapabilityEvidenceRecord) -> bool {
         if let Some(retained) = self.records.iter().position(|existing| {
             existing.skill_id == record.skill_id
                 && existing.scope_fingerprint == record.scope_fingerprint
@@ -551,17 +574,20 @@ impl CapabilityRegistry {
             // backdated replay only makes a record look older, so it can never
             // win this comparison.
             if record.observed_at <= self.records[retained].observed_at {
-                return;
+                return false;
             }
-            self.records.remove(retained);
             if record.is_qualifying_evidence() {
                 self.invalidated_scopes.remove(&record.scope_fingerprint);
             }
+            self.records[retained] = record;
+            return true;
+        }
+        if self.records.len() >= MAX_CAPABILITY_EVIDENCE_RECORDS {
+            self.restriction_capacity_exhausted |= record.is_restrictive_evidence();
+            return false;
         }
         self.records.push(record);
-        while self.records.len() > MAX_CAPABILITY_EVIDENCE_RECORDS {
-            self.records.remove(0);
-        }
+        true
     }
 
     /// Returns all records, including invalidated and declared-only entries.
@@ -619,7 +645,11 @@ impl CapabilityRegistry {
             }
         }
         if positive {
-            SkillStanding::Holding
+            if self.restriction_capacity_exhausted {
+                SkillStanding::Unevaluated
+            } else {
+                SkillStanding::Holding
+            }
         } else {
             SkillStanding::Unevaluated
         }
@@ -651,6 +681,9 @@ impl CapabilityRegistry {
         scope: &RouteScopeFingerprint,
         now: u64,
     ) -> bool {
+        if self.restriction_capacity_exhausted {
+            return false;
+        }
         if self.records.iter().any(|record| {
             record.is_fresh_restriction_for(skill_id, scope, now, &self.invalidated_scopes)
         }) {

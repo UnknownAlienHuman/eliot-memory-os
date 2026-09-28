@@ -17,9 +17,9 @@ use eliot_agent_api::{
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
-    CandidateId, CoordinatorConfig, RecipeId, RecipeManifest, RoleProfileId, RoleProfileManifest,
-    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
-    WorkClass,
+    CandidateId, CoordinatorConfig, LearningRole, RecipeId, RecipeManifest, RoleProfileId,
+    RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
+    StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -50,6 +50,27 @@ fn test_fence() -> TestResult<StateFence> {
 
 fn test_digest(seed: &str) -> TestResult<LowercaseSha256> {
     serde_json::from_value(serde_json::json!(sha256_hex(seed.as_bytes()))).map_err(Into::into)
+}
+
+fn fixture_reference(
+    label: &str,
+) -> Result<eliot_agent_contracts::PublicReference, eliot_agent_contracts::ContractError> {
+    Ok(eliot_agent_contracts::PublicReference {
+        kind: "fixture".to_owned(),
+        id: eliot_agent_contracts::TargetId::new(format!("fixture-{label}"))?,
+        revision: RevisionId::new("fixture-v1")?,
+        digest: None,
+    })
+}
+
+fn fixture_schema_identity(
+    label: &str,
+) -> Result<eliot_contracts::ContractIdentity, eliot_contracts::ContractError> {
+    eliot_contracts::contract_identity(
+        format!("fixture-{label}"),
+        eliot_contracts::ContractVersion::new(1, 0, 0),
+        &serde_json::json!({ "fixture_schema": label }),
+    )
 }
 
 fn test_route() -> TestResult<RouteFingerprint> {
@@ -104,6 +125,7 @@ fn test_request(
         },
         stop_condition: "candidate submitted".to_owned(),
     };
+    let role_effects = work.effect_ceiling.clone();
     Ok(StaffingPlanRequest {
         candidate_id: CandidateId::new(candidate).map_err(|error| format!("candidate: {error}"))?,
         launch: AgentLaunchRequest {
@@ -135,15 +157,40 @@ fn test_request(
             recipe_id: RecipeId::new("recipe-872").map_err(|error| format!("recipe: {error}"))?,
             manifest_revision: RevisionId::new("recipe-rev-872")
                 .map_err(|error| format!("recipe rev: {error}"))?,
+            schema_identity: fixture_schema_identity("recipe-872")?,
+            content_digest: test_digest("recipe-manifest-872")?,
             route_policy_revision: RevisionId::new("route-policy-1")
                 .map_err(|error| format!("route policy: {error}"))?,
             max_lanes: 1,
             max_descendants: 8,
+            stage_templates: vec![fixture_reference("stage-template")?],
+            work_item_templates: vec![fixture_reference("work-item-template")?],
+            dependency_templates: vec![fixture_reference("dependency-template")?],
+            merge_templates: vec![fixture_reference("merge-template")?],
+            eligible_route_classes: vec!["provider-fabric-a".to_owned()],
+            expansion_conditions: vec![fixture_reference("expansion-condition")?],
+            contraction_conditions: vec![fixture_reference("contraction-condition")?],
+            verifier_requirements: vec![fixture_reference("verifier-requirement")?],
+            audit_requirements: vec![fixture_reference("audit-requirement")?],
+            budget: test_budget(),
+            partial_result_behavior: fixture_reference("partial-result-behavior")?,
+            failure_behavior: fixture_reference("failure-behavior")?,
             role_profiles: vec![RoleProfileManifest {
                 role_id: RoleProfileId::new("role-1").map_err(|error| format!("role: {error}"))?,
                 manifest_revision: RevisionId::new("role-rev-role-1")
                     .map_err(|error| format!("role rev: {error}"))?,
+                schema_identity: fixture_schema_identity("role-1")?,
+                content_digest: test_digest("role-manifest-1")?,
                 required_competence: vec!["rust".to_owned()],
+                allowed_operations: vec![fixture_reference("role-operation")?],
+                allowed_effects: role_effects,
+                independence_requirement: fixture_reference("independence-requirement")?,
+                input_schemas: vec![fixture_reference("role-input-schema")?],
+                output_schemas: vec![fixture_reference("role-output-schema")?],
+                visibility_policy: fixture_reference("visibility-policy")?,
+                learning_role: LearningRole::NotApplicable,
+                stop_condition: fixture_reference("candidate-submitted")?,
+                escalation_policy: fixture_reference("integration-owner")?,
                 allowed_route_classes: vec!["provider-fabric-a".to_owned()],
                 mutation_capable: false,
             }],

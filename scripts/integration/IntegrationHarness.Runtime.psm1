@@ -23,8 +23,13 @@
 # minted); authenticated peer handshake; liveness never proves subsystem readiness;
 # stale/foreign/expired receipts never restore readiness; unknown launches require
 # reconciliation without retry/reuse; owner-only reset; reverse-order shutdown +
-# owned-tree-only termination (never by label/pipe/PID alone); full descendant/job/
-# pipe/mutex/handle/lock/root verification; idempotent cleanup preserving the primary
+# owned-tree-only termination (never by label/pipe/PID alone) re-proven live from
+# this run's own launch claim before every termination request, an unproven
+# component left running and reported instead of terminated, and every diagnostic
+# emission (typed error detail, receipt failure text) passing caller- and
+# seam-derived text through one total redactor that removes the value and can
+# never throw; full descendant/job/pipe/mutex/handle/lock/root verification;
+# idempotent cleanup preserving the primary
 # failure; bounded redacted evidence; ELIOT_GOVERNOR_CONFIG only as a versioned
 # run-local receipt via the Core-protected channel, dispatched from Allocate and
 # bound (relative path + digest) into the Allocate and provider-readiness receipts
@@ -201,7 +206,7 @@ function Invoke-RuntimeProviderOperation {
     $context = @{ operation = $Operation; binding = $Binding; arguments = $Arguments }
     $raw = $null
     try { $raw = (& $implementation $context) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-PROVIDER-FAILED:$Operation : $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-PROVIDER-FAILED:$Operation : $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     if ($null -eq $raw) { throw [System.InvalidOperationException]::new("RUNTIME-PROVIDER-FAILED:$Operation : provider returned no result.") }
     $result = @{}
     if ($raw -is [hashtable]) { $result = $raw }
@@ -273,17 +278,17 @@ function Resolve-RuntimeOwnedPath {
     if ([System.IO.Path]::IsPathFullyQualified($Path)) { $candidate = [System.IO.Path]::GetFullPath($Path) }
     else { $candidate = [System.IO.Path]::GetFullPath((Join-Path $rootFull $Path)) }
     $prefix = $rootFull.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    if ($candidate -ine $rootFull -and -not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw [System.InvalidOperationException]::new("RUNTIME-PATH-ESCAPE: path escapes the admitted run root: $candidate") }
-    if (-not [string]::IsNullOrEmpty([System.IO.Path]::GetFileName($candidate)) -and ([System.IO.Path]::GetFileName($candidate) -match $Script:RuntimeReservedLeafPattern)) { throw [System.InvalidOperationException]::new("RUNTIME-RESERVED-PATH: reserved device name rejected: $candidate") }
+    if ($candidate -ine $rootFull -and -not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw [System.InvalidOperationException]::new("RUNTIME-PATH-ESCAPE: path escapes the admitted run root: $(Get-RuntimeSafeDiagnosticText -Text $candidate)") }
+    if (-not [string]::IsNullOrEmpty([System.IO.Path]::GetFileName($candidate)) -and ([System.IO.Path]::GetFileName($candidate) -match $Script:RuntimeReservedLeafPattern)) { throw [System.InvalidOperationException]::new("RUNTIME-RESERVED-PATH: reserved device name rejected: $(Get-RuntimeSafeDiagnosticText -Text $candidate)") }
     foreach ($segment in ($candidate.Substring($rootFull.Length).Split([System.IO.Path]::DirectorySeparatorChar))) {
-        if ($segment -match $Script:RuntimeReservedLeafPattern) { throw [System.InvalidOperationException]::new("RUNTIME-RESERVED-PATH: reserved device segment rejected: $segment") }
+        if ($segment -match $Script:RuntimeReservedLeafPattern) { throw [System.InvalidOperationException]::new("RUNTIME-RESERVED-PATH: reserved device segment rejected: $(Get-RuntimeSafeDiagnosticText -Text $segment)") }
     }
     $probe = $candidate
     while ($null -ne $probe -and $probe.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
         $entry = $null
         try { $entry = Get-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue } catch { $entry = $null }
         if ($null -ne $entry) {
-            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw [System.InvalidOperationException]::new("RUNTIME-REPARSE-ESCAPE: path crosses a reparse point: $($entry.FullName)") }
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw [System.InvalidOperationException]::new("RUNTIME-REPARSE-ESCAPE: path crosses a reparse point: $(Get-RuntimeSafeDiagnosticText -Text $entry.FullName)") }
             break
         }
         $parent = Split-Path -Parent $probe
@@ -296,9 +301,9 @@ function Resolve-RuntimeOwnedPath {
         if (Test-Path -LiteralPath $marker -PathType Leaf) {
             try {
                 $recorded = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                if ($recorded.run_id -cne $ExpectedRunId) { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: owner marker belongs to another run: $cursor") }
+                if ($recorded.run_id -cne $ExpectedRunId) { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: owner marker belongs to another run: $(Get-RuntimeSafeDiagnosticText -Text $cursor)") }
             } catch [System.InvalidOperationException] { throw }
-            catch { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: owner marker unreadable at: $cursor") }
+            catch { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: owner marker unreadable at: $(Get-RuntimeSafeDiagnosticText -Text $cursor)") }
             break
         }
         if ($cursor -ieq $rootFull) { break }
@@ -394,11 +399,14 @@ function Get-RuntimeRedactedText {
                 $redacted = $redacted.Replace($secret, '[redacted-runtime-secret]')
             }
         }
-        $redacted = [regex]::Replace($redacted, '(?i)(password|passwd|secret|token|api[_-]?key|connectionstring|governorconfig)\s*[:=]\s*\S+', '$1=[redacted-runtime-secret]')
-        $redacted = [regex]::Replace($redacted, '(?i)ELIOT_GOVERNOR_CONFIG\s*=\s*\S+', 'ELIOT_GOVERNOR_CONFIG=[redacted-runtime-secret]')
-        $redacted = [regex]::Replace($redacted, '(?i)runtime_[a-z_]*(pass|secret|token|key)[a-z_]*\s*=\s*\S+', '[redacted-runtime-secret]')
-        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ|protocol|source|model|user)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
-        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s*[:=]\s*\S+', '$1=[redacted-runtime-secret]')
+        # A quoted value is removed whole; an unquoted value runs to the next
+        # separator. Matching only the first token would leave the tail of a
+        # payload ("model = "claude opus 5"") recoverable from the diagnostic.
+        $redacted = [regex]::Replace($redacted, '(?i)(password|passwd|secret|token|api[_-]?key|connectionstring|governorconfig)\s*[:=]\s*("[^"]*"|''[^'']*''|\S+)', '$1=[redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)ELIOT_GOVERNOR_CONFIG\s*=\s*("[^"]*"|''[^'']*''|\S+)', 'ELIOT_GOVERNOR_CONFIG=[redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)runtime_[a-z_]*(pass|secret|token|key)[a-z_]*\s*=\s*("[^"]*"|''[^'']*''|\S+)', '[redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environment|environ|protocol|source|model|user)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environment|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s*[:=]\s*("[^"]*"|''[^'']*''|\S+)', '$1=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)([A-Za-z]:\\(?:[^\\/:*?"<>|\s]+\\)*private(?:\\[^\\/:*?"<>|\s]*)*|/(?:[^\\/:*?"<>|\s]+/)*private(?:/[^\\/:*?"<>|\s]*)*)', '[redacted-private-path]')
         $redacted = [regex]::Replace($redacted, '(?i)[A-Za-z]:\\Users\\[^\\/:*?"<>|]+', '[redacted-user-path]')
     } catch {
@@ -415,6 +423,20 @@ function Get-RuntimeRedactedText {
         } catch { return [pscustomobject]@{ text = ''; bytes = 0; truncated = $true; failed = $true } }
     }
     return [pscustomobject]@{ text = $output; bytes = $bytes.Length; truncated = $truncated; failed = $false }
+}
+# W7 redaction lane: every diagnostic-adjacent emission (typed error detail, receipt
+# failure text) sends caller- and seam-derived text through this one entry point, so
+# no emitting path is left unredacted. The emitted copy loses the value; control flow
+# keeps reading the raw text, so a diagnostic never decides behaviour. Total by
+# construction: a redaction failure degrades to an empty detail instead of throwing,
+# so a diagnostic can never introduce a failure of its own.
+function Get-RuntimeSafeDiagnosticText {
+    [CmdletBinding()]
+    param([Parameter()][AllowNull()][AllowEmptyString()][string]$Text, [Parameter()][AllowNull()][AllowEmptyCollection()][string[]]$Secrets, [Parameter()][ValidateRange(1, 16777216)][int]$MaxBytes = 2048)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $redacted = Get-RuntimeRedactedText -Text $Text -Secrets $Secrets -MaxBytes $MaxBytes
+    if ([bool]$redacted.failed) { return '' }
+    return [string]$redacted.text
 }
 function Invoke-RuntimeAllocate {
     [CmdletBinding()]
@@ -433,7 +455,7 @@ function Invoke-RuntimeAllocate {
     } else { $nonce = $runId.Substring(0, 8) }
     $runRoot = [System.IO.Path]::GetFullPath((Join-Path $baseFull ("eliot-runtime-{0}-{1}" -f $runId, $nonce)))
     $prefix = $baseFull.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    if (-not $runRoot.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw [System.InvalidOperationException]::new("RUNTIME-PATH-ESCAPE: allocated run root escaped its base: $runRoot") }
+    if (-not $runRoot.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw [System.InvalidOperationException]::new("RUNTIME-PATH-ESCAPE: allocated run root escaped its base: $(Get-RuntimeSafeDiagnosticText -Text $runRoot)") }
     $roots = @{}
     foreach ($leaf in @('installation', 'session', 'config', 'data', 'logs', 'temp', 'artifacts')) {
         $full = [System.IO.Path]::GetFullPath((Join-Path $runRoot $leaf))
@@ -455,7 +477,7 @@ function Invoke-RuntimeAllocate {
     if ($null -eq $NamespaceReservation) { throw [System.ArgumentException]::new('RUNTIME-MISSING-RESERVATION: a namespace-reservation seam is required; no pipe is created here.') }
     $reservation = $null
     try { $reservation = (& $NamespaceReservation @{ runId = $runId; pipeNamespace = $pipeNamespace; sessionId = $sessionId }) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-NAMESPACE-CONFLICT: reservation failed: $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-NAMESPACE-CONFLICT: reservation failed: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     $reserved = ''
     if ($reservation -is [hashtable] -and $reservation.ContainsKey('pipeNamespace')) { $reserved = [string]$reservation['pipeNamespace'] }
     elseif ($reservation -is [string]) { $reserved = $reservation }
@@ -562,7 +584,7 @@ function Invoke-RuntimeStart {
     if ($null -eq $OwnerIssuance) { throw [System.ArgumentException]::new('RUNTIME-MISSING-ISSUANCE: an owner-issuance seam is required; generation/fence/epoch are never locally minted.') }
     $receipt = $null
     try { $receipt = (& $Acquisition @{ runId = $runId; artifact = $Script:RuntimeArtifact }) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACQUISITION-FAILED: $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACQUISITION-FAILED: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     if ($null -eq $receipt -or $receipt -isnot [hashtable]) { throw [System.InvalidOperationException]::new('RUNTIME-ACQUISITION-FAILED: acquisition must return a hashtable receipt.') }
     foreach ($field in @('version', 'architecture', 'peMachine', 'peProfile', 'digest', 'provenance', 'runtimePath')) {
         if (-not $receipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$receipt[$field])) { throw [System.InvalidOperationException]::new("RUNTIME-ACQUISITION-FAILED: receipt is missing '$field'.") }
@@ -590,7 +612,7 @@ function Invoke-RuntimeStart {
     }
     $issuance = $null
     try { $issuance = (& $OwnerIssuance @{ runId = $runId }) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-ISSUANCE-FAILED: $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-ISSUANCE-FAILED: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     if ($null -eq $issuance -or $issuance -isnot [hashtable]) { throw [System.InvalidOperationException]::new('RUNTIME-ISSUANCE-FAILED: owner issuance must return a hashtable.') }
     foreach ($field in @('generation', 'fence', 'epoch', 'owner')) {
         if (-not $issuance.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$issuance[$field])) { throw [System.InvalidOperationException]::new("RUNTIME-ISSUANCE-FAILED: owner issuance is missing '$field'.") }
@@ -688,9 +710,9 @@ function Invoke-RuntimeStart {
         catch {
             $message = $_.Exception.Message
             if ($message -match '(?i)lost-response|timeout|unknown') {
-                return @{ runId = $runId; launchState = 'ReconciliationRequired'; requested = @{ component = $component; requestKey = $requestKey; pipe = $pipe }; observed = $null; invocation = @{ argvCount = $fixedArgv.Count; pipe = $pipe; component = $component }; binary = @{ version = $Script:RuntimeVersion; digest = [string]$receipt['digest']; provenance = $provenance }; retryPermitted = $false; failure = ('lost-response-owned:' + $message) }
+                return @{ runId = $runId; launchState = 'ReconciliationRequired'; requested = @{ component = $component; requestKey = $requestKey; pipe = $pipe }; observed = $null; invocation = @{ argvCount = $fixedArgv.Count; pipe = $pipe; component = $component }; binary = @{ version = $Script:RuntimeVersion; digest = [string]$receipt['digest']; provenance = $provenance }; retryPermitted = $false; failure = ('lost-response-owned:' + (Get-RuntimeSafeDiagnosticText -Text $message)) }
             }
-            throw [System.InvalidOperationException]::new("RUNTIME-LAUNCH-FAILED: $message")
+            throw [System.InvalidOperationException]::new("RUNTIME-LAUNCH-FAILED: $(Get-RuntimeSafeDiagnosticText -Text $message)")
         }
         if ($null -eq $single -or $single -isnot [hashtable]) { throw [System.InvalidOperationException]::new("RUNTIME-LAUNCH-FAILED: launcher must return a hashtable observation for '$component'.") }
         if (-not $single.ContainsKey('observedPid') -or -not $single.ContainsKey('observedNonce') -or -not $single.ContainsKey('containment')) { throw [System.InvalidOperationException]::new("RUNTIME-LAUNCH-FAILED: launcher observation is missing pid/nonce/containment for '$component'.") }
@@ -959,9 +981,26 @@ function Invoke-RuntimeStop {
         if ($ownedPid -le 0) { throw [System.ArgumentException]::new("RUNTIME-INVALID-PID: owned pid is not positive for '$component'.") }
         $ownedPids[$component] = $ownedPid
     }
+    # Teardown never acts on a component label, a pipe name or a PID alone. Each
+    # component carries this run's own launch claim (the pid the run asked the
+    # launcher to bind, the image the run asked to launch, and the observed start
+    # when the containment proof recorded one), and that claim is re-proven live
+    # before any termination request. An unproven claim is never handed to the
+    # controller: the process is left running and reported instead.
+    $ownedIdentities = @{}
+    foreach ($component in $Script:RuntimeComponents) {
+        $observedEntry = $StartReceipt['observed'][$component]
+        $expectedImage = ''
+        if ($observedEntry.ContainsKey('observedImage')) { $expectedImage = [string]$observedEntry['observedImage'] }
+        if ([string]::IsNullOrWhiteSpace($expectedImage) -and $StartReceipt.ContainsKey('binary') -and ($StartReceipt['binary'] -is [hashtable]) -and $StartReceipt['binary'].ContainsKey('runtimePath')) { $expectedImage = [string]$StartReceipt['binary']['runtimePath'] }
+        $expectedStart = ''
+        if ($observedEntry.ContainsKey('observedStartUtc')) { $expectedStart = [string]$observedEntry['observedStartUtc'] }
+        $ownedIdentities[$component] = @{ pid = [int]$ownedPids[$component]; expectedImage = $expectedImage; expectedStartUtc = $expectedStart }
+    }
     if ($null -eq $ProcessController) { throw [System.ArgumentException]::new('RUNTIME-MISSING-CONTROLLER: a process-controller seam is required.') }
     $stopOrder = New-Object Collections.Generic.List[string]
     $componentStates = @{}
+    $unprovenOwnership = New-Object Collections.Generic.List[string]
     foreach ($component in $Script:RuntimeComponents) { $componentStates[$component] = 'stop-unknown' }
     $forced = $false
     foreach ($phaseName in @('graceful', 'forced')) {
@@ -973,9 +1012,28 @@ function Invoke-RuntimeStop {
         if ($phaseName -ceq 'forced') { $forced = $true }
         foreach ($component in $Script:RuntimeShutdownOrder) {
             if ($phaseName -ceq 'forced' -and $componentStates[$component] -ceq 'process-exited') { continue }
-            $phase = (& $ProcessController @{ phase = $phaseName; component = $component; pid = $ownedPids[$component]; runId = $runId })
+            $identity = $ownedIdentities[$component]
+            $owned = $null
+            $ownershipFailure = ''
+            try { $owned = Get-RuntimeProcessBinding -ProcessId ([int]$identity['pid']) -ExpectedImagePath ([string]$identity['expectedImage']) -ExpectedStartUtc ([string]$identity['expectedStartUtc']) }
+            catch { $ownershipFailure = [string]$_.Exception.Message }
+            if ($null -eq $owned) {
+                # Already gone: there is nothing to terminate and nothing to delete,
+                # so the controller is never handed a pid that could be recycled.
+                if ($ownershipFailure -match 'RUNTIME-PROCESS-ABSENT') {
+                    $componentStates[$component] = 'process-exited'
+                    [void]$stopOrder.Add(($phaseName + ':' + $component))
+                    continue
+                }
+                # Ownership unproven (foreign image, recycled pid, unreadable identity
+                # or no launch claim): left alone and reported, never terminated.
+                $componentStates[$component] = 'ownership-unproven'
+                [void]$unprovenOwnership.Add(('{0}:{1}:{2}' -f $component, $phaseName, (Get-RuntimeSafeDiagnosticText -Text $ownershipFailure)))
+                continue
+            }
+            $phase = (& $ProcessController @{ phase = $phaseName; component = $component; pid = [int]$identity['pid']; runId = $runId; expectedImage = [string]$identity['expectedImage']; expectedStartUtc = [string]$identity['expectedStartUtc'] })
             if ($null -eq $phase) {
-                return @{ runId = $runId; stopState = 'ReconciliationRequired'; requestedStop = $true; stopOrder = @($stopOrder); forced = $forced; retryPermitted = $false; failure = ("unknown-stop-owned:{0}:{1}" -f $component, $phaseName) }
+                return @{ runId = $runId; stopState = 'ReconciliationRequired'; requestedStop = $true; stopOrder = @($stopOrder); forced = $forced; retryPermitted = $false; failure = ("unknown-stop-owned:{0}:{1}" -f $component, $phaseName); unprovenOwnership = @($unprovenOwnership) }
             }
             if ($phase -isnot [hashtable] -or -not $phase.ContainsKey('exited')) { throw [System.InvalidOperationException]::new("RUNTIME-CONTROLLER-FAILED: $phaseName phase must return an exited mapping for '$component'.") }
             if ($phase.ContainsKey('pid') -and ([int]$phase['pid'] -ne [int]$ownedPids[$component])) { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-PROCESS: controller touched a foreign pid for '$component'; PID reuse is rejected.") }
@@ -985,7 +1043,9 @@ function Invoke-RuntimeStop {
     }
     $phase = 'graceful'
     if ($forced) { $phase = 'forced' }
-    return @{ runId = $runId; stopPhase = $phase; stopState = 'ShutdownRequested'; stopOrder = @($stopOrder); componentStates = $componentStates; ownedPids = $ownedPids; forced = $forced }
+    $stopResult = @{ runId = $runId; stopPhase = $phase; stopState = 'ShutdownRequested'; stopOrder = @($stopOrder); componentStates = $componentStates; ownedPids = $ownedPids; forced = $forced }
+    if ($unprovenOwnership.Count -gt 0) { $stopResult['unprovenOwnership'] = @($unprovenOwnership) }
+    return $stopResult
 }
 function Invoke-RuntimeVerifyCleanup {
     [CmdletBinding()]
@@ -998,7 +1058,7 @@ function Invoke-RuntimeVerifyCleanup {
     }
     $runRoot = [System.IO.Path]::GetFullPath([string]$Allocation['runRoot'])
     $runLeaf = [System.IO.Path]::GetFileName($runRoot)
-    if ([string]::IsNullOrWhiteSpace($runLeaf) -or -not $runLeaf.Contains($runId)) { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: cleanup run root leaf does not carry the run identity: $runRoot") }
+    if ([string]::IsNullOrWhiteSpace($runLeaf) -or -not $runLeaf.Contains($runId)) { throw [System.InvalidOperationException]::new("RUNTIME-FOREIGN-ROOT: cleanup run root leaf does not carry the run identity: $(Get-RuntimeSafeDiagnosticText -Text $runRoot)") }
     $runPrefix = $runRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
     foreach ($rootField in @('installationRoot', 'sessionRoot', 'configRoot', 'dataRoot', 'logRoot', 'tempRoot', 'artifactRoot')) {
         $rootFull = [System.IO.Path]::GetFullPath([string]$Allocation[$rootField])
@@ -1193,22 +1253,22 @@ function Test-RuntimeArtifactFile {
     catch { throw [System.ArgumentException]::new('RUNTIME-ARTIFACT-MISSING: runtime path is not usable.') }
     $leaf = $null
     try { $leaf = Get-Item -LiteralPath $full -Force -ErrorAction Stop }
-    catch { throw [System.IO.FileNotFoundException]::new("RUNTIME-ARTIFACT-MISSING: runtime file is absent: $full") }
-    if ($leaf -isnot [System.IO.FileInfo]) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-MISSING: runtime path is not a file: $full") }
-    if (($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-REPARSE: runtime file is a reparse point: $full") }
+    catch { throw [System.IO.FileNotFoundException]::new("RUNTIME-ARTIFACT-MISSING: runtime file is absent: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
+    if ($leaf -isnot [System.IO.FileInfo]) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-MISSING: runtime path is not a file: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
+    if (($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-REPARSE: runtime file is a reparse point: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
     $cursor = Split-Path -Parent $full
     $depth = 0
     while (-not [string]::IsNullOrWhiteSpace($cursor) -and $depth -lt 64) {
         $depth++
         $entry = $null
         try { $entry = Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue } catch { $entry = $null }
-        if ($null -ne $entry -and (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-REPARSE: runtime path crosses a reparse point: $($entry.FullName)") }
+        if ($null -ne $entry -and (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-REPARSE: runtime path crosses a reparse point: $(Get-RuntimeSafeDiagnosticText -Text $entry.FullName)") }
         $next = Split-Path -Parent $cursor
         if ([string]::IsNullOrWhiteSpace($next) -or $next -ceq $cursor) { break }
         $cursor = $next
     }
-    if ($leaf.Length -le 0) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-MISSING: runtime file is empty: $full") }
-    if ($leaf.Length -gt $MaxBytes) { throw [System.ArgumentException]::new("RUNTIME-ARTIFACT-BOUND: runtime file exceeds byte bound ($MaxBytes): $full") }
+    if ($leaf.Length -le 0) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-MISSING: runtime file is empty: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
+    if ($leaf.Length -gt $MaxBytes) { throw [System.ArgumentException]::new("RUNTIME-ARTIFACT-BOUND: runtime file exceeds byte bound ($MaxBytes): $(Get-RuntimeSafeDiagnosticText -Text $full)") }
     $header = [byte[]]::new(65536)
     $headerCount = 0
     $machineHex = ''
@@ -1221,11 +1281,11 @@ function Test-RuntimeArtifactFile {
             if ($read -le 0) { break }
             $headerCount += $read
         }
-        if ($headerCount -lt 64) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: file too small for headers: $full") }
-        if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: missing MZ signature: $full") }
+        if ($headerCount -lt 64) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: file too small for headers: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
+        if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: missing MZ signature: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
         $peOffset = [System.BitConverter]::ToInt32($header, 0x3C)
-        if ($peOffset -lt 0 -or ($peOffset + 6) -gt $headerCount) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: PE offset outside header window: $full") }
-        if ($header[$peOffset] -ne 0x50 -or $header[$peOffset + 1] -ne 0x45 -or $header[$peOffset + 2] -ne 0x00 -or $header[$peOffset + 3] -ne 0x00) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: missing PE signature: $full") }
+        if ($peOffset -lt 0 -or ($peOffset + 6) -gt $headerCount) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: PE offset outside header window: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
+        if ($header[$peOffset] -ne 0x50 -or $header[$peOffset + 1] -ne 0x45 -or $header[$peOffset + 2] -ne 0x00 -or $header[$peOffset + 3] -ne 0x00) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-NOT-PE: missing PE signature: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
         $machine = [System.BitConverter]::ToUInt16($header, $peOffset + 4)
         $machineHex = ('{0:x4}' -f $machine)
         if ($machineHex -cne $ExpectedPeMachine.ToLowerInvariant()) { throw [System.InvalidOperationException]::new("RUNTIME-ARTIFACT-PE-MISMATCH: PE machine '$machineHex' is not the accepted '$ExpectedPeMachine'.") }
@@ -1354,16 +1414,16 @@ function Test-RuntimeOwnedRootAcl {
     param([Parameter(Mandatory)][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { throw [System.ArgumentException]::new('RUNTIME-INVALID-PATH: path is empty.') }
     $full = [System.IO.Path]::GetFullPath($Path)
-    if (-not (Test-Path -LiteralPath $full)) { throw [System.IO.DirectoryNotFoundException]::new("RUNTIME-ACL-ABSENT: owned path is absent: $full") }
+    if (-not (Test-Path -LiteralPath $full)) { throw [System.IO.DirectoryNotFoundException]::new("RUNTIME-ACL-ABSENT: owned path is absent: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
     $acl = $null
     try { $acl = Get-Acl -LiteralPath $full -ErrorAction Stop }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACL-UNREADABLE: ACL is not observable: $full") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACL-UNREADABLE: ACL is not observable: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
     $me = $null
     try { $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
     catch { throw [System.InvalidOperationException]::new('RUNTIME-ACL-UNREADABLE: current test principal SID is not observable.') }
     $ownerSid = $null
     try { $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACL-UNREADABLE: owner SID is not resolvable: $full") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-ACL-UNREADABLE: owner SID is not resolvable: $(Get-RuntimeSafeDiagnosticText -Text $full)") }
     if ($ownerSid -cne $me) { throw [System.InvalidOperationException]::new('RUNTIME-ACL-FOREIGN-OWNER: owned path is not owned by the current test principal.') }
     $broadSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
     $allowedMask = [int]([System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [System.Security.AccessControl.FileSystemRights]::Synchronize)
@@ -1441,10 +1501,10 @@ function New-RuntimeGovernorConfigFile {
     $parent = Split-Path -Parent $configFull
     [void](Resolve-RuntimeOwnedPath -RunRoot $RunRoot -Path $parent -ExpectedRunId $runId)
     try { [void][System.IO.Directory]::CreateDirectory($parent) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-CONFIG-CREATE-FAILED: cannot create owned config dir: $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-CONFIG-CREATE-FAILED: cannot create owned config dir: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     if (Test-Path -LiteralPath $configFull) { throw [System.InvalidOperationException]::new('RUNTIME-CONFIG-SQUAT: governor config path is already occupied; refusing to overwrite.') }
     try { [System.IO.File]::WriteAllText($configFull, $json, [System.Text.Encoding]::UTF8) }
-    catch { throw [System.InvalidOperationException]::new("RUNTIME-CONFIG-CREATE-FAILED: cannot write owned config file: $($_.Exception.Message)") }
+    catch { throw [System.InvalidOperationException]::new("RUNTIME-CONFIG-CREATE-FAILED: cannot write owned config file: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
     try { [void](Test-RuntimeOwnedRootAcl -Path $configFull) }
     catch {
         Remove-Item -LiteralPath $configFull -Force -ErrorAction SilentlyContinue
@@ -1479,4 +1539,4 @@ function Test-RuntimePortObservation {
     if ([bool]$Observation['portsOpen'] -or $ports.Count -gt 0) { $portFailures += 'ports-still-open' }
     return @{ runId = [string]$Allocation['runId']; portsObserved = $ports.Count; failures = $portFailures }
 }
-Export-ModuleMember -Function @('Get-RuntimeProviderIdentity', 'Get-RuntimeLockIdentity', 'Get-RuntimeClosedOperations', 'Get-RuntimeTerminalDispositions', 'Test-RuntimeDigestFormat', 'Test-RuntimeClosedOperation', 'Test-RuntimeTerminalDisposition', 'Resolve-RuntimeDeadline', 'Test-RuntimeBindingShape', 'Test-RuntimeProviderResultClosed', 'Invoke-RuntimeProviderOperation', 'Invoke-RuntimeValidateRequirement', 'Invoke-RuntimePlan', 'Resolve-RuntimeOwnedPath', 'Get-RuntimeChildEnv', 'New-RuntimeEphemeralCredential', 'Test-RuntimePrincipalShape', 'Test-RuntimeProviderReceipt', 'Get-RuntimeRedactedText', 'Invoke-RuntimeAllocate', 'Invoke-RuntimeStart', 'Invoke-RuntimeObserveReadiness', 'Invoke-RuntimeResetForTest', 'Invoke-RuntimeCollectEvidence', 'Invoke-RuntimeStop', 'Invoke-RuntimeVerifyCleanup', 'Resolve-RuntimeGovernorConfig', 'Test-RuntimeStoreHandleReference', 'Test-RuntimeArtifactFile', 'Test-RuntimeOwnerHandshake', 'Test-RuntimeContainmentProof', 'Get-RuntimeProcessBinding', 'Test-RuntimePrincipalBinding', 'Test-RuntimeOwnedRootAcl', 'New-RuntimeGovernorConfigFile', 'Test-RuntimePortObservation')
+Export-ModuleMember -Function @('Get-RuntimeProviderIdentity', 'Get-RuntimeLockIdentity', 'Get-RuntimeClosedOperations', 'Get-RuntimeTerminalDispositions', 'Test-RuntimeDigestFormat', 'Test-RuntimeClosedOperation', 'Test-RuntimeTerminalDisposition', 'Resolve-RuntimeDeadline', 'Test-RuntimeBindingShape', 'Test-RuntimeProviderResultClosed', 'Invoke-RuntimeProviderOperation', 'Invoke-RuntimeValidateRequirement', 'Invoke-RuntimePlan', 'Resolve-RuntimeOwnedPath', 'Get-RuntimeChildEnv', 'New-RuntimeEphemeralCredential', 'Test-RuntimePrincipalShape', 'Test-RuntimeProviderReceipt', 'Get-RuntimeRedactedText', 'Get-RuntimeSafeDiagnosticText', 'Invoke-RuntimeAllocate', 'Invoke-RuntimeStart', 'Invoke-RuntimeObserveReadiness', 'Invoke-RuntimeResetForTest', 'Invoke-RuntimeCollectEvidence', 'Invoke-RuntimeStop', 'Invoke-RuntimeVerifyCleanup', 'Resolve-RuntimeGovernorConfig', 'Test-RuntimeStoreHandleReference', 'Test-RuntimeArtifactFile', 'Test-RuntimeOwnerHandshake', 'Test-RuntimeContainmentProof', 'Get-RuntimeProcessBinding', 'Test-RuntimePrincipalBinding', 'Test-RuntimeOwnedRootAcl', 'New-RuntimeGovernorConfigFile', 'Test-RuntimePortObservation')

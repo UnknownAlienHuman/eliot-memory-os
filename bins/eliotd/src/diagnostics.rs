@@ -20,13 +20,18 @@
 //! strict-Finish, Store, Kernel, process, or authority behavior. It converts
 //! already-validated identities and already-typed owner outcomes into bounded
 //! stderr records. Missing identity stays [`UNAVAILABLE`]; secret or
-//! payload-bearing input is replaced with [`REDACTED`] before formatting,
-//! including nested owner error text.
+//! payload-bearing input is replaced by a policy handle plus redaction status
+//! before formatting, including nested owner error text. No source object is
+//! retained by this daemon boundary.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use eliot_observability::field_policy::{
+    self, RedactedHandle, RedactionReason, TelemetryFieldFamily, scrub_labels_for_emit,
+};
 use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResultAckOutcome};
 
 use super::agent_fabric::{FabricAdmission, FabricError, FabricPortId, Reservation};
@@ -98,8 +103,8 @@ const PAYLOAD_MARKERS: [&str; 7] = [
 /// provider tokens, chatops tokens, PEM headers and related shapes) is denied
 /// here, so the daemon emission boundary enforces the same recognisable-secret
 /// rule the policy library applies to span and metric labels (issue #1842,
-/// I16.3/I15.4). Denied values record [`REDACTED`] before formatting, never
-/// after.
+/// I16.3/I15.4). The compatibility sanitizers return [`REDACTED`]; emitted
+/// diagnostic fields carry a policy handle and status instead.
 #[must_use]
 pub fn carries_denied_content(value: &str) -> bool {
     if eliot_observability::field_policy::looks_like_secret(value) {
@@ -110,6 +115,20 @@ pub fn carries_denied_content(value: &str) -> bool {
         .iter()
         .chain(PAYLOAD_MARKERS.iter())
         .any(|marker| lowered.contains(marker))
+}
+
+fn local_redaction_reason(value: &str) -> Option<RedactionReason> {
+    let lowered = value.to_lowercase();
+    if SECRET_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        Some(RedactionReason::Secret)
+    } else if PAYLOAD_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        Some(RedactionReason::Content)
+    } else {
+        None
+    }
 }
 
 /// Sanitizes one validated identity for a record.
@@ -163,6 +182,82 @@ pub fn sanitize_detail(value: &str) -> String {
         return REDACTED.to_owned();
     }
     trimmed.chars().take(MAX_DETAIL_CHARS).collect()
+}
+
+/// A daemon field after shared telemetry screening and, when it is ordinary
+/// pass-through data, the existing local sanitizer. Redaction metadata is
+/// carried alongside the display value until the common emitter formats the
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScreenedValue {
+    value: String,
+    redaction: Option<RedactedHandle>,
+}
+
+impl ScreenedValue {
+    fn identity(key: &str, value: &str) -> Self {
+        screen_value(key, value, sanitize_identity)
+    }
+
+    fn detail(key: &str, value: &str) -> Self {
+        screen_value(key, value, sanitize_detail)
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            value: UNAVAILABLE.to_owned(),
+            redaction: None,
+        }
+    }
+}
+
+fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> ScreenedValue {
+    let mut candidate = BTreeMap::new();
+    candidate.insert(key.to_owned(), value.to_owned());
+    let scrubbed = scrub_labels_for_emit(TelemetryFieldFamily::OperationalLog, &candidate);
+
+    if let Some(handle) = scrubbed.handles.first() {
+        if scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) {
+            return ScreenedValue {
+                value: handle.handle.clone(),
+                redaction: Some(handle.clone()),
+            };
+        }
+        return screened_handle(key, value, RedactionReason::HandleOnly);
+    }
+
+    if let Some(reason) = local_redaction_reason(value) {
+        let handle =
+            field_policy::mint_handle(TelemetryFieldFamily::OperationalLog, key, value, reason);
+        return ScreenedValue {
+            value: handle.handle.clone(),
+            redaction: Some(handle),
+        };
+    }
+
+    let Some(scrubbed_value) = scrubbed.labels.get(key) else {
+        return ScreenedValue::unavailable();
+    };
+    let sanitized = sanitize(scrubbed_value);
+    if sanitized == UNAVAILABLE {
+        return ScreenedValue::unavailable();
+    }
+    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) && sanitized == value {
+        return screened_handle(key, value, RedactionReason::HandleOnly);
+    }
+    ScreenedValue {
+        value: sanitized,
+        redaction: None,
+    }
+}
+
+fn screened_handle(key: &str, value: &str, reason: RedactionReason) -> ScreenedValue {
+    let handle =
+        field_policy::mint_handle(TelemetryFieldFamily::OperationalLog, key, value, reason);
+    ScreenedValue {
+        value: handle.handle.clone(),
+        redaction: Some(handle),
+    }
 }
 
 /// Computes the deterministic admission digest over one namespace plus the
@@ -362,7 +457,40 @@ impl DiagnosticRecord {
 /// Emits one bounded record to the `tracing` sink and the active
 /// thread-local capture, then returns it for assertion.
 fn emit_line(event: &'static str, fields: &str) -> DiagnosticRecord {
-    let line = format!("event='{event}' {fields}");
+    emit_line_with_redactions(event, fields, &[])
+}
+
+fn emit_screened_line(
+    event: &'static str,
+    fields: &str,
+    screened: &[&ScreenedValue],
+) -> DiagnosticRecord {
+    let redactions = screened
+        .iter()
+        .filter_map(|field| field.redaction.clone())
+        .collect::<Vec<_>>();
+    emit_line_with_redactions(event, fields, &redactions)
+}
+
+fn emit_line_with_redactions(
+    event: &'static str,
+    fields: &str,
+    redactions: &[RedactedHandle],
+) -> DiagnosticRecord {
+    let mut line = format!("event='{event}' {fields}");
+    for (index, redaction) in redactions.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            line,
+            " redaction_{index}_handle='{}' redaction_{index}_status='{}' redaction_{index}_marker='{}'",
+            redaction.handle, redaction.redaction_status, REDACTED
+        );
+    }
+    if !redactions.is_empty() {
+        // The daemon has no evidence/BlobStore owner to retain the source
+        // object behind a redaction handle.
+        line.push_str(" evidence_disposition='unavailable'");
+    }
     push_capture(&line);
     tracing::info!(target: "eliotd::diagnostics", event = %event, record = %line);
     DiagnosticRecord { event, line }
@@ -419,11 +547,12 @@ pub fn emit_startup() -> DiagnosticRecord {
 /// Emits the Kernel handshake observation (transport connect/session
 /// validation). This is not semantic readiness.
 pub fn emit_kernel_handshake(connection_id: &str, validated: bool) -> DiagnosticRecord {
-    let connection = sanitize_identity(connection_id);
+    let connection = ScreenedValue::identity("connection", connection_id);
     let state = if validated { "validated" } else { "connected" };
-    emit_line(
+    emit_screened_line(
         "eliotd.kernel_handshake",
-        &format!("connection='{connection}' state='{state}'"),
+        &format!("connection='{}' state='{state}'", connection.value),
+        &[&connection],
     )
 }
 
@@ -465,36 +594,49 @@ pub fn emit_maintenance_trigger_decision(
     input: &eliot_maintenance::MaintenanceTriggerInput,
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> DiagnosticRecord {
-    let trigger = sanitize_identity(&input.trigger_id);
-    let scope = sanitize_identity(&input.scope_ref);
+    let trigger = ScreenedValue::identity("trigger", &input.trigger_id);
+    let scope = ScreenedValue::identity("scope", &input.scope_ref);
     let durable_job_ref = match &decision.durable_job_ref {
-        Some(reference) => sanitize_identity(reference),
-        None => UNAVAILABLE.to_owned(),
+        Some(reference) => ScreenedValue::identity("durable_job_ref", reference),
+        None => ScreenedValue::unavailable(),
     };
     let evidence = input
         .evidence_refs
         .iter()
-        .map(|reference| sanitize_identity(reference))
+        .map(|reference| ScreenedValue::identity("evidence", reference))
+        .collect::<Vec<_>>();
+    let evidence_text = evidence
+        .iter()
+        .map(|reference| reference.value.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    let active_job = match &input.active_job_id {
+        Some(active) => ScreenedValue::identity("active_job", active),
+        None => ScreenedValue::unavailable(),
+    };
     // I16.5 (issue #1841): the same observation as a bounded active-claims
     // gauge, fed by the run loop's live in-flight activation gate.
     if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
         metrics.record(metrics.record_maintenance_observation(input.idle));
     }
-    emit_line(
+    let mut screened = vec![&trigger, &scope, &durable_job_ref, &active_job];
+    screened.extend(evidence.iter());
+    emit_screened_line(
         "eliotd.maintenance_trigger_decision",
         &format!(
-            "service='{SERVICE_NAME}' trigger='{trigger}' family='{}' scope='{scope}' \
-             decision='{:?}' reason='{:?}' admits_job={} durable_job_ref='{durable_job_ref}' \
+            "service='{SERVICE_NAME}' trigger='{}' family='{}' scope='{}' \
+             decision='{:?}' reason='{:?}' admits_job={} durable_job_ref='{}' \
              origin='{:?}' mode='{:?}' idle={} scheduled_window={} route_available={} \
              budget_available={} user_session_available={} user_session_required={} \
              explicit_request={} safety_required={} active_job='{}' expires_at_ms='{}' \
-             evidence='{evidence}'",
+             evidence='{}'",
+            trigger.value,
             input.family,
+            scope.value,
             decision.decision,
             decision.reason,
             decision.admits_job,
+            durable_job_ref.value,
             input.trigger,
             input.mode,
             input.idle,
@@ -505,15 +647,14 @@ pub fn emit_maintenance_trigger_decision(
             input.user_session_required,
             input.explicit_request,
             input.safety_required,
-            match &input.active_job_id {
-                Some(active) => sanitize_identity(active),
-                None => UNAVAILABLE.to_owned(),
-            },
+            active_job.value,
             match input.expires_at_ms {
                 Some(expires) => expires.to_string(),
                 None => UNAVAILABLE.to_owned(),
             },
+            evidence_text,
         ),
+        &screened,
     )
 }
 
@@ -521,8 +662,8 @@ pub fn emit_maintenance_trigger_decision(
 /// payload content. The constructor takes no payload parameter by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestReceipt {
-    request_id: String,
-    operation_id: String,
+    request_id: ScreenedValue,
+    operation_id: ScreenedValue,
 }
 
 impl RequestReceipt {
@@ -530,19 +671,20 @@ impl RequestReceipt {
     #[must_use]
     pub fn of(request_id: &str, operation_id: &str) -> Self {
         Self {
-            request_id: sanitize_identity(request_id),
-            operation_id: sanitize_identity(operation_id),
+            request_id: ScreenedValue::identity("request", request_id),
+            operation_id: ScreenedValue::identity("operation", operation_id),
         }
     }
 
     /// Emits the receipt record.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.request_receipt",
             &format!(
                 "request='{}' operation='{}'",
-                self.request_id, self.operation_id
+                self.request_id.value, self.operation_id.value
             ),
+            &[&self.request_id, &self.operation_id],
         )
     }
 }
@@ -551,9 +693,9 @@ impl RequestReceipt {
 /// as their owner supplied them (or [`UNAVAILABLE`] when absent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeIdentities {
-    scope_id: String,
-    task_id: String,
-    fence: String,
+    scope_id: ScreenedValue,
+    task_id: ScreenedValue,
+    fence: ScreenedValue,
 }
 
 impl ScopeIdentities {
@@ -561,20 +703,21 @@ impl ScopeIdentities {
     #[must_use]
     pub fn of(scope_id: &str, task_id: &str, fence: &str) -> Self {
         Self {
-            scope_id: sanitize_identity(scope_id),
-            task_id: sanitize_identity(task_id),
-            fence: sanitize_identity(fence),
+            scope_id: ScreenedValue::identity("scope", scope_id),
+            task_id: ScreenedValue::identity("task", task_id),
+            fence: ScreenedValue::identity("fence", fence),
         }
     }
 
     /// Emits the resolution record.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.scope_resolved",
             &format!(
                 "scope='{}' task='{}' fence='{}'",
-                self.scope_id, self.task_id, self.fence
+                self.scope_id.value, self.task_id.value, self.fence.value
             ),
+            &[&self.scope_id, &self.task_id, &self.fence],
         )
     }
 }
@@ -674,8 +817,8 @@ pub fn disposition_of_admission(_admission: &FabricAdmission) -> AdmissionDispos
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionRecord {
     disposition: AdmissionDisposition,
-    digest: String,
-    request_id: String,
+    digest: ScreenedValue,
+    request_id: ScreenedValue,
 }
 
 impl AdmissionRecord {
@@ -684,21 +827,22 @@ impl AdmissionRecord {
     pub fn of(disposition: AdmissionDisposition, request_id: &str, digest: &str) -> Self {
         Self {
             disposition,
-            digest: sanitize_identity(digest),
-            request_id: sanitize_identity(request_id),
+            digest: ScreenedValue::identity("digest", digest),
+            request_id: ScreenedValue::identity("request", request_id),
         }
     }
 
     /// Emits the admission record.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.admission_decided",
             &format!(
                 "disposition='{}' digest='{}' request='{}'",
                 self.disposition.as_str(),
-                self.digest,
-                self.request_id
+                self.digest.value,
+                self.request_id.value
             ),
+            &[&self.digest, &self.request_id],
         )
     }
 }
@@ -726,11 +870,12 @@ impl HandoffKind {
 
 /// Emits the handoff/commitment record over validated identities.
 pub fn emit_handoff(kind: HandoffKind, operation_id: &str, digest: &str) -> DiagnosticRecord {
-    let operation = sanitize_identity(operation_id);
-    let digest = sanitize_identity(digest);
-    emit_line(
+    let operation = ScreenedValue::identity("operation", operation_id);
+    let digest = ScreenedValue::identity("digest", digest);
+    emit_screened_line(
         kind.event(),
-        &format!("operation='{operation}' digest='{digest}'"),
+        &format!("operation='{}' digest='{}'", operation.value, digest.value),
+        &[&operation, &digest],
     )
 }
 
@@ -756,6 +901,9 @@ pub enum RejectionReason {
     NeedsProposal,
     /// No eligible route; typed outcome, never a local fallback.
     NoRoute,
+    /// Claimed pair route diverges from the requested lane; the pair is
+    /// rejected closed without execution (issue #1839).
+    RouteMismatch,
     /// Local wiring contract violation.
     Contract,
     /// Receipt does not bind the exact definition digest and reservation.
@@ -792,6 +940,7 @@ impl RejectionReason {
             Self::Narrowed => "narrowed",
             Self::NeedsProposal => "needs-proposal",
             Self::NoRoute => "no-route",
+            Self::RouteMismatch => "route-mismatch",
             Self::Contract => "contract",
             Self::ReceiptBinding => "receipt-binding",
             Self::DuplicateLaunch => "duplicate-launch",
@@ -1003,7 +1152,7 @@ pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
 pub struct RejectionRecord {
     reason: RejectionReason,
     owner: OwningComponent,
-    detail: String,
+    detail: ScreenedValue,
 }
 
 impl RejectionRecord {
@@ -1013,7 +1162,7 @@ impl RejectionRecord {
         Self {
             reason,
             owner,
-            detail: sanitize_detail(detail),
+            detail: ScreenedValue::detail("detail", detail),
         }
     }
 
@@ -1035,14 +1184,15 @@ impl RejectionRecord {
 
     /// Emits the rejection record.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.candidate_rejected",
             &format!(
                 "reason='{}' owner='{}' detail='{}'",
                 self.reason.as_str(),
                 self.owner.as_str(),
-                self.detail
+                self.detail.value
             ),
+            &[&self.detail],
         )
     }
 }
@@ -1093,19 +1243,21 @@ impl CacheState {
 
 /// Emits the rebuild-state record over the owner digest identity.
 pub fn emit_rebuild(state: RebuildState, digest: &str) -> DiagnosticRecord {
-    let digest = sanitize_identity(digest);
-    emit_line(
+    let digest = ScreenedValue::identity("digest", digest);
+    emit_screened_line(
         "eliotd.cache_rebuild",
-        &format!("state='{}' digest='{digest}'", state.as_str()),
+        &format!("state='{}' digest='{}'", state.as_str(), digest.value),
+        &[&digest],
     )
 }
 
 /// Emits the cache-health record over the owner digest identity.
 pub fn emit_cache_health(state: CacheState, digest: &str) -> DiagnosticRecord {
-    let digest = sanitize_identity(digest);
-    emit_line(
+    let digest = ScreenedValue::identity("digest", digest);
+    emit_screened_line(
         "eliotd.cache_health",
-        &format!("state='{}' digest='{digest}'", state.as_str()),
+        &format!("state='{}' digest='{}'", state.as_str(), digest.value),
+        &[&digest],
     )
 }
 
@@ -1121,11 +1273,12 @@ pub const fn strict_finish_completed(authoritative_finish_supported: bool) -> bo
 /// authoritative result passthrough ([`strict_finish_completed`]), never a
 /// locally synthesized success.
 pub fn emit_finish_evaluation(attempt_id: &str, completed: bool) -> DiagnosticRecord {
-    let attempt = sanitize_identity(attempt_id);
+    let attempt = ScreenedValue::identity("attempt", attempt_id);
     let completed_text = if completed { "true" } else { "false" };
-    emit_line(
+    emit_screened_line(
         "eliotd.finish_evaluated",
-        &format!("attempt='{attempt}' completed='{completed_text}'"),
+        &format!("attempt='{}' completed='{completed_text}'", attempt.value),
+        &[&attempt],
     )
 }
 
@@ -1136,19 +1289,21 @@ pub fn emit_finish_refusal(
     reason: RejectionReason,
     owner: OwningComponent,
 ) -> DiagnosticRecord {
-    let attempt = sanitize_identity(attempt_id);
+    let attempt = ScreenedValue::identity("attempt", attempt_id);
     // I16.5 (issue #1841): the same observation as a bounded finish metric, so
     // the terminal refusal has a real producer instead of a comment.
     if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
         metrics.record(metrics.record_finish_refusal());
     }
-    emit_line(
+    emit_screened_line(
         "eliotd.finish_refused",
         &format!(
-            "attempt='{attempt}' completed='false' reason='{}' owner='{}'",
+            "attempt='{}' completed='false' reason='{}' owner='{}'",
+            attempt.value,
             reason.as_str(),
             owner.as_str()
         ),
+        &[&attempt],
     )
 }
 
@@ -1175,20 +1330,23 @@ impl DrainOutcome {
 
 /// Emits the drain record.
 pub fn emit_drain(outcome: DrainOutcome, ticket_id: &str, result_sha256: &str) -> DiagnosticRecord {
-    let ticket = sanitize_identity(ticket_id);
-    let result = sanitize_identity(result_sha256);
+    let ticket = ScreenedValue::identity("ticket", ticket_id);
+    let result = ScreenedValue::identity("result", result_sha256);
     // I16.5 (issue #1841): the same observation as a bounded termination
     // metric, so an orphaned activation has a real producer instead of a
     // comment.
     if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
         metrics.record(metrics.record_drain_observation(outcome));
     }
-    emit_line(
+    emit_screened_line(
         "eliotd.drain",
         &format!(
-            "disposition='{}' ticket='{ticket}' result='{result}'",
-            outcome.as_str()
+            "disposition='{}' ticket='{}' result='{}'",
+            outcome.as_str(),
+            ticket.value,
+            result.value
         ),
+        &[&ticket, &result],
     )
 }
 
@@ -1217,10 +1375,15 @@ impl ShutdownOutcome {
 
 /// Emits the shutdown record.
 pub fn emit_shutdown(outcome: ShutdownOutcome, detail: &str) -> DiagnosticRecord {
-    let detail = sanitize_detail(detail);
-    emit_line(
+    let detail = ScreenedValue::detail("detail", detail);
+    emit_screened_line(
         "eliotd.shutdown",
-        &format!("disposition='{}' detail='{detail}'", outcome.as_str()),
+        &format!(
+            "disposition='{}' detail='{}'",
+            outcome.as_str(),
+            detail.value
+        ),
+        &[&detail],
     )
 }
 
@@ -1233,11 +1396,15 @@ pub fn ack_is_completed(_outcome: &AgentActivationResultAckOutcome) -> bool {
 
 /// Emits the worker-acknowledgement record with `completed='false'`.
 pub fn emit_worker_ack(attempt_id: &str, worker_id: &str) -> DiagnosticRecord {
-    let attempt = sanitize_identity(attempt_id);
-    let worker = sanitize_identity(worker_id);
-    emit_line(
+    let attempt = ScreenedValue::identity("attempt", attempt_id);
+    let worker = ScreenedValue::identity("worker", worker_id);
+    emit_screened_line(
         "eliotd.worker_ack",
-        &format!("attempt='{attempt}' worker='{worker}' completed='false'"),
+        &format!(
+            "attempt='{}' worker='{}' completed='false'",
+            attempt.value, worker.value
+        ),
+        &[&attempt, &worker],
     )
 }
 
@@ -1249,10 +1416,14 @@ pub const fn process_exit_is_completed() -> bool {
 
 /// Emits the process-exit record with `completed='false'`.
 pub fn emit_process_exit(process_id: &str, exit_code: i32) -> DiagnosticRecord {
-    let process = sanitize_identity(process_id);
-    emit_line(
+    let process = ScreenedValue::identity("process", process_id);
+    emit_screened_line(
         "eliotd.process_exited",
-        &format!("process='{process}' exit='{exit_code}' completed='false'"),
+        &format!(
+            "process='{}' exit='{exit_code}' completed='false'",
+            process.value
+        ),
+        &[&process],
     )
 }
 
@@ -1264,10 +1435,11 @@ pub const fn response_write_is_completed() -> bool {
 
 /// Emits the response-write record with `completed='false'`.
 pub fn emit_response_write(operation_id: &str) -> DiagnosticRecord {
-    let operation = sanitize_identity(operation_id);
-    emit_line(
+    let operation = ScreenedValue::identity("operation", operation_id);
+    emit_screened_line(
         "eliotd.response_written",
-        &format!("operation='{operation}' completed='false'"),
+        &format!("operation='{}' completed='false'", operation.value),
+        &[&operation],
     )
 }
 
@@ -1277,8 +1449,8 @@ pub fn emit_response_write(operation_id: &str) -> DiagnosticRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorRecord {
     owner: OwningComponent,
-    code: String,
-    detail: String,
+    code: ScreenedValue,
+    detail: ScreenedValue,
 }
 
 impl ErrorRecord {
@@ -1287,8 +1459,8 @@ impl ErrorRecord {
     pub fn of(owner: OwningComponent, code: &str, detail: &str) -> Self {
         Self {
             owner,
-            code: sanitize_identity(code),
-            detail: sanitize_detail(detail),
+            code: ScreenedValue::identity("code", code),
+            detail: ScreenedValue::detail("detail", detail),
         }
     }
 
@@ -1326,14 +1498,15 @@ impl ErrorRecord {
 
     /// Emits the error record.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.operation_error",
             &format!(
                 "owner='{}' code='{}' detail='{}'",
                 self.owner.as_str(),
-                self.code,
-                self.detail
+                self.code.value,
+                self.detail.value
             ),
+            &[&self.code, &self.detail],
         )
     }
 }
@@ -1393,7 +1566,7 @@ impl Default for RepeatedFailureGuard {
 /// semantic decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelDisconnect {
-    connection_id: String,
+    connection_id: ScreenedValue,
 }
 
 impl KernelDisconnect {
@@ -1401,18 +1574,19 @@ impl KernelDisconnect {
     #[must_use]
     pub fn of(connection_id: &str) -> Self {
         Self {
-            connection_id: sanitize_identity(connection_id),
+            connection_id: ScreenedValue::identity("connection", connection_id),
         }
     }
 
     /// Emits the disconnect record with `state='unknown'`.
     pub fn emit(&self) -> DiagnosticRecord {
-        emit_line(
+        emit_screened_line(
             "eliotd.kernel_disconnect",
             &format!(
                 "connection='{}' state='{STATE_UNKNOWN}'",
-                self.connection_id
+                self.connection_id.value
             ),
+            &[&self.connection_id],
         )
     }
 }
@@ -1428,15 +1602,19 @@ pub fn emit_activation_ack(
     result_sha256: &str,
     outcome: &AgentActivationResultAckOutcome,
 ) -> DiagnosticRecord {
-    let ticket = sanitize_identity(ticket_id);
-    let result = sanitize_identity(result_sha256);
+    let ticket = ScreenedValue::identity("ticket", ticket_id);
+    let result = ScreenedValue::identity("result", result_sha256);
     let outcome_text = match outcome {
         AgentActivationResultAckOutcome::Accepted => "accepted",
         AgentActivationResultAckOutcome::Unknown => STATE_UNKNOWN,
     };
-    emit_line(
+    emit_screened_line(
         "eliotd.activation_ack",
-        &format!("ticket='{ticket}' result='{result}' outcome='{outcome_text}'"),
+        &format!(
+            "ticket='{}' result='{}' outcome='{outcome_text}'",
+            ticket.value, result.value
+        ),
+        &[&ticket, &result],
     )
 }
 
@@ -1447,14 +1625,18 @@ pub fn emit_fabric_attached(
     generation: u64,
     authority_epoch: u64,
 ) -> DiagnosticRecord {
-    let service = sanitize_identity(service);
+    let service = ScreenedValue::identity("service", service);
     // I16.5 (issue #1841): the same observation as a bounded module-health
     // metric, so the fabric attach has a real producer instead of a comment.
     if let Some(metrics) = crate::execution_metrics::daemon_metrics() {
         metrics.record(metrics.record_fabric_attached());
     }
-    emit_line(
+    emit_screened_line(
         "eliotd.fabric_attached",
-        &format!("service='{service}' generation='{generation}' epoch='{authority_epoch}'"),
+        &format!(
+            "service='{}' generation='{generation}' epoch='{authority_epoch}'",
+            service.value
+        ),
+        &[&service],
     )
 }

@@ -479,15 +479,16 @@ const FUNNEL_REFUSAL_CONTEXT: &str = "production admission";
 
 /// Recovery marker recorded on a generation-scoped challenge failure.
 ///
-/// Names the ONE recovery path this crate can actually perform: reaching the
-/// owner-set expiry carried on the outcome. The registry view also exposes
-/// `requalify_generation` as an explicit recovery, and it deliberately is not
-/// named here, because it has no production caller: the block's window is the
-/// evidence record's own `expires_at`, so the negative evidence and the block
-/// expire together and no in-window requalification event exists to trigger
-/// it. Claiming that path in the emitted record would put a recovery in the
-/// data that the daemon cannot perform.
-const GENERATION_RECOVERY: &str = "reach-outcome-expiry-on-the-retained-generation-block";
+/// Names the TWO recovery paths this crate can actually perform, and only
+/// those: reaching the owner-set expiry carried on the outcome, or the
+/// gate's explicit requalification — [`CapabilityRegistryView`]'s
+/// `requalify_generation`, wired in [`refuse_blocked_generation`] to fire
+/// when the caller-threaded evidence carries fresh positive
+/// (`probe_passed`/`observed`) standing on the exact route and generation
+/// with no contradictory fresh negative standing. A requalification the
+/// daemon cannot perform is never named here.
+const GENERATION_RECOVERY: &str =
+    "reach-outcome-expiry-or-requalify-exact-fingerprint-on-fresh-positive-evidence";
 
 /// What survives every degradation this gate records (A13.11).
 ///
@@ -859,6 +860,69 @@ fn refuse_capability_call(
     }
 }
 
+/// Lifts the retained exact-fingerprint generation block when the
+/// caller-threaded evidence requalifies the generation, returning true.
+///
+/// Requalification is fresh positive standing, not absence: at least one
+/// required capability must carry a fresh `probe_passed` or `observed`
+/// record on the exact route and admitted generation — the standing I3.4
+/// requires for production admission — and no required capability may carry
+/// a fresh `broken` or `unsupported` record on that same exact scope. Fresh
+/// contradictory standing fails closed (returns false, the block stands),
+/// because a reproduced-failure finding is not displaced while its negative
+/// evidence is still fresh; unknown or stale standing is likewise not a
+/// requalification, and expiry of the block's own window remains that case's
+/// recovery through `clear_expired`.
+///
+/// Every filter mirrors [`exact_generation_outcome`]: same route equality,
+/// same admitted generation, same owner-set freshness window, same
+/// future-observation exclusion, same required-capability binding. The
+/// fingerprint itself is never recomputed: the caller lifts exactly the
+/// block the eligibility check refused on.
+///
+/// A lifted block is not an admission: the caller re-derives from the same
+/// evidence next (re-recording when reproduced negatives persist) and the
+/// funnel side still admits per capability, so only currently evidenced
+/// routes proceed.
+fn requalify_generation_on_fresh_positive(
+    required: &[String],
+    input: &ModelInvokeInput,
+    generation: u64,
+    generation_fingerprint: &str,
+    outcomes: &mut CapabilityRegistryView,
+) -> bool {
+    if generation_fingerprint.is_empty() {
+        return false;
+    }
+    let mut positive = false;
+    for record in &input.evidence_records {
+        if record.generation != generation
+            || record.route != input.binding.route
+            || record.observed_at_unix_ms > input.now_unix_ms
+            || input.now_unix_ms >= record.expires_at_unix_ms
+            || !required.contains(&record.capability)
+        {
+            continue;
+        }
+        match record.status {
+            CapabilityEvidenceStatus::ProbePassed | CapabilityEvidenceStatus::Observed => {
+                positive = true;
+            }
+            CapabilityEvidenceStatus::Broken | CapabilityEvidenceStatus::Unsupported => {
+                return false;
+            }
+            CapabilityEvidenceStatus::Declared
+            | CapabilityEvidenceStatus::Degraded
+            | CapabilityEvidenceStatus::Unknown => {}
+        }
+    }
+    if !positive {
+        return false;
+    }
+    outcomes.requalify_generation(generation_fingerprint);
+    true
+}
+
 /// Applies the #1961 exact-generation scope to one invoke.
 ///
 /// A reproduced failure on the exact capability, route fingerprint, and
@@ -875,14 +939,14 @@ fn refuse_capability_call(
 /// generation-scope record survives as state instead of a per-call value.
 ///
 /// The block is lifted by the owner's expiry, `clear_expired` against the
-/// recorded record's own window, and a new admitted generation carries a
-/// different fingerprint and is therefore unaffected. Stated honestly: the
-/// view also exposes `requalify_generation`, and that explicit recovery is NOT
-/// wired, because the block's window is the evidence record's own
-/// `expires_at` — the negative evidence and the block expire together, so no
-/// in-window requalification event exists. The honest extent of the guarantee
-/// is therefore that the generation finding is RETAINED and re-read, not that
-/// it refuses for longer than the fresh negative evidence already refused.
+/// recorded record's own window, or by explicit requalification: fresh
+/// positive (`probe_passed`/`observed`) standing on the exact route and
+/// generation with no contradictory fresh negative standing lifts the
+/// retained finding through the view's own `requalify_generation` (see
+/// [`requalify_generation_on_fresh_positive`]), and a new admitted
+/// generation carries a different fingerprint and is therefore unaffected.
+/// A lone positive never displaces still-fresh negative evidence, and absent
+/// or stale standing requalifies nothing.
 ///
 /// Returns the refusal when the bound generation fingerprint is blocked, and
 /// `Ok(None)` when no required capability carries reproduced
@@ -923,9 +987,24 @@ fn refuse_blocked_generation(
         ))));
     }
     if !outcomes.is_route_eligible(generation_fingerprint, None, input.now_unix_ms) {
-        return Ok(Some(owner_error(format!(
-            "capability is not admitted on generation {generation} of route {requested_key}: a retained exact-fingerprint failure already blocks that generation until its recovery or requalification"
-        ))));
+        // Explicit requalification comes before the retained refusal: a
+        // generation whose exact scope now carries fresh positive standing
+        // with no contradictory fresh negative standing is requalified
+        // instead of refused past its recovery. When nothing requalifies,
+        // the retained finding refuses; when it does, the derivation below
+        // re-reads the same evidence (re-blocking on still-reproduced
+        // negatives) and the funnel side still admits per capability.
+        if !requalify_generation_on_fresh_positive(
+            required,
+            input,
+            generation,
+            generation_fingerprint,
+            &mut outcomes,
+        ) {
+            return Ok(Some(owner_error(format!(
+                "capability is not admitted on generation {generation} of route {requested_key}: a retained exact-fingerprint failure already blocks that generation until its recovery or requalification"
+            ))));
+        }
     }
     for capability in required {
         let Some(outcome) = exact_generation_outcome(
@@ -1058,7 +1137,9 @@ fn verify_gate_preconditions(
 ///   through [`CapabilityRegistryView::is_route_eligible`], which refuses
 ///   every route presenting that exact fingerprint and no other. That view is
 ///   the daemon-held one, so the block is also re-read on later attempts
-///   before any evidence is re-derived. A refusal
+///   before any evidence is re-derived; fresh positive standing on the exact
+///   scope requalifies (lifts) the retained block first, while still-fresh
+///   negative standing keeps it refusing. A refusal
 ///   with no such evidence stays `CALL`-scoped (see
 ///   [`refuse_capability_call`]).
 /// - the funnel side runs through [`admit_production_route`]: the same
@@ -1100,7 +1181,8 @@ fn gate_model_capability(
     // #1961 exact-generation scope: a reproduced failure on the exact
     // fingerprint is a generation finding, not a call error. The daemon-held
     // registry view decides eligibility, so a block recorded here keeps
-    // refusing later attempts until its own recovery; the outcome stays
+    // refusing later attempts until its own recovery or an explicit
+    // requalification on fresh positive evidence; the outcome stays
     // visible on this attempt's receipt and never becomes
     // installation-global state.
     let generation_owner = format!("kernel-resource-generation:{generation}");
@@ -1413,6 +1495,27 @@ mod tests {
         serde_json::from_value(serde_json::json!(sha256_hex(seed.as_bytes()))).map_err(Into::into)
     }
 
+    fn fixture_reference(
+        label: &str,
+    ) -> Result<eliot_agent_contracts::PublicReference, eliot_agent_contracts::ContractError> {
+        Ok(eliot_agent_contracts::PublicReference {
+            kind: "fixture".to_owned(),
+            id: eliot_agent_contracts::TargetId::new(format!("fixture-{label}"))?,
+            revision: RevisionId::new("fixture-v1")?,
+            digest: None,
+        })
+    }
+
+    fn fixture_schema_identity(
+        label: &str,
+    ) -> Result<eliot_contracts::ContractIdentity, eliot_contracts::ContractError> {
+        eliot_contracts::contract_identity(
+            format!("fixture-{label}"),
+            eliot_contracts::ContractVersion::new(1, 0, 0),
+            &serde_json::json!({ "fixture_schema": label }),
+        )
+    }
+
     fn test_route() -> TestResult<RouteFingerprint> {
         Ok(RouteFingerprint {
             host_family: "test-host".to_owned(),
@@ -1457,8 +1560,8 @@ mod tests {
         route: &RouteFingerprint,
     ) -> TestResult<StaffingPlanRequest> {
         use eliot_agent_coordinator::{
-            CandidateId, RecipeId, RecipeManifest, RoleProfileId, RoleProfileManifest,
-            RouteCandidateEvidence, StaffingLaneRequest,
+            CandidateId, LearningRole, RecipeId, RecipeManifest, RoleProfileId,
+            RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
         };
         let work_budget = test_budget();
         let work = AgentWorkUnitBrief {
@@ -1479,6 +1582,7 @@ mod tests {
             },
             stop_condition: "candidate submitted".to_owned(),
         };
+        let role_effects = work.effect_ceiling.clone();
         Ok(StaffingPlanRequest {
             candidate_id: CandidateId::new("candidate-t12-07")?,
             launch: AgentLaunchRequest {
@@ -1509,13 +1613,38 @@ mod tests {
             recipe: RecipeManifest {
                 recipe_id: RecipeId::new("recipe-t12-07")?,
                 manifest_revision: rev("recipe-rev-t12-07")?,
+                schema_identity: fixture_schema_identity("recipe-t12-07")?,
+                content_digest: test_digest("recipe-manifest-t12-07")?,
                 route_policy_revision: rev("route-policy-1")?,
                 max_lanes: 1,
                 max_descendants: 8,
+                stage_templates: vec![fixture_reference("stage-template")?],
+                work_item_templates: vec![fixture_reference("work-item-template")?],
+                dependency_templates: vec![fixture_reference("dependency-template")?],
+                merge_templates: vec![fixture_reference("merge-template")?],
+                eligible_route_classes: vec!["provider-model-a".to_owned()],
+                expansion_conditions: vec![fixture_reference("expansion-condition")?],
+                contraction_conditions: vec![fixture_reference("contraction-condition")?],
+                verifier_requirements: vec![fixture_reference("verifier-requirement")?],
+                audit_requirements: vec![fixture_reference("audit-requirement")?],
+                budget: test_budget(),
+                partial_result_behavior: fixture_reference("partial-result-behavior")?,
+                failure_behavior: fixture_reference("failure-behavior")?,
                 role_profiles: vec![RoleProfileManifest {
                     role_id: RoleProfileId::new("role-1")?,
                     manifest_revision: rev("role-rev-role-1")?,
+                    schema_identity: fixture_schema_identity("role-1")?,
+                    content_digest: test_digest("role-manifest-role-1")?,
                     required_competence: vec!["rust".to_owned()],
+                    allowed_operations: vec![fixture_reference("role-operation")?],
+                    allowed_effects: role_effects,
+                    independence_requirement: fixture_reference("independence-requirement")?,
+                    input_schemas: vec![fixture_reference("role-input-schema")?],
+                    output_schemas: vec![fixture_reference("role-output-schema")?],
+                    visibility_policy: fixture_reference("visibility-policy")?,
+                    learning_role: LearningRole::NotApplicable,
+                    stop_condition: fixture_reference("candidate-submitted")?,
+                    escalation_policy: fixture_reference("integration-owner")?,
                     allowed_route_classes: vec!["provider-model-a".to_owned()],
                     mutation_capable: false,
                 }],

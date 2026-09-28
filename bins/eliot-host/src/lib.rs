@@ -4420,6 +4420,7 @@ impl HostJobBranches {
         )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
+        host_job_launch::ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
         let child = Self::launch(
             &executable,
             executable_lease,
@@ -5118,8 +5119,9 @@ use journal_append::append_authenticated_kernel_readiness;
 use journal_append::{append_clean_marker, exact_termination_binding_matches};
 use journal_append::{
     append_reconciled, clean_marker_record, degraded_activation, drain_commit_record_for_stop,
-    initial_activation_record, pending_activation_binding, terminated_prior_kernel,
-    transition_activation_record, transition_activation_record_with_evidence,
+    initial_activation_record, pending_activation_binding, require_journal_kernel_restart_record,
+    terminated_prior_kernel, transition_activation_record,
+    transition_activation_record_with_evidence,
 };
 // I1.5 capability gate: `start_manifest_contour` reads the durable
 // `requested_capabilities` of the generation it is starting and starts only the
@@ -7369,6 +7371,15 @@ impl HostComposition {
                 "prior Kernel process/job binding is absent; cannot prove termination".to_owned(),
             ));
         }
+        // I1.9 A1: this explicit restart is permitted only when the valid
+        // journal record binds the approved relaunch artifact and carries
+        // the full process lineage for it. The gate runs before termination
+        // destroys evidence, so a missing or unbound record refuses the
+        // restart as manual recovery instead of relaunching first.
+        let (kernel_artifact, _) = active_manifest
+            .host_child_artifact_digests()
+            .map_err(|e| HostError::ProcessContour(e.to_string()))?;
+        require_journal_kernel_restart_record(&current_kernel, kernel_artifact)?;
         let old_generation = current_kernel.kernel_generation.clone();
         let host_clone = self.host.clone();
         let activation_id = self.activation_id.clone();
@@ -7445,9 +7456,6 @@ impl HostComposition {
                 "Prior kernel disposition does not match durable terminated evidence".to_owned(),
             ));
         }
-        let (kernel_artifact, _) = active_manifest
-            .host_child_artifact_digests()
-            .map_err(|e| HostError::ProcessContour(e.to_string()))?;
         let config_digest = self
             .jobs
             .config_digest
@@ -8887,6 +8895,15 @@ impl HostComposition {
                     "dead Kernel branch has no durable Kernel record".to_owned(),
                 )
             })?;
+            // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
+            // the valid journal record binds this relaunch's approved
+            // artifact and carries the full process lineage for it. The
+            // shared choke revalidates the original recorded record, refuses
+            // an artifact mismatch as manual recovery instead of relaunching
+            // an unapproved image, and refuses a record without PID/Job
+            // lineage instead of reconstructing it. The snapshot above
+            // already fails a corrupt journal.
+            require_journal_kernel_restart_record(&current, kernel_artifact)?;
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }

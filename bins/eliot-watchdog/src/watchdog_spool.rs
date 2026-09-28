@@ -278,11 +278,14 @@ impl WatchdogSpool {
     /// ever collected, then opens one bounded coherent read transaction over
     /// the header, high-water, and entries (mirroring [`readback`](Self::readback)),
     /// decodes and validates through the existing codec validators, and
-    /// delegates fence construction to [`backup::capture_fence`]. The result
-    /// is an immutable data handle carrying digests and redacted receipts
-    /// only: no live redb file is opened or copied, and no lease, heartbeat,
-    /// supervision authority, epoch, restart, deletion, or cutover state is
-    /// touched.
+    /// delegates fence construction to
+    /// [`backup::capture_fence_with_channel_coverage`]. `channel_coverage` is
+    /// the owner-bound I8.2 report to carry beside the fence's retained-record
+    /// denominator; it is validated inside that builder and never conjoined with
+    /// the denominator by this owner. The result is an immutable data handle
+    /// carrying digests and redacted receipts only: no live redb file is opened
+    /// or copied, and no lease, heartbeat, supervision authority, epoch,
+    /// restart, deletion, or cutover state is touched.
     ///
     /// Two owner-level refusals run before the capture, because this owner
     /// holds nothing that could satisfy them honestly:
@@ -311,8 +314,10 @@ impl WatchdogSpool {
     /// Returns [`SpoolError`] when the limits window is unbounded or
     /// over-ceiling, the capture names a cross-owner reference, the retained
     /// work exceeds the bounded work ceiling, the spool header or high-water
-    /// is missing or invalid, or any retained entry is expired, missing,
-    /// duplicated, conflicting, or malformed.
+    /// is missing or invalid, any retained entry is expired, missing,
+    /// duplicated, conflicting, or malformed, or a supplied channel-coverage
+    /// report is not consistent with the sensor map and its own observed
+    /// classes.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "955 owner-method contract takes the capture bindings by value; the fence builder borrows them"
@@ -321,6 +326,7 @@ impl WatchdogSpool {
         &self,
         params: backup::CaptureFenceParams,
         limits: WatchdogSpoolBackupLimits,
+        channel_coverage: Option<&crate::observation_coverage::IntervalCoverageReport>,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
         limits.validate()?;
         if params.canonical_ref.is_some() || params.ors_ref.is_some() {
@@ -374,7 +380,13 @@ impl WatchdogSpool {
                 "watchdog spool backup capture exceeds the bounded work ceiling".to_owned(),
             ));
         }
-        backup::capture_fence(&header, &entries, high_water, &params)
+        backup::capture_fence_with_channel_coverage(
+            &header,
+            &entries,
+            high_water,
+            &params,
+            channel_coverage,
+        )
     }
 
     /// Imports an isolated-restore step chain as quarantined historical evidence.

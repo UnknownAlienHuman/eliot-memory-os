@@ -13,9 +13,17 @@
 //! [`product_proof`] carries the terminal product-proof status record at the
 //! ProductProof/FinishService acceptance-owner boundary, reusing the existing
 //! I18.24 outcome and execution vocabularies instead of declaring new ones.
+//!
+//! [`burden`] carries the I16.22 contract and documentation burden views:
+//! [`burden::ContractSurfaceProfile`] and [`burden::DocumentationBurdenReceipt`]
+//! are bound to the same [`projection::ReportInputRevision`] references as every
+//! other report family, and [`burden::resolve_burden`] resolves a burden case to
+//! simplify, merge, generate, or remove with the measured delta attached, so no
+//! scalar in these views can become a target.
 
 #![forbid(unsafe_code)]
 
+pub mod burden;
 pub mod product_proof;
 pub mod projection;
 

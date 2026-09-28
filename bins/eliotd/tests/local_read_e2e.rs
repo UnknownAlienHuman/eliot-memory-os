@@ -338,6 +338,8 @@ fn result_body_for(envelope: &HostRequestEnvelope) -> TestResult<HostRequestResu
         // attempt, enforced by the Kernel legs.
         attempt: None,
         lineage: None,
+        // Wire-shape proof only: no execution evidence rides this vehicle.
+        evidence: None,
     };
     body.validate()
         .map_err(|error| format!("result body must validate: {error}"))?;

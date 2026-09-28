@@ -5,6 +5,17 @@
 //! authority envelope, or treats a provider terminal message as task finish.
 //! Physical execution is exclusively delegated to the P-03 [`ProcessExecutor`]
 //! supplied by the caller.
+//!
+//! I6.5 disposition (issue #1797): the Codex App Server bridge is
+//! **not admitted** on this contour. `CODEX_ADAPTER_ID` is a registry identity
+//! only - `eliot-native-worker` carries the entry for resolution and no
+//! `CodexAdapter::<E>::new`, `attach`, or `begin_attempt` production caller
+//! exists anywhere in the tree, so an I6.5 `BridgeContract` here would be a
+//! declaration with no consuming loader or gate. The declaration is therefore
+//! absent rather than retained as unwired source, and it returns with the
+//! first admitted Codex composition. This bridge's mechanical obligations are
+//! unchanged: the adapter stays a translator and never acquires task meaning,
+//! policy decisions, or promotion.
 
 use std::sync::Arc;
 

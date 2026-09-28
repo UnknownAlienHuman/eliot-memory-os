@@ -51,9 +51,33 @@
 //!   high-water order and family revision into the page token, so the token binds
 //!   owner-established state and not only caller-asserted fields.
 //!
+//! The same issue closes the DENOMINATOR, which the page binding above left
+//! open: a snapshot's `denominator_digest` used to be shape-checked and nothing
+//! recomputed it, so a caller could declare any well-formed digest and be
+//! admitted as a complete capture of a denominator that was never measured.
+//! Three contract changes carry that:
+//! - [`OrsBackupSnapshot::snapshot_digest`] stays the ONE derivation of the
+//!   denominator and is now re-derived by [`OrsBackupSnapshot::validate`], so a
+//!   declared denominator that does not hash to the snapshot's own contents is
+//!   [`OrsError::PayloadIntegrityMismatch`] rather than accepted on shape.
+//! - [`OrsBackupEntry::payload_state`] states, per member, whether its opaque
+//!   payload was obtained at all. Without it "this row's bytes were never
+//!   available" had no representation, and a `Complete` snapshot could contain
+//!   such a row without anything noticing.
+//! - `Complete` is additionally withheld from a member roster that is not a
+//!   roster. [`check_observed_members`] refuses a member identity repeated across
+//!   pages, `member_roster_refused` separates a plain duplicate
+//!   ([`OrsError::DuplicateConflict`]) from one whose facts disagree
+//!   ([`OrsError::IntegrityProblem`]), [`check_declared_members`] refuses a
+//!   declared frozen-family row count the pages do not carry, and
+//!   [`check_member_payload_states`] refuses an unavailable member inside a
+//!   `Complete` snapshot. Four distinct typed outcomes, because the operator
+//!   action differs in each case and one generic failure would hide that.
+//!
 //! Storage-free: no `redb`, no filesystem, no `eliot-backup` dependency.
 //! Distinct from `snapshot_model`; every new name starts `OrsBackup`/`Backup`.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -93,7 +117,18 @@ use crate::OrsError;
 /// rejected at construction and at import rather than being silently
 /// reinterpreted. For the same I05-22 reason this is a version bump with no
 /// migration rather than an in-place widening of v2.
-pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+///
+/// Issue #953 bumps this from `3` to `4` because `OrsBackupEntry` gains
+/// [`payload_state`](OrsBackupEntry::payload_state) and the declared
+/// `denominator_digest` becomes a proved value instead of a shape-checked one.
+/// A v3 shape cannot say whether a member's opaque payload was obtained, so a v3
+/// archive cannot distinguish a member it read from a member whose ciphertext it
+/// never obtained, and `Complete` could not be withheld for the second case. The
+/// bump is a WIRE constant again, not durable schema: no table, column or row
+/// changes, nothing is rewritten, and no migration is introduced — the existing
+/// [`OrsError::MigrationRequired`] refusal in
+/// [`OrsBackupSourceIdentity::new`] covers it exactly as it covered v2 and v3.
+pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 /// Hard ceiling for entries in one backup page (mirrors `MAX_RECOVERY_PAGE`).
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
@@ -203,7 +238,15 @@ impl OrsBackupFence {
     }
 }
 /// Every durable ORS row family classifiable for backup disposition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+///
+/// `Ord`/`PartialOrd`/`Hash` are derived for the admission census in
+/// `check_observed_members`, which has to key observed members by
+/// `(family, record_id)` to tell a repeat of one identity from two different
+/// rows. They are the only reason those derives exist: a string key built from
+/// `{:?}` would alias two members onto one whenever a record id contained the
+/// separator, which is exactly the silent-collapse failure the census exists to
+/// prevent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowFamilyKind {
     OperationalHistory,
@@ -803,15 +846,41 @@ impl OrsBackupRequest {
         )
     }
 }
+/// Whether one member's opaque payload was actually obtained from the source
+/// (issue #953, A6).
+///
+/// This is the only way a snapshot can say "a member of this denominator exists
+/// and I could not read its bytes" without inventing a digest for bytes nobody
+/// read. A digest for an unavailable payload would be a fabricated proof, and a
+/// sentinel string in `payload_digest` would be indistinguishable from a real
+/// row whose payload digest happens to be that value, so the statement is a
+/// two-valued typed field on the member instead.
+///
+/// It is folded into both the page digest and the snapshot denominator, so a
+/// member cannot be flipped between the two states without moving the digest
+/// that proves it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowPayloadState {
+    /// The member's opaque payload was read from the source and hashed.
+    Obtained,
+    /// The member's opaque payload could not be obtained. The entry names the
+    /// member and carries no payload digest.
+    Unavailable,
+}
 /// One backup entry: digests only, never raw payload (redaction).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsBackupEntry {
     pub record_id: String,
     pub family: RowFamilyKind,
     pub order: u64,
-    /// Digest of the opaque payload held by the store.
+    /// Digest of the opaque payload held by the store. Empty exactly when
+    /// `payload_state` is [`RowPayloadState::Unavailable`], which
+    /// [`OrsBackupSnapshot::validate`] enforces in both directions.
     pub payload_digest: String,
     pub effect_class: StoredEffectClass,
+    /// Whether this member's payload was obtained (issue #953, A6).
+    pub payload_state: RowPayloadState,
 }
 /// Per-page family continuation state (issue #2884).
 ///
@@ -934,10 +1003,18 @@ impl OrsBackupPage {
     /// the concatenation is length-delimited by construction and an embedded
     /// separator inside a `record_id` cannot make two different pages produce the
     /// same material.
+    ///
+    /// Since issue #953 each entry's material also folds the entry's
+    /// [`RowPayloadState`], so the page digest moves when a member's payload
+    /// availability moves and an unavailable member can never be laundered into
+    /// an available one behind an unchanged digest. The `v2`→`v3` label change
+    /// is that addition; it is a wire constant, not durable schema, and the
+    /// pre-existing [`OrsError::MigrationRequired`] refusal is the migration
+    /// story.
     #[must_use]
     pub fn expected_page_digest(&self) -> String {
         let mut material = format!(
-            "eliot.ors.backup_page.v2|{}|{}|{}|{}|{}|{}|",
+            "eliot.ors.backup_page.v3|{}|{}|{}|{}|{}|{}|",
             self.fence_token,
             self.page_index,
             self.is_last,
@@ -961,12 +1038,13 @@ impl OrsBackupPage {
             // cannot shift a field boundary and alias one entry set onto another.
             material.push_str(&sha256_hex(
                 format!(
-                    "eliot.ors.backup_entry.v2|{}|{:?}|{}|{}|{:?}",
+                    "eliot.ors.backup_entry.v3|{}|{:?}|{}|{}|{:?}|{:?}",
                     entry.record_id,
                     entry.family,
                     entry.order,
                     entry.payload_digest,
-                    entry.effect_class
+                    entry.effect_class,
+                    entry.payload_state
                 )
                 .as_bytes(),
             ));
@@ -1114,10 +1192,17 @@ impl OrsBackupSnapshot {
     /// Since issue #953 the denominator also transitively binds each page's
     /// capture token and capture window, because it folds `page_digest` and
     /// `page_digest` is recomputable from those fields by
-    /// [`OrsBackupPage::expected_page_digest`]. The denominator itself is still
-    /// only shape-checked by [`OrsBackupSnapshot::validate`]; it is the page
-    /// binding that is re-derived, and a snapshot whose declared denominator does
-    /// not equal this value is a residual gap outside issue #953's three items.
+    /// [`OrsBackupPage::expected_page_digest`].
+    ///
+    /// This is the ONE derivation of the denominator, and since issue #953 it is
+    /// not decorative: [`OrsBackupSnapshot::validate`] recomputes it and refuses
+    /// a snapshot whose declared `denominator_digest` does not equal it. A
+    /// well-formed 64-hex declared denominator that does not hash to this
+    /// snapshot's own contents used to pass validation on shape alone, which
+    /// meant any caller could declare any denominator and be admitted. There is
+    /// still exactly one implementation — a second derivation here would let a
+    /// producer and a validator disagree about what the denominator binds, which
+    /// is the defect in its original form.
     pub fn snapshot_digest(&self) -> String {
         let mut material = format!(
             "{}:{}:{}:{}:",
@@ -1173,6 +1258,15 @@ impl OrsBackupSnapshot {
             );
             for entry in &page.entries {
                 material.push_str(&entry.payload_digest);
+                // The availability state is folded beside the digest it qualifies,
+                // so a member whose payload was never obtained and a member whose
+                // payload was obtained but hashed to something can never produce
+                // the same denominator contribution.
+                material.push(':');
+                material.push_str(match entry.payload_state {
+                    RowPayloadState::Obtained => "obtained",
+                    RowPayloadState::Unavailable => "unavailable",
+                });
                 material.push(':');
             }
         }
@@ -1270,7 +1364,25 @@ impl OrsBackupSnapshot {
                 reason: "declared entry count does not match pages",
             });
         }
-        check_completeness(&self.completeness, counted, &self.pages)
+        // THE denominator proof (issue #953, A6). `denominator_digest` is not
+        // shape-checked and left there: it is recomputed from this snapshot's own
+        // contents through the ONE existing derivation, `snapshot_digest`, and a
+        // declared value that does not equal it is refused. The shape check above
+        // stays because it is what names the field in the refusal for a
+        // non-digest; the comparison here is what makes a well-formed digest
+        // prove anything at all. Same variant as the page binding
+        // (`OrsBackupPage::validate_binding`), because it is the same defect: a
+        // declared digest that disagrees with the content it claims to describe.
+        if self.denominator_digest != self.snapshot_digest() {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        check_completeness(
+            &self.completeness,
+            counted,
+            &self.pages,
+            self.process_stream_recovery_family.as_ref(),
+            self.versioned_artifact_family.as_ref(),
+        )
     }
 }
 /// Checks one paged family's declared snapshot state against the last page's
@@ -1312,6 +1424,21 @@ fn check_declared_family(
         return Err(OrsError::InvalidField {
             field: identity_field,
             reason: "a declared family denominator requires a family continuation on the last page",
+        });
+    }
+    // The declared frozen identity must be the identity the last page was
+    // actually read under, not merely a well-formed identity of the right
+    // family. Without this the declaration and the pages were two independent
+    // statements: a snapshot could name one frozen family snapshot at the top
+    // and carry pages read under a different one, and the declared row count
+    // that `check_observed_members` later counts against would describe rows
+    // that are not in these pages at all.
+    if let (Some(identity), Some(continuation)) = (identity, last)
+        && continuation.cursor.identity != *identity
+    {
+        return Err(OrsError::InvalidField {
+            field: identity_field,
+            reason: "declared family denominator is not the frozen family the last page was read under",
         });
     }
     if let Some(continuation) = last
@@ -1375,12 +1502,23 @@ fn check_page_shape(
     }
     Ok(())
 }
-/// Enforce completeness rules: `Complete` needs entries, valid digests, and a
-/// final last page.
+/// Enforce completeness rules: `Complete` needs entries, valid digests, a final
+/// last page, and members that agree with the declared denominator.
+///
+/// The member census ([`check_observed_members`], [`check_declared_members`]) is
+/// the A6 half and runs only on the `Complete` arm, which is exactly the claim
+/// it has to police: a `Partial` or `Incomplete` snapshot is by definition not
+/// asserting a proven denominator, so an unavailable member there is a stated
+/// reason rather than a contradiction. Nothing here downgrades a `Complete`
+/// declaration to `Partial` silently — a snapshot that contradicts its own
+/// contents is malformed, and every other violation in this validator is a
+/// refusal, so this one is too.
 fn check_completeness(
     completeness: &BackupCompleteness,
     counted: u64,
     pages: &[OrsBackupPage],
+    recovery_family: Option<&OrsFamilySnapshotIdentity>,
+    artifact_family: Option<&OrsFamilySnapshotIdentity>,
 ) -> Result<(), OrsError> {
     match completeness {
         BackupCompleteness::Complete => {
@@ -1398,8 +1536,22 @@ fn check_completeness(
             }
             for page in pages {
                 require_digest(&page.page_digest, "backup_page_digest")?;
+            }
+            check_member_payload_states(pages, true)?;
+            check_observed_members(pages)?;
+            check_declared_members(RowFamilyKind::ProcessStreamRecovery, recovery_family, pages)?;
+            check_declared_members(RowFamilyKind::VersionedArtifacts, artifact_family, pages)?;
+            // Digest shapes are required only now, and only for members whose
+            // payload was actually obtained. A member that declares its payload
+            // unavailable carries no digest at all, so demanding a 64-hex value
+            // there would demand a digest of bytes nobody read; demanding a
+            // non-empty one on an unavailable member is refused by
+            // `check_observed_members` as a fabricated proof.
+            for page in pages {
                 for entry in &page.entries {
-                    require_digest(&entry.payload_digest, "backup_payload_digest")?;
+                    if entry.payload_state == RowPayloadState::Obtained {
+                        require_digest(&entry.payload_digest, "backup_payload_digest")?;
+                    }
                 }
             }
             Ok(())
@@ -1411,9 +1563,203 @@ fn check_completeness(
                     reason: "partial snapshots must state a reason",
                 });
             }
+            check_member_payload_states(pages, false)?;
             Ok(())
         }
     }
+}
+
+/// Requires every member's payload-availability claim to be self-consistent, and
+/// — when `requires_obtained` — requires every member's payload to have been
+/// obtained at all.
+///
+/// Two rules, and they are different rules:
+///
+/// - ALWAYS: a member that says its payload is unavailable must carry no payload
+///   digest. A digest there is a hash of bytes the same entry says were never
+///   read, so it is a fabricated proof, and it is refused as the opaque-payload
+///   outcome rather than as a shape problem because the availability claim is
+///   what is wrong.
+/// - `Complete` ONLY: no member may be unavailable at all. A `Complete` snapshot
+///   is a claim that the whole denominator is in evidence, so a member whose
+///   ciphertext was never obtained contradicts that claim outright. Inside a
+///   `Partial` or `Incomplete` snapshot the same member is the stated reason
+///   rather than a contradiction, which is why the rule is scoped and not
+///   unconditional.
+///
+/// This runs on both arms while the duplicate and conflict census below runs on
+/// the `Complete` arm only: an unavailable member is a legitimate partial, but a
+/// member whose availability claim contradicts its own digest never is.
+fn check_member_payload_states(
+    pages: &[OrsBackupPage],
+    requires_obtained: bool,
+) -> Result<(), OrsError> {
+    for page in pages {
+        for entry in &page.entries {
+            let unavailable = entry.payload_state == RowPayloadState::Unavailable;
+            if unavailable && !entry.payload_digest.is_empty() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "backup_opaque_payload",
+                    reason: format!(
+                        "member {:?} of family {:?} declares its payload unavailable and also carries a payload digest",
+                        entry.record_id, entry.family
+                    ),
+                });
+            }
+            if unavailable && requires_obtained {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "backup_opaque_payload",
+                    reason: format!(
+                        "member {:?} of family {:?} has no obtainable payload, so this snapshot cannot be complete",
+                        entry.record_id, entry.family
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What one member identity was first observed to say, so a later occurrence of
+/// the same identity can be told apart from a genuinely different row.
+#[derive(Clone, Copy)]
+struct ObservedMember {
+    order: u64,
+    effect_class: StoredEffectClass,
+    payload_state: RowPayloadState,
+    has_payload_digest: bool,
+}
+
+/// The two identity-level refusals a `Complete` snapshot can earn, kept apart on
+/// purpose.
+///
+/// A repeat of one identity with the SAME facts is a duplicate: the denominator
+/// counts the member twice while the frozen family counted it once, so the
+/// snapshot is internally inconsistent even though no single row lies. A repeat
+/// with DIFFERENT facts is a conflict: two members claim one identity and
+/// disagree about what it is, which is the shape a forged or spliced archive
+/// takes. Collapsing them into one error would make the operator unable to tell
+/// a double-counted row from a row that was rewritten, which is the difference
+/// between re-running the capture and investigating the archive.
+#[derive(Clone, Copy)]
+enum MemberRoster {
+    Duplicate,
+    Conflicting,
+}
+
+/// Keys the members the pages observed and refuses a `Complete` snapshot whose
+/// roster is not a roster: a repeated member identity, and a member that
+/// conflicts with its own first observation.
+///
+/// The opaque-payload rule is [`check_member_payload_states`], not this
+/// function: availability is a per-member claim that holds on a partial
+/// snapshot too, while a doubled or contradicted member only contradicts a
+/// completeness claim.
+///
+/// This is the ONE place member identity is resolved, and it is deliberately
+/// exhaustive over the pages rather than over one page: a member identity that
+/// repeats only ACROSS pages is invisible to any per-page check, and the whole
+/// point of a denominator is that it spans pages. The key is the typed
+/// `(RowFamilyKind, String)` pair, not a formatted string, so no `record_id` can
+/// alias two members onto one.
+fn check_observed_members(pages: &[OrsBackupPage]) -> Result<(), OrsError> {
+    let mut roster: BTreeMap<(RowFamilyKind, &str), ObservedMember> = BTreeMap::new();
+    for page in pages {
+        for entry in &page.entries {
+            let key = (entry.family, entry.record_id.as_str());
+            let observed = ObservedMember {
+                order: entry.order,
+                effect_class: entry.effect_class,
+                payload_state: entry.payload_state,
+                has_payload_digest: !entry.payload_digest.is_empty(),
+            };
+            match roster.get(&key) {
+                None => {
+                    roster.insert(key, observed);
+                }
+                Some(first) => {
+                    if first.order == observed.order
+                        && first.effect_class == observed.effect_class
+                        && first.payload_state == observed.payload_state
+                        && first.has_payload_digest == observed.has_payload_digest
+                    {
+                        return Err(member_roster_refused(MemberRoster::Duplicate, entry));
+                    }
+                    return Err(member_roster_refused(MemberRoster::Conflicting, entry));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The distinct typed refusal for each way a member roster can be wrong.
+///
+/// Two different `OrsError` variants, not one variant with two reasons: the
+/// operator action differs (re-run the bounded capture versus treat the archive
+/// as untrustworthy) and a caller matching on the variant must be able to tell
+/// them apart without parsing a message.
+fn member_roster_refused(roster: MemberRoster, entry: &OrsBackupEntry) -> OrsError {
+    match roster {
+        MemberRoster::Duplicate => OrsError::DuplicateConflict,
+        MemberRoster::Conflicting => OrsError::IntegrityProblem {
+            record_type: "backup_member_roster",
+            reason: format!(
+                "member {:?} of family {:?} is observed more than once with disagreeing facts",
+                entry.record_id, entry.family
+            ),
+        },
+    }
+}
+
+/// Requires the members a `Complete` snapshot declares for one cursor-paged
+/// family to be the members its pages actually carry.
+///
+/// The declared denominator is the frozen family's `family_row_count`, taken by
+/// the owner from a streaming pass over that family's durable rows, and the
+/// observed side is the count of this family's entries across every page. When
+/// the two disagree, the snapshot is claiming a completeness it did not observe,
+/// which is the A6 "missing row prevents complete" case: a family with rows the
+/// pages did not carry can be certified `Complete` only by trusting a declared
+/// number instead of the members, and the issue forbids exactly that
+/// ("never complete from reference count alone").
+///
+/// Extra members are refused too, not only missing ones: an observed member the
+/// frozen family never counted means the pages were not read under the declared
+/// family at all, and `check_declared_family` already refuses that on the last
+/// page's in-force identity. Refusing both directions here is what makes the
+/// comparison exact rather than a one-sided lower bound.
+fn check_declared_members(
+    family: RowFamilyKind,
+    declared: Option<&OrsFamilySnapshotIdentity>,
+    pages: &[OrsBackupPage],
+) -> Result<(), OrsError> {
+    let Some(declared) = declared else {
+        // `validate` already refuses `Complete` without both family
+        // denominators, so this arm is unreachable for a `Complete` snapshot and
+        // returns the same field-named refusal rather than a new one.
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry a family denominator to count members against",
+        });
+    };
+    let observed: u64 = pages
+        .iter()
+        .flat_map(|page| &page.entries)
+        .filter(|entry| entry.family == family)
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if observed != declared.family_row_count {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "backup_member_denominator",
+            reason: format!(
+                "declared row family {family:?} denominator counts {} member(s) but the pages carry {observed}",
+                declared.family_row_count
+            ),
+        });
+    }
+    Ok(())
 }
 /// Destination identity for a backup import.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

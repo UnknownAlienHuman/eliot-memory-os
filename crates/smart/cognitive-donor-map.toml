@@ -16,8 +16,9 @@ rejected_overgeneralization = "Any Smart crate that owns capture, status, lifecy
 path = "crates/smart/eliot-context"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 targets = ["eliot-context-contracts", "eliot-context-candidates", "eliot-context-admission", "eliot-context-assembly"]
-rationale = "Retain pure whole-unit compiler, deterministic ordering and vector quality ideas; separate candidate construction, admission and rendering."
+rationale = "Retain pure whole-unit compiler, deterministic ordering and vector quality ideas; separate candidate construction, admission and rendering. Measured product consumers (#1862 owner-boundary rework): the frozen ContextCompiler rows are back to zero product consumers after the bins/eliotd eliot.packet call to ContextCompiler::compile_with_campaign_learning_state and its #[allow(deprecated)] were removed, but the crate is NOT zero-consumer — bins/eliotd campaign source boundary imports eliot_context::campaign_publication, so this donor row is not eligible for the zero-consumer step of the #40 A4 removal plan until that consumer migrates to the owner cells."
 rejected_overgeneralization = "Nested compilation, mixed ownership and a facade that recomputes child semantics."
+removal_condition = "crates/smart/eliot-context/src/facade.rs FACADE_DISPOSITIONS and the bounded removal plan (#40 A4) name the surviving bins/eliotd campaign_publication consumer; a zero-consumer re-verification that ignores it is not a retirement proof."
 
 [[donor]]
 path = "crates/smart/eliot-understanding"
@@ -105,9 +106,9 @@ path = "crates/smart/eliot-context"
 observed_disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 current_owner = "A-15/A-16a/A-17a/A-18"
 targets = ["A-15", "A-16a", "A-17a", "A-18"]
-owner_issue_refs = [584, 604, 608, 626]
-evidence = "existing donor row plus current module manifests"
-uncertainty = "facade remains compatibility material until each consumer migration is independently proved"
+owner_issue_refs = [584, 604, 608, 626, 1862]
+evidence = "existing donor row plus current module manifests; crates/smart/eliot-context/src/facade.rs FACADE_DISPOSITIONS (62 rows) and its bounded removal plan carry the measured consumer status"
+uncertainty = "facade remains compatibility material until each consumer migration is independently proved; #1862 removed the unauthorized bins/eliotd eliot.packet edge into the frozen ContextCompiler, so no binary compiles through the donor algorithm any more, but bins/eliotd still imports eliot_context::campaign_publication and the campaign->candidate/admission/assembly context edge has no admitted owner-minted admission closure (floor, priority, rule, measurement profile, quality scorecard, assembly policy, F-STU measurement port), so the zero-consumer step is not reached and no retirement is inferred"
 
 [[topology_donor]]
 path = "crates/smart/eliot-understanding"

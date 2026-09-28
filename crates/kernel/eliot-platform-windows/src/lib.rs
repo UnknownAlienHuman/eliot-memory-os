@@ -288,7 +288,8 @@ pub use supervision_authority_key::{
     WindowsSupervisionAuthorityKeyStore,
 };
 pub use tcp_listener_owner::{
-    TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
+    TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,
+    observe_loopback_tcp_connection_peer_owner, observe_loopback_tcp_listener_owner,
 };
 pub use terminal_containment::{
     TERMINAL_CONTAINMENT_DETAIL_MAX_BYTES, TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES,

@@ -4039,8 +4039,8 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
         route_scope: "daemon".to_owned(),
         old_generation: None,
         new_generation: ResourceGeneration::new(2)?,
-        old_epoch: AuthorityEpoch::new(1)?,
-        new_epoch: AuthorityEpoch::new(2)?,
+        old_epoch: test_epoch(1),
+        new_epoch: test_epoch(2),
         state: GenerationCutoverState::Armed,
     };
     let staged = store.stage_generation_cutover(first.clone())?;
@@ -4077,8 +4077,8 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
         route_scope: "worker".to_owned(),
         old_generation: None,
         new_generation: ResourceGeneration::new(3)?,
-        old_epoch: AuthorityEpoch::new(2)?,
-        new_epoch: AuthorityEpoch::new(3)?,
+        old_epoch: test_epoch(2),
+        new_epoch: test_epoch(3),
         state: GenerationCutoverState::Armed,
     };
     store.stage_generation_cutover(second.clone())?;
@@ -4096,8 +4096,8 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
         route_scope: "daemon".to_owned(),
         old_generation: Some(ResourceGeneration::new(2)?),
         new_generation: ResourceGeneration::new(5)?,
-        old_epoch: AuthorityEpoch::new(3)?,
-        new_epoch: AuthorityEpoch::new(4)?,
+        old_epoch: test_epoch(3),
+        new_epoch: test_epoch(4),
         state: GenerationCutoverState::Armed,
     };
     store.stage_generation_cutover(daemon_again.clone())?;
@@ -4108,8 +4108,8 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
         route_scope: "scheduler".to_owned(),
         old_generation: None,
         new_generation: ResourceGeneration::new(4)?,
-        old_epoch: AuthorityEpoch::new(4)?,
-        new_epoch: AuthorityEpoch::new(5)?,
+        old_epoch: test_epoch(4),
+        new_epoch: test_epoch(5),
         state: GenerationCutoverState::Armed,
     };
     store.stage_generation_cutover(interrupted)?;

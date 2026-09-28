@@ -320,16 +320,169 @@ jobs:
               (?:(?:pwsh(?:\.exe)?|powershell(?:\.exe)?|sh|bash|cmd(?:\.exe)?|/bin/(?:sh|bash))
                  (?:\s+[^\s|>&;]+)*\s+(?:-c(?:ommand)?\s+)?)?
               $''')
+          # The claim marker is assembled from fragments at runtime: this file
+          # is itself scanned by the closed `operator_harness_executed` check
+          # below, and a literal copy of the marker here would make this
+          # workflow report an execution claim it does not make. The same
+          # reason the two keys below are split.
+          operator_execution_claim = 'Operator tests: ' + 'executed'
+          # Execution conditions (issue #1225 N_step5), mirrored verbatim from
+          # scripts/verify-github-workflows.py: an invocation line is executed
+          # evidence only when the step that carries it can actually execute and
+          # its result reaches the run. The soft-failure and timeout keys are
+          # assembled at runtime from the same fragments the closed scan above
+          # uses, so this step's own source keeps passing that scan.
+          soft_failure_key = 'continue-' + 'on-' + 'error'
+          timeout_key = 'timeout-' + 'minutes'
 
-          def operator_harness_executed(text):
-              # Issue #1225 N_step5: execution is an explicit dotnet run/exec
-              # of the Eliot.Operator.Tests harness with dotnet at command
-              # position. A step name, quoted prose, a run-summary claim, or
-              # a harness-shaped mention passed to a print builtin
-              # (echo/Write-Host bypass, quoted or not) is not execution:
-              # quoted literals and comments are stripped so only real
-              # invocations count.
-              for line in text.splitlines():
+          def _strip_expression_braces(body):
+              return body.replace('$', '').replace('{', '').replace('}', '').strip()
+
+          def _strip_comment(text):
+              return text.split('#', 1)[0]
+
+          def _strip_quotes(text):
+              return text.strip().strip('\'"')
+
+          def _condition_is_falsy(expression):
+              # True when a GitHub `if:` condition provably evaluates to false:
+              # an empty condition (`if:`, `if: ${{ }}`, `if: null`) or a value
+              # that is `false` or numeric zero. Any other condition is not
+              # proof of a skip, so it stays unverifiable rather than a licence
+              # to claim execution.
+              value = _strip_quotes(_strip_comment(_strip_expression_braces(expression)))
+              text = value.strip()
+              if text in ('', 'null'):
+                  return True
+              if text.lower() == 'false':
+                  return True
+              try:
+                  return float(text) == 0.0
+              except ValueError:
+                  return False
+
+          def _condition_is_unconditional(expression):
+              # True when a GitHub `if:` condition runs the step on every
+              # dispatch. An absent condition, the literals `true`/`always()`,
+              # and a comparison whose two sides are identical all run the step
+              # whatever the run looks like. Any other condition depends on
+              # something the workflow does not fix at authoring time, so it is
+              # a condition the claim may not assume holds.
+              value = _strip_quotes(_strip_comment(_strip_expression_braces(expression)))
+              text = value.strip()
+              if text in ('', 'true', 'always', 'always()'):
+                  return True
+              left, separator, right = text.partition('==')
+              if separator and left.strip() and left.strip() == right.strip():
+                  return True
+              return False
+
+          def _yaml_key(line):
+              # The YAML mapping key of a line, or None when it carries none: an
+              # optionally quoted key, any spacing before the `:`, and either a
+              # value or a block indicator after it. Block-scalar shell source,
+              # list items and comments carry no key.
+              match = re.match(r'^\s*(?:-\s+)?(?:"([^"]*)"|\'([^\']*)\'|([^\s#:][^:]*?))\s*:(?:\s|$)', line)
+              if match is None:
+                  return None
+              for group in (match.group(1), match.group(2), match.group(3)):
+                  if group is not None:
+                      return group.strip()
+              return None
+
+          def _yaml_value(line):
+              # The scalar value written on a mapping line, or '' for a block
+              # indicator.
+              _, separator, tail = line.partition(':')
+              if not separator:
+                  return ''
+              tail = tail.strip()
+              if tail in ('|', '>', '|-', '>-', '|+', '>+'):
+                  return ''
+              return _strip_quotes(_strip_comment(tail))
+
+          def _is_yaml_comment(line):
+              stripped = line.lstrip()
+              return stripped == '' or stripped.startswith('#')
+
+          def _is_step_entry(line):
+              # True for a YAML block-sequence entry (`      - name: ...`).
+              stripped = line.lstrip(' ')
+              return stripped.startswith('- ') or stripped.rstrip() == '-'
+
+          def _enclosing_job_block(lines, index, indent):
+              # Line indexes of the job body that owns a step at `indent`.
+              # `steps:` sits between the job header and its steps, so the owning
+              # job's body is every shallower mapping line from the job header up
+              # to (and including) the `steps:` container. Every governing
+              # `if:`/soft-failure/timeout key in that body is returned, so a
+              # skipped or soft-failure job is seen no matter which key carries
+              # it.
+              governing = []
+              for previous in range(index, -1, -1):
+                  line = lines[previous]
+                  if _is_yaml_comment(line):
+                      continue
+                  key = _yaml_key(line)
+                  if key is None:
+                      continue
+                  leading = len(line) - len(line.lstrip(' '))
+                  if leading >= indent:
+                      continue
+                  governing.append(previous)
+                  if key == 'steps':
+                      break
+              return governing
+
+          def _nearest_list_item(lines, index):
+              # The index of the nearest block-sequence entry at or above `index`.
+              for previous in range(index, -1, -1):
+                  if not _is_yaml_comment(lines[previous]) and _is_step_entry(lines[previous]):
+                      return previous
+              return None
+
+          def _own_block_end(lines, item):
+              # The last line index of the block owned by the sequence entry at
+              # `item`: every following line that is blank, a comment, or
+              # indented deeper than the entry's dash. The first same-indent
+              # sibling ends the block.
+              indent = len(lines[item]) - len(lines[item].lstrip(' '))
+              last = item
+              for index in range(item + 1, len(lines)):
+                  line = lines[index]
+                  if _is_yaml_comment(line):
+                      continue
+                  if len(line) - len(line.lstrip(' ')) > indent:
+                      last = index
+                      continue
+                  break
+              return last
+
+          def _own_block(lines, item):
+              # Line indexes from the sequence entry at `item` to the end of its
+              # block.
+              return list(range(item, _own_block_end(lines, item) + 1))
+
+          def _enclosing_step_scope(lines, index):
+              # The index of the sequence entry that owns the invocation at
+              # `index`. A step's `run`/`uses` body belongs to its own sequence
+              # entry, so the owning entry is the nearest one whose block still
+              # covers `index`. The index is resolved to that entry's line, so an
+              # identical repeated mapping line never resolves to a later,
+              # unrelated block.
+              item = _nearest_list_item(lines, index)
+              if item is None:
+                  return None
+              if index > _own_block_end(lines, item):
+                  return None
+              return item
+
+          def _harness_invocations(lines):
+              # (owning sequence entry, invocation line) for every real
+              # invocation: `dotnet` at command position, not a print-builtin
+              # argument, with quoted prose and comments stripped.
+              invocations = []
+              for index, line in enumerate(lines):
                   code = re.sub(r'"[^"]*"', '', line)
                   code = re.sub(r"'[^']*'", '', code)
                   code = code.split('#', 1)[0]
@@ -341,8 +494,84 @@ jobs:
                       continue
                   if not harness_command_prefix_re.match(before):
                       continue
+                  scope = _enclosing_step_scope(lines, index)
+                  if scope is None:
+                      continue
+                  invocations.append((scope, index))
+              return invocations
+
+          def _mapping_value_is_falsy(line):
+              # True when a governing `if:` is provably false, or carries no
+              # value at all (`if:`, `if: ${{ }}`).
+              value = _yaml_value(line)
+              if value == '':
                   return True
-              return False
+              return _condition_is_falsy(value)
+
+          def _step_executes(scope, lines):
+              # True when the step carrying the invocation can execute and
+              # report. The step's own `if:`/soft-failure/timeout keys govern
+              # it, and so does the job that owns it: a job whose `if:` is false
+              # never reaches its steps, and a soft-failure job discards their
+              # results. A step timeout is a bound rather than a skip, so only a
+              # degenerate bound of zero refuses. An `if:` runs the step on every
+              # dispatch only when it is unconditional; any other condition may
+              # skip the step, so it cannot carry an execution claim.
+              indent = len(lines[scope]) - len(lines[scope].lstrip(' '))
+              governing = _enclosing_job_block(lines, scope - 1, indent)
+              governing.extend(_own_block(lines, scope))
+              for index in governing:
+                  key = _yaml_key(lines[index])
+                  if key is None:
+                      continue
+                  normalized = key.replace('_', '-').lower()
+                  if normalized == soft_failure_key:
+                      return False
+                  if normalized == timeout_key:
+                      if _mapping_value_is_falsy(lines[index]):
+                          return False
+                      continue
+                  if key.lower() == 'if':
+                      value = _yaml_value(lines[index])
+                      if _condition_is_falsy(value):
+                          return False
+                      if not _condition_is_unconditional(value):
+                          return False
+                      continue
+              return True
+
+          def operator_harness_executed(text):
+              # Issue #1225 N_step5: execution is an explicit dotnet run/exec
+              # of the Eliot.Operator.Tests harness with dotnet at command
+              # position. A step name, quoted prose, a run-summary claim, or
+              # a harness-shaped mention passed to a print builtin
+              # (echo/Write-Host bypass, quoted or not) is not execution:
+              # quoted literals and comments are stripped so only real
+              # invocations count.
+              #
+              # An invocation is execution evidence only when its step can
+              # actually execute and its result can reach the run. A step that
+              # is conditionally skipped, soft-failure, or bounded by a step
+              # timeout discards the harness result, so the run-summary claim
+              # is compared against a nonzero executed denominator: an
+              # invocable line whose step never executes satisfies that claim
+              # for nothing.
+              lines = text.splitlines()
+              invocations = _harness_invocations(lines)
+              if not invocations:
+                  return False
+              claim_index = text.find(operator_execution_claim)
+              if claim_index < 0:
+                  # No execution claim: coverage needs a step that executes.
+                  return any(_step_executes(scope, lines) for scope, _index in invocations)
+              # A claim is only satisfied by an executing invocation that
+              # precedes it: the evidence must be produced before the summary
+              # line asserts the result.
+              claim_line = text.count('\n', 0, claim_index) + 1
+              return any(
+                  scope < claim_line and _step_executes(scope, lines)
+                  for scope, _index in invocations
+              )
 
           workflow_dir = pathlib.Path('.github/workflows')
           workflows = sorted(workflow_dir.glob('*.yml'))

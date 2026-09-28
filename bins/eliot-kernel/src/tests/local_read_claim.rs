@@ -134,6 +134,9 @@ fn result_body_for(
         response,
         attempt,
         lineage: None,
+        // Claim-lifecycle fixture only: no execution evidence is presented,
+        // so the sealed manifest lists it as missing parts.
+        evidence: None,
     }
 }
 

@@ -53,6 +53,7 @@
 //! deadline is `Timeout`. No error prose drives routing.
 
 use super::kernel_audit::AuditEventDraft;
+use super::trace_manifest::TraceManifest;
 use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
@@ -413,6 +414,57 @@ enum DaemonReadQueue {
     CampaignPacket,
 }
 
+/// Queue-lane selector for claimed-lease expiry cleanup (issue #1839).
+///
+/// The submit/defer legs pass the lane they serve so expiry retires exactly
+/// the queue pair that authorized the presented attempt.
+#[derive(Clone, Copy)]
+enum ExpiryRetireLane {
+    LocalRead,
+    CampaignPacket,
+    Observe,
+    TaskController,
+    Finish,
+}
+
+/// Expiry observation for one deadline-passed claimed pair (issue #1839).
+#[derive(Clone, Copy)]
+struct ExpiredClaimObservation<'a> {
+    /// Presenting daemon session, when the expiry surfaced on an
+    /// authenticated leg (`None` for admission-time staging).
+    session: Option<&'a Session>,
+    /// Durable ORS record the expiry was detected against.
+    stored: &'a HostRequestRecord,
+    /// Serving lane that detected the expiry.
+    lane: &'static str,
+    /// Queue pair to retire for the expiry (`None` before routing, where no
+    /// lane served the operation yet).
+    retire: Option<ExpiryRetireLane>,
+    /// Route phase that detected the expiry: `admission`, `submit`, or `defer`.
+    phase: &'static str,
+    /// Presented attempt identity, when the leg presented one.
+    presented_attempt_id: Option<&'a str>,
+    /// Presented fencing generation, when the leg presented one.
+    presented_generation: Option<u64>,
+}
+
+impl<'a> ExpiredClaimObservation<'a> {
+    /// Observes a deadline-passed pair detected at admission time, before
+    /// routing, when no lane served the operation and no attempt was
+    /// presented (issue #1839).
+    fn unrouted(stored: &'a HostRequestRecord) -> Self {
+        Self {
+            session: None,
+            stored,
+            lane: "unrouted",
+            retire: None,
+            phase: "admission",
+            presented_attempt_id: None,
+            presented_generation: None,
+        }
+    }
+}
+
 impl KernelComposition {
     fn persist_observe_claim_attempt(
         &self,
@@ -606,7 +658,10 @@ impl KernelComposition {
                 }
             }
             self.note_host_request_operation_under_transition(envelope)?;
-            return Err(TransportError::Timeout);
+            // Routing has not run, so no lane served this operation yet: the
+            // record stands alone and cleanup lands on the submit legs (which
+            // retire the dead pair) or on disconnect fencing.
+            return self.expired_claim_timeout(ExpiredClaimObservation::unrouted(&stored));
         }
 
         let admitted = if stored.state == HostRequestState::Requested {
@@ -942,6 +997,7 @@ impl KernelComposition {
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
+            let mut mismatch_reason: Option<&'static str> = None;
             let routed_lane = match check_local_read_admission(envelope, tool) {
                 Ok(LocalReadAdmission::Query(_)) => {
                     // Queue admission is part of the same authenticated
@@ -980,8 +1036,10 @@ impl KernelComposition {
                         // mutation); the serve leg that admits state pairs is
                         // #2565's dispatch lane.
                         let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+                        mismatch_reason = Some("state_carrier_refused");
                         None
                     } else {
+                        mismatch_reason = Some("no_lane");
                         None
                     }
                 }
@@ -991,6 +1049,11 @@ impl KernelComposition {
                 self.audit_observe(AuditEventDraft::route_invoke_read_routed(
                     envelope, &receipt, lane,
                 ));
+            } else if let Some(reason) = mismatch_reason {
+                // Issue #1839: durable audit evidence for the rejected
+                // route. The requested capability matched no serving lane,
+                // so the work was refused before queueing.
+                self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
             }
         }
         // Coherence gate before serving: a resulted record must carry a
@@ -1006,6 +1069,8 @@ impl KernelComposition {
                 // Coherence gate only: stored rows predate attempt ownership.
                 attempt: None,
                 lineage: None,
+                // Coherence gate only: stored rows predate execution evidence.
+                evidence: None,
             }
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1602,11 +1667,10 @@ impl KernelComposition {
 
     /// Advances the exact parent of a Cancellation envelope toward cancellation.
     ///
-    /// The parent must be a known current-generation operation. Cancellation
-    /// is attempted first; when the parent already passed the cancellable
-    /// window the parent is fenced to `Unknown` instead so its outcome is
-    /// reconciled rather than assumed. Store failures are returned so a failed
-    /// durable transition never looks like cancellation succeeded.
+    /// The parent must be a known current-generation operation. ORS observes
+    /// its durable attempt in the same transaction as the cancellation: a
+    /// claimed or possibly effected operation remains Unknown for owner
+    /// reconciliation instead of being reported as safely cancelled.
     fn advance_host_request_parent(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1627,44 +1691,27 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
-        if parent.state.is_terminal() {
-            self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
-            return Ok(());
-        }
-        match self.generation_gateway.ors.advance_host_request(
-            &parent_operation,
+        let settled = self
+            .generation_gateway
+            .ors
+            .cancel_host_request_parent(&parent_operation, &parent_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let disposition = match settled.state {
+            HostRequestState::Cancelled => "cancelled",
+            HostRequestState::Unknown => "fenced_unknown",
+            HostRequestState::Reconciling => "reconciling",
+            state if state.is_terminal() => "already_terminal",
+            _ => return Err(TransportError::SessionFenced),
+        };
+        self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
+        self.audit_observe(AuditEventDraft::cancel_confirmed(
+            envelope,
+            parent_operation.as_str(),
             &parent_digest,
-            HostRequestState::Cancelled,
-            None,
-        ) {
-            Ok(Some(_)) => {
-                self.retire_observe_pair_under_transition(
-                    parent_operation.as_str(),
-                    &parent_digest,
-                );
-                Ok(())
-            }
-            Ok(None) => Err(TransportError::UnknownRequest),
-            Err(OrsError::InvalidTransition) => {
-                match self.generation_gateway.ors.advance_host_request(
-                    &parent_operation,
-                    &parent_digest,
-                    HostRequestState::Unknown,
-                    None,
-                ) {
-                    Ok(Some(_)) => {
-                        self.retire_observe_pair_under_transition(
-                            parent_operation.as_str(),
-                            &parent_digest,
-                        );
-                        Ok(())
-                    }
-                    Ok(None) => Err(TransportError::UnknownRequest),
-                    Err(_) => Err(TransportError::SessionFenced),
-                }
-            }
-            Err(_) => Err(TransportError::SessionFenced),
-        }
+            disposition,
+        ));
+        Ok(())
     }
 
     /// Requires the exact parent of a Status envelope to be known.
@@ -2174,6 +2221,86 @@ impl KernelComposition {
         }
     }
 
+    /// Audits one claimed-lease expiry and retires the dead queue pair.
+    ///
+    /// The expired pair can never complete (every submit leg re-checks the
+    /// absolute deadline), so it is retired instead of lingering as a
+    /// stranded claim; removal records the existing orphan-cleanup evidence.
+    /// Always fails with [`TransportError::Timeout`] so the expiry stays the
+    /// expected race the daemon arm projects.
+    fn expired_claim_timeout<T>(
+        &self,
+        observation: ExpiredClaimObservation<'_>,
+    ) -> Result<T, TransportError> {
+        let retired = observation.retire.is_some_and(|lane| {
+            self.retire_expired_claim_pair_under_transition(
+                lane,
+                observation.stored.operation_id.as_str(),
+                observation.stored.request_digest.as_str(),
+            )
+        });
+        // Issue #1839: durable audit evidence for claimed-lease expiry.
+        self.audit_observe(AuditEventDraft::lease_claim_expired(
+            observation.session,
+            observation.stored,
+            observation.lane,
+            observation.phase,
+            observation.presented_attempt_id,
+            observation.presented_generation,
+            retired,
+        ));
+        Err(TransportError::Timeout)
+    }
+
+    /// Retires one deadline-expired queue pair for its serving lane.
+    ///
+    /// Returns true when a queued pair was actually removed. Unlike the
+    /// completion retire legs (which record orphan cleanup for the pair they
+    /// just completed), expiry cleanup must not invent a retire record for an
+    /// operation that never queued, so removal and the orphan record stay
+    /// joined here.
+    fn retire_expired_claim_pair_under_transition(
+        &self,
+        lane: ExpiryRetireLane,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> bool {
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return false;
+        };
+        let mut removed = false;
+        for refs in index.values_mut() {
+            let before = refs.len();
+            refs.retain(|candidate| {
+                let lane_present = match lane {
+                    ExpiryRetireLane::LocalRead => candidate.local_read_envelope.is_some(),
+                    ExpiryRetireLane::CampaignPacket => {
+                        candidate.campaign_packet_envelope.is_some()
+                    }
+                    ExpiryRetireLane::Observe => candidate.observe_envelope.is_some(),
+                    ExpiryRetireLane::TaskController => {
+                        candidate.task_controller_envelope.is_some()
+                    }
+                    ExpiryRetireLane::Finish => candidate.finish_envelope.is_some(),
+                };
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && lane_present)
+            });
+            removed |= refs.len() != before;
+        }
+        if removed {
+            // Issue #1837 orphan record reused for expiry cleanup (issue
+            // #1839): the pair can never complete after its absolute
+            // deadline, so removal is orphan cleanup, not a completion.
+            self.audit_observe(AuditEventDraft::orphan_queue_retired(
+                operation_id,
+                request_digest,
+            ));
+        }
+        removed
+    }
+
     /// Submits one daemon-produced local-read result for its waiting host request.
     ///
     /// Validates the closed [`HostRequestResultBody`], binds it to the exact
@@ -2238,17 +2365,29 @@ impl KernelComposition {
             }
             DaemonReadQueue::CampaignPacket => capability == "eliot.packet",
         };
-        if stored.operation_id.as_str() != body.operation_id
-            || stored.request_digest != body.request_sha256
-            || !queue_matches_capability
-        {
-            return Err(TransportError::SessionFenced);
-        }
         let lane = match queue {
             DaemonReadQueue::LocalRead if capability == "eliot.query" => "query",
             DaemonReadQueue::LocalRead => "skill",
             DaemonReadQueue::CampaignPacket => "campaign-packet",
         };
+        let retire = match queue {
+            DaemonReadQueue::LocalRead => ExpiryRetireLane::LocalRead,
+            DaemonReadQueue::CampaignPacket => ExpiryRetireLane::CampaignPacket,
+        };
+        if stored.operation_id.as_str() != body.operation_id
+            || stored.request_digest != body.request_sha256
+            || !queue_matches_capability
+        {
+            // Issue #1839: durable audit evidence for the refused route. A
+            // stored capability outside the serving lane is a requested versus
+            // actual route divergence, not a silent fence.
+            if !queue_matches_capability {
+                self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                    session, &stored, lane,
+                ));
+            }
+            return Err(TransportError::SessionFenced);
+        }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
@@ -2266,7 +2405,21 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane,
+                retire: Some(retire),
+                phase: "submit",
+                presented_attempt_id: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_id.as_str()),
+                presented_generation: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.fencing_generation),
+            });
         }
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
@@ -2380,7 +2533,21 @@ impl KernelComposition {
             }
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane,
+                retire: Some(retire),
+                phase: "submit",
+                presented_attempt_id: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_id.as_str()),
+                presented_generation: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.fencing_generation),
+            });
         }
         let queued_envelope = {
             let index = self
@@ -2477,6 +2644,13 @@ impl KernelComposition {
                 lane,
             ))
             .is_some();
+        // Issue #1838: seal the canonical replayable trace manifest for the
+        // bound result through the single audit chain. The seal is downstream
+        // of the binding it describes, so it follows the binding append and
+        // does not participate in the #1837 binding/spool reconciliation.
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
+            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
+        ));
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
         // completes the chain from it); a failed persist likewise leaves the
@@ -3182,7 +3356,21 @@ impl KernelComposition {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane,
+                retire: Some(ExpiryRetireLane::Observe),
+                phase: "submit",
+                presented_attempt_id: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_id.as_str()),
+                presented_generation: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.fencing_generation),
+            });
         }
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
@@ -3284,7 +3472,21 @@ impl KernelComposition {
             }
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane,
+                retire: Some(ExpiryRetireLane::Observe),
+                phase: "submit",
+                presented_attempt_id: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_id.as_str()),
+                presented_generation: body
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.fencing_generation),
+            });
         }
         let queued_envelope = {
             let index = self
@@ -3346,6 +3548,11 @@ impl KernelComposition {
             queued_envelope.as_ref(),
             lane,
         ));
+        // Issue #1838: seal the canonical replayable trace manifest for the
+        // bound result through the single audit chain.
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
+            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
+        ));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
         self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
@@ -3401,7 +3608,15 @@ impl KernelComposition {
             return Ok(ObserveDeferDisposition::Settled(Box::new(stored)));
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane: "observe",
+                retire: Some(ExpiryRetireLane::Observe),
+                phase: "defer",
+                presented_attempt_id: Some(attempt.attempt_id.as_str()),
+                presented_generation: Some(attempt.fencing_generation),
+            });
         }
         let live = self.live_observe_attempt_under_transition(operation_id, request_digest)?;
         match live {
@@ -3522,6 +3737,10 @@ impl KernelComposition {
             .defer_host_request_attempt(&operation, request_digest, durable_attempt)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1839: durable audit evidence for the deferral.
+        self.audit_observe(AuditEventDraft::observe_claim_deferred(
+            session, attempt, &routed,
+        ));
         self.retire_observe_pair_under_transition(operation_id, request_digest);
         Ok(ObserveDeferDisposition::Deferred(Box::new(routed)))
     }
@@ -6010,6 +6229,8 @@ pub(crate) fn local_read_replay_response(
         // Replay readback only: stored rows predate attempt ownership.
         attempt: None,
         lineage: None,
+        // Replay readback only: stored rows predate execution evidence.
+        evidence: None,
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;

@@ -8,6 +8,8 @@
 //! remains below the `<10k LOC` split invariant; this is an implementation
 //! invariant for maintainability, not a claimed Architecture numeric rule.
 
+use std::collections::BTreeMap;
+
 use super::kernel_unavailability::{
     KernelAvailability, RecoveryDeferral, RecoveryView, semantic_task_recovery_deferral,
 };
@@ -292,6 +294,108 @@ impl KernelComposition {
                 })
             }
         }
+    }
+
+    /// Projects bounded Kernel–`eliotd` live-route metrics (issue #1839, I16.5).
+    ///
+    /// View-only: instantaneous queue/WIP/reservation gauges read from queue
+    /// memory plus cumulative lifecycle counters folded from the single #1837
+    /// audit chain and the chain head cursor for event-gap observation. There
+    /// is no second counter store: cumulative counters derive from durable
+    /// audit records (a closed kind set, so the map stays bounded), gauges
+    /// from live queue state. A lock or chain-read failure projects
+    /// `unknown` for the affected section instead of zeros, so missing
+    /// telemetry never reads as an idle route (I16.11). Consumed by future
+    /// health dispatch wiring like [`Self::blob_capability_projection`]; the
+    /// dispatch wiring itself is owned there.
+    #[must_use]
+    pub fn daemon_route_metrics_projection(&self) -> serde_json::Value {
+        let Ok(index) = self.host_request_connection_index.lock() else {
+            observe_health("kernel.health.route_metrics_projected", "fenced");
+            return serde_json::json!({"status": "unknown"});
+        };
+        let mut queued_query = 0_u64;
+        let mut queued_campaign_packet = 0_u64;
+        let mut queued_observe = 0_u64;
+        let mut queued_task_controller = 0_u64;
+        let mut queued_finish = 0_u64;
+        let mut live_claims = 0_u64;
+        let mut observe_reservations = 0_u64;
+        for candidate in index.values().flatten() {
+            if candidate.local_read_envelope.is_some() {
+                queued_query += 1;
+                if candidate.local_read_attempt.is_live() {
+                    live_claims += 1;
+                }
+            }
+            if candidate.campaign_packet_envelope.is_some() {
+                queued_campaign_packet += 1;
+                if candidate.campaign_packet_attempt.is_live() {
+                    live_claims += 1;
+                }
+            }
+            if candidate.observe_envelope.is_some() {
+                queued_observe += 1;
+                if candidate.observe_attempt.is_live() {
+                    live_claims += 1;
+                }
+            }
+            if candidate.task_controller_envelope.is_some() {
+                queued_task_controller += 1;
+                if candidate.task_controller_attempt.is_live() {
+                    live_claims += 1;
+                }
+            }
+            if candidate.finish_envelope.is_some() {
+                queued_finish += 1;
+                if candidate.finish_attempt.is_live() {
+                    live_claims += 1;
+                }
+            }
+            if candidate.observe_reservation.is_some() {
+                observe_reservations += 1;
+            }
+        }
+        drop(index);
+        let gauges = serde_json::json!({
+            "queued_pairs": {
+                "query": queued_query,
+                "campaign_packet": queued_campaign_packet,
+                "observe": queued_observe,
+                "task_controller": queued_task_controller,
+                "finish": queued_finish,
+            },
+            "live_claims": live_claims,
+            "observe_reservations_outstanding": observe_reservations,
+        });
+        let (cumulative, chain, outcome) = match self.audit_chain_records() {
+            Ok(records) => {
+                let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+                for record in &records {
+                    *by_kind.entry(record.kind.as_str()).or_default() += 1;
+                }
+                let head_seq = records.last().map(|record| record.seq);
+                (
+                    serde_json::to_value(&by_kind).unwrap_or(serde_json::Value::Null),
+                    serde_json::json!({
+                        "records": records.len(),
+                        "head_seq": head_seq,
+                    }),
+                    "success",
+                )
+            }
+            Err(_) => (
+                serde_json::json!({"status": "unknown"}),
+                serde_json::json!({"status": "unknown"}),
+                "degraded",
+            ),
+        };
+        observe_health("kernel.health.route_metrics_projected", outcome);
+        serde_json::json!({
+            "gauges": gauges,
+            "cumulative": cumulative,
+            "chain": chain,
+        })
     }
 
     /// Projects the restricted Recovery View for surviving Host/Watchdog

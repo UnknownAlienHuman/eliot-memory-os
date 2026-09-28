@@ -120,6 +120,43 @@ pub(super) fn terminated_prior_kernel(
     }))
 }
 
+/// I1.9 A1 gate: permits a Host-managed Kernel restart only when the valid
+/// journal `Kernel` record carries both this relaunch's approved artifact
+/// and the full process lineage for that approval.
+///
+/// The record is the original journal recording: it is revalidated with the
+/// existing [`KernelRecord::validate`], never replaced by a freshly
+/// recomputed checksum over a held copy. The approved artifact bound here is
+/// the exact digest the relaunch is about to start; the required lineage is
+/// the record's own generation/Job/process binding (`kernel_generation`,
+/// `candidate_job_binding`, `process`), which must be present in that same
+/// record. Absence, invalidity, an artifact mismatch, or missing lineage
+/// refuses the restart as manual recovery instead of reconstructing or
+/// approximating state from a live PID or a directory listing.
+pub(super) fn require_journal_kernel_restart_record(
+    current: &KernelRecord,
+    kernel_artifact: &PlatformHandle,
+) -> Result<(), HostError> {
+    current.validate().map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Kernel restart refused: durable Kernel record is invalid ({error}); manual recovery required"
+        ))
+    })?;
+    if current.approved_artifact_hash != *kernel_artifact {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: durable Kernel record does not bind the approved relaunch artifact; manual recovery required"
+                .to_owned(),
+        ));
+    }
+    if current.candidate_job_binding.is_none() || current.process.is_none() {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: durable Kernel record carries no PID/Job lineage for the approved artifact; manual recovery required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The proven ingress one fresh activation generation is created for.
 ///
 /// I1.5 requires the durable `EliotActivationRecord` to carry the real

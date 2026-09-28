@@ -20,7 +20,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 use uuid::Uuid;
@@ -85,13 +85,14 @@ impl RpcSession {
         Ok(session)
     }
     async fn signin(&self, username: &str, password: &SecretString) -> Result<(), AdapterError> {
-        self.request(
+        self.request_with_guard(
             "auth.signin",
             "signin",
             json!([{
                 "user": username,
                 "pass": password.expose_secret(),
             }]),
+            true,
         )
         .await
         .map(|_| ())
@@ -113,6 +114,17 @@ impl RpcSession {
         method: &'static str,
         params: Value,
     ) -> Result<Value, AdapterError> {
+        self.request_with_guard(operation, method, params, false)
+            .await
+    }
+
+    async fn request_with_guard(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+        params: Value,
+        prove_connection_owner: bool,
+    ) -> Result<Value, AdapterError> {
         let id = format!("{RPC_PROTOCOL_VERSION}:{operation}:{}", Uuid::new_v4());
         let expected_id = Value::String(id.clone());
         let payload = serde_json::to_string(&RpcRequest {
@@ -122,7 +134,8 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id).await
+        self.request_payload(payload, expected_id, prove_connection_owner)
+            .await
     }
 
     async fn request_without_params(
@@ -139,20 +152,28 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id).await
+        self.request_payload(payload, expected_id, true).await
     }
 
     async fn request_payload(
         &self,
         payload: String,
         expected_id: Value,
+        prove_connection_owner: bool,
     ) -> Result<Value, AdapterError> {
-        let _owner = self
+        let owner = self
             .owner
             .upgrade()
             .ok_or(AdapterError::ProviderUnavailable)?;
         timeout(self.request_timeout, async {
             let mut socket = self.socket.lock().await;
+            if prove_connection_owner {
+                let (client_local_endpoint, peer_endpoint) =
+                    connected_tcp_endpoints(socket.get_ref())?;
+                owner
+                    .validate_connected_peer(client_local_endpoint, peer_endpoint)
+                    .await?;
+            }
             socket
                 .send(Message::Text(payload.into()))
                 .await
@@ -190,6 +211,25 @@ impl RpcSession {
         })
         .await
         .map_err(|_| AdapterError::ProviderUnavailable)?
+    }
+}
+
+fn connected_tcp_endpoints(
+    stream: &MaybeTlsStream<tokio::net::TcpStream>,
+) -> Result<(SocketAddr, SocketAddr), AdapterError> {
+    match stream {
+        MaybeTlsStream::Plain(stream) => {
+            let client_local_endpoint = stream
+                .local_addr()
+                .map_err(|_| AdapterError::ProviderUnavailable)?;
+            let peer_endpoint = stream
+                .peer_addr()
+                .map_err(|_| AdapterError::ProviderUnavailable)?;
+            Ok((client_local_endpoint, peer_endpoint))
+        }
+        _ => Err(AdapterError::Config(
+            "provider WebSocket transport does not expose its TCP peer".to_owned(),
+        )),
     }
 }
 

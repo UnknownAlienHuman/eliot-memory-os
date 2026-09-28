@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod pack_hash;
 mod procedure_projection;
 
 pub use contract::*;
+pub use pack_hash::*;
 pub use procedure_projection::*;
 
 /// Stable package contract name.

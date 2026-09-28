@@ -47,12 +47,31 @@ impl RustcCommand {
     ) -> Result<Self, RustcError> {
         let target = checked_text(target.into(), "target")?;
         let source = checked_text(source.into(), "source")?;
+        // A response file would hide the real argument vector from the
+        // adapter; only an explicit source path is admitted.
+        if source.starts_with('@') {
+            return Err(RustcError::InvalidCommand(
+                "source must be a file path; response files are refused".to_owned(),
+            ));
+        }
         let mut arguments = vec!["--error-format=json".to_owned(), source];
         for option in options {
             let option = checked_text(option.clone(), "option")?;
             if option == "--error-format=json" || option.starts_with("--error-format=json,") {
                 return Err(RustcError::InvalidCommand(
                     "error format must be selected by the adapter".to_owned(),
+                ));
+            }
+            // The output location always comes from the admitted target
+            // root: a caller-supplied output override or an opaque response
+            // file could redirect the actual output elsewhere (issue #1806).
+            if option.starts_with("-o")
+                || option == "--out-dir"
+                || option.starts_with("--out-dir=")
+                || option.starts_with('@')
+            {
+                return Err(RustcError::InvalidCommand(
+                    "output location must come from the admitted target root".to_owned(),
                 ));
             }
             arguments.push(option);

@@ -131,6 +131,7 @@ mod runtime_root_contract;
 mod scm_approval;
 mod setup_binding;
 mod signed_activation;
+mod survey;
 mod transaction;
 
 pub use installation_registry::RedbInstallationRegistry;
@@ -166,6 +167,12 @@ use approved_generation_registry::{
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
     IntegrationCategory, IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry,
+};
+
+pub use survey::{
+    InstallationSurvey, SurveyCandidate, SurveyFamilyReport, SurveyInputObservation,
+    SurveyObservationSource, SurveyProbeAdmission, SurveyProbeAnswer, SurveyStage,
+    SurveyStageOutcome, SurveyStageResult, survey_installation,
 };
 
 pub use activation::{
@@ -206,9 +213,11 @@ pub use credential_provision::{
 };
 pub use package::{PackageObservationSnapshot, PackageObservedFile};
 use package::{
-    execute_package, inspect_package, package_plan_error, package_port_error, reconcile_package,
-    validate_package_binding, validate_package_relative_text,
-    validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
+    execute_package, inspect_package, is_request_correlated_package_staging_unknown,
+    is_typed_package_staging_unknown_reference, package_plan_error, package_port_error,
+    package_staging_unknown_port_error, reconcile_package, validate_package_binding,
+    validate_package_relative_text, validate_staging_receipt_for_observation,
+    validate_staging_receipt_for_plan,
 };
 #[cfg(test)]
 use package::{package_absent_with_snapshot, package_manifest_matches, package_staging_reference};
@@ -4452,7 +4461,11 @@ impl WindowsInstallationEffectPort {
         request: &InstallationEffectRequest,
     ) -> Result<InstallationEffectObservation, PortError> {
         let (spec, operation) = windows_root_spec(request)?;
-        match self.primitive.inspect(&spec).map_err(root_port_error)? {
+        match self
+            .primitive
+            .inspect(&spec)
+            .map_err(|error| installer_root_reconcile_error(request, error))?
+        {
             InstallerRootPrimitiveObservation::Absent(snapshot) => {
                 absent_observation(request, snapshot)
             }
@@ -5327,69 +5340,7 @@ impl WindowsInstallationEffectPort {
                 })
             }
             HostCredentialControlResponse::Deleted { absence_digest } => {
-                let prior = host_request
-                    .expected_receipt
-                    .as_ref()
-                    .ok_or(PortError::IdentityConflict)?;
-                let expected = credential_deleted_response_digest(
-                    &host_request.intent.request_digest,
-                    &prior.host_owner_epoch,
-                    &prior.host_process_identity,
-                    &prior.marker,
-                )
-                .map_err(|_| PortError::IdentityConflict)?;
-                if expected != absence_digest {
-                    return Err(PortError::IdentityConflict);
-                }
-                // s33.3 (#1313): a delete acknowledgement without a typed
-                // absence snapshot cannot pass the strict rollback gate
-                // (`validate()` requires os/credential/package). Preserve the
-                // admitted credential snapshot verbatim when the rollback
-                // request already carries it (fixed inspect followed by
-                // reconcile). Otherwise independently re-observe absence now
-                // through an `Inspect` Host call and bind its snapshot via
-                // `with_credential_snapshot` — never fabricated from the plan.
-                // The delete digest stays in evidence alongside the fresh
-                // absent digest so both the authenticated delete and the
-                // re-observed absence are bound. Any non-absent re-readback
-                // fails closed.
-                if request.precondition.credential_snapshot.is_some() {
-                    return Ok(InstallationEffectObservation::Absent {
-                        observed_precondition: request.precondition.clone(),
-                        evidence: vec![absence_digest],
-                        service_runtime_lineage: None,
-                    });
-                }
-                let inspect_request = Self::host_credential_request(
-                    request,
-                    HostCredentialControlOperation::Inspect,
-                    Vec::new(),
-                )?;
-                match self.call_credential_host(&inspect_request)? {
-                    HostCredentialControlResponse::Absent {
-                        snapshot,
-                        response_digest,
-                    } => {
-                        if response_digest
-                            != credential_absent_response_digest(
-                                &inspect_request.intent.request_digest,
-                                &snapshot,
-                            )
-                            .map_err(|_| PortError::IdentityConflict)?
-                        {
-                            return Err(PortError::IdentityConflict);
-                        }
-                        Ok(InstallationEffectObservation::Absent {
-                            observed_precondition: request
-                                .precondition
-                                .with_credential_snapshot(snapshot)
-                                .map_err(|_| PortError::InvalidRequestMetadata)?,
-                            evidence: vec![absence_digest, response_digest],
-                            service_runtime_lineage: None,
-                        })
-                    }
-                    _ => Err(PortError::IdentityConflict),
-                }
+                self.credential_deleted_observation(request, &host_request, absence_digest)
             }
             HostCredentialControlResponse::PhaseBReady { .. }
             | HostCredentialControlResponse::PhaseBPrepared { .. } => {
@@ -5398,6 +5349,82 @@ impl WindowsInstallationEffectPort {
             HostCredentialControlResponse::Unknown { pending_ref } => {
                 Ok(InstallationEffectObservation::Mismatch { pending_ref })
             }
+        }
+    }
+
+    /// Observes the post-delete absence bound to a delete acknowledgement.
+    ///
+    /// Pure split from `credential_observation` (s33.3, #1313): the expected
+    /// delete digest is still compared exactly against the recorded receipt
+    /// and never recomputed, and the snapshot rules are unchanged.
+    fn credential_deleted_observation(
+        &self,
+        request: &InstallationEffectRequest,
+        host_request: &HostCredentialControlRequest,
+        absence_digest: PlatformHandle,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let prior = host_request
+            .expected_receipt
+            .as_ref()
+            .ok_or(PortError::IdentityConflict)?;
+        let expected = credential_deleted_response_digest(
+            &host_request.intent.request_digest,
+            &prior.host_owner_epoch,
+            &prior.host_process_identity,
+            &prior.marker,
+        )
+        .map_err(|_| PortError::IdentityConflict)?;
+        if expected != absence_digest {
+            return Err(PortError::IdentityConflict);
+        }
+        // s33.3 (#1313): a delete acknowledgement without a typed
+        // absence snapshot cannot pass the strict rollback gate
+        // (`validate()` requires os/credential/package). Preserve the
+        // admitted credential snapshot verbatim when the rollback
+        // request already carries it (fixed inspect followed by
+        // reconcile). Otherwise independently re-observe absence now
+        // through an `Inspect` Host call and bind its snapshot via
+        // `with_credential_snapshot` — never fabricated from the plan.
+        // The delete digest stays in evidence alongside the fresh
+        // absent digest so both the authenticated delete and the
+        // re-observed absence are bound. Any non-absent re-readback
+        // fails closed.
+        if request.precondition.credential_snapshot.is_some() {
+            return Ok(InstallationEffectObservation::Absent {
+                observed_precondition: request.precondition.clone(),
+                evidence: vec![absence_digest],
+                service_runtime_lineage: None,
+            });
+        }
+        let inspect_request = Self::host_credential_request(
+            request,
+            HostCredentialControlOperation::Inspect,
+            Vec::new(),
+        )?;
+        match self.call_credential_host(&inspect_request)? {
+            HostCredentialControlResponse::Absent {
+                snapshot,
+                response_digest,
+            } => {
+                if response_digest
+                    != credential_absent_response_digest(
+                        &inspect_request.intent.request_digest,
+                        &snapshot,
+                    )
+                    .map_err(|_| PortError::IdentityConflict)?
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                Ok(InstallationEffectObservation::Absent {
+                    observed_precondition: request
+                        .precondition
+                        .with_credential_snapshot(snapshot)
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    evidence: vec![absence_digest, response_digest],
+                    service_runtime_lineage: None,
+                })
+            }
+            _ => Err(PortError::IdentityConflict),
         }
     }
 
@@ -6011,7 +6038,8 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 Ok(key) => key,
                 Err(error) => return PortOutcome::Error(error),
             };
-            reconcile_package(request, &key).map_err(|error| package_port_error(&error))
+            reconcile_package(request, &key)
+                .map_err(|error| package_staging_unknown_port_error(request, &error))
         } else if matches!(
             request.plan,
             InstallerEffectPlan::ProvisionStoreCredential { .. }
@@ -6863,6 +6891,106 @@ fn installer_root_reference(stage: InstallerRootStage, code: u32) -> PlatformHan
         installer_root_stage_token(stage),
     ))
     .unwrap_or_else(|_| unreachable!())
+}
+
+/// Prefix for a request-correlated installer-root unknown reference.
+///
+/// Issue #1352 (X1): the per-class extension of the service-registration
+/// unknown scheme to the installer root. The reference carries the initiating
+/// [`InstallationEffectRequest::intent_digest`] ahead of the exact
+/// `<stage>:<code>` Win32 cause the uncorrelated `installer-root-win32-v2`
+/// grammar carries, so a post-effect root unknown stays reconcilable under
+/// its original operation.
+const INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX: &str = "installer-root-unknown-v1:";
+
+/// Accepts only the exact request-correlated installer-root unknown grammar:
+/// the request identity digest, then the same `<stage>:<code>` cause the
+/// uncorrelated [`is_typed_installer_root_reference`] grammar carries.
+fn is_typed_installer_root_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let Some((digest, cause)) = rest.split_once(':') else {
+        return false;
+    };
+    if !is_lower_sha256(digest) {
+        return false;
+    }
+    is_typed_installer_root_reference(&format!("installer-root-win32-v2:{cause}"))
+}
+
+/// Whether `reference` is the typed installer-root unknown reference that was
+/// published for exactly `intent_digest`.
+///
+/// Same binding shape as
+/// [`is_request_correlated_service_registration_unknown`]: the grammar check
+/// alone proves only well-formedness; the embedded request-identity field
+/// must equal the intent digest the durable transaction holds. The digest is
+/// compared, never recomputed.
+fn is_request_correlated_installer_root_unknown(
+    reference: &str,
+    intent_digest: &PlatformHandle,
+) -> bool {
+    is_typed_installer_root_unknown_reference(reference)
+        && reference
+            .strip_prefix(INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            == Some(intent_digest.as_str())
+}
+
+/// Projects one observed installer-root Win32 failure into the
+/// request-correlated unknown reference.
+///
+/// The mint runs in the immediate continuation of this operation's own
+/// reconcile readback. A request that cannot form its own canonical identity
+/// cannot carry a request-correlated reference; that is a deterministic
+/// contract rejection, never a synthesized digest and never a published
+/// mismatch.
+fn installer_root_unknown_reference(
+    request: &InstallationEffectRequest,
+    stage: InstallerRootStage,
+    code: u32,
+) -> Result<PlatformHandle, PortError> {
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let reference = format!(
+        "{INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX}{}:{}:{code:08x}",
+        intent_digest.as_str(),
+        installer_root_stage_token(stage),
+    );
+    if !is_typed_installer_root_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// Maps one installer-root reconcile readback failure to its port error.
+///
+/// Issue #1352 (X1): a Win32 failure observed while reconciling a committed
+/// intent keeps the request-correlated unknown reference, so the unresolved
+/// read stays attributable to its original operation and a later drive can
+/// reconcile it again. A mint that cannot form its own reference, and every
+/// other failure, keeps the existing [`root_port_error`] projection
+/// unchanged, so the recorded cause still survives as a terminal unknown.
+fn installer_root_reconcile_error(
+    request: &InstallationEffectRequest,
+    error: InstallerRootError,
+) -> PortError {
+    if let InstallerRootError::Win32 { stage, code } = error
+        && let Ok(reference) = installer_root_unknown_reference(request, stage, code)
+    {
+        return PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference,
+        };
+    }
+    root_port_error(error)
 }
 
 fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> PortError {
@@ -8673,7 +8801,7 @@ where
             self.store.compare_and_save(expected, &transaction)?;
         }
         // Issue #1352: an effect whose committed intent survived a typed
-        // service-registration unknown is unresolved for the reason the
+        // request-correlated unknown is unresolved for the reason the
         // transaction durably recorded, so the `unreconciled` scan reports that
         // exact request-correlated cause rather than the intent digest and
         // `persist_quarantined` keeps the stage, Win32 code and SCM sample.
@@ -8691,10 +8819,7 @@ where
                         .pending_external_changes
                         .iter()
                         .find(|pending| {
-                            is_request_correlated_service_registration_unknown(
-                                pending.as_str(),
-                                intent_digest,
-                            )
+                            is_request_correlated_unknown(pending.as_str(), intent_digest)
                         })
                         .cloned()
                         .or_else(|| Some(intent_digest.clone()))
@@ -9168,19 +9293,21 @@ where
     /// Issue #1352: an observation that could not be classified must not destroy
     /// the identity of an operation that already committed its intent. When
     /// [`has_reconcilable_service_registration_intent`] proves that this exact
-    /// observation is the request-correlated service-registration unknown of
-    /// that committed intent, the intent is preserved: the typed cause is
-    /// recorded in `pending_external_changes`, the transaction stays
-    /// `RollbackRequired`, and the effect keeps the `attempt`/`intent_digest`
-    /// that authorized the external object, so re-driving this transaction
-    /// re-enters [`Self::drive_effect_at`]'s `IntentCommitted` branch and
-    /// issues `port.reconcile` for the same reconstructed request. I3.15 keeps
-    /// such a stage at `UNKNOWN_OUTCOME`/`ROLLBACK_REQUIRED` "until read-back
-    /// reconciliation", which requires exactly this retained identity.
+    /// observation is the request-correlated unknown of that committed intent —
+    /// service-registration, installer-root or package-staging — the intent is
+    /// preserved: the typed cause is recorded in `pending_external_changes`,
+    /// the transaction stays `RollbackRequired`, and the effect keeps the
+    /// `attempt`/`intent_digest` that authorized the external object, so
+    /// re-driving this transaction re-enters [`Self::drive_effect_at`]'s
+    /// `IntentCommitted` branch and issues `port.reconcile` for the same
+    /// reconstructed request. I3.15 keeps such a stage at
+    /// `UNKNOWN_OUTCOME`/`ROLLBACK_REQUIRED` "until read-back reconciliation",
+    /// which requires exactly this retained identity.
     ///
     /// Every other contour — a pre-intent observation, an intent this
-    /// transaction can no longer reconstruct, a different post-intent cause and
-    /// every non-service effect — keeps the existing terminal
+    /// transaction can no longer reconstruct, a different post-intent cause,
+    /// an uncorrelated reference and every non-reconcile effect observation —
+    /// keeps the existing terminal
     /// [`InstallationEffectProgressState::Unknown`] disposition unchanged.
     fn persist_unknown(
         &mut self,
@@ -10159,6 +10286,21 @@ fn is_request_correlated_service_registration_unknown(
             == Some(intent_digest.as_str())
 }
 
+/// Whether `reference` is a request-correlated unknown reference of any
+/// effect class for exactly `intent_digest`.
+///
+/// Issue #1352 (X1): per-class composition of the three request-correlated
+/// unknown grammars — service-registration, installer-root and
+/// package-staging. Each arm keeps its own grammar and its own exact digest
+/// binding; this only shares the disjunction between the persist guard and
+/// the rollback scan so the two can never disagree on what counts as this
+/// operation's own cause.
+fn is_request_correlated_unknown(reference: &str, intent_digest: &PlatformHandle) -> bool {
+    is_request_correlated_service_registration_unknown(reference, intent_digest)
+        || is_request_correlated_installer_root_unknown(reference, intent_digest)
+        || is_request_correlated_package_staging_unknown(reference, intent_digest)
+}
+
 /// Whether `index` still holds the committed intent that `pending_ref` names as
 /// unresolved, and therefore still has to be reconciled under that intent.
 ///
@@ -10174,10 +10316,11 @@ fn is_request_correlated_service_registration_unknown(
 ///
 /// 1. the effect is in `IntentCommitted` with a non-zero attempt (any other
 ///    state has no committed operation to preserve);
-/// 2. `pending_ref` is a well-formed service-registration unknown reference
-///    whose embedded request identity equals that `intent_digest`, so the
-///    observation is provably this operation's own cause and not a sibling
-///    effect's or a bare crash window's;
+/// 2. `pending_ref` is a well-formed request-correlated unknown reference of
+///    any effect class — service-registration, installer-root or
+///    package-staging — whose embedded request identity equals that
+///    `intent_digest`, so the observation is provably this operation's own
+///    cause and not a sibling effect's or a bare crash window's;
 /// 3. [`effect_request`] still rebuilds a request for the persisted attempt
 ///    whose own [`InstallationEffectRequest::intent_digest`] equals the recorded
 ///    one, so the transaction still reproduces the intent verbatim.
@@ -10199,9 +10342,7 @@ fn has_reconcilable_service_registration_intent(
     else {
         return false;
     };
-    if *attempt == 0
-        || !is_request_correlated_service_registration_unknown(pending_ref.as_str(), intent_digest)
-    {
+    if *attempt == 0 || !is_request_correlated_unknown(pending_ref.as_str(), intent_digest) {
         return false;
     }
     effect_request(
@@ -10292,6 +10433,8 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
             if is_typed_installer_root_reference(reference.as_str())
                 || is_typed_package_staging_reference(reference.as_str())
                 || is_typed_service_registration_unknown_reference(reference.as_str())
+                || is_typed_installer_root_unknown_reference(reference.as_str())
+                || is_typed_package_staging_unknown_reference(reference.as_str())
             {
                 return reference;
             }

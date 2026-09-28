@@ -198,9 +198,25 @@ pub(super) fn run_watchdog(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let shutdown = runtime
-        .block_on(composition.run_until_shutdown())
-        .map_err(|error| format!("{error:?}"))?;
+    // #962 W1/W2: the live production startup path of this process now owns the
+    // backup-control lifecycle. It registers and starts against the real
+    // `WatchdogComposition` started above, and stops on the single release
+    // point below, so no registration outlives the supervised lifetime and no
+    // exit path skips the release.
+    //
+    // Placement is deliberate: readiness is already published and SCM is already
+    // `RUNNING` above, so a refusal here can never block readiness, delay
+    // start, or keep the service from reaching its supervised lifetime. The
+    // blast radius of a refusal is exactly one capability — supervision
+    // continues unchanged, and no listener, task, registration slot, or
+    // authority is created on either side of it.
+    let backup_control = start_supervision_backup_control(&composition);
+    let shutdown = runtime.block_on(composition.run_until_shutdown());
+    // Unconditional and before the only fallible step below, so the normal
+    // return, the task-failure return, and the externally requested stop all
+    // release the registration exactly once.
+    release_supervision_backup_control(backup_control);
+    let shutdown = shutdown.map_err(|error| format!("{error:?}"))?;
     #[cfg(windows)]
     set_service_status_stopped();
     let disposition = match shutdown.disposition {
@@ -216,6 +232,84 @@ pub(super) fn run_watchdog(
         "watchdog supervision shutdown reported"
     );
     Ok(())
+}
+
+/// Registers and starts Watchdog backup control on the live composition.
+///
+/// This is a real production caller, not a probe: it calls the composition's
+/// own registration method and the bounded start on the composition this
+/// process actually started, and it observes the live owner resource both steps
+/// read. It returns `None` — never a substitute handle, never a no-op stand-in
+/// — when this process cannot admit backup control.
+///
+/// A refusal is bounded and nonfatal by placement, not by suppression: the
+/// caller runs this after readiness is published and after SCM reports
+/// `RUNNING`, so declining backup control cannot delay or block startup. The
+/// typed reason is traced in full, and supervision continues with exactly the
+/// behaviour it had before, because this function creates no listener, task,
+/// slot, or authority on either the admitted or the refused path.
+fn start_supervision_backup_control(
+    composition: &WatchdogComposition,
+) -> Option<eliot_watchdog::BackupControlHandle> {
+    let mut handle = match composition.register_backup_control() {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                event = "watchdog.backup_control_registration_refused",
+                observation = "unavailable",
+                reason_code = "REGISTRATION_REFUSED",
+                detail = truncate_failure_detail(&error.to_string()).as_str(),
+                "watchdog continues without backup control; supervision is unchanged"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = eliot_watchdog::start_backup_control(&mut handle) {
+        // The bounded slot this handle already reserved is released on this
+        // refusal path too: a handle that failed to start never admitted
+        // dispatch, so it must not keep occupying one of the bounded slots.
+        let released = eliot_watchdog::stop_backup_control(handle);
+        tracing::warn!(
+            event = "watchdog.backup_control_start_refused",
+            observation = "unavailable",
+            reason_code = "START_REFUSED",
+            registration_slot = released.registration_slot(),
+            detail = truncate_failure_detail(&error.to_string()).as_str(),
+            "watchdog continues without backup control; supervision is unchanged"
+        );
+        return None;
+    }
+    tracing::info!(
+        event = "watchdog.backup_control_admitted",
+        observation = "admitted",
+        registration_slot = handle.registration_slot(),
+        owner_spool_high_water = handle.owner_spool_high_water(),
+        owner_generation = handle.owner_generation(),
+        "watchdog backup control registered and started against the live owner spool"
+    );
+    Some(handle)
+}
+
+/// Releases one started backup-control registration on the shutdown path.
+///
+/// Idempotent for a `None` input: the caller may hold no registration at all
+/// when registration was refused. The released slot and the owner sequences
+/// observed while it was live are both reported, so a reader can see that the
+/// registration was released rather than merely dropped.
+fn release_supervision_backup_control(handle: Option<eliot_watchdog::BackupControlHandle>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let slot = handle.registration_slot();
+    let owner_spool_high_water = handle.owner_spool_high_water();
+    let _released = eliot_watchdog::stop_backup_control(handle);
+    tracing::info!(
+        event = "watchdog.backup_control_released",
+        observation = "released",
+        registration_slot = slot,
+        owner_spool_high_water = owner_spool_high_water,
+        "watchdog backup control registration released on the shutdown path"
+    );
 }
 
 /// Delay between durable-admission probes while fenced pre-Phase-B.

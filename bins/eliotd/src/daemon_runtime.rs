@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_governor::KernelTransitionPort;
+use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
@@ -842,14 +842,14 @@ fn bind_declared_startup_capabilities(
     // for an unreadable inbox.
     let notification_snapshot =
         match eliotd::notification_board_attach::attach_notification_snapshot(kernel, composition) {
-            eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+            eliotd::notification_board_attach::NotificationBoardAttach::Ready(snapshot) => {
                 tracing::info!(
                     target: "eliotd::diagnostics",
                     event = "eliotd.notification_snapshot_attached",
-                    record_count = records.len(),
+                    record_count = snapshot.records.len(),
                 );
                 Ok(RetainedStartupBinding::NotificationSnapshot {
-                    record_count: records.len(),
+                    record_count: snapshot.records.len(),
                 })
             }
             eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
@@ -2702,7 +2702,7 @@ fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
 async fn run_local_read_poll(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     startup_readiness: StartupReadinessProjection,
 ) -> Result<LocalReadStep, String> {
@@ -2770,13 +2770,22 @@ async fn run_local_read_poll(
             };
             return Ok(step(outcome, delta));
         }
-        let admitted_fence = {
+        // #2664: the execute leg also reads the owner-retained execution
+        // position, and that read is a plain in-process owner lookup. It runs
+        // under the SAME short composition borrow that snapshots the fence and
+        // the borrow is dropped before the plan runs, so no composition guard
+        // is ever held across the plan's canonical reads or its awaits.
+        let (admitted_fence, execution_owner_read) = {
             let guard = composition.lock().await;
-            guard.kernel_snapshot().state_fence().clone()
+            (
+                guard.kernel_snapshot().state_fence().clone(),
+                eliotd::skill_dispatch::execution_owner_read(&guard, &tool),
+            )
         };
         let plan = Box::pin(eliotd::skill_dispatch::plan_skill_pair(
             kernel,
             admitted_fence,
+            execution_owner_read,
             &envelope,
             &tool,
             &attempt,
@@ -2864,9 +2873,28 @@ async fn run_local_read_poll(
     // and claiming one would be false: none of the four gates admits that
     // capability, and no producer presents it either.
     if eliotd::is_controlboard_read_tool(&tool) {
-        let body = {
-            let guard = composition.lock().await;
-            eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+        let body = match eliotd::notification_board_attach::fetch_notification_snapshot(kernel)
+            .await
+        {
+            Ok(snapshot) => {
+                let mut guard = composition.lock().await;
+                let kernel_fence = kernel.snapshot().state_fence();
+                let composition_fence = guard.kernel_snapshot().state_fence();
+                if snapshot.state_fence != kernel_fence || snapshot.state_fence != composition_fence
+                {
+                    eliotd::controlboard_notification_refresh_refusal_body(
+                        &envelope,
+                        &attempt,
+                        "Kernel or composition state fence changed before notification attach",
+                    )
+                } else {
+                    guard.note_notification_snapshot(snapshot.records);
+                    eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+                }
+            }
+            Err(reason) => {
+                eliotd::controlboard_notification_refresh_refusal_body(&envelope, &attempt, &reason)
+            }
         };
         let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,

@@ -6,7 +6,8 @@
 //! backup envelope (performed by the `BlobStore`/secret-provider owner, outside
 //! this crate) or records a separately protected wrapped-key manifest plus a
 //! restoration receipt per blob. This module binds that manifest, proves exact
-//! key coverage, and fails `full_recovery` issuance when key material for any
+//! key coverage, proves the manifest names the archive it travels with, and
+//! fails `full_recovery` issuance when key material for any
 //! carried blob lineage is missing or unverifiable. The backup contains key
 //! lineage and format metadata, never plaintext master/data keys, and no key
 //! is ever opened here: digests bind opaque wrapped bytes only.
@@ -126,6 +127,34 @@ pub fn verify_key_coverage(
     Ok(())
 }
 
+/// Proves the wrapped-key manifest is *this* archive's key material.
+///
+/// [`verify_key_coverage`] compares only the carried blob key lineages. It is
+/// a set-membership proof, and lineage strings are chosen by the source
+/// installation, so a manifest minted for a different backup whose lineages
+/// happen to match passes it. On the restore direction that is precisely the
+/// failure I5.13 forbids: installation-encrypted payloads would be copied into
+/// the destination isolated root on the strength of *another* archive's key
+/// proof, which is assuming destination key ownership rather than proving it.
+/// The manifest therefore has to name this exact backup — the same binding
+/// [`FullRecoveryPackage::validate`] already required at issuance — before the
+/// runner may write a single sealed byte.
+///
+/// This does not decrypt anything: `wrapped_key_bytes` stay opaque here. The
+/// unwrap/re-seal under destination key ownership remains the `BlobStore` and
+/// secret-provider owner's step, driven by the restoration receipts.
+pub fn verify_portable_key_material(
+    bundle: &BackupBundle,
+    manifest: &WrappedKeyManifest,
+) -> Result<(), BackupError> {
+    if manifest.backup_id != bundle.manifest.backup_id {
+        return Err(BackupError::FenceMismatch {
+            subject: "key manifest backup binding".to_owned(),
+        });
+    }
+    verify_key_coverage(&bundle.blobs, manifest)
+}
+
 /// Per-blob restoration receipt binding one carried blob to its wrapped key.
 ///
 /// Issued at backup time from validated coverage; consumed by the destination
@@ -220,14 +249,7 @@ impl FullRecoveryPackage {
             });
         }
         match &self.key_manifest {
-            Some(manifest) => {
-                if manifest.backup_id != self.bundle.manifest.backup_id {
-                    return Err(BackupError::FenceMismatch {
-                        subject: "key manifest backup binding".to_owned(),
-                    });
-                }
-                verify_key_coverage(&self.bundle.blobs, manifest)?;
-            }
+            Some(manifest) => verify_portable_key_material(&self.bundle, manifest)?,
             None => {
                 if !self.bundle.blobs.is_empty() {
                     return Err(BackupError::MissingRecoveryComponent("blob_key_material"));

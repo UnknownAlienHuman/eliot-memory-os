@@ -1,4 +1,7 @@
 use crate::EngineError;
+use eliot_skills::{
+    SKILL_PACK_HASH_ALGORITHM, canonical_skill_content_hash, canonical_skill_pack_hash,
+};
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
@@ -19,12 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
-pub const ELIOT_SKILL_NAMES: [&str; 4] = [
-    "eliot-work",
-    "eliot-remember",
-    "eliot-recover",
-    "eliot-finish",
-];
+pub use eliot_skills::{DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackEntryReport {
@@ -63,7 +61,6 @@ impl SkillPackService {
         let mut entries = Vec::new();
         let mut descriptions = 0;
         let mut paragraph_owners = BTreeMap::<String, String>::new();
-        let mut pack_material = String::new();
 
         for name in ELIOT_SKILL_NAMES {
             let canonical_path = canonical_root.join(name).join("SKILL.md");
@@ -137,10 +134,6 @@ impl SkillPackService {
             if !opencode_parity || !claude_parity || !codex_parity || !antigravity_parity {
                 errors.push(format!("{name}: generated host package drift"));
             }
-            pack_material.push_str(name);
-            pack_material.push(':');
-            pack_material.push_str(&canonical_hash);
-            pack_material.push('\n');
             entries.push(SkillPackEntryReport {
                 name: name.to_owned(),
                 description_characters: description.chars().count(),
@@ -159,11 +152,14 @@ impl SkillPackService {
             errors.push("combined descriptions exceed estimated 100 token budget".to_owned());
         }
         let skill_count = entries.len();
-        let pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
+        let pack_hash_entries = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.canonical_hash.as_str()))
+            .collect::<Vec<_>>();
+        let pack_hash = canonical_skill_pack_hash(&pack_hash_entries);
         let manifest_path = canonical_root.join("skill-pack.manifest.json");
         let manifest: Value = serde_json::from_reader(File::open(&manifest_path)?)?;
-        if manifest.get("hash_algorithm").and_then(Value::as_str)
-            != Some("blake3(name:content_blake3 joined with LF in manifest order)")
+        if manifest.get("hash_algorithm").and_then(Value::as_str) != Some(SKILL_PACK_HASH_ALGORITHM)
         {
             errors.push(
                 "skill manifest hash algorithm is not the canonical BLAKE3 recipe".to_owned(),
@@ -221,16 +217,6 @@ impl SkillPackService {
         })
     }
 }
-
-/// The host packages that carry a copy of the canonical skill bodies.
-/// Declared in `skill-pack.manifest.json` as `derived_packages`; kept here so
-/// the sync and the lint cannot disagree about what is derived.
-pub const DERIVED_SKILL_PACKAGES: [&str; 4] = [
-    "integrations/opencode/skills",
-    "integrations/claude/eliot/skills",
-    "plugin/eliot-governor/skills",
-    "plugin/eliot-antigravity-official/skills",
-];
 
 const DERIVED_PACKAGE_NOTICE: &str = "\
 # Generated skill copies -- do not edit
@@ -294,7 +280,6 @@ impl SkillPackService {
         let declared_assets =
             declared_reference_assets(&previous_manifest).map_err(skill_manifest_error)?;
         let mut report = SkillPackSyncReport::default();
-        let mut pack_material = String::new();
         let mut manifest_skills = Vec::new();
         let mut listing_characters = 0usize;
 
@@ -329,10 +314,6 @@ impl SkillPackService {
                 report.rewritten.push(label);
             }
 
-            pack_material.push_str(name);
-            pack_material.push(':');
-            pack_material.push_str(&hash);
-            pack_material.push('\n');
             manifest_skills.push(ManifestSkill {
                 name,
                 content_blake3: hash,
@@ -351,10 +332,14 @@ impl SkillPackService {
             }
         }
 
-        report.pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
+        let pack_hash_entries = manifest_skills
+            .iter()
+            .map(|skill| (skill.name, skill.content_blake3.as_str()))
+            .collect::<Vec<_>>();
+        report.pack_hash = canonical_skill_pack_hash(&pack_hash_entries);
         let manifest = SkillPackManifest {
             schema_version: "eliot-agent-skill-pack-v1",
-            hash_algorithm: "blake3(name:content_blake3 joined with LF in manifest order)",
+            hash_algorithm: SKILL_PACK_HASH_ALGORITHM,
             reference_assets_schema: "sha256-path-list-v1",
             pack_hash: &report.pack_hash,
             listing_characters,
@@ -542,12 +527,6 @@ fn collect_reference_assets(
         }
     }
     Ok(())
-}
-
-fn canonical_skill_content_hash(body: &str) -> String {
-    blake3::hash(body.replace("\r\n", "\n").as_bytes())
-        .to_hex()
-        .to_string()
 }
 
 #[cfg(test)]

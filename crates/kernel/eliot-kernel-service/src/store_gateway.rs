@@ -47,8 +47,8 @@ use crate::commit_recovery::{
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
-    begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
+    StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
+    finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
     writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
@@ -645,6 +645,32 @@ impl KernelStoreGateway {
         self.flight.fence_and_drain(timeout).await
     }
 
+    /// Refuses a mutating Store or ORS effect while this Kernel candidate is
+    /// in `shadow_no_authority` (I14.16 step 4).
+    ///
+    /// Every mutating entry point calls this as its *first* gated step, before
+    /// any ORS reservation, scope advance, or Store send. It exists because
+    /// [`Self::apply`] and [`Self::apply_reserved`] do not reach
+    /// `acquire_admission` until after their staging work, so a
+    /// `shadow_no_authority` candidate could otherwise write ORS rows before
+    /// the lease gate refused the send. Read-only inspection
+    /// ([`Self::execute_named`], [`Self::receipt`], [`Self::recovery`]) is
+    /// deliberately not gated: I14.16 step 3 permits immutable/read-only
+    /// inspection and compatibility checks in this phase.
+    ///
+    /// The refusal is the crate's existing [`KernelServiceError::AdmissionClosed`]
+    /// carrying the exact current state, flattened to this module's `String`
+    /// error the way every other gateway refusal is.
+    fn refuse_shadow_mutation(&self) -> Result<(), String> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        service
+            .admit_shadow_effect()
+            .map_err(|error| error.to_string())
+    }
+
     /// Applies one already prepared transition after fixed Kernel admission.
     pub async fn apply(
         &self,
@@ -657,6 +683,7 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        self.refuse_shadow_mutation()?;
         // 1927: authenticate the caller before plan admission (I5.6 step 1),
         // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
@@ -815,6 +842,12 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: the shadow refusal precedes the ORS `stage_and_reserve`
+        // write below. The normal admission lease is only acquired later, at
+        // the bounded send window, so without this gate a
+        // `shadow_no_authority` candidate would stage and reserve ORS rows
+        // before the lease gate refused the Store send.
+        self.refuse_shadow_mutation()?;
         apply_reserved_admission(context, &transition)?;
         {
             let view = CanonicalRequestView::from_apply(
@@ -929,6 +962,29 @@ impl KernelStoreGateway {
         context: &RequestMetadata,
         transition: &PreparedTransition,
     ) -> Result<CompositionReservation, String> {
+        // The generation the route is checked against is the admitted
+        // transition's own fence, so the equality is re-asserted here rather
+        // than inherited from a caller: the shared helper below then reads the
+        // same tuple the transition was admitted under.
+        if transition.state_fence != context.state_fence {
+            return Err("transition state fence does not match request metadata".to_owned());
+        }
+        self.bind_reservation_owner_for_fence(commit_ors, &context.state_fence)
+    }
+
+    /// Binds the reservation owner from one already-validated live fence.
+    ///
+    /// Same gates as [`Self::bind_reservation_owner`] for the entry points that
+    /// present a fence instead of an admitted transition: the presented fence
+    /// must be the same-generation, same-authority tuple the active route and
+    /// the live service epoch both name. A stale or foreign fence never reaches
+    /// ORS, so a recovery pass can never read or close another generation's
+    /// reservation.
+    fn bind_reservation_owner_for_fence(
+        &self,
+        commit_ors: &Arc<RedbRecoveryStore>,
+        fence: &StateFence,
+    ) -> Result<CompositionReservation, String> {
         let service = self
             .service
             .lock()
@@ -941,12 +997,14 @@ impl KernelStoreGateway {
         }
         let live_epoch = service.authority_epoch();
         if !self.route.authority_epoch().is_same_authority(&live_epoch)
-            || self.route.active_generation() != transition.state_fence.resource_generation
-            || !live_epoch.is_same_authority(&context.state_fence.authority_epoch)
+            || self.route.active_generation() != fence.resource_generation
+            || !live_epoch.is_same_authority(&fence.authority_epoch)
         {
             return Err("canonical-store route is outside the active Kernel generation".to_owned());
         }
-        let writer_epoch = writer_epoch_for_fence(context).map_err(|error| error.to_string())?;
+        let writer_epoch =
+            writer_epoch_for_fence_from_epoch(&fence.authority_epoch).map_err(|e| e.to_string())?;
+        drop(service);
         CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
             .map_err(|error| error.to_string())
     }
@@ -1010,6 +1068,10 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: cancelling a reservation is an ORS mutation, so a
+        // `shadow_no_authority` candidate refuses it before the owner and
+        // protected lease are taken below.
+        self.refuse_shadow_mutation()?;
         let commit_ors = self.commit_ors.clone().ok_or_else(|| {
             "reserved writes require the composition-bound ORS; nothing to cancel".to_owned()
         })?;
@@ -1137,6 +1199,50 @@ impl KernelStoreGateway {
             ));
         }
         Ok(())
+    }
+
+    /// Enumerates and reconciles the durable staged write envelopes in the
+    /// composition-bound ORS (issue #1925, I1.11 step 6, I5.2/I5.6).
+    ///
+    /// This is the recovery owner for the same envelope
+    /// [`Self::apply_reserved`] stages, not a second scan vocabulary: it runs
+    /// the ORS pending-reservation reconciliation by exact operation identity,
+    /// revalidates every reported staged envelope through the owner, and
+    /// reports the durable Recovery Problems a corrupted or unreadable staged
+    /// payload leaves behind. Nothing is decoded, defaulted, force-released, or
+    /// deleted, and no unresolved operation is retried.
+    ///
+    /// Gates: the flight counter, the rebind fence, the I14.16 step 4 shadow
+    /// refusal (reconciliation is an ORS mutation), and the same
+    /// generation/route/authority binding the reserved write uses — a fence from
+    /// another generation or authority never reaches ORS. A composition with no
+    /// bound ORS refuses explicitly instead of reporting an empty clean scan.
+    ///
+    /// `limit` is the whole-scan ceiling for the reservation scan and the
+    /// retained-problem listing.
+    pub async fn reconcile_staged_writes(
+        &self,
+        fence: &StateFence,
+        limit: u16,
+    ) -> Result<StagedWriteRecovery, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.refuse_shadow_mutation()?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "staged write recovery requires the composition-bound ORS; refusing to report an empty reconciliation"
+                .to_owned()
+        })?;
+        let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
+        crate::store_write_reservation::reconcile_staged_writes_at_startup(
+            &owner,
+            fence,
+            &self.store,
+            limit,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
@@ -3225,6 +3331,9 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
+        // write. The gate precedes the normal admission lease below.
+        self.refuse_shadow_mutation()?;
         context.validate().map_err(|error| error.to_string())?;
         request
             .validate_for_context(context)
@@ -3366,6 +3475,17 @@ impl KernelStoreGateway {
         let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
+        // write. The gate reuses this module's own
+        // [`dreamer_operation_effect`] classification, so a permitted
+        // `Status` read stays available (the read-only inspection I14.16 step
+        // 3 allows) while every ledger mutation is refused before the durable
+        // recovery state is read and before the retained-commit
+        // classification, so a shadow candidate cannot stage, classify or
+        // reconcile a mutation.
+        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
+            self.refuse_shadow_mutation()?;
         }
         context.validate().map_err(|error| error.to_string())?;
         request.validate().map_err(|error| error.to_string())?;

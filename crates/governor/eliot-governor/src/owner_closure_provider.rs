@@ -35,12 +35,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::{
-    CrossRootQuarantineEvidence, GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId,
-    GrantRecoveryRecord, GrantStatus, QuarantineEnforcementRef, QuarantineEvidenceStatus,
-    RevocationClosureState, RevocationClosureVerdict, RevocationHistoryEvidence,
-    VerifiedQuarantineBinding,
+    ApprovalReference, CanonicalSourceCommitment, CrossRootQuarantineEvidence,
+    GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
+    MechanicalAuthoritySubset, MechanicalSubsetConstraints, QuarantineEnforcementRef,
+    QuarantineEvidenceStatus, RevocationClosureState, RevocationClosureVerdict,
+    RevocationHistoryEvidence, VerifiedQuarantineBinding,
 };
-use eliot_contracts::{StateFence, canonical_json_bytes};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_influence::RevocationBounds;
 use eliot_kernel_core::{
     GovernorClosureRestore, GrantActivationIntent, GrantClosureMember, GrantClosureSurvivor,
@@ -167,6 +168,34 @@ pub struct GrantAdmissionParams {
     pub session_id: String,
     /// Scope the grant is admitted for.
     pub scope_id: String,
+    /// Capability-token identity the canonical source issued for this
+    /// admission. It is part of the compiled mechanical subset's
+    /// principal/session/token identity group and inside its content
+    /// commitment, so a different token is a different projection.
+    pub token_id: String,
+    /// Named transition classes this admission may drive. Required: an
+    /// omitted list refuses compilation rather than admitting every class.
+    pub transition_classes: Vec<String>,
+    /// Exact data/observation classes this admission may touch. Required.
+    pub data_classes: Vec<String>,
+    /// Policy revision the semantic decision was taken under. Required.
+    pub policy_revision: String,
+    /// Configuration revision the semantic decision was taken under. Required.
+    pub configuration_revision: String,
+    /// Lease revision the semantic decision was taken under. Required.
+    pub lease_revision: String,
+    /// Heartbeat cadence in milliseconds, when the source requires liveness.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Reference to the retained canonical decision this admission compiles
+    /// from. Required; an admission without a canonical source cannot produce
+    /// a mechanical subset.
+    pub canonical_source_receipt_ref: String,
+    /// SHA-256 over the canonical bytes of that retained decision. Required.
+    pub canonical_source_receipt_sha256: String,
+    /// Approval handles the compiled subset requires before any effect.
+    /// Required and non-empty: an admission with no required approval cannot
+    /// resolve that group and refuses.
+    pub required_approvals: Vec<ApprovalReference>,
     /// Authority binding pinning owner, epoch, fence, effect and ceiling.
     /// Must equal the graph entry's binding.
     pub binding: AuthorityBinding,
@@ -956,6 +985,16 @@ impl OwnerClosureProvider {
     /// rejected by [`Self::restore`].
     pub fn serve_restore(&self) -> Result<GovernorClosureRestore, CompositionError> {
         let declarations = self.closure_declarations()?;
+        // The point of use for the compiled mechanical subset: every hydration
+        // this bundle hands the Kernel is content-verified against the CURRENT
+        // canonical grant record, so the Kernel never receives a structurally
+        // valid payload nobody compared with the source authority.
+        for member in self.registry.members.values() {
+            self.verify_hydration_mechanical_subset(&member.intent)?;
+        }
+        for root in self.registry.roots.values() {
+            self.verify_hydration_mechanical_subset(&root.intent)?;
+        }
         let preserved = declarations
             .iter()
             .map(|declaration| {
@@ -1186,6 +1225,10 @@ impl OwnerClosureProvider {
             &hydration.intent.operation_id,
             hydration.durable_record.record(),
         )?;
+        // Imported history is suspended evidence: its compiled subset must be
+        // re-proven against the CURRENT canonical record before it is served,
+        // never activated because it was copied.
+        self.verify_hydration_mechanical_subset(&hydration.intent)?;
         if self
             .registry
             .members
@@ -1214,6 +1257,10 @@ impl OwnerClosureProvider {
             &hydration.intent.authority_root_ref,
             &hydration.intent.binding,
         )?;
+        // Imported history is suspended evidence: its compiled subset must be
+        // re-proven against the CURRENT canonical record before it is served,
+        // never activated because it was copied.
+        self.verify_hydration_mechanical_subset(&hydration.intent)?;
         verify_imported_grant_seal(
             &hydration.intent.grant_id,
             &hydration.intent.operation_id,
@@ -1230,6 +1277,82 @@ impl OwnerClosureProvider {
             ));
         }
         Ok(hydration.clone())
+    }
+
+    /// Content-verifies one hydration's compiled mechanical subset against the
+    /// CURRENT canonical grant record at the point of use.
+    ///
+    /// Four independent comparisons, none of them a recomputed digest standing
+    /// in for a recorded one:
+    ///
+    /// 1. the subset still hashes to its OWN RECORDED content commitment;
+    /// 2. the intent's separately recorded commitment equals the subset's, so a
+    ///    tampered subset and a tampered intent must agree with each other and
+    ///    with the canonical record before anything is served;
+    /// 3. every identity/ceiling field the subset compiled from the intent
+    ///    agrees with the intent;
+    /// 4. the subset's operations, scopes and effect ceiling are the CURRENT
+    ///    canonical record's own values, and its recorded source grant
+    ///    commitment is the digest of that CURRENT record — so altered content
+    ///    cannot be admitted under a source commitment from another revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] for an unknown or malformed
+    /// subset, a recorded commitment that no longer matches its payload, an
+    /// intent/subset disagreement, or content that no longer equals the CURRENT
+    /// canonical grant record.
+    fn verify_hydration_mechanical_subset(
+        &self,
+        intent: &GrantActivationIntent,
+    ) -> Result<(), CompositionError> {
+        let subset = &intent.mechanical_subset;
+        subset
+            .verify_recorded_commitment()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if intent.mechanical_subset_commitment != subset.content_commitment {
+            return Err(CompositionError::Recovery(
+                "admitted mechanical subset disagrees with its recorded content commitment"
+                    .to_owned(),
+            ));
+        }
+        let record = self.snapshot_grant(&intent.grant_id).ok_or_else(|| {
+            CompositionError::Recovery(
+                "admitted mechanical subset names unknown canonical grant lineage".to_owned(),
+            )
+        })?;
+        if subset.grant_id != intent.grant_id
+            || subset.holder_principal != intent.holder_principal
+            || subset.session_id != intent.session_id
+            || subset.scope_id != intent.scope_id
+            || subset.authority_root_ref != intent.authority_root_ref
+            || subset.governor_snapshot_id != intent.snapshot_id
+            || subset.binding != intent.binding
+            || subset.effect_ceiling != intent.allowed_effect
+            || subset.proof_ceiling != intent.proof_ceiling
+            || subset.expires_at_ms != intent.expires_at_ms
+            || subset.issued_at_ms != intent.issued_at_ms
+        {
+            return Err(CompositionError::Recovery(
+                "admitted mechanical subset disagrees with its admitted grant intent".to_owned(),
+            ));
+        }
+        if subset.operations != record.allowed_operations
+            || subset.scopes != record.allowed_resources
+            || subset.effect_ceiling != record.max_effect
+            || subset.source.source_grant_id != record.grant_id
+        {
+            return Err(CompositionError::Recovery(
+                "admitted mechanical subset is not a subset of the current canonical grant"
+                    .to_owned(),
+            ));
+        }
+        if subset.source.source_grant_commitment != canonical_grant_record_commitment(record)? {
+            return Err(CompositionError::Recovery(
+                "admitted mechanical subset names a different canonical grant revision".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn sync_owner_hydrations(&mut self) -> Result<(), CompositionError> {
@@ -1262,6 +1385,15 @@ impl OwnerClosureProvider {
         reject_blank(&params.holder_principal, "admission.holder_principal")?;
         reject_blank(&params.session_id, "admission.session_id")?;
         reject_blank(&params.scope_id, "admission.scope_id")?;
+        reject_blank(&params.token_id, "admission.token_id")?;
+        reject_blank(
+            &params.canonical_source_receipt_ref,
+            "admission.canonical_source_receipt_ref",
+        )?;
+        reject_blank(
+            &params.canonical_source_receipt_sha256,
+            "admission.canonical_source_receipt_sha256",
+        )?;
         for obligation in &params.receipt_obligations {
             reject_blank(obligation, "admission.receipt_obligation")?;
         }
@@ -1279,6 +1411,10 @@ impl OwnerClosureProvider {
             &params.authority_root_ref,
             &params.binding,
         )?;
+        // I6.10: the mechanically enforceable subset is COMPILED here, from the
+        // canonical grant record plus the explicitly resolved constraints, and
+        // is refused rather than widened when any required group is missing.
+        let mechanical_subset = self.compile_mechanical_subset(params)?;
         let intent = GrantActivationIntent {
             operation_id: params.operation_id.clone(),
             grant_id: params.grant_id.clone(),
@@ -1289,12 +1425,15 @@ impl OwnerClosureProvider {
             holder_principal: params.holder_principal.clone(),
             session_id: params.session_id.clone(),
             scope_id: params.scope_id.clone(),
+            token_id: params.token_id.clone(),
             binding: params.binding.clone(),
             allowed_effect: params.allowed_effect,
             proof_ceiling: params.proof_ceiling,
             issued_at_ms: params.issued_at_ms,
             expires_at_ms: params.expires_at_ms,
             receipt_obligations: params.receipt_obligations.clone(),
+            mechanical_subset_commitment: mechanical_subset.content_commitment.clone(),
+            mechanical_subset,
         };
         let record = Self::opaque_grant_record(&intent, secret)?;
         Ok(GrantClosureMember {
@@ -1302,6 +1441,54 @@ impl OwnerClosureProvider {
             durable_record: record,
             observed_at_ms,
         })
+    }
+
+    /// Compiles the complete I6.10 mechanical subset of the canonical grant
+    /// record this admission names.
+    ///
+    /// The canonical record is read from the restored durable graph, never from
+    /// caller material, so the compiled operation/scope sets and ceilings are
+    /// provably a subset of the accepted source authority and its inherited
+    /// ceilings. Every group the canonical record does not carry must be
+    /// supplied resolved; an absent one refuses compilation instead of
+    /// becoming a wildcard.
+    fn compile_mechanical_subset(
+        &self,
+        params: &GrantAdmissionParams,
+    ) -> Result<MechanicalAuthoritySubset, CompositionError> {
+        let record = self.snapshot_grant(&params.grant_id).ok_or_else(|| {
+            CompositionError::Owner("admission names unknown grant lineage".to_owned())
+        })?;
+        let source = CanonicalSourceCommitment {
+            canonical_decision_ref: params.canonical_source_receipt_ref.clone(),
+            canonical_decision_sha256: params.canonical_source_receipt_sha256.clone(),
+            source_grant_id: record.grant_id.clone(),
+            // The canonical grant record's own bytes are its commitment: the
+            // compiled subset names the exact revision it read, so a later
+            // same-identity grant revision cannot re-authorize it.
+            source_grant_commitment: canonical_grant_record_commitment(record)?,
+            source_graph_revision: self.revision(),
+        };
+        MechanicalAuthoritySubset::compile(
+            record,
+            &params.snapshot_id,
+            &params.holder_principal,
+            &params.session_id,
+            &params.scope_id,
+            &params.token_id,
+            &params.binding,
+            MechanicalSubsetConstraints {
+                transition_classes: params.transition_classes.clone(),
+                data_classes: params.data_classes.clone(),
+                policy_revision: params.policy_revision.clone(),
+                configuration_revision: params.configuration_revision.clone(),
+                lease_revision: params.lease_revision.clone(),
+                heartbeat_interval_ms: params.heartbeat_interval_ms,
+                source,
+                required_approvals: params.required_approvals.clone(),
+            },
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
     /// Validates one grant admission against the restored graph: the grant
@@ -1858,41 +2045,58 @@ fn secret_reference_from_record(
 }
 
 fn grant_admission_params_from_member(hydration: &GrantClosureMember) -> GrantAdmissionParams {
-    GrantAdmissionParams {
-        operation_id: hydration.intent.operation_id.clone(),
-        grant_id: hydration.intent.grant_id.clone(),
-        parent_grant_id: hydration.intent.parent_grant_id.clone(),
-        authority_root_ref: hydration.intent.authority_root_ref.clone(),
-        snapshot_id: hydration.intent.snapshot_id.clone(),
-        holder_principal: hydration.intent.holder_principal.clone(),
-        session_id: hydration.intent.session_id.clone(),
-        scope_id: hydration.intent.scope_id.clone(),
-        binding: hydration.intent.binding.clone(),
-        allowed_effect: hydration.intent.allowed_effect,
-        proof_ceiling: hydration.intent.proof_ceiling,
-        issued_at_ms: hydration.intent.issued_at_ms,
-        expires_at_ms: hydration.intent.expires_at_ms,
-        receipt_obligations: hydration.intent.receipt_obligations.clone(),
-    }
+    grant_admission_params_from_intent(&hydration.intent)
 }
 
 fn grant_admission_params_from_root(hydration: &RootGrantHydration) -> GrantAdmissionParams {
+    grant_admission_params_from_intent(&hydration.intent)
+}
+
+/// Projects a restored intent back onto the admission parameter shape so a
+/// durable import round-trips through the same compiler instead of a second
+/// reconstruction path. The compiled subset is carried as-is and is re-proven
+/// against the CURRENT canonical record by
+/// [`OwnerClosureProvider::verify_hydration_mechanical_subset`]; nothing here
+/// invents, defaults, or re-derives a group.
+fn grant_admission_params_from_intent(intent: &GrantActivationIntent) -> GrantAdmissionParams {
+    let subset = &intent.mechanical_subset;
     GrantAdmissionParams {
-        operation_id: hydration.intent.operation_id.clone(),
-        grant_id: hydration.intent.grant_id.clone(),
-        parent_grant_id: hydration.intent.parent_grant_id.clone(),
-        authority_root_ref: hydration.intent.authority_root_ref.clone(),
-        snapshot_id: hydration.intent.snapshot_id.clone(),
-        holder_principal: hydration.intent.holder_principal.clone(),
-        session_id: hydration.intent.session_id.clone(),
-        scope_id: hydration.intent.scope_id.clone(),
-        binding: hydration.intent.binding.clone(),
-        allowed_effect: hydration.intent.allowed_effect,
-        proof_ceiling: hydration.intent.proof_ceiling,
-        issued_at_ms: hydration.intent.issued_at_ms,
-        expires_at_ms: hydration.intent.expires_at_ms,
-        receipt_obligations: hydration.intent.receipt_obligations.clone(),
+        operation_id: intent.operation_id.clone(),
+        grant_id: intent.grant_id.clone(),
+        parent_grant_id: intent.parent_grant_id.clone(),
+        authority_root_ref: intent.authority_root_ref.clone(),
+        snapshot_id: intent.snapshot_id.clone(),
+        holder_principal: intent.holder_principal.clone(),
+        session_id: intent.session_id.clone(),
+        scope_id: intent.scope_id.clone(),
+        token_id: subset.token_id.clone(),
+        transition_classes: subset.transition_classes.clone(),
+        data_classes: subset.data_classes.clone(),
+        policy_revision: subset.policy_revision.clone(),
+        configuration_revision: subset.configuration_revision.clone(),
+        lease_revision: subset.lease_revision.clone(),
+        heartbeat_interval_ms: subset.heartbeat_interval_ms,
+        canonical_source_receipt_ref: subset.source.canonical_decision_ref.clone(),
+        canonical_source_receipt_sha256: subset.source.canonical_decision_sha256.clone(),
+        required_approvals: subset.required_approvals.clone(),
+        binding: intent.binding.clone(),
+        allowed_effect: intent.allowed_effect,
+        proof_ceiling: intent.proof_ceiling,
+        issued_at_ms: intent.issued_at_ms,
+        expires_at_ms: intent.expires_at_ms,
+        receipt_obligations: intent.receipt_obligations.clone(),
     }
+}
+
+/// Immutable commitment of one canonical grant record: the canonical digest of
+/// its complete durable form. Grant identity alone is not a commitment, so a
+/// same-identity grant revision cannot re-authorize a compiled mechanical
+/// subset.
+fn canonical_grant_record_commitment(
+    record: &GrantRecoveryRecord,
+) -> Result<String, CompositionError> {
+    let bytes = canonical_json_bytes(record).map_err(recovery)?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn introduction_admission_params_from_hydration(
@@ -2157,8 +2361,13 @@ mod owner_closure_provider_tests {
             .expect("authority"),
             inherited_source_ceiling: None,
             binding: binding(fence),
-            issued_at: LogicalTime::new(1),
-            expires_at: LogicalTime::new(10),
+            // The canonical lifetime the compiled mechanical subset commits to.
+            // It matches the lifetime [`grant_params`] declares, because an
+            // admission whose declared expiry diverges from its canonical grant
+            // cannot be reconciled with the projection compiled from it and is
+            // refused rather than widened.
+            issued_at: LogicalTime::new(1_000),
+            expires_at: LogicalTime::new(10_000),
             max_uses: 2,
             status: GrantStatus::Active,
         }
@@ -2199,6 +2408,20 @@ mod owner_closure_provider_tests {
         OwnerClosureProvider::restore(owner_snapshot(&fence), Some(history(&fence)), &fence)
     }
 
+    /// The one revision token these fixtures declare. No fixture models a
+    /// separate policy, configuration, or lease revision, so all three compiled
+    /// groups carry it; each stays independently content-committed, so changing
+    /// one is a different projection.
+    const FIXTURE_REVISION: &str = "fixture-revision-1";
+
+    /// Canonical-decision digest recorded as the compiled subset's source
+    /// receipt. The compiler only proves the digest contour (lowercase
+    /// SHA-256), so the fixture pins one value for the same reason
+    /// [`PRESERVED_REQUEST_HASH`] is pinned: no test builds the canonical
+    /// decision whose bytes it would be.
+    const FIXTURE_SOURCE_DIGEST: &str =
+        "8c1d0f7a4b6e2391d5c70a8f3b62e9147d0c5a83f1e6b27d9048ac35f1e6b720";
+
     fn grant_params(
         fence: &StateFence,
         operation_id: &str,
@@ -2214,6 +2437,23 @@ mod owner_closure_provider_tests {
             holder_principal: "principal:holder".to_owned(),
             session_id: "session-1".to_owned(),
             scope_id: "scope-1".to_owned(),
+            token_id: format!("token-{grant_id}"),
+            // The canonical grant entry these fixtures already admit names
+            // `op.read` on `res:1`, so the compiled transition and data classes
+            // are that same vocabulary rather than a new label.
+            transition_classes: vec!["op.read".to_owned()],
+            data_classes: vec!["res:1".to_owned()],
+            policy_revision: FIXTURE_REVISION.to_owned(),
+            configuration_revision: FIXTURE_REVISION.to_owned(),
+            lease_revision: FIXTURE_REVISION.to_owned(),
+            heartbeat_interval_ms: None,
+            canonical_source_receipt_ref: format!("decision-{grant_id}"),
+            canonical_source_receipt_sha256: FIXTURE_SOURCE_DIGEST.to_owned(),
+            required_approvals: vec![ApprovalReference {
+                approval_record_id: format!("approval-{grant_id}"),
+                approved_action_hash: PRESERVED_REQUEST_HASH.to_owned(),
+                allowed_once: false,
+            }],
             binding: binding(fence),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,

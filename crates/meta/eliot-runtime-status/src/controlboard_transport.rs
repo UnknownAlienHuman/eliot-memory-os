@@ -301,13 +301,15 @@ mod tests {
     use std::num::NonZeroU64;
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+    use eliot_controlboard::{NotificationInbox, NotificationMetrics};
     use eliot_ipc::TransportLimits;
     use eliot_protocol::{FrameKind, MessageType, ProtocolError};
 
     use super::super::controlboard_consumer::{
-        CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardInstallation, ControlBoardObservationTime,
-        ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
-        RenderedControlBoard, RenderedControlBoardRow,
+        CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardEvidenceHandle,
+        ControlBoardGeneration, ControlBoardInstallation, ControlBoardObservationTime,
+        ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
+        ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
     };
     use super::*;
 
@@ -331,6 +333,14 @@ mod tests {
             entry_id: entry_id.to_owned(),
             disposition,
             summary: summary.map(str::to_owned),
+            capability: Some(ControlBoardCapability::new("controlboard.read").expect("capability")),
+            owner: Some(ControlBoardOwner::new("owner-transport-test").expect("owner")),
+            generation: Some(
+                ControlBoardGeneration::new("generation-transport-test").expect("generation"),
+            ),
+            evidence_handle: Some(
+                ControlBoardEvidenceHandle::new("evidence-transport-test").expect("evidence"),
+            ),
             installation: ControlBoardInstallation::new("installation-transport-test")
                 .expect("installation"),
             observed_at: ControlBoardObservationTime::new(1_786_000_000_002).expect("observed_at"),
@@ -386,6 +396,10 @@ mod tests {
                 ),
                 row("ghost-component", ControlBoardRowDisposition::Missing, None),
             ],
+            notifications: NotificationInbox {
+                rows: Vec::new(),
+                metrics: NotificationMetrics::default(),
+            },
             observed_count: 7,
             missing_count: 1,
             unexpected_observed: vec!["extra-entry".to_owned()],

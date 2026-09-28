@@ -15,20 +15,24 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod bridge_contract;
 mod bridge_event_capacity;
 mod bridge_event_recovery;
 mod capability_cell_registry;
 mod cell_effective_manifest;
 mod epoch_identity;
 mod module_catalog;
+mod module_test_capsule;
 mod peer_blackboard;
 
+pub use bridge_contract::*;
 pub use bridge_event_capacity::*;
 pub use bridge_event_recovery::*;
 pub use capability_cell_registry::*;
 pub use cell_effective_manifest::*;
 pub use epoch_identity::*;
 pub use module_catalog::*;
+pub use module_test_capsule::*;
 pub use peer_blackboard::*;
 
 /// The current wire revision of this foundation surface.

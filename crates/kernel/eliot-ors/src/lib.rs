@@ -102,7 +102,7 @@ pub use store::{
     ScanDisclosureRecordOwner,
 };
 pub use versioned_artifact::{
-    ArtifactGenerationState, CompatibilityEvidence, VersionedArtifact,
+    ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
     VersionedArtifactCutoverRecord, VersionedArtifactEntry, VersionedArtifactRegistry,
     VersionedArtifactRetirement, VersionedArtifactStatus,
 };

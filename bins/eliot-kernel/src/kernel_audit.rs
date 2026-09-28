@@ -28,13 +28,14 @@
 //! record owns lifecycle state; audit is its evidence projection. An append
 //! failure is never silent: it emits the stable
 //! `KERNEL_AUDIT_APPEND_FAILED` terminal through the #895 diagnostics
-//! facade. The I16.11 cascade holds the two result legs durably: the submit
-//! path spools both drafts fsync-sealed before the ORS completion, and
-//! `audit_chain_records` reconciles that spool against the validated ORS
-//! record before reading, so a completed result always yields its full
-//! ordered chain. Residual: the Watchdog-domain spool leg and the
-//! last-resort control slot are not implemented; other legs stay visible
-//! only through that terminal until the next successful append. Anchor
+//! facade. The I16.11 cascade has two legs. The submit path spools both
+//! drafts fsync-sealed before the ORS completion and `audit_chain_records`
+//! reconciles that spool against the validated ORS record before reading, so a
+//! completed result always yields its full ordered chain. A failed append
+//! itself runs the independent cascade owned by
+//! [`crate::audit_fallback::KernelAuditFallback`] (issue #1840): the failed
+//! draft is retained in the independently persisted audit spool, else the
+//! last-resort channel, else the visible control-loss state. Anchor
 //! auto-export runs
 //! every [`KERNEL_AUDIT_ANCHOR_INTERVAL_RECORDS`] records plus on explicit
 //! export; a failed auto-export likewise stays visible through
@@ -363,12 +364,18 @@ impl AuditEventKind {
     pub const QUEUE_LOCAL_READ_ENQUEUED: &'static str = "queue.local_read_enqueued";
     /// One invoke-read routed to its daemon-claimable lane.
     pub const ROUTE_INVOKE_READ_ROUTED: &'static str = "route.invoke_read_routed";
+    /// A requested route diverged from the actual serving lane and the work
+    /// was rejected without queueing or binding (issue #1839).
+    pub const ROUTE_MISMATCH: &'static str = "route.mismatch";
     /// First governed claim minted a fencing lease for one pair.
     pub const LEASE_CLAIM_CREATED: &'static str = "lease.claim_created";
     /// Same-owner re-claim returned the identical current capability.
     pub const LEASE_CLAIM_RECONFIRMED: &'static str = "lease.claim_reconfirmed";
     /// A new owner reassigned the fencing lease (generation bump).
     pub const LEASE_CLAIM_REASSIGNED: &'static str = "lease.claim_reassigned";
+    /// A claimed pair's absolute deadline passed before completion; the dead
+    /// pair was retired instead of lingering as a stranded claim (issue #1839).
+    pub const LEASE_CLAIM_EXPIRED: &'static str = "lease.claim_expired";
     /// A supervision lease was established for the daemon contour.
     pub const LEASE_SUPERVISION_ESTABLISHED: &'static str = "lease.supervision_established";
     /// A supervision lease was renewed for the daemon contour.
@@ -391,14 +398,23 @@ impl AuditEventKind {
     pub const RESULT_DAEMON_SUBMITTED: &'static str = "result.daemon_submitted";
     /// The Kernel bound a daemon result to its operation (ORS persist).
     pub const RESULT_KERNEL_BOUND: &'static str = "result.kernel_bound";
+    /// The Kernel sealed the canonical replayable trace manifest for one
+    /// bound result (issue #1838; I16.12).
+    pub const TRACE_MANIFEST_SEALED: &'static str = "trace.manifest_sealed";
     /// A stale submission was quarantined without binding.
     pub const RESULT_STALE_QUARANTINED: &'static str = "result.stale_quarantined";
+    /// A claimed observe pair deferred to `DeferredNoEffect` and retired its
+    /// queue pair (issue #1839).
+    pub const DEFER_CLAIM_DEFERRED: &'static str = "defer.claim_deferred";
     /// A canonical admission receipt was issued.
     pub const RECEIPT_ADMISSION_ISSUED: &'static str = "receipt.admission_issued";
     /// The durable eliotd live receipt was published.
     pub const RECEIPT_LIVE_PUBLISHED: &'static str = "receipt.live_published";
     /// A typed cancellation was requested for its exact parent.
     pub const CANCEL_REQUESTED: &'static str = "cancel.requested";
+    /// A cancellation reached its exact parent: cancelled, fenced to
+    /// `Unknown` past the cancellable window, or already terminal (issue #1839).
+    pub const CANCEL_CONFIRMED: &'static str = "cancel.confirmed";
     /// A queued pair was retired (orphan cleanup).
     pub const ORPHAN_QUEUE_RETIRED: &'static str = "orphan.queue_retired";
     /// A lost connection's operations were fenced (orphan cleanup).
@@ -428,9 +444,11 @@ impl AuditEventKind {
         Self::QUEUE_ENVELOPE_ADMITTED,
         Self::QUEUE_LOCAL_READ_ENQUEUED,
         Self::ROUTE_INVOKE_READ_ROUTED,
+        Self::ROUTE_MISMATCH,
         Self::LEASE_CLAIM_CREATED,
         Self::LEASE_CLAIM_RECONFIRMED,
         Self::LEASE_CLAIM_REASSIGNED,
+        Self::LEASE_CLAIM_EXPIRED,
         Self::LEASE_SUPERVISION_ESTABLISHED,
         Self::LEASE_SUPERVISION_RENEWED,
         Self::LEASE_SUPERVISION_REVOKED,
@@ -442,10 +460,13 @@ impl AuditEventKind {
         Self::DISPATCH_DAEMON_CLAIM,
         Self::RESULT_DAEMON_SUBMITTED,
         Self::RESULT_KERNEL_BOUND,
+        Self::TRACE_MANIFEST_SEALED,
         Self::RESULT_STALE_QUARANTINED,
+        Self::DEFER_CLAIM_DEFERRED,
         Self::RECEIPT_ADMISSION_ISSUED,
         Self::RECEIPT_LIVE_PUBLISHED,
         Self::CANCEL_REQUESTED,
+        Self::CANCEL_CONFIRMED,
         Self::ORPHAN_QUEUE_RETIRED,
         Self::ORPHAN_CONNECTION_FENCED,
         Self::PROCESS_LAUNCH_COMMITTED,
@@ -465,6 +486,20 @@ impl AuditEventKind {
         Self::ALL.contains(&kind)
     }
 
+    /// Returns the closed-kind static matching a runtime kind string.
+    ///
+    /// The #1840 spool reconcile path rebuilds drafts through this lookup,
+    /// so a spooled kind either resolves to its canonical static or is
+    /// retained as unknown-kind evidence; a non-canonical kind can never
+    /// leak into the chain through a rebuilt draft.
+    #[must_use]
+    pub(crate) fn canonical(kind: &str) -> Option<&'static str> {
+        Self::ALL
+            .iter()
+            .find(|candidate| **candidate == kind)
+            .copied()
+    }
+
     /// Returns the I16.9 assurance class for one canonical kind.
     #[must_use]
     pub fn assurance_class(kind: &str) -> AuditAssuranceClass {
@@ -478,8 +513,10 @@ impl AuditEventKind {
             | Self::SESSION_REJECTED
             | Self::SESSION_REVOKED
             | Self::RESULT_KERNEL_BOUND
+            | Self::TRACE_MANIFEST_SEALED
             | Self::RECEIPT_LIVE_PUBLISHED
             | Self::CANCEL_REQUESTED
+            | Self::CANCEL_CONFIRMED
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
             | Self::SHUTDOWN_DRAIN_REQUESTED
@@ -748,6 +785,52 @@ impl AuditLineage {
         Self::fill(&mut self.route_receipt_actual, receipt_sha256);
     }
 
+    /// Fills lineage slots from one sealed trace manifest (issue #1838).
+    pub fn fill_manifest(&mut self, manifest: &crate::trace_manifest::TraceManifest) {
+        Self::fill(&mut self.trace_id, manifest.trace_id.as_str());
+        Self::fill(&mut self.operation_id, &manifest.operation_id);
+        Self::fill(&mut self.work_item, &manifest.operation_id);
+        if let Some(task) = manifest.task_id.as_deref() {
+            Self::fill(&mut self.task_id, task);
+        }
+        if let Some(session) = manifest.session_id.as_deref() {
+            Self::fill(&mut self.session_id, session);
+        }
+        if let Some(scope) = manifest.work_scope_id.as_deref() {
+            Self::fill(&mut self.work_scope, scope);
+        }
+        if let Some(lease) = manifest.lease_attempt_id.as_deref() {
+            Self::fill(&mut self.attempt_id, lease);
+            Self::fill(&mut self.environment_lease, lease);
+        }
+        if self.state_fence.is_none() {
+            self.state_fence.clone_from(&manifest.state_fence);
+        }
+        if let Some(adapter) = manifest
+            .adapter_identity
+            .as_deref()
+            .or(manifest.connection_id.as_deref())
+        {
+            Self::fill(&mut self.adapter_instance, adapter);
+        }
+        if let Some(process) = manifest.executor_identity.as_deref() {
+            Self::fill(&mut self.process_identity, process);
+        }
+        if let Some(route) = manifest.requested_route.as_deref() {
+            Self::fill(&mut self.route_receipt_requested, route);
+        }
+        if let Some(route) = manifest.actual_route.as_deref() {
+            Self::fill(&mut self.route_receipt_actual, route);
+        }
+        if let Some(generation) = manifest.module_generation.as_deref() {
+            Self::fill(&mut self.module_generation, generation);
+        }
+        if let Some(epoch) = manifest.authority_epoch.as_deref() {
+            Self::fill(&mut self.authority_epoch, epoch);
+        }
+        Self::fill(&mut self.controller, "kernel");
+    }
+
     fn fill(slot: &mut Option<String>, value: &str) {
         if slot.is_none() && !value.trim().is_empty() {
             *slot = Some(value.to_owned());
@@ -811,6 +894,42 @@ impl AuditEventDraft {
             lineage: AuditLineage::empty(),
             body: serde_json::Value::Null,
         }
+    }
+
+    /// Rebuilds a draft from spooled parts for #1840 reconciliation.
+    ///
+    /// The caller resolves `kind` through [`AuditEventKind::canonical`];
+    /// [`KernelAuditChain::append`] reseals the cursor/version lineage slots
+    /// at the new sequence, so spooled pre-finalize lineage stays valid.
+    #[must_use]
+    pub(crate) fn from_parts(
+        kind: &'static str,
+        lineage: AuditLineage,
+        body: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind,
+            lineage,
+            body,
+        }
+    }
+
+    /// Returns the draft kind for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Returns the draft lineage for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn lineage(&self) -> &AuditLineage {
+        &self.lineage
+    }
+
+    /// Returns the draft body for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn body(&self) -> &serde_json::Value {
+        &self.body
     }
 
     /// Returns the chain (re)opened draft sealing the restart boundary.
@@ -908,6 +1027,55 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns the route-mismatch draft for one invoke-read that matched no
+    /// daemon-claimable lane (issue #1839).
+    ///
+    /// The requested capability is preserved in lineage
+    /// (`route_receipt_requested`) and body; no actual lane exists because the
+    /// work was rejected before queueing.
+    #[must_use]
+    pub fn route_mismatch_routing(envelope: &HostRequestEnvelope, reason: &'static str) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::ROUTE_MISMATCH,
+            lineage,
+            body: serde_json::json!({
+                "requested_route": envelope.identity.capability,
+                "actual_lane": serde_json::Value::Null,
+                "disposition": "rejected_not_queued",
+                "reason": reason,
+            }),
+        }
+    }
+
+    /// Returns the route-mismatch draft for one submit refused because the
+    /// stored capability diverged from the serving lane (issue #1839).
+    ///
+    /// Observation only: the refusal itself is unchanged
+    /// ([`TransportError::SessionFenced`](eliot_ipc::TransportError::SessionFenced));
+    /// the record names the requested versus actual route so the rejection is
+    /// diagnosable instead of silent.
+    #[must_use]
+    pub fn route_mismatch_submit(
+        session: &Session,
+        stored: &HostRequestRecord,
+        lane: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(stored);
+        lineage.fill_daemon_leg(session);
+        Self {
+            kind: AuditEventKind::ROUTE_MISMATCH,
+            lineage,
+            body: serde_json::json!({
+                "requested_route": stored.capability_ref.as_str(),
+                "actual_lane": lane,
+                "disposition": "rejected_submit_refused",
+            }),
+        }
+    }
+
     /// Returns the fencing-lease claim draft, classified by claim history.
     #[must_use]
     pub fn lease_claim(
@@ -939,6 +1107,54 @@ impl AuditEventDraft {
                 "owner_session_epoch": session.session_epoch,
                 "expires_at_unix_ms": attempt.expires_at_unix_ms,
                 "use_budget": attempt.use_budget,
+            }),
+        }
+    }
+
+    /// Returns the claimed-lease-expiry draft for one deadline-passed pair
+    /// (issue #1839).
+    ///
+    /// `phase` names the route leg that detected the expiry (`admission`,
+    /// `submit`, or `defer`); `queue_retired` reports whether the dead pair
+    /// was actually removed, so the expiry record stays joined to its
+    /// observable cleanup instead of implying removal that never happened.
+    /// The presented attempt identity is carried when the leg presented one;
+    /// admission-time staging presents none.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the expiry observation joins session, record, lane, phase, presented attempt, and cleanup outcome in one audited call"
+    )]
+    pub fn lease_claim_expired(
+        session: Option<&Session>,
+        stored: &HostRequestRecord,
+        lane: &'static str,
+        phase: &'static str,
+        presented_attempt_id: Option<&str>,
+        presented_generation: Option<u64>,
+        queue_retired: bool,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(stored);
+        if let Some(session) = session {
+            lineage.fill_daemon_leg(session);
+        }
+        if let Some(attempt_id) = presented_attempt_id {
+            lineage.attempt_id = Some(attempt_id.to_owned());
+            lineage.environment_lease = Some(attempt_id.to_owned());
+        }
+        Self {
+            kind: AuditEventKind::LEASE_CLAIM_EXPIRED,
+            lineage,
+            body: serde_json::json!({
+                "lane": lane,
+                "phase": phase,
+                "request_digest": stored.request_digest,
+                "deadline_unix_ms": stored.deadline_unix_ms,
+                "presented_attempt_id": presented_attempt_id,
+                "presented_generation": presented_generation,
+                "queue_retired": queue_retired,
+                "durable_state": format!("{:?}", stored.state),
             }),
         }
     }
@@ -1074,6 +1290,25 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns the trace-manifest-sealed draft for one bound result.
+    ///
+    /// The lineage mirrors the manifest's I16.3 slots; the sealed body is the
+    /// manifest itself, so [`TraceManifest::find_sealed`](crate::trace_manifest::TraceManifest::find_sealed)
+    /// replays the exact record from the retained chain. A manifest that
+    /// cannot serialize seals a null body instead of failing the observation:
+    /// the kind plus the lineage operation still identify the seal, and
+    /// readback honestly reports no manifest.
+    #[must_use]
+    pub fn trace_manifest_sealed(manifest: &crate::trace_manifest::TraceManifest) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_manifest(manifest);
+        Self {
+            kind: AuditEventKind::TRACE_MANIFEST_SEALED,
+            lineage,
+            body: serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
     /// Returns the stale-quarantined draft for one noncanonical submission.
     #[must_use]
     pub fn result_stale_quarantined(
@@ -1101,6 +1336,35 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns the claim-deferred draft for one observe deferral (issue #1839).
+    ///
+    /// The durable `DeferredNoEffect` persist precedes the observation; the
+    /// queue pair retires on the same leg, so `queue_retired` is always true
+    /// here and pairs the deferral with its cleanup.
+    #[must_use]
+    pub fn observe_claim_deferred(
+        session: &Session,
+        attempt: &LocalReadAttempt,
+        routed: &HostRequestRecord,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(routed);
+        lineage.fill_daemon_leg(session);
+        lineage.fill_attempt(attempt);
+        Self {
+            kind: AuditEventKind::DEFER_CLAIM_DEFERRED,
+            lineage,
+            body: serde_json::json!({
+                "lane": "observe",
+                "attempt_id": attempt.attempt_id,
+                "fencing_generation": attempt.fencing_generation,
+                "attempt_phase": "deferred_no_effect",
+                "queue_retired": true,
+                "durable_state": format!("{:?}", routed.state),
+            }),
+        }
+    }
+
     /// Returns the cancellation-requested draft for one exact parent.
     #[must_use]
     pub fn cancel_requested(envelope: &HostRequestEnvelope, admitted: &HostRequestRecord) -> Self {
@@ -1113,6 +1377,35 @@ impl AuditEventDraft {
                 "parent_operation_id": envelope.identity.parent_operation_id,
                 "cancellation_id": envelope.identity.cancellation_id,
                 "durable_state": format!("{:?}", admitted.state),
+            }),
+        }
+    }
+
+    /// Returns the cancellation-confirmed draft for one exact parent
+    /// (issue #1839).
+    ///
+    /// `outcome` is `cancelled` only after the atomic ORS transition proves
+    /// no possible effect, `fenced_unknown` when a claimed attempt remains
+    /// unresolved, `reconciling` for an existing recovery, or
+    /// `already_terminal` for an already closed parent. The durable ORS
+    /// observation precedes this audit record.
+    #[must_use]
+    pub fn cancel_confirmed(
+        envelope: &HostRequestEnvelope,
+        parent_operation_id: &str,
+        parent_digest: &str,
+        outcome: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::CANCEL_CONFIRMED,
+            lineage,
+            body: serde_json::json!({
+                "parent_operation_id": parent_operation_id,
+                "parent_digest": parent_digest,
+                "cancellation_id": envelope.identity.cancellation_id,
+                "outcome": outcome,
             }),
         }
     }
@@ -2360,23 +2653,40 @@ fn append_missing_result_leg(
 }
 
 impl crate::KernelComposition {
-    /// Appends one audit event through the composition's single chain.
+    /// Observes one audit event through the I16.11 fallback cascade.
     ///
     /// Uniform observational posture: best-effort, never changes an
-    /// authority decision. A failed append emits the stable
-    /// `KERNEL_AUDIT_APPEND_FAILED` terminal and returns `None` (I16.11:
-    /// silent success is forbidden).
+    /// authority decision. The draft runs the composition's single chain
+    /// first and then the single audit fallback (issue #1840): a failed
+    /// append is retained in the audit spool, else the last-resort
+    /// channel, else the visible control-loss state. Every chain failure
+    /// still emits the stable `KERNEL_AUDIT_APPEND_FAILED` terminal plus
+    /// the cascade retention code (I16.11: silent success is forbidden).
+    /// Lock order is chain-then-fallback, matching reconciliation.
     pub(crate) fn audit_observe(&self, draft: AuditEventDraft) -> Option<AuditRecord> {
         let now = crate::unix_ms();
         let Ok(mut chain) = self.kernel_audit.lock() else {
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
             return None;
         };
-        if let Ok(record) = chain.append(draft, now) {
-            Some(record)
-        } else {
+        let Ok(mut fallback) = self.audit_fallback.lock() else {
+            if let Ok(record) = chain.append(draft, now) {
+                return Some(record);
+            }
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
-            None
+            return None;
+        };
+        match fallback.observe(&mut chain, draft, now) {
+            crate::audit_fallback::AuditFallbackOutcome::Appended(record) => Some(record),
+            outcome => {
+                crate::kernel_diagnostics::observe_terminal_error(
+                    KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                );
+                if let Some(code) = outcome.retention_code() {
+                    crate::kernel_diagnostics::observe_terminal_error(code);
+                }
+                None
+            }
         }
     }
 
@@ -2617,6 +2927,32 @@ impl crate::KernelComposition {
             let head_seq = chain.head_seq();
             let head_hash = chain.head_hash().to_owned();
             (head_seq, head_hash)
+        })
+    }
+
+    /// Reconciles spooled audit records into canonical state (issue #1840).
+    ///
+    /// Best-effort like every observation: lock order is chain-then-
+    /// fallback, matching the observe path. Returns `None` when either
+    /// lock is poisoned.
+    pub fn reconcile_audit_spool(&self) -> Option<crate::audit_fallback::AuditReconcileReport> {
+        let now = crate::unix_ms();
+        let mut chain = self.kernel_audit.lock().ok()?;
+        let mut fallback = self.audit_fallback.lock().ok()?;
+        Some(fallback.reconcile(&mut chain, now))
+    }
+
+    /// Counts spool records still awaiting reconciliation.
+    pub fn audit_spool_pending(&self) -> u64 {
+        self.audit_fallback
+            .lock()
+            .map_or(0, |fallback| fallback.pending_spool_records())
+    }
+
+    /// Returns the control-loss counters (`total`, `held`).
+    pub fn audit_control_loss(&self) -> (u64, usize) {
+        self.audit_fallback.lock().map_or((0, 0), |fallback| {
+            (fallback.control_loss_total(), fallback.held_control_loss())
         })
     }
 }

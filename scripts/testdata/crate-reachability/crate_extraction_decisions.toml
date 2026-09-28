@@ -1,4 +1,4 @@
-# CrateExtractionDecision registry (issue #1720).
+# CrateExtractionDecision registry.
 #
 # This is the EXPLICIT, POLICY record the reachability inventory checks. Dispositions
 # are never inferred from source statistics, name similarity or LOC. A package absent
@@ -6,35 +6,291 @@
 # `scripts/crate_reachability_inventory.py` as an `UNCLASSIFIED` admission defect,
 # which is the correct, honest outcome for a package nobody has dispositioned.
 #
-# Allowed `disposition` values (exactly four):
-#   Connect          - wire to its first intended binary/runtime bundle through the
-#                      owning composition crate, preserving C0->C4 dependency direction.
-#   ContractOnly     - library-only by intent; a real public consumer is established
-#                      through a service or contract boundary.
-#   MigrationFacade  - retained only as a time-bounded facade. REQUIRES `owner`,
-#                      `expires`, `successor` and `removal_condition`; the tool rejects
-#                      a facade whose expiry is missing, unparsable or already past.
-#   OptionalContour  - optional/laboratory dependency island moved to a federated
-#                      workspace contour, excluded from the root daily path while
-#                      retaining an explicit invocation/proof entrypoint.
-#
 # Adding a package here is a reviewed policy act, not a mechanical fix. Do not add an
 # entry to silence the report: an unclassified package is a true finding until a human
 # records a real disposition with a real owner.
 #
-# `source_ref` points at the record that justifies the disposition. A disposition
-# without a traceable source reference is a defect in itself.
+# TWO DISJOINT CLASSIFICATION LAYERS LIVE IN THIS FILE, because the Architecture
+# fixes two different vocabularies for two different denominators. Both are read and
+# enforced by `scripts/crate_reachability_inventory.py`; neither is inferred.
+#
+# 1. `decision` - issue #1720. The classification of a package that IS a root workspace
+#    member yet is unreachable from every binary or service consumer. Allowed
+#    `disposition` values (exactly four):
+#      Connect          - wire to its first intended binary/runtime bundle through the
+#                         owning composition crate, preserving C0->C4 dependency direction.
+#      ContractOnly     - library-only by intent; a real public consumer is established
+#                         through a service or contract boundary.
+#      MigrationFacade  - retained only as a time-bounded facade. REQUIRES `owner`,
+#                         `expires`, `successor` and `removal_condition`; the tool rejects
+#                         a facade whose expiry is missing, unparsable or already past.
+#      OptionalContour  - optional/laboratory dependency island moved to a federated
+#                         workspace contour, excluded from the root daily path while
+#                         retaining an explicit invocation/proof entrypoint.
+#    `source_ref` points at the record that justifies the disposition. A disposition
+#    without a traceable source reference is a defect in itself.
+#
+# 2. `admission_decision` - issue #1721. The I2.23 "Canonical extraction decision"
+#    record for a package admitted out of the root `exclude` list by an admission wave.
+#    I2.23 fixes the record's thirteen field names verbatim, and I2.21 fixes the
+#    outcome vocabulary, which collapses onto exactly six `disposition` values:
+#      keep | split | merge | extract_contract | isolate_dependency | experiment
+#    The tool compares every field of every record against the crate the record names,
+#    so a record cannot be satisfied by existing:
+#      - the package must be a real root-workspace member whose `module.toml`
+#        `[agent_task].workspace_admission` names admission wave #966, #967 or #968,
+#        and every such member must have a record (the denominator is derived from the
+#        tree, never from this file);
+#      - `proposed_package_boundary` must name a contour that exists on disk and a
+#        package that is a member of that contour's `[workspace].members`;
+#      - `public_contract_and_independent_test_entrypoint` must be a `path::symbol`
+#        inside the named package, and that symbol must exist in that file;
+#      - `first_real_consumer_or_time_bounded_migration_facade` must either name a
+#        `path::symbol` outside the package whose owning manifest really declares a
+#        Cargo dependency on it, or carry an ISO-8601 expiry that is not already past
+#        together with a consumer string the crate's own `module.toml` declares;
+#      - `affected_functional_cells_and_lifecycle_owners` and
+#        `source_maintenance_owner_and_vendor_type_boundary` must name the crate's real
+#        `functional_cell`, `lifecycle_owner` and `[agent_task].integration_owner`.
+#    A `[[donor]] disposition` in a `module.toml` is a DONOR disposition in a donor
+#    vocabulary and is never read as an admission disposition.
 
 schema = "eliot.crate-extraction-decision.v1"
-revision = "2026-09-27.1"
+revision = "2026-09-27.2"
 
-# Intentionally empty. Every production-admitted, binary-unreachable workspace package
-# is currently UNCLASSIFIED and is reported as an admission defect by the inventory.
-#
-# This is the honest starting state for #1720: no explicit, reviewed per-package
-# disposition record exists in the repository yet. The registry mechanism, the four
-# decision types, the facade obligations and the fail-closed admission-defect path are
-# implemented and enforced; populating the rows requires a human to supply a genuine
-# owner, expiry, successor and removal condition per package, and guessing those here
-# would fabricate exactly the authority this issue forbids inventing.
+# Honest residual, recorded rather than hidden: `decision` is STILL EMPTY. No
+# decision row has ever been recorded here - the array has been empty since this
+# registry was created for #1720, so nothing was ever decided in this layer. Every
+# production-admitted, binary-unreachable workspace package is therefore UNCLASSIFIED
+# under the #1720 four-verb vocabulary and is reported as an admission defect by the
+# inventory, which is the correct outcome until a human supplies a genuine owner,
+# expiry, successor and removal condition per unreachable package. Writing rows here
+# to silence that defect would fabricate exactly the authority this issue forbids
+# inventing; the registry mechanism, the four decision types, the facade obligations
+# and the fail-closed admission-defect path are implemented and enforced regardless.
+# The I2.23 admission decisions for the wave-admitted packages are recorded below, in
+# the record shape and vocabulary I2.23 fixes for them.
 decision = []
+[[admission_decision]]
+package = "eliot-dreamer-clarification"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.clarification, lifecycle owner smart.dreamer.clarification, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies serde_json (crates.io); no build script; declared consumers agent mailbox compiler, Human attention proposal"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-clarification"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-clarification/src/tests/strict_regressions.rs::routing_owner_mismatch_is_rejected_after_resealing; cargo test -p eliot-dreamer-clarification --lib routing_owner_mismatch_is_rejected_after_resealing"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares agent mailbox compiler (and Human attention proposal) as the intended consumer, but that name is not a package in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 3679 non-blank lines and 45 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 45 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-architecture-brief"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.architecture_brief, lifecycle owner smart.dreamer.architecture_brief, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies eliot-epistemic-contracts (path), eliot-receipts (path); no build script; declared consumers Dreamer self-query surface, ELIOT self-scope Edge proof"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-architecture-brief"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-architecture-brief/tests/architecture_brief.rs::minimal_accepted_architecture_brief_is_complete; cargo test -p eliot-dreamer-architecture-brief --test architecture_brief minimal_accepted_architecture_brief_is_complete"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Dreamer self-query surface (and ELIOT self-scope Edge proof) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 2637 non-blank lines and 30 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 30 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-implementation-brief"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.implementation_brief, lifecycle owner smart.dreamer.implementation_brief, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-conformance-contracts (path), eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies eliot-epistemic-contracts (path), eliot-receipts (path); no build script; declared consumers Dreamer self-query surface, ELIOT self-scope Edge proof"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-implementation-brief"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-implementation-brief/tests/implementation_brief.rs::minimal_implementation_brief; cargo test -p eliot-dreamer-implementation-brief --test implementation_brief minimal_implementation_brief"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Dreamer self-query surface (and ELIOT self-scope Edge proof) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 4102 non-blank lines and 39 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 39 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #968 (T8-A1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-failure"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.failure, lifecycle owner smart.dreamer.failure, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-dreamer-contracts (path), eliot-receipts (path); dev dependencies eliot-contracts (path), eliot-evidence (path); no build script; declared consumers eliot-dreamer-curation"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-failure"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-failure/tests/failure.rs::exact_failure_produces_sealed_hypothesis_decision; cargo test -p eliot-dreamer-failure --test failure exact_failure_produces_sealed_hypothesis_decision"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 6599 non-blank lines and 55 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 55 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-structure-repair"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.structure_repair, lifecycle owner smart.dreamer.structure_repair, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-structure-repair"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::case_01_valid_merge_completes_with_rewrite_manifest; cargo test -p eliot-dreamer-structure-repair --lib case_01_valid_merge_completes_with_rewrite_manifest"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 3184 non-blank lines and 8 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 8 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-reconsolidation"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.reconsolidation, lifecycle owner smart.dreamer.reconsolidation, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-reconsolidation"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::case_01_valid_derived_completes_with_allocation_request; cargo test -p eliot-dreamer-reconsolidation --lib case_01_valid_derived_completes_with_allocation_request"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5048 non-blank lines and 64 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 64 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-accessibility"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.accessibility, lifecycle owner smart.dreamer.accessibility, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evaluation-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-accessibility"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-accessibility/src/lib.rs::case_01_accessibility_only_typed_payload_completes; cargo test -p eliot-dreamer-accessibility --lib case_01_accessibility_only_typed_payload_completes"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 4145 non-blank lines and 59 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 59 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-memory-repair"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.memory_repair, lifecycle owner smart.dreamer.memory_repair, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path), eliot-security-contracts (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-memory-repair"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::a03_port_binds_repair_wire_kind_and_preserves_candidate_content; cargo test -p eliot-dreamer-memory-repair --lib a03_port_binds_repair_wire_kind_and_preserves_candidate_content"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5016 non-blank lines and 71 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 71 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-dreamer-curation"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.curation, lifecycle owner smart.dreamer.curation, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers Governor candidate disposition, maintenance review"
+proposed_package_boundary = "workspace/core :: eliot-dreamer-curation"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-curation/src/lib.rs::h1_native_binding_invokes_selected_owner_once_with_full_content; cargo test -p eliot-dreamer-curation --lib h1_native_binding_invokes_selected_owner_once_with_full_content"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer bins/eliot-dreamer/src/dispatch_stage.rs::dispatch_curation and crates/smart/eliot-dreamer-curation-wasm/src/conversion.rs::handle_with_ports; no migration expiry applies because the boundary already has a consumer"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 2900 non-blank lines and 9 test cases; measured Cargo reverse fan-out is eliot-dreamer and eliot-dreamer-curation-wasm (2 production dependents)"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 9 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "keep"
+
+[[admission_decision]]
+package = "eliot-learning-state-view"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.learning.state_view, lifecycle owner smart.learning.state_view, runtime bundle eliotd, source layer C1 into runtime layer R5"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-evidence (path), eliot-learning-contracts (path), eliot-reactive-context-plan (path); dev dependencies none; no build script; declared consumers learning delta, learning overlay, Context Compiler"
+proposed_package_boundary = "workspace/core :: eliot-learning-state-view"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-learning-state-view/tests/state_view.rs::complete_reconstruction_preserves_recipe_member_order_and_canonical_digest; cargo test -p eliot-learning-state-view --test state_view complete_reconstruction_preserves_recipe_member_order_and_canonical_digest"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result and crates/smart/eliot-context/src/lib.rs::compile_with_campaign_learning_state; no migration expiry applies because the boundary already has a consumer"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 3321 non-blank lines and 40 test cases; measured Cargo reverse fan-out is eliotd and eliot-context (2 production dependents)"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 40 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "keep"
+
+[[admission_decision]]
+package = "eliot-learning-delta"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.learning.delta, lifecycle owner smart.learning.delta, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-evidence (path), eliot-instrument-api (path), eliot-learning-contracts (path); dev dependencies none; no build script; declared consumers learning overlay, Meta closure"
+proposed_package_boundary = "workspace/core :: eliot-learning-delta"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-learning-delta/tests/delta.rs::derives_delta_with_exact_before_and_inverse; cargo test -p eliot-learning-delta --test delta derives_delta_with_exact_before_and_inverse"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer crates/governor/eliot-governor/src/learning_delta_integration.rs::derive_delta_at_boundary; no migration expiry applies because the boundary already has a consumer"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 8531 non-blank lines and 44 test cases; measured Cargo reverse fan-out is eliot-governor (1 production dependent)"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 44 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "keep"
+
+[[admission_decision]]
+package = "eliot-learning-overlay"
+affected_functional_cells_and_lifecycle_owners = "functional cell smart.learning.overlay, lifecycle owner smart.learning.overlay, runtime bundle eliotd, source layer C1 into runtime layer R5"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-evidence (path), eliot-learning-contracts (path); dev dependencies eliot-agent-contracts (path); no build script; declared consumers Governor local admission, Context Compiler"
+proposed_package_boundary = "workspace/core :: eliot-learning-overlay"
+public_contract_and_independent_test_entrypoint = "crates/smart/eliot-learning-overlay/tests/overlay.rs::composes_disjoint_add_replace_remove_with_exact_inverses; cargo test -p eliot-learning-overlay --test overlay composes_disjoint_add_replace_remove_with_exact_inverses"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Context Compiler (and Governor local admission) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5704 non-blank lines and 58 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 58 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "extract_contract"
+
+[[admission_decision]]
+package = "eliot-learning-activation-assessment"
+affected_functional_cells_and_lifecycle_owners = "functional cell meta.learning.activation_assessment, lifecycle owner meta.learning.activation_assessment, runtime bundle eliotd, source layer C1 into runtime layer R7"
+current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-evidence (path), eliot-learning-contracts (path); dev dependencies none; no build script; declared consumers Meta closure, self-quality diagnosis"
+proposed_package_boundary = "workspace/core :: eliot-learning-activation-assessment"
+public_contract_and_independent_test_entrypoint = "crates/meta/eliot-learning-activation-assessment/tests/activation.rs::constructs_candidate_and_retains_unknowns; cargo test -p eliot-learning-activation-assessment --test activation constructs_candidate_and_retains_unknowns"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer crates/governor/eliot-governor/src/learning_delta_integration.rs::emit_activation_receipt_at_attempt_close; no migration expiry applies because the boundary already has a consumer"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 7313 non-blank lines and 57 test cases; measured Cargo reverse fan-out is eliot-governor (1 production dependent)"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 57 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "keep"
+
+[[admission_decision]]
+package = "eliot-self-quality"
+affected_functional_cells_and_lifecycle_owners = "functional cell meta.self_quality.diagnosis, lifecycle owner meta.self_quality.diagnosis, runtime bundle eliotd, source layer C1 into runtime layer R7"
+current_source_dependency_and_change_closure = "path dependencies eliot-conformance-contracts (path), eliot-contracts (path), eliot-improvement (path); dev dependencies none; no build script; declared consumers conflict analysis (#673), development diagnosis (#675), maintenance plan (#677), configuration assistance (#679), incident recovery, Human decision owners"
+proposed_package_boundary = "workspace/core :: eliot-self-quality"
+public_contract_and_independent_test_entrypoint = "crates/meta/eliot-self-quality/tests/self_quality_820_a.rs::meta_identity_exact_and_distinct_from_a37; cargo test -p eliot-self-quality --test self_quality_820_a meta_identity_exact_and_distinct_from_a37"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer bins/eliotd/src/improvement_intake.rs::route_self_quality_handoff_to_backlog; no migration expiry applies because the boundary already has a consumer"
+source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
+dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 4591 non-blank lines and 56 test cases; measured Cargo reverse fan-out is eliotd (1 production dependent)"
+expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 56 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
+counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+evidence_status_and_review_owner = "workspace admission: admitted via #967 (T8-AL1) root workspace membership; review owner cognitive-wave-integrator"
+disposition = "keep"

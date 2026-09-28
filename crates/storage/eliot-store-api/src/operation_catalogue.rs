@@ -60,7 +60,10 @@
 //! (issue #1779: closed query discriminator with exact selectors, no scope),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
-//! known-but-unsupported and unadvertised: no other mutation on base has a
+//! known-but-unsupported and unadvertised: this includes issue #1814's
+//! typed `GetInstrumentRegistryState` / `ApplyInstrumentRegistryState`
+//! contract until canonical read/write handlers are available. No other
+//! mutation on base has a
 //! proven handler, schema, and consumer triple, so C1 advertises no other
 //! mutation entry and any transition carrying another named command fails
 //! closed against the generated set.
@@ -863,7 +866,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
-            | NamedMutationOperation::ApplySwarmOwnerRevisions => {
+            | NamedMutationOperation::ApplySwarmOwnerRevisions
+            | NamedMutationOperation::ApplyInstrumentRegistryState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::ApplyNotificationState => {
@@ -896,13 +900,19 @@ pub fn validate_transition_against_catalogue(
                 return Err(StoreError::UnknownOperation);
             }
         }
-        let parameter_bytes = canonical_json_bytes(&command.parameters)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        if u64::try_from(parameter_bytes.len())
-            .map_or(true, |len| len > u64::from(entry.max_input_bytes))
-        {
-            return Err(StoreError::PayloadTooLarge);
-        }
+        validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_parameter_size(
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+    max_input_bytes: u32,
+) -> Result<(), StoreError> {
+    let parameter_bytes = canonical_json_bytes(parameters)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if u64::try_from(parameter_bytes.len()).map_or(true, |len| len > u64::from(max_input_bytes)) {
+        return Err(StoreError::PayloadTooLarge);
     }
     Ok(())
 }

@@ -58,11 +58,12 @@ pub use governor_closure_source::{
     GovernorClosureSource, GovernorClosureSourceHandle,
 };
 pub use grant_activation_port::{
-    CommittedReceipt, GRANT_CLOSURE_ENUMERATION_FIELDS, GrantActivationIntent, GrantActivationPort,
-    GrantClosureActivationIntent, GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt,
-    GrantClosureRevocationIntent, GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition,
-    IntroductionActivationIntent, IntroductionRevocationIntent, ROOT_GRANT_HYDRATION_FIELDS,
-    RootGrantHydration, RootGrantHydrationSource, verify_grant_seal, verify_introduction_seal,
+    CommittedAuthorityActivation, CommittedReceipt, GRANT_CLOSURE_ENUMERATION_FIELDS,
+    GrantActivationIntent, GrantActivationPort, GrantClosureActivationIntent,
+    GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt, GrantClosureRevocationIntent,
+    GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition, IntroductionActivationIntent,
+    IntroductionRevocationIntent, ROOT_GRANT_HYDRATION_FIELDS, RootGrantHydration,
+    RootGrantHydrationSource, verify_grant_seal, verify_introduction_seal,
 };
 pub use introduction_lifecycle::{
     INTRODUCTION_HYDRATION_FIELDS, IntroductionHydration, introduction_fence_input,
@@ -72,7 +73,7 @@ pub use module::compatibility_handshake::{
     AcceptedCompatibilityEvidence, CompatibilityEnvelope, CompatibilityMismatch,
     DurableCompatibilityState, HANDSHAKE_ENVELOPE_VERSION, MismatchField, NORMATIVE_SEAL_DOMAIN,
     NormativePairReceipt, StateMigrationClass, VersionRange, admit_handshake, admit_rollback,
-    expected_seal_tag,
+    expected_seal_tag, restore_recorded_evidence,
 };
 pub use module::control_reserve_front_door::{
     AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,
@@ -81,7 +82,16 @@ pub use module::control_reserve_front_door::{
     PermitOperation,
 };
 pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
+pub use module::generation_readiness::{
+    GenerationContractIdentity, GenerationReadiness, GenerationReadinessProjection,
+    evaluate_admitted_generation_readiness, evaluate_generation_readiness,
+    evaluate_module_set_readiness, graph_identity, recheck_after_provider_change,
+};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
+pub use module::module_lifecycle_order::{
+    LifecycleOrder, LifecycleStep, ProviderObservation, drain_ready_now,
+    provider_first_lifecycle_order, startup_ready_now,
+};
 pub use module::notification_state::{
     Acknowledgement, DeadlineOrReview, DeliveryChannel, DeliveryState, Notification,
     NotificationDraft, NotificationError, NotificationSeverity, NotificationStore, Resolution,
@@ -94,7 +104,7 @@ pub use module::process_health::{
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 pub use module::runtime_health::{
     CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
-    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence, runtime_supervision_coverage,
 };
 pub use user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,

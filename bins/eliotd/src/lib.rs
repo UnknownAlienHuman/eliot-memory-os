@@ -147,9 +147,12 @@ pub use capability_outcome::{
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
-    controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
+    controlboard_notification_refresh_refusal_body, controlboard_result_body,
+    is_controlboard_read_tool, serve_controlboard_view,
 };
-pub use daemon_config::DaemonConfig;
+pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
+#[cfg(windows)]
+pub use daemon_kernel_client::admitted_daemon_module_contract;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
@@ -1760,6 +1763,18 @@ impl DaemonComposition {
             ));
         }
         Ok(self.shared_skill_adapter())
+    }
+
+    /// Borrows the one Governor Skill lifecycle owner for a read-only
+    /// owner-position probe (issue #2664).
+    ///
+    /// Narrow composition seam for the execute leg: the reconciliation must
+    /// read what the lifecycle owner actually retains, and it must do so
+    /// without taking a second authority or creating a Skill-private store.
+    /// The borrow is in-process owner state only, is valid for the duration of
+    /// the caller's expression, and can never be held across an await.
+    pub fn skill_lifecycle_owner(&self) -> &eliot_skill::SkillRegistry {
+        &self.governor.owners().skill
     }
 
     /// Builds the shared-catalogue skill adapter driven by the runtime

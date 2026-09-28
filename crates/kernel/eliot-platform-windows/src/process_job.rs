@@ -180,6 +180,50 @@ impl JobObjectLimits {
             active_process_limit,
         })
     }
+
+    /// Creates validated Job limits with a mandatory memory ceiling.
+    ///
+    /// Worker launch descriptors whose approved profile requires containment
+    /// use this constructor: a missing (`None`) memory ceiling fails closed
+    /// instead of falling back to the unlimited default. A failed limit is a
+    /// typed rejection, never an admitted unlimited Job.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the required memory ceiling is absent, is
+    /// zero, or cannot be represented by the Win32 Job Object structures, or
+    /// when any other supplied ceiling is zero or unrepresentable.
+    pub fn require_memory_ceiling(
+        cpu_time_ms: Option<u64>,
+        memory_bytes: Option<u64>,
+        active_process_limit: Option<u32>,
+    ) -> Result<Self, WindowsAdapterError> {
+        if memory_bytes.is_none() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Self::new(cpu_time_ms, memory_bytes, active_process_limit)
+    }
+
+    /// Returns the admitted CPU-time ceiling, if one was installed.
+    #[must_use]
+    pub const fn cpu_time_ms(&self) -> Option<u64> {
+        self.cpu_time_ms
+    }
+
+    /// Returns the admitted Job memory ceiling in bytes, if one was installed.
+    ///
+    /// `None` is an explicitly unlimited Job, never a zero reading: callers
+    /// binding requested and observed enforced limits must preserve the
+    /// distinction instead of projecting unlimited as contained.
+    #[must_use]
+    pub const fn memory_bytes(&self) -> Option<u64> {
+        self.memory_bytes
+    }
+
+    /// Returns the admitted active-process ceiling, if one was installed.
+    #[must_use]
+    pub const fn active_process_limit(&self) -> Option<u32> {
+        self.active_process_limit
+    }
 }
 
 /// Owner identity of one Host-owned outer Job Object kill domain.
@@ -1151,6 +1195,7 @@ pub struct SuspendedProcessEvidence {
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     command_line_utf16: Vec<u16>,
     job_process_count: u32,
+    enforced_limits: Option<JobObjectLimits>,
 }
 
 #[cfg(windows)]
@@ -1211,6 +1256,18 @@ impl SuspendedProcessEvidence {
     #[must_use]
     pub const fn job_process_count(&self) -> u32 {
         self.job_process_count
+    }
+
+    /// Returns the exact resource ceilings installed on the containing Job
+    /// before any process was assigned, bound to this admitted identity.
+    ///
+    /// Fresh contained spawns report `Some` with the ceilings passed to the
+    /// limit constructor. Members launched into a reopened Job report `None`:
+    /// the enforced ceilings of a pre-existing Job are unknown to this launch
+    /// and are explicit here, never zero or a containment claim.
+    #[must_use]
+    pub const fn enforced_limits(&self) -> Option<JobObjectLimits> {
+        self.enforced_limits
     }
 }
 
@@ -1658,6 +1715,7 @@ struct JobChildHandles {
     process: OwnedProcessHandle,
     thread: OwnedProcessHandle,
     job: JobObject,
+    resource_limits: JobObjectLimits,
     spawn_identity: ProcessIdentity,
     executable: PinnedExecutable,
     spec: SuspendedLaunchSpec,
@@ -1707,6 +1765,7 @@ impl JobChildHandles {
             environment: self.spec.environment.clone(),
             command_line_utf16: self.command_line_utf16.clone(),
             job_process_count: count,
+            enforced_limits: Some(self.resource_limits),
         })
     }
 
@@ -1845,6 +1904,10 @@ impl ExistingJobMemberHandles {
             environment: self.spec.environment.clone(),
             command_line_utf16: self.command_line_utf16.clone(),
             job_process_count: count,
+            // The member was assigned to a reopened pre-existing Job: the
+            // ceilings enforced by that Job are unknown to this launch and
+            // stay explicit here instead of a containment claim.
+            enforced_limits: None,
         })
     }
 
@@ -2457,6 +2520,12 @@ impl SuspendedJobChild {
     /// child-side standard handles are inheritable. Validation and resume stay
     /// separate consuming transitions.
     ///
+    /// The Job carries no resource ceilings: this form is reserved for core
+    /// branches whose approved posture is kill-on-close containment without a
+    /// job-memory ceiling. Worker launch descriptors with a required memory
+    /// ceiling must use [`Self::spawn_named_with_limits`] with
+    /// [`JobObjectLimits::require_memory_ceiling`] and never fall back here.
+    ///
     /// # Errors
     /// Returns a typed adapter error for a Job-name collision or any pipe,
     /// process, identity, or assignment failure.
@@ -2689,6 +2758,7 @@ impl SuspendedJobChild {
             process,
             thread,
             job,
+            resource_limits,
             spawn_identity,
             executable,
             spec,

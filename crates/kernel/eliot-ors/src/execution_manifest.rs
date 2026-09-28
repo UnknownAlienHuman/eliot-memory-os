@@ -650,6 +650,16 @@ impl KernelExecutionRestartRequest {
             "kernel_execution_restart_bound_manifest_sha256",
         )?;
         self.candidate.validate()?;
+        // The recorded I1.12 verdict must satisfy its own storage shape and be
+        // bound to this request's generation, so a restart can never be decided
+        // against evidence that names a different candidate.
+        self.compatibility.validate()?;
+        if self.compatibility.module_generation() != self.generation.value() {
+            return Err(OrsError::InvalidField {
+                field: "kernel_execution_restart_compatibility_generation",
+                reason: "the recorded compatibility verdict must name the request's own generation",
+            });
+        }
         if self.current_catalog_revision == 0 {
             return Err(OrsError::InvalidField {
                 field: "kernel_execution_restart_current_catalog_revision",
@@ -1041,9 +1051,7 @@ fn manifest_blocking_defect(
     if manifest.launch_binding() != request.candidate {
         return Some(KernelReconciliationKind::ManifestCandidateBindingMismatch);
     }
-    if !request.compatibility.durable_format_compatible
-        || !request.compatibility.epoch_lineage_compatible
-    {
+    if request.compatibility.is_refused() {
         return Some(KernelReconciliationKind::ManifestIncompatible);
     }
     if request.revocation == RevocationAcknowledgement::Acknowledged {

@@ -16,10 +16,12 @@
 #[cfg(windows)]
 use super::SupervisionLeaseAuthorityConfig;
 use super::{
-    AgentBridgeAdmissionDescriptor, AuditAnchorBinding, BlobStoreManifest, DEFAULT_PIPE_NAME,
-    EliotdLaunchDescriptor, EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
+    AgentBridgeAdmissionDescriptor, AuditAnchorBinding, AuditSpoolBinding, BlobStoreManifest,
+    DEFAULT_PIPE_NAME, EliotdLaunchDescriptor, EliotdReceiptRootBinding,
+    HostStoreBootstrapRequirement, PathBuf,
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
+use eliot_observability_runtime::RuntimeProfile;
 
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +95,15 @@ pub struct KernelConfig {
     /// for an operational surface. A non-loopback value is refused at install
     /// rather than narrowed, so this field cannot turn into an off-box endpoint.
     pub metrics_listen: Option<String>,
+    /// Host-owned directory receiving the independently persisted audit
+    /// spool records (issue #1840; I16.11). `None` keeps the default spool
+    /// below the Kernel work root; the Kernel never creates the foreign one.
+    pub audit_spool_binding: Option<AuditSpoolBinding>,
+    /// Installation profile driving the audit last-resort rule (issue
+    /// #1840; I16.2): `system_service` uses the Windows Event Log,
+    /// `user_mode`/portable use the control slot. `None` behaves as
+    /// portable (slot only), which is safe on every platform.
+    pub audit_fallback_profile: Option<RuntimeProfile>,
     /// Production startup must opt into consuming the exact authority receipt
     /// from the already protected process handoff descriptor. Tests and
     /// library-only process-authority compositions do not silently synthesize
@@ -127,6 +138,8 @@ impl KernelConfig {
             supervision_lease_authority: None,
             audit_anchor_binding: None,
             metrics_listen: None,
+            audit_spool_binding: None,
+            audit_fallback_profile: None,
             #[cfg(windows)]
             require_descriptor_supervision_authority: false,
         }
@@ -297,6 +310,29 @@ impl KernelConfig {
     pub fn with_metrics_listen(mut self, address: impl Into<String>) -> Self {
         self.metrics_listen = Some(address.into());
         self
+    }
+
+    /// Injects the Host-owned audit-spool directory.
+    /// No default; `None` keeps the spool below the Kernel work root.
+    #[must_use]
+    pub fn with_audit_spool_binding(mut self, binding: AuditSpoolBinding) -> Self {
+        self.audit_spool_binding = Some(binding);
+        self
+    }
+
+    /// Injects the installation profile for the audit last-resort rule.
+    /// No default; `None` behaves as portable (control slot only).
+    #[must_use]
+    pub fn with_audit_fallback_profile(mut self, profile: RuntimeProfile) -> Self {
+        self.audit_fallback_profile = Some(profile);
+        self
+    }
+
+    /// Returns the effective audit-fallback profile.
+    #[must_use]
+    pub fn audit_fallback_profile_or_default(&self) -> RuntimeProfile {
+        self.audit_fallback_profile
+            .unwrap_or(RuntimeProfile::Portable)
     }
 }
 

@@ -1,6 +1,6 @@
 schema = "eliot.dependency-policy.v1"
 issue = 1229
-updated_at = "2026-09-23"
+updated_at = "2026-09-27"
 # Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
 exceptions = []
 
@@ -161,12 +161,12 @@ removal_plan = "standalone encoding helper"
 
 [direct_dependencies.blake3]
 ecosystem = "rust"
-consumer = "eliot-evidence/receipts"
-owner = "crates/foundation/eliot-evidence"
-reason = "cryptographic content addressing and tree hashing"
+consumer = "crates/eliot-engine, crates/surfaces/eliot-skills"
+owner = "crates/eliot-engine, crates/surfaces/eliot-skills"
+reason = "content addressing and canonical Skill-pack identity hashing"
 features = []
-public_exposure = "digest types only"
-removal_plan = "standard SHA-256 fallback"
+public_exposure = "digest strings only; no blake3 vendor types"
+removal_plan = "version and migrate existing digest contracts and readers before removal"
 
 [direct_dependencies.clap]
 ecosystem = "rust"

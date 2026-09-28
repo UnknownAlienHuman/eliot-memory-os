@@ -186,6 +186,16 @@ required_files = []
 optional_files = []
 
 [[route]]
+id = "daemon-diagnostics"
+description = "Daemon diagnostics redaction, evidence handles, and telemetry retention."
+path_globs = ["bins/eliotd/src/diagnostics.rs"]
+topic_keywords = []
+required_handles = ["I16.3", "I16.7", "I16.9"]
+optional_handles = []
+required_files = ["bins/AGENTS.md"]
+optional_files = []
+
+[[route]]
 id = "doctor-operations"
 description = "Doctor diagnostics, bounded repair, recovery recipes, operational status, and maintenance."
 path_globs = ["bins/eliot-doctor/**", "docs/operations/**"]
@@ -266,6 +276,12 @@ expect_routes = ["generic-source", "host-kernel", "security-privacy"]
 path = "bins/eliot-watchdog/src/runtime_loop.rs"
 topic = "Watchdog liveness"
 expect_routes = ["generic-source", "watchdog"]
+
+[[coverage.example]]
+path = "bins/eliotd/src/diagnostics.rs"
+topic = ""
+expect_routes = ["generic-source", "daemon-diagnostics"]
+expect_required_handles = ["I16.3", "I16.7", "I16.9"]
 
 [[coverage.example]]
 path = "bins/eliot-store-surreal/src/adapter_materialization.rs"

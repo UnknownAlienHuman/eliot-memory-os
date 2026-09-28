@@ -941,117 +941,619 @@ pub struct ExecutionFold {
     pub uncertain: u64,
 }
 
-/// Production verdict of the unknown-effects reconciliation gate (issue
-/// #1191).
+/// Which set of executions one assessment's numbers describe (issue #2664).
 ///
-/// Counts distinct presented executions by latest presented outcome and
-/// names every execution still [`ExecutionOutcome::Uncertain`]. Retry is
-/// permitted only when nothing is uncertain: an uncertain execution has
-/// unknown effects, and an unknown effect must be reconciled — superseded by
-/// exact observed or failed evidence for the same execution — before the next
-/// attempt. Repeated records for one execution fold idempotently through
-/// their latest outcome instead of double-counting. Absence of an execution
-/// record is absence of evidence, never an observed claim: only presented
-/// records fold, so uninstrumented executions stay unknown instead of
-/// proving success.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnknownEffectsVerdict {
-    /// Distinct presented executions whose latest outcome is fully observed.
-    pub observed: u64,
-    /// Distinct presented executions whose latest outcome is known failed.
-    pub failed: u64,
-    /// `execution_ref`s whose latest presented outcome is still unknown, in
-    /// first-presented order.
-    pub uncertain_pending_refs: Vec<String>,
+/// Page statistics and attempt-wide statistics are different claims about
+/// different sets, and collapsing them is the defect this split removes. A
+/// bounded ingest page is an OBSERVATION about the Skill; the owner-retained
+/// execution set is the attempt-wide position at exactly one owner revision.
+/// A page with no `Uncertain` row therefore says nothing about the rest of the
+/// attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionAssessmentScope {
+    /// Numbers describe only the bounded page this ingest presented.
+    PresentedPage,
+    /// Numbers describe the owner-retained execution set for the subject
+    /// Skill at the owner revision the assessment names.
+    OwnerRetainedSet,
 }
 
-impl UnknownEffectsVerdict {
+/// Maximum per-execution references one assessment publishes over the wire.
+///
+/// The transport's own ingest bound (`MAX_EXECUTION_RECORDS` in
+/// `eliot-agent-bridge-core`) is unchanged by this work; this is the separate
+/// bound on the evidence list the assessment itself carries. A longer
+/// owner-retained set is cut here and REPORTED as cut
+/// ([`ExecutionReconciliationAssessment::entries_truncated`]), never silently
+/// shortened into a smaller claim.
+pub const MAX_ASSESSMENT_REFS: usize = 256;
+
+/// Closed source label for the owner-retained attempt-wide execution set an
+/// assessment was decided over (issue #2664).
+///
+/// The lifecycle owner publishes a lifecycle revision for the retained set;
+/// unlike the keyed immutable learning-record owner (issue #1868) it DOES
+/// report one, so a revision is never synthesized to fill
+/// [`SourceRevision::revision`].
+pub const SOURCE_EXECUTION_OWNER_SET: &str = "execution_owner_retained_set";
+
+/// Expected / observed / missing counts for one scope.
+///
+/// `expected` and `missing` are present only when an owner-issued expected
+/// execution/effect set exists for the subject. They are `None` otherwise, and
+/// are never derived from the presented page: a caller-provided record, a
+/// `complete = true` self-claim, and a self-comparison of the page against
+/// itself can never define a denominator (issue #2664).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSetCounts {
+    /// Owner-issued expected execution/effect count for the scope. `None`
+    /// when no owner issued one — the honest state, and never inferred from
+    /// the presented page.
+    pub expected: Option<u64>,
+    /// Distinct executions in the scope whose current outcome is
+    /// [`ExecutionOutcome::Observed`].
+    pub observed: u64,
+    /// Distinct executions in the scope whose current outcome is
+    /// [`ExecutionOutcome::Failed`].
+    pub failed: u64,
+    /// Owner-issued expected count that the scope does not resolve. `None`
+    /// whenever `expected` is `None`: without a denominator there is nothing
+    /// to be missing from.
+    pub missing: Option<u64>,
+}
+
+impl ExecutionSetCounts {
     pub fn validate(&self) -> Result<(), SkillError> {
-        unique(
-            self.uncertain_pending_refs.iter().cloned(),
-            "verdict.uncertain_pending_refs",
-        )?;
-        for reference in &self.uncertain_pending_refs {
-            text(reference, "verdict.uncertain_pending_ref")?;
+        if self.missing.is_some() && self.expected.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "counts.missing",
+                reason: "a missing count requires an owner-issued expected count",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// How completely the denominator behind one assessment is established.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentCompleteness {
+    /// No owner-issued expected execution/effect set is available on this
+    /// route, so the presented window is an observation and can never clear a
+    /// retry. This is the fail-closed default and the only state reachable
+    /// until the owner read contract lands.
+    #[default]
+    DenominatorUnestablished,
+    /// The evidence list published here is a bounded window over a larger
+    /// owner-retained set, so it is not the whole attempt.
+    PartialWindow,
+    /// An owner-issued expected set covers the whole attempt-wide window with
+    /// no retention gap.
+    Complete,
+}
+
+/// Per-execution disposition in the current projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDisposition {
+    /// The owner-retained record proves the effect committed. The result is
+    /// replayed or observed, never re-executed.
+    CommittedResultToReplay,
+    /// The owner-retained record proves a KNOWN bounded effect, so no
+    /// unresolved external state remains. This is the evidence the existing
+    /// same-identity retry gate needs; it is not a grant of execution.
+    KnownEffectRetryGateEligible,
+    /// The current owner-retained outcome for this execution is still
+    /// [`ExecutionOutcome::Uncertain`]; its effects are unresolved.
+    UnresolvedEffect,
+    /// Presented evidence disagreed with the owner-retained record under the
+    /// same execution identity. A contradictory revision stays unresolved: a
+    /// later position in a submitted page never wins.
+    Conflict,
+}
+
+/// One execution's disposition, bound to its exact execution reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDispositionEntry {
+    /// Exact execution reference this disposition names.
+    pub execution_ref: String,
+    /// Disposition decided from the owner-authorized position.
+    pub disposition: ExecutionDisposition,
+}
+
+/// The assessment's own disposition, addressed to the retry/admission owner.
+///
+/// The assessment SUPPLIES EVIDENCE. It never grants execution, and
+/// [`AssessmentDisposition::KnownEffectRetryEligible`] only reports that the
+/// same-identity retry gate now has the evidence it requires.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentDisposition {
+    /// Incomplete / missing: the denominator is unestablished or the published
+    /// window is partial, so these counts cannot clear a retry. Fail-closed
+    /// default.
+    #[default]
+    IncompleteMissing,
+    /// At least one execution's effects are unresolved; the exact pending
+    /// references travel with this assessment.
+    UnresolvedEffect,
+    /// At least one execution's effect is committed and must be replayed
+    /// rather than re-executed.
+    CommittedResultToReplay,
+    /// Resolved-but-not-authorized: the owner-retained set advanced with
+    /// executions this subject's evidence did not present, so those
+    /// resolutions are not authorized here.
+    ResolvedNotAuthorized,
+    /// Presented evidence contradicts the owner-retained revision.
+    Conflict,
+    /// Every execution in the projection resolved to a known effect, so no
+    /// unresolved external state remains. Reachable ONLY when completeness is
+    /// [`AssessmentCompleteness::Complete`]: without an owner-issued expected
+    /// set this bucket is unreachable by construction.
+    KnownEffectRetryEligible,
+}
+
+impl AssessmentDisposition {
+    /// Stable code a receiver switches on to take a different downstream path.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::IncompleteMissing => "INCOMPLETE_EVIDENCE",
+            Self::UnresolvedEffect => "UNRESOLVED_EFFECT",
+            Self::CommittedResultToReplay => "COMMITTED_RESULT_REPLAY",
+            Self::ResolvedNotAuthorized => "RESOLVED_NOT_AUTHORIZED",
+            Self::Conflict => "EVIDENCE_CONFLICT",
+            Self::KnownEffectRetryEligible => "RETRY_GATE_ELIGIBLE",
+        }
+    }
+}
+
+/// One observation of the owner-retained execution set for a subject Skill.
+///
+/// This is the owner's own position: the records it holds and the owner
+/// revision it holds them at. It is built from the lifecycle view the owner
+/// returns, so a caller cannot present a position the owner does not hold.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillExecutionOwnerPosition {
+    /// Skill the retained set belongs to.
+    pub skill_id: String,
+    /// Owner revision (lifecycle revision) the retained set was read at.
+    pub revision: u64,
+    /// Owner-retained attempt-wide records, exactly as held.
+    pub retained: Vec<SkillExecutionEvidence>,
+}
+
+impl SkillExecutionOwnerPosition {
+    /// Reads one owner position off the lifecycle view the owner returned.
+    #[must_use]
+    pub fn from_lifecycle_view(view: &SkillLifecycleView) -> Self {
+        Self {
+            skill_id: view.skill_id().to_owned(),
+            revision: view.lifecycle_revision,
+            retained: view.execution_evidence.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SkillError> {
+        text(&self.skill_id, "position.skill_id")?;
+        if self.revision == 0 {
+            return Err(SkillError::InvalidField {
+                field: "position.revision",
+                reason: "owner revision must be non-zero",
+            });
+        }
+        for record in &self.retained {
+            record.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// The current projection one owner-authorized set yields, built BEFORE any
+/// counter is derived (issue #2664, I7.25 / I14.21).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProjection {
+    /// Per-execution disposition, in owner-retained order.
+    pub dispositions: Vec<ExecutionDispositionEntry>,
+    /// Exact execution references whose effects are unresolved, in
+    /// owner-retained order. Never a count.
+    pub pending_refs: Vec<String>,
+    /// Presented references whose bytes contradicted the owner-retained
+    /// record for the same execution identity.
+    pub conflicting_refs: Vec<String>,
+    /// Presented references the owner does not hold. These are observations
+    /// with no owner position behind them, never absence of an execution.
+    pub unowned_refs: Vec<String>,
+}
+
+impl ExecutionProjection {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        let refs = self
+            .dispositions
+            .iter()
+            .map(|entry| entry.execution_ref.clone());
+        unique(refs, "projection.dispositions")?;
+        for entry in &self.dispositions {
+            text(&entry.execution_ref, "projection.disposition.execution_ref")?;
+        }
+        for (values, field) in [
+            (&self.pending_refs, "projection.pending_refs"),
+            (&self.conflicting_refs, "projection.conflicting_refs"),
+            (&self.unowned_refs, "projection.unowned_refs"),
+        ] {
+            unique(values.iter().cloned(), field)?;
+            for value in values {
+                text(value, field)?;
+            }
         }
         Ok(())
     }
 
-    /// Retry is permitted only when no presented execution has unknown
-    /// effects. A failed execution is a known effect — the retry is a new
-    /// attempt, not a repeated unknown — while an uncertain one blocks until
-    /// reconciled.
-    #[must_use]
-    pub const fn retry_permitted(&self) -> bool {
-        self.uncertain_pending_refs.is_empty()
+    /// Distinct executions in the projection whose current outcome is
+    /// `Observed` / `Failed`, and the exact unresolved reference list.
+    fn counts(&self) -> (u64, u64) {
+        let mut observed = 0_u64;
+        let mut failed = 0_u64;
+        for entry in &self.dispositions {
+            match entry.disposition {
+                ExecutionDisposition::CommittedResultToReplay => {
+                    observed = observed.saturating_add(1);
+                }
+                ExecutionDisposition::KnownEffectRetryGateEligible => {
+                    failed = failed.saturating_add(1);
+                }
+                ExecutionDisposition::UnresolvedEffect | ExecutionDisposition::Conflict => {}
+            }
+        }
+        (observed, failed)
     }
 }
 
-/// Reconciles unknown execution effects before retry (issue #1191).
+/// Builds the current projection from the OWNER's retained set (issue #2664).
 ///
-/// Validates every presented [`SkillExecutionEvidence`] and folds one
-/// outcome per distinct execution: the latest presented outcome wins, so an
-/// exact observed or failed record supersedes an earlier uncertain one for
-/// the same execution, a later uncertain record re-opens it, and repeated
-/// records fold idempotently. Observed executions require exact step refs,
-/// non-default causal credit requires exact step refs and never claims sole
-/// cause, and missing instrumentation never becomes an observed claim —
-/// unreported executions simply do not fold. The returned verdict names the
-/// still-uncertain execution refs; the caller refuses retry while
-/// [`UnknownEffectsVerdict::retry_permitted`] is false.
-pub fn reconcile_unknown_effects(
-    executions: &[SkillExecutionEvidence],
-) -> Result<UnknownEffectsVerdict, SkillError> {
-    // Latest presented outcome wins per execution. Windows are
-    // payload-bounded, so the linear scan stays small.
-    let mut latest: Vec<(String, ExecutionOutcome)> = Vec::new();
-    for execution in executions {
-        execution.validate()?;
-        match latest
-            .iter_mut()
-            .find(|(reference, _)| *reference == execution.execution_ref)
-        {
-            Some(slot) => slot.1 = execution.outcome,
-            None => latest.push((execution.execution_ref.clone(), execution.outcome)),
-        }
-    }
-    // Independent re-derivation over the raw records: every folded outcome
-    // must match its latest presented record, so a verdict that clears a
-    // still-uncertain execution — or miscounts a superseded one — never
-    // publishes.
-    for (reference, outcome) in &latest {
-        let confirmed = executions
+/// `retained` is the owner-retained attempt-wide set and `presented` is the
+/// bounded page this ingest submitted. Three rules, all owner-authorized:
+///
+/// 1. every outcome class is deduplicated by exact evidence identity: one
+///    `execution_ref` carrying the same bytes folds once, so a duplicate never
+///    inflates a class;
+/// 2. supersession comes only from the owner's own retained set. The former
+///    positional "latest presented wins" fold is gone — where a page places a
+///    record says nothing about which revision the owner holds, which is how
+///    a B-only page used to clear a retained unresolved A;
+/// 3. a presented record that disagrees with the retained record for the same
+///    execution is a CONTRADICTORY revision: it is reported as a conflict and
+///    that execution stays unresolved. Nothing is overwritten in either
+///    direction, and a self-contradictory owner set is a typed
+///    [`SkillError::RevisionConflict`] rather than a resolved guess.
+///
+/// Absent records stay absent: a projection over the presented page alone
+/// describes that page and nothing else.
+pub fn project_execution_outcomes(
+    retained: &[SkillExecutionEvidence],
+    presented: &[SkillExecutionEvidence],
+) -> Result<ExecutionProjection, SkillError> {
+    let mut owner: Vec<SkillExecutionEvidence> = Vec::with_capacity(retained.len());
+    for record in retained {
+        record.validate()?;
+        match owner
             .iter()
-            .rfind(|execution| &execution.execution_ref == reference)
-            .is_some_and(|record| record.outcome == *outcome);
-        if !confirmed {
-            return Err(SkillError::IdentityMismatch);
+            .position(|held| held.execution_ref == record.execution_ref)
+        {
+            // Same identity, same bytes: a replay of the same evidence. It
+            // folds once and never inflates a class.
+            Some(index) if owner[index] == *record => {}
+            // Same identity, changed bytes: the retained set disagrees with
+            // itself. A contradictory revision is never resolved by position.
+            Some(_) => return Err(SkillError::RevisionConflict),
+            None => owner.push(record.clone()),
         }
     }
-    let mut observed = 0_u64;
-    let mut failed = 0_u64;
-    let mut uncertain_pending_refs = Vec::new();
-    for (reference, outcome) in &latest {
-        match outcome {
-            ExecutionOutcome::Observed => {
-                observed = observed.saturating_add(1);
-            }
-            ExecutionOutcome::Failed => {
-                failed = failed.saturating_add(1);
-            }
-            ExecutionOutcome::Uncertain => {
-                uncertain_pending_refs.push(reference.clone());
-            }
+    let mut conflicting_refs = Vec::new();
+    let mut unowned_refs = Vec::new();
+    for record in presented {
+        record.validate()?;
+        match owner
+            .iter()
+            .find(|held| held.execution_ref == record.execution_ref)
+        {
+            Some(held) if *held == *record => {}
+            Some(_) => conflicting_refs.push(record.execution_ref.clone()),
+            None => unowned_refs.push(record.execution_ref.clone()),
         }
     }
-    let verdict = UnknownEffectsVerdict {
-        observed,
-        failed,
-        uncertain_pending_refs,
+    let mut dispositions = Vec::with_capacity(owner.len());
+    let mut pending_refs = Vec::new();
+    for record in &owner {
+        let disposition = if conflicting_refs.contains(&record.execution_ref) {
+            ExecutionDisposition::Conflict
+        } else {
+            match record.outcome {
+                ExecutionOutcome::Observed => ExecutionDisposition::CommittedResultToReplay,
+                ExecutionOutcome::Failed => ExecutionDisposition::KnownEffectRetryGateEligible,
+                ExecutionOutcome::Uncertain => ExecutionDisposition::UnresolvedEffect,
+            }
+        };
+        if disposition == ExecutionDisposition::UnresolvedEffect {
+            pending_refs.push(record.execution_ref.clone());
+        }
+        dispositions.push(ExecutionDispositionEntry {
+            execution_ref: record.execution_ref.clone(),
+            disposition,
+        });
+    }
+    let projection = ExecutionProjection {
+        dispositions,
+        pending_refs,
+        conflicting_refs,
+        unowned_refs,
     };
-    verdict.validate()?;
-    Ok(verdict)
+    projection.validate()?;
+    Ok(projection)
+}
+
+/// Subject identity one execution assessment is scoped to.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAssessmentContext {
+    /// Skill identity the executions belong to.
+    pub skill_id: String,
+    /// Skill revision the evidence was observed at.
+    pub skill_revision: String,
+    /// Package digest the evidence was observed at.
+    pub package_digest: String,
+    /// This ingest's own authenticated attempt id, never the Skill's
+    /// historical attempt: the execution wire carries no subject attempt
+    /// reference, so the ingest identity is the only attempt binding this
+    /// route can state (I15.2).
+    pub ingest_attempt_id: String,
+    /// Load-bearing owner revisions the assessment depends on.
+    pub source_revisions: Vec<SourceRevision>,
+}
+
+impl ExecutionAssessmentContext {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        text(&self.skill_id, "assessment.skill_id")?;
+        text(&self.skill_revision, "assessment.skill_revision")?;
+        digest(&self.package_digest, "assessment.package_digest")?;
+        text(&self.ingest_attempt_id, "assessment.ingest_attempt_id")?;
+        for revision in &self.source_revisions {
+            revision.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// The bounded reconciliation assessment that replaces the bare retry flag
+/// (issue #2664).
+///
+/// This is the production decision surface for the execute leg. It is an
+/// assessment, not a permission: it carries the scope it covers, the
+/// expected/observed/missing counts of BOTH the presented page and the
+/// attempt-wide owner-retained set, how completely that denominator is
+/// established, the owner revision the position was read at, a per-operation
+/// disposition, and the EXACT references still pending — never a count in
+/// place of them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionReconciliationAssessment {
+    /// The set the disposition below was decided over. Always
+    /// [`ExecutionAssessmentScope::OwnerRetainedSet`]: dispositions are never
+    /// decided from a page.
+    pub scope: ExecutionAssessmentScope,
+    /// Skill identity this assessment is scoped to.
+    pub skill_id: String,
+    /// Skill revision the evidence was observed at.
+    pub skill_revision: String,
+    /// Package digest the evidence was observed at.
+    pub package_digest: String,
+    /// This ingest's own authenticated attempt id.
+    pub ingest_attempt_id: String,
+    /// How completely the denominator is established.
+    pub completeness: AssessmentCompleteness,
+    /// The assessment's disposition for the retry/admission owner.
+    pub disposition: AssessmentDisposition,
+    /// Stable code matching [`ExecutionReconciliationAssessment::disposition`],
+    /// so a receiver takes a different path per disposition.
+    pub disposition_code: String,
+    /// Statistics over the bounded page this ingest presented. Page numbers are
+    /// never attempt-wide numbers.
+    pub page_statistics: ExecutionSetCounts,
+    /// Statistics over the attempt-wide owner-retained set at the owner
+    /// revision named in `source_revisions`.
+    pub attempt_statistics: ExecutionSetCounts,
+    /// Per-operation disposition for every execution this page presented.
+    pub page_dispositions: Vec<ExecutionDispositionEntry>,
+    /// Exact execution references whose effects remain unresolved, cut at
+    /// [`MAX_ASSESSMENT_REFS`] with `entries_truncated` set when longer.
+    pub pending_refs: Vec<String>,
+    /// True when `pending_refs` was cut at the bound. The DISPOSITION was
+    /// still decided over the whole owner-retained set, so this bounds the
+    /// published evidence list, not the decision.
+    pub entries_truncated: bool,
+    /// Owner-retained references that appeared between the read and the
+    /// commit and that this ingest did not present. Non-empty means the
+    /// clearance derived from the earlier read is stale.
+    pub appeared_after_read_refs: Vec<String>,
+    /// Presented references that contradicted the owner-retained revision.
+    pub conflicting_refs: Vec<String>,
+    /// Load-bearing owner revisions this assessment depends on.
+    pub source_revisions: Vec<SourceRevision>,
+}
+
+impl ExecutionReconciliationAssessment {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        ExecutionAssessmentContext {
+            skill_id: self.skill_id.clone(),
+            skill_revision: self.skill_revision.clone(),
+            package_digest: self.package_digest.clone(),
+            ingest_attempt_id: self.ingest_attempt_id.clone(),
+            source_revisions: self.source_revisions.clone(),
+        }
+        .validate()?;
+        if self.scope != ExecutionAssessmentScope::OwnerRetainedSet {
+            return Err(SkillError::InvalidField {
+                field: "assessment.scope",
+                reason: "a reconciliation disposition is never decided from a presented page",
+            });
+        }
+        self.page_statistics.validate()?;
+        self.attempt_statistics.validate()?;
+        if self.disposition_code != self.disposition.code() {
+            return Err(SkillError::InvalidField {
+                field: "assessment.disposition_code",
+                reason: "disposition code does not match the disposition it names",
+            });
+        }
+        let refs = self
+            .page_dispositions
+            .iter()
+            .map(|entry| entry.execution_ref.clone());
+        unique(refs, "assessment.page_dispositions")?;
+        for entry in &self.page_dispositions {
+            text(
+                &entry.execution_ref,
+                "assessment.page_disposition.execution_ref",
+            )?;
+        }
+        for (values, field) in [
+            (&self.pending_refs, "assessment.pending_refs"),
+            (
+                &self.appeared_after_read_refs,
+                "assessment.appeared_after_read_refs",
+            ),
+            (&self.conflicting_refs, "assessment.conflicting_refs"),
+        ] {
+            unique(values.iter().cloned(), field)?;
+            for value in values {
+                text(value, field)?;
+            }
+        }
+        if self.pending_refs.len() > MAX_ASSESSMENT_REFS
+            || self.page_dispositions.len() > MAX_ASSESSMENT_REFS
+        {
+            return Err(SkillError::InvalidField {
+                field: "assessment.pending_refs",
+                reason: "assessment evidence list exceeds its bound",
+            });
+        }
+        if self.entries_truncated && self.completeness == AssessmentCompleteness::Complete {
+            return Err(SkillError::InvalidField {
+                field: "assessment.entries_truncated",
+                reason: "a truncated evidence list is never complete evidence",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Builds the bounded reconciliation assessment for one execution ingest
+/// (issue #2664, I7.25 / I14.21).
+///
+/// `read_position` is the owner-retained set as it stood BEFORE the publish,
+/// and `committed_position` is the set the owner actually holds AFTER it. The
+/// audit recheck lives in the difference: an execution that appears in the
+/// committed set, was absent from the read set, and was not presented here is
+/// a new execution/effect that appeared between read and commit, so the
+/// clearance derived from the read is stale and the disposition says so.
+///
+/// The denominator is NEVER taken from the page. `expected`/`missing` stay
+/// `None` and completeness stays
+/// [`AssessmentCompleteness::DenominatorUnestablished`] until an owner-issued
+/// expected execution/effect set exists, so
+/// [`AssessmentDisposition::KnownEffectRetryEligible`] is unreachable until
+/// that read contract lands. The published window is
+/// [`AssessmentCompleteness::PartialWindow`] whenever the evidence list had to
+/// be cut, which also withholds retry eligibility.
+pub fn assess_execution_reconciliation(
+    context: ExecutionAssessmentContext,
+    page: &[SkillExecutionEvidence],
+    read_position: &SkillExecutionOwnerPosition,
+    committed_position: &SkillExecutionOwnerPosition,
+) -> Result<ExecutionReconciliationAssessment, SkillError> {
+    context.validate()?;
+    read_position.validate()?;
+    committed_position.validate()?;
+    if read_position.skill_id != context.skill_id || committed_position.skill_id != context.skill_id
+    {
+        return Err(SkillError::IdentityMismatch);
+    }
+    // The page projected over itself is page statistics and nothing more; the
+    // disposition below never reads it.
+    let page_projection = project_execution_outcomes(page, page)?;
+    let attempt_projection = project_execution_outcomes(&committed_position.retained, page)?;
+    let (page_observed, page_failed) = page_projection.counts();
+    let (attempt_observed, attempt_failed) = attempt_projection.counts();
+    let mut appeared_after_read_refs = Vec::new();
+    for record in &committed_position.retained {
+        let read_held = read_position
+            .retained
+            .iter()
+            .any(|held| held.execution_ref == record.execution_ref);
+        let presented = page_projection
+            .dispositions
+            .iter()
+            .any(|entry| entry.execution_ref == record.execution_ref);
+        if !read_held && !presented {
+            appeared_after_read_refs.push(record.execution_ref.clone());
+        }
+    }
+    let truncated = attempt_projection.pending_refs.len() > MAX_ASSESSMENT_REFS;
+    let completeness = if truncated {
+        AssessmentCompleteness::PartialWindow
+    } else {
+        AssessmentCompleteness::DenominatorUnestablished
+    };
+    let disposition = if !attempt_projection.conflicting_refs.is_empty() {
+        AssessmentDisposition::Conflict
+    } else if !appeared_after_read_refs.is_empty() {
+        AssessmentDisposition::ResolvedNotAuthorized
+    } else if !attempt_projection.pending_refs.is_empty() {
+        AssessmentDisposition::UnresolvedEffect
+    } else if completeness != AssessmentCompleteness::Complete {
+        AssessmentDisposition::IncompleteMissing
+    } else if attempt_observed > 0 {
+        AssessmentDisposition::CommittedResultToReplay
+    } else {
+        AssessmentDisposition::KnownEffectRetryEligible
+    };
+    let mut pending_refs = attempt_projection.pending_refs.clone();
+    pending_refs.truncate(MAX_ASSESSMENT_REFS);
+    let assessment = ExecutionReconciliationAssessment {
+        scope: ExecutionAssessmentScope::OwnerRetainedSet,
+        skill_id: context.skill_id,
+        skill_revision: context.skill_revision,
+        package_digest: context.package_digest,
+        ingest_attempt_id: context.ingest_attempt_id,
+        completeness,
+        disposition,
+        disposition_code: disposition.code().to_owned(),
+        page_statistics: ExecutionSetCounts {
+            expected: None,
+            observed: page_observed,
+            failed: page_failed,
+            missing: None,
+        },
+        attempt_statistics: ExecutionSetCounts {
+            expected: None,
+            observed: attempt_observed,
+            failed: attempt_failed,
+            missing: None,
+        },
+        page_dispositions: page_projection.dispositions,
+        pending_refs,
+        entries_truncated: truncated,
+        appeared_after_read_refs,
+        conflicting_refs: attempt_projection.conflicting_refs,
+        source_revisions: context.source_revisions,
+    };
+    assessment.validate()?;
+    Ok(assessment)
 }
 
 /// Counts presented execution records by outcome; observed executions with
@@ -1059,10 +1561,11 @@ pub fn reconcile_unknown_effects(
 /// evidence validation accepts only the distributed, uncertain or associated
 /// representations, each bound to exact step refs. This is the record-count
 /// fold behind [`derive_lifecycle_view`]: unlike
-/// [`reconcile_unknown_effects`], which folds one latest outcome per distinct
-/// execution for the retry gate, it counts every presented record, so the two
-/// agree exactly on duplicate-free windows and intentionally differ when one
-/// execution carries repeated records.
+/// [`project_execution_outcomes`], which deduplicates by exact evidence
+/// identity over the OWNER's retained set before deriving any counter, it
+/// counts every presented record, so the two agree exactly on duplicate-free
+/// windows and intentionally differ when one execution carries repeated
+/// records.
 pub fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {

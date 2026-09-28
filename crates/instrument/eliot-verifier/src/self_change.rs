@@ -10,6 +10,14 @@
 //! rollback-capable; cutover happens only on independent evidence plus a
 //! new generation receipt.
 //!
+//! The independent evidence a cutover requires is the machine-observed
+//! program identity of the two passes. The shadow comparison carries both
+//! observed program digests, and the bootstrap refuses a candidate that
+//! observed the same program as the last-known-good generation: comparing one
+//! implementation with itself matches every axis while proving nothing, which
+//! is precisely the "changed verifier as sole authority" case the bootstrap
+//! exists to refuse.
+//!
 //! Refusal is terminal under the oracle rule (W3): a refused cutover is
 //! rejected by the old generation, and a diverged shadow comparison
 //! escalates to a Human or independent route. The old generation can
@@ -20,6 +28,9 @@
 //! network effects. The Governor owns these semantics; the Kernel owns
 //! admission/fencing effects at its own enforcement points.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use eliot_contracts::sha256_hex;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -52,11 +63,17 @@ pub enum SelfChangeSurface {
     TestDiscovery,
     /// `FinishService` and verifier binding.
     FinishService,
+    /// Documentation/audit tooling: the `DocumentationEvidenceCheck` freeze
+    /// and publication path (I18.31:40, I0.14). A change to the tool that
+    /// renders, packages or audits the documentation is a verification-surface
+    /// change for the same reason a parser change is: it decides what evidence
+    /// the rest of the system is allowed to believe.
+    DocumentationTooling,
 }
 
 impl SelfChangeSurface {
     /// Every surface governed by the bootstrap.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ProcessExecutor,
         Self::InstrumentRunner,
         Self::ProfileSelection,
@@ -64,6 +81,7 @@ impl SelfChangeSurface {
         Self::EvidenceNormalization,
         Self::TestDiscovery,
         Self::FinishService,
+        Self::DocumentationTooling,
     ];
 
     /// Stable wire name of the surface.
@@ -77,6 +95,7 @@ impl SelfChangeSurface {
             Self::EvidenceNormalization => "evidence-normalization",
             Self::TestDiscovery => "test-discovery",
             Self::FinishService => "finish-service",
+            Self::DocumentationTooling => "documentation-tooling",
         }
     }
 
@@ -88,12 +107,13 @@ impl SelfChangeSurface {
             Self::Parser => Some(SpecialCase::ParserReplay),
             Self::ProfileSelection => Some(SpecialCase::SelectionSentinel),
             Self::FinishService => Some(SpecialCase::FinishServiceAdversarial),
+            Self::DocumentationTooling => Some(SpecialCase::DocumentationEvidence),
             Self::InstrumentRunner | Self::EvidenceNormalization | Self::TestDiscovery => None,
         }
     }
 }
 
-/// The four I18.31 special cases (W2).
+/// The I18.31 special cases (W2), one per guarded surface.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpecialCase {
@@ -109,6 +129,10 @@ pub enum SpecialCase {
     /// A `FinishService`/verifier-binding change runs the forged/partial-proof
     /// adversarial suite through the last-known-good public front door.
     FinishServiceAdversarial,
+    /// A documentation/audit-tooling change runs the
+    /// `DocumentationEvidenceCheck` from a frozen outer script/generation and
+    /// verifies the exact bytes it packages (I18.31:40).
+    DocumentationEvidence,
 }
 
 impl SpecialCase {
@@ -120,6 +144,7 @@ impl SpecialCase {
             Self::ParserReplay => "parser-replay",
             Self::SelectionSentinel => "selection-sentinel",
             Self::FinishServiceAdversarial => "finish-service-adversarial",
+            Self::DocumentationEvidence => "documentation-evidence",
         }
     }
 
@@ -131,6 +156,7 @@ impl SpecialCase {
             Self::ParserReplay => SelfChangeSurface::Parser,
             Self::SelectionSentinel => SelfChangeSurface::ProfileSelection,
             Self::FinishServiceAdversarial => SelfChangeSurface::FinishService,
+            Self::DocumentationEvidence => SelfChangeSurface::DocumentationTooling,
         }
     }
 
@@ -139,8 +165,9 @@ impl SpecialCase {
     /// Each arm calls the real check: the executor arm re-checks the
     /// outer-guardian digest half over the exact evidence bytes, the parser
     /// arm replays the bound corpus, the selection arm requires zero false
-    /// negatives with lane coverage, and the finish arm requires every
-    /// forged and partial proof rejected.
+    /// negatives with lane coverage, the finish arm requires every
+    /// forged and partial proof rejected, and the documentation arm re-hashes
+    /// the frozen outer script and re-derives the exact packaged bytes.
     ///
     /// # Errors
     ///
@@ -161,6 +188,9 @@ impl SpecialCase {
                 Self::FinishServiceAdversarial,
                 SpecialCaseEvidence::FinishServiceAdversarial(record),
             ) => verify_finish_adversarial(record),
+            (Self::DocumentationEvidence, SpecialCaseEvidence::DocumentationEvidence(record)) => {
+                verify_documentation_evidence(record)
+            }
             (_, mismatched) => Err(SelfChangeError::UnexpectedSpecialCase {
                 observed: mismatched.case(),
             }),
@@ -180,6 +210,12 @@ pub enum SpecialCaseEvidence {
     SelectionSentinel(SelectionSentinelRecord),
     /// Forged/partial-proof suite for a `FinishService` change.
     FinishServiceAdversarial(AdversarialSuiteRecord),
+    /// Frozen outer `DocumentationEvidenceCheck` over the exact packaged bytes.
+    ///
+    /// Boxed because the record carries both byte sides of every packaged
+    /// document and is much the largest of the five variants; `Box` is
+    /// transparent to serde, so the wire shape is unchanged.
+    DocumentationEvidence(Box<DocumentationEvidenceRecord>),
 }
 
 impl SpecialCaseEvidence {
@@ -191,6 +227,7 @@ impl SpecialCaseEvidence {
             Self::ParserReplay(_) => SpecialCase::ParserReplay,
             Self::SelectionSentinel(_) => SpecialCase::SelectionSentinel,
             Self::FinishServiceAdversarial(_) => SpecialCase::FinishServiceAdversarial,
+            Self::DocumentationEvidence(_) => SpecialCase::DocumentationEvidence,
         }
     }
 }
@@ -579,6 +616,541 @@ pub fn verify_finish_adversarial(record: &AdversarialSuiteRecord) -> Result<(), 
     Ok(())
 }
 
+/// The frozen outer pin a `DocumentationEvidenceCheck` is published under.
+///
+/// The values mirror `scripts/documentation_evidence_check.freeze.json`. A pin
+/// is only evidence when the script it names re-hashes to the recorded digest:
+/// "frozen" means the bytes are compared, never that a pin file is present.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FrozenOuterPin {
+    /// The outer generation the check is published under.
+    pub generation: String,
+    /// Repository-relative path of the outer script the pin freezes.
+    pub script: String,
+    /// The recorded digest of the frozen outer script bytes.
+    pub script_sha256: EvidenceDigest,
+}
+
+/// The frozen outer script/generation one `DocumentationEvidenceCheck` really
+/// executed from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FrozenOuterScript {
+    /// The pin, as recorded.
+    pub pin: FrozenOuterPin,
+    /// The exact bytes of the outer script that executed the check.
+    pub script_bytes: Vec<u8>,
+}
+
+impl FrozenOuterScript {
+    /// Records the pin and the exact script bytes that really ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::InvalidText`] for a blank or control-bearing
+    /// generation or script path.
+    pub fn new(pin: FrozenOuterPin, script_bytes: Vec<u8>) -> Result<Self, SelfChangeError> {
+        for (value, field) in [(&pin.generation, "generation"), (&pin.script, "script")] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(SelfChangeError::InvalidText { field });
+            }
+        }
+        Ok(Self { pin, script_bytes })
+    }
+}
+
+/// One document a frozen evidence package carries.
+///
+/// Both byte sides are carried deliberately: `packaged_bytes` are the bytes
+/// the package re-extracted, and `source_bytes` are the bytes the candidate
+/// generator claims it packaged from. Equality between them is the re-extraction
+/// requirement of I18.31:56 — a post-package edit creates a new revision, so
+/// any drift between the two is a refusal, not a warning.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageDocument {
+    /// Package-relative path, exactly as the manifest names it.
+    pub path: String,
+    /// The bytes the candidate generator packaged.
+    pub source_bytes: Vec<u8>,
+    /// The bytes the frozen package re-extracted for this path.
+    pub packaged_bytes: Vec<u8>,
+    /// The bytes the live workspace holds for this path, when the check was
+    /// also run against a workspace.
+    pub workspace_bytes: Option<Vec<u8>>,
+}
+
+impl PackageDocument {
+    /// Records one packaged document. The path must be text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::InvalidText`] for a blank or control-bearing
+    /// path.
+    pub fn new(
+        path: impl Into<String>,
+        source_bytes: Vec<u8>,
+        packaged_bytes: Vec<u8>,
+        workspace_bytes: Option<Vec<u8>>,
+    ) -> Result<Self, SelfChangeError> {
+        let path = path.into();
+        if path.trim().is_empty() || path.chars().any(char::is_control) {
+            return Err(SelfChangeError::InvalidText { field: "path" });
+        }
+        Ok(Self {
+            path,
+            source_bytes,
+            packaged_bytes,
+            workspace_bytes,
+        })
+    }
+}
+
+/// The versioned copy a manifest intentionally publishes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionedCopy {
+    /// Package-relative path the manifest points the versioned copy at.
+    pub path: String,
+    /// The digest the manifest records for that path.
+    pub sha256: EvidenceDigest,
+}
+
+/// The machine manifest recorded inside a frozen evidence package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageManifest {
+    /// Every path the manifest names, with the digest recorded for it.
+    pub files: BTreeMap<String, EvidenceDigest>,
+    /// The file count the manifest generated from its source revision.
+    pub file_count: u64,
+    /// Local evidence the package references, resolved by digest.
+    pub evidence_refs: Vec<String>,
+    /// The versioned copy the manifest publishes, when one is published.
+    pub versioned_copy: Option<VersionedCopy>,
+}
+
+/// The machine ledger recorded inside a frozen evidence package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageLedger {
+    /// Package-relative path of the Markdown document the ledger covers.
+    pub markdown: String,
+    /// The digest the ledger records for that document.
+    pub markdown_sha256: EvidenceDigest,
+}
+
+/// The stable reason-code dispositions recorded inside a frozen package.
+///
+/// A disposition outside [`STABLE_AGENT_RESPONSE_DISPOSITIONS`] fails to
+/// round-trip: an unknown additive reason code cannot be decoded back into a
+/// stable `AgentResponseDisposition`, so it may not appear in a frozen package.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageDispositions {
+    /// Reason code to recorded disposition.
+    pub codes: BTreeMap<String, String>,
+}
+
+/// The I18.31:40 `DocumentationEvidenceCheck` evidence admitted for one
+/// documentation/audit-tooling change.
+///
+/// # A candidate documentation generator cannot certify itself
+///
+/// There is no verdict field, no `accepted` boolean, and no report string on
+/// this record. The only outcome is the absence of a recomputed refusal:
+/// every rule below recomputes a digest, a byte comparison, or a text scan
+/// from the bytes carried here, and a caller that merely asserts the package
+/// is green can satisfy none of them. I18.31:56 — "The candidate
+/// documentation generator cannot certify itself solely by emitting a green
+/// report" — is therefore structural rather than documentary: there is no
+/// place in the type where a self-reported pass can be written.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentationEvidenceRecord {
+    /// The frozen outer script/generation the check really ran from.
+    pub script: FrozenOuterScript,
+    /// Every document the package carries, with both byte sides.
+    pub documents: Vec<PackageDocument>,
+    /// The machine manifest recorded in the package.
+    pub manifest: PackageManifest,
+    /// The machine ledger recorded in the package, when it carries one.
+    pub ledger: Option<PackageLedger>,
+    /// The stable reason-code dispositions recorded in the package.
+    pub dispositions: Option<PackageDispositions>,
+}
+
+impl DocumentationEvidenceRecord {
+    /// Records one frozen documentation-evidence run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::DocumentationPackageEmpty`] when the package
+    /// carries no document, [`SelfChangeError::InvalidText`] for a blank or
+    /// control-bearing path, or
+    /// [`SelfChangeError::DocumentationDuplicateDocument`] when two documents
+    /// share one path. The non-empty requirement is what stops an empty
+    /// package from passing every rule vacuously.
+    pub fn new(
+        script: FrozenOuterScript,
+        documents: Vec<PackageDocument>,
+        manifest: PackageManifest,
+        ledger: Option<PackageLedger>,
+        dispositions: Option<PackageDispositions>,
+    ) -> Result<Self, SelfChangeError> {
+        if documents.is_empty() {
+            return Err(SelfChangeError::DocumentationPackageEmpty);
+        }
+        let mut seen = BTreeSet::new();
+        for document in &documents {
+            if document.path.trim().is_empty() || document.path.chars().any(char::is_control) {
+                return Err(SelfChangeError::InvalidText { field: "path" });
+            }
+            if !seen.insert(document.path.as_str()) {
+                return Err(SelfChangeError::DocumentationDuplicateDocument {
+                    path: document.path.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            script,
+            documents,
+            manifest,
+            ledger,
+            dispositions,
+        })
+    }
+
+    /// The re-extracted document the manifest names at `path`.
+    #[must_use]
+    pub fn document(&self, path: &str) -> Option<&PackageDocument> {
+        self.documents.iter().find(|document| document.path == path)
+    }
+
+    /// The packaged document bytes, re-hashed here over the exact re-extracted
+    /// bytes rather than trusted from the manifest.
+    fn packaged_digest(&self, path: &str) -> Option<EvidenceDigest> {
+        self.document(path)
+            .and_then(|document| EvidenceDigest::new(sha256_hex(&document.packaged_bytes)).ok())
+    }
+}
+
+/// Fields `ReceiptEnvelope` owns, which a receipt payload may never redefine.
+///
+/// Mirrors the frozen outer script's own list, read from
+/// `scripts/documentation_evidence_check.py`; the ownership rule is I18.31's
+/// and I0.14's, not this module's invention.
+pub const ENVELOPE_OWNED_RECEIPT_FIELDS: [&str; 4] =
+    ["identity", "authority", "fence", "provenance"];
+
+/// The stable `AgentResponseDisposition` values an additive reason code
+/// round-trips under.
+///
+/// Mirrors the frozen outer script's own list, read from
+/// `scripts/documentation_evidence_check.py`.
+pub const STABLE_AGENT_RESPONSE_DISPOSITIONS: [&str; 4] = ["accept", "reject", "defer", "escalate"];
+
+/// Verifies one `DocumentationEvidenceCheck` executed from a frozen outer
+/// script/generation over the exact bytes it packages (I18.31:40, I18.31:56).
+///
+/// Each arm recomputes its verdict from the carried bytes; none of them can be
+/// satisfied by asserting a result:
+///
+/// - `verify_frozen_outer_script` re-hashes the exact outer script bytes with
+///   [`sha256_hex`] and requires the recorded pin digest, and requires the
+///   script's own bytes to declare the recorded generation.
+/// - `verify_package_reextraction` requires every manifest entry and every
+///   evidence reference to resolve in the re-extracted package, recomputes
+///   each packaged document's digest and requires the recorded one, and
+///   refuses any byte drift between the source bytes and the re-extracted
+///   bytes.
+/// - `verify_versioned_copy` requires the manifest's versioned copy to resolve
+///   and to re-hash to the digest the manifest records for it.
+/// - `verify_ledger` recomputes the ledger's Markdown digest from the packaged
+///   bytes and requires the recorded one.
+/// - `verify_workspace_divergence` requires the workspace bytes to equal the
+///   re-extracted package bytes.
+/// - `verify_generated_counts` recomputes the manifest's file count from the
+///   documents that resolve.
+/// - `verify_text_corpus` scans the packaged text for the remaining negative
+///   corpus classes: unresolved template sentinels, a `CURRENT_VERIFIED` claim
+///   with no resolving evidence reference, two contract sections defining the
+///   same name with different body digests, a receipt payload redefining an
+///   [`ENVELOPE_OWNED_RECEIPT_FIELDS`] field, and a reason code that does not
+///   round-trip under a [`STABLE_AGENT_RESPONSE_DISPOSITIONS`] disposition.
+///
+/// # Errors
+///
+/// Returns the first recomputed refusal. Every corruption class in the I18.31
+/// negative corpus has its own typed variant; none of them is a generic error.
+pub fn verify_documentation_evidence(
+    record: &DocumentationEvidenceRecord,
+) -> Result<(), SelfChangeError> {
+    verify_frozen_outer_script(&record.script)?;
+    verify_package_reextraction(record)?;
+    verify_versioned_copy(record)?;
+    verify_ledger(record)?;
+    verify_workspace_divergence(record)?;
+    verify_generated_counts(record)?;
+    verify_text_corpus(record)
+}
+
+/// Re-hashes the exact outer script bytes and requires the recorded pin.
+fn verify_frozen_outer_script(script: &FrozenOuterScript) -> Result<(), SelfChangeError> {
+    if sha256_hex(&script.script_bytes) != script.pin.script_sha256.as_str() {
+        return Err(SelfChangeError::DocumentationFrozenScriptDrift {
+            generation: script.pin.generation.clone(),
+        });
+    }
+    if !String::from_utf8_lossy(&script.script_bytes).contains(&script.pin.generation) {
+        return Err(SelfChangeError::DocumentationGenerationMismatch {
+            generation: script.pin.generation.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Requires the package to re-extract to the bytes it was built from.
+fn verify_package_reextraction(
+    record: &DocumentationEvidenceRecord,
+) -> Result<(), SelfChangeError> {
+    for document in &record.documents {
+        if document.source_bytes != document.packaged_bytes {
+            return Err(SelfChangeError::DocumentationPostPackageMutation {
+                path: document.path.clone(),
+            });
+        }
+    }
+    for (path, expected) in &record.manifest.files {
+        let Some(observed) = record.packaged_digest(path) else {
+            return Err(SelfChangeError::DocumentationMissingReferencedArtifact {
+                path: path.clone(),
+            });
+        };
+        if observed.as_str() != expected.as_str() {
+            return Err(SelfChangeError::DocumentationPackageDigestMismatch { path: path.clone() });
+        }
+    }
+    for reference in &record.manifest.evidence_refs {
+        if record.document(reference).is_none() {
+            return Err(SelfChangeError::DocumentationMissingReferencedArtifact {
+                path: reference.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Requires the manifest's versioned copy to resolve to the bytes it names.
+fn verify_versioned_copy(record: &DocumentationEvidenceRecord) -> Result<(), SelfChangeError> {
+    let Some(versioned) = &record.manifest.versioned_copy else {
+        return Ok(());
+    };
+    match record.packaged_digest(&versioned.path) {
+        Some(observed) if observed == versioned.sha256 => Ok(()),
+        _ => Err(SelfChangeError::DocumentationVersionedCopyMismatch {
+            path: versioned.path.clone(),
+        }),
+    }
+}
+
+/// Recomputes the ledger's Markdown digest from the packaged bytes.
+fn verify_ledger(record: &DocumentationEvidenceRecord) -> Result<(), SelfChangeError> {
+    let Some(ledger) = &record.ledger else {
+        return Ok(());
+    };
+    match record.packaged_digest(&ledger.markdown) {
+        Some(observed) if observed == ledger.markdown_sha256 => Ok(()),
+        _ => Err(SelfChangeError::DocumentationLedgerStale {
+            path: ledger.markdown.clone(),
+        }),
+    }
+}
+
+/// Requires every workspace side to equal the re-extracted package bytes.
+fn verify_workspace_divergence(
+    record: &DocumentationEvidenceRecord,
+) -> Result<(), SelfChangeError> {
+    for document in &record.documents {
+        if let Some(workspace) = &document.workspace_bytes
+            && workspace != &document.packaged_bytes
+        {
+            return Err(SelfChangeError::DocumentationWorkspaceDivergence {
+                path: document.path.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Recomputes the manifest's generated file count from the resolved documents.
+fn verify_generated_counts(record: &DocumentationEvidenceRecord) -> Result<(), SelfChangeError> {
+    let observed = record
+        .manifest
+        .files
+        .keys()
+        .filter(|path| record.document(path).is_some())
+        .count();
+    let observed = u64::try_from(observed).unwrap_or(u64::MAX);
+    if observed != record.manifest.file_count {
+        return Err(SelfChangeError::DocumentationCountFromDifferentRevision {
+            expected: record.manifest.file_count,
+            observed,
+        });
+    }
+    Ok(())
+}
+
+/// Scans the packaged text for the remaining negative corpus classes.
+fn verify_text_corpus(record: &DocumentationEvidenceRecord) -> Result<(), SelfChangeError> {
+    let texts: Vec<(&str, &str)> = record
+        .documents
+        .iter()
+        .filter_map(|document| {
+            std::str::from_utf8(&document.packaged_bytes)
+                .ok()
+                .map(|text| (document.path.as_str(), text))
+        })
+        .collect();
+    let has_evidence = record
+        .manifest
+        .evidence_refs
+        .iter()
+        .any(|reference| record.document(reference).is_some());
+    for (path, text) in &texts {
+        if let Some(sentinel) = template_sentinels(text).into_iter().next() {
+            return Err(SelfChangeError::DocumentationUnresolvedTemplate {
+                path: (*path).to_owned(),
+                sentinel,
+            });
+        }
+        if text.contains("CURRENT_VERIFIED") && !has_evidence {
+            return Err(
+                SelfChangeError::DocumentationCurrentVerifiedWithoutEvidence {
+                    path: (*path).to_owned(),
+                },
+            );
+        }
+        if let Some(field) = redefined_envelope_field(path, text) {
+            return Err(SelfChangeError::DocumentationReceiptFieldRedefinition {
+                path: (*path).to_owned(),
+                field,
+            });
+        }
+    }
+    verify_contract_sections(&texts)?;
+    verify_dispositions(record)
+}
+
+/// Requires every `## Contract:` section of one name to share one body digest.
+fn verify_contract_sections(texts: &[(&str, &str)]) -> Result<(), SelfChangeError> {
+    let mut seen: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (path, text) in texts {
+        for (name, digest) in contract_section_digests(text) {
+            let diverges = seen
+                .get(&name)
+                .is_some_and(|(_, first)| first.as_str() != digest.as_str());
+            if diverges {
+                return Err(SelfChangeError::DocumentationContractSectionDivergence { name });
+            }
+            seen.entry(name)
+                .or_insert_with(|| ((*path).to_owned(), digest));
+        }
+    }
+    Ok(())
+}
+
+/// Requires every recorded reason code to round-trip under a stable
+/// `AgentResponseDisposition`.
+fn verify_dispositions(record: &DocumentationEvidenceRecord) -> Result<(), SelfChangeError> {
+    let Some(dispositions) = &record.dispositions else {
+        return Ok(());
+    };
+    for (code, disposition) in &dispositions.codes {
+        if !STABLE_AGENT_RESPONSE_DISPOSITIONS.contains(&disposition.as_str()) {
+            return Err(SelfChangeError::DocumentationUnknownDisposition {
+                code: code.clone(),
+                disposition: disposition.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `{{NAME}}` template sentinels one rendered document still carries.
+fn template_sentinels(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = BTreeSet::new();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'{' && bytes[index + 1] == b'{' {
+            let mut end = index + 2;
+            if end < bytes.len() && bytes[end].is_ascii_uppercase() {
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_uppercase()
+                        || bytes[end].is_ascii_digit()
+                        || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                if end + 1 < bytes.len() && bytes[end] == b'}' && bytes[end + 1] == b'}' {
+                    found.insert(text[index..end + 2].to_owned());
+                    index = end + 2;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    found.into_iter().collect()
+}
+
+/// The `## Contract: NAME` sections of one document, with the digest of each
+/// section body.
+fn contract_section_digests(text: &str) -> BTreeMap<String, String> {
+    const PREFIX: &str = "## Contract:";
+    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if let Some(name) = line.trim_start().strip_prefix(PREFIX) {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                current = None;
+            } else {
+                sections.entry(name.clone()).or_default();
+                current = Some(name);
+            }
+        } else if let Some(name) = &current {
+            sections
+                .entry(name.clone())
+                .or_default()
+                .push(line.to_owned());
+        }
+    }
+    sections
+        .into_iter()
+        .map(|(name, body)| {
+            let digest = sha256_hex(body.join("\n").as_bytes());
+            (name, digest)
+        })
+        .collect()
+}
+
+/// The [`ENVELOPE_OWNED_RECEIPT_FIELDS`] field one receipt payload redefines.
+///
+/// Only receipt payloads are read: a package stores them under `receipts/`
+/// with a `.json` suffix, which is the layout the frozen outer script itself
+/// documents. A non-JSON or unparsable receipt is not a redefinition and
+/// returns `None`.
+fn redefined_envelope_field(path: &str, text: &str) -> Option<String> {
+    let is_receipt = path.starts_with("receipts/")
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if !is_receipt {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = payload.as_object()?;
+    ENVELOPE_OWNED_RECEIPT_FIELDS
+        .iter()
+        .find(|owned| object.contains_key(**owned))
+        .map(|owned| (**owned).to_owned())
+}
+
 /// The five I18.31 bootstrap phases in cutover order, plus the terminal
 /// oracle-conflict state.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -719,6 +1291,19 @@ impl AxisVerdicts {
 }
 
 /// Shadow comparison record over the same raw fixture/tool evidence.
+///
+/// The two program identities are the independence evidence of this record.
+/// `last_known_good_program` and `candidate_program` are the machine-computed
+/// content digests of the two executables the two passes really ran, observed
+/// by the driver from the file bytes — not a bundle-supplied path, name, or
+/// string. I18.31 requires cutover to occur only on independent evidence, and
+/// "a changed verifier cannot be the sole authority proving its own
+/// correctness" is exactly the case a comparison of one implementation with
+/// itself fails to catch: every axis matches because there is only one side.
+/// Carrying the two observed program identities on the record makes that
+/// independence an observed, compared fact of the comparison itself, so
+/// [`SelfChangeBootstrap::record_comparison`] can refuse a candidate that is
+/// not a distinct program before any receipt can be minted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShadowComparisonRecord {
     /// The changed surface under comparison (W5 scope).
@@ -727,6 +1312,10 @@ pub struct ShadowComparisonRecord {
     pub old_generation: u64,
     /// Candidate generation producing the shadow side.
     pub candidate_generation: u64,
+    /// Machine-observed program identity the last-known-good pass really ran.
+    pub last_known_good_program: EvidenceDigest,
+    /// Machine-observed program identity the candidate shadow pass really ran.
+    pub candidate_program: EvidenceDigest,
     /// Per-axis verdicts.
     pub verdicts: AxisVerdicts,
     /// Digest of the comparison evidence.
@@ -734,16 +1323,22 @@ pub struct ShadowComparisonRecord {
 }
 
 impl ShadowComparisonRecord {
-    /// Records one comparison. Generations must advance.
+    /// Records one comparison. Generations must advance, and the candidate
+    /// program identity must be a machine-observed program distinct from the
+    /// last-known-good one.
     ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::NonAdvancingGeneration`] when the
-    /// candidate does not advance past the old generation.
+    /// candidate does not advance past the old generation, or
+    /// [`SelfChangeError::CandidateNotIndependent`] when both passes observed
+    /// the same program.
     pub fn new(
         surface: SelfChangeSurface,
         old_generation: u64,
         candidate_generation: u64,
+        last_known_good_program: EvidenceDigest,
+        candidate_program: EvidenceDigest,
         verdicts: AxisVerdicts,
         evidence: EvidenceDigest,
     ) -> Result<Self, SelfChangeError> {
@@ -753,10 +1348,17 @@ impl ShadowComparisonRecord {
                 candidate: candidate_generation,
             });
         }
+        if last_known_good_program == candidate_program {
+            return Err(SelfChangeError::CandidateNotIndependent {
+                program: candidate_program,
+            });
+        }
         Ok(Self {
             surface,
             old_generation,
             candidate_generation,
+            last_known_good_program,
+            candidate_program,
             verdicts,
             evidence,
         })
@@ -766,6 +1368,13 @@ impl ShadowComparisonRecord {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.verdicts.is_clean()
+    }
+
+    /// Whether the two passes really observed distinct programs, which is the
+    /// independent evidence I18.31 requires before a cutover.
+    #[must_use]
+    pub fn is_independent(&self) -> bool {
+        self.last_known_good_program != self.candidate_program
     }
 }
 
@@ -1073,6 +1682,19 @@ pub enum SelfChangeError {
         /// The diverging axes.
         axes: Vec<ComparisonAxis>,
     },
+    /// The candidate shadow pass observed the same program as the
+    /// last-known-good pass, so the comparison is not independent evidence
+    /// (I18.31: "cutover occurs only after independent evidence"). A changed
+    /// verifier can never be the sole authority proving its own correctness,
+    /// and a candidate that runs the identical program image proves nothing a
+    /// receipt could bind.
+    #[error(
+        "candidate observed program is not independent of the last-known-good program: {program:?}"
+    )]
+    CandidateNotIndependent {
+        /// The machine-observed program identity both passes really ran.
+        program: EvidenceDigest,
+    },
     /// The canary task count is zero or above [`MAX_CANARY_TASKS`].
     #[error("canary task count {bounded_tasks} is not within 1..=1024")]
     CanaryTaskBound {
@@ -1157,6 +1779,121 @@ pub enum SelfChangeError {
     AdversarialPartialAdmitted {
         /// The admitted partial-proof case.
         case: String,
+    },
+    /// A documentation evidence package carried no document, so every rule
+    /// would pass vacuously.
+    #[error("documentation evidence package carries no document")]
+    DocumentationPackageEmpty,
+    /// Two packaged documents share one path.
+    #[error("documentation evidence package carries path {path} twice")]
+    DocumentationDuplicateDocument {
+        /// The duplicated package-relative path.
+        path: String,
+    },
+    /// The exact outer script bytes do not re-hash to the recorded frozen
+    /// pin digest: the script is not frozen at the recorded generation.
+    #[error("frozen outer script bytes do not re-hash to the pinned generation {generation}")]
+    DocumentationFrozenScriptDrift {
+        /// The recorded generation.
+        generation: String,
+    },
+    /// The outer script's own bytes do not declare the recorded generation, so
+    /// a record naming a different generation is refused.
+    #[error("frozen outer script does not declare the recorded generation {generation}")]
+    DocumentationGenerationMismatch {
+        /// The recorded generation.
+        generation: String,
+    },
+    /// A packaged document's source bytes differ from the bytes the package
+    /// re-extracted: a post-package edit is a new revision (I18.31:56).
+    #[error("packaged document {path} differs from the bytes it was built from")]
+    DocumentationPostPackageMutation {
+        /// The mutated package-relative path.
+        path: String,
+    },
+    /// The recomputed packaged digest differs from the recorded manifest
+    /// digest.
+    #[error("packaged document {path} does not re-hash to its recorded manifest digest")]
+    DocumentationPackageDigestMismatch {
+        /// The diverging package-relative path.
+        path: String,
+    },
+    /// A manifested artifact or an evidence reference does not resolve in the
+    /// re-extracted package.
+    #[error("referenced artifact {path} does not resolve in the package")]
+    DocumentationMissingReferencedArtifact {
+        /// The unresolved package-relative path.
+        path: String,
+    },
+    /// The manifest points at a versioned copy whose bytes are not the ones it
+    /// records.
+    #[error("manifest versioned copy {path} does not match the bytes it names")]
+    DocumentationVersionedCopyMismatch {
+        /// The mispointed package-relative path.
+        path: String,
+    },
+    /// The ledger's recorded Markdown digest is stale against the packaged
+    /// bytes.
+    #[error("ledger for {path} is stale against the packaged bytes")]
+    DocumentationLedgerStale {
+        /// The ledger's package-relative path.
+        path: String,
+    },
+    /// A packaged document's bytes differ from the live workspace file.
+    #[error("packaged document {path} differs from the workspace file")]
+    DocumentationWorkspaceDivergence {
+        /// The diverging package-relative path.
+        path: String,
+    },
+    /// The manifest's file count was generated from a different source
+    /// revision than the one the package carries.
+    #[error(
+        "manifest file count {expected} was generated from a different revision ({observed} now)"
+    )]
+    DocumentationCountFromDifferentRevision {
+        /// The recorded count.
+        expected: u64,
+        /// The recomputed count.
+        observed: u64,
+    },
+    /// A published document still carries an unresolved template sentinel.
+    #[error("packaged document {path} carries the unresolved template sentinel {sentinel}")]
+    DocumentationUnresolvedTemplate {
+        /// The offending package-relative path.
+        path: String,
+        /// The unresolved sentinel.
+        sentinel: String,
+    },
+    /// A document claims `CURRENT_VERIFIED` with no executable evidence
+    /// resolving.
+    #[error("packaged document {path} claims CURRENT_VERIFIED with no executable evidence")]
+    DocumentationCurrentVerifiedWithoutEvidence {
+        /// The unevidenced package-relative path.
+        path: String,
+    },
+    /// Two public contract sections define the same name with different body
+    /// digests.
+    #[error("contract section {name} is defined twice with different digests")]
+    DocumentationContractSectionDivergence {
+        /// The diverging contract section name.
+        name: String,
+    },
+    /// A receipt payload redefines a field `ReceiptEnvelope` owns.
+    #[error("receipt payload {path} redefines the envelope-owned field {field}")]
+    DocumentationReceiptFieldRedefinition {
+        /// The offending receipt path.
+        path: String,
+        /// The redefined field.
+        field: String,
+    },
+    /// An unknown additive reason code does not round-trip under a stable
+    /// `AgentResponseDisposition`.
+    #[error("reason code {code} does not round-trip under a stable disposition ({disposition})")]
+    DocumentationUnknownDisposition {
+        /// The offending reason code.
+        code: String,
+        /// The recorded disposition.
+        disposition: String,
     },
     /// The bootstrap raised an oracle conflict and is terminal.
     #[error("bootstrap raised an oracle conflict and accepts no further evidence")]
@@ -1282,16 +2019,22 @@ impl SelfChangeBootstrap {
         Ok(())
     }
 
-    /// Records the shadow comparison. It must be in scope, name the
-    /// admitted generations, and match on every axis. Use
-    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] when a
-    /// diverged comparison must escalate under the oracle rule instead
-    /// of returning [`SelfChangeError::ComparisonDiverged`].
+    /// Records the shadow comparison. It must be in scope, name the admitted
+    /// generations, carry independent evidence, and match on every axis. Use
+    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] when a diverged
+    /// comparison must escalate under the oracle rule instead of returning
+    /// [`SelfChangeError::ComparisonDiverged`].
+    ///
+    /// The independence check runs here, in the owner that mints the receipt,
+    /// rather than only in [`ShadowComparisonRecord::new`]: a record can also
+    /// arrive through deserialization, and a record whose two passes observed
+    /// the same program is refused here before the phase can advance.
     ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::SurfaceMismatch`],
-    /// [`SelfChangeError::GenerationMismatch`], or [`SelfChangeError::ComparisonDiverged`].
+    /// [`SelfChangeError::GenerationMismatch`], [`SelfChangeError::CandidateNotIndependent`],
+    /// or [`SelfChangeError::ComparisonDiverged`].
     pub fn record_comparison(
         &mut self,
         record: ShadowComparisonRecord,
@@ -1299,6 +2042,11 @@ impl SelfChangeBootstrap {
         self.require_phase(BootstrapPhase::Comparison)?;
         self.require_scope(record.surface)?;
         self.require_generations(record.old_generation, record.candidate_generation)?;
+        if !record.is_independent() {
+            return Err(SelfChangeError::CandidateNotIndependent {
+                program: record.candidate_program.clone(),
+            });
+        }
         if !record.is_clean() {
             return Err(SelfChangeError::ComparisonDiverged {
                 axes: record.verdicts.diverged_axes(),
@@ -1319,10 +2067,17 @@ impl SelfChangeBootstrap {
     /// terminal [`BootstrapPhase::OracleConflict`], and stores the
     /// [`ResolvedOracleConflict`] for [`SelfChangeBootstrap::oracle_conflict`].
     ///
+    /// A candidate that is not independent is not a disagreement between two
+    /// generations, so it never escalates: there is no second generation whose
+    /// view could resolve it. It surfaces as
+    /// [`SelfChangeError::CandidateNotIndependent`] and leaves the machine
+    /// untouched.
+    ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::SurfaceMismatch`],
-    /// or [`SelfChangeError::GenerationMismatch`] for driver-side misuse;
+    /// [`SelfChangeError::GenerationMismatch`], or
+    /// [`SelfChangeError::CandidateNotIndependent`] for driver-side misuse;
     /// the machine is untouched then. Divergence never errors: it
     /// escalates.
     pub fn record_comparison_or_escalate(

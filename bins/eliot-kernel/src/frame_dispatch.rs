@@ -45,7 +45,9 @@ use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
 
-const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
+/// Crate-visible so the restart rollback gate (`generation_recovery`) builds the
+/// same durable required-capability set as this handshake path.
+pub(crate) const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
 const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 
 /// Computes the I1.12 contract-set digest from the live contract identities.
@@ -54,7 +56,11 @@ const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 /// made from contract shapes rather than artifact/configuration material, so a
 /// successful digest proves the same public surfaces were admitted on both
 /// sides of the carrier.
-fn runtime_contract_set_digest() -> Result<String, TransportError> {
+///
+/// Crate-visible so the restart rollback gate (`generation_recovery`) compares
+/// against the SAME derivation as this handshake path rather than a second
+/// spelling of it that could drift.
+pub(crate) fn runtime_contract_set_digest() -> Result<String, TransportError> {
     let identities = (
         eliot_kernel_core::contract_identity().map_err(|_| TransportError::SessionFenced)?,
         eliot_kernel_service::contract_identity().map_err(|_| TransportError::SessionFenced)?,
@@ -431,14 +437,16 @@ impl KernelComposition {
     /// authenticated daemon generation and epoch. An empty, stale, unrelated,
     /// or unreadable projection remains explicitly Preparing.
     ///
-    /// A durable `GenerationCutoverRecord` carries only a bare epoch sequence,
-    /// so it can never establish the lineage of the presented
-    /// `EpochId`. The Kernel's own route table is the lineage-bearing owner of
-    /// a cutover, so it gates first: the record may only corroborate a cutover
-    /// for the exact `(lineage_id, sequence)` tuple the route table currently
-    /// holds. Two lineages at the same sequence are unrelated, and a record
-    /// from a superseded lineage stays historical instead of completing a
-    /// restore that minted a new one.
+    /// A durable `GenerationCutoverRecord` carries the complete
+    /// `(lineage_id, sequence)` tuple, and it is still only a corroborating
+    /// record: the Kernel's own route table is the lineage-bearing owner of a
+    /// cutover, so it gates first. The record may then corroborate a cutover
+    /// only for the exact tuple the route table currently holds. A larger
+    /// same-lineage sequence is a different tuple and is not authority; two
+    /// lineages at the same sequence are unrelated; and a record from a
+    /// superseded lineage stays historical instead of completing a restore
+    /// that minted a new one. A row written before the typed migration no
+    /// longer decodes, so it can never reach this read at all.
     ///
     /// The state is read FROM the matched cutover record itself and is never
     /// inferred from the process state or the generation state. The newest
@@ -480,7 +488,7 @@ impl KernelComposition {
                 let record = snapshot.record();
                 record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
                     && record.new_generation == generation
-                    && record.new_epoch.value() == authority_epoch.sequence.get()
+                    && record.new_epoch.is_same_authority(authority_epoch)
             })
             .max_by_key(|snapshot| snapshot.operation_order())
         {
@@ -499,23 +507,22 @@ impl KernelComposition {
 
     /// Independent Watchdog branch coverage for the current activation.
     ///
-    /// The projection is a decision over the real branch state, not a
-    /// permanent refusal: a contour whose Watchdog branch verifies is
-    /// `Healthy`, and everything else stays `Unknown` so a supervised claim is
-    /// never projected from lease continuity alone.
+    /// The verification input is the five-part Watchdog branch check for the
+    /// exact target fence; the dimension value itself is projected by
+    /// `eliot_kernel_core::runtime_supervision_coverage`, so this stays a
+    /// decision over the real branch state, not a permanent refusal: a
+    /// contour whose Watchdog branch verifies is `Healthy`, and everything
+    /// else stays `Unknown` so a supervised claim is never projected from
+    /// lease continuity alone.
     fn runtime_supervision_coverage(
         &self,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         generation: &eliot_runtime_contracts::ModuleGeneration,
     ) -> HealthDimension {
-        if self
-            .verify_watchdog_supervision_branch(candidate, &generation.state_fence)
-            .is_ok()
-        {
-            HealthDimension::Healthy
-        } else {
-            HealthDimension::Unknown
-        }
+        eliot_kernel_core::runtime_supervision_coverage(
+            self.verify_watchdog_supervision_branch(candidate, &generation.state_fence)
+                .is_ok(),
+        )
     }
 
     /// Verifies the independent Watchdog branch for one exact target fence.

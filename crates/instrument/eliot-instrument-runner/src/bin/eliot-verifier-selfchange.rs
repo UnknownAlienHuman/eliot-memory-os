@@ -16,10 +16,14 @@
 //! [`WindowsProcessExecutor`], and the post-cutover launch crosses it exactly
 //! once through the bootstrapped runner. No phase is asserted, no digest is
 //! fabricated, and the receipt cannot be hand-built
-//! ([`GenerationReceipt`] fields are private). A surface whose special-case
-//! evidence does not verify fails closed before any launch, and the protocol
-//! binds only the admitted surface, so an unrelated module is never dragged
-//! through a full release cycle.
+//! ([`GenerationReceipt`] fields are private). The independence a cutover
+//! requires is observed too: the shadow pass must really run a different
+//! program from the last-known-good one, decided by comparing the two
+//! machine-computed program identities, so a bundle that names the same
+//! executable twice cannot mint a receipt by agreeing with itself. A surface
+//! whose special-case evidence does not verify fails closed before any launch,
+//! and the protocol binds only the admitted surface, so an unrelated module is
+//! never dragged through a full release cycle.
 //!
 //! Value discipline: nothing compositional is hardcoded. The recorded bundle
 //! carries the authority epoch, dispatch generation, permit expiry, session,
@@ -71,8 +75,9 @@ use eliot_process_executor::{
     },
 };
 use eliot_verifier::{
-    AxisVerdicts, CanaryRecord, ComparisonAxis, EvidenceDigest, GenerationReceipt,
-    OracleResolution, OuterGuardianRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
+    AxisVerdicts, CanaryRecord, ComparisonAxis, DocumentationEvidenceRecord, EvidenceDigest,
+    FrozenOuterPin, FrozenOuterScript, GenerationReceipt, OracleResolution, OuterGuardianRecord,
+    PackageDocument, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
     ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence, VerificationDecision,
     verdict_with_bootstrap,
 };
@@ -86,6 +91,11 @@ const EXIT_CUTOVER: i32 = 0;
 const EXIT_REFUSED: i32 = 1;
 /// Exit code for a committed launch whose terminal state needs reconciliation.
 const EXIT_RECONCILE_REQUIRED: i32 = 4;
+
+/// The exit code the frozen outer `DocumentationEvidenceCheck` uses for an
+/// accepted package, read from `scripts/documentation_evidence_check.py`
+/// `_cmd_verify` (`0 if report.accepted else 1`).
+const DOC_EVIDENCE_ACCEPT_EXIT_CODE: i32 = 0;
 
 /// Validation revision pinned into every stored dispatch validation context.
 ///
@@ -150,13 +160,24 @@ struct BootstrapEvidence {
     /// `ExecutorOuterGuardian` arm below requires it, so an executor-surface
     /// change can never reach cutover without a real scenario run.
     outer_guardian_scenario: Option<GuardianScenarioRecord>,
+    /// The frozen outer script/generation this entry re-reads from the machine
+    /// before a documentation/audit-tooling change is admitted. The typed
+    /// `DocumentationEvidence` arm below requires it, so a
+    /// documentation-surface change can never reach cutover on a
+    /// bundle-supplied script identity: the pin and the script bytes are read
+    /// from this machine and the recorded digests are re-derived from them.
+    documentation_freeze: Option<DocumentationFreezeRecord>,
     /// The unchanged external discriminator, run for real on this machine by
     /// the last-known-good pass and the canary.
     discriminator: DiscriminatorCommand,
     /// The candidate generation's own discriminator executable, run for real
     /// on this machine by the shadow pass alone. It is what makes the
     /// comparison a changed implementation against the last-known-good one
-    /// instead of one implementation compared with itself.
+    /// instead of one implementation compared with itself — but naming a
+    /// different path is not enough, so the two passes' machine-observed
+    /// program identities are compared and a candidate that ran the same
+    /// program as the last-known-good pass is refused before the comparison
+    /// can be recorded.
     candidate_discriminator: DiscriminatorCommand,
     /// The instrument launch admitted only under the freshly minted receipt.
     launch: LaunchCommand,
@@ -194,6 +215,28 @@ struct GuardianScenarioRecord {
     evidence: String,
     /// The expected evidence digest the recomputed value must equal.
     expected_evidence: EvidenceDigest,
+}
+
+/// The frozen outer script/generation a documentation/audit-tooling change is
+/// checked from.
+///
+/// The pin file and the script are both absolute paths read from this machine.
+/// Nothing about the freeze is taken from the bundle beyond the pointer: the
+/// generation and the script digest come out of the pin file this process
+/// reads, and the script bytes come out of the script file this process reads,
+/// so `DocumentationEvidenceRecord` is built over machine-observed bytes.
+struct DocumentationFreezeRecord {
+    /// Absolute path of the frozen pin file recording generation and digest.
+    pin: PathBuf,
+    /// Absolute path of the frozen outer script the pin names.
+    script: PathBuf,
+    /// Absolute path of the interpreter the frozen outer script runs under.
+    interpreter: PathBuf,
+    /// Absolute workspace root the packaged documents are compared against,
+    /// or `None` when the run checks the package alone.
+    workspace: Option<PathBuf>,
+    /// Absolute path of the evidence package whose bytes were packaged.
+    package: PathBuf,
 }
 
 /// One real child process the bootstrap genuinely runs on this machine.
@@ -349,9 +392,20 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
     // legitimately differs between them, and that per-activation permit
     // identity is deliberately excluded from the compared axes (see
     // `compare_axes`).
+    //
+    // That the two sides really are two different programs is itself observed,
+    // not read off the bundle: `require_independent_candidate` compares the
+    // machine-computed program identity of each pass, and refuses the run
+    // before any comparison is recorded when the candidate ran the same
+    // program as the last-known-good generation. That is the independent
+    // evidence I18.31 requires for a cutover — without it, a bundle naming the
+    // same executable twice produces a perfectly clean five-axis verdict that
+    // proves only that one implementation agrees with itself, and the changed
+    // verifier becomes the sole authority for its own correctness.
     let (last_known_good, last_known_good_pass) =
         run_discriminator(&evidence.discriminator, &admission)?;
     let (shadow, shadow_pass) = run_discriminator(&evidence.candidate_discriminator, &admission)?;
+    require_independent_candidate(&last_known_good_pass, &shadow_pass)?;
     let verdicts = compare_axes(&last_known_good_pass, &shadow_pass);
 
     let mut bootstrap = SelfChangeBootstrap::admit(
@@ -366,19 +420,26 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
     // `ProcessExecutor` change really runs the outer Host/OS guardian scenario
     // and every other case really runs its own mechanic. The typed
     // `SpecialCaseEvidence` shape makes a fabricated variant unrepresentable.
-    if let Some((case, digest)) = dispatch_special_case(&evidence)? {
+    if let Some((case, digest)) = dispatch_special_case(&evidence, &admission)? {
         bootstrap.record_special_case(case, digest)?;
     }
 
     // The comparison carries the axes actually computed from the two live
-    // observations, never an assumed clean verdict. `record_comparison` then
-    // refuses closed through [`SelfChangeError::ComparisonDiverged`], naming
-    // exactly the diverging axes, before the phase can advance; the
-    // last-known-good run's own evidence digest is what the record binds.
+    // observations, never an assumed clean verdict, plus the machine-observed
+    // program identity of each pass: the independence evidence I18.31 requires
+    // before a cutover. `require_independent_candidate` refuses a candidate
+    // that observed the same program as the last-known-good pass, so a
+    // comparison that never saw a second implementation cannot reach
+    // `record_comparison` at all. Then `record_comparison` refuses closed
+    // through [`SelfChangeError::ComparisonDiverged`], naming exactly the
+    // diverging axes, before the phase can advance; the last-known-good run's
+    // own evidence digest is what the record binds.
     let comparison = ShadowComparisonRecord::new(
         evidence.surface,
         evidence.old_generation,
         evidence.candidate_generation,
+        observed_program(&last_known_good_pass)?,
+        observed_program(&shadow_pass)?,
         verdicts,
         last_known_good,
     )?;
@@ -472,10 +533,15 @@ struct DiscriminatorPass {
 ///   `ProcessStreamEvidence::observed_sha256` and `observed_bytes`, in
 ///   `ProcessStreamKind` order: the machine hash and length of the bytes the
 ///   tool actually wrote to each stream. This is the raw capture itself. The
-///   executable `content_digest` it replaces hashed the program image, which
-///   both passes necessarily shared, so it could never diverge and proved
-///   nothing about the run; it remains in the per-run evidence digest, where
-///   the sealed request binds it.
+///   executable `content_digest` is deliberately not an axis: it hashes the
+///   program image, which is not a property of the run's output at all, so a
+///   difference there says nothing about how either pass handled the evidence.
+///   It is not discarded, though — it is the independence evidence, compared by
+///   `require_independent_candidate`, where it belongs. (It was previously
+///   excluded from every axis on the stated premise that "both passes
+///   necessarily shared" the program image; that premise is false, because the
+///   two passes are two different programs. The digest is now compared, on its
+///   own axis-of-record, where it actually decides something.)
 /// - [`ComparisonAxis::NormalizedMeaning`] from the same streams'
 ///   `ProcessStreamEvidence::parsing` and `::evaluation`: the meaning the
 ///   captured bytes were actually attributed, per stream, by the parser and
@@ -486,10 +552,14 @@ struct DiscriminatorPass {
 ///   `EnvironmentProjection::new(BTreeMap::new(), Vec::new(),
 ///   EnvironmentInheritance::None)`, so it is the same constant for every
 ///   invocation that has ever existed and carries no comparison signal at all.
-/// - [`ComparisonAxis::Selection`] from `pass.observed.argv` plus the
-///   deterministic `operation_identity` the run sealed: the selection axis is
-///   the operation the pass chose to run, so a pass that selects a different
-///   command, or a different executable for it, diverges here.
+/// - [`ComparisonAxis::Selection`] from `pass.observed.argv`: the selection
+///   axis is the command the pass chose to run, compared argument by argument,
+///   so a pass that selects a different command over the same raw evidence
+///   diverges here. The executable the pass is bound to is NOT part of this
+///   axis — the two passes are supposed to run different implementations, so a
+///   different executable is the expected difference, not a divergence, and it
+///   is judged as the independence evidence instead (see
+///   `require_independent_candidate`).
 /// - [`ComparisonAxis::Omissions`] from the exact streams each pass actually
 ///   published, every `ProcessStreamEvidence::gaps` entry it declared, the
 ///   `StreamTransportStatus` and `StreamPersistenceStatus` it recorded per
@@ -529,12 +599,20 @@ struct DiscriminatorPass {
 /// about the candidate generation's own observed behaviour over the same raw
 /// fixture/tool evidence, compared against the last-known-good generation's.
 /// A bundle that names no candidate executable is refused by
-/// [`read_bundle`], so the comparison can never silently fall back to
-/// comparing the last-known-good generation with itself.
+/// [`read_bundle`], and a bundle whose candidate executable is the same
+/// machine-observed program as the last-known-good one is refused by
+/// [`require_independent_candidate`], so the comparison can never silently
+/// fall back to comparing the last-known-good generation with itself.
+/// Requiring the field to exist was not enough: a bundle naming the same
+/// executable twice passed that check and still compared one implementation
+/// against itself.
 ///
 /// No axis is fabricated: an axis is recorded as diverging only on a real
 /// difference between two observed values, and an empty list means every axis
-/// in [`ComparisonAxis::ALL`] was compared and matched.
+/// in [`ComparisonAxis::ALL`] was compared and matched. A clean five-axis
+/// verdict therefore means the candidate is a DIFFERENT program that behaved
+/// the same over the same raw evidence — the independent evidence a cutover
+/// requires.
 fn compare_axes(last_known_good: &DiscriminatorPass, shadow: &DiscriminatorPass) -> AxisVerdicts {
     let mut axes = Vec::new();
     for axis in ComparisonAxis::ALL {
@@ -554,6 +632,51 @@ fn compare_axes(last_known_good: &DiscriminatorPass, shadow: &DiscriminatorPass)
         }
     }
     AxisVerdicts::with_divergence(axes)
+}
+
+/// Requires the candidate shadow pass to be independent of the last-known-good
+/// pass (I18.31).
+///
+/// The two passes' program identities are what the machine observed over the
+/// executable bytes each pass really ran — `ExecutableObservation`'s
+/// machine-computed `content_digest`, carried on every
+/// [`ChildObservation`]. Deciding independence from those digests rather than
+/// from the recorded paths is the whole point: a bundle may name the same
+/// executable twice, and any check on the bundle string, its well-formedness,
+/// or even on the canonical path cannot see that. Two passes that ran the same
+/// program agree on every axis by construction, so their comparison proves only
+/// that the last-known-good generation agrees with itself, and a receipt minted
+/// on that comparison would make the changed verifier the sole authority for
+/// its own correctness.
+///
+/// This runs before any comparison is recorded, so a non-independent candidate
+/// never reaches a phase that can mint a [`GenerationReceipt`]. The same fact is
+/// re-checked by the bootstrap owner itself, through the two observed program
+/// identities on [`ShadowComparisonRecord`], so the guarantee does not depend on
+/// this driver remembering to call it.
+///
+/// # Errors
+///
+/// Returns [`SelfChangeError::CandidateNotIndependent`] when both passes
+/// observed the same program.
+fn require_independent_candidate(
+    last_known_good: &DiscriminatorPass,
+    shadow: &DiscriminatorPass,
+) -> Result<(), CliError> {
+    let candidate = observed_program(shadow)?;
+    if candidate == observed_program(last_known_good)? {
+        return Err(SelfChangeError::CandidateNotIndependent { program: candidate }.into());
+    }
+    Ok(())
+}
+
+/// The machine-observed program identity of one pass, as a validated digest.
+///
+/// Straight from the observation [`run_child`] took of the executable's bytes on
+/// this machine; nothing is re-derived from the bundle, so the value cannot name
+/// a program that was not actually run.
+fn observed_program(pass: &DiscriminatorPass) -> Result<EvidenceDigest, CliError> {
+    Ok(EvidenceDigest::new(pass.observed.content_digest.clone())?)
 }
 
 /// The machine hash and length of the bytes one pass actually captured on each
@@ -588,17 +711,24 @@ fn pass_normalized_meaning(
         .collect()
 }
 
-/// The observed selection of one pass: the exact argv it ran and the
-/// deterministic operation identity that argv and executable select.
+/// The observed selection of one pass: the exact argv it chose to run.
 ///
-/// This is the same identity the sealed request binds, derived the same way, so
-/// a pass that selected a different command — or a different executable for it
-/// — genuinely differs in what it chose to run.
-fn pass_selection(pass: &DiscriminatorPass) -> (Vec<String>, String) {
-    (
-        pass.observed.argv.clone(),
-        operation_identity(&pass.observed.executable_path, &pass.observed.argv),
-    )
+/// Selection is what the pass picked out of the available work — the command
+/// it selected, compared argument by argument. The executable it is bound to
+/// is deliberately NOT part of this axis: the two passes are SUPPOSED to run
+/// different implementations, so a different executable path is the expected
+/// difference, not a divergence. Folding the executable path in here (as this
+/// axis previously did, via the path-derived `operation_identity`) fired on
+/// exactly that expected difference and blocked every honest candidate before
+/// cutover could ever be reached — the only bundle that could pass was the one
+/// whose candidate was not a candidate at all.
+///
+/// Which program each pass actually ran is not discarded: it is the
+/// independence evidence, compared by
+/// `require_independent_candidate` through the machine-observed
+/// `content_digest`, and it is the thing the independence check must judge on.
+fn pass_selection(pass: &DiscriminatorPass) -> Vec<String> {
+    pass.observed.argv.clone()
 }
 
 /// The omissions of one pass: exactly which streams it published, the exact
@@ -733,6 +863,7 @@ fn streams(pass: &DiscriminatorPass) -> impl Iterator<Item = &ProcessStreamEvide
 /// evidence variant can only be admitted for the case that guards it.
 fn dispatch_special_case(
     evidence: &BootstrapEvidence,
+    admission: &HarnessAdmission,
 ) -> Result<Option<(SpecialCase, EvidenceDigest)>, CliError> {
     match (
         evidence.surface.special_case(),
@@ -742,12 +873,19 @@ fn dispatch_special_case(
             // The `ProcessExecutor` arm additionally re-runs the machine-side
             // outer guardian scenario here, so the cleanup fact the typed
             // `OuterGuardianRecord` carries is one this process observed from
-            // the machine rather than a claim read back from the bundle.
+            // the machine rather than a claim read back from the bundle. The
+            // documentation/audit-tooling arm does the same for the frozen
+            // outer script: it launches the frozen check for real and rebuilds
+            // the typed record over bytes read from this machine.
             let record = match (case, &record) {
                 (
                     SpecialCase::ExecutorOuterGuardian,
                     SpecialCaseEvidence::ExecutorOuterGuardian(record),
                 ) => observe_outer_guardian(evidence, record)?,
+                (
+                    SpecialCase::DocumentationEvidence,
+                    SpecialCaseEvidence::DocumentationEvidence(record),
+                ) => observe_documentation_evidence(evidence, record, admission)?,
                 (_, record) => record.clone(),
             };
             case.verify(&record)?;
@@ -809,6 +947,206 @@ fn observe_outer_guardian(
     ))
 }
 
+/// Reads the frozen outer pin and the frozen outer script from this machine.
+///
+/// The pin is the recorded generation plus the recorded digest of the frozen
+/// script; the script is the exact bytes the outer `DocumentationEvidenceCheck`
+/// executes from. Both are read from disk here, so the freeze is an observation
+/// and not a bundle string: a bundle that names a different script, or a pin
+/// whose generation or digest does not match the script it names, fails closed
+/// below before the typed record is even built.
+fn read_frozen_outer(
+    freeze: &DocumentationFreezeRecord,
+) -> Result<(FrozenOuterPin, Vec<u8>), CliError> {
+    let pin_bytes = std::fs::read(&freeze.pin).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen pin {} is unavailable: {error}",
+            freeze.pin.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&pin_bytes).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen pin {} is not canonical: {error}",
+            freeze.pin.display()
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::Contract(format!(
+            "frozen pin {} is not a JSON object",
+            freeze.pin.display()
+        ))
+    })?;
+    let pin = FrozenOuterPin {
+        generation: text(object, "generation")?,
+        script: text(object, "script")?,
+        script_sha256: field(object, "script_sha256")?,
+    };
+    let script_bytes = std::fs::read(&freeze.script).map_err(|error| {
+        CliError::Contract(format!(
+            "frozen outer script {} is unavailable: {error}",
+            freeze.script.display()
+        ))
+    })?;
+    if sha256_hex(&script_bytes) != pin.script_sha256.as_str() {
+        return Err(CliError::Contract(format!(
+            "frozen outer script {} does not match the digest the pin records for generation {}",
+            freeze.script.display(),
+            pin.generation
+        )));
+    }
+    Ok((pin, script_bytes))
+}
+
+/// Re-reads the documentation evidence package from this machine.
+///
+/// What is machine-observed here, exactly: the package exists and is a real
+/// ZIP archive, and every live workspace file is read from disk. What is NOT
+/// observed here: the archive members themselves. Extracting a ZIP member needs
+/// a decompressor, this workspace declares none, and a hand-rolled inflate for
+/// a verification check would be exactly the invented mechanism the item does
+/// not name. So `packaged_bytes` stays the byte side the record carries and is
+/// compared against the recorded manifest digest and against the live workspace
+/// bytes; the archive re-extraction that I18.31:56 requires is performed by the
+/// FROZEN outer script itself, whose own exit code `run_frozen_outer_check`
+/// requires. The two are complementary and neither stands in for the other:
+/// this function ties the record to the machine, the frozen script re-extracts
+/// the archive. This paragraph exists so no reviewer reads a guarantee into the
+/// `PK` check that the code does not perform.
+fn read_package_documents(
+    freeze: &DocumentationFreezeRecord,
+    recorded: &[PackageDocument],
+) -> Result<Vec<PackageDocument>, CliError> {
+    let bytes = std::fs::read(&freeze.package).map_err(|error| {
+        CliError::Contract(format!(
+            "evidence package {} is unavailable: {error}",
+            freeze.package.display()
+        ))
+    })?;
+    if bytes.len() < 4 || &bytes[..2] != b"PK" {
+        return Err(CliError::Contract(format!(
+            "evidence package {} is not a ZIP archive",
+            freeze.package.display()
+        )));
+    }
+    recorded
+        .iter()
+        .map(|document| {
+            let workspace_bytes = freeze.workspace.as_ref().map(|root| {
+                std::fs::read(root.join(&document.path)).map_err(|error| {
+                    CliError::Contract(format!(
+                        "workspace file {} is unavailable: {error}",
+                        root.join(&document.path).display()
+                    ))
+                })
+            });
+            Ok(PackageDocument {
+                path: document.path.clone(),
+                source_bytes: document.source_bytes.clone(),
+                packaged_bytes: document.packaged_bytes.clone(),
+                workspace_bytes: workspace_bytes.transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Runs the frozen outer check for real, then re-derives its verdict.
+///
+/// I18.31:56 says the candidate documentation generator cannot certify itself
+/// by emitting a green report, so the green report is never the verdict: the
+/// frozen script is launched as a real child through the sole
+/// `WindowsProcessExecutor`, its own exit code must be the accept code, and
+/// the typed check below then recomputes every rule from the bytes on this
+/// machine. Both must accept, so neither side can stand in for the other.
+fn run_frozen_outer_check(
+    freeze: &DocumentationFreezeRecord,
+    admission: &HarnessAdmission,
+) -> Result<(), CliError> {
+    let command = DiscriminatorCommand {
+        executable: freeze.interpreter.clone(),
+        argv: {
+            let mut argv = vec![
+                freeze.script.to_string_lossy().into_owned(),
+                "verify".to_owned(),
+                "--package".to_owned(),
+                freeze.package.to_string_lossy().into_owned(),
+            ];
+            // The frozen script takes `--workspace` itself, so when a live
+            // workspace is configured the independent side runs its own
+            // divergence check too instead of this process being the only one
+            // that ever compares the package against the workspace.
+            if let Some(workspace) = &freeze.workspace {
+                argv.push("--workspace".to_owned());
+                argv.push(workspace.to_string_lossy().into_owned());
+            }
+            argv
+        },
+        working_directory: freeze
+            .script
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    };
+    let child = run_child(&command, admission)?;
+    let Some(status) = child.exit_status else {
+        return Err(CliError::Contract(
+            "frozen outer documentation evidence check published no terminal exit status"
+                .to_owned(),
+        ));
+    };
+    let outcome = exit_outcome(&status).map_err(CliError::Contract)?;
+    if outcome.code != Some(DOC_EVIDENCE_ACCEPT_EXIT_CODE) {
+        return Err(CliError::Contract(format!(
+            "frozen outer documentation evidence check exited {:?}, want {}",
+            outcome.code, DOC_EVIDENCE_ACCEPT_EXIT_CODE
+        )));
+    }
+    Ok(())
+}
+
+/// Runs the documentation evidence check from the frozen outer script.
+///
+/// The typed record is rebuilt over machine-observed bytes: the pin and the
+/// outer script are read from disk and re-hashed, and each packaged document
+/// carries the live workspace bytes next to the bytes the package re-extracted.
+/// The verdict is never read from the bundle — there is no verdict field on
+/// `SpecialCaseEvidence` to read — so a candidate documentation generator
+/// cannot certify itself by emitting a green report: every rule is recomputed
+/// from the bytes below.
+fn observe_documentation_evidence(
+    evidence: &BootstrapEvidence,
+    record: &DocumentationEvidenceRecord,
+    admission: &HarnessAdmission,
+) -> Result<SpecialCaseEvidence, CliError> {
+    let Some(freeze) = &evidence.documentation_freeze else {
+        return Err(CliError::Contract(
+            "the documentation evidence special case requires a frozen outer script".to_owned(),
+        ));
+    };
+    // The pin is read and the script bytes are re-hashed BEFORE the script is
+    // launched, never after: `freeze.script` is a bundle-supplied absolute path,
+    // so launching first would execute whatever that path names and only then
+    // discover it is not the frozen script. Verify first, then execute.
+    let (pin, script_bytes) = read_frozen_outer(freeze)?;
+    if record.script.pin != pin {
+        return Err(CliError::Contract(
+            "recorded documentation freeze differs from the pin on this machine".to_owned(),
+        ));
+    }
+    run_frozen_outer_check(freeze, admission)?;
+    let script = FrozenOuterScript::new(pin, script_bytes)?;
+    let documents = read_package_documents(freeze, &record.documents)?;
+    let rebuilt = DocumentationEvidenceRecord::new(
+        script,
+        documents,
+        record.manifest.clone(),
+        record.ledger.clone(),
+        record.dispositions.clone(),
+    )?;
+    Ok(SpecialCaseEvidence::DocumentationEvidence(Box::new(
+        rebuilt,
+    )))
+}
+
 /// Reads and shape-validates the recorded evidence bundle.
 ///
 /// The bundle is read field by field from its JSON value, so a missing,
@@ -837,6 +1175,13 @@ fn read_bundle(bundle: &Path) -> Result<BootstrapEvidence, CliError> {
             "outer_guardian_scenario",
         )? {
             Some(scenario) => Some(guardian_scenario(&scenario)?),
+            None => None,
+        },
+        documentation_freeze: match optional_field::<serde_json::Value>(
+            object,
+            "documentation_freeze",
+        )? {
+            Some(freeze) => Some(documentation_freeze(&freeze)?),
             None => None,
         },
         discriminator: discriminator(object, "discriminator")?,
@@ -933,11 +1278,46 @@ fn guardian_scenario(value: &serde_json::Value) -> Result<GuardianScenarioRecord
     })
 }
 
+/// Decodes the recorded frozen outer script/generation pointers.
+///
+/// Every path is required and absolute, and the workspace root is optional
+/// because I0.14:59 scopes a successful check to artifact integrity: a run with
+/// no live workspace compares the packaged bytes against themselves and the
+/// manifest, which is the package-only form the frozen script itself supports.
+fn documentation_freeze(value: &serde_json::Value) -> Result<DocumentationFreezeRecord, CliError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError::Bundle("'documentation_freeze' is not an object".to_owned()))?;
+    Ok(DocumentationFreezeRecord {
+        pin: absolute_path(object, "documentation_freeze", "pin")?,
+        script: absolute_path(object, "documentation_freeze", "script")?,
+        interpreter: absolute_path(object, "documentation_freeze", "interpreter")?,
+        workspace: match optional_field::<String>(object, "workspace")? {
+            Some(workspace) => {
+                let workspace = PathBuf::from(workspace);
+                if !workspace.is_absolute() {
+                    return Err(CliError::Bundle(
+                        "'documentation_freeze.workspace' must be an absolute path".to_owned(),
+                    ));
+                }
+                Some(workspace)
+            }
+            None => None,
+        },
+        package: absolute_path(object, "documentation_freeze", "package")?,
+    })
+}
+
 /// Decodes one recorded discriminator command.
 ///
 /// The recorded field is required and never defaulted: a bundle that names no
 /// candidate executable has no candidate to shadow-run, so the shadow pass
-/// cannot be produced at all and the run fails closed here.
+/// cannot be produced at all and the run fails closed here. That is necessary
+/// but not sufficient — the two fields are decoded independently and a
+/// well-formed bundle may still name the same executable twice, which is why
+/// the recorded strings are never the basis of the independence decision:
+/// [`require_independent_candidate`] compares the machine-observed program
+/// identity of the two passes instead.
 fn discriminator(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1839,11 +2219,14 @@ fn resolve_executable(path: &Path) -> Result<PathBuf, CliError> {
 
 /// The stable operation identity bound to one observed executable and argv.
 ///
-/// Both the sealed request and the selection axis of the five-axis comparison
-/// derive their identity here, so a pass that selected a different command — or
-/// a different executable for it — is the same difference the sealed permit
-/// names. The machine-resolved path is what the child actually runs, so this is
-/// the observed value rather than the recorded one.
+/// Both the sealed request and the per-run retained-evidence digest derive
+/// their identity here, so the operation the permit was minted for is the
+/// operation the evidence binds. The machine-resolved path is what the child
+/// actually runs, so this is the observed value rather than the recorded one.
+/// It is deliberately NOT the selection axis: it names the executable too, and
+/// the two passes are supposed to name different executables, so comparing it
+/// across the passes would fire on the expected difference (see
+/// `pass_selection`).
 fn operation_identity(executable: &str, argv: &[String]) -> String {
     let material = format!("{executable}\0{}", argv.join("\u{1}"));
     format!(

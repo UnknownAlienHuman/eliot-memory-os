@@ -1,15 +1,17 @@
-//! Authenticated Context-owner publication and consumption boundary for the
-//! campaign packet path.
+//! Authenticated Context-owner publication boundary for the campaign packet
+//! path.
 //!
-//! The Context compiler owns the recipe and the session-delivery snapshot.
+//! The Context owner publishes the recipe and the session-delivery snapshot.
 //! This adapter is deliberately thin: it invokes the owner validators, then
-//! projects their exact typed bodies into the closed store publication shape.
-//! It never creates a Context recipe, delivery snapshot, or campaign source
-//! from a transcript/current-file substitute.
+//! projects their exact typed bodies into the closed store publication shape,
+//! and at consumption time re-runs those same owner validators so the decoded
+//! bodies still bind to the packet State Fence. It never creates a Context
+//! recipe, delivery snapshot, or campaign source from a transcript/current-file
+//! substitute, and it is not a second compiler: the frozen
+//! `eliot_context::ContextCompiler` takes no product caller on this route.
 
 use std::collections::BTreeSet;
 
-use eliot_context::CampaignCompiledContext;
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, ContextPublicationError, ContextSourcePublication,
     context_delivery_publication, context_recipe_publication,
@@ -194,45 +196,14 @@ pub fn build_context_owner_publications(
     ])
 }
 
-/// Consume the exact Context compiler result at the packet boundary.
-///
-/// This is a downstream consumer, not another compiler: it checks that the
-/// compiled context still names the exact learning-state view and recipe
-/// digests, then projects a bounded delivery receipt for the caller. The
-/// receipt contains no transcript copy and performs no store write.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CampaignContextDeliveryReceipt {
-    pub(crate) learning_state_view_id: ArtifactId,
-    pub(crate) learning_state_view_digest: String,
-    pub(crate) context_recipe_digest: String,
-    pub(crate) delivered_unit_count: usize,
-    pub(crate) retained_handle_count: usize,
-}
-
-/// Consume one compiled Context result after the owner publications have been
-/// independently validated by the packet compiler.
-pub(crate) fn consume_compiled_context(
-    compiled: &CampaignCompiledContext,
-    expected_view_id: &ArtifactId,
-    expected_view_digest: &str,
-) -> Result<CampaignContextDeliveryReceipt, String> {
-    if &compiled.learning_state_view_id != expected_view_id
-        || compiled.learning_state_view_digest != expected_view_digest
-        || compiled.context_recipe_digest.trim().is_empty()
-    {
-        return Err("compiled Context result is not bound to the current learning view".to_owned());
-    }
-    Ok(CampaignContextDeliveryReceipt {
-        learning_state_view_id: compiled.learning_state_view_id.clone(),
-        learning_state_view_digest: compiled.learning_state_view_digest.clone(),
-        context_recipe_digest: compiled.context_recipe_digest.clone(),
-        delivered_unit_count: compiled.context.units.len(),
-        retained_handle_count: compiled.context.handle_only.len(),
-    })
-}
-
 /// Validate the exact Context owner bodies against a campaign source fence
-/// before a packet compiler consumes them.
+/// before a packet attempt consumes them.
+///
+/// This is the owner-side recheck of the named-read joins for the Context
+/// source rows: the typed bodies this attempt decoded from the fresh
+/// authenticated reads are re-derived by the Context owner and re-bound to the
+/// packet State Fence. It is a validator, not a second publisher, and it never
+/// creates a recipe, delivery snapshot, or campaign source row of its own.
 pub(crate) fn validate_context_owner_bodies(
     recipe_body: &ContextCampaignRecipeBody,
     prior_delivery: Option<&SessionDeliverySnapshot>,

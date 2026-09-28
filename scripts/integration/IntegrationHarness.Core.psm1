@@ -2418,6 +2418,172 @@ function Get-HarnessWhatIfDerivation {
     }
 }
 
+# Closed #905 row consumption (issue #907 OBJ): normalize one parsed inventory
+# row into a Model-valid row hashtable. Not exported: the WhatIf/Run seams
+# attach it to every inventory shape, so the one bounded coordinator consumes
+# #905's run-local inventory instead of refusing it.
+#
+# - snake_case #905 identity/digest spellings map to the Model spellings; a row
+#   carrying both spellings for one field is ambiguous and rejected (fail
+#   closed, never first-wins);
+# - the five grouping classes are allocated ONLY from #905-declared fields:
+#   providerClass is the exact singleton of requirements (+) {STORE,RUNTIME,GIT}
+#   (the closed #905 requirement vocabulary shared with the provider lanes);
+#   targetClass is the declared targetKind verbatim; isolation/reset/
+#   serialization classes project the declared isolation tokens verbatim, with
+#   absence recorded as the explicit 'undeclared' marker so identical
+#   declarations group identically. Nothing is defaulted from outside the row.
+# - a row that is complete per #905 but names no single concrete provider is
+#   NOT an incomplete inventory (case 6): it receives an explicit
+#   UNALLOCATED-* provider class and flows to dispatch, where a missing
+#   provider blocks it as InfrastructureBlocked (never skipped or passed).
+#   Truly malformed rows (missing identity/digest, illegal shape, ambiguous
+#   spellings, foreign isolation tokens, non-text requirement/isolation
+#   entries) throw HARNESS-INVALID-ROW for the caller to report as
+#   HARNESS-INCOMPLETE-INVENTORY.
+# - rows that already carry all five classes pass through with strict shape
+#   checks; partially allocated rows are contradictory and rejected.
+function ConvertTo-IntegrationHarnessInventoryRow {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        $Row
+    )
+    $aliases = [ordered]@{
+        package_id = 'packageId'
+        target_kind = 'targetKind'
+        target_name = 'targetName'
+        test_name = 'testName'
+        row_digest = 'rowDigest'
+    }
+    $names = @()
+    if ($Row -is [hashtable]) {
+        $names = @($Row.Keys | ForEach-Object { [string]$_ })
+    } else {
+        $names = @($Row.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    }
+    foreach ($alias in $aliases.GetEnumerator()) {
+        $hasInventoryName = $false
+        $hasModelName = $false
+        foreach ($name in $names) {
+            if ($name -ceq [string]$alias.Key) {
+                $hasInventoryName = $true
+            } elseif ($name -ieq [string]$alias.Value) {
+                $hasModelName = $true
+            }
+        }
+        if ($hasInventoryName -and $hasModelName) {
+            throw [System.ArgumentException]::new("HARNESS-AMBIGUOUS-ROW-FIELD: inventory row contains both '$($alias.Key)' and '$($alias.Value)'.")
+        }
+    }
+    $h = @{}
+    if ($Row -is [hashtable]) {
+        foreach ($key in @($Row.Keys)) {
+            $propertyName = [string]$key
+            $modelName = $propertyName
+            foreach ($alias in $aliases.GetEnumerator()) {
+                if ($propertyName -ceq [string]$alias.Key) {
+                    $modelName = [string]$alias.Value
+                    break
+                }
+            }
+            $h[$modelName] = $Row[$key]
+        }
+    } else {
+        foreach ($prop in $Row.PSObject.Properties) {
+            $propertyName = [string]$prop.Name
+            $modelName = $propertyName
+            foreach ($alias in $aliases.GetEnumerator()) {
+                if ($propertyName -ceq [string]$alias.Key) {
+                    $modelName = [string]$alias.Value
+                    break
+                }
+            }
+            $h[$modelName] = $prop.Value
+        }
+    }
+    $classFields = @('providerClass', 'isolationClass', 'targetClass', 'resetClass', 'serializationClass')
+    $present = @($classFields | Where-Object { $h.ContainsKey($_) -and -not [string]::IsNullOrWhiteSpace([string]$h[$_]) })
+    if ($present.Count -eq $classFields.Count) {
+        foreach ($field in $classFields) {
+            $h[$field] = [string]$h[$field]
+            if ($h[$field] -cmatch '[|]') {
+                throw [System.ArgumentException]::new("HARNESS-INVALID-ROW: field '$field' contains a separator.")
+            }
+        }
+    } elseif ($present.Count -gt 0) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-ROW: partially allocated class fields.')
+    } else {
+        $requirements = @()
+        if ($h.ContainsKey('requirements') -and $null -ne $h['requirements']) {
+            $requirements = @($h['requirements'])
+        }
+        $requirementTokens = @()
+        foreach ($entry in $requirements) {
+            if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$entry)) {
+                throw [System.ArgumentException]::new('HARNESS-INVALID-ROW: requirement token must be nonempty text.')
+            }
+            $requirementTokens += [string]$entry
+        }
+        $recognized = @($requirementTokens | Where-Object { $_ -ceq 'STORE' -or $_ -ceq 'RUNTIME' -or $_ -ceq 'GIT' } |
+            Sort-Object -Culture '' -CaseSensitive -Unique)
+        $distinct = @($requirementTokens | Sort-Object -Culture '' -CaseSensitive -Unique)
+        if ($recognized.Count -eq 1 -and $distinct.Count -eq 1) {
+            $h['providerClass'] = $recognized[0]
+        } elseif ($requirementTokens -ccontains 'EXTERNAL_CREDENTIALED_MANUAL_ONLY') {
+            $h['providerClass'] = 'UNALLOCATED-EXTERNAL'
+        } elseif ($recognized.Count -gt 1) {
+            $h['providerClass'] = 'UNALLOCATED-AMBIGUOUS'
+        } else {
+            $h['providerClass'] = 'UNALLOCATED-UNKNOWN'
+        }
+        $isolationEntries = @()
+        if ($h.ContainsKey('isolation') -and $null -ne $h['isolation']) {
+            $isolationEntries = @($h['isolation'])
+        }
+        $allowedIsolation = @('parallel', 'serial', 'isolated', 'timeout', 'reset')
+        $declared = @()
+        foreach ($token in $isolationEntries) {
+            if ($token -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$token)) {
+                throw [System.ArgumentException]::new('HARNESS-INVALID-ROW: isolation token must be nonempty text.')
+            }
+            $text = [string]$token
+            if ($allowedIsolation -cnotcontains $text) {
+                throw [System.ArgumentException]::new("HARNESS-INVALID-ROW: foreign isolation token '$text'.")
+            }
+            $declared += $text
+        }
+        $declared = @($declared | Sort-Object -Culture '' -CaseSensitive -Unique)
+        if ($declared.Count -gt 0) {
+            $h['isolationClass'] = ($declared -join ',')
+        } else {
+            $h['isolationClass'] = 'undeclared'
+        }
+        if ($h.ContainsKey('targetKind') -and -not [string]::IsNullOrWhiteSpace([string]$h['targetKind'])) {
+            $h['targetClass'] = [string]$h['targetKind']
+        } else {
+            throw [System.ArgumentException]::new("HARNESS-INVALID-ROW: missing 'targetKind'.")
+        }
+        if ($declared -ccontains 'reset') {
+            $h['resetClass'] = 'reset'
+        } else {
+            $h['resetClass'] = 'undeclared'
+        }
+        $serialTokens = @($declared | Where-Object { $_ -ceq 'serial' -or $_ -ceq 'parallel' })
+        if ($serialTokens.Count -gt 0) {
+            $h['serializationClass'] = ($serialTokens -join ',')
+        } else {
+            $h['serializationClass'] = 'undeclared'
+        }
+    }
+    $rowCommand = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue
+    if ($null -ne $rowCommand) {
+        [void](Test-IntegrationHarnessInventoryRow -Row $h)
+    }
+    return $h
+}
+
 function Invoke-HarnessWhatIf {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -2467,16 +2633,24 @@ function Invoke-HarnessWhatIf {
             throw [System.IO.FileNotFoundException]::new('HARNESS-MISSING-INVENTORY: SelectAllRows requires a finite inventory file.')
         }
         $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
-        $rows = @($parsed.rows)
         $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
-        $planIdentities = @(@($parsed.rows) | ForEach-Object {
-            ('{0}::{1}::{2}::{3}' -f $_.packageId, $_.targetKind, $_.targetName, $_.testName)
+        $normalizedRows = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($row in @($parsed.rows)) {
+            try {
+                [void]$normalizedRows.Add((ConvertTo-IntegrationHarnessInventoryRow -Row $row))
+            }
+            catch {
+                throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory row is not accepted: $($_.Exception.Message)")
+            }
+        }
+        $planIdentities = @(@($normalizedRows) | ForEach-Object {
+            ('{0}::{1}::{2}::{3}' -f $_['packageId'], $_['targetKind'], $_['targetName'], $_['testName'])
         } | Sort-Object -Culture '' -CaseSensitive)
         $derivation = Get-HarnessWhatIfDerivation -SortedIdentities $planIdentities
         return @{
             status         = 'Planned'
             inventory      = $resolved
-            selectionCount = $rows.Count
+            selectionCount = $normalizedRows.Count
             commands       = @($derivation['commands'])
             resources      = @($derivation['resources'])
             cleanup        = @($derivation['cleanup'])
@@ -2490,15 +2664,8 @@ function Invoke-HarnessWhatIf {
         $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
         $byIdentity = @{}
         foreach ($row in @($parsed.rows)) {
-            $h = @{}
-            foreach ($prop in $row.PSObject.Properties) {
-                $h[[string]$prop.Name] = $prop.Value
-            }
             try {
-                $cmd = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue
-                if ($null -ne $cmd) {
-                    [void](Test-IntegrationHarnessInventoryRow -Row $h)
-                }
+                $h = ConvertTo-IntegrationHarnessInventoryRow -Row $row
             }
             catch {
                 throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory row is not accepted: $($_.Exception.Message)")
@@ -2621,48 +2788,9 @@ function Invoke-HarnessRun {
         $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
         $byIdentity = @{}
         $rowTables = [System.Collections.Generic.List[hashtable]]::new()
-        $inventoryRowAliases = [ordered]@{
-            package_id = 'packageId'
-            target_kind = 'targetKind'
-            target_name = 'targetName'
-            test_name = 'testName'
-            row_digest = 'rowDigest'
-        }
         foreach ($row in @($parsed.rows)) {
-            $h = @{}
-            $rowProperties = @($row.PSObject.Properties)
-            foreach ($alias in $inventoryRowAliases.GetEnumerator()) {
-                $hasInventoryName = $false
-                $hasModelName = $false
-                foreach ($prop in $rowProperties) {
-                    $propertyName = [string]$prop.Name
-                    if ($propertyName -ceq [string]$alias.Key) {
-                        $hasInventoryName = $true
-                    }
-                    elseif ($propertyName -ieq [string]$alias.Value) {
-                        $hasModelName = $true
-                    }
-                }
-                if ($hasInventoryName -and $hasModelName) {
-                    throw [System.ArgumentException]::new("HARNESS-AMBIGUOUS-ROW-FIELD: inventory row contains both '$($alias.Key)' and '$($alias.Value)'.")
-                }
-            }
-            foreach ($prop in $rowProperties) {
-                $propertyName = [string]$prop.Name
-                $modelName = $propertyName
-                foreach ($alias in $inventoryRowAliases.GetEnumerator()) {
-                    if ($propertyName -ceq [string]$alias.Key) {
-                        $modelName = [string]$alias.Value
-                        break
-                    }
-                }
-                $h[$modelName] = $prop.Value
-            }
             try {
-                $rowCommand = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue
-                if ($null -ne $rowCommand) {
-                    [void](Test-IntegrationHarnessInventoryRow -Row $h)
-                }
+                $h = ConvertTo-IntegrationHarnessInventoryRow -Row $row
             }
             catch {
                 throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory row is not accepted: $($_.Exception.Message)")

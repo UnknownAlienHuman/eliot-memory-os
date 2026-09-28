@@ -21,17 +21,20 @@ use serde::Serialize;
 use crate::SNAPSHOT_SCHEMA_VERSION;
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
-    CancellationReconciliationId, CandidateId, CandidateResultReceipt, CoordinatedAttemptState,
-    CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot,
+    CancellationReconciliationId, CandidateId, CandidateResultReceipt, CapacityDeferral,
+    CapacityLimitDimension, ClassSkipReason, CoordinatedAttemptState, CoordinatorConfig,
+    CoordinatorError, CoordinatorEvent, CoordinatorSnapshot, DeliverableClaim,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
-    ExecutionContext, LegacyResultWireKind, LostWorkerReceipt, OperationId,
-    OutcomeReconciliationId, PeerMessageReceipt, PlanGap, ProviderAdmissionReceipt,
-    ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ExecutionContext, FAIR_PULL_ALGORITHM, FAIRNESS_QUANTUM, LegacyResultWireKind,
+    LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt, PlanGap,
+    ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
-    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
-    ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
-    UnknownOutcomeFinalReceipt, WorkerId, validate_text,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReadyItemSkipReason,
+    ReadySelectionOutcome, ReassignmentId, ReassignmentReceipt, ResultSubmission,
+    RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, StaffingLaneCandidate,
+    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt,
+    WipPartitionKey, WorkClass, WorkClassProfile, WorkClassSelectionReport, WorkerId,
+    validate_text,
 };
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
@@ -303,6 +306,401 @@ struct RouteCapacityRequest {
     capacity_limit: usize,
 }
 
+/// One class's admitted and in-flight view for a single fair pull (issue
+/// #1683 W2). It borrows the stored records; nothing is copied or re-stored.
+///
+/// `in_flight` is every non-terminal attempt that is not queued: `Running`,
+/// `CancellationRequested` and `UnknownOutcome`. `UnknownOutcome` is in that set
+/// deliberately. Issue #1683 W4 requires that "unknown old execution keeps
+/// exclusion until reconciliation, not merely until an outer result says
+/// Partial or its lease expires", and an attempt whose outcome is unknown has
+/// not been reconciled, so it keeps holding its concurrency slot, its bytes and
+/// its WIP partition until `reconcile_unknown_outcome` releases it. A queued
+/// (`Admitted`) item is in `ready` only, so these ceilings measure real
+/// in-flight pressure rather than queue length.
+struct ClassPullView<'a> {
+    in_flight: Vec<&'a AttemptRecord>,
+    in_flight_bytes: u64,
+    ready: Vec<(u64, &'a AttemptRecord)>,
+    head: Option<&'a AttemptRecord>,
+    scanned: usize,
+    skipped: usize,
+    infeasible: usize,
+    skip_reason: Option<ClassSkipReason>,
+    capacity_closure: Option<ItemBlock>,
+    deferral: Option<CapacityDeferral>,
+}
+
+impl ClassPullView<'_> {
+    const fn empty() -> Self {
+        Self {
+            in_flight: Vec::new(),
+            in_flight_bytes: 0,
+            ready: Vec::new(),
+            head: None,
+            scanned: 0,
+            skipped: 0,
+            infeasible: 0,
+            skip_reason: None,
+            capacity_closure: None,
+            deferral: None,
+        }
+    }
+
+    /// Canonical enqueue sequence of the oldest admitted item of this class.
+    fn oldest_ready_sequence(&self) -> Option<u64> {
+        self.ready.first().map(|(sequence, _)| *sequence)
+    }
+}
+
+/// Why one admitted item could not be offered by a pull, with the exact
+/// observed value and limit of the capacity dimension that closed it.
+///
+/// `closure` is `None` for a block that is not a capacity closure: a deadline
+/// ceiling mismatch is a property of the item, not of a saturated class, so it
+/// publishes no capacity deferral.
+struct ItemBlock {
+    reason: ReadyItemSkipReason,
+    /// Present only when a capacity dimension is what closed the item. There is
+    /// no placeholder value: a deadline mismatch has no observed/limit pair to
+    /// report and therefore carries none.
+    closure: Option<CapacityClosure>,
+}
+
+/// The exact capacity measurement behind one refusal.
+struct CapacityClosure {
+    dimension: CapacityLimitDimension,
+    observed: u64,
+    limit: u64,
+}
+
+impl ItemBlock {
+    const fn unclosed(reason: ReadyItemSkipReason) -> Self {
+        Self {
+            reason,
+            closure: None,
+        }
+    }
+
+    const fn closed(
+        reason: ReadyItemSkipReason,
+        dimension: CapacityLimitDimension,
+        observed: u64,
+        limit: u64,
+    ) -> Self {
+        Self {
+            reason,
+            closure: Some(CapacityClosure {
+                dimension,
+                observed,
+                limit,
+            }),
+        }
+    }
+}
+
+/// Exact `u64` value of a count, saturating rather than wrapping. A count can
+/// never exceed `u64::MAX` on any platform this crate supports; the saturation
+/// only keeps the conversion total.
+fn count_as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// The I14.8 WIP partition value of one stored attempt for one dimension.
+fn wip_partition_value(attempt: &AttemptRecord, key: WipPartitionKey) -> String {
+    match key {
+        WipPartitionKey::Route => route_key(&attempt.route),
+        WipPartitionKey::Scope => attempt
+            .mutation_scope
+            .clone()
+            .unwrap_or_else(|| WORKSCOPE_ABSENT.to_owned()),
+        WipPartitionKey::Task => attempt.task_id.as_str().to_owned(),
+        WipPartitionKey::Worker => attempt.worker_id.as_str().to_owned(),
+    }
+}
+
+/// Partition value for an attempt that declares no scope. It cannot collide with
+/// a declared scope, because `plan` rejects a blank `mutation_scope`.
+const WORKSCOPE_ABSENT: &str = "\u{0}no-mutation-scope";
+
+/// Publishes one class's exact result. Ceilings are the profile's own values
+/// and are `None` on the profile-free peek, so a caller can tell an absent
+/// partition from an unlimited one.
+fn class_report(
+    work_class: WorkClass,
+    view: &ClassPullView<'_>,
+    class_profile: Option<&WorkClassProfile>,
+    scheduled_credit: Option<u64>,
+) -> WorkClassSelectionReport {
+    WorkClassSelectionReport {
+        work_class,
+        ready_items: view.ready.len(),
+        in_flight_items: view.in_flight.len(),
+        in_flight_bytes: view.in_flight_bytes,
+        item_ceiling: class_profile.map(|profile| count_as_u64(profile.max_items)),
+        concurrency_ceiling: class_profile.map(|profile| count_as_u64(profile.max_concurrency)),
+        byte_ceiling: class_profile.map(|profile| profile.max_bytes),
+        scanned_ready_items: view.scanned,
+        oldest_ready_enqueue_sequence: view.oldest_ready_sequence(),
+        offered_attempt_id: view.head.map(|attempt| attempt.attempt_id.clone()),
+        scheduled_credit,
+        class_skip_reason: view.skip_reason,
+        skipped_ready_items: view.skipped,
+        infeasible_items: view.infeasible,
+    }
+}
+
+/// Per-class admitted/in-flight view of the whole projection, in canonical
+/// enqueue order.
+///
+/// `enqueue_sequence` and `attempts` are written together by `admit`/`reassign`,
+/// so an index entry without a record cannot occur; skipping it keeps the pull
+/// total instead of inventing an order for it.
+fn class_views<'a>(
+    attempts: &'a BTreeMap<AttemptId, AttemptRecord>,
+    enqueue_sequence: &'a BTreeMap<AttemptId, u64>,
+) -> [ClassPullView<'a>; 9] {
+    let mut views: [ClassPullView<'a>; 9] = std::array::from_fn(|_| ClassPullView::empty());
+    for (attempt_id, sequence) in enqueue_sequence {
+        let Some(attempt) = attempts.get(attempt_id) else {
+            continue;
+        };
+        if attempt.state.is_terminal() {
+            continue;
+        }
+        let view = &mut views[usize::from(attempt.work_class.rank())];
+        if attempt.state == CoordinatedAttemptState::Admitted {
+            view.ready.push((*sequence, attempt));
+        } else {
+            // `Running`, `CancellationRequested` and `UnknownOutcome`; see the
+            // `ClassPullView` doc for why an unknown outcome still holds its
+            // resources.
+            view.in_flight.push(attempt);
+            view.in_flight_bytes = view
+                .in_flight_bytes
+                .saturating_add(attempt.budget.output_bytes);
+        }
+    }
+    for view in &mut views {
+        // Order by the canonical enqueue ordinal, which is unique per attempt,
+        // so no further tie-break is needed or possible. The sort is stable and
+        // the walk above is over a `BTreeMap`, so the result is deterministic
+        // and independent of hash iteration order.
+        view.ready.sort_by_key(|(sequence, _)| *sequence);
+    }
+    views
+}
+
+/// The per-class policy in force for one pull, with the revision any refusal
+/// from that class is measured against.
+///
+/// A capacity deferral is only ever built from one of these, because every
+/// limit it reports comes from the profile; the profile revision, not the route
+/// capacity view, is what re-opens a closed class.
+#[derive(Clone, Copy)]
+struct ClassContext<'a> {
+    profile: &'a WorkClassProfile,
+    revision: &'a str,
+}
+
+/// Decides what one class offers to this pull: its oldest eligible admitted
+/// item, or the exact reason it offers nothing.
+fn offer_class_head(
+    view: &mut ClassPullView<'_>,
+    work_class: WorkClass,
+    context: Option<ClassContext<'_>>,
+) {
+    let Some(context) = context else {
+        // Profile-free peek: no limit applies, so the class offers its oldest
+        // admitted item directly and nothing beyond that item is examined.
+        if let Some((_, attempt)) = view.ready.first() {
+            view.scanned += 1;
+            view.head = Some(attempt);
+        }
+        return;
+    };
+    if view.ready.is_empty() {
+        return;
+    }
+    if view.in_flight.len() >= context.profile.max_concurrency {
+        view.skip_reason = Some(ClassSkipReason::ClassConcurrencyAtLimit);
+        view.deferral = Some(CapacityDeferral::new(
+            work_class,
+            CapacityLimitDimension::ClassConcurrency,
+            count_as_u64(view.in_flight.len()),
+            count_as_u64(context.profile.max_concurrency),
+            context.revision,
+        ));
+        return;
+    }
+    // Bounded scan for the oldest eligible head; the window is the class item
+    // ceiling. See the known-limitation note on `next_ready`: the window always
+    // starts at the oldest admitted item, so a window whose items are all
+    // permanently out of profile never advances.
+    for (_, attempt) in view.ready.iter().take(context.profile.max_items) {
+        view.scanned += 1;
+        let Some(block) = item_block(view, attempt, context.profile) else {
+            view.head = Some(attempt);
+            return;
+        };
+        view.skipped += 1;
+        if block.reason == ReadyItemSkipReason::ClassDeadlineCeiling {
+            view.infeasible += 1;
+        }
+        if view.capacity_closure.is_none() && block.closure.is_some() {
+            view.capacity_closure = Some(block);
+        }
+    }
+    view.skip_reason = Some(ClassSkipReason::AllReadyItemsSkipped);
+    if let Some(closure) = view
+        .capacity_closure
+        .as_ref()
+        .and_then(|block| block.closure.as_ref())
+    {
+        view.deferral = Some(CapacityDeferral::new(
+            work_class,
+            closure.dimension,
+            closure.observed,
+            closure.limit,
+            context.revision,
+        ));
+    }
+}
+
+/// Why one admitted item cannot be offered by a pull, with the exact observed
+/// value and limit of the capacity dimension that blocked it.
+///
+/// With no class profile there is nothing to check, so on the profile-free peek
+/// no item is ever passed over.
+///
+/// One writer per deliverable is deliberately *not* re-checked here. It is
+/// already enforced once, at the owning transition, by `plan`, `admit` and
+/// `reassign` on the Work/Action lease identity, and it cannot be violated from
+/// this side: `writer_holders` is written only where that lease is taken, and
+/// each of its four release sites immediately settles the releasing attempt
+/// terminally, so a scope's holder is always the only non-terminal attempt on
+/// that scope and is never a different admitted item. A second check here
+/// could not fail, so it is not written.
+fn item_block(
+    view: &ClassPullView<'_>,
+    attempt: &AttemptRecord,
+    class_profile: &WorkClassProfile,
+) -> Option<ItemBlock> {
+    if attempt.budget.wall_time_ms > class_profile.deadline_ms {
+        return Some(ItemBlock::unclosed(
+            ReadyItemSkipReason::ClassDeadlineCeiling,
+        ));
+    }
+    let requested = view
+        .in_flight_bytes
+        .saturating_add(attempt.budget.output_bytes);
+    if requested > class_profile.max_bytes {
+        return Some(ItemBlock::closed(
+            ReadyItemSkipReason::ClassByteCapReached,
+            CapacityLimitDimension::ClassBytes,
+            requested,
+            class_profile.max_bytes,
+        ));
+    }
+    for partition in &class_profile.wip_partitions {
+        let value = wip_partition_value(attempt, partition.key);
+        let observed = view
+            .in_flight
+            .iter()
+            .filter(|other| wip_partition_value(other, partition.key) == value)
+            .count();
+        if observed >= partition.max_in_flight {
+            return Some(ItemBlock::closed(
+                ReadyItemSkipReason::WipPartitionAtLimit,
+                CapacityLimitDimension::WipPartition { key: partition.key },
+                count_as_u64(observed),
+                count_as_u64(partition.max_in_flight),
+            ));
+        }
+    }
+    None
+}
+
+/// Smooth weighted round robin over the classes that offered a head.
+///
+/// The lowest virtual time among the participating classes wins, an exact tie
+/// goes to the lower scheduler rank (so equal weights keep the I14.1 class
+/// order), and **only the winner** then advances by
+/// `FAIRNESS_QUANTUM / weight`. Selecting before advancing is what makes the
+/// rotation proportional: advancing every participant first would leave the
+/// minimum unchanged between pulls, so the same class would win every pull.
+///
+/// Service bound, as implemented and checked: over any complete round of
+/// `W = sum(weight)` pulls, class `i` is selected exactly `weight_i` times. In
+/// a shorter window the observed share deviates from `weight_i / W` by at most
+/// one round, so `weight / W` is the round share and not a per-pull guarantee.
+///
+/// Credit bound. A class's credit is its virtual time minus the winner's, so it
+/// is non-negative. For a class served at global time `T`, its virtual time is
+/// `T + FAIRNESS_QUANTUM / weight`, and the global time only moves forward, so
+/// the credit is at most `FAIRNESS_QUANTUM / weight`, hence at most
+/// `FAIRNESS_QUANTUM` because every weight is at least 1. That bound is tight:
+/// a weight-1 class that has fallen a full quantum behind reaches exactly
+/// `FAIRNESS_QUANTUM`. A class that has never been served holds virtual time 0,
+/// and the winner's time is a minimum, so its credit is 0 as well. The bound
+/// assumes no virtual time has saturated: the *spread* is bounded as above, but
+/// the stored values themselves grow by one stride per pull and saturate after
+/// roughly `u64::MAX / FAIRNESS_QUANTUM` pulls, after which the rotation
+/// degrades to index tie-breaks.
+///
+/// A class that cannot participate keeps its virtual time, so it is not charged
+/// for the pulls it missed.
+///
+/// Returns the advanced virtual times separately: committing them is the
+/// caller's decision, so the profile-free peek can leave scheduler state
+/// untouched.
+fn choose_fair_head<'a, 'profile>(
+    views: &'a [ClassPullView<'a>],
+    current: &[u64; 9],
+    resolve: &impl Fn(WorkClass) -> Option<&'profile WorkClassProfile>,
+) -> (Option<&'a AttemptRecord>, [u64; 9], [Option<u64>; 9]) {
+    let mut virtual_time = *current;
+    let mut credits: [Option<u64>; 9] = [None; 9];
+    let winner = (0..WorkClass::ALL.len())
+        .filter(|index| views[*index].head.is_some())
+        .min_by_key(|index| (virtual_time[*index], *index));
+    let Some(winner) = winner else {
+        return (None, virtual_time, credits);
+    };
+    let base = virtual_time[winner];
+    for index in 0..WorkClass::ALL.len() {
+        if views[index].head.is_some() {
+            credits[index] = Some(virtual_time[index] - base);
+        }
+    }
+    let weight = resolve(WorkClass::ALL[winner]).map_or(1, |profile| u64::from(profile.weight));
+    virtual_time[winner] = virtual_time[winner].saturating_add(FAIRNESS_QUANTUM / weight);
+    (views[winner].head, virtual_time, credits)
+}
+
+/// Published claim state of every deliverable that currently has a live writer.
+///
+/// Reads `writer_holders`, the structure that actually enforces one writer per
+/// deliverable, rather than re-deriving holders from the attempt list. An entry
+/// whose attempt record is absent is skipped: the holder and its record are
+/// written together, so the pair cannot diverge.
+fn deliverable_claims(
+    attempts: &BTreeMap<AttemptId, AttemptRecord>,
+    writer_holders: &BTreeMap<String, AttemptId>,
+) -> Vec<DeliverableClaim> {
+    writer_holders
+        .iter()
+        .filter_map(|(scope, attempt_id)| {
+            let holder = attempts.get(attempt_id)?;
+            Some(DeliverableClaim {
+                mutation_scope: scope.clone(),
+                holder_attempt_id: attempt_id.clone(),
+                holder_state: holder.state,
+            })
+        })
+        .collect()
+}
+
 /// Deterministic A-02 execution projection. It owns no provider admission,
 /// lease minting, process launch, task truth, canonical writer, or task graph.
 pub struct AgentCoordinator {
@@ -335,6 +733,20 @@ pub struct AgentCoordinator {
     descendant_closures: BTreeMap<AttemptId, IdempotentRecord<DescendantClosureCandidateReceipt>>,
     peer_messages: BTreeMap<MessageId, IdempotentRecord<PeerMessageReceipt>>,
     peer_message_payloads: BTreeMap<MessageId, LivePeerMessage>,
+    /// Canonical enqueue ordinal per attempt (issue #1683 W2). It is derived
+    /// state, not a snapshot field: `admit` and `reassign` assign it in the
+    /// same block that inserts the record, and snapshot replay re-runs exactly
+    /// those two methods, so a projection rebuild or a restart re-derives the
+    /// identical age for every item. No wall clock participates, so a restart
+    /// cannot renew an item's age.
+    enqueue_sequence: BTreeMap<AttemptId, u64>,
+    next_enqueue_sequence: u64,
+    /// Smooth weighted fair-pull virtual times per class, indexed by
+    /// [`WorkClass::rank`]. A class's credit for one pull is its virtual time
+    /// minus the winner's virtual time and is at most [`FAIRNESS_QUANTUM`], so
+    /// this state cannot grow without bound. It is in-memory scheduler state,
+    /// not canonical work state: a restore starts it from zero.
+    fair_virtual_time: [u64; 9],
     events: Vec<CoordinatorEvent>,
 }
 
@@ -460,6 +872,9 @@ impl AgentCoordinator {
             descendant_closures: BTreeMap::new(),
             peer_messages: BTreeMap::new(),
             peer_message_payloads: BTreeMap::new(),
+            enqueue_sequence: BTreeMap::new(),
+            next_enqueue_sequence: 0,
+            fair_virtual_time: [0; 9],
             events: Vec::new(),
         })
     }
@@ -577,6 +992,13 @@ impl AgentCoordinator {
             lane.budget
                 .is_within(&work.budget)
                 .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            lane.budget
+                .is_within(&request.recipe.budget)
+                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            // A role may not admit effect kinds or external-effect counts
+            // excluded by its manifest. Scope containment remains unresolved
+            // until owner-validated manifest evidence is available.
+            validate_effect_ceiling(&work.effect_ceiling, &role.allowed_effects)?;
             if !role
                 .required_competence
                 .iter()
@@ -871,6 +1293,13 @@ impl AgentCoordinator {
                 self.writer_holders
                     .insert(scope.clone(), record.attempt_id.clone());
             }
+            // Issue #1683 W2: the canonical enqueue ordinal is assigned in the
+            // same block that inserts the record, over the receipt's normalized
+            // lane order, so replay through `admit` re-derives the identical
+            // age for every attempt.
+            self.enqueue_sequence
+                .insert(record.attempt_id.clone(), self.next_enqueue_sequence);
+            self.next_enqueue_sequence = self.next_enqueue_sequence.saturating_add(1);
             self.attempts.insert(record.attempt_id.clone(), record);
         }
         self.admissions.insert(
@@ -885,32 +1314,191 @@ impl AgentCoordinator {
         Ok(receipt)
     }
 
-    pub fn next_ready(&self) -> Option<AttemptRecord> {
-        let mut ready = self
-            .attempts
-            .values()
-            .filter(|attempt| attempt.state == CoordinatedAttemptState::Admitted)
-            .cloned()
-            .collect::<Vec<_>>();
-        // I14.1 work class (issue #1698) routes/selects before priority:
-        // protected control first, then normal classes in document order.
-        // Every queued `AttemptRecord.work_class` is the closed `WorkClass`
-        // boundary type, so only validated values can be observed here:
-        // `admit` copies the class from the validated candidate lane, the
-        // retry path (`reassign`) copies it from the stored record, and
-        // restore replays `plan`/`admit` through the same `Deserialize`
-        // ingress. There is no invalid arm because invalid is
-        // unrepresentable.
-        ready.sort_by(|left, right| {
-            left.work_class
-                .rank()
-                .cmp(&right.work_class.rank())
-                .then_with(|| right.priority.cmp(&left.priority))
-                .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
-                .then_with(|| left.role_id.cmp(&right.role_id))
-                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
-        });
-        ready.into_iter().next()
+    /// Profile-free peek at the next admissible item (issue #1683 W2).
+    ///
+    /// This is the coordinator's existing selection entry point and it calls
+    /// the same bounded fair-pull selector as [`Self::pull_next`], with no
+    /// [`SchedulingProfile`]: every class then carries equal weight and **no
+    /// per-class item, byte, concurrency, deadline or WIP limit is applied** —
+    /// the ceilings it publishes are `None`, not unlimited ones. Only the
+    /// canonical enqueue age order inside a class and the cross-class rank
+    /// tie-break on an exact virtual-time tie apply. The call is a read: it
+    /// consumes no fairness credit, so two peeks over unchanged state return the
+    /// same item and a peek never changes what a later pull selects.
+    ///
+    /// The coordinator's global limits are **not** applied here. `max_ready_items`,
+    /// `max_admitted_attempts` and `max_active_per_route` are admission-time
+    /// limits, enforced in `plan`, `admit` and `reassign`; selection reads none of
+    /// them. A returned item may therefore already sit on a route that is at
+    /// `max_active_per_route`, and a class may hold more admitted items than a
+    /// single plan's `max_ready_items` would suggest.
+    ///
+    /// Known limitation, stated here so a reader of the code does not need the
+    /// delivery report: the per-class partition is reachable only through the
+    /// profile-bound path [`Self::pull_next`], and `pull_next` has **no in-tree
+    /// caller** — the composition root that could supply a `SchedulingProfile` is
+    /// out of this crate's grant. So on every path that runs today, selection
+    /// applies the age order and the class-rank order but no per-class limit, and
+    /// `profile_revision` in the published outcome is `None`. A reader must not
+    /// conclude from this method that saturated low-priority work is prevented
+    /// from consuming another class's partition: nothing on this path does that.
+    pub fn next_ready(&mut self) -> Option<AttemptRecord> {
+        let selected = self.select_ready(None, false).selected_attempt_id?;
+        self.attempts.get(&selected).cloned()
+    }
+
+    /// Profile-bound fair pull (issue #1683 W2/W7).
+    ///
+    /// One deterministic pull: bounded weighted round robin over the classes
+    /// that currently admit work, and inside a class the oldest canonical
+    /// enqueue ordinal first. That ordinal is unique per attempt, so the
+    /// within-class order is total and needs no further tie-break; the ordering
+    /// walk is over a `BTreeMap` and the sort is stable, so the result is
+    /// deterministic and independent of hash iteration order. Per-class limits
+    /// come from `profile` and are counted per class only — the item ceiling
+    /// bounds the class scan, and the byte, concurrency, deadline and WIP
+    /// ceilings gate the head — so a saturated class cannot consume another
+    /// class's partition. The coordinator's global limits are admission-time
+    /// only and are not re-checked here; see the note on [`Self::next_ready`].
+    ///
+    /// Service bounds, each stated for what this code does (see
+    /// [`choose_fair_head`] for the derivation):
+    ///
+    /// - **round share**: over any complete round of `W = sum(weight)` pulls,
+    ///   class `i` is selected exactly `weight_i` times, so `weight / W` is the
+    ///   share it receives in a round. In a window shorter than a round the
+    ///   observed share deviates from it by at most one round; it is not a
+    ///   per-pull guarantee.
+    /// - **returning class**: a class that becomes eligible again keeps the
+    ///   virtual time it had, so it is not charged for the pulls it missed. It
+    ///   wins again as soon as its frozen time is the lowest among the eligible
+    ///   classes. That is **not** necessarily the very next pull: if it was
+    ///   closed with a virtual time above the current minimum, the classes that
+    ///   ran meanwhile are still below it. Each of them advances by exactly
+    ///   [`FAIRNESS_QUANTUM`] per round of their own service, so the wait is
+    ///   finite and is a whole number of those rounds.
+    /// - **bounded scan**: the per-class scan is bounded by the class item
+    ///   ceiling and walks the items in ascending canonical enqueue ordinal, so
+    ///   a truncated window can only leave later items unserved, never displace
+    ///   an older one.
+    /// - **bounded credit**: each class's credit for a pull — its virtual time
+    ///   minus the winner's — lies in `0..=[FAIRNESS_QUANTUM]`, and the bound is
+    ///   tight. The scheduler's *stored* virtual times are not bounded in value:
+    ///   each pull advances one of them by a stride, so they grow until they
+    ///   saturate (after roughly `u64::MAX / FAIRNESS_QUANTUM` pulls) and the
+    ///   rotation then degrades to index tie-breaks.
+    /// - **no promise for permanently out-of-profile work**: an item whose own
+    ///   `wall_time_ms` budget exceeds the class deadline ceiling is reported as
+    ///   infeasible and gets no service promise from this selector. Disposing of
+    ///   it is the admission owner's decision.
+    ///
+    /// Known limitation, not papered over: the scan window always starts at the
+    /// oldest admitted item of its class. If every item inside the window is
+    /// permanently out of profile — the deadline-ceiling case above — then the
+    /// class reports `AllReadyItemsSkipped`, publishes no capacity deferral
+    /// (a deadline mismatch is not a capacity dimension), and the window never
+    /// advances, so both the blocked items and everything queued behind them in
+    /// that class make no progress on any pull. Nothing in this selector breaks
+    /// that: the disposition belongs to admission, which must refuse or stage an
+    /// item whose budget exceeds the class deadline ceiling, and `plan`/`admit`
+    /// take no profile today. The condition is reachable by profile choice
+    /// alone: any class whose `deadline_ms` is below the `wall_time_ms` budget of
+    /// its first `max_items` admitted items.
+    ///
+    /// The pull selects; it does not start anything. A caller that receives a
+    /// `selected_attempt_id` starts that attempt through the existing
+    /// [`Self::start_attempt`], which remains the only state transition.
+    ///
+    /// This entry point has no in-tree caller yet: the composition root that
+    /// would compile and supply a `SchedulingProfile` is outside this crate, so
+    /// the per-class partition it enforces is currently unexercised in
+    /// production. See the limitation note on [`Self::next_ready`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's own validation failure when it is not a valid
+    /// versioned nine-class set; the pull is then refused whole rather than
+    /// silently run without per-class partitions.
+    pub fn pull_next(
+        &mut self,
+        profile: &SchedulingProfile,
+    ) -> Result<ReadySelectionOutcome, CoordinatorError> {
+        profile.validate()?;
+        Ok(self.select_ready(Some(profile), true))
+    }
+
+    /// The bounded deterministic selector behind [`Self::next_ready`] and
+    /// [`Self::pull_next`].
+    ///
+    /// `profile` is `None` only on the profile-free peek, where no per-class
+    /// limit exists. When it is `Some`, the caller has already run
+    /// [`SchedulingProfile::validate`], so exactly one profile per class
+    /// resolves and the ceilings below are always the profile's own values.
+    ///
+    /// Within a class the order is the canonical enqueue ordinal, which is
+    /// unique per attempt; across classes it is [`choose_fair_head`]. Nothing
+    /// here re-checks one-writer exclusion, which its owning transition already
+    /// enforces — see [`item_block`].
+    fn select_ready(
+        &mut self,
+        profile: Option<&SchedulingProfile>,
+        consume_credit: bool,
+    ) -> ReadySelectionOutcome {
+        let resolve = |work_class: WorkClass| profile.and_then(|set| set.class_profile(work_class));
+        let class_context = |work_class: WorkClass| {
+            profile.and_then(|set| {
+                set.class_profile(work_class)
+                    .map(|class_profile| ClassContext {
+                        profile: class_profile,
+                        revision: set.profile_revision.as_str(),
+                    })
+            })
+        };
+        let mut views = class_views(&self.attempts, &self.enqueue_sequence);
+        for (index, work_class) in WorkClass::ALL.into_iter().enumerate() {
+            offer_class_head(&mut views[index], work_class, class_context(work_class));
+        }
+        let (selected, advanced, credits) =
+            choose_fair_head(&views, &self.fair_virtual_time, &resolve);
+        if consume_credit {
+            self.fair_virtual_time = advanced;
+        }
+        let classes = WorkClass::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, work_class)| {
+                class_report(
+                    work_class,
+                    &views[index],
+                    resolve(work_class),
+                    credits[index],
+                )
+            })
+            .collect();
+        let claims = deliverable_claims(&self.attempts, &self.writer_holders);
+        let oldest_ready_enqueue_sequence = views
+            .iter()
+            .filter_map(ClassPullView::oldest_ready_sequence)
+            .min();
+        let selected_enqueue_sequence =
+            selected.and_then(|attempt| self.enqueue_sequence.get(&attempt.attempt_id).copied());
+        let selected_attempt_id = selected.map(|attempt| attempt.attempt_id.clone());
+        let selected_work_class = selected.map(|attempt| attempt.work_class);
+        let deferrals = views.into_iter().filter_map(|view| view.deferral).collect();
+
+        ReadySelectionOutcome {
+            algorithm: FAIR_PULL_ALGORITHM,
+            profile_revision: profile.map(|set| set.profile_revision.clone()),
+            capacity_identity: self.config.capacity_identity.clone(),
+            capacity_revision: self.config.capacity_revision.clone(),
+            selected_attempt_id,
+            selected_work_class,
+            selected_enqueue_sequence,
+            oldest_ready_enqueue_sequence,
+            classes,
+            deliverable_claims: claims,
+            deferrals,
+        }
     }
 
     pub fn attempt(&self, attempt_id: &AttemptId) -> Option<&AttemptRecord> {
@@ -1408,6 +1996,11 @@ impl AgentCoordinator {
             self.writer_holders
                 .insert(scope.clone(), new_record.attempt_id.clone());
         }
+        // A reassigned attempt re-enters the ready queue as new work, so it
+        // takes the next canonical enqueue ordinal (issue #1683 W2).
+        self.enqueue_sequence
+            .insert(new_record.attempt_id.clone(), self.next_enqueue_sequence);
+        self.next_enqueue_sequence = self.next_enqueue_sequence.saturating_add(1);
         self.attempts
             .get_mut(&old.attempt_id)
             .ok_or(CoordinatorError::UnknownAttempt)?
@@ -2577,6 +3170,11 @@ impl AgentCoordinator {
 fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError> {
     validate_text(request.recipe.recipe_id.as_str(), "recipe_id")?;
     validate_text(request.recipe.manifest_revision.as_str(), "recipe_revision")?;
+    request
+        .recipe
+        .schema_identity
+        .validate()
+        .map_err(provider_contract)?;
     validate_text(
         request.recipe.route_policy_revision.as_str(),
         "route_policy_revision",
@@ -2584,17 +3182,45 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
     if request.recipe.max_lanes == 0 || request.recipe.role_profiles.is_empty() {
         return Err(CoordinatorError::InvalidField("recipe"));
     }
-    if request.recipe.max_descendants > request.launch.cumulative_descendant_budget.max_descendants
+    request
+        .recipe
+        .budget
+        .validate()
+        .map_err(provider_contract)?;
+    request
+        .recipe
+        .budget
+        .is_within(&request.launch.cumulative_descendant_budget)
+        .map_err(|_| CoordinatorError::BudgetExceeded)?;
+    if request.recipe.max_descendants > request.recipe.budget.max_descendants
+        || request.recipe.max_descendants
+            > request.launch.cumulative_descendant_budget.max_descendants
     {
         return Err(CoordinatorError::BudgetExceeded);
     }
+
+    validate_recipe_references(&request.recipe)?;
+
     let mut roles = BTreeSet::new();
     for role in &request.recipe.role_profiles {
         validate_text(role.role_id.as_str(), "role_id")?;
         validate_text(role.manifest_revision.as_str(), "role_revision")?;
+        role.schema_identity.validate().map_err(provider_contract)?;
+        role.allowed_effects.validate().map_err(provider_contract)?;
         if role.required_competence.is_empty() || role.allowed_route_classes.is_empty() {
             return Err(CoordinatorError::InvalidField("role_profile"));
         }
+        validate_manifest_references(
+            &role.allowed_operations,
+            "role_profile.allowed_operations",
+            false,
+        )?;
+        validate_manifest_reference(&role.independence_requirement)?;
+        validate_manifest_references(&role.input_schemas, "role_profile.input_schemas", false)?;
+        validate_manifest_references(&role.output_schemas, "role_profile.output_schemas", false)?;
+        validate_manifest_reference(&role.visibility_policy)?;
+        validate_manifest_reference(&role.stop_condition)?;
+        validate_manifest_reference(&role.escalation_policy)?;
         for value in role
             .required_competence
             .iter()
@@ -2605,6 +3231,72 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
         if !roles.insert(role.role_id.clone()) {
             return Err(CoordinatorError::DuplicateIdentity("role_id"));
         }
+    }
+    Ok(())
+}
+
+fn validate_recipe_references(recipe: &crate::RecipeManifest) -> Result<(), CoordinatorError> {
+    validate_manifest_references(&recipe.stage_templates, "recipe.stage_templates", true)?;
+    validate_manifest_references(
+        &recipe.work_item_templates,
+        "recipe.work_item_templates",
+        true,
+    )?;
+    validate_manifest_references(
+        &recipe.dependency_templates,
+        "recipe.dependency_templates",
+        false,
+    )?;
+    validate_manifest_references(&recipe.merge_templates, "recipe.merge_templates", false)?;
+    validate_manifest_references(
+        &recipe.expansion_conditions,
+        "recipe.expansion_conditions",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.contraction_conditions,
+        "recipe.contraction_conditions",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.verifier_requirements,
+        "recipe.verifier_requirements",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.audit_requirements,
+        "recipe.audit_requirements",
+        false,
+    )?;
+    validate_manifest_reference(&recipe.partial_result_behavior)?;
+    validate_manifest_reference(&recipe.failure_behavior)?;
+    if recipe.eligible_route_classes.is_empty() {
+        return Err(CoordinatorError::InvalidField(
+            "recipe.eligible_route_classes",
+        ));
+    }
+    for route_class in &recipe.eligible_route_classes {
+        validate_text(route_class, "recipe.eligible_route_class")?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_reference(
+    reference: &eliot_agent_contracts::PublicReference,
+) -> Result<(), CoordinatorError> {
+    reference.validate().map_err(provider_contract)
+}
+
+fn validate_manifest_references(
+    references: &[eliot_agent_contracts::PublicReference],
+    field: &'static str,
+    required: bool,
+) -> Result<(), CoordinatorError> {
+    if required && references.is_empty() {
+        return Err(CoordinatorError::InvalidField(field));
+    }
+    for reference in references {
+        validate_manifest_reference(reference)?;
     }
     Ok(())
 }
@@ -2679,7 +3371,8 @@ fn select_route(
             Some(REJECT_CAPACITY_MISMATCH)
         } else if candidate.capacity_limit == 0 {
             Some(REJECT_NO_CAPACITY)
-        } else if !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
+        } else if !route_class_allowed(&request.recipe.eligible_route_classes, &candidate.route)
+            || !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
             || !route_class_allowed(&role.allowed_route_classes, &candidate.route)
         {
             Some(REJECT_ROUTE_CLASS)
@@ -2781,7 +3474,7 @@ fn select_route(
 /// is an owner-defined property, not necessarily the provider name. The model
 /// display name never satisfies a class constraint on its own: model-name
 /// inference is forbidden, so a class naming only a model stays ineligible.
-/// Both the launch and the role allowlists must admit the candidate.
+/// The recipe, launch, and role allowlists must all admit the candidate.
 fn route_class_allowed(
     allowed_route_classes: &[String],
     route: &eliot_agent_api::RouteFingerprint,

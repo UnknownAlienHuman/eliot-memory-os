@@ -12,9 +12,13 @@
 
 use std::sync::Arc;
 
-use eliot_contracts::{AuthorityEpoch, StateFence};
+use eliot_contracts::StateFence;
 use eliot_ipc::ServerHandshakePolicy;
-use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
+use eliot_kernel_core::{
+    CompatibilityMismatch, CutoverDecision, DurableCompatibilityState, GenerationRoute,
+    GenerationRouter, RouteScope, StateMigrationClass, VersionRange, admit_rollback,
+    restore_recorded_evidence,
+};
 use eliot_kernel_service::KernelService;
 use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
 use eliot_runtime_contracts::{
@@ -159,12 +163,89 @@ pub(crate) struct OrsGenerationCoordinator {
     pub(crate) cutover_routes: CutoverRouteTable,
 }
 
+/// The current durable compatibility state the Kernel is running under, used
+/// to gate every restored route as a rollback (I1.12, issue #1890 W4).
+///
+/// Built from the SAME live values the runtime handshake binds
+/// (`frame_dispatch::runtime_compatibility_evidence`), so the rollback gate and
+/// the activation handshake are compared against one durable state rather than
+/// two independently derived projections. It is derived from the running
+/// binary's own protocol/format/contract/architecture identity and the service's
+/// current authority epoch; nothing is invented and no evidence is carried over
+/// from a previous process.
+fn current_durable_compatibility_state(
+    service: &KernelService,
+) -> Result<DurableCompatibilityState, String> {
+    let protocol_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
+    let canonical_format_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
+    let contract_set_digest =
+        super::frame_dispatch::runtime_contract_set_digest().map_err(|error| error.to_string())?;
+    DurableCompatibilityState::new(
+        protocol_range,
+        contract_set_digest,
+        canonical_format_range,
+        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+        service.authority_epoch(),
+        vec![super::frame_dispatch::RUNTIME_HEALTH_CAPABILITY.to_owned()],
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|error| error.to_string())
+}
+
 impl OrsGenerationCoordinator {
     pub(crate) fn new(ors: Arc<RedbRecoveryStore>) -> Self {
         Self {
             ors,
             cutover_routes: CutoverRouteTable::new(),
         }
+    }
+
+    /// Re-verifies one retained generation's recorded I1.12 evidence against the
+    /// CURRENT durable compatibility state before that generation may be used as
+    /// a rollback target (I1.12, issue #1890 W4/A2).
+    ///
+    /// This is the production caller of [`admit_rollback`]. "Last known good"
+    /// means verified compatible with current durable formats and Authority
+    /// Epoch lineage, not "it launched once": the verdict persisted with the
+    /// candidate generation is re-read from ORS, projected back into the
+    /// handshake evidence shape, and compared against the durable state the
+    /// Kernel is running under right now.
+    ///
+    /// A previously launched artifact is therefore refused as a rollback target
+    /// after a format, contract, architecture, seal, migration-class or
+    /// epoch-lineage change, even though its own recorded verdict was admitted
+    /// when it first ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`CompatibilityMismatch`] produced by
+    /// [`admit_rollback`], or one naming an absent/unreadable record, so the
+    /// caller retains the field label and reason as the structured cause.
+    pub(crate) fn admit_generation_rollback(
+        &self,
+        module_id: &str,
+        generation: u64,
+        durable: &DurableCompatibilityState,
+    ) -> Result<(), CompatibilityMismatch> {
+        let recorded = self
+            .ors
+            .load_versioned_artifact_registry(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                CompatibilityMismatch::new(
+                    eliot_kernel_core::MismatchField::EnvelopeVersion,
+                    format!("generation registry is unreadable: {error}"),
+                )
+            })?
+            .compatibility(module_id, generation)
+            .cloned()
+            .ok_or_else(|| {
+                CompatibilityMismatch::new(
+                    eliot_kernel_core::MismatchField::EnvelopeVersion,
+                    "no recorded compatibility verdict exists for this generation",
+                )
+            })?;
+        let evidence = restore_recorded_evidence(&recorded)?;
+        admit_rollback(&evidence, durable)
     }
 
     /// Restores the committed I14.14 ownership projection before the Kernel
@@ -239,49 +320,70 @@ impl OrsGenerationCoordinator {
             observe_recovery("kernel.recovery.load_empty", "empty");
             return Ok(());
         }
-        let epoch_value = snapshots
+        // Current bindings are rebuilt from verified records, and the current
+        // tuple is the complete `(lineage_id, sequence)` of the most recently
+        // committed cutover in durable ORS order. A bare `max()` over sequences
+        // is undefined as soon as more than one lineage exists, and re-deriving
+        // that number on the service's own lineage would silently attach
+        // today's lineage to a record that never carried one. A row written
+        // before the typed migration no longer decodes, so it cannot reach here
+        // at all: a historical valid tuple never reactivates current authority.
+        let current = snapshots
             .iter()
-            .map(|snapshot| snapshot.record().new_epoch.value())
-            .max()
+            .max_by_key(|snapshot| snapshot.operation_order())
+            .map(|snapshot| snapshot.record().new_epoch.clone())
             .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
         for snapshot in &snapshots {
-            let record = snapshot.record();
-            if record.state != GenerationCutoverState::Committed
-                || record.new_epoch.value() > epoch_value
-            {
+            if snapshot.record().state != GenerationCutoverState::Committed {
                 return Err("ORS route projection has invalid committed epochs".to_owned());
             }
         }
         observe_recovery("kernel.recovery.cutovers_validated", "success");
-        // Lineage-aware bridge (Implements #64): the durable ORS cutover record
-        // carries only the sequence, so it can never prove a lineage. The
-        // canonical service epoch keeps its own lineage and advances to the
-        // maximal committed sequence; `synchronize` fails closed on a lineage
-        // mismatch or a regression, and the rebuilt route table is then bound
-        // to that exact tuple rather than to a bare counter.
-        let current_lineage = service.authority_epoch().lineage_id.clone();
-        let canonical = eliot_contracts::EpochId::new(
-            current_lineage,
-            std::num::NonZeroU64::new(epoch_value)
-                .ok_or_else(|| "committed cutover epoch must be non-zero".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
+        // The service keeps its own Host-approved lineage and refuses a
+        // cross-lineage or regressing target, so a record from a superseded
+        // lineage fails closed here instead of being adopted.
         service
-            .synchronize_authority_epoch(canonical)
+            .synchronize_authority_epoch(current)
             .map_err(|error| error.to_string())?;
         let active_epoch = service.authority_epoch();
         let mut recovered = GenerationRouter::at_epoch(active_epoch.clone());
+        // I1.12 (issue #1890 W4/A2): a restart rebuilds the route table from the
+        // committed cutover records, which is the one place a retained
+        // generation is re-selected as a live route after it previously ran.
+        // That re-selection is a rollback, so it is gated here: each restored
+        // route's recorded I1.12 evidence must still validate against the
+        // durable compatibility state the Kernel is running under NOW. A
+        // generation that was admitted once is not thereby a valid rollback
+        // target after a format, contract, architecture, seal, migration-class
+        // or epoch-lineage change.
+        let durable = current_durable_compatibility_state(service)?;
         for snapshot in &snapshots {
             let record = snapshot.record();
-            // A committed record at any other sequence belongs to a superseded
-            // position in the epoch history. Adopting it here would replay a
-            // bare scalar into the current lineage, so it stays historical and
+            // A committed record for any other tuple — a pre-restore tuple, a
+            // superseded sequence, or a tuple from a lineage that is no longer
+            // active — belongs to epoch history only. Adopting it would replay
+            // history into the current binding, so it stays historical and
             // never becomes the active route.
             if record.state != GenerationCutoverState::Committed
-                || record.new_epoch.value() != active_epoch.sequence.get()
+                || !record.new_epoch.is_same_authority(&active_epoch)
             {
                 continue;
             }
+            // The cutover record names its generation as the typed
+            // `ResourceGeneration`; the ORS versioned-artifact registry keys
+            // the recorded verdict by the same generation value, so the
+            // rollback lookup uses that value rather than a re-derived one.
+            let generation = record.new_generation.value();
+            self.admit_generation_rollback(&record.route_scope, generation, &durable)
+                .map_err(|mismatch| {
+                    format!(
+                        "restored route {} generation {} is not a valid rollback target: {} ({})",
+                        record.route_scope,
+                        generation,
+                        mismatch.field(),
+                        mismatch.reason()
+                    )
+                })?;
             let scope =
                 RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
             let route = GenerationRoute::new(scope, record.new_generation, active_epoch.clone())
@@ -334,12 +436,13 @@ impl OrsGenerationCoordinator {
             route_scope: decision.route_scope().as_str().to_owned(),
             old_generation: decision.old_generation(),
             new_generation: decision.new_generation(),
-            // The durable ORS record is still a scalar contour (W3 residual,
-            // #64): only the sequence is projected into it, and no
-            // authorization decision reads it back. The lineage-bearing
-            // decision stays in `decision` and in the live route table.
-            old_epoch: durable_epoch_projection(decision.old_epoch())?,
-            new_epoch: durable_epoch_projection(decision.new_epoch())?,
+            // The durable ORS record carries the complete typed tuples, so a
+            // reader can no longer lose the lineage. Nothing here narrows an
+            // `EpochId` to a sequence: the record written here is the same
+            // tuple the router advanced on, and every authorization decision
+            // still reads the live route table.
+            old_epoch: decision.old_epoch().clone(),
+            new_epoch: decision.new_epoch().clone(),
             state: GenerationCutoverState::Armed,
         };
         self.ors
@@ -369,20 +472,6 @@ impl OrsGenerationCoordinator {
         observations.cutover_applied = true;
         Ok(())
     }
-}
-
-/// Projects one lineage-aware epoch into the still-scalar durable ORS cutover
-/// record.
-///
-/// This is the only place a canonical epoch is narrowed to a bare counter, and
-/// it exists because [`RuntimeGenerationCutoverRecord`] is a durable contract
-/// that a versioned compatibility decoder (issue #64 W3) has not migrated yet.
-/// The projection is write-only: every read and every authorization decision
-/// in this file uses the complete [`eliot_contracts::EpochId`] tuple, so a
-/// sequence-only record can never decide lineage.
-fn durable_epoch_projection(epoch: &eliot_contracts::EpochId) -> Result<AuthorityEpoch, String> {
-    AuthorityEpoch::new(epoch.sequence.get())
-        .map_err(|error| format!("epoch projection is not representable: {error}"))
 }
 
 /// Older ORS databases predate the optional I14.14 ownership table. An absent
@@ -474,6 +563,7 @@ mod generation_recovery_diagnostics_tests {
 
     use super::*;
     use crate::{KernelComposition, KernelConfig, unix_ms};
+    use eliot_contracts::AuthorityEpoch;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 

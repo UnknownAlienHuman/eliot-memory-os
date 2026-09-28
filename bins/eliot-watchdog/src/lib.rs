@@ -57,10 +57,12 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod audit_anchor_sink;
 mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
 mod host_identity_observation;
+mod observation_coverage;
 mod runtime_manifest_selection;
 mod scm_launch;
 mod self_admission;
@@ -143,6 +145,10 @@ pub(crate) use service_registration_projection::{
     read_approved_service_registration, validate_bound_service_registrations,
 };
 
+pub use audit_anchor_sink::{
+    AnchorRejection, AnchorSinkObservation, AuditAnchorSinkError, VerifiedAuditAnchorHead,
+    WatchdogAuditAnchorSink, watchdog_anchor_dir,
+};
 pub use backup_control::{
     AcceptedWatchdogBackupMethod, BackupControlError, BackupControlHandle, WatchdogBackupOutcome,
     WatchdogBackupRequest, accepted_watchdog_backup_methods, register_backup_control,
@@ -1293,11 +1299,19 @@ fn owner_backup_port(
     installation_id: &str,
     watchdog_generation: u64,
 ) -> Result<Arc<WatchdogBackupPort>, SpoolError> {
+    // I8.2 (#1755 W1/W5): the per-interval coverage cell is created once here,
+    // beside the owner-bound port, and shared with the composition that
+    // publishes into it. One cell per owner means a capture and a readiness
+    // projection can never disagree about what this owner observed.
+    let coverage = Arc::new(observation_coverage::IntervalCoverageCell::new(
+        current_unix_ms().unwrap_or(0),
+    ));
     Ok(Arc::new(WatchdogBackupPort::new(
         Arc::clone(spool),
         installation_id.to_owned(),
         watchdog_generation,
         WatchdogSpoolBackupLimits::default(),
+        coverage,
     )?))
 }
 

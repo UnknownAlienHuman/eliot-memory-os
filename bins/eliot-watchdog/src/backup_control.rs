@@ -34,6 +34,23 @@
 //! dispatched request is a finite, bounded owner read or a bounded owner write
 //! and runs outside the heartbeat tick.
 //!
+//! Production lifecycle: the Watchdog's own startup path registers, starts, and
+//! stops this port. Registration binds the composition's real owner spool and
+//! proves that owner resource is live by reading its own durable high-water
+//! sequence; start re-reads it as a second, independent observation; stop
+//! releases the bounded registration slot. A refusal at either step is bounded
+//! to this one capability: it is typed, it happens on a path where readiness is
+//! already published, and the process creates no listener, task, slot, or
+//! authority on either side of it.
+//!
+//! What that lifecycle does NOT establish, stated plainly so the claims are
+//! never read wider than the code: this process still opens no backup listener
+//! and spawns no backup task, because a new pipe family and its transport belong
+//! to the Kernel/Host side of #962 rather than to this Watchdog port. Nothing
+//! here accepts a connection, so nothing here can serve a requester; the
+//! registration is the owner-side admission of a method table over a proven
+//! live owner resource, not a live endpoint.
+//!
 //! Lifecycle scope: the bounded registration table belongs to ONE composition
 //! lifecycle and is opened when that composition starts. Starting supervision
 //! never closes it, only that same composition's own shutdown does, and a
@@ -321,23 +338,119 @@ pub enum WatchdogBackupOutcome {
     Restore(SpoolRestoreDisposition),
 }
 
-/// Bounded failure of one admitted backup request.
+/// Bounded failure of one admitted backup request, or of one backup-control
+/// lifecycle step.
+///
+/// The owner's own typed [`SpoolError`] is carried as a typed source in every
+/// case and is never restated as a configuration string, so a caller can always
+/// tell an unreachable owner spool apart from a policy refusal or from a
+/// composition refusal.
 #[derive(Debug, Error)]
 pub enum BackupControlError {
     /// The request is outside the closed admitted subset, or the handle
     /// cannot currently dispatch.
     #[error("watchdog backup control rejects the request: {0}")]
     Rejected(String),
-    /// The owner refused the request; the owner's own bounded reason travels
-    /// verbatim and is never restated as success.
+    /// The owner refused the request, or the owner-bound resource behind a
+    /// registration or start step could not be read; the owner's own bounded
+    /// reason travels verbatim and is never restated as success.
     #[error("watchdog spool owner refused the backup request: {0}")]
     OwnerRefused(#[source] SpoolError),
+    /// A registration or start step was refused by the composition itself: an
+    /// unrecognized composition identity, no owner-bound spool port, a bounded
+    /// registration table that is exhausted or already closed, or a lifecycle
+    /// state that does not admit this step.
+    #[error("watchdog backup control lifecycle is refused: {0}")]
+    Composition(#[source] CompositionError),
+}
+
+/// Lifecycle state of one registered backup-control handle.
+///
+/// Closed over the whole lifecycle so no combination of independent booleans can
+/// describe a state the code does not implement. Every variant is reachable and
+/// every variant is read: `Registered` is what [`register_backup_control`]
+/// returns, `Started` is what [`start_backup_control`] produces, and `Released`
+/// is what [`stop_backup_control`] leaves behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackupControlState {
+    /// The bounded slot is reserved and the owner resource was proven
+    /// reachable at registration, but dispatch is not admitted yet.
+    Registered,
+    /// Dispatch is admitted against the same owner binding.
+    Started,
+    /// The bounded slot has been released; this handle can no longer dispatch
+    /// and can no longer be started.
+    Released,
+}
+
+impl BackupControlState {
+    /// Returns whether this state admits dispatch.
+    const fn admits_dispatch(self) -> bool {
+        matches!(self, Self::Started)
+    }
+}
+
+/// One real, owner-bound backup-control registration record.
+///
+/// Recorded by [`register_backup_control`] and by [`start_backup_control`] from
+/// the LIVE owner resource the handle is bound to, through
+/// [`WatchdogBackupPort::owner_spool_high_water`]: a real read transaction
+/// against the owner's own `watchdog.redb`, taken through the same owner handle
+/// every heartbeat and gap record is appended through. The recorded sequence is
+/// therefore the owner's own durable value at the moment of registration or
+/// start, and it is a real observation of a real resource — not a constant, not
+/// a placeholder, and not a copy of a value supplied by the caller.
+///
+/// It exists because "a slot number was handed out" is not a registration: it
+/// is the evidence that the resource behind this handle was genuinely reachable
+/// when the handle was admitted. The two observations are deliberately separate
+/// reads, so a start can still be refused when the owner became unreachable
+/// after registration succeeded. It grants no authority, mints no identity, and
+/// is compared against nothing — a self-comparison of immutable fields could
+/// never fail and would prove nothing, so this record is retained and reported
+/// instead of being re-verified against itself.
+///
+/// It carries no copy of the owner installation identity: that value is
+/// immutable on the bound port and is already read live through
+/// [`BackupControlHandle::owner_installation`], so a second copy here would be
+/// written and never read.
+#[derive(Debug)]
+struct BackupOwnerBinding {
+    /// The owner's own durable high-water sequence as observed live.
+    owner_spool_high_water: u64,
+    /// The owner-held watchdog generation this handle is bound to.
+    owner_generation: u64,
+    /// The composition identity admitted at registration.
+    service: &'static str,
+    /// The protocol identity admitted at registration.
+    protocol: &'static str,
+}
+
+impl BackupOwnerBinding {
+    /// Observes the live owner resource this handle would bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the owner-bound spool cannot be read.
+    fn observe(
+        port: &WatchdogBackupPort,
+        service: &'static str,
+        protocol: &'static str,
+    ) -> Result<Self, SpoolError> {
+        Ok(Self {
+            owner_spool_high_water: port.owner_spool_high_water()?,
+            owner_generation: port.watchdog_generation(),
+            service,
+            protocol,
+        })
+    }
 }
 
 /// Bounded registration receipt for Watchdog backup control.
 ///
-/// Carries the bounded registration slot and the owner-bound backup port, so
-/// the accepted methods dispatch to the real owner instead of a receipt alone.
+/// Carries the bounded registration slot, a real [`BackupOwnerBinding`] observed
+/// from the live owner spool, and the owner-bound backup port itself, so the
+/// accepted methods dispatch to the real owner instead of to a receipt alone.
 /// There is intentionally no kill-by-name (no string handle, no PID, no
 /// service-name targeting) and no listener or task identity: this process opens
 /// neither.
@@ -349,7 +462,9 @@ pub enum BackupControlError {
 /// growing an unbounded set.
 pub struct BackupControlHandle {
     slot: u64,
-    active: bool,
+    state: BackupControlState,
+    /// Real owner-bound registration record, observed live.
+    binding: BackupOwnerBinding,
     port: std::sync::Arc<WatchdogBackupPort>,
     /// The registering composition's own bounded table. Kept per handle so a
     /// handle is never evaluated against another lifecycle's slots.
@@ -363,7 +478,13 @@ impl std::fmt::Debug for BackupControlHandle {
         formatter
             .debug_struct("BackupControlHandle")
             .field("registration_slot", &self.slot)
-            .field("active", &self.active)
+            .field("state", &self.state)
+            .field(
+                "owner_spool_high_water",
+                &self.binding.owner_spool_high_water,
+            )
+            .field("service", &self.binding.service)
+            .field("protocol", &self.binding.protocol)
             .finish_non_exhaustive()
     }
 }
@@ -375,10 +496,29 @@ impl BackupControlHandle {
         self.slot
     }
 
-    /// Returns whether the handle is started.
+    /// Returns whether the handle admits dispatch.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active
+        self.state.admits_dispatch()
+    }
+
+    /// Returns the owner's own durable spool sequence, observed live from the
+    /// bound owner resource when this handle was registered and re-observed
+    /// when it was started.
+    ///
+    /// This is a real read of the owner's `watchdog.redb` high-water metadata
+    /// through the same owner handle the supervision path appends through. It
+    /// is reported evidence that the bound resource was reachable at admission,
+    /// and it is not an authority, fence, or health verdict.
+    #[must_use]
+    pub const fn owner_spool_high_water(&self) -> u64 {
+        self.binding.owner_spool_high_water
+    }
+
+    /// Returns the owner-held watchdog generation observed at registration.
+    #[must_use]
+    pub const fn owner_generation(&self) -> u64 {
+        self.binding.owner_generation
     }
 
     /// Returns the owner-held installation identity this handle is bound to.
@@ -415,9 +555,10 @@ impl BackupControlHandle {
         method: &AcceptedWatchdogBackupMethod,
         request: &WatchdogBackupRequest<'_>,
     ) -> Result<WatchdogBackupOutcome, BackupControlError> {
-        if !self.active {
+        if !self.state.admits_dispatch() {
             return Err(BackupControlError::Rejected(
-                "watchdog backup control cannot dispatch before it is started".to_owned(),
+                "watchdog backup control cannot dispatch before it is started, or after it is released"
+                    .to_owned(),
             ));
         }
         if !self.registration.is_registered(self.slot) {
@@ -509,11 +650,18 @@ const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static
 /// Validates the composition readiness identity (`SERVICE_NAME` /
 /// `PROTOCOL_VERSION`), takes the owner-bound backup port from the
 /// composition's own kernel port — the same owner that appends every heartbeat
-/// and gap record, so no second database handle is opened — and reserves one
-/// bounded slot in the registering composition's own
+/// and gap record, so no second database handle is opened — proves that bound
+/// owner resource is live by reading its own durable high-water sequence, and
+/// reserves one bounded slot in the registering composition's own
 /// [`BackupControlRegistration`] table. A composition whose kernel port owns no
 /// spool admits no backup control: there is exactly one construction path and
 /// no substitute.
+///
+/// The owner proof runs BEFORE the reservation, so a refusal here consumes no
+/// bounded slot. The returned handle is therefore not a bare slot number: it
+/// carries the real owner-bound registration record observed from the live owner
+/// spool together with the owner port itself, and it is refused rather than
+/// returned when that resource is not readable.
 ///
 /// The reservation is refused only by that composition's own table: its
 /// bounded bound, or a genuine close of that same lifecycle. Neither starting
@@ -521,33 +669,44 @@ const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static
 /// is available for the whole supervised lifetime.
 ///
 /// No listener is opened, no task is spawned, and no authority is minted; the
-/// owning [`crate::KernelWatchdogPort`] implementation keeps all effects.
+/// owning [`crate::KernelWatchdogPort`] implementation keeps all effects. The
+/// handle is registered-but-not-yet-started; [`start_backup_control`] admits
+/// dispatch.
 ///
 /// # Errors
 ///
-/// Returns [`CompositionError`] when the composition identity is unexpected,
-/// when the composition exposes no owner-bound spool port, or when that
-/// composition's bounded registration table is exhausted or already closed.
+/// Returns [`BackupControlError::Composition`] when the composition identity is
+/// unexpected, when the composition exposes no owner-bound spool port, or when
+/// that composition's bounded registration table is exhausted or already
+/// closed. Returns [`BackupControlError::OwnerRefused`] with the owner's own
+/// typed reason when the bound owner spool cannot be read.
 pub fn register_backup_control(
     composition: &WatchdogComposition,
-) -> Result<BackupControlHandle, CompositionError> {
+) -> Result<BackupControlHandle, BackupControlError> {
     let readiness = composition.readiness();
     if readiness.service != SERVICE_NAME || readiness.protocol != PROTOCOL_VERSION {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control refuses an unrecognized composition identity".to_owned(),
+        return Err(BackupControlError::Composition(
+            CompositionError::InvalidConfiguration(
+                "watchdog backup control refuses an unrecognized composition identity".to_owned(),
+            ),
         ));
     }
     let port = composition.owner_backup_port().ok_or_else(|| {
-        CompositionError::InvalidConfiguration(
+        BackupControlError::Composition(CompositionError::InvalidConfiguration(
             "watchdog backup control refuses registration without an owner-held spool port"
                 .to_owned(),
-        )
+        ))
     })?;
+    let binding = BackupOwnerBinding::observe(&port, SERVICE_NAME, PROTOCOL_VERSION)
+        .map_err(BackupControlError::OwnerRefused)?;
     let registration = composition.backup_control_registration();
-    let slot = registration.reserve()?;
+    let slot = registration
+        .reserve()
+        .map_err(BackupControlError::Composition)?;
     Ok(BackupControlHandle {
         slot,
-        active: false,
+        state: BackupControlState::Registered,
+        binding,
         port,
         registration,
     })
@@ -555,43 +714,75 @@ pub fn register_backup_control(
 
 /// Starts a registered backup control handle.
 ///
-/// Marks the handle active so the accepted methods can be dispatched. Fails
-/// closed when already active, when the composition has closed backup control,
-/// or when the handle no longer holds a live bounded slot, so a second
-/// registration can never be admitted past the bound.
+/// Re-reads the bound owner resource — a second, independent live read, not a
+/// re-check of the value captured at registration — and admits dispatch only
+/// when that read succeeds. A start can therefore be refused after a successful
+/// registration, when the owner became unreachable in between; the newly
+/// observed sequence replaces the registration one on the handle.
+///
+/// Fails closed when the handle is already started, when the handle was already
+/// released by [`stop_backup_control`], when the composition has closed backup
+/// control, or when the handle no longer holds a live bounded slot, so a second
+/// registration can never be admitted past the bound and a released handle can
+/// never be revived.
 ///
 /// # Errors
 ///
-/// Returns [`CompositionError`] when the handle is already active or its slot
-/// is no longer registered.
-pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), CompositionError> {
-    if handle.active {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control is already started".to_owned(),
-        ));
+/// Returns [`BackupControlError::Composition`] when the handle is already
+/// started, when it was already released, or when its slot is no longer
+/// registered. Returns [`BackupControlError::OwnerRefused`] with the owner's own
+/// typed reason when the bound owner spool cannot be read.
+pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), BackupControlError> {
+    match handle.state {
+        BackupControlState::Started => {
+            return Err(BackupControlError::Composition(
+                CompositionError::InvalidConfiguration(
+                    "watchdog backup control is already started".to_owned(),
+                ),
+            ));
+        }
+        BackupControlState::Released => {
+            return Err(BackupControlError::Composition(
+                CompositionError::InvalidConfiguration(
+                    "watchdog backup control cannot start a released registration".to_owned(),
+                ),
+            ));
+        }
+        BackupControlState::Registered => {}
     }
     if !handle.registration.is_registered(handle.slot) {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control handle does not hold a live bounded registration slot"
-                .to_owned(),
+        return Err(BackupControlError::Composition(
+            CompositionError::InvalidConfiguration(
+                "watchdog backup control handle does not hold a live bounded registration slot"
+                    .to_owned(),
+            ),
         ));
     }
-    handle.active = true;
+    handle.binding = BackupOwnerBinding::observe(
+        &handle.port,
+        handle.binding.service,
+        handle.binding.protocol,
+    )
+    .map_err(BackupControlError::OwnerRefused)?;
+    handle.state = BackupControlState::Started;
     Ok(())
 }
 
 /// Stops backup control with bounded cleanup.
 ///
 /// Consumes the handle, releases its bounded registration slot in the
-/// registering composition's table, and returns the same receipt marked
-/// stopped. The returned receipt is already released and can no longer
-/// dispatch, so a later stop is a no-op rather than a double release. There is
-/// no background work to join because registration never spawned any.
+/// registering composition's table, and returns the same receipt in the
+/// `Released` state. A released handle can no longer dispatch and can no longer
+/// be started, so a later stop is a no-op rather than a double release and a
+/// stopped handle cannot be revived. Releasing an already-released slot is
+/// itself a no-op. There is no background work to join because registration
+/// never spawned any.
 pub fn stop_backup_control(handle: BackupControlHandle) -> BackupControlHandle {
     handle.registration.release(handle.slot);
     BackupControlHandle {
         slot: handle.slot,
-        active: false,
+        state: BackupControlState::Released,
+        binding: handle.binding,
         port: handle.port,
         registration: handle.registration,
     }

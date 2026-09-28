@@ -23,8 +23,18 @@
 //! 1. Legacy rows are frozen: no behavior change, no extension, no new callers.
 //! 2. Delete the legacy rows after the #832 cue-kind battery and the
 //!    `tests/admission_integrity.rs` fixtures migrate to owner-cell suites (or
-//!    a relocated legacy battery) and zero-consumer status is re-verified
-//!    (today: zero product consumers; only the crate's own tests import it).
+//!    a relocated legacy battery) and zero-consumer status is re-verified.
+//!    Measured consumer status at the #1862 owner-boundary rework: the frozen
+//!    `ContextCompiler` rows again have zero product consumers — the
+//!    `bins/eliotd` `eliot.packet` production call to
+//!    `ContextCompiler::compile_with_campaign_learning_state` and its
+//!    `#[allow(deprecated)]` were removed, so no binary reaches a legacy
+//!    compiler and only this crate's own tests import the crate root. The
+//!    crate itself is NOT zero-consumer: `campaign_publication` and its
+//!    publication helpers below are imported by the `bins/eliotd` campaign
+//!    source boundary (`campaign_packet`, `campaign_context_owner`,
+//!    `campaign_task_controller`), so step 3 stays blocked until those
+//!    consumers move to the owner cells.
 //! 3. Delete this crate after every consumer migrates, per issue #40 A4.
 
 use thiserror::Error;
@@ -54,7 +64,7 @@ pub enum FacadeError {
 /// `(item, disposition, owner-or-replacement)`. Legacy rows are frozen
 /// compatibility material with the removal plan from the module docs;
 /// re-export rows resolve by type identity to the current owner.
-pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 48] = [
+pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 62] = [
     ("CONTRACT_NAME", "LegacyFrozen", "frozen wire name"),
     ("CONTRACT_VERSION", "LegacyFrozen", "frozen wire revision"),
     (
@@ -176,6 +186,82 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 48] = [
         "decode_legacy_cue_kind",
         "LegacyFrozen",
         "DEPRECATED; frozen #832 decoder, no owner conversion exists",
+    ),
+    // Campaign source surface added by #1862. It carries the current A-15
+    // `ContextRecipe` and `SessionDeliverySnapshot` around the frozen legacy
+    // `ContextInput`, so it is compatibility material for a boundary the owner
+    // cells still have to own: no new callers, and it is named here so facade
+    // retirement can see its `bins/eliotd` product consumer instead of
+    // inheriting a silent one.
+    (
+        "campaign_publication",
+        "LegacyFrozen",
+        "campaign source publication over frozen ContextInput; owner cells A-15/A-16a/A-17a/A-18",
+    ),
+    (
+        "campaign_publication::CONTEXT_RECIPE_CAMPAIGN_OWNER_ID",
+        "LegacyFrozen",
+        "owner label read by the campaign source boundary; not an admitted owner identity",
+    ),
+    (
+        "campaign_publication::ContextSourceDocument",
+        "LegacyFrozen",
+        "frozen document union; owner is A-15 ContextRecipe/SessionDeliverySnapshot",
+    ),
+    (
+        "campaign_publication::ContextCampaignRecipeBody",
+        "LegacyFrozen",
+        "frozen recipe+compiler-input body; embeds the frozen ContextInput",
+    ),
+    (
+        "campaign_publication::ContextSourcePublication",
+        "LegacyFrozen",
+        "frozen store-neutral publication; owner is the campaign source boundary",
+    ),
+    (
+        "campaign_publication::ContextPublicationError",
+        "LegacyFrozen",
+        "frozen campaign publication refusal vocabulary",
+    ),
+    (
+        "campaign_publication::context_recipe_publication",
+        "LegacyFrozen",
+        "no NEW callers; campaign source re-homing is #40 removal work",
+    ),
+    (
+        "campaign_publication::context_delivery_publication",
+        "LegacyFrozen",
+        "no NEW callers; campaign source re-homing is #40 removal work",
+    ),
+    (
+        "campaign_publication::context_recipe_body_digest",
+        "LegacyFrozen",
+        "donor digest helper; no NEW callers since the #1862 rework",
+    ),
+    (
+        "campaign_publication::context_delivery_body_digest",
+        "LegacyFrozen",
+        "donor digest helper; no NEW callers since the #1862 rework",
+    ),
+    (
+        "CampaignContextCompileError",
+        "LegacyFrozen",
+        "refusal vocabulary of the removed legacy campaign compile edge; no NEW callers",
+    ),
+    (
+        "CampaignLearningStateCompileInput",
+        "LegacyFrozen",
+        "legacy compile DTO; no NEW callers since the #1862 rework",
+    ),
+    (
+        "CampaignCompiledContext",
+        "LegacyFrozen",
+        "legacy compiled view DTO; no NEW callers since the #1862 rework",
+    ),
+    (
+        "CampaignContextRolePolicy",
+        "LegacyFrozen",
+        "frozen semantic-to-compiler role projection; owner is A-15 RoleLossRule",
     ),
     ("AdmissionInput", "ReexportOwner", "eliot-context-contracts"),
     (

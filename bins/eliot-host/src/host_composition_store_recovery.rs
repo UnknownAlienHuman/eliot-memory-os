@@ -1240,6 +1240,16 @@ impl HostComposition {
             &old_proc.image_path,
             &old_job_name,
         )?;
+        // A foreign listener must be observed before terminating the retained
+        // Store child. Its own verified listener is allowed until containment;
+        // relaunch checks again and requires the endpoint to be free.
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        host_job_launch::ensure_store_endpoint_available_or_owned(
+            &launch.canonical_store_arguments,
+            Some(old_proc.process_id),
+        )?;
         self.jobs.store_restart_attempts = self
             .jobs
             .store_restart_attempts

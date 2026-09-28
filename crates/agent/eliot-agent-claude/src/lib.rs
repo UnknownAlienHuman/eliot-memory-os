@@ -34,6 +34,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod bridge_contract;
 pub mod execution;
 
 // ---------------------------------------------------------------------------

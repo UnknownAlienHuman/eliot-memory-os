@@ -11,6 +11,7 @@ mod break_glass;
 mod effects;
 mod grants;
 mod leases;
+mod mechanical_subset;
 mod quarantine_evidence;
 mod revocation_history;
 mod root_transition;
@@ -47,14 +48,20 @@ pub use grants::{
     SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
+pub use mechanical_subset::{
+    ApprovalReference, AuthorityUseSite, CanonicalSourceCommitment,
+    MECHANICAL_SUBSET_DIGEST_DOMAIN, MECHANICAL_SUBSET_SCHEMA, MECHANICAL_SUBSET_VERSION,
+    MechanicalAdmission, MechanicalAuthoritySubset, MechanicalSubsetConstraints,
+};
 pub use quarantine_evidence::{
     CrossRootQuarantineEvidence, QUARANTINE_EVIDENCE_OPERATION_KIND, QUARANTINE_EVIDENCE_SCHEMA,
     QUARANTINE_EVIDENCE_VERSION, QuarantineDisposition, QuarantineEnforcementRef,
     QuarantineEvidenceStatus, UnresolvedEffectDisposition, VerifiedQuarantineBinding,
 };
 pub use revocation_history::{
-    GrantRestoreOutcome, REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationHistoryError,
-    RevocationHistoryEvidence, SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
+    AuthorityRevocationClosureEvidence, GrantRestoreOutcome, REVOCATION_HISTORY_EVIDENCE_VERSION,
+    RevocationEvidenceDisposition, RevocationHistoryError, RevocationHistoryEvidence,
+    SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
 };
 
 use std::{error::Error, fmt};
@@ -79,6 +86,10 @@ pub enum AuthorityError {
     UseBudgetExhausted,
     UnauthorizedOperation,
     UnauthorizedResource,
+    /// The use site names a data/observation class outside the committed
+    /// ceiling set. Distinct from an unauthorized operation or resource so a
+    /// data-class refusal is never reported as a missing route.
+    UnauthorizedDataClass,
     EffectCeilingExceeded,
     IdentityConflict,
     /// Admitted transition evidence no longer matches CURRENT owner state, or
@@ -121,6 +132,7 @@ impl fmt::Display for AuthorityError {
             Self::UseBudgetExhausted => formatter.write_str("authority use budget exhausted"),
             Self::UnauthorizedOperation => formatter.write_str("operation is not authorized"),
             Self::UnauthorizedResource => formatter.write_str("resource is not authorized"),
+            Self::UnauthorizedDataClass => formatter.write_str("data class is not authorized"),
             Self::EffectCeilingExceeded => formatter.write_str("effect ceiling exceeded"),
             Self::IdentityConflict => formatter.write_str("idempotency identity conflict"),
             Self::StaleTransitionEvidence(field) => write!(

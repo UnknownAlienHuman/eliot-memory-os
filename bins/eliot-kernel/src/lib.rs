@@ -41,6 +41,10 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+/// Kernel-owned audit-fallback interface (issue #1840; I16.11): the
+/// independently persisted audit spool, the last-resort channel, the
+/// visible control-loss state, and reconciliation with receipts.
+pub mod audit_fallback;
 mod backup_capture;
 mod backup_capture_ports;
 mod backup_restore;
@@ -77,10 +81,20 @@ mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;
+/// Canonical replayable trace manifests for Material/Critical work (issue
+/// #1838; I16.12): the Kernel-owned record sealed through the single audit
+/// chain, never a second store.
+pub mod trace_manifest;
 
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
+pub use audit_fallback::{
+    AuditFallbackOutcome, AuditLastResortChannel, AuditReconcileDisposition, AuditReconcileFailure,
+    AuditReconcileReceipt, AuditReconcileReport, AuditSpoolBinding, AuditSpoolDisposition,
+    AuditSpoolProtection, AuditSpoolRecord, AuditSpoolRedaction, KernelAuditFallback,
+    audit_spool_dir,
+};
 pub use backup_capture::{
     ARCHIVE_FENCE_RELATION_CONTRACT_VERSION, ArchiveFenceProof, ArchiveFenceRelation,
     CaptureEvidenceLevel, CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture,
@@ -137,6 +151,9 @@ pub(crate) use shutdown_drain::{
     DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
     ReceiptOwnerEvidence, ReceiptOwnerFamily, ReceiptReconciliation, ReceiptRescanObservation,
     ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
+};
+pub use trace_manifest::{
+    TRACE_MANIFEST_FORMAT_VERSION, TRACE_MANIFEST_REQUIRED_SLOTS, TraceFinish, TraceManifest,
 };
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
 /// Records that a supervision lease expired, at the exact decision that refuses
@@ -693,6 +710,11 @@ pub struct KernelComposition {
     /// once at assembly below the canonical work root; every boundary
     /// appends through [`KernelComposition::audit_observe`].
     pub(crate) kernel_audit: Mutex<KernelAuditChain>,
+    /// The single Kernel-owned audit-fallback handle (issue #1840; I16.11).
+    /// Locked after `kernel_audit`, never before it; the fallback itself
+    /// acquires no other Kernel lock. Opened once at assembly over the
+    /// audit-spool directory; failed appends retain through it.
+    pub(crate) audit_fallback: Mutex<KernelAuditFallback>,
 }
 
 impl KernelComposition {
@@ -2590,6 +2612,32 @@ impl KernelComposition {
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
         coordinator
             .admit_normal_write()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Queued-attach release admission through the startup coordinator
+    /// (I1.11 step 10, issue #1892 W5).
+    ///
+    /// This is the single ordered-startup gate on the attach queue: a queued
+    /// attach is released only when the same `front_door_ready` fact
+    /// [`Self::startup_status`] reports is true. It reads the existing
+    /// [`StartupCoordinator`] field rather than a queue-side latch, so the
+    /// release cannot proceed independently of the ordered I1.11 cursor that
+    /// proves required capability evaluation and front-door publication
+    /// complete. The refusal reuses the existing [`StartupRejection`] and
+    /// [`StartupPrerequisite`] vocabulary used by every other startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] as a platform error naming
+    /// the unmet prerequisite, or a lock-poison platform error.
+    pub(crate) fn admit_queued_attach_release(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_queued_attach_release()
             .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
     }
 
