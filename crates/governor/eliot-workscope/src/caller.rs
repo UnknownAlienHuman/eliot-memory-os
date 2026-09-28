@@ -13,7 +13,12 @@
 //! - who consumes a [`WorkScopeResolutionReceipt`] plus [`GenerationEvidence`]
 //!   at admission: [`verify_receipt_for_admission`] re-checks identity,
 //!   fingerprint, generation, and fence, returning [`ReceiptAdmission`] instead
-//!   of a boolean so a withheld operation keeps its exact reason.
+//!   of a boolean so a withheld operation keeps its exact reason;
+//! - who turns a live resource observation into the *observed* [`ScopeBinding`]
+//!   the I4.2.1 use boundaries compare against the retained binding:
+//!   [`observed_scope_binding`] derives every identity field from the
+//!   observation plus the retained scope, so a caller cwd, a display name, or a
+//!   normalized path string can never stand in for a real workspace read.
 //!
 //! Fail-closed construction rules, enforced here so callers cannot launder
 //! aliases into identity:
@@ -33,14 +38,16 @@
 use super::{
     EvidenceStanding, GenerationEvidence, GuardTrigger, IdentityEvidence, PrivacyProfile,
     ProposalSource, RepositoryLineageIdentity, ResolutionAuthentication, ResourceExecutionIdentity,
-    ScopeFingerprint, ScopeKind, ScopeLifecycle, SupportingEvidenceClass, WorkScopeBindingOwner,
-    WorkScopeDescriptor, WorkScopeError, WorkScopeProposal, WorkScopeResolutionReceipt,
-    WorkspaceInstanceIdentity, binding_matches_descriptor, counter, text, unique,
+    ScopeBinding, ScopeFingerprint, ScopeIdentity, ScopeKind, ScopeLifecycle,
+    SupportingEvidenceClass, WorkScopeBindingOwner, WorkScopeDescriptor, WorkScopeError,
+    WorkScopeProposal, WorkScopeResolutionReceipt, WorkspaceInstanceIdentity,
+    binding_matches_descriptor, counter, text, unique,
 };
 use eliot_bootstrap::capture::WorkspaceInstanceFacts;
 use eliot_contracts::{
     ResourceGeneration, StateFence, canonical_json_bytes, fences_match_exact, sha256_hex,
 };
+use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +257,81 @@ pub fn describe_observed_scope(
     };
     descriptor.validate()?;
     Ok(descriptor)
+}
+
+/// Derives the *observed* [`ScopeBinding`] for one I4.2.1 use boundary from a
+/// live resource observation and the retained binding (issue #1746, W3).
+///
+/// This is the missing mechanical step between "read the real workspace" and
+/// "compare it with the bound scope". [`ScopeBinding`] is the guard's only
+/// comparison input, and before this constructor a caller could only produce
+/// one by hand, which is exactly the "caller cwd or a normalized path string"
+/// the use boundaries must not accept.
+///
+/// Every identity field comes from the observation itself, never from a raw
+/// path, display name, or caller-supplied scope label:
+///
+/// - `scope_ref` and `kind` come from the *retained* binding, so the comparison
+///   is against the scope the Governor actually holds rather than a label the
+///   request chose; a differently-kinded observation is refused outright;
+/// - `lineage_ref`, `instance_ref`, `root_identity`, and `generation` come from
+///   the one observed instance and the observed lineage;
+/// - `privacy_class` and `governing_source_generation` are owner inputs the
+///   caller already retains (the admitted privacy boundary and the
+///   onboarding-retained source closure generation), so a source-generation or
+///   privacy change is still visible to the guard.
+///
+/// An observation that names zero instances is already rejected by
+/// [`ObservedScopeResources::validate`]; more than one instance is
+/// [`WorkScopeError::AmbiguousObservation`], because several similar checkouts
+/// stay ambiguous per I4.1 and no candidate may be picked here. Absent lineage
+/// evidence is carried through as `None` rather than invented, which is what
+/// makes the guard report `DIFFERENT_INSTANCE` for a lineage-bearing scope
+/// instead of matching it.
+///
+/// # Errors
+///
+/// Returns [`WorkScopeError::AmbiguousObservation`] when the observation names
+/// more than one workspace instance, [`WorkScopeError::BindingReceiptMismatch`]
+/// when the observation is of a different scope kind than the retained binding,
+/// or the underlying validation errors for a malformed observation, privacy
+/// boundary, or zero source generation.
+pub fn observed_scope_binding(
+    retained: &ScopeBinding,
+    observed: &ObservedScopeResources,
+    privacy_class: PrivacyClass,
+    governing_source_generation: u64,
+) -> Result<ScopeBinding, WorkScopeError> {
+    observed.validate()?;
+    if observed.kind != retained.scope.kind {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if observed.instances.len() != 1 {
+        return Err(WorkScopeError::AmbiguousObservation {
+            observed_instances: observed.instances.len(),
+        });
+    }
+    let instance = &observed.instances[0];
+    if observed.generation.resource_generation.value() != instance.generation {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let binding = ScopeBinding {
+        scope: ScopeIdentity {
+            scope_ref: retained.scope.scope_ref.clone(),
+            kind: observed.kind,
+            lineage_ref: observed
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.lineage_ref.clone()),
+            instance_ref: instance.instance_ref.clone(),
+            root_identity: instance.root_identity.clone(),
+            generation: instance.generation,
+        },
+        privacy_class,
+        governing_source_generation,
+    };
+    binding.validate()?;
+    Ok(binding)
 }
 
 /// Packages a resolution request from live observations.

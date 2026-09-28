@@ -753,6 +753,7 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-user-broker-core",
+ "eliot-workscope",
  "secrecy",
  "serde",
  "serde_json",
