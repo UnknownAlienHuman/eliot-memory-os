@@ -440,7 +440,7 @@ impl QualityScorecard {
         // ordered vectors differ.
         let declared: Vec<QualityDimension> =
             self.results.iter().map(|result| result.dimension).collect();
-        let expected: Vec<QualityDimension> = QUALITY_DIMENSIONS.iter().copied().collect();
+        let expected: Vec<QualityDimension> = QUALITY_DIMENSIONS.to_vec();
         if declared != expected {
             return Err(ContextError::QualityIncomplete);
         }
