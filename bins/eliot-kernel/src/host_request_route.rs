@@ -1548,6 +1548,35 @@ impl KernelComposition {
         Ok((profile.admission, receipt))
     }
 
+    /// Verifies that the retained activation binding still correlates to the
+    /// exact Kernel-issued ticket and typed result that produced it (issue
+    /// #1746 W2).
+    ///
+    /// A stored `Resolved` projection is not perpetual authority: the retained
+    /// ticket identity and result digest must still name one live Kernel-owned
+    /// terminal activation result. A result that was never retained, that was
+    /// displaced by a different result under the same ticket, or that is only
+    /// a `NotReady` deferral is not an authentication, so the binding cannot
+    /// carry a later request.
+    fn activation_result_still_retained(
+        &self,
+        retained: &super::ActivatedApplicationBinding,
+    ) -> bool {
+        let Ok(pending) = self.agent_activation_pending.lock() else {
+            return false;
+        };
+        pending
+            .results
+            .get(&retained.activation_ticket_id)
+            .is_some_and(|record| {
+                record.result.result_sha256 == retained.resolution_result_sha256
+                    && matches!(
+                        record.phase,
+                        super::AgentActivationResultPhase::AcceptedTerminal
+                    )
+            })
+    }
+
     /// Verifies claimed application session/task/scope continuity against the
     /// exact binding retained from this connection's `Resolved` activation
     /// (issue #1746).
@@ -1567,6 +1596,18 @@ impl KernelComposition {
     /// session is unknown, terminal, epoch-mismatched, never bound to the
     /// presenting connection, or carries an expired or revoked session-bound
     /// lease is `SessionFenced`.
+    ///
+    /// Two further legs come from the same retained record (issue #1746 W2).
+    /// The presented fence must still be the activation's current epoch and
+    /// generation, so a request arriving after a generation or epoch move is
+    /// fenced instead of running under a stored `Resolved` projection. And the
+    /// requested capability is classified through the frozen operation table
+    /// below: a task-relative/effectful capability receives no task-bound
+    /// authority unless the envelope names exactly the retained task, scope,
+    /// and revision, while authenticated discovery/read-only and safe raw
+    /// capture stay reachable with no task at all. A principal is never taken
+    /// from the envelope — there is none — and the bridge peer identity is
+    /// never substituted for the activation-resolved principal.
     fn host_request_application_binding_gate_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1587,6 +1628,24 @@ impl KernelComposition {
                 .clone()
                 .ok_or(TransportError::SessionFenced)?
         };
+        // The activation's own principal is the end user. A blank principal was
+        // already refused when the binding was retained, so re-checking it here
+        // keeps "no retained identity means no authority" true even if a future
+        // projection path ever yields one.
+        if retained.principal_id.trim().is_empty() {
+            return Err(TransportError::SessionFenced);
+        }
+        if !self.activation_result_still_retained(&retained) {
+            return Err(TransportError::SessionFenced);
+        }
+        if !envelope
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&retained.authority_epoch)
+            || envelope.state_fence.resource_generation != retained.activation_generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
         if let Some(claimed) = envelope.identity.session_id.as_deref() {
             if claimed != retained.session_id {
                 return Err(TransportError::IdentityConflict);
@@ -1628,6 +1687,21 @@ impl KernelComposition {
             && claimed != retained.task_revision
         {
             return Err(TransportError::IdentityConflict);
+        }
+        // A task-relative/effectful capability is exactly the case I7.8 steps
+        // 7-12 and the A1 acceptance forbid without task-bound authority: the
+        // envelope must therefore carry the retained task, scope, and
+        // revision. Discovery, read-only, and cold capture keep their no-task
+        // route and are unaffected by this leg.
+        if host_request_capability_is_task_relative(envelope.identity.capability.as_str()) {
+            let task_named =
+                envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
+            let scope_named =
+                envelope.identity.work_scope_id.as_deref() == Some(retained.work_scope_id.as_str());
+            let revision_named = envelope.state_fence.task_revision == Some(retained.task_revision);
+            if !(task_named && scope_named && revision_named) {
+                return Err(TransportError::SessionFenced);
+            }
         }
         Ok(())
     }
@@ -2137,6 +2211,25 @@ impl KernelComposition {
                     .state_fence
                     .task_revision
                     .is_some_and(|claimed| claimed != retained.task_revision)
+            {
+                return Ok(false);
+            }
+            // The generation/epoch leg and the task-relative capability leg
+            // are rechecked here too, so a task-bound write cannot be claimed
+            // under a fence the activation never held (issue #1746 W2/A1).
+            if !envelope
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+                || envelope.state_fence.resource_generation != retained.activation_generation
+            {
+                return Ok(false);
+            }
+            if host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+                && (envelope.identity.task_id.as_deref() != Some(retained.task_id.as_str())
+                    || envelope.identity.work_scope_id.as_deref()
+                        != Some(retained.work_scope_id.as_str())
+                    || envelope.state_fence.task_revision != Some(retained.task_revision))
             {
                 return Ok(false);
             }
@@ -2919,6 +3012,32 @@ impl KernelComposition {
 /// admission-only, and a forged capability fails the linkage gate before any
 /// staging.
 pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
+
+/// Whether one requested capability is task-relative or effectful and
+/// therefore needs the exact applicable task binding (issue #1746, W2).
+///
+/// This mirrors the frozen operation table the MCP contract surface already
+/// publishes (`eliot_mcp::semantic_profile::CanonicalOperation::requirement`,
+/// I7.8 steps 7-12) over the closed capability set this module already routes.
+/// It is a table lookup, not a second classifier: an unknown capability is not
+/// task-relative here and is refused by its own per-tool linkage gate instead,
+/// so this predicate can only ever remove task-bound authority, never grant
+/// it.
+///
+/// - `eliot.packet` is `Packet`, classified `TaskRelativeEffectful` with
+///   `ExactApplicableTask`;
+/// - `skill.activate` and `skill.execute` activate or run a task-scoped skill,
+///   which is control/action work and needs the same exact task binding;
+/// - `eliot.state` and `eliot.query` stay authenticated discovery/read-only
+///   and remain reachable before a task is selected;
+/// - `eliot.observe` stays safe raw capture with no task effect, and the
+///   Watchdog intent route is a parentless observation submission.
+fn host_request_capability_is_task_relative(capability: &str) -> bool {
+    matches!(
+        capability,
+        "eliot.packet" | "skill.activate" | "skill.execute"
+    )
+}
 
 /// Bound on queued observe pairs for the daemon observe poller.
 ///
