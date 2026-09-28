@@ -256,6 +256,14 @@ fn test_evidence_scope() -> RouteScopeFingerprint {
     }
 }
 
+/// Deterministic stand-in for a store-issued evidence revision.
+fn test_owner_revision(owner_revision: u64) -> TestResult<eliot_governor::OwnerEvidenceRevision> {
+    eliot_governor::OwnerEvidenceRevision::issued(
+        owner_revision,
+        &eliot_store_api::sha256_hex(&owner_revision.to_be_bytes()),
+    )
+    .map_err(|error| format!("owner revision: {error}").into())
+}
 fn test_evidence_admitted() -> TestResult<GovernorCapabilityAdmission> {
     let mut admission = GovernorCapabilityAdmission::new();
     admission.insert(
@@ -267,6 +275,7 @@ fn test_evidence_admitted() -> TestResult<GovernorCapabilityAdmission> {
             1,
         )
         .map_err(|error| format!("probe evidence: {error}"))?,
+        test_owner_revision(1)?,
     );
     Ok(admission)
 }
@@ -1178,9 +1187,15 @@ fn resolved_route_without_capability_evidence_is_denied() -> TestResult {
     })
     .map_err(|error| format!("legacy import: {error}"))?;
     let mut declared_registry = CapabilityRegistry::new();
-    declared_registry.insert(CapabilityEvidenceRecord::from(&imported));
-    for record in declared_registry.records() {
-        declared_only.insert(record.clone());
+    declared_registry.insert(
+        CapabilityEvidenceRecord::from(&imported),
+        eliot_governor::OwnerEvidenceRevision::legacy_declared(),
+    );
+    for retained in declared_registry.retained() {
+        declared_only.insert(
+            retained.record.clone(),
+            eliot_governor::OwnerEvidenceRevision::legacy_declared(),
+        );
     }
     assert!(!empty.admit_production_route("rust", &test_evidence_scope(), EVIDENCE_NOW));
     assert!(!declared_only.admit_production_route("rust", &test_evidence_scope(), EVIDENCE_NOW));

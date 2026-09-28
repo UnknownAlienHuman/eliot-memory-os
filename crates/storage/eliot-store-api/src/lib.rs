@@ -231,9 +231,27 @@ pub use wire::{
     request_frame, request_frame_with_payload_authority, response_frame,
 };
 
+mod capability_evidence_store;
 mod operation_catalogue;
 mod operation_parameters;
 mod revocation_history;
+
+pub use capability_evidence_store::{
+    CAPABILITY_EVIDENCE_PARAM_CURSOR, CAPABILITY_EVIDENCE_PARAM_EXPECTED_REVISION,
+    CAPABILITY_EVIDENCE_PARAM_IDEMPOTENCY_KEY, CAPABILITY_EVIDENCE_PARAM_MAX_RECORDS,
+    CAPABILITY_EVIDENCE_PARAM_RECORD_DIGEST, CAPABILITY_EVIDENCE_PARAM_RECORD_JSON,
+    CAPABILITY_EVIDENCE_PARAM_SCOPE_KEY, CAPABILITY_EVIDENCE_PARAM_SKILL_ID,
+    CAPABILITY_EVIDENCE_RECORD_MUTATION_NAME, CAPABILITY_EVIDENCE_RECORD_NAMESPACE,
+    CAPABILITY_EVIDENCE_RECORD_READ_NAME, CAPABILITY_EVIDENCE_STORE_SCHEMA_V1,
+    DecodedCapabilityEvidenceMutation, DecodedCapabilityEvidenceRead,
+    MAX_CAPABILITY_EVIDENCE_IDEMPOTENCY_BYTES, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+    MAX_CAPABILITY_EVIDENCE_RECORD_JSON_BYTES, MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES,
+    capability_evidence_commit_params, capability_evidence_mutation_request,
+    capability_evidence_read_request, capability_evidence_row_key,
+    decode_capability_evidence_mutation, decode_capability_evidence_read,
+    reject_direct_capability_evidence_write, valid_skill_id,
+    validate_capability_evidence_mutation_params, validate_capability_evidence_read_params,
+};
 
 pub use erasure_admission::{
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_REASON, ERASURE_PARAM_REQUESTER,
@@ -3720,6 +3738,18 @@ pub enum NamedReadOperation {
     /// the held transaction lock. The read projects verbatim record
     /// documents; admission re-proof stays Governor-owned at the read edge.
     GetLearningRecordRange,
+    /// Canonical paged capability-evidence record read (issue #1773, I3.4).
+    ///
+    /// Durable same-scope capability-evidence rows keyed `(skill_id,
+    /// scope_key)`, each carrying the store-issued fenced `revision` of that
+    /// evidence key and the owner-issued evidence reference of the committed
+    /// record bytes. This is the only read that can rebuild the Governor
+    /// capability registry and its invalidation set; `GetCapabilityEvidenceState`
+    /// answers committed lifecycle-governance rows and carries no capability
+    /// status, source, scope fingerprint, or revision. The read serves one
+    /// bounded page with a fence-bound keyset continuation cursor, so a
+    /// complete hydration drains it to exhaustion.
+    GetCapabilityEvidenceRecordRange,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -3830,6 +3860,21 @@ pub enum NamedMutationOperation {
     /// keys with convergent replay, and never derives semantics,
     /// admission, or effectiveness: durability never implies effectiveness.
     RecordLearningRecord,
+    /// Canonical capability-evidence record commit (issue #1773, I3.4).
+    ///
+    /// Durable capability-evidence persistence only: the prepared transition
+    /// must carry [`TransitionClass::CaptureCandidate`], the declared
+    /// candidate-only effect ceiling, and the closed capability-evidence typed
+    /// parameters (exact skill identity, owner-issued scope key, verbatim
+    /// record document, presented record digest, asserted CAS predecessor, and
+    /// idempotency key). The store bridge persists the document verbatim and
+    /// arbitrates only the fenced revision of the evidence row, issuing
+    /// `expected + 1` as the owner-issued revision the Governor orders
+    /// same-key evidence by. The write itself grants no admission, no support,
+    /// no influence, and no lifecycle change: it records a fact that the
+    /// Governor registry re-evaluates through its own exact-fingerprint,
+    /// freshness, invalidation, and requalification predicates.
+    RecordCapabilityEvidenceRecord,
 }
 
 impl NamedMutationOperation {
@@ -3841,7 +3886,8 @@ impl NamedMutationOperation {
             | Self::RecordLearningRecord
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
-            | Self::ApplyBlackboardItem => TransitionClass::CaptureCandidate,
+            | Self::ApplyBlackboardItem
+            | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,

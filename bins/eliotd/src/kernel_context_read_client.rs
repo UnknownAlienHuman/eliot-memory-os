@@ -812,6 +812,7 @@ impl KernelContextReadClient {
     /// Checks the closed `GetCapabilityEvidenceState` selectors before any
     /// transport: exactly `skill_id` (non-blank, no control characters) plus
     /// `max_records` (positive decimal within `EVIDENCE_PACK_MAX_RECORDS`),
+    /// plus the optional opaque `cursor` continuation selector (issue #1773),
     /// mirroring the store catalogue declaration and the memory/Surreal
     /// handler bounds. Any other key, blank skill, or out-of-range bound
     /// fails closed here before transport.
@@ -825,14 +826,31 @@ impl KernelContextReadClient {
     fn check_capability_evidence_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
         const SELECTOR_ERROR: StoreError = StoreError::InvalidField {
             field: "operation.parameter",
-            reason: "GetCapabilityEvidenceState declares exactly skill_id and max_records",
+            reason: "GetCapabilityEvidenceState declares exactly skill_id and max_records, plus an optional cursor",
         };
         eliot_store_api::validate_typed_read_parameters(request.operation, &request.parameters)?;
-        if request.parameters.len() != 2
+        let cursor_present = request.parameters.contains_key("cursor");
+        if (cursor_present && request.parameters.len() != 3)
+            || (!cursor_present && request.parameters.len() != 2)
             || !request.parameters.contains_key("skill_id")
             || !request.parameters.contains_key("max_records")
         {
             return Err(SELECTOR_ERROR);
+        }
+        if cursor_present {
+            let cursor = request
+                .parameters
+                .get("cursor")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(SELECTOR_ERROR)?;
+            if cursor.is_empty()
+                || cursor.len() > eliot_store_api::MAX_CAPABILITY_EVIDENCE_IDEMPOTENCY_BYTES
+            {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "cursor continuation selector is out of bounds",
+                });
+            }
         }
         let skill_id = request
             .parameters

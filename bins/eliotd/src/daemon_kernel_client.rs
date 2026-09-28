@@ -1894,6 +1894,47 @@ impl DaemonKernelClient {
         Ok(response)
     }
 
+    /// Blocking sibling of [`store_named_async`](Self::store_named_async), for
+    /// the synchronous startup attach sites that already hold the concrete
+    /// client and the composition (issue #1773).
+    ///
+    /// Same request validation, same `"store_named"` operation, same typed
+    /// response binding; only the await is bridged through the same
+    /// [`Self::blocking`] helper the `receipt` / `store_recovery` templates
+    /// use. This opens no second transport and no second write path: it is the
+    /// one authenticated Kernel named-read route, driven synchronously.
+    pub(super) fn store_named_blocking(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, KernelPortError> {
+        let client = self.clone_for_future();
+        request
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if self.snapshot.state_fence() != request.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon named read fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = Self::blocking(async move {
+            client
+                .transact_async(
+                    "store_named",
+                    serde_json::json!({
+                        "request": request,
+                    }),
+                )
+                .await
+        })?;
+        let value = super::kind_value(&value, "store_named")?;
+        let response: NamedReadResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        response
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(response)
+    }
+
     /// Claims one queued admitted `eliot.query` or Skill pair for the
     /// outbound local-read poller and local Skill dispatch (issue #1882).
     /// Skill names are exactly those recognized by

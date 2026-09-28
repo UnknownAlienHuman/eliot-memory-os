@@ -204,6 +204,9 @@ const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
 const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
 /// Version of the `GetCapabilityEvidenceState` payload shape (T11.3).
 const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetCapabilityEvidenceRecordRange` payload shape (issue
+/// #1773, I3.4).
+const CAPABILITY_EVIDENCE_RECORD_PAYLOAD_VERSION: u32 = 1;
 
 /// A deterministic reference store with no external authority or I/O.
 ///
@@ -368,6 +371,10 @@ impl MemoryStore {
         // receipt's outbox references include the appended learning outbox
         // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_learning_state(&mut state, &transition, &mut plan)?;
+        // Issue #1773: admitted capability-evidence legs execute here, beside
+        // the learning legs and before the receipt is built, so the row, the
+        // receipt, and the outbox intents still commit atomically below.
+        dispatch_apply_capability_evidence(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
@@ -1467,6 +1474,244 @@ fn dispatch_apply_learning_state(
         learning_index = learning_index.saturating_add(1);
     }
     Ok(())
+}
+
+/// Applies the admitted Governor capability-evidence leg (issue #1773, I3.4).
+///
+/// Runs beside [`dispatch_apply_learning_state`] under the same lock as the
+/// receipt commit: one identity, one receipt, recoverable replay without
+/// duplicate work. The row is a **fenced revision compare-and-set** on the
+/// deterministic `(skill_id, scope_key)` evidence key:
+///
+/// * a missing row must present `expected_canonical_revision == 0`;
+/// * an existing row must present exactly its current `revision` and fence, or
+///   the write is refused with [`StoreError::RevisionConflict`] /
+///   [`StoreError::FenceMismatch`];
+/// * the issued `revision` is always `expected + 1`.
+///
+/// That issued revision is the owner-issued immutable revision the Governor
+/// registry orders same-key evidence by, so a delayed writer holding a stale
+/// predecessor is refused here, before it can reach the registry. The evidence
+/// document stays opaque: this backend never derives status, source, scope
+/// fingerprint, limitations, or requalification semantics from the bytes, and
+/// the write grants no admission, support, influence, or lifecycle change.
+/// Each command appends one outbox intent bound to the resulting row bytes, so
+/// row, receipt, and outbox intents commit atomically via
+/// [`commit_transaction`]. Transitions without the named operation are a no-op
+/// here.
+fn dispatch_apply_capability_evidence(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_evidence_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::RecordCapabilityEvidenceRecord);
+    if !has_evidence_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut evidence_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::RecordCapabilityEvidenceRecord {
+            continue;
+        }
+        let decoded = eliot_store_api::decode_capability_evidence_mutation(
+            command.operation,
+            &command.parameters,
+        )?;
+        let key =
+            eliot_store_api::capability_evidence_row_key(&decoded.skill_id, &decoded.scope_key);
+        // The owner-issued compare-and-set: a present row must be advanced from
+        // exactly its current revision and fence, and an absent row only from
+        // the `0` floor. Anything else is a delayed or concurrent writer and is
+        // refused here, before it can reach the Governor registry.
+        let expected_revision = decoded.expected_canonical_revision;
+        if let Some(existing) = state.capability_evidence_rows.get(&key) {
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            if existing.revision != expected_revision {
+                return Err(StoreError::RevisionConflict);
+            }
+        } else if expected_revision != 0 {
+            return Err(StoreError::RevisionConflict);
+        }
+        let revision =
+            decoded
+                .expected_canonical_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidField {
+                    field: "capability_evidence.revision",
+                    reason: "capability evidence revision overflow",
+                })?;
+        let row = CapabilityEvidenceRow {
+            skill_id: decoded.skill_id.clone(),
+            scope_key: decoded.scope_key.clone(),
+            record_json: decoded.record_json.clone(),
+            record_digest: decoded.record_digest.clone(),
+            revision,
+            state_fence: transition.state_fence.clone(),
+            scope_id: transition.scope_id.to_string(),
+        };
+        let row_json = serde_json::to_value(&row.record_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        state.capability_evidence_rows.insert(key, row);
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-capability-evidence-{evidence_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        evidence_index = evidence_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Projects one bounded page of the same-fence, same-scope capability-evidence
+/// eligible set with genuine keyset continuation (issue #1773, I3.4).
+///
+/// The complete scope / skill / fence predicate is applied before the page
+/// bound, and the skip window is served by a fence-bound continuation cursor
+/// issued only when a further eligible row was actually observed, so the scan
+/// terminates: an empty page is an authoritative empty eligible set, never an
+/// unexamined suffix, and a second page never re-materializes the consumed
+/// prefix. A cursor that does not decode against the current fence and
+/// revision heads fails closed in [`eliot_store_api::audit_cursor_parse`], so a
+/// partial hydration cannot be mistaken for complete coverage.
+///
+/// Each projected row carries the store-issued `revision` and the owner-issued
+/// `record_digest`, which is exactly what the Governor needs to re-mint a real
+/// `CapabilityEvidenceRecord` with its owner-issued revision instead of a
+/// legacy declaration. (The record type is owned by `eliot-governor`; this
+/// payload deliberately carries only store-neutral fields plus the verbatim
+/// document, and never derives the record's semantics from its bytes.)
+fn capability_evidence_record_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, StoreError> {
+    let decoded =
+        eliot_store_api::decode_capability_evidence_read(query.operation, &query.parameters)?;
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "capability evidence record range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records);
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query
+        .parameters
+        .get(eliot_store_api::CAPABILITY_EVIDENCE_PARAM_CURSOR)
+        .and_then(Value::as_str)
+    {
+        None => None,
+        Some(cursor) => Some(eliot_store_api::audit_cursor_parse(cursor, fence, &heads)?),
+    };
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for (key, row) in &state.capability_evidence_rows {
+        if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+            continue;
+        }
+        if decoded
+            .skill_id
+            .as_deref()
+            .is_some_and(|skill| row.skill_id != skill)
+        {
+            continue;
+        }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() >= limit {
+            truncated = true;
+            break;
+        }
+        // The same structural re-proofs the Surreal provider applies, so the two
+        // providers accept exactly the same rows and serve exactly the same
+        // payload shape. `record_json` is served as a JSON **string** here and in
+        // Surreal (`String::from_utf8` of the `TYPE bytes` column), so the
+        // consumer's decode is provider-independent.
+        //
+        // Row-address re-proof, like for like: the map key is a
+        // `RecoveryRecordKey` (the in-memory form of the `namespace` + `key`
+        // columns), so it is compared against the same
+        // `capability_evidence_row_key` the Surreal provider compares the `key`
+        // column against. The digest re-proof below validates the ORIGINAL
+        // recorded bytes, not a derived substitute, so a row can never be served
+        // under an owner-issued reference the store never issued for those bytes.
+        if eliot_store_api::capability_evidence_row_key(&row.skill_id, &row.scope_key) != *key {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.key",
+                reason: "capability evidence row address does not match its identity",
+            });
+        }
+        if sha256_hex(row.record_json.as_bytes()) != row.record_digest {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.record_digest",
+                reason: "capability evidence digest does not match its record bytes",
+            });
+        }
+        if row.revision < 1 {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.revision",
+                reason: "capability evidence revision must be at least 1",
+            });
+        }
+        records.push(json!({
+            "skill_id": row.skill_id,
+            "scope_key": row.scope_key,
+            "record_digest": row.record_digest,
+            "record_json": row.record_json,
+            "revision": row.revision,
+        }));
+    }
+    let returned = records.len();
+    let next_cursor = if truncated {
+        Some(eliot_store_api::audit_cursor_issue(
+            fence,
+            &heads,
+            start
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX)),
+        )?)
+    } else {
+        None
+    };
+    Ok(json!({
+        "version": CAPABILITY_EVIDENCE_RECORD_PAYLOAD_VERSION,
+        "scope_id": scope_id,
+        "records": records,
+        "matched_total": returned,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": fence,
+    }))
 }
 
 /// Applies one decoded leg against the shared record model and returns the
@@ -3848,6 +4093,10 @@ impl MemoryStore {
                     Err(error) => Err(serde_json::Error::custom(error.to_string())),
                 }
             }
+            NamedReadOperation::GetCapabilityEvidenceRecordRange => {
+                let value = capability_evidence_record_range_payload(state, query, fence)?;
+                Ok(value)
+            }
             _ => return Ok(None),
         };
         payload
@@ -4262,6 +4511,22 @@ impl MemoryStore {
             });
         }
         let (max_records, limit) = Self::parse_max_records(query)?;
+        // Issue #1773: the page is served by genuine keyset continuation
+        // instead of a bare prefix slice. A bare `.take(limit)` with no
+        // continuation token would re-read the first `limit` rows on every
+        // further request, so a caller draining this read could never reach
+        // exhaustion. The cursor is fence- and heads-bound and fails closed
+        // when it does not decode, so a partial drain cannot be mistaken for
+        // complete coverage.
+        let heads: Vec<(String, u64)> = state
+            .revision_heads
+            .values()
+            .map(|head| (head.key.as_str().to_owned(), head.revision))
+            .collect();
+        let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+            None => None,
+            Some(cursor) => Some(eliot_store_api::audit_cursor_parse(cursor, fence, &heads)?),
+        };
         let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
             .named_operations
             .iter()
@@ -4279,18 +4544,36 @@ impl MemoryStore {
             .map(|(index, record)| (index, &record.operation))
             .collect();
         let matched_total = matched.len();
-        let records: Vec<Value> = matched
-            .into_iter()
-            .take(limit)
-            .map(|(capture_index, operation)| {
-                json!({
-                    "capture_index": capture_index,
-                    "operation": named_mutation_operation_name(operation.operation),
-                    "parameters": operation.parameters,
-                })
-            })
-            .collect();
+        let mut records: Vec<Value> = Vec::new();
+        let mut truncated = false;
+        let mut ordinal: u64 = 0;
+        for (capture_index, operation) in matched {
+            ordinal = ordinal.saturating_add(1);
+            if start.is_some_and(|start| ordinal <= start) {
+                continue;
+            }
+            if records.len() >= limit {
+                truncated = true;
+                break;
+            }
+            records.push(json!({
+                "capture_index": capture_index,
+                "operation": named_mutation_operation_name(operation.operation),
+                "parameters": operation.parameters,
+            }));
+        }
         let returned = records.len();
+        let next_cursor = if truncated {
+            Some(eliot_store_api::audit_cursor_issue(
+                fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX)),
+            )?)
+        } else {
+            None
+        };
         Ok(json!({
             "version": CAPABILITY_EVIDENCE_PAYLOAD_VERSION,
             "skill_id": skill_id,
@@ -4301,8 +4584,9 @@ impl MemoryStore {
                 "matched_total": matched_total,
                 "returned": returned,
                 "max_records": max_records,
-                "truncated": matched_total > returned,
+                "truncated": truncated,
             },
+            "next_cursor": next_cursor,
         }))
     }
 
@@ -4709,6 +4993,25 @@ struct LearningRecordRow {
     task_id: Option<String>,
 }
 
+/// One durable Governor-owned capability-evidence row (issue #1773, I3.4).
+///
+/// The row is the store-issued, fenced-revisioned image of one
+/// `(skill_id, scope_key)` evidence key: the verbatim evidence document, the
+/// owner-issued evidence reference of those bytes, and the store-issued
+/// `revision` that orders the key. The memory backend mirrors the reference
+/// CAS semantics of the Surreal adapter; it never derives status, source,
+/// scope fingerprint, or requalification semantics from the document bytes.
+#[derive(Clone, Debug, PartialEq)]
+struct CapabilityEvidenceRow {
+    skill_id: String,
+    scope_key: String,
+    record_json: String,
+    record_digest: String,
+    revision: u64,
+    state_fence: StateFence,
+    scope_id: String,
+}
+
 /// One immutable automation revision row: the verbatim Kernel-owned
 /// revision document for one automation + revision with its admission
 /// fence and task-binding provenance (issue #1779).
@@ -4847,6 +5150,13 @@ struct MemoryState {
     /// learning leg under the held transaction lock; divergent rewrites
     /// fail closed.
     learning_record_rows: BTreeMap<String, LearningRecordRow>,
+    /// Durable Governor-owned capability-evidence rows keyed by the
+    /// deterministic `(skill_id, scope_key)` evidence key (issue #1773,
+    /// I3.4). Each row carries the verbatim evidence document, the
+    /// owner-issued evidence reference of those bytes, and the store-issued
+    /// `revision` the fenced CAS advances, which is the owner-issued
+    /// immutable revision the Governor registry orders same-key evidence by.
+    capability_evidence_rows: BTreeMap<RecoveryRecordKey, CapabilityEvidenceRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -4885,6 +5195,7 @@ impl PartialEq for MemoryState {
             && self.experience_bank_rows == other.experience_bank_rows
             && self.experience_feedback_rows == other.experience_feedback_rows
             && self.learning_record_rows == other.learning_record_rows
+            && self.capability_evidence_rows == other.capability_evidence_rows
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -4929,6 +5240,7 @@ impl Default for MemoryState {
             experience_bank_rows: BTreeMap::new(),
             experience_feedback_rows: BTreeMap::new(),
             learning_record_rows: BTreeMap::new(),
+            capability_evidence_rows: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }

@@ -583,6 +583,19 @@ pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE {
 /// fence, and outer revision are provider-arbitrated.
 pub(crate) const TX_CANONICAL_OWNER: &str = "LET $canonical_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($canonical_owner_table, $canonical_owner_id)); IF type::is_object($canonical_existing) { LET $canonical_owner_cas = (UPDATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record WHERE state_fence = $canonical_expected_state_fence AND revision = $canonical_expected_revision RETURN AFTER); IF array::len($canonical_owner_cas ?? []) != 1 { THROW 'canonical_owner_cas_conflict'; }; } ELSE { IF $canonical_expected_revision != 0 { THROW 'canonical_owner_create_conflict'; }; LET $canonical_owner_create = (CREATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record RETURN AFTER); IF array::len($canonical_owner_create ?? []) != 1 { THROW 'canonical_owner_create_conflict'; }; };";
 
+/// Fenced compare-and-set of one Governor-owned capability-evidence row
+/// (issue #1773, I3.4).
+///
+/// Same shape as [`TX_CANONICAL_OWNER`], with the evidence row's own
+/// addresses: a present row must be advanced from exactly the asserted
+/// `revision` and fence, an absent row only from the `0` floor, and the issued
+/// `revision` is always `expected + 1`. That issued revision is the
+/// owner-issued immutable revision the Governor registry orders same-key
+/// evidence by, so a delayed writer holding a stale predecessor is refused
+/// inside the canonical transaction, before it can reach the registry. The
+/// record document stays opaque bytes.
+pub(crate) const TX_CAPABILITY_EVIDENCE_OWNER: &str = "LET $capability_evidence_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($capability_evidence_table, $capability_evidence_id)); IF type::is_object($capability_evidence_existing) { LET $capability_evidence_cas = (UPDATE type::record($capability_evidence_table, $capability_evidence_id) CONTENT $capability_evidence_record WHERE state_fence = $capability_evidence_expected_state_fence AND revision = $capability_evidence_expected_revision RETURN AFTER); IF array::len($capability_evidence_cas ?? []) != 1 { THROW 'capability_evidence_cas_conflict'; }; } ELSE { IF $capability_evidence_expected_revision != 0 { THROW 'capability_evidence_create_conflict'; }; LET $capability_evidence_create = (CREATE type::record($capability_evidence_table, $capability_evidence_id) CONTENT $capability_evidence_record RETURN AFTER); IF array::len($capability_evidence_create ?? []) != 1 { THROW 'capability_evidence_create_conflict'; }; };";
+
 /// Renders an indexed transaction template for the given binding index.
 pub(crate) fn indexed(template: &str, index: usize) -> String {
     template.replace("{i}", &index.to_string())

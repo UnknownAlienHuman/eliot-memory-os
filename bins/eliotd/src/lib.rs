@@ -139,7 +139,8 @@ pub use capability_admission::{
     canonical_required_set, evaluate_production_admission,
 };
 pub use capability_evidence_wiring::{
-    EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
+    CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, drain_capability_evidence_records,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
@@ -2875,16 +2876,53 @@ impl DaemonComposition {
         now: u64,
     ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
         let view = self.capability_admission_mut()?;
-        let staled = view.apply_scope_change(
-            observed_scope,
-            eliot_governor::ScopeDependencySelector::all(),
-        );
-        if staled > 0 {
+        // The applied-change restriction is written into each affected record's
+        // own persisted `limitations_and_negative_evidence` under the exact
+        // owner-issued reference of the observed behaviour scope. Two things
+        // follow, and both are load-bearing:
+        //
+        // * only a fresh requalification that names that reference, and is
+        //   strictly newer than the owner-issued revision of the evidence it
+        //   staled, can clear it; and
+        // * the restriction is a property of the record's own bytes, so a
+        //   restart re-derives it from what the canonical store served instead
+        //   of starting from an empty invalidation set.
+        let staled = view
+            .apply_scope_change(
+                observed_scope,
+                eliot_governor::ScopeDependencySelector::all(),
+                &observed_scope.reference_digest(),
+            )
+            .map_err(|error| {
+                DaemonError::Composition(CompositionError::Owner(format!(
+                    "capability evidence scope change is not owner-referenced: {error}"
+                )))
+            })?;
+        if staled.newly_staled > 0 {
+            // LOUD, and deliberately not phrased as if the restriction were
+            // recorded durably. `staled.records` are the durable half — each
+            // carries this change reference in its own persisted
+            // `limitations_and_negative_evidence`, which the canonical store
+            // serves verbatim — and this call site DOES NOT COMMIT THEM.
+            //
+            // The restriction therefore holds in this process only and a restart
+            // erases it. That is the W2 gap, and it is `STITCH` because
+            // `commit_capability_evidence_record` has no production caller: no
+            // capability-probe producer exists in the repository, so there is no
+            // observation to commit from. Committing here anyway would require
+            // inventing a request identity and would turn a working route refusal
+            // into a possible error, which is not an improvement.
+            //
+            // The log therefore states the limitation's scope rather than
+            // implying durability the code does not achieve.
             tracing::warn!(
                 target: "eliotd::capability_evidence",
                 event = "eliotd.capability_evidence_staled",
-                staled_records = staled,
-                "an observed runtime/adapter/provider/serializer change staled dependent capability evidence; the exact route must requalify before production work"
+                staled_records = staled.newly_staled,
+                uncommitted_records = staled.records.len(),
+                change_reference = %staled.blocking_evidence_ref,
+                durable = false,
+                "an observed runtime/adapter/provider/serializer change limited dependent capability evidence IN THIS PROCESS ONLY; the mutated records carrying this change reference are NOT committed, so a restart will forget the restriction. The exact route must requalify, naming this change reference, before production work"
             );
         }
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
