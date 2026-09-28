@@ -3046,6 +3046,7 @@ dependencies = [
 name = "eliot-runtime-status"
 version = "0.1.0"
 dependencies = [
+ "eliot-conformance-contracts",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-evaluation-contracts",

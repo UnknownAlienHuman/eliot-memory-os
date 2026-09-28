@@ -1,8 +1,8 @@
 //! Read-only `ControlBoard` status projection owned by `eliot-runtime-status`.
 //!
-//! Issue #1213 second half: this module is the one real read-only consumer
-//! that wires `eliot-controlboard` under the current runtime-status owner.
-//! It consumes only the immutable [`ControlBoardView`](eliot_controlboard::ControlBoardView)
+//! Issue #1213: this module is the read-only projection that binds
+//! `eliot-controlboard` under the current runtime-status owner. It consumes
+//! only the immutable [`ControlBoardView`](eliot_controlboard::ControlBoardView)
 //! produced by the authenticated [`ControlBoard::view`](eliot_controlboard::ControlBoard::view)
 //! read edge. It never submits commands, never touches operator ports, and
 //! cannot mint authority, sessions, fences, or operation identities.
@@ -24,13 +24,30 @@
 //! bounded length); this projection never infers them from files, PIDs, ports,
 //! or manifests, and never widens them.
 //!
-//! Independence: `liveness`, `readiness`, `support`, `evidence_refs`, and the
-//! `product_*` fields are separate contour fields with no synthesis function.
-//! A projected view proves neither liveness nor readiness, so both stay
-//! `Unknown` with explicit gaps; live evidence remains owned by issue #11.
-//! There is intentionally no `status()`, `is_healthy()`, or `is_ready()`
-//! constructor: collapsing the dimensions would manufacture a claim no single
-//! read can justify (Implementation I0.5).
+//! Support and evidence vocabulary: the implementation-support and
+//! evidence-execution axes are **not** ControlBoard types. The contour carries
+//! the #216 owner records verbatim — [`DomainCoverage`] for all five
+//! `EvidenceDomain` axes, [`CapabilitySupportRow`] for capability ownership, and
+//! the owner's own [`EvidenceExecutionStatus`] / [`SupportObservationState`] —
+//! and validates them with the owner's own validators at one frozen evaluation
+//! boundary. There is deliberately no ControlBoard-local support alias, so a
+//! second support or proof vocabulary cannot be constructed here (I0.5, I2.23).
+//!
+//! Completeness: the declared coverage denominator is
+//! `EvidenceDomain::ALL`, taken from the owner crate, never from a
+//! caller-supplied list. A missing, duplicated, or out-of-order domain refuses
+//! the contour, so a domain cannot disappear from the board.
+//!
+//! Independence: `liveness`, `readiness`, `transport`, `evidence_execution`,
+//! `domain_coverage`, `support_rows`, and the `product_*` fields are separate
+//! contour fields with no synthesis function. A projected view proves neither
+//! liveness nor readiness, so both stay `Unknown` with explicit gaps; live
+//! process evidence remains owned by issue #11. `transport` and
+//! `evidence_execution` are the composition's own observation, reproduced
+//! verbatim: transport reachability is never derived from a row, and evidence
+//! execution is never read off the support rows. There is intentionally no
+//! `status()`, `is_healthy()`, or `is_ready()` constructor: collapsing the
+//! dimensions would manufacture a claim no single read can justify.
 //!
 //! Secret handling: the contour carries no session, credential, challenge,
 //! access-digest, token, or nonce fields by construction. Summaries are
@@ -42,6 +59,12 @@
 //! [`MAX_BINDING_CHARS`] characters; entry summaries at most
 //! [`MAX_SUMMARY_CHARS`] characters.
 
+use eliot_conformance_contracts::{
+    CONTRACT_VERSION as CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow,
+    ConformanceContractError, ConformanceContractSet, DomainCoverage, EvidenceExecutionStatus,
+    SupportObservationState, canonicalize_domain_coverage, canonicalize_support_claim_set,
+    validate_conformance_contract_set,
+};
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_controlboard::{
     BoardItemKind, ControlBoard, ControlBoardView, NotificationInbox, ReadRequest, ReviewLifecycle,
@@ -52,7 +75,7 @@ use thiserror::Error;
 use crate::ComponentState;
 
 /// Stable contract identity for this read-only contour.
-pub const CONTROLBOARD_CONTOUR_CONTRACT: &str = "eliot.runtime-status.controlboard-contour/v1";
+pub const CONTROLBOARD_CONTOUR_CONTRACT: &str = "eliot.runtime-status.controlboard-contour/v2";
 
 /// Maximum rows projected from one view (allocation guard, fail-closed).
 const MAX_CONTROLBOARD_ROWS: usize = 2048;
@@ -76,7 +99,12 @@ fn readiness_gap() -> String {
 /// Exactly one of `product_pulse` / `product_not_applicable` must be `Some`,
 /// mirroring the registry readback convention: a contour either names its
 /// Product Pulse or states explicitly why none applies.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The last five fields are the #216 owner records. They are reproduced
+/// verbatim and validated by the owner's own contract-set validator at the one
+/// `evaluated_at_ms` boundary; this module never rewrites, averages, or
+/// re-labels them, and never derives one from another.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlBoardProjectionBindings {
     /// Admitted read capability the operator read was performed under
@@ -99,6 +127,22 @@ pub struct ControlBoardProjectionBindings {
     pub product_pulse: Option<String>,
     /// Explicit reason no Product Pulse applies, when none is declared.
     pub product_not_applicable: Option<String>,
+    /// The one evaluation boundary this owner declares for this validation
+    /// unit. Coverage and support rows are checked together at exactly this
+    /// instant; a row evaluated at any other boundary refuses the contour.
+    pub evaluated_at_ms: u64,
+    /// Owner-declared five-domain coverage. Completeness is checked against
+    /// the owner's `EvidenceDomain::ALL`, never against this list.
+    pub domain_coverage: Vec<DomainCoverage>,
+    /// Owner-declared capability support rows, checked against the coverage
+    /// above. An empty set is accepted and mints no support claim.
+    pub support_rows: Vec<CapabilitySupportRow>,
+    /// Transport reachability of the read edge, as the composition observed it.
+    /// Never inferred from a row, a pipe, a port, or a process.
+    pub transport: SupportObservationState,
+    /// Evidence execution of the cited evidence, as the composition observed
+    /// it. Never recomputed from the support rows.
+    pub evidence_execution: EvidenceExecutionStatus,
 }
 
 /// Which board entry a status row was projected from.
@@ -136,24 +180,15 @@ pub struct ControlBoardStatusRow {
     pub invalidation: String,
 }
 
-/// Implementation-support position this projection may claim.
-///
-/// The only justifiable position for a freshly read view is
-/// `CURRENT_UNVERIFIED`: source exists in-process, product behavior is not
-/// proven. The vocabulary is a closed single-variant enum so no other support
-/// claim can be constructed or deserialized through this contour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ControlBoardSupport {
-    CurrentUnverified,
-}
-
 /// Read-only `ControlBoard` contour.
 ///
-/// Liveness, readiness, support, evidence, and Product are independent fields.
-/// No method combines them; adding one would manufacture a claim no single
-/// read can justify.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Liveness, readiness, transport, evidence execution, five-domain coverage,
+/// capability support and Product are independent fields. No method combines
+/// them; adding one would manufacture a claim no single read can justify.
+/// `Eq` is intentionally absent: the owner records carried here
+/// ([`DomainCoverage`], [`CapabilitySupportRow`]) are `PartialEq` only, and the
+/// contour refuses to narrow them to a weaker equality contract.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlBoardContour {
     /// Always [`CONTROLBOARD_CONTOUR_CONTRACT`].
@@ -177,8 +212,23 @@ pub struct ControlBoardContour {
     pub liveness: ComponentState,
     /// Always `Unknown`: a view does not prove readiness.
     pub readiness: ComponentState,
-    /// Always `CURRENT_UNVERIFIED`: source read, behavior unproven.
-    pub support: ControlBoardSupport,
+    /// Transport reachability of the read edge, reproduced verbatim from the
+    /// composition. Never inferred from a port, a pipe, or a process, and
+    /// never promoted into liveness or readiness.
+    pub transport: SupportObservationState,
+    /// Evidence execution of the cited evidence, reproduced verbatim from the
+    /// composition. Never recomputed from the support rows and never promoted
+    /// into implementation support.
+    pub evidence_execution: EvidenceExecutionStatus,
+    /// The one evaluation boundary the owner declared for this validation unit.
+    pub evaluated_at_ms: u64,
+    /// Exactly one coverage record per `EvidenceDomain`, canonicalized and
+    /// validated by the owner crate. An omitted domain cannot reach this board.
+    pub domain_coverage: Vec<DomainCoverage>,
+    /// Owner capability support rows, canonicalized and validated against
+    /// `domain_coverage`. Each row keeps its own independent maturity,
+    /// implementation-support and evidence-execution values.
+    pub support_rows: Vec<CapabilitySupportRow>,
     /// Caller evidence plus the exact view-revision reference.
     pub evidence_refs: Vec<String>,
     /// Product Pulse reference, when the owning composition declares one.
@@ -218,6 +268,12 @@ pub enum ControlBoardProjectionError {
     /// Neither or both Product bindings are present; exactly one is required.
     #[error("controlboard contour requires exactly one product binding")]
     MissingPulseBinding,
+    /// The owner-declared five-domain coverage or capability support rows were
+    /// refused by the owner's own `eliot-conformance-contracts` validator. The
+    /// error is the owner's, reproduced verbatim: this module never repairs,
+    /// relaxes, or re-labels a support or evidence claim.
+    #[error("controlboard I0.5 evidence axis refused: {0}")]
+    EvidenceAxis(#[from] ConformanceContractError),
     /// The authenticated board read itself failed; no contour exists.
     #[error("controlboard read failed: {detail}")]
     ReadFailed {
@@ -277,18 +333,69 @@ fn validate_bindings(
     Ok(())
 }
 
+/// Canonical owner evidence records for one contour, validated at the single
+/// declared evaluation boundary.
+///
+/// The coverage denominator is the owner's `EvidenceDomain::ALL`, so a missing,
+/// duplicated, or out-of-order domain refuses the contour. The support rows are
+/// checked against that exact coverage at the same boundary, and a mixed
+/// boundary is rejected rather than normalized. Nothing here recomputes a
+/// support or evidence-execution value from another field.
+fn validated_evidence_axes(
+    bindings: &ControlBoardProjectionBindings,
+) -> Result<(Vec<DomainCoverage>, Vec<CapabilitySupportRow>), ControlBoardProjectionError> {
+    let domain_coverage = canonicalize_domain_coverage(bindings.domain_coverage.clone())?;
+    let support_rows =
+        canonicalize_support_claim_set(bindings.support_rows.clone(), &domain_coverage)?;
+    validate_conformance_contract_set(&ConformanceContractSet {
+        contract_version: CONFORMANCE_CONTRACT_VERSION,
+        evaluated_at_ms: bindings.evaluated_at_ms,
+        domain_coverage: domain_coverage.clone(),
+        support_rows: support_rows.clone(),
+    })?;
+    Ok((domain_coverage, support_rows))
+}
+
+/// One shape-validated, owner-stamped projection row.
+///
+/// The row text is validated here rather than in the caller so the item and
+/// review paths cannot drift apart, and so every projected row is stamped from
+/// the same validated bindings in the same order.
+fn stamped_row(
+    entry_id: &str,
+    entry: ControlBoardEntryKind,
+    summary: &str,
+    bindings: &ControlBoardProjectionBindings,
+) -> Result<ControlBoardStatusRow, ControlBoardProjectionError> {
+    bound_text(entry_id, "row.entry_id", MAX_BINDING_CHARS)?;
+    bound_text(summary, "row.summary", MAX_SUMMARY_CHARS)?;
+    Ok(ControlBoardStatusRow {
+        entry_id: entry_id.to_owned(),
+        entry,
+        summary: summary.to_owned(),
+        capability: bindings.capability.clone(),
+        owner: bindings.owner.clone(),
+        generation: bindings.generation.clone(),
+        evidence: bindings.evidence.clone(),
+        expiry: bindings.expiry.clone(),
+        invalidation: bindings.invalidation.clone(),
+    })
+}
+
 /// Projects one read-only contour over an already-obtained board view.
 ///
 /// The view is consumed by shared reference; role/privacy filtering is the
 /// view's own property and is preserved 1:1. Every row is stamped with the
-/// validated caller bindings. Liveness and readiness stay `Unknown`,
-/// support stays `CURRENT_UNVERIFIED`, and Product stays exactly the
-/// caller-declared pulse binding: the dimensions are never merged.
+/// validated caller bindings. Liveness and readiness stay `Unknown`, the owner
+/// evidence records are carried verbatim after the owner's own validation, and
+/// Product stays exactly the caller-declared pulse binding: the dimensions are
+/// never merged.
 pub fn project_controlboard_contour(
     view: &ControlBoardView,
     bindings: &ControlBoardProjectionBindings,
 ) -> Result<ControlBoardContour, ControlBoardProjectionError> {
     validate_bindings(bindings)?;
+    let (domain_coverage, support_rows) = validated_evidence_axes(bindings)?;
     let entry_total = view.items.len().saturating_add(view.reviews.len());
     if entry_total > MAX_CONTROLBOARD_ROWS {
         return Err(ControlBoardProjectionError::Oversized { field: "rows" });
@@ -296,44 +403,32 @@ pub fn project_controlboard_contour(
     let mut rows = Vec::with_capacity(entry_total);
     let mut seen_ids = std::collections::BTreeSet::new();
     for item in &view.items {
-        bound_text(&item.item_id, "row.entry_id", MAX_BINDING_CHARS)?;
-        bound_text(&item.summary, "row.summary", MAX_SUMMARY_CHARS)?;
+        let row = stamped_row(
+            &item.item_id,
+            ControlBoardEntryKind::Item(item.kind),
+            &item.summary,
+            bindings,
+        )?;
         if !seen_ids.insert(item.item_id.clone()) {
             return Err(ControlBoardProjectionError::DuplicateEntryId {
                 entry_id: item.item_id.clone(),
             });
         }
-        rows.push(ControlBoardStatusRow {
-            entry_id: item.item_id.clone(),
-            entry: ControlBoardEntryKind::Item(item.kind),
-            summary: item.summary.clone(),
-            capability: bindings.capability.clone(),
-            owner: bindings.owner.clone(),
-            generation: bindings.generation.clone(),
-            evidence: bindings.evidence.clone(),
-            expiry: bindings.expiry.clone(),
-            invalidation: bindings.invalidation.clone(),
-        });
+        rows.push(row);
     }
     for review in &view.reviews {
-        bound_text(&review.review_item_id, "row.entry_id", MAX_BINDING_CHARS)?;
-        bound_text(&review.content, "row.summary", MAX_SUMMARY_CHARS)?;
+        let row = stamped_row(
+            &review.review_item_id,
+            ControlBoardEntryKind::Review(review.lifecycle),
+            &review.content,
+            bindings,
+        )?;
         if !seen_ids.insert(review.review_item_id.clone()) {
             return Err(ControlBoardProjectionError::DuplicateEntryId {
                 entry_id: review.review_item_id.clone(),
             });
         }
-        rows.push(ControlBoardStatusRow {
-            entry_id: review.review_item_id.clone(),
-            entry: ControlBoardEntryKind::Review(review.lifecycle),
-            summary: review.content.clone(),
-            capability: bindings.capability.clone(),
-            owner: bindings.owner.clone(),
-            generation: bindings.generation.clone(),
-            evidence: bindings.evidence.clone(),
-            expiry: bindings.expiry.clone(),
-            invalidation: bindings.invalidation.clone(),
-        });
+        rows.push(row);
     }
     let revision = view.revision.get();
     let evidence_refs = vec![
@@ -347,6 +442,11 @@ pub fn project_controlboard_contour(
         &rows,
         &view.notifications,
         &evidence_refs,
+        &domain_coverage,
+        &support_rows,
+        bindings.evaluated_at_ms,
+        bindings.transport,
+        bindings.evidence_execution,
     ))
     .map_err(|error| ControlBoardProjectionError::EncodingFailed {
         detail: error.to_string(),
@@ -368,7 +468,11 @@ pub fn project_controlboard_contour(
             reason: "controlboard view presence does not prove readiness".to_owned(),
             gap: readiness_gap(),
         },
-        support: ControlBoardSupport::CurrentUnverified,
+        transport: bindings.transport,
+        evidence_execution: bindings.evidence_execution,
+        evaluated_at_ms: bindings.evaluated_at_ms,
+        domain_coverage,
+        support_rows,
         evidence_refs,
         product_pulse: bindings.product_pulse.clone(),
         product_not_applicable: bindings.product_not_applicable.clone(),
@@ -398,6 +502,71 @@ pub fn read_controlboard_contour(
     project_controlboard_contour(&view, bindings)
 }
 
+/// Owner-record fixtures shared by this crate's controlboard test modules.
+///
+/// The records are built from the owner's own vocabulary and claim nothing:
+/// every domain is `Unknown` and the single support row is `TARGET` /
+/// `NOT_EXECUTED`, which is the strongest position a fixture without executed
+/// evidence may carry. Nothing here invents an observation.
+#[cfg(test)]
+pub(crate) mod owner_records {
+    use eliot_conformance_contracts::{
+        CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity, DomainCoverage, EvidenceDomain,
+        EvidenceExecutionStatus, ImplementationSupport, SupportObservationState,
+    };
+
+    /// One declared evaluation boundary shared by coverage and support rows.
+    pub const EVALUATED_AT_MS: u64 = 1_786_000_000_000;
+
+    /// Exactly one `Unknown` coverage record per `EvidenceDomain`, in the
+    /// owner's canonical order.
+    #[must_use]
+    pub fn unobserved_coverage() -> Vec<DomainCoverage> {
+        EvidenceDomain::ALL
+            .iter()
+            .map(|domain| DomainCoverage {
+                contract_version: CONTRACT_VERSION,
+                domain: *domain,
+                state: SupportObservationState::Unknown,
+                source_handles: Vec::new(),
+                evidence_refs: vec![format!("owner-record:{domain:?}")],
+                blind_boundaries: Vec::new(),
+                observed_at_ms: None,
+                expires_at_ms: None,
+                invalidation_set: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// One `TARGET` / `NOT_EXECUTED` capability support row for the `Source`
+    /// domain at [`EVALUATED_AT_MS`].
+    #[must_use]
+    pub fn target_source_support_row() -> CapabilitySupportRow {
+        CapabilitySupportRow {
+            contract_version: CONTRACT_VERSION,
+            contract_ref: "eliot.surfaces.controlboard/v1".to_owned(),
+            support_claim_ref: "controlboard.status#projected-rows".to_owned(),
+            scope_ref: "eliot-runtime-status#controlboard".to_owned(),
+            claim_domain: Some(EvidenceDomain::Source),
+            required_dependency_domains: vec![EvidenceDomain::Source],
+            support_observation_state: SupportObservationState::Unknown,
+            contract_maturity: ContractMaturity::Compatible,
+            implementation_support: ImplementationSupport::Target,
+            evidence_execution_status: EvidenceExecutionStatus::NotExecuted,
+            proof_profile_ref: None,
+            source_handles: vec![
+                "crates/meta/eliot-runtime-status/src/controlboard_projection.rs".to_owned(),
+            ],
+            evidence_refs: vec!["owner-record:Source".to_owned()],
+            blind_boundaries: Vec::new(),
+            invalidation_set: vec!["source-head-change".to_owned()],
+            compatibility_rule_ref: None,
+            not_applicable_reason_ref: None,
+            evaluated_at_ms: EVALUATED_AT_MS,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -405,6 +574,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use eliot_conformance_contracts::{EvidenceDomain, ImplementationSupport};
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_controlboard::{
         AccessBinding, AccessResolverPort, AnchorResolution, AnchorTargetKind, BoardItem,
@@ -484,6 +654,11 @@ mod tests {
             product_not_applicable: Some(
                 "read-only status contour carries no product claim".to_owned(),
             ),
+            evaluated_at_ms: super::owner_records::EVALUATED_AT_MS,
+            domain_coverage: super::owner_records::unobserved_coverage(),
+            support_rows: vec![super::owner_records::target_source_support_row()],
+            transport: SupportObservationState::Unknown,
+            evidence_execution: EvidenceExecutionStatus::NotExecuted,
         }
     }
 
@@ -658,11 +833,26 @@ mod tests {
         other_bindings.evidence = "evidence-other".to_owned();
         other_bindings.product_pulse = Some("pulse-b".to_owned());
         other_bindings.product_not_applicable = None;
+        other_bindings.transport = SupportObservationState::Unavailable;
+        other_bindings.evidence_execution = EvidenceExecutionStatus::UnknownOutcome;
         let second = project_controlboard_contour(&view(), &other_bindings).expect("second");
-        // Liveness, readiness, and support do not move with evidence/Product.
+        // Liveness and readiness never move with evidence, transport, evidence
+        // execution, or Product.
         assert_eq!(first.liveness, second.liveness);
         assert_eq!(first.readiness, second.readiness);
-        assert_eq!(first.support, second.support);
+        // Transport and evidence execution are their own axes: they move only
+        // where the composition observed them, and they never become liveness,
+        // readiness, or support.
+        assert_eq!(first.transport, SupportObservationState::Unknown);
+        assert_eq!(second.transport, SupportObservationState::Unavailable);
+        assert_eq!(
+            first.evidence_execution,
+            EvidenceExecutionStatus::NotExecuted
+        );
+        assert_eq!(
+            second.evidence_execution,
+            EvidenceExecutionStatus::UnknownOutcome
+        );
         // Evidence and Product move exactly as supplied, nowhere else.
         assert_ne!(first.evidence_refs, second.evidence_refs);
         assert_ne!(first.contour_digest, second.contour_digest);
@@ -680,11 +870,38 @@ mod tests {
     }
 
     #[test]
-    fn support_is_pinned_to_current_unverified() {
+    fn support_axis_is_the_owner_record_not_a_controlboard_alias() {
         let contour = project_controlboard_contour(&view(), &bindings()).expect("contour");
-        assert_eq!(contour.support, ControlBoardSupport::CurrentUnverified);
+        // The implementation-support axis is the owner's record, not a
+        // ControlBoard alias: exactly one coverage record per declared domain,
+        // and the owner support row keeps its own independent values.
+        assert_eq!(
+            contour.evaluated_at_ms,
+            super::owner_records::EVALUATED_AT_MS
+        );
+        assert_eq!(contour.domain_coverage.len(), 5);
+        assert_eq!(
+            contour
+                .domain_coverage
+                .iter()
+                .map(|row| row.domain)
+                .collect::<Vec<_>>(),
+            EvidenceDomain::ALL.to_vec()
+        );
+        assert_eq!(contour.support_rows.len(), 1);
+        assert_eq!(
+            contour.support_rows[0].implementation_support,
+            ImplementationSupport::Target
+        );
+        assert_eq!(
+            contour.support_rows[0].evidence_execution_status,
+            EvidenceExecutionStatus::NotExecuted
+        );
+        // No ControlBoard-specific support alias reaches the wire.
         let json = serde_json::to_value(&contour).expect("json");
-        assert_eq!(json["support"], serde_json::json!("CURRENT_UNVERIFIED"));
+        assert!(json.get("support").is_none());
+        assert!(json.get("domain_coverage").is_some());
+        assert!(json.get("support_rows").is_some());
     }
 
     #[test]

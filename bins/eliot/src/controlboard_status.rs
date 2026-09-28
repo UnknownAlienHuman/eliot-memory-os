@@ -66,9 +66,12 @@ pub fn decode_status_response(
 ///
 /// Every row keeps its typed disposition label plus the exact observer and
 /// projection identity fields; counts, unexpected entries, expiry, and
-/// invalidation are reproduced verbatim. No health, readiness, support, or
-/// product scalar is synthesized: a rendered label is an observation state,
-/// never a verdict.
+/// invalidation are reproduced verbatim. The board-level I0.5 evidence axes —
+/// transport reachability, evidence execution, the evaluation boundary, the
+/// five-domain coverage, and the owner capability support rows — are reproduced
+/// verbatim under their own keys. No health, readiness, support, or product
+/// scalar is synthesized: a rendered label is an observation state, never a
+/// verdict, and no axis is derived from another.
 pub fn render_status_json(
     board: &RenderedControlBoard,
 ) -> Result<serde_json::Value, ControlBoardStatusError> {
@@ -95,6 +98,10 @@ pub fn render_status_json(
         .collect();
     let view_fence = serde_json::to_value(&board.view_fence)
         .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
+    let domain_coverage = serde_json::to_value(&board.domain_coverage)
+        .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
+    let support_rows = serde_json::to_value(&board.support_rows)
+        .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
     Ok(serde_json::json!({
         "contract": "eliot.controlboard.status",
         "contract_version": "1.0.0",
@@ -105,6 +112,11 @@ pub fn render_status_json(
         "observed_count": board.observed_count,
         "missing_count": board.missing_count,
         "unexpected_observed": board.unexpected_observed,
+        "transport": board.transport,
+        "evidence_execution": board.evidence_execution,
+        "evaluated_at_ms": board.evaluated_at_ms,
+        "domain_coverage": domain_coverage,
+        "support_rows": support_rows,
         "expiry": board.expiry,
         "invalidation": board.invalidation,
         "rows": rows?,
@@ -131,12 +143,59 @@ mod tests {
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
     use eliot_runtime_status::{
+        CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity,
         ControlBoardInstallation, ControlBoardObservationTime, ControlBoardRecoveryOwner,
-        ControlBoardRowDisposition, ControlBoardSourceDigest, build_controlboard_frame,
-        open_controlboard_frame,
+        ControlBoardRowDisposition, ControlBoardSourceDigest, DomainCoverage, EvidenceDomain,
+        EvidenceExecutionStatus, ImplementationSupport, SupportObservationState,
+        build_controlboard_frame, open_controlboard_frame,
     };
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_EVALUATED_AT_MS: u64 = 1_786_000_000_002;
+
+    /// Owner coverage fixture: one `Unknown` record per declared domain. It
+    /// observes nothing, which is the only position a fixture may honestly
+    /// carry.
+    fn unobserved_coverage() -> Vec<DomainCoverage> {
+        EvidenceDomain::ALL
+            .iter()
+            .map(|domain| DomainCoverage {
+                contract_version: CONFORMANCE_CONTRACT_VERSION,
+                domain: *domain,
+                state: SupportObservationState::Unknown,
+                source_handles: Vec::new(),
+                evidence_refs: vec![format!("owner-record:{domain:?}")],
+                blind_boundaries: Vec::new(),
+                observed_at_ms: None,
+                expires_at_ms: None,
+                invalidation_set: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Owner support-row fixture: `TARGET` / `NOT_EXECUTED`, claiming nothing.
+    fn target_source_support_row() -> CapabilitySupportRow {
+        CapabilitySupportRow {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            contract_ref: "eliot.surfaces.controlboard/v1".to_owned(),
+            support_claim_ref: "controlboard.status#projected-rows".to_owned(),
+            scope_ref: "eliot-runtime-status#controlboard".to_owned(),
+            claim_domain: Some(EvidenceDomain::Source),
+            required_dependency_domains: vec![EvidenceDomain::Source],
+            support_observation_state: SupportObservationState::Unknown,
+            contract_maturity: ContractMaturity::Compatible,
+            implementation_support: ImplementationSupport::Target,
+            evidence_execution_status: EvidenceExecutionStatus::NotExecuted,
+            proof_profile_ref: None,
+            source_handles: vec!["bins/eliot/src/controlboard_status.rs".to_owned()],
+            evidence_refs: vec!["owner-record:Source".to_owned()],
+            blind_boundaries: Vec::new(),
+            invalidation_set: vec!["source-head-change".to_owned()],
+            compatibility_rule_ref: None,
+            not_applicable_reason_ref: None,
+            evaluated_at_ms: TEST_EVALUATED_AT_MS,
+        }
+    }
 
     fn fence() -> StateFence {
         let epoch = EpochId::new(
@@ -204,6 +263,11 @@ mod tests {
             observed_count: 1,
             missing_count: 1,
             unexpected_observed: vec!["extra-entry".to_owned()],
+            transport: SupportObservationState::Unknown,
+            evidence_execution: EvidenceExecutionStatus::NotExecuted,
+            evaluated_at_ms: TEST_EVALUATED_AT_MS,
+            domain_coverage: unobserved_coverage(),
+            support_rows: vec![target_source_support_row()],
             expiry: "re-read required after fence or generation change".to_owned(),
             invalidation: "revision/fence change, generation rotation, owner rebind".to_owned(),
         }
