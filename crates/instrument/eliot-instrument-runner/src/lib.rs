@@ -67,7 +67,7 @@ pub use profile::{
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
     ProfileRunError, ProviderDispatch, StageEvidence, StageIdentity, StageLauncher,
-    StageOrchestrator, StagePlan, TestExecutionPlaneRoute, TestdPlaneAdmission,
+    StageOrchestrator, StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,
     compose_provider_dispatch,
 };
 pub use provider_denominator::{
@@ -339,6 +339,14 @@ pub struct InstrumentStartReceipt {
     pub executable: Option<ResolvedExecutableIdentity>,
     /// Exact process argv sealed from the request at launch.
     pub argv: Vec<String>,
+    /// Working directory sealed from the request at launch.
+    pub working_directory: String,
+    /// `CARGO_TARGET_DIR` sealed from the request environment at launch,
+    /// when the admitted request carries one.
+    pub target_root_observed: Option<String>,
+    /// `CARGO_HOME` sealed from the request environment at launch, when
+    /// the admitted request carries one.
+    pub cache_root_observed: Option<String>,
 }
 
 /// Current process observation correlated to its instrument invocation.
@@ -609,6 +617,17 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
             .ok_or(RunnerError::ReceiptMismatch)?;
         let argv = process_request.argv().to_vec();
         let executable = binding.verified_executable.clone();
+        let working_directory = process_request.working_directory().to_owned();
+        let target_root_observed = process_request
+            .environment()
+            .non_secret()
+            .get("CARGO_TARGET_DIR")
+            .cloned();
+        let cache_root_observed = process_request
+            .environment()
+            .non_secret()
+            .get("CARGO_HOME")
+            .cloned();
         let process = self.executor.start(process_request, sink).await?;
         if process.operation_id() != &binding.operation_id
             || process.request_digest() != binding.request_digest
@@ -621,6 +640,9 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
             process,
             executable,
             argv,
+            working_directory,
+            target_root_observed,
+            cache_root_observed,
         })
     }
 

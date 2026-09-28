@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use eliot_contracts::{ContractError, ContractId, ContractVersion, StateFence, sha256_hex};
-use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentKind};
+use eliot_instrument_api::{
+    BuildClass, InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentKind,
+};
 use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
@@ -2028,6 +2030,28 @@ impl AdmittedProfile {
     /// Whether the admission covers the invocation class.
     pub fn admits_kind(&self, kind: InstrumentKind) -> bool {
         self.kinds.contains(&kind)
+    }
+}
+
+impl AdmittedStage {
+    /// Selects the governed build class for this admitted stage definition.
+    ///
+    /// Returns `None` when the stage kind has no dedicated class; such a
+    /// stage emits no build output or requires an explicitly owner-issued
+    /// class, and is never silently merged into a neighbor class.
+    pub fn build_class(&self) -> Option<BuildClass> {
+        BuildClass::for_instrument_kind(self.kind)
+    }
+}
+
+impl ResolvedStage {
+    /// Selects the governed build class for this resolved stage definition.
+    ///
+    /// Returns `None` when the stage kind has no dedicated class; such a
+    /// stage emits no build output or requires an explicitly owner-issued
+    /// class, and is never silently merged into a neighbor class.
+    pub fn build_class(&self) -> Option<BuildClass> {
+        BuildClass::for_instrument_kind(self.kind)
     }
 }
 
