@@ -39,11 +39,11 @@ use eliot_platform_windows::{AdmittedEventLogEvent, ProcessIdentity};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use crate::SpoolError;
 use crate::host_identity_observation::{
     ApprovedRecoveryPolicy, BoundedChallengeWait, ChallengeAttemptOutcome, ChallengeUncertainty,
     HostObservation, HostObservationState, HostResponsiveness, RecoveryBudgetDecision,
 };
-use crate::SpoolError;
 
 /// Single-key row of the open recovery operation.
 ///
@@ -235,7 +235,7 @@ impl RecoveryTarget {
 /// expected-generation check. The three are independent; none substitutes for
 /// another, and none is satisfied by the service name or by an earlier status
 /// query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundaryEvidence {
     /// Does the live SCM configuration still match the approved registration
     /// this target was bound to?
@@ -330,8 +330,14 @@ impl AuditCorrelation {
     fn validate(&self) -> Result<(), RecoveryError> {
         validated("audit correlation operation", &self.operation_id)?;
         validated("audit correlation policy", &self.policy_digest)?;
-        validated("audit correlation target generation", &self.target_generation)?;
-        validated("audit correlation target identity", &self.target_identity_digest)
+        validated(
+            "audit correlation target generation",
+            &self.target_generation,
+        )?;
+        validated(
+            "audit correlation target identity",
+            &self.target_identity_digest,
+        )
     }
 }
 
@@ -388,11 +394,13 @@ impl EventLogDelivery {
 
     /// Whether an Event Log record for this cell can be claimed readable back.
     ///
-    /// It cannot: the installed source does not admit one, so no code may treat
-    /// a persisted spool record as Event Log visibility.
+    /// It reads the installed port's own closed admission rule rather than
+    /// assuming it, so a future owner extension flips this without a second
+    /// source of truth. While it is `false` no code may treat a persisted spool
+    /// record as Event Log visibility.
     #[must_use]
-    pub const fn readable_back(&self) -> bool {
-        false
+    pub fn readable_back(&self) -> bool {
+        AdmittedEventLogEvent::admits_watchdog_audit()
     }
 }
 
@@ -755,11 +763,16 @@ impl RecoveryOperation {
         let next = step.target_phase();
         let follows = matches!(
             (self.phase, next),
-            (RecoveryPhase::StopIntentCommitted, RecoveryPhase::StopObserved)
-                | (RecoveryPhase::StopIntentCommitted, RecoveryPhase::StopOutcomeUnknown)
-                | (RecoveryPhase::StopObserved, RecoveryPhase::StartIntentCommitted)
-                | (RecoveryPhase::StartIntentCommitted, RecoveryPhase::StartedObserved)
-                | (RecoveryPhase::StartIntentCommitted, RecoveryPhase::StartOutcomeUnknown)
+            (
+                RecoveryPhase::StopIntentCommitted,
+                RecoveryPhase::StopObserved | RecoveryPhase::StopOutcomeUnknown
+            ) | (
+                RecoveryPhase::StopObserved,
+                RecoveryPhase::StartIntentCommitted
+            ) | (
+                RecoveryPhase::StartIntentCommitted,
+                RecoveryPhase::StartedObserved | RecoveryPhase::StartOutcomeUnknown
+            )
         );
         if !self.phase.is_open() || !follows {
             return Err(RecoveryError::IllegalPhase);
@@ -934,7 +947,7 @@ pub struct AdmittedRecoveryIntent {
 }
 
 /// Every input one boundary revalidation reads.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct RecoveryFence<'audit> {
     /// The installation-approved recovery policy.
     pub policy: &'audit ApprovedRecoveryPolicy,
@@ -1145,7 +1158,16 @@ pub fn read_recovery_operation(
 /// Returns [`RecoveryError::Journal`] when the journal cannot be read and
 /// [`RecoveryError::Invalid`] when a stored row is not canonical.
 pub fn read_recovery_budget(database: &Database) -> Result<RecoveryBudget, RecoveryError> {
-    read_budget_in(database)
+    read_budget_in(database)?.map_or_else(
+        || {
+            Ok(RecoveryBudget {
+                schema_version: RECOVERY_SCHEMA_VERSION,
+                attempt_timestamps_ms: Vec::new(),
+                consecutive_failures: 0,
+            })
+        },
+        Ok,
+    )
 }
 
 /// Advances the durable failure and attempt accounting.
@@ -1254,8 +1276,7 @@ pub fn begin_recovery_operation(
     };
     if stored
         .as_ref()
-        .is_some_and(RecoveryOperation::phase)
-        .is_some_and(RecoveryPhase::is_open)
+        .is_some_and(|previous| previous.phase().is_open())
     {
         return Err(RecoveryError::OperationOpen);
     }
@@ -1303,13 +1324,15 @@ pub fn commit_recovery_step(
     let expected_bytes = encode(expected)?;
     let write = database.begin_write().map_err(journal)?;
     let mut stored = {
-        let table = write.open_table(SPOOL_RECOVERY_TABLE).map_err(journal)?;
-        let row = table.get(SPOOL_RECOVERY_KEY).map_err(journal)?;
-        let stored: RecoveryOperation = match row {
-            None => return Err(RecoveryError::Conflict),
-            Some(value) => decode(value.value())?,
+        let stored: Option<RecoveryOperation> = {
+            let table = write.open_table(SPOOL_RECOVERY_TABLE).map_err(journal)?;
+            let row = table.get(SPOOL_RECOVERY_KEY).map_err(journal)?;
+            match row {
+                None => None,
+                Some(value) => Some(decode(value.value())?),
+            }
         };
-        drop(table);
+        let stored = stored.ok_or(RecoveryError::Conflict)?;
         if encode(&stored)? != expected_bytes {
             return Err(RecoveryError::Conflict);
         }
@@ -1323,9 +1346,7 @@ pub fn commit_recovery_step(
             ));
         }
         if evidence.generation.as_ref() != Some(&target.generation) {
-            return Err(RecoveryError::Boundary(
-                BoundaryRefusal::GenerationChanged,
-            ));
+            return Err(RecoveryError::Boundary(BoundaryRefusal::GenerationChanged));
         }
     }
     stored.apply(step)?;
