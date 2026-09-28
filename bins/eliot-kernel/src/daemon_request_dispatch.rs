@@ -5741,20 +5741,21 @@ impl KernelComposition {
         let grant = gateway
             .decide_origin_control(&presentation)
             .map_err(|_| TransportError::SessionFenced)?;
-        // Graceful WASM half (`#2896`): when the decided operation is a
-        // supervised WASM-host parent, the owner first offers a versioned
-        // Shutdown delivery through its replayable control spool, so the
-        // host loop can close admission before the gateway kill lands. A
-        // foreign image skips this half with the response unchanged; a
-        // proven WASM operation that cannot stage or retain its control
-        // fails closed before the kill.
-        let wasm_control = Self::publish_wasm_host_control(
+        // Graceful WASM ladder (`#2896` W1/A1): when the decided
+        // operation is a supervised WASM-host parent, the owner first
+        // offers the ordered Reconcile/Cancel/Shutdown ladder through
+        // its replayable control spool — the exact A4 ordered pairs —
+        // so the host loop can reconcile the uncertain outcome,
+        // contain guest work, and close admission before the gateway
+        // kill lands. A foreign image skips this half with the response
+        // unchanged; a proven WASM operation that cannot stage or
+        // retain its control fails closed before the kill.
+        let wasm_control = Self::publish_wasm_host_control_sequence(
             session,
             &owner,
             &operation.operation_id,
             presentation.request(),
             &grant,
-            eliot_kernel_service::WasmControlKind::Shutdown,
         )?;
         let cancelled = gateway
             .cancel_with_origin_grant(&owner, operation.operation_id.clone(), &grant)
@@ -5789,13 +5790,13 @@ impl KernelComposition {
                 }
             }
             WasmHostControlOutcome::Published {
-                receipt,
+                receipts,
                 install_dir,
             } => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert(
                         "control".to_owned(),
-                        wasm_host_control_projection(&install_dir, &receipt),
+                        wasm_host_control_projection(&install_dir, &receipts),
                     );
                 }
             }
@@ -7568,10 +7569,10 @@ impl KernelComposition {
     }
 
     /// Publishes one graceful owner control for a decided WASM-host
-    /// operation (`#2896`): the production Kernel call behind external
-    /// Cancel/Reconcile/Shutdown delivery, reached from
-    /// [`Self::origin_control_decide_operation`] after the origin grant
-    /// issues and before the gateway kill lands.
+    /// operation (`#2896`): the production Kernel call behind one
+    /// external Cancel/Reconcile/Shutdown delivery, reached per kind
+    /// from [`Self::publish_wasm_host_control_sequence`] after the
+    /// origin grant issues and before the gateway kill lands.
     ///
     /// The publisher authenticates through the existing process/control
     /// owner contract, never through path correlation alone: the image
@@ -7684,9 +7685,87 @@ impl KernelComposition {
         let receipt = eliot_kernel_service::publish_wasm_control_delivery(&inputs)
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(WasmHostControlOutcome::Published {
-            receipt,
+            receipts: vec![receipt],
             install_dir: install_dir.to_path_buf(),
         })
+    }
+
+    /// Publishes the ordered graceful owner-control ladder for a
+    /// decided WASM-host operation (`#2896` W1/A1): Reconcile, then
+    /// Cancel, then Shutdown — the exact A4 ordered pairs — through
+    /// the existing owner spool before the gateway kill lands.
+    ///
+    /// The origin-control Kill decision is the sole production trigger
+    /// that binds the exact running WASM operation (inspected
+    /// process, origin grant, live session); it funds the whole
+    /// ladder, so the child never mints its own control authority.
+    /// Shutdown keeps its terminal position closing admission; Cancel
+    /// contains the uncertain outcome first (I2.4 cancellation before
+    /// forced termination) and Reconcile resolves it while authority
+    /// is still live (the host's own settle-while-live ladder,
+    /// mirrored owner-side). Each kind reuses the single
+    /// authenticated publisher [`Self::publish_wasm_host_control`],
+    /// so same-kind retries re-offer the retained identity and any
+    /// staging or retention fault fails the decision closed before
+    /// the kill, exactly like the single publish.
+    ///
+    /// The outcome merge is total: publishes accumulate in owner
+    /// order and the first non-published kind short-circuits. When at
+    /// least one delivery staged, the ladder reports `Published` with
+    /// every staged receipt and the kill proceeds; otherwise the
+    /// binding outcome propagates (`Foreign` leaves the response
+    /// unchanged, `NotStaged` carries its honest reason and the kill
+    /// proceeds).
+    fn publish_wasm_host_control_sequence(
+        session: &Session,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
+        request: &OriginChallengeRequest,
+        grant: &OriginControlGrant,
+    ) -> Result<WasmHostControlOutcome, TransportError> {
+        match Self::publish_wasm_host_control(
+            session,
+            owner,
+            operation_id,
+            request,
+            grant,
+            eliot_kernel_service::WasmControlKind::Reconcile,
+        )? {
+            WasmHostControlOutcome::Published {
+                mut receipts,
+                install_dir,
+            } => {
+                for control_kind in [
+                    eliot_kernel_service::WasmControlKind::Cancel,
+                    eliot_kernel_service::WasmControlKind::Shutdown,
+                ] {
+                    match Self::publish_wasm_host_control(
+                        session,
+                        owner,
+                        operation_id,
+                        request,
+                        grant,
+                        control_kind,
+                    )? {
+                        WasmHostControlOutcome::Published {
+                            receipts: staged, ..
+                        } => {
+                            receipts.extend(staged);
+                        }
+                        // Partial ladder: an operation that unbinds
+                        // mid-sequence keeps every staged delivery; the
+                        // kill proceeds and the projection notes each
+                        // staged sequence honestly.
+                        _ => break,
+                    }
+                }
+                Ok(WasmHostControlOutcome::Published {
+                    receipts,
+                    install_dir,
+                })
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
@@ -8086,42 +8165,50 @@ enum WasmHostControlOutcome {
         /// Stable reason code (never a path or digest).
         reason: &'static str,
     },
-    /// A versioned control was offered through the owner spool.
+    /// Versioned controls were offered through the owner spool: a
+    /// full Reconcile/Cancel/Shutdown ladder, or the staged prefix
+    /// when the operation unbound mid-sequence.
     Published {
-        /// Staged delivery receipt.
-        receipt: eliot_kernel_service::WasmControlPublishReceipt,
-        /// Spool root the delivery staged into.
+        /// Staged delivery receipts in owner-sequence order (non-empty).
+        receipts: Vec<eliot_kernel_service::WasmControlPublishReceipt>,
+        /// Spool root the deliveries staged into.
         install_dir: std::path::PathBuf,
     },
 }
 
-/// Projects the post-kill control status for one published WASM
-/// control (`#2896` item 12): the supervised-termination note lands
-/// first (a decisive ack still wins over `Unknown`), then a fresh
-/// spool reconcile reports every retained delivery and its
-/// terminal-or-open disposition.
+/// Projects the post-kill control status for the published WASM
+/// control ladder (`#2896` item 12): the supervised-termination note
+/// lands per staged delivery (a decisive ack still wins over `Unknown`
+/// on each), then a fresh spool reconcile reports every retained
+/// delivery and its terminal-or-open disposition.
 ///
 /// Never fails the decide response: the kill receipt is authoritative,
 /// so a spool fault degrades to an honest `unrecorded` marker instead
 /// of losing the receipt.
 fn wasm_host_control_projection(
     install_dir: &std::path::Path,
-    receipt: &eliot_kernel_service::WasmControlPublishReceipt,
+    receipts: &[eliot_kernel_service::WasmControlPublishReceipt],
 ) -> serde_json::Value {
+    let Some(head) = receipts.first() else {
+        return serde_json::json!({"staged": false, "reason": "ladder-empty"});
+    };
     let now = unix_ms();
-    let noted = eliot_kernel_service::note_wasm_control_supervised_end(
-        install_dir,
-        receipt.operation_id.as_str(),
-        receipt.generation,
-        receipt.owner_sequence,
-        "origin-kill-acknowledged",
-        now,
-    )
-    .is_ok();
+    let mut noted = true;
+    for receipt in receipts {
+        noted &= eliot_kernel_service::note_wasm_control_supervised_end(
+            install_dir,
+            receipt.operation_id.as_str(),
+            receipt.generation,
+            receipt.owner_sequence,
+            "origin-kill-acknowledged",
+            now,
+        )
+        .is_ok();
+    }
     let spool = eliot_kernel_service::reconcile_wasm_control_spool(
         install_dir,
-        receipt.operation_id.as_str(),
-        receipt.generation,
+        head.operation_id.as_str(),
+        head.generation,
         now,
     );
     let (spool_value, spool_ok) = match spool {
@@ -8133,7 +8220,7 @@ fn wasm_host_control_projection(
     };
     let mut control = serde_json::json!({
         "staged": true,
-        "publish": receipt,
+        "publishes": receipts,
         "spool": spool_value,
     });
     if (!noted || !spool_ok)
