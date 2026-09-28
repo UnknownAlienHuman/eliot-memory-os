@@ -76,7 +76,8 @@ use eliot_store_api::WriteReceipt;
 
 use super::backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    PublicationPort, PublishedArchive, SnapshotRelation, require_capture_admitted,
+    PublicationPort, PublishedArchive, SnapshotRelation, owner_fence_dispositions,
+    owner_residency_key_digest, owner_suspended_recovery_refs, require_capture_admitted,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -602,9 +603,9 @@ impl KernelBackupCapture {
         gate_class_capability(request)?;
         gate_approved_manifest_digests(request)?;
         // The ORS owner's own pending-operation identities are the frontier.
-        let unresolved_count = observed_unresolved_frontier(request).len() as u64;
+        let unresolved_count = observed_unresolved_frontier(request)?.len() as u64;
         require_suspended_claim_matches_frontier(request, unresolved_count)?;
-        let relation = snapshot_relation(&SnapshotEvidence::from_request(request));
+        let relation = snapshot_relation(&SnapshotEvidence::from_request(request))?;
         Self::validate_snapshot_relation(&relation)?;
         duration.check()?;
         let member_dispositions = check_denominator(request)?;
@@ -664,24 +665,26 @@ impl KernelBackupCapture {
         // producer's claim above. A caller-asserted integer never decides this.
         let (state, receipt_identity) =
             terminal_capture_decision(request, unresolved_count, &operation_id);
-        // The publication receipt is the owner-issued proof that this operation
-        // durably published THESE bytes, and it was already proved to match the
-        // operation identity and archive digest above. It is therefore the exact
-        // reference that qualifies the relation as this installation's own
-        // capture, and it is the same value the report carries as its receipt
-        // identity so the qualifier and the receipt field cannot drift apart.
-        // It is bound once here rather than cloned per field so the proof value
-        // used for the relation, for the restrictions and for the field itself is
-        // a single construction.
-        let capture_receipt =
-            receipt_identity
-                .clone()
-                .ok_or(KernelCaptureError::OwnerEvidenceInvalid(
-                    "capture published without an owner-issued publication receipt".to_owned(),
-                ))?;
+        // The provenance qualifier is bound to the OWNER-ISSUED receipt, never to
+        // the report's `receipt_identity`. That field is documented as "publication
+        // receipt identity, or the suspended-operations marker", so on a capture
+        // with an unresolved frontier it holds a coordinator-computed
+        // `suspended:<count>` string. Naming the qualifier from it would let a
+        // string this owner invented stand in for an owner receipt, which is
+        // precisely the substitution `ArchiveFenceProof::CaptureOwnerProven` is
+        // supposed to make impossible. The value bound here is the operation
+        // identity the OWNER returned, and the two comparisons above already
+        // proved it equals this operation's identity AND that the same receipt
+        // names this operation's archive digest, so the receipt is bound to this
+        // operation's content and not merely to a predictable name.
         let archived_fence_proof = ArchiveFenceProof::CaptureOwnerProven {
-            capture_receipt: capture_receipt.clone(),
+            capture_receipt: receipt.operation_id.clone(),
         };
+        // The report's own `receipt_identity` keeps its documented two-way
+        // meaning (the operation identity, or the suspended-operations marker
+        // when the archive carries a bounded unresolved frontier), so a reader of
+        // the report can tell which of the two it is looking at. It is NOT what
+        // the provenance qualifier is named from, for the reason above.
         Ok(CaptureReport {
             backup_id: identities.backup_id,
             class: request.plan.class,
@@ -716,7 +719,7 @@ impl KernelBackupCapture {
                 &bundle.export_fence.state_fence,
             )?,
             member_dispositions,
-            receipt_identity: Some(capture_receipt),
+            receipt_identity,
             archived_fence_proof,
         })
     }
@@ -788,7 +791,7 @@ impl KernelBackupCapture {
         // as on the capture contour: a structurally decodable archive whose
         // carried owner evidence does not form a coherent relation is not a
         // verifiable capture.
-        let relation = snapshot_relation(&SnapshotEvidence::from_bundle(&bundle));
+        let relation = snapshot_relation(&SnapshotEvidence::from_bundle(&bundle))?;
         Self::validate_snapshot_relation(&relation)?;
         // The relation is TOTAL over the archived complete fence value: a
         // foreign, ahead or divergent archive is a structural candidate carrying
@@ -820,7 +823,7 @@ impl KernelBackupCapture {
         let source_installation = bundle.export_fence.export_id.clone();
         let owner_contract = bundle.manifest.source_adapter.clone();
         let export_fence_digest = bundle.manifest.export_fence_sha256.clone();
-        let member_dispositions = member_disposition_list(
+        let mut member_dispositions = member_disposition_list(
             &bundle.canonical_events,
             &bundle.projections,
             &bundle.receipts,
@@ -828,6 +831,20 @@ impl KernelBackupCapture {
             &bundle.purge_ledger,
             &bundle.artifacts,
         )?;
+        // The archive's OWN owner-declared members are retained beside its carried
+        // content, through the same adapter the capture contour uses, so a decoded
+        // archive reports the same one-disposition-per-member set the capture
+        // contour produced.
+        member_dispositions.extend(
+            owner_fence_dispositions(
+                &bundle.export_fence,
+                bundle.ors_snapshot.as_ref(),
+                bundle.watchdog_spool.as_ref(),
+                bundle.host_audit.as_ref(),
+            )?
+            .iter()
+            .cloned(),
+        );
         let state = if class == BackupClass::FullRecovery {
             CaptureState::Complete
         } else {
@@ -1194,12 +1211,16 @@ fn gate_approved_manifest_digests(request: &CaptureRequest) -> Result<(), Kernel
 /// reports completeness against an independently supplied integer could claim a
 /// clean frontier while the ORS owner recorded unresolved operations. An absent
 /// ORS snapshot is an empty frontier, never a default of "none claimed".
-fn observed_unresolved_frontier(request: &CaptureRequest) -> Vec<String> {
+///
+/// The identities are read through the archive owner's own suspended derivation
+/// (`owner_suspended_recovery_refs`), which validates the fence before counting
+/// it. A raw read of `pending_operation_ids` would count rows the archive owner
+/// itself refuses.
+fn observed_unresolved_frontier(request: &CaptureRequest) -> Result<Vec<String>, KernelCaptureError> {
     request
         .ors_snapshot
         .as_ref()
-        .map(|snapshot| snapshot.pending_operation_ids.clone())
-        .unwrap_or_default()
+        .map_or(Ok(Vec::new()), owner_suspended_recovery_refs)
 }
 
 /// Refuses a producer whose asserted suspended count disagrees with the ORS
@@ -1440,9 +1461,17 @@ impl CaptureDuration {
 /// evidence: cursors from the ORS snapshot when present, otherwise from the
 /// observed canonical coverage; lineage from the export state fence;
 /// checkpoints, cutovers, and spool signals from their owners. Capture times
-/// stay empty here: production composition records per-owner capture times,
-/// and times alone never satisfy the relation.
-fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
+/// stay empty here: every accepted owner-neutral type hands this owner
+/// already-acquired evidence and none reports the instant it was acquired, so
+/// there is no per-owner clock to record, and times alone never satisfy the
+/// relation anyway.
+///
+/// The pending-operation identities come from the archive owner's own suspended
+/// derivation, so an ORS fence the owner refuses refuses the relation instead of
+/// yielding a shortened frontier.
+fn snapshot_relation(
+    evidence: &SnapshotEvidence<'_>,
+) -> Result<SnapshotRelation, KernelCaptureError> {
     let export_fence = evidence.export_fence;
     let receipt_cursor = evidence
         .ors_snapshot
@@ -1473,7 +1502,7 @@ fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
             .state_fence
             .is_compatible_with(&export_fence.state_fence)
     });
-    SnapshotRelation {
+    Ok(SnapshotRelation {
         installation_id: export_fence.export_id.clone(),
         store_generation: export_fence.store_generation.clone(),
         authority_lineage: export_fence
@@ -1485,10 +1514,12 @@ fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
         receipt_cursor,
         event_cursor,
         outbox_cursor,
-        pending_operation_ids: evidence
-            .ors_snapshot
-            .map(|snapshot| snapshot.pending_operation_ids.clone())
-            .unwrap_or_default(),
+        pending_operation_ids: match evidence.ors_snapshot {
+            Some(snapshot) => owner_suspended_recovery_refs(snapshot)?,
+            None => Vec::new(),
+        },
+        // Unreportable dimensions, not empty claims: see the field docs on
+        // `SnapshotRelation` in `backup_capture_ports.rs`.
         pending_operation_hashes: Vec::new(),
         checkpoint_ids: evidence
             .ors_snapshot
@@ -1509,38 +1540,19 @@ fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
             && purge_compatible
             && receipt_compatible,
         timestamps_only: false,
-    }
+    })
 }
 
-/// The opaque residency-key digest of one carried blob's full residency
-/// identity.
-///
-/// I5.13 requires every export and backup entry to "preserve the opaque
-/// residency-key digest" and never to merge blob records "solely because their
-/// content digests match"; I5.12 derives the physical path from
-/// `<residency-key-digest>` and deduplicates equal bytes "only when all
-/// residency-domain identities are equivalent". `BlobLocator::hash` is only the
-/// versioned CONTENT digest, so using it as a blob's identity here would
-/// collapse two obligations over equal bytes into one logical object.
-///
-/// The digest is taken over the canonical encoding the repository already has,
-/// over the whole `ObjectResidencyKey` (all six obligation domain ids plus the
-/// versioned content digest) — not over a hand-assembled concatenation of
-/// domain ids, which would be a second, differing digest scheme.
-fn blob_residency_key_digest(blob: &BackupBlob) -> Result<String, KernelCaptureError> {
-    let bytes = canonical_json_bytes(&blob.locator.residency).map_err(|_| {
-        KernelCaptureError::OwnerEvidenceInvalid(
-            "blob residency key is not serializable".to_owned(),
-        )
-    })?;
-    Ok(sha256_hex(&bytes))
-}
-
-/// Builds exactly one `captured` disposition per expected source member.
+/// Builds exactly one `captured` disposition per carried source member.
 /// Domain prefixes keep obligation domains disjoint so equal bytes under
 /// different obligations never coalesce into one logical object, and each blob
-/// is keyed by its full residency identity (see [`blob_residency_key_digest`])
-/// for the same reason: the content digest alone is not a logical object.
+/// is keyed by the blob owner's own full residency identity (see
+/// [`owner_residency_key_digest`]) for the same reason: the content digest
+/// alone is not a logical object.
+///
+/// The members an OWNER declared rather than carried are emitted separately by
+/// [`owner_fence_dispositions`]; [`merge_member_dispositions`] joins the two
+/// halves into the one disposition list the denominator is checked against.
 fn member_disposition_list(
     events: &[CanonicalRecord],
     projections: &[CanonicalRecord],
@@ -1570,7 +1582,7 @@ fn member_disposition_list(
     }
     for blob in blobs {
         dispositions.push((
-            format!("{}{}", MEMBER_DOMAIN_BLOB, blob_residency_key_digest(blob)?),
+            format!("{}{}", MEMBER_DOMAIN_BLOB, owner_residency_key_digest(blob)?),
             "captured".to_owned(),
         ));
     }
@@ -1589,8 +1601,9 @@ fn member_disposition_list(
 /// Checks the complete reconciliation denominator: a consistent export fence,
 /// exactly one blob per reachability hash and no unreferenced blob, an event
 /// range matching the carried canonical events, and exactly one disposition
-/// per expected member. Expired or mixed-generation evidence (an inconsistent
-/// fence) cannot stitch into a complete result.
+/// per expected member — carried members AND the members each owner declared in
+/// its own fence. Expired or mixed-generation evidence (an inconsistent fence)
+/// cannot stitch into a complete result.
 ///
 /// The export fence's own `blob_reachability_manifest` is a `Vec<BlobHash>`, so
 /// the fence bijection is still over CONTENT digests — that is the fence's own
@@ -1650,7 +1663,28 @@ fn check_denominator(
             request.canonical_events.len()
         )));
     }
-    let dispositions = member_disposition_list(
+    // The SECOND, independent expected set. Everything above enumerates members
+    // from the caller's carried CONTENT lists; the members each OWNER declared
+    // are enumerated here straight from that owner's own fence — the canonical
+    // owner's order/history heads, the ORS owner's pending operations,
+    // checkpoints and cutovers, the Watchdog owner's unresolved signals, and the
+    // optional forensic Host audit's own dispositions. A16 requires every
+    // expected source/member to have exactly one disposition, and an expected
+    // set taken from the carried content alone cannot state that about a member
+    // the owner declared and the capture never enumerated: the two copies of one
+    // caller-supplied list would agree with each other whatever the owner said.
+    //
+    // What this cannot do, and does not claim: it cannot detect a member an
+    // owner dropped from its OWN fence before this owner saw it. The fences are
+    // the owner's declaration; a fence that under-declares is the owner's
+    // evidence gap, not one this owner can detect from inside the capture.
+    let owner_declared = owner_fence_dispositions(
+        &request.export_fence,
+        request.ors_snapshot.as_ref(),
+        request.watchdog_spool.as_ref(),
+        request.host_audit.as_ref(),
+    )?;
+    let mut dispositions = member_disposition_list(
         &request.canonical_events,
         &request.projections,
         &request.receipts,
@@ -1658,6 +1692,7 @@ fn check_denominator(
         &request.purge_ledger,
         &request.artifacts,
     )?;
+    dispositions.extend(owner_declared.iter().cloned());
     for event in &request.canonical_events {
         let want = format!("canonical:{}", event.record_id);
         let count = dispositions.iter().filter(|entry| entry.0 == want).count();
@@ -1665,6 +1700,14 @@ fn check_denominator(
             return Err(KernelCaptureError::DenominatorIncomplete(format!(
                 "canonical event {} has {count} dispositions, want exactly one",
                 event.record_id
+            )));
+        }
+    }
+    for (declared, _) in &owner_declared {
+        let count = dispositions.iter().filter(|entry| &entry.0 == declared).count();
+        if count != 1 {
+            return Err(KernelCaptureError::DenominatorIncomplete(format!(
+                "owner-declared member {declared} has {count} dispositions, want exactly one"
             )));
         }
     }
