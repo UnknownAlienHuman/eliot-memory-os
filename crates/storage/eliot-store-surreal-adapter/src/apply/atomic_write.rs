@@ -33,6 +33,11 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 };
 ";
 
+/// Creates one immutable maintenance-trigger decision owner row, or accepts
+/// only an exact replay of its already-bound content. The row is part of the
+/// same transaction as the canonical receipt and outbox.
+const TX_MAINTENANCE_TRIGGER_DECISION_OWNER: &str = "LET $maintenance_trigger_decision_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM ONLY type::record($maintenance_trigger_decision_table, $maintenance_trigger_decision_id)); IF type::is_object($maintenance_trigger_decision_existing) { IF $maintenance_trigger_decision_existing.namespace != $maintenance_trigger_decision_expected.namespace OR $maintenance_trigger_decision_existing.key != $maintenance_trigger_decision_expected.key OR $maintenance_trigger_decision_existing.state_fence != $maintenance_trigger_decision_expected.state_fence OR $maintenance_trigger_decision_existing.revision != $maintenance_trigger_decision_expected.revision OR $maintenance_trigger_decision_existing.schema != $maintenance_trigger_decision_expected.schema OR $maintenance_trigger_decision_existing.payload != <bytes>$maintenance_trigger_decision_expected.payload OR $maintenance_trigger_decision_existing.value_digest != $maintenance_trigger_decision_expected.value_digest { THROW 'maintenance_trigger_decision_conflict'; }; } ELSE { CREATE type::record($maintenance_trigger_decision_table, $maintenance_trigger_decision_id) CONTENT { namespace: $maintenance_trigger_decision_record.namespace, key: $maintenance_trigger_decision_record.key, state_fence: $maintenance_trigger_decision_record.state_fence, revision: $maintenance_trigger_decision_record.revision, schema: $maintenance_trigger_decision_record.schema, payload: <bytes>$maintenance_trigger_decision_record.payload, value_digest: $maintenance_trigger_decision_record.value_digest }; };";
+
 // 688-B erasure intent-before-dispatch statements. These closed templates live
 // in this apply-owned writer (a sibling of `schema`, inside the admitted
 // apply/schema SurrealQL contour): the intent upsert opens the same atomic
@@ -126,6 +131,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "maintenance_trigger_decision_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "swarm_owner_revision_conflict",
@@ -560,6 +566,7 @@ fn build_apply_statements(
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_maintenance_trigger_decision_owner_statement(&mut sql, &mut bindings, transition)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -810,6 +817,152 @@ fn append_finish_owner_statement(
     // prevents a future caller from silently dropping the required parameter
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MaintenanceTriggerDecisionOwnerPayload<'a> {
+    operation_id: &'a str,
+    trigger_id: &'a str,
+    operation_hash: &'a str,
+    trigger_revision: u64,
+    evaluation_revision: &'a str,
+    policy_revision: &'a str,
+    scope_ref: &'a str,
+    job_ref: Option<&'a str>,
+    recommendation_ref: Option<&'a str>,
+    wake_ref: Option<&'a str>,
+    decision_json: &'a str,
+}
+
+/// Appends the immutable Governor-owned maintenance-trigger decision record
+/// to the current canonical transaction. The adapter binds the exact typed
+/// fields and decision bytes, but does not interpret the decision or execute
+/// the referenced downstream intents.
+fn append_maintenance_trigger_decision_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation
+            == eliot_store_api::NamedMutationOperation::RecordMaintenanceTriggerDecision
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let optional_text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or(AdapterError::Store(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "optional intent reference must be non-empty text",
+                    }))
+            })
+            .transpose()
+    };
+
+    let trigger_id = text_param("trigger_id")?;
+    let operation_hash = text_param("operation_hash")?;
+    let trigger_revision = text_param("trigger_revision")?
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a positive decimal revision",
+        }))?;
+    let evaluation_revision = text_param("evaluation_revision")?;
+    let policy_revision = text_param("policy_revision")?;
+    let scope_ref = text_param("scope_ref")?;
+    let job_ref = optional_text_param("job_ref")?;
+    let recommendation_ref = optional_text_param("recommendation_ref")?;
+    let wake_ref = optional_text_param("wake_ref")?;
+    if job_ref.is_none() && recommendation_ref.is_none() && wake_ref.is_none() {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.intent_refs",
+            reason: "at least one downstream intent reference is required",
+        }));
+    }
+    let decision_json = text_param("decision_json")?;
+    let operation_id = transition.identity.operation_id.to_string();
+    let owner_payload = MaintenanceTriggerDecisionOwnerPayload {
+        operation_id: &operation_id,
+        trigger_id,
+        operation_hash,
+        trigger_revision,
+        evaluation_revision,
+        policy_revision,
+        scope_ref,
+        job_ref,
+        recommendation_ref,
+        wake_ref,
+        decision_json,
+    };
+    let payload = eliot_store_api::canonical_json_bytes(&owner_payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    // The trigger revision is part of an immutable key, so distinct retained
+    // revisions remain separately addressable without overwriting history.
+    let key_bytes = eliot_store_api::canonical_json_bytes(&(trigger_id, trigger_revision))
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let key = String::from_utf8(key_bytes)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let owner_key = eliot_store_api::RecoveryRecordKey::new(
+        eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE,
+        key,
+    )
+    .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&owner_key)?;
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(owner_key.namespace));
+    record.insert("key".to_owned(), json!(owner_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert("revision".to_owned(), json!(1_u64));
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA),
+    );
+    let value_digest = eliot_store_api::sha256_hex(&payload);
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert("value_digest".to_owned(), json!(value_digest));
+
+    let expected = Value::Object(record.clone());
+    sql.push_str(TX_MAINTENANCE_TRIGGER_DECISION_OWNER);
+    bindings.insert(
+        "maintenance_trigger_decision_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert(
+        "maintenance_trigger_decision_id".to_owned(),
+        json!(owner_id),
+    );
+    bindings.insert("maintenance_trigger_decision_expected".to_owned(), expected);
+    bindings.insert(
+        "maintenance_trigger_decision_record".to_owned(),
+        Value::Object(record),
+    );
     Ok(())
 }
 

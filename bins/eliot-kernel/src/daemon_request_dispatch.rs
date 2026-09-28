@@ -109,6 +109,10 @@ pub(crate) const MAINTENANCE_TRIGGER_PAGE_OPERATION: &str = "maintenance_trigger
 /// Authenticated claim for one retained maintenance trigger.
 #[cfg(windows)]
 pub(crate) const MAINTENANCE_TRIGGER_CLAIM_OPERATION: &str = "maintenance_trigger_claim";
+/// Reads exact retained material for one current maintenance-trigger claim.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_DELIVERY_READ_OPERATION: &str =
+    "maintenance_trigger_delivery_read";
 /// Authenticated commit-receipt recording or reconciliation for one trigger.
 #[cfg(windows)]
 pub(crate) const MAINTENANCE_TRIGGER_DECISION_OPERATION: &str =
@@ -175,6 +179,10 @@ const MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND: &str = "maintenance_trigger_page";
 /// Response kind for one session-bound maintenance-trigger claim.
 #[cfg(windows)]
 const MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND: &str = "maintenance_trigger_claim";
+/// Response kind for one claim-bound retained trigger read.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND: &str =
+    "maintenance_trigger_delivery_read";
 /// Response kind for a recorded or reconciled canonical trigger decision.
 #[cfg(windows)]
 const MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND: &str = "maintenance_trigger_decision_receipt";
@@ -745,6 +753,14 @@ struct MaintenanceTriggerClaimOperation {
     /// Copy of the page-summary eligibility bound. The gateway checks this
     /// against the retained trigger before it commits the claim.
     applicable_until_unix_ms: u64,
+}
+
+/// Current claim authorizing one exact retained-trigger read.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerDeliveryReadOperation {
+    claim: MaintenanceTriggerClaim,
 }
 
 /// Full decision receipt; the exact canonical receipt bytes retain its intent
@@ -2370,6 +2386,10 @@ impl KernelComposition {
                 payload,
                 request_identity,
             ),
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_DELIVERY_READ_OPERATION => {
+                self.maintenance_trigger_delivery_read_operation(session, payload, request_identity)
+            }
             #[cfg(windows)]
             MAINTENANCE_TRIGGER_DECISION_OPERATION => {
                 self.maintenance_trigger_decision_operation(session, payload, request_identity)
@@ -4151,6 +4171,46 @@ impl KernelComposition {
             "value": {
                 "kind": MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
                 "claim": retained,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_delivery_read_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerDeliveryReadOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND,
+            ));
+        };
+        let delivery = match gateway.load_claimed_maintenance_trigger_delivery(
+            &session.module_generation.state_fence,
+            &session.connection_id,
+            &operation.claim,
+        ) {
+            Ok(delivery) => delivery,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND,
+                "claim": delivery.claim,
+                "trigger": delivery.trigger,
+                "envelope": delivery.envelope,
             },
             "recovery": null,
         }))

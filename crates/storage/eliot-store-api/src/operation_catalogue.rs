@@ -437,8 +437,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
-/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `ReconcileRecovery`, `RecordFinishEvidence`, `RecordFinishDecision`, and
+/// `RecordMaintenanceTriggerDecision` persist `ReversibleMutation` through
+/// the `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
@@ -467,10 +468,10 @@ struct ActivatedMutationDescriptor {
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
 /// influence, or lifecycle change). All
-/// eighteen address no store scope, mirroring the scope-free read
+/// nineteen address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -509,6 +510,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordFinishEvidence,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordMaintenanceTriggerDecision,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
@@ -888,6 +895,10 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyInstrumentRegistryState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
+            NamedMutationOperation::RecordMaintenanceTriggerDecision => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                validate_maintenance_trigger_decision_parameters(&command.parameters)?;
+            }
             NamedMutationOperation::ApplyNotificationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_notification_mutation_params(&command.parameters)?;
@@ -925,6 +936,40 @@ pub fn validate_transition_against_catalogue(
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
     }
+    Ok(())
+}
+
+fn validate_maintenance_trigger_decision_parameters(
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let _revision = parameters
+        .get("trigger_revision")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|revision| *revision > 0)
+        .ok_or(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a positive decimal revision",
+        })?;
+
+    // The decision receipt contract requires at least one durable downstream
+    // intent reference. This operation records that reference; it does not
+    // execute a job or deliver a recommendation/wake.
+    if !["job_ref", "recommendation_ref", "wake_ref"]
+        .iter()
+        .any(|name| {
+            parameters
+                .get(*name)
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        })
+    {
+        return Err(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.intent_refs",
+            reason: "at least one downstream intent reference is required",
+        });
+    }
+
     Ok(())
 }
 
