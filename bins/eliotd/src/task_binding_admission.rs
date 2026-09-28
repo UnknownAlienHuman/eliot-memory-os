@@ -146,9 +146,8 @@ use std::path::{Path, PathBuf};
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
-    CanonicalWriteEnvelope, GenerationEvidence, GoverningSourceSet, PrivacyProfile, ScopeBinding,
-    TaskScopeOutcome, WorkScopeDescriptor, WorkspaceInstanceIdentity, check_task_observation,
-    derive_observed_resources,
+    CanonicalWriteEnvelope, GoverningSourceSet, PrivacyProfile, ScopeBinding,
+    WorkScopeDescriptor, derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
@@ -283,13 +282,51 @@ pub enum TaskBindingAdmission {
 /// not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSelectionDisposition {
-    /// No current exact selection: absent, exploratory (non-material), or stale.
+    /// The caller selected no task.
     Absent,
+    /// One exploratory task is available for read-only orientation only.
+    Exploratory {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
     /// More than one candidate task handle survived selection; none is chosen.
     /// The owner-issued handles are carried verbatim so the caller can answer
     /// with the bounded eligible set instead of inventing a choice.
     Ambiguous(Vec<String>),
+    /// A task selection names an older revision; preserve the exact identity
+    /// for the owner's refresh/rebind response instead of treating it as absent.
+    Stale {
+        task_ref: String,
+        task_revision: u64,
+    },
     /// Exactly one current `TaskContract` revision with an acceptance digest.
+    Current(TaskSelectionEvidence),
+}
+
+/// Agent-facing result of resolving the current task selection.
+///
+/// Absence carries the existing bounded task-intake shape for the retained
+/// scope; task-candidate ambiguity preserves the exact owner-issued handles
+/// and remains distinct from active-work scope ambiguity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskSelectionResponse {
+    /// No current selection; caller can answer with this scope's intake shape.
+    Absent(eliot_workscope::TaskSelectionRequired),
+    /// Exploratory binding stays explicitly read-only, not material task work.
+    Exploratory {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
+    /// Multiple task candidates survived; none is selected.
+    Ambiguous(Vec<String>),
+    /// Stale task identity preserved for an explicit refresh/rebind response.
+    Stale {
+        task_ref: String,
+        task_revision: u64,
+    },
+    /// One exact current TaskContract revision with its owner evidence.
     Current(TaskSelectionEvidence),
 }
 
@@ -410,16 +447,15 @@ pub fn admit_task_bound(
 
 /// Admits one task-relative transition with observed workspace identity.
 ///
-/// Extends [`admit_task_bound`] with the scope-identity legs for the first
-/// tool-event trigger: the evidence's `WorkScope` claim is checked against
-/// the retained Governor binding (`expected`) and the host-observed workspace
-/// instance and generation. A mismatching checkout fails closed with
-/// `TASK_SCOPE_INCOMPATIBLE` naming the exact disposition
+/// Extends [`admit_task_bound`] with the sources-independent scope-identity
+/// legs for the first tool-event trigger. It derives the observed binding from
+/// the complete live workspace observation, including lineage, exact
+/// instance/root, and resource generation. A mismatching checkout fails
+/// closed with `TASK_SCOPE_INCOMPATIBLE` naming the exact disposition
 /// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, or `STALE_BINDING`); the retained
-/// binding, task state, and project memory are untouched. When the
-/// observation agrees, the existing alias, fence, and compatibility checks
-/// run unchanged. Lineage is enforced on lineage-observing paths, not here:
-/// the daemon edge does not observe it.
+/// binding, task state, and project memory are untouched. An identity-clear
+/// result is only an identity check; this helper does not replace the full
+/// source-closure guard required before a scope-sensitive effect.
 ///
 /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
 #[allow(
@@ -430,8 +466,7 @@ pub fn admit_task_bound_with_observed_scope(
     selection: Option<&TaskSelectionEvidence>,
     expected_task_ref: &str,
     expected: &ScopeBinding,
-    observed_instance: &WorkspaceInstanceIdentity,
-    observed_generation: &GenerationEvidence,
+    observed: &ObservedScopeResources,
     expected_fence: &StateFence,
     compatibility: CompatibilityDisposition,
 ) -> Result<(), TaskBindingError> {
@@ -444,21 +479,38 @@ pub fn admit_task_bound_with_observed_scope(
             compatibility,
         );
     };
-    let check = check_task_observation(
+    let observed_binding = eliot_workscope::observed_scope_binding(
         expected,
-        &evidence.work_scope_ref,
-        observed_instance,
-        observed_generation,
-    );
-    match check.outcome {
-        TaskScopeOutcome::Clear => {}
-        TaskScopeOutcome::DifferentInstance
-        | TaskScopeOutcome::Ambiguous
-        | TaskScopeOutcome::StaleBinding => {
-            return Err(TaskBindingError::scope_incompatible(format!(
-                "task observation scope identity check {:?}: {}",
-                check.outcome, check.detail
-            )));
+        observed,
+        expected.privacy_class,
+        expected.governing_source_generation,
+    )
+    .map_err(|error| match error {
+        eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
+            TaskBindingError::scope_incompatible(format!(
+                "task observation scope identity check AMBIGUOUS: {observed_instances} workspace instances observed"
+            ))
+        }
+        other => TaskBindingError::scope_incompatible(format!(
+            "task observation scope identity could not be established: {other}"
+        )),
+    })?;
+    match eliot_workscope::identity_legs(expected, &observed_binding) {
+        eliot_workscope::IdentityLegOutcome::IdentityClear => {}
+        eliot_workscope::IdentityLegOutcome::DifferentInstance => {
+            return Err(TaskBindingError::scope_incompatible(
+                "task observation scope identity check DIFFERENT_INSTANCE",
+            ));
+        }
+        eliot_workscope::IdentityLegOutcome::Ambiguous => {
+            return Err(TaskBindingError::scope_incompatible(
+                "task observation scope identity check AMBIGUOUS",
+            ));
+        }
+        eliot_workscope::IdentityLegOutcome::StaleBinding => {
+            return Err(TaskBindingError::scope_incompatible(
+                "task observation scope identity check STALE_BINDING",
+            ));
         }
     }
     admit_task_bound(
@@ -477,12 +529,13 @@ pub fn admit_task_bound_with_observed_scope(
 /// it invents nothing: a `CurrentTaskContract` binding is the owner-issued
 /// `task_ref` + `task_revision` + `acceptance_digest` triple from the receipt's
 /// own `task_binding`, joined with the receipt's exact `WorkScope` identity and
-/// reference handles. Every other binding state resolves to no selection:
+/// reference handles. Every other binding state keeps its typed meaning:
 ///
 /// - [`TaskBindingState::None_`] — the caller selected no task;
 /// - `Exploratory` — a task is named but the binding is explicitly
-///   non-material, so it is not a current `TaskContract`;
-/// - `Stale` — the named revision is no longer current;
+///   non-material, so it remains a read-only disposition;
+/// - `Stale` — the exact named revision is no longer current and is preserved
+///   for an owner refresh/rebind response;
 /// - `Ambiguous` — several candidate handles survived selection and the receipt
 ///   is forbidden to prefer one, so the candidate count is preserved and the
 ///   disposition stays non-material.
@@ -505,12 +558,26 @@ pub fn resolve_task_selection(receipt: &OnboardingReadinessReceipt) -> TaskSelec
             evidence_ref: receipt.receipt_ref.clone(),
             contamination_flags: Vec::new(),
         }),
+        TaskBindingState::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => TaskSelectionDisposition::Exploratory {
+            task_ref: task_ref.clone(),
+            task_revision: *task_revision,
+            acceptance_digest: acceptance_digest.clone(),
+        },
         TaskBindingState::Ambiguous { candidate_handles } => {
             TaskSelectionDisposition::Ambiguous(candidate_handles.clone())
         }
-        TaskBindingState::None_
-        | TaskBindingState::Exploratory { .. }
-        | TaskBindingState::Stale { .. } => TaskSelectionDisposition::Absent,
+        TaskBindingState::Stale {
+            task_ref,
+            task_revision,
+        } => TaskSelectionDisposition::Stale {
+            task_ref: task_ref.clone(),
+            task_revision: *task_revision,
+        },
+        TaskBindingState::None_ => TaskSelectionDisposition::Absent,
     }
 }
 
@@ -530,20 +597,49 @@ pub fn resolve_task_selection(receipt: &OnboardingReadinessReceipt) -> TaskSelec
 /// Structure preserved, never resolved:
 ///
 /// - [`TaskSelectionDisposition::Absent`] stays absent. No task is created to
-///   remove the ambiguity;
+///   remove a missing selection;
 /// - [`TaskSelectionDisposition::Ambiguous`] keeps the owner-issued candidate
 ///   handles verbatim (bounded by the owner that produced them) so the caller
 ///   can return the typed selection/intake response. None is chosen;
+/// - exploratory bindings remain explicitly read-only, and stale bindings
+///   preserve the exact task and revision for an owner refresh/rebind response;
 /// - a receipt compiled for a different `WorkScope` or a different fence is
 ///   refused before the binding state is even inspected.
 ///
 /// It reads no caller-supplied `TaskSelectionEvidence`: structural validation
 /// of evidence a request carried is never sufficient here.
 pub fn bind_current_task_selection(
-    activation: &eliot_governor::GovernorActivationSnapshot,
+    activation: Option<&eliot_governor::GovernorActivationSnapshot>,
     receipt: &OnboardingReadinessReceipt,
     live_fence: &StateFence,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
+    receipt.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "compiled readiness receipt is invalid: {error}"
+        ))
+    })?;
+    if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt was compiled at another fence",
+        ));
+    }
+    let disposition = resolve_task_selection(receipt);
+    let TaskSelectionDisposition::Current(evidence) = &disposition else {
+        // The Governor's current-task owner returns no activation for these
+        // receipt states. A contradictory activation must fail closed rather
+        // than being discarded or reported as an ordinary task choice.
+        if activation.is_some() {
+            return Err(TaskBindingError::scope_incompatible(
+                "activation route returned a task for a non-current TaskContract receipt",
+            ));
+        }
+        return Ok(disposition);
+    };
+    let activation = activation.ok_or_else(|| {
+        TaskBindingError::scope_incompatible(
+            "current TaskContract receipt has no owner-validated activation snapshot",
+        )
+    })?;
     if !eliot_contracts::fences_match_exact(&activation.state_fence, live_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "activation snapshot is not applicable at the current fence",
@@ -557,18 +653,6 @@ pub fn bind_current_task_selection(
             "compiled readiness receipt is bound to another principal, session, or WorkScope",
         ));
     }
-    if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
-        return Err(TaskBindingError::scope_incompatible(
-            "compiled readiness receipt was compiled at another fence",
-        ));
-    }
-    let disposition = resolve_task_selection(receipt);
-    let TaskSelectionDisposition::Current(evidence) = &disposition else {
-        // No task and several candidates are honest typed answers here, not
-        // rejections: the caller answers with selection/intake data carrying
-        // the owner's bounded candidate handles.
-        return Ok(disposition);
-    };
     if evidence.task_ref != activation.task_id.as_str()
         || evidence.task_revision != activation.task_revision
         || evidence.work_scope_ref != activation.work_scope_id
@@ -655,7 +739,9 @@ pub fn admit_canonical_write(
     let disposition = resolve_task_selection(receipt);
     let compatibility = compatibility_for(receipt, envelope, write_fence);
     let (selection, candidate_count) = match &disposition {
-        TaskSelectionDisposition::Absent => (None, 0_usize),
+        TaskSelectionDisposition::Absent
+        | TaskSelectionDisposition::Exploratory { .. }
+        | TaskSelectionDisposition::Stale { .. } => (None, 0_usize),
         TaskSelectionDisposition::Ambiguous(candidate_handles) => (None, candidate_handles.len()),
         TaskSelectionDisposition::Current(evidence) => (Some(evidence), 1_usize),
     };
@@ -882,15 +968,11 @@ pub fn observe_and_admit_task(
                 "observed workspace resources invalid: {error}"
             ))
         })?;
-    let instance = observed.instances.first().ok_or_else(|| {
-        TaskBindingError::scope_incompatible("observed workspace has no instance".to_owned())
-    })?;
     admit_task_bound_with_observed_scope(
         selection,
         expected_task_ref,
         expected,
-        instance,
-        &observed.generation,
+        &observed,
         expected_fence,
         compatibility,
     )

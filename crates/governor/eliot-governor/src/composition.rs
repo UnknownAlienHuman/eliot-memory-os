@@ -49,6 +49,7 @@ use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    fences_match_exact,
 };
 use eliot_coordination::{
     ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
@@ -5244,35 +5245,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// including the `TaskContract` acceptance digest and the selection
     /// source/evidence (issue #1746, W4).
     ///
-    /// Both halves are owner state and neither comes from a request: the
-    /// activation half is [`Self::read_unique_agent_activation`], which proves
-    /// one unique live work lease, one live owner session, one durable
-    /// `TaskContract` revision, and an installed `MATCHED` `WorkScope`; the
-    /// acceptance digest and the selection source exist only inside the
-    /// owner-compiled [`eliot_workscope::OnboardingReadinessReceipt`] retained
-    /// as the terminal of the cold-start lease, so this entry reads that
-    /// receipt back through the retained [`OnboardingSingleFlight`] registry
-    /// instead of accepting a request-supplied
-    /// `TaskSelectionEvidence`.
+    /// The acceptance digest, selection source and evidence are read only
+    /// from Governor's retained cold-start terminal, never from a
+    /// request-supplied `TaskSelectionEvidence`. Before returning a selection
+    /// disposition, this method validates the retained receipt and exact lease
+    /// key against the live Governor fence and freshly matched `WorkScope`.
+    /// A current task contract is additionally joined to the unique live
+    /// activation, including principal, session, task id and revision.
     ///
-    /// The join is the applicability recheck admission needs: the compiled
-    /// receipt must name the same task, the same non-zero `TaskContract`
-    /// revision, and the same `WorkScope` the activation route just proved, and
-    /// must have been compiled at the live fence. A receipt that disagrees on
-    /// any of those is a stale selection, not a second resolver's opinion, and
-    /// the typed `ScopeGuardWithheld` refusal keeps the exact disposition. No
-    /// task and several candidates keep their own typed refusals with bounded
-    /// candidate handles; this entry never prefers the latest, the most
-    /// similar, or any other task, and it never creates one.
+    /// Valid no-task, exploratory, stale-selection and ambiguous dispositions
+    /// return `None` with the original receipt so the caller can retain the
+    /// typed intake response and bounded owner-issued handles. Active-work
+    /// ambiguity stays a separate activation outcome. This entry never
+    /// prefers the latest or most similar task, and it never creates one.
     ///
     /// # Errors
     ///
-    /// Returns [`CompositionError::NotReady`] while the composition is not
-    /// ready, [`CompositionError::Recovery`] when no terminal receipt is
-    /// retained for the exact lease key, and the activation route's own typed
-    /// refusals (`ActivationTaskSelectionRequired`, `ActivationScopeAmbiguous`,
-    /// `ActivationStaleFence`, `ActivationScopeSelectionRequired`, `NotReady`)
-    /// unchanged.
+    /// Returns `Some(activation)` only for one current task contract. Invalid
+    /// or stale owner state is refused before the caller can admit a binding.
     pub fn current_task_selection(
         &self,
         now: u64,
@@ -5282,7 +5272,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_generation: u64,
     ) -> Result<
         (
-            GovernorActivationSnapshot,
+            Option<GovernorActivationSnapshot>,
             eliot_workscope::OnboardingReadinessReceipt,
         ),
         CompositionError,
@@ -5290,8 +5280,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        let activation = self.read_unique_agent_activation(now)?;
-        let (_lease, receipt) = self
+        let live_fence = self.snapshot.state_fence();
+        let (lease, receipt) = self
             .cold_start
             .terminal_for_key(
                 lineage_candidate_ref,
@@ -5304,24 +5294,76 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "no terminal cold-start receipt for lease key".to_owned(),
                 )
             })?;
-        if receipt.state_fence != activation.state_fence
-            || receipt.scope.scope_ref != activation.work_scope_id
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let scope = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .read_current(&live_fence)
+            .map_err(map_activation_scope_error)?;
+        ensure_snapshot_fresh(&scope, "task selection WorkScope is not freshly matched")?;
+        if receipt.lease_ref != lease.lease_ref
+            || lease.lineage_candidate_ref != lineage_candidate_ref
+            || lease.workspace_instance_candidate_ref != workspace_instance_candidate_ref
+            || lease.privacy_class != privacy_class
+            || lease.governing_source_generation != governing_source_generation
+            || receipt.governing_source_generation != governing_source_generation
+            || receipt.expiry_tick < now
+            || receipt.expiry_tick != lease.deadline
+            || !fences_match_exact(&receipt.state_fence, &live_fence)
+            || receipt.scope != scope.binding.scope
+            || receipt.instance.instance_ref != scope.binding.scope.instance_ref
+            || receipt.instance.root_identity != scope.binding.scope.root_identity
+            || receipt.instance.generation != scope.binding.scope.generation
+            || receipt.governing_source_generation != scope.binding.governing_source_generation
         {
-            return Err(CompositionError::ScopeGuardWithheld {
-                claimed_scope: receipt.scope.scope_ref.clone(),
-                observed_scope: activation.work_scope_id.clone(),
-                trigger: GuardTrigger::FirstToolEvent,
-                identity: IdentityLegOutcome::StaleBinding,
-                verdict: GuardVerdict::Withhold,
-                report: Box::new(TriggerReport {
-                    trigger: GuardTrigger::FirstToolEvent,
-                    identity: IdentityLegOutcome::StaleBinding,
-                    receipt: None,
-                    verdict: GuardVerdict::Withhold,
-                }),
-            });
+            return Err(CompositionError::ActivationStaleFence);
         }
-        Ok((activation, receipt))
+        match receipt.task_binding.clone() {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => {
+                if receipt.scope_resolution != eliot_workscope::ScopeResolutionState::Authenticated
+                    || receipt.readiness != eliot_workscope::ReadinessLifecycle::ReadyMaterial
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                let activation = self.read_unique_agent_activation(now)?;
+                if !fences_match_exact(&activation.state_fence, &live_fence)
+                    || receipt.principal_ref != activation.principal_id
+                    || receipt.session_ref != activation.session_id
+                    || receipt.scope.scope_ref != activation.work_scope_id
+                    || task_ref != activation.task_id.as_str()
+                    || task_revision != activation.task_revision
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                eliot_observation::TaskSelectionEvidence {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                    work_scope_ref: receipt.scope.scope_ref.clone(),
+                    selection_source_ref: receipt.governance_profile_ref.clone(),
+                    evidence_ref: receipt.receipt_ref.clone(),
+                    contamination_flags: Vec::new(),
+                }
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                Ok((Some(activation), receipt))
+            }
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Stale { .. }
+            | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
+        }
     }
 
     /// Admits one scope-sensitive canonical write whose observed binding and
