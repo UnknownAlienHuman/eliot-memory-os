@@ -1000,6 +1000,13 @@ struct RecoveryReplyCoverage {
     unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
 }
 
+struct RecoveryUnscopedGapCoverage {
+    total: u64,
+    proof: Option<String>,
+    complete: bool,
+    continuation: Option<RecoveryUnscopedGapCursor>,
+}
+
 fn decode_recovery_reply_coverage(
     reconciliation: &serde_json::Value,
     window_status: RecoveryWindowStatus,
@@ -1049,15 +1056,33 @@ fn decode_recovery_reply_coverage(
             "reconciliation refused: stream facts exceed the owner denominator",
         ));
     }
-    let unscoped_gap_total = recovery_cursor(reconciliation, "unscoped_gap_total")?;
-    let unscoped_gaps_proof = recovery_optional_digest(reconciliation, "unscoped_gaps_proof")?;
-    let unscoped_gaps_complete = reconciliation
+    let unscoped = decode_recovery_unscoped_gap_coverage(reconciliation, window_status)?;
+    Ok(RecoveryReplyCoverage {
+        unproven_scope_present,
+        stream_list_total,
+        stream_list_proof,
+        stream_list_complete,
+        stream_list_continuation,
+        unscoped_gap_total: unscoped.total,
+        unscoped_gaps_proof: unscoped.proof,
+        unscoped_gaps_complete: unscoped.complete,
+        unscoped_gaps_continuation: unscoped.continuation,
+    })
+}
+
+fn decode_recovery_unscoped_gap_coverage(
+    reconciliation: &serde_json::Value,
+    window_status: RecoveryWindowStatus,
+) -> Result<RecoveryUnscopedGapCoverage, ProviderFailure> {
+    let total = recovery_cursor(reconciliation, "unscoped_gap_total")?;
+    let proof = recovery_optional_digest(reconciliation, "unscoped_gaps_proof")?;
+    let complete = reconciliation
         .get("unscoped_gaps_complete")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| {
             event_shape_failure("reconciliation refused: unscoped gap coverage absent")
         })?;
-    let unscoped_gaps_continuation = match reconciliation.get("unscoped_gaps_continuation") {
+    let continuation = match reconciliation.get("unscoped_gaps_continuation") {
         Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Object(cursor)) if cursor.len() == 2 => {
             let after = recovery_text(
@@ -1082,33 +1107,26 @@ fn decode_recovery_reply_coverage(
             ));
         }
     };
-    let unscoped_gaps = reconciliation
+    let gaps = reconciliation
         .get("unscoped_gaps")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
     validate_recovery_continuation_proof(
-        unscoped_gaps_proof.as_deref(),
-        unscoped_gaps_continuation.is_some(),
+        proof.as_deref(),
+        continuation.is_some(),
         window_status,
         "reconciliation refused: unscoped-gap continuation proof does not match its cursor",
     )?;
-    if unscoped_gap_total == 0
-        && (!unscoped_gaps.is_empty() || unscoped_gaps_continuation.is_some())
-    {
+    if total == 0 && (!gaps.is_empty() || continuation.is_some()) {
         return Err(event_shape_failure(
             "reconciliation refused: empty unscoped-gap denominator has page facts",
         ));
     }
-    Ok(RecoveryReplyCoverage {
-        unproven_scope_present,
-        stream_list_total,
-        stream_list_proof,
-        stream_list_complete,
-        stream_list_continuation,
-        unscoped_gap_total,
-        unscoped_gaps_proof,
-        unscoped_gaps_complete,
-        unscoped_gaps_continuation,
+    Ok(RecoveryUnscopedGapCoverage {
+        total,
+        proof,
+        complete,
+        continuation,
     })
 }
 

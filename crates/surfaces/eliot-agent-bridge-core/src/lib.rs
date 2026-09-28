@@ -2656,6 +2656,60 @@ pub struct RecoveryWindowFacts {
     unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_recovery_window_stream_facts(
+    window_status: RecoveryWindowStatus,
+    stream_facts: &[RecoveredStreamFacts],
+    unscoped_gaps: &[RecoveredGapFact],
+) -> Result<(), BridgeError> {
+    let mut seen_streams = BTreeSet::new();
+    let mut seen_gap_ids = BTreeSet::new();
+    for facts in stream_facts {
+        validate_recovery_proof(
+            facts.stream_proof.as_deref(),
+            "recovery_window.stream_proof",
+        )?;
+        if window_status == RecoveryWindowStatus::Active
+            && facts.stream_proof.is_some()
+                != (facts.page_continuation.is_some() || facts.gap_continuation.is_some())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.stream_proof",
+                reason: "active stream proof must match its event or gap continuation",
+            });
+        }
+        if !seen_streams.insert(facts.stream_id.clone()) {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.stream",
+                reason: "duplicate stream scope in one recovery window",
+            });
+        }
+        for gap in facts.gaps() {
+            if !seen_gap_ids.insert(gap.gap_id.clone()) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovery_window.gap",
+                    reason: "duplicate gap identity in one recovery window",
+                });
+            }
+        }
+    }
+    for gap in unscoped_gaps {
+        if !gap.stream_id.is_empty() {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.unscoped_gap",
+                reason: "top-level gap must carry no stream scope",
+            });
+        }
+        if !seen_gap_ids.insert(gap.gap_id.clone()) {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.gap",
+                reason: "duplicate gap identity in one recovery window",
+            });
+        }
+    }
+    Ok(())
+}
+
 impl RecoveryWindowFacts {
     /// Checks the window binding legs. Stream facts arrive pre-checked;
     /// duplicate stream scopes refuse the whole window.
@@ -2713,51 +2767,7 @@ impl RecoveryWindowFacts {
                 reason: "live producer generation must be nonzero",
             });
         }
-        let mut seen = BTreeSet::new();
-        let mut seen_gap_ids = BTreeSet::new();
-        for facts in &stream_facts {
-            validate_recovery_proof(
-                facts.stream_proof.as_deref(),
-                "recovery_window.stream_proof",
-            )?;
-            if window_status == RecoveryWindowStatus::Active
-                && facts.stream_proof.is_some()
-                    != (facts.page_continuation.is_some() || facts.gap_continuation.is_some())
-            {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovery_window.stream_proof",
-                    reason: "active stream proof must match its event or gap continuation",
-                });
-            }
-            if !seen.insert(facts.stream_id.clone()) {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovery_window.stream",
-                    reason: "duplicate stream scope in one recovery window",
-                });
-            }
-            for gap in facts.gaps() {
-                if !seen_gap_ids.insert(gap.gap_id.clone()) {
-                    return Err(BridgeError::InvalidContract {
-                        field: "recovery_window.gap",
-                        reason: "duplicate gap identity in one recovery window",
-                    });
-                }
-            }
-        }
-        for gap in &unscoped_gaps {
-            if !gap.stream_id.is_empty() {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovery_window.unscoped_gap",
-                    reason: "top-level gap must carry no stream scope",
-                });
-            }
-            if !seen_gap_ids.insert(gap.gap_id.clone()) {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovery_window.gap",
-                    reason: "duplicate gap identity in one recovery window",
-                });
-            }
-        }
+        validate_recovery_window_stream_facts(window_status, &stream_facts, &unscoped_gaps)?;
         if window_status == RecoveryWindowStatus::Active
             && (stream_list_complete != stream_list_proof.is_none()
                 || unscoped_gaps_complete != unscoped_gaps_proof.is_none()
