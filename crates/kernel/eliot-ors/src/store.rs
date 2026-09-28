@@ -18352,8 +18352,104 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
+    /// Converts a host request whose claimed owner vanished with the process
+    /// into the durable unknown-outcome state (issue #1853, I14.21, I1.4).
+    ///
+    /// A non-terminal row holding a `Claimed` attempt is a daemon that was
+    /// killed after it claimed writer ownership and may have issued effects. The
+    /// restart path must not leave it looking live, must not free the retained
+    /// attempt so a replacement can silently acquire ownership, and must not
+    /// retry: it advances the row to `Unknown` through the existing
+    /// [`crate::HostRequestState::transition_to`] edge, so exactly one result or
+    /// `UNKNOWN_OUTCOME` can still be bound later from reconciliation evidence.
+    /// The attempt is retained in place and its generation is untouched.
+    ///
+    /// A `Reconciling` row keeps its retained `Claimed` attempt and still has a
+    /// legal edge to `Unknown`, so it is a candidate too: the interrupted
+    /// reconciliation cannot be resumed across a restart, and the owning route
+    /// re-advances the row to `Reconciling` when the next reconciliation
+    /// envelope arrives.
+    ///
+    /// The original stored record is validated before it is trusted and is
+    /// never re-proved: the sweep reads the durable bytes, and a fresh proof
+    /// over data the sweep itself holds would let recovery invent authority.
+    /// Identity-index rows share `HOST_REQUESTS` and are told apart by the
+    /// same `request_digest` marker the reuse check uses, so only real
+    /// operation rows are candidates.
+    fn recover_interrupted_host_requests(&self) -> Result<(), OrsError> {
+        loop {
+            let write = self.database.begin_write().map_err(storage)?;
+            let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
+            {
+                let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                for row in table.iter().map_err(storage)? {
+                    let (key, value) = row.map_err(storage)?;
+                    let record: crate::HostRequestRecord = decode(value.value())?;
+                    if record.request_digest == HOST_REQUEST_IDENTITY_BINDING_DIGEST {
+                        continue;
+                    }
+                    if record.record_key() != key.value() {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "host_request",
+                            reason: "table key diverges from the retained host-request row"
+                                .to_owned(),
+                        });
+                    }
+                    record.validate()?;
+                    if record.state.is_terminal() {
+                        continue;
+                    }
+                    let claimed = record.attempt.as_ref().is_some_and(|attempt| {
+                        attempt.phase == crate::HostRequestAttemptPhase::Claimed
+                    });
+                    if !claimed {
+                        continue;
+                    }
+                    // A row already advanced to `Unknown`/`Reconciling` keeps
+                    // its retained `Claimed` attempt, so it still looks like a
+                    // candidate. The owner's own transition table decides
+                    // whether the row can still move forward; re-using it here
+                    // keeps the sweep idempotent across its own pages without
+                    // restating a second copy of the edge set.
+                    if record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    interrupted.push((key.value().to_owned(), record));
+                    if interrupted.len() == usize::from(crate::MAX_RECOVERY_PAGE) {
+                        break;
+                    }
+                }
+            }
+            if interrupted.is_empty() {
+                return Ok(());
+            }
+            {
+                let mut operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                for (key, interrupted_record) in &interrupted {
+                    let mut record = interrupted_record.clone();
+                    // The existing table already permits this advance; it is
+                    // the owner's transition, not a recovery-side rewrite.
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)?;
+                    record.validate()?;
+                    let payload = encode(&record)?;
+                    operations
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+            }
+            write.commit().map_err(storage)?;
+        }
+    }
+
     fn recover_interrupted_execution(&self) -> Result<(), OrsError> {
         self.reconcile_interrupted_activation_tickets()?;
+        self.recover_interrupted_host_requests()?;
         loop {
             let write = self.database.begin_write().map_err(storage)?;
             let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
