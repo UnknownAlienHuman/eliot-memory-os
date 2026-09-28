@@ -80,7 +80,7 @@ use eliot_backup::{
     RestoreJournalPort, RestoreObligationState, RestoreObligations, RestoreOwnerObligation,
     RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
     RestoredFence, RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts,
-    suspended_recovery_entries, verify_key_coverage,
+    suspended_recovery_entries, verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -786,7 +786,7 @@ impl KernelBackupRestore {
         check_kernel_effect_fence(ports.kernel_fence, bundle)
             .map_err(|error| KernelRestoreError::FenceMismatch(error.to_string()))?;
         if let Some(manifest) = ports.keys {
-            verify_key_coverage(&bundle.blobs, manifest)
+            verify_portable_key_material(bundle, manifest)
                 .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         } else if !bundle.blobs.is_empty() {
             return Err(KernelRestoreError::CapabilityMissing {
