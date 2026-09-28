@@ -5,9 +5,11 @@
 //! 1. structured `tracing` with bounded fields, writing JSON operational
 //!    records to the non-blocking rolling appender and to stderr;
 //! 2. the bounded-label `OpenMetrics` registry published for scraping;
-//! 3. the OTLP bridge disposition, which reports `no_transport` when the
-//!    `otlp` feature is built and no transport is present, `feature_disabled`
-//!    when the feature is off, and never reports an active bridge;
+//! 3. the OTLP bridge: `enabled` when a usable endpoint is configured and the
+//!    `otlp` feature is built, `feature_disabled` when the feature is off,
+//!    `endpoint_unusable` when the configured endpoint cannot be parsed, and
+//!    `not_configured` when no endpoint is set - and, only in the first case,
+//!    the export of this stack's own startup record through the bridge;
 //! 4. the `system_service` Windows Event Log stage, or the protected event
 //!    spool for `user_mode` and portable;
 //! 5. the I16.11 critical-path fallback machine.
@@ -32,7 +34,7 @@ use crate::critical_path::{
 };
 use crate::event_log::EventLogReport;
 use crate::metrics::{Metric, MetricKind, OpenMetrics};
-use crate::otlp::{OtlpDisposition, disposition as otlp_disposition};
+use crate::otlp::{OtlpBridge, OtlpBridgeError, OtlpDisposition, OtlpExport, otlp_enabled};
 use crate::rolling_log::{RollingLogHandle, RollingLogWriter};
 use crate::spool::{EventSpool, SpoolSinks};
 
@@ -47,6 +49,12 @@ pub const CONTROL_LOSS_METRIC: &str = "eliot_observability_control_loss_total";
 
 /// Metric name of the held control-loss record gauge.
 pub const CONTROL_LOSS_HELD_METRIC: &str = "eliot_observability_control_loss_held";
+
+/// Stable event name of the record an enabled OTLP bridge exports at install.
+///
+/// I16.4 requires process start to be visible; this is the observability
+/// stack's own start, and it is the only record the bootstrap produces itself.
+const OTLP_STARTUP_EVENT: &str = "observability.startup";
 
 /// Shared bounded metric registry.
 #[derive(Debug, Default)]
@@ -96,8 +104,14 @@ pub struct ObservabilityInstall {
     pub metrics: Arc<MetricsRegistry>,
     /// I16.11 critical-path fallback machine.
     pub critical_path: CriticalPath,
-    /// Honest OTLP bridge disposition for this build.
+    /// Honest OTLP bridge disposition for this build. `Enabled` means an
+    /// endpoint is configured and this build has the `otlp` feature, so a
+    /// transport exists; it never claims that any particular export was
+    /// accepted, which only the collector's response decides.
     pub otlp: OtlpDisposition,
+    /// The live bridge, present only when `otlp` is `Enabled`. Absent otherwise,
+    /// so a default build holds no bridge and can open no collector connection.
+    pub otlp_bridge: Option<OtlpBridge>,
     /// Installation profile the stack was configured with.
     pub profile: RuntimeProfile,
 }
@@ -206,13 +220,46 @@ pub fn install(
         ObservabilityConfigError::Inconsistent("rolling log appender could not be opened")
     })?;
     install_subscriber(log.writer());
+    // The bridge is built only where both halves of the option hold: an endpoint
+    // is configured and this build has the `otlp` feature. In a default build
+    // `otlp_enabled()` is false, `OtlpBridge::new` would refuse with
+    // `FeatureDisabled`, and no socket is opened - the disabled half of A2 is
+    // untouched. A configured but unusable endpoint is an install-time
+    // configuration error, not a silently inert bridge.
+    let otlp_bridge = match config.otlp_endpoint.as_deref() {
+        Some(endpoint) if otlp_enabled() => Some(OtlpBridge::new(endpoint).map_err(|error| {
+            ObservabilityConfigError::Inconsistent(match error {
+                OtlpBridgeError::EndpointNotParsable | OtlpBridgeError::SchemeNotSupported => {
+                    "OTLP collector endpoint is not a usable http:// host, port, and path"
+                }
+                _ => "OTLP collector endpoint is not usable",
+            })
+        })?),
+        _ => None,
+    };
     let install = ObservabilityInstall {
         log: log.writer(),
         metrics: Arc::new(MetricsRegistry::default()),
         critical_path: CriticalPath::new(sinks_for(config, &log.writer())?),
-        otlp: otlp_disposition(config.otlp_endpoint.as_deref()),
+        // Taken from the bridge that was actually built, so the reported
+        // disposition and the live transport cannot disagree. A configured
+        // endpoint that built no bridge reached this line only when the feature
+        // is off, because an unusable endpoint is refused above.
+        otlp: match (&otlp_bridge, &config.otlp_endpoint) {
+            (Some(_), _) => OtlpDisposition::Enabled,
+            (None, Some(_)) => OtlpDisposition::FeatureDisabled,
+            (None, None) => OtlpDisposition::NotConfigured,
+        },
+        otlp_bridge,
         profile: config.profile,
     };
+    // The bridge is live, so it exports now. The verdict is the collector's own
+    // status line: a refusal is recorded through the subscriber that is already
+    // installed, never turned into a reported success, and it never gates
+    // startup (A13.10).
+    if let Some(bridge) = &install.otlp_bridge {
+        export_bridge_startup_record(bridge, config.profile);
+    }
     if let Some(listener) = metrics_listener {
         start_openmetrics_server(listener, Arc::clone(&install.metrics)).map_err(|_| {
             ObservabilityConfigError::Inconsistent("OpenMetrics endpoint could not start")
@@ -224,6 +271,41 @@ pub fn install(
     let _ = APPENDER.set(log);
     let _ = INSTALL.set(install.clone());
     Ok(ObservabilityInstallOutcome::Installed(install))
+}
+
+/// Exports the stack's own startup record through a live OTLP bridge.
+///
+/// This is the production caller of [`OtlpBridge::export`]: a bundle binary that
+/// is built with the `otlp` feature and configured with an endpoint emits
+/// through the bridge here, while a default startup has no bridge and emits
+/// nothing. I16.4 requires process start to be visible, and this record is that
+/// visibility on the bridge surface.
+///
+/// The verdict is the collector's observed status, never an assumption. A
+/// refusal is written to the same rolling log the rest of the stack uses, so
+/// I16.11's "silent success is forbidden" holds: an unsent record never produces
+/// a reported success. Startup is not gated on the collector (A13.10), so the
+/// refusal is recorded rather than promoted to an install failure.
+fn export_bridge_startup_record(bridge: &OtlpBridge, profile: RuntimeProfile) {
+    let record = OtlpExport {
+        event: OTLP_STARTUP_EVENT.to_owned(),
+        labels: vec![
+            ("target".to_owned(), OBSERVABILITY_TARGET.to_owned()),
+            ("profile".to_owned(), profile.as_str().to_owned()),
+        ],
+    };
+    match bridge.export(&record) {
+        Ok(()) => {}
+        Err(error) => {
+            // The endpoint itself is not logged: a configured URL may carry
+            // userinfo, and I15.4 keeps secret material out of logs. The typed
+            // reason already names the exact refusal.
+            tracing::error!(
+                reason = %error,
+                "otlp bridge export refused; the record was not accepted by the collector"
+            );
+        }
+    }
 }
 
 /// Starts the optional scrape listener on a detached process-lifetime thread.
