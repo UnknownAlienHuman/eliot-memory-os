@@ -6,6 +6,10 @@
 //! - [`generation_routing`] — runtime generation routes and cutover decisions;
 //! - [`control_reserve_front_door`] — the bounded control reserve and the
 //!   synchronous front-door admission core;
+//! - [`control_reserve_profile_compiler`] — the I14.3 multidimensional
+//!   capacity-profile compiler joining owner-produced evidence into one
+//!   canonical row per frozen bottleneck, kept separate from the front-door
+//!   slice because it describes no front-door capacity of its own;
 //! - [`recovery_state_view`] — the role-filtered, non-semantic recovery view;
 //! - [`notification_state`] — canonical persistent notification records;
 //! - [`compatibility_handshake`] — the versioned I1.12 process-handshake
@@ -21,6 +25,7 @@
 
 pub mod compatibility_handshake;
 pub mod control_reserve_front_door;
+pub mod control_reserve_profile_compiler;
 pub mod epoch_and_fence;
 pub mod generation_readiness;
 pub mod generation_routing;
