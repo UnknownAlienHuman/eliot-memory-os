@@ -77,6 +77,25 @@
 //!   Governor attachment composition, one ledger owner, one runner owner):
 //!   `let swarm = eliotd::swarm_composition::SwarmComposition::new(&attachment, &ledger, &runner);`
 //!
+//! # No-lost-child accounting over the durable ledger
+//!
+//! The in-memory `launched` list is a cache, never the source of truth. Both
+//! places that would otherwise read it as if it were authoritative now ask the
+//! [`LaunchIntentLedger`] directly:
+//!
+//! - [`SwarmComposition::launch_child`] refuses a slot that already carries a
+//!   persisted intent, so a second append plus a second runner call can never
+//!   mint the same `operation_id`/`attempt_id` twice and drop one of them from
+//!   restart accounting.
+//! - [`SwarmComposition::attach_admitted_plan`] grants launch rights only when
+//!   the durable ledger holds no intent. A non-empty ledger is a restart, not a
+//!   fresh boot: the canonical binding commits, but
+//!   [`SwarmComposition::launch_allowed`] stays false until
+//!   [`SwarmComposition::rehydrate_after_restart`] re-observes every persisted
+//!   child. Without this, a fresh process could relaunch over children that
+//!   were never reconciled, which is exactly the lost-child outcome I9.9 and A5
+//!   forbid.
+//!
 //! [`SwarmAttachmentComposition`]: eliot_governor::SwarmAttachmentComposition
 //! [`SwarmPlanAttachmentService`]: eliot_governor::SwarmPlanAttachmentService
 //! [`CanonicalSwarmPlanAttachmentStore`]: eliot_governor::CanonicalSwarmPlanAttachmentStore
@@ -556,8 +575,12 @@ impl SwarmCompositionError {
 ///
 /// Mirrors the `eliot-swarm` `DurableWorkStore` append/load feeding seam:
 /// restart safety belongs to the owner; the composition only enforces that
-/// [`SwarmComposition::launch_child`] appends before calling the runner.
-/// Deterministic fake owners prove the order protocol, not disk behavior.
+/// [`SwarmComposition::launch_child`] appends before calling the runner, and it
+/// reads [`LaunchIntentLedger::intents`] — never its own cache — wherever it
+/// needs the set of already-launched children. A composition rebuilt over a
+/// surviving ledger therefore cannot grant launch rights or relaunch a slot
+/// that already has a persisted intent. Deterministic fake owners prove the
+/// order protocol, not disk behavior.
 pub trait LaunchIntentLedger: Send + Sync {
     /// Appends one immutable launch intent and echoes its durable sequence.
     fn append_intent(&self, intent: &ChildLaunchIntent) -> Result<u64, SwarmCompositionError>;
@@ -1072,8 +1095,18 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// between acquisition and attach: the first job commits, an identical
     /// replay returns the identical binding, and a second job observes
     /// [`SwarmCompositionError::AttachConflict`] naming the canonical
-    /// winner. A successful attach marks the composition reconciled (fresh
-    /// boot has nothing to reconcile).
+    /// winner.
+    ///
+    /// A successful attach marks the composition reconciled only for a fresh
+    /// boot — the case where the durable ledger holds no launch intent. A
+    /// non-empty ledger means the ledger owner outlived the process, so this
+    /// is a restart: the canonical binding still commits, but
+    /// [`SwarmComposition::launch_allowed`] stays false and the caller must
+    /// present the sealed attachment to
+    /// [`SwarmComposition::rehydrate_after_restart`], which re-observes
+    /// every persisted child through the runner before any relaunch (I9.9:
+    /// every admitted child is registered before launch; A5: reconcile before
+    /// any relaunch).
     ///
     /// # Errors
     ///
@@ -1133,7 +1166,16 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             return Ok(prior.clone());
         }
         self.plan = Some(attached.clone());
-        self.reconciled = true;
+        // A fresh boot is the case where the caller persisted no child, so
+        // there is nothing to reconcile. A non-empty durable ledger means the
+        // ledger owner outlived this process: the canonical binding still
+        // commits (identically and idempotently), but launch rights stay
+        // withheld until the caller presents the sealed attachment to
+        // `rehydrate_after_restart`, which re-observes every persisted child
+        // through the runner before any relaunch. Granting them here would
+        // let a relaunch happen with no child reconciled, which is the
+        // lost-child accounting this composition exists to prevent.
+        self.reconciled = self.ledger.intents().is_empty();
         Ok(attached)
     }
 
@@ -1208,7 +1250,19 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
                 ),
             });
         }
-        if self.launched.iter().any(|intent| intent.slot == slot) {
+        // Duplicate detection is a completeness check against the durable
+        // denominator, so it reads the ledger — the source of truth for every
+        // persisted intent — and never the in-memory cache, which a fresh
+        // composition over a surviving ledger owner does not hold. Reading
+        // the cache would let a second append plus a second runner call mint
+        // the same operation/attempt identity twice, omitting a launched
+        // child from restart and reconciliation accounting.
+        if self
+            .ledger
+            .intents()
+            .iter()
+            .any(|intent| intent.slot == slot)
+        {
             return Err(SwarmCompositionError::DuplicateSlot {
                 slot: slot.to_owned(),
             });
