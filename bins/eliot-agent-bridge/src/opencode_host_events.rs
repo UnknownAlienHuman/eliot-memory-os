@@ -28,6 +28,7 @@
 //! onto a main-loop channel is the named gap
 //! `OPENCODE_BRIDGE_THREAD_INTEGRATION`.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,11 +36,14 @@ use eliot_agent_bridge_core::{
     AckPhase, BridgeError, CoverageGap, EventDisposition, EventForwardStatus, GapDisposition,
 };
 use eliot_agent_opencode::{
-    CredentialResolver, HOST_EVENTS_PAYLOAD_TYPE, HostEventAdmission, HostEventAdmissionError,
+    ActionGate, ActionGateDecision, ActionGateError, ActionGateRequest, CredentialResolver,
+    EffectDecisionRecord, HOST_EVENTS_PAYLOAD_TYPE, HostEventAdmission, HostEventAdmissionError,
     HostEventAdmissionFailure, HostEventAdmissionReceipt, HostEventDelivery, HostEventGap,
-    HostEventKind, HostEventPorts, HostEventSubmission, IntroductionStore, UnconfiguredActionGate,
+    HostEventKind, HostEventPorts, HostEventSubmission, IntroductionStore,
 };
-use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_governor::{GovernorActionGateRefusal, GovernorActionGateRequest, decide_pre_effect};
+use eliot_integration_coverage::GovernanceProfile;
 use eliot_process::{FencingToken, Generation, SecretRef};
 use eliot_protocol::{DeliveryClass, EventEnvelope, EventPayload, ProtocolPayload};
 use eliot_user_broker_core::{OpenCodeBridgeIntroduction, OpenCodeSessionFacts};
@@ -48,30 +52,90 @@ use thiserror::Error;
 
 use crate::BridgeRunner;
 
-/// Named gap: Governor/authority `ActionGate` evaluation wiring (issue
-/// #2898, step 9). Until a Governor-owned evaluation implements the port,
-/// the composition serves [`UnconfiguredActionGate`], which fails every
-/// gate closed to a durable-observation-only `recorded` response. The
-/// absent narrow adapter is a Governor/authority-owned `ActionGate`
-/// implementor that evaluates [`ActionGateRequest`](eliot_agent_opencode::ActionGateRequest)
-/// — the exact retained event/effect/session/fence plus current policy
-/// revision — and echoes the evaluated request hash in its decision; no
-/// such implementor exists in the tree. Policy is never decided inside the
-/// HTTP handler and `recorded` is never promoted to `allow`.
-pub const OPENCODE_ACTION_GATE_GAP: &str = "OPENCODE_ACTION_GATE_EVALUATION";
+/// Exact `EventEnvelope::payload_type` of a persisted effect-decision
+/// commitment. It names the closed, versioned record the route admits, so a
+/// decision is never confused with the retained host event it is bound to.
+pub const HOST_EVENTS_DECISION_PAYLOAD_TYPE: &str = "opencode.effect-decision.v1";
 
-/// Named gap: durable effect-decision persistence (issue #2898, step 10).
-/// The ingress binds each evaluated decision to its exact request hash and
-/// replays or conflicts decision identity through
-/// [`classify_decision_replay`](eliot_agent_opencode::classify_decision_replay),
-/// but no durable decision record exists: an exact retry after a lost
-/// response re-drives `ActionGate::decide` once the Governor evaluation is
-/// wired. The missing piece is a durable decision record under the ORS
-/// bridge-event route owner (operation/event ID, request/effect digest,
-/// task/scope/fence, generations, policy/authority revision, decision,
-/// expiry, receipt commitment, reconciliation owner) consulted before any
-/// second evaluation.
-pub const OPENCODE_DECISION_STORE_GAP: &str = "OPENCODE_DECISION_PERSISTENCE";
+/// Producer identity of a persisted effect-decision commitment. It is the
+/// decision's own producer, distinct from the `OpenCode` plugin that produced
+/// the retained event: a decision is made by the Governor through the bridge,
+/// not by the host.
+pub const HOST_EVENTS_DECISION_PRODUCER_ID: &str = "opencode.action-gate";
+
+/// Reconciliation owner of an `OpenCode` effect decision: the existing
+/// bridge-event route / ORS reconciliation owner named by
+/// [`HOST_EVENTS_DECISION_RECONCILER`](eliot_agent_opencode::HOST_EVENTS_DECISION_RECONCILER).
+/// It already holds the durable event and its ORS idempotency survives the
+/// listener process lifecycle, so the decision record is admitted through the
+/// same route rather than in a second journal.
+pub const OPENCODE_DECISION_OWNER: &str = eliot_agent_opencode::HOST_EVENTS_DECISION_RECONCILER;
+
+/// Narrow Governor/authority pre-effect evaluation over the live attach
+/// binding (issue #2898, step 9).
+///
+/// The Governor is the pre-effect decision owner. This adapter holds the
+/// current [`GovernanceProfile`](eliot_integration_coverage::GovernanceProfile)
+/// the composition supplies and delegates the exact decision to
+/// [`eliot_governor::decide_pre_effect`], which evaluates it through the
+/// existing `GovernanceProfile::authorizes` primitive under the current
+/// policy revision. No policy is decided in the HTTP handler, and a refused or
+/// unconfigured Governor yields `recorded` — a durable observation that cannot
+/// authorize a mutating tool.
+pub struct GovernorActionGate<P> {
+    current_profile: Option<P>,
+}
+
+impl<P> GovernorActionGate<P> {
+    /// Builds the gate over the current Governor profile, or `None` when
+    /// nothing has been derived (fail closed to `recorded`).
+    #[must_use]
+    pub fn new(current_profile: Option<P>) -> Self {
+        Self { current_profile }
+    }
+}
+
+impl<P> ActionGate for GovernorActionGate<P>
+where
+    P: Borrow<GovernanceProfile> + Send,
+{
+    fn decide(
+        &mut self,
+        _introduction: &OpenCodeBridgeIntroduction,
+        receipt: &HostEventAdmissionReceipt,
+        request: &ActionGateRequest,
+    ) -> Result<ActionGateDecision, ActionGateError> {
+        let governor_request = GovernorActionGateRequest {
+            operation_id: request.operation_id.clone(),
+            request_hash: request.request_hash.clone(),
+            effect_digest: request.effect_digest.clone(),
+            tool: request.tool.clone(),
+            bridge_generation: request.bridge_generation,
+            authority_epoch: request.authority_epoch.clone(),
+            fence_id: request.fence_id.clone(),
+        };
+        let verdict = decide_pre_effect(
+            self.current_profile.as_ref().map(Borrow::borrow),
+            &governor_request,
+            &receipt.authority_epoch,
+            &receipt.fence_id,
+            receipt.bridge_generation,
+        );
+        Ok(ActionGateDecision {
+            request_hash: request.request_hash.clone(),
+            allow: verdict.allow,
+            policy_revision: verdict.policy_revision,
+            authority_revision: verdict.authority_revision,
+            // The Governor's decision carries no independent expiry; the
+            // ingress accepts an `allow` only under a current expiry, so a
+            // decision with none degrades to `recorded` rather than becoming
+            // an unbounded permit.
+            expires_at_ms: 0,
+            decision_receipt: verdict.decision_receipt,
+            reason_code: verdict.reason_code.map(GovernorActionGateRefusal::as_str),
+        })
+    }
+}
 
 /// Current-introduction holder for the bridge process.
 ///
@@ -209,6 +273,38 @@ where
     }
 }
 
+/// Builds the admission receipt for one committed effect decision.
+///
+/// The owner-state bindings come from the live attach fence the decision was
+/// admitted under, never reconstructed from the record, and the receipt
+/// reports the stored record whenever this operation identity already holds
+/// one so the handler performs its content comparison against what was
+/// actually persisted.
+fn decision_receipt(
+    stream_id: String,
+    event_id: String,
+    epoch: EpochId,
+    fence: &FencingToken,
+    stored: Option<EffectDecisionRecord>,
+) -> HostEventAdmissionReceipt {
+    let replayed = stored.is_some();
+    HostEventAdmissionReceipt {
+        stream_id,
+        event_id,
+        phase: phase_text(AckPhase::Durable).to_owned(),
+        disposition: if replayed { "duplicate" } else { "accepted" }.to_owned(),
+        envelope_digest: stored
+            .as_ref()
+            .map_or_else(String::new, |record| record.decision_receipt.clone()),
+        replayed,
+        cursor_advanced: false,
+        authority_epoch: epoch,
+        fence_id: fence.nonce().to_owned(),
+        bridge_generation: fence.generation().get(),
+        replayed_decision: stored,
+    }
+}
+
 fn phase_text(phase: AckPhase) -> &'static str {
     match phase {
         AckPhase::Received => "RECEIVED",
@@ -245,12 +341,21 @@ fn bridge_failure(error: &BridgeError) -> HostEventAdmissionFailure {
 /// owner-state join rules.
 pub struct BridgeHostEventAdmission<'runner> {
     runner: &'runner mut BridgeRunner,
+    /// Effect decisions this admission already committed, keyed by their exact
+    /// operation identity. The stored record is what a `Duplicate` from the
+    /// route's own ORS replay returns, so the handler compares the presented
+    /// request against the record that was actually persisted rather than
+    /// against a recomputed one.
+    committed_decisions: BTreeMap<String, EffectDecisionRecord>,
 }
 
 impl<'runner> BridgeHostEventAdmission<'runner> {
     /// Borrows the live runner for same-thread admission.
     pub fn new(runner: &'runner mut BridgeRunner) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            committed_decisions: BTreeMap::new(),
+        }
     }
 
     fn check_coherence(
@@ -374,6 +479,13 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                     authority_epoch: epoch,
                     fence_id: fence.nonce().to_owned(),
                     bridge_generation: generation_value,
+                    // The retained event carries no decision yet: the decision
+                    // is committed under its own identity by `commit_decision`
+                    // once the Governor has evaluated it. A decision this
+                    // admission already committed for this exact operation is
+                    // returned here so a retry after a lost response reconciles
+                    // the original decision instead of evaluating a second one.
+                    replayed_decision: self.committed_decisions.get(&submission.event_id).cloned(),
                 })
             }
             EventForwardStatus::BestEffortForwarded
@@ -381,6 +493,113 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable),
             ),
         }
+    }
+
+    fn commit_decision(
+        &mut self,
+        record: &EffectDecisionRecord,
+    ) -> Result<HostEventAdmissionReceipt, HostEventAdmissionError> {
+        let binding = self
+            .runner
+            .attach_view()
+            .map(|view| view.binding().clone())
+            .ok_or_else(|| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        let fence = binding.state_fence().clone();
+        let epoch = fence.authority_epoch().clone();
+        // The decision must still be bound to the live owner state: a fence,
+        // generation or authority that moved after the evaluation refuses the
+        // write rather than persisting a decision under stale bindings.
+        if fence.nonce() != record.fence_id || fence.generation().get() != record.bridge_generation
+        {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Fenced,
+            ));
+        }
+        let stream_id = format!("{OPENCODE_DECISION_OWNER}.decisions");
+        let event_id = record.operation_id.clone();
+        if let Some(stored) = self.committed_decisions.get(&event_id) {
+            // This exact operation identity already holds a decision. The
+            // handler compares the presented record against this stored one by
+            // content, so a changed effect, scope, fence, generation or policy
+            // revision under one identity is refused without a second policy
+            // evaluation and without a second durable write.
+            return Ok(decision_receipt(
+                stream_id,
+                event_id,
+                epoch,
+                &fence,
+                Some(stored.clone()),
+            ));
+        }
+        let generation = ResourceGeneration::new(record.bridge_generation)
+            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        let envelope = EventEnvelope {
+            stream_id: stream_id.clone(),
+            producer_id: HOST_EVENTS_DECISION_PRODUCER_ID.to_owned(),
+            producer_generation: generation,
+            authority_epoch: epoch.clone(),
+            event_id: event_id.clone(),
+            // A decision is a per-operation commitment, not a stream position;
+            // its own content is what identifies it.
+            sequence: 1,
+            causal_predecessor_refs: Vec::new(),
+            delivery_class: DeliveryClass::DurableControl,
+            ack_required: true,
+            payload_type: HOST_EVENTS_DECISION_PAYLOAD_TYPE.to_owned(),
+            payload_or_blob_ref: EventPayload::Inline(Box::new(ProtocolPayload::Json(
+                record.to_json(),
+            ))),
+            state_fence: StateFence::new(epoch.clone(), generation),
+            trace_context: BTreeMap::new(),
+        };
+        envelope
+            .validate()
+            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        let status = self
+            .runner
+            .forward_event(&envelope)
+            .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
+        let EventForwardStatus::Durable {
+            phase, disposition, ..
+        } = status
+        else {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        };
+        if matches!(disposition, EventDisposition::Conflict) {
+            // The same decision identity already holds different content. The
+            // stored record is deliberately not disclosed to a conflicting
+            // presenter; reconciliation replays the presenter's own original
+            // content under the same identity.
+            return Err(HostEventAdmissionError::conflict(String::new()));
+        }
+        if matches!(disposition, EventDisposition::Duplicate) {
+            // The route proves this exact content is already durable, but the
+            // record it holds is not readable here. Refuse rather than
+            // re-evaluate: an unreconcilable duplicate must not become a second
+            // decision.
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        }
+        if !matches!(
+            phase,
+            AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
+        ) {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        }
+        self.committed_decisions
+            .insert(event_id.clone(), record.clone());
+        Ok(decision_receipt(
+            stream_id,
+            event_id,
+            epoch,
+            &fence,
+            Some(record.clone()),
+        ))
     }
 
     fn report_gap(
@@ -407,20 +626,24 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
     }
 }
 
-/// Assembles the four ingress ports over the live bridge composition.
+/// Assembles the ingress ports over the live bridge composition.
 ///
-/// The admission port borrows the runner on the bridge thread; the gate
-/// is the explicit fail-closed [`UnconfiguredActionGate`] until the
-/// Governor-owned evaluation named by [`OPENCODE_ACTION_GATE_GAP`] is
-/// wired; introductions and credentials come from the owner's live store
-/// and secret boundary.
+/// The admission port borrows the runner on the bridge thread; the gate is the
+/// real Governor/authority evaluation
+/// ([`GovernorActionGate`]) over the current policy profile the composition
+/// supplies, so `tool.execute.before` is decided by the pre-effect decision
+/// owner and never inside the HTTP handler. `current_profile` is `None` when no
+/// Governor profile has been derived: the gate then refuses closed and the
+/// response stays an observation-only `recorded`. Introductions and
+/// credentials come from the owner's live store and secret boundary.
 pub fn assemble_ports<F>(
     runner: &mut BridgeRunner,
     store: BridgeIntroductionStore,
+    current_profile: Option<GovernanceProfile>,
     resolve_credential: F,
 ) -> HostEventPorts<
     BridgeHostEventAdmission<'_>,
-    UnconfiguredActionGate,
+    GovernorActionGate<GovernanceProfile>,
     BridgeIntroductionStore,
     FnCredentialResolver<F>,
 >
@@ -429,7 +652,7 @@ where
 {
     HostEventPorts {
         admission: BridgeHostEventAdmission::new(runner),
-        gate: UnconfiguredActionGate,
+        gate: GovernorActionGate::new(current_profile),
         introductions: store,
         credentials: FnCredentialResolver::new(resolve_credential),
     }
