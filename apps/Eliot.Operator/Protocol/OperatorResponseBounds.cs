@@ -78,18 +78,61 @@ public static class OperatorResponseGuard
     }
 }
 
+/// The closed `ReadConsistency` vocabulary of I5.20, used here only to classify
+/// values the owner already issued on `OperatorProjectionPage`.
+///
+/// Every branch reads an owner-issued field, so the class can never claim a
+/// support level the owner did not send, and it exists for exactly one purpose:
+/// deciding whether a newly read page still describes the same owner view as
+/// the page the retained UI state was built from. `stable_scope` is deliberately
+/// absent: nothing the page contract issues distinguishes a stable-scope
+/// assembly from an exact one, and an undeterminable vocabulary word would be a
+/// word the owner never issued.
+public enum OperatorReadConsistency
+{
+    /// I5.20:17 — cheap preview. The owner issued an exact count but bound no
+    /// task revision, so there is no owner revision to be read-your-write
+    /// against and nothing to compare.
+    Eventual = 0,
+
+    /// I5.20:18 — read-your-write after receipt. The owner issued the matching
+    /// count as a lower bound it declined to sharpen, so the retained view is
+    /// pinned to the bound revision but is not an exact count.
+    AtLeastRevision = 1,
+
+    /// I5.20:20 — all listed dependency revisions must match. The owner issued
+    /// an exact count and a bound task revision, so every revision key this
+    /// page carries is owner-issued and comparable.
+    ExactFence = 2
+}
+
+/// The exact I5.20 vocabulary word for one classified read consistency. A value
+/// outside the closed vocabulary is refused, never reported under a word the
+/// owner did not issue.
+public static class OperatorReadConsistencyTokens
+{
+    public static string Token(this OperatorReadConsistency consistency) => consistency switch
+    {
+        OperatorReadConsistency.Eventual => "eventual",
+        OperatorReadConsistency.AtLeastRevision => "at_least_revision",
+        OperatorReadConsistency.ExactFence => "exact_fence",
+        _ => throw new OperatorProtocolException("projection", "read_consistency_unclassified")
+    };
+}
+
 /// The exact identity one retained projection is bound to.
 ///
 /// Rows, selection, cursor, task context and the retained result payload are
 /// rebuildable views of this binding, never authority. Any change to runtime,
-/// auth generation, owner task revision, projection or project/task scope
-/// invalidates every dependent piece of UI state before the new page is used.
+/// auth generation, owner task revision, projection, project/task scope or the
+/// owner-issued read consistency invalidates every dependent piece of UI state
+/// before the new page is used.
 ///
 /// `GeneratedAtUtc` is the owner's timestamp. The page contract in
-/// `crates/eliot-types` carries no State Fence or consistency discriminator,
-/// so this binding records them as owner-unissued rather than inventing one:
-/// the client refuses to *act* on a binding it cannot place against the exact
-/// owner revision, and the owner remains the single source of both values.
+/// `crates/eliot-types` carries no State Fence, so this binding reports the
+/// fence as owner-unissued rather than inventing one: the client refuses to
+/// *act* on a binding it cannot place against the exact owner revision, and the
+/// owner remains the single source of that value.
 public sealed record OperatorProjectionBinding(
     string SchemaVersion,
     string RuntimeId,
@@ -98,19 +141,31 @@ public sealed record OperatorProjectionBinding(
     string? ProjectId,
     string? TaskId,
     ulong? TaskRevision,
+    OperatorReadConsistency ReadConsistency,
     DateTimeOffset GeneratedAtUtc)
 {
     /// The owner-supplied State Fence discriminator does not exist in the
     /// current page contract. It is reported as absent, never defaulted to a
-    /// value the client made up.
+    /// value the client made up, and it is deliberately not a comparable axis:
+    /// a constant can never differ, so comparing it would be a hard-wired pass.
     public const string StateFence = "owner_unissued";
-    public const string Consistency = "owner_unissued";
 
     /// Bounded clock-skew tolerance for the owner timestamp, taken from the
     /// owner's own handoff lifetime. A page dated further into the future is
     /// refused instead of becoming permanently "fresh".
     public static TimeSpan ClockSkewTolerance { get; } =
         TimeSpan.FromSeconds(OperatorProtocol.HandoffLifetimeSeconds);
+
+    /// Classifies the owner-issued page fields into the closed I5.20
+    /// `ReadConsistency` vocabulary, strongest match first. This is a
+    /// classification of what the owner sent, never a level the client picks.
+    public static OperatorReadConsistency ClassifyReadConsistency(OperatorProjectionPage page)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        if (page.TotalIsExact && page.TaskRevision is not null) return OperatorReadConsistency.ExactFence;
+        if (!page.TotalIsExact) return OperatorReadConsistency.AtLeastRevision;
+        return OperatorReadConsistency.Eventual;
+    }
 
     public static OperatorProjectionBinding From(OperatorProjectionPage page, DateTimeOffset nowUtc)
     {
@@ -127,11 +182,17 @@ public sealed record OperatorProjectionBinding(
             page.ProjectId,
             page.TaskId,
             page.TaskRevision,
+            ClassifyReadConsistency(page),
             page.GeneratedAt);
     }
 
     /// True when the two bindings describe different owner state. A change on
-    /// any identity axis requires invalidation before use.
+    /// any identity or read-consistency axis requires invalidation before use.
+    ///
+    /// The owner timestamp is deliberately not compared: every fresh page
+    /// carries a fresh timestamp, so comparing it would rotate on every read
+    /// rather than describe a change in owner state, and would destroy the
+    /// append (load-more) path. Freshness is a refusal in `From`, not an axis.
     public bool DiffersFrom(OperatorProjectionBinding? other) =>
         other is null
         || !string.Equals(SchemaVersion, other.SchemaVersion, StringComparison.Ordinal)
@@ -140,14 +201,15 @@ public sealed record OperatorProjectionBinding(
         || !string.Equals(Projection, other.Projection, StringComparison.Ordinal)
         || !string.Equals(ProjectId, other.ProjectId, StringComparison.Ordinal)
         || !string.Equals(TaskId, other.TaskId, StringComparison.Ordinal)
-        || TaskRevision != other.TaskRevision;
+        || TaskRevision != other.TaskRevision
+        || ReadConsistency != other.ReadConsistency;
 
     /// Bounded redacted projection for the status banner. It names the binding
     /// axes and revision, never a record body.
     public string Describe() =>
         $"runtime={RuntimeId} auth_generation={AuthGeneration} projection={Projection} " +
         $"task_revision={(TaskRevision?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none")} " +
-        $"state_fence={StateFence} consistency={Consistency}";
+        $"state_fence={StateFence} read_consistency={ReadConsistency.Token()}";
 }
 
 /// Refuses a decoded projection page whose retained containers exceed their
