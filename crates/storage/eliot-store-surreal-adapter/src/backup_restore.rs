@@ -2908,6 +2908,11 @@ fn check_record_binding(
     {
         return Err(StoreError::IdentityConflict);
     }
+    // The denominator above is a count; the member *set* is bound here, by
+    // identity. A same-operation replay that carries a different member set is
+    // changed input, so it conflicts here rather than reconciling to a receipt
+    // computed over a member list this operation never recorded.
+    recorded_members_by_identity(batch, document)?;
     Ok(())
 }
 
