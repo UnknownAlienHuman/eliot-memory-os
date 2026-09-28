@@ -3972,7 +3972,8 @@ impl MemoryStore {
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
-            NamedReadOperation::GetEvidencePack
+            NamedReadOperation::GetMaintenanceTriggerDecisionOwner
+                | NamedReadOperation::GetEvidencePack
                 | NamedReadOperation::GetCurrentEpistemicPosition
                 | NamedReadOperation::GetTaskState
                 | NamedReadOperation::GetAttentionAndProblems
@@ -4096,6 +4097,44 @@ impl MemoryStore {
         fence: &StateFence,
         revision_heads: &[RevisionHead],
     ) -> Result<Option<Value>, StoreError> {
+        if query.operation == NamedReadOperation::GetMaintenanceTriggerDecisionOwner {
+            let trigger_id = query
+                .parameters
+                .get("trigger_id")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "maintenance_trigger_decision.trigger_id",
+                    reason: "must be non-empty text",
+                })?;
+            let trigger_revision = query
+                .parameters
+                .get("trigger_revision")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "maintenance_trigger_decision.trigger_revision",
+                    reason: "must be a positive decimal revision",
+                })?;
+            let owner_key = eliot_store_api::maintenance_trigger_decision_owner_key(
+                trigger_id,
+                trigger_revision,
+            )?;
+            let record = state.recovery_records.get(&owner_key);
+            if let Some(record) = record {
+                record.validate()?;
+                if record.record_key() != owner_key
+                    || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "maintenance_trigger_decision.owner_record",
+                        reason: "does not match the requested immutable owner identity",
+                    });
+                }
+            }
+            return serde_json::to_value(record)
+                .map(Some)
+                .map_err(|error| StoreError::Serialization(error.to_string()));
+        }
+
         let payload = match query.operation {
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 let scope = query
