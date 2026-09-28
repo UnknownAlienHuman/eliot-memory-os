@@ -280,6 +280,7 @@ use crate::backup_snapshot::{
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
+    StreamRecoveryReconciliationState,
     VersionedArtifactEntry,
 };
 
@@ -311,14 +312,16 @@ impl super::RedbRecoveryStore {
     ///   refusals the family's write body applies to a restored row: differing
     ///   evidence axes, an activation the destination may not become, an
     ///   archived `Retired` row landing on a destination row that is not already
-    ///   `Retired` (a restore must not terminate a live row), and an archived
-    ///   `Retired` row landing on a `Retired` destination row whose retained
-    ///   reconciliation differs. Any of these refuses the whole driver with
-    ///   zero writes, so a page is never left half-restored by a refusal the
-    ///   driver could have seen in advance. The pre-pass is strictly stronger
-    ///   than the write body for the terminal-over-live case: it refuses that
-    ///   page even when the archived row is byte-identical to the destination
-    ///   row apart from the activation.
+    ///   `Retired` (a restore must not terminate a live row), a restore
+    ///   rewriting the retained reconciliation of an already `Retired`
+    ///   destination row, and a restore introducing a `Reconciled` handoff
+    ///   readback onto a destination row that does not already carry one. Any
+    ///   of these refuses the whole driver with zero writes, so a page is never
+    ///   left half-restored by a refusal the driver could have seen in advance.
+    ///   The pre-pass is strictly stronger than the write body for the
+    ///   terminal-over-live case: it refuses that page even when the archived
+    ///   row is byte-identical to the destination row apart from the
+    ///   activation.
     ///
     /// The pre-pass reads destination state in one read transaction that is
     /// dropped before the first write, so the zero-write property is exact for
@@ -421,6 +424,9 @@ impl super::RedbRecoveryStore {
 /// pre-flight is deliberately stricter: a restore proves no terminal
 /// disposition, so it may re-preserve a terminal row into an empty key or over
 /// an already terminal row, and never turns a live destination row terminal.
+/// That single stricter case is disclosed at its own write path rather than
+/// closed here, because closing it would break "an archived `Retired` row stays
+/// `Retired`" (merged W7).
 fn restore_row_refusal(
     record_id: &str,
     archived: &ProcessStreamRecoveryProjection,
@@ -445,12 +451,26 @@ fn restore_row_refusal(
     let terminal_restore = imported == StreamRecoveryActivation::Retired;
     if destination.activation == imported {
         // Observation-advance arm of the write body, which cannot move
-        // activation: only a reconciliation rewrite is refused there, and only
-        // for a row that is already terminal.
-        if terminal_restore && destination.reconciliation != archived.reconciliation {
+        // activation. The write body's blanket "a non-admitted writer may not
+        // change a durable row's reconciliation" rule does NOT apply here,
+        // because a restore is admitted; what still applies in that arm is the
+        // retained-history rule, which is exactly the comparison below, and it
+        // has two halves. A restore may never rewrite the retained
+        // reconciliation of an already `Retired` destination row, and it may
+        // never introduce a `Reconciled` handoff readback onto a row that does
+        // not already carry it. Mirroring both here is what keeps this
+        // pre-pass faithful to the write body it stands in front of, so the
+        // documented "any disagreement refuses the whole driver with zero
+        // writes" property holds for these conflicts instead of aborting the
+        // page after an earlier row was written.
+        if destination.reconciliation != archived.reconciliation
+            && (terminal_restore
+                || archived.reconciliation.state == StreamRecoveryReconciliationState::Reconciled)
+        {
             return Ok(Some(refusal(
-                "the retained reconciliation of an already retired destination row must not be \
-                 rewritten by a restore"
+                "a restore must not rewrite an already retired destination row's retained \
+                 reconciliation, and must not author a reconciled handoff readback onto a row \
+                 that does not already carry one"
                     .to_owned(),
             )));
         }
