@@ -81,17 +81,23 @@
 //! rewritten as plaintext, and the refusal names no payload byte.
 //!
 //! The bytes are sealed by the installation secret owner `I15.4` names for the
-//! first Windows line. `WindowsPlatform::protect_secret` /
-//! `unprotect_secret` (in `eliot_platform_windows::secret_store`, already a
-//! production dependency of this crate) are the DPAPI user-scope protection
-//! primitive, and `is_windows_secret_provider` in the same crate already
-//! recognises [`RESERVATION_KEY_PROVIDER`] as a Windows secret provider
-//! identity. This module adds no second encoding, no cipher, and no key
-//! material: it asks that owner for protected bytes and hands ORS the
-//! reference it sealed against. The recovery owner reverses the same
-//! primitive; a payload that fails to unprotect is a Recovery Problem
-//! (`RedbRecoveryStore::report_recovery_problem`), never a plaintext
-//! fallback.
+//! first Windows line: `WindowsPlatform::protect_secret` in
+//! `eliot_platform_windows` is the DPAPI user-scope protection primitive, and
+//! that crate is already a production dependency of this one. [`gateway_seed`]
+//! asks that owner for protected bytes and hands ORS the reference it sealed
+//! against; this module adds no second encoding, no cipher, and no key
+//! material.
+//!
+//! Reversing the seal is not done here, and this module does not claim
+//! otherwise: no caller in this workspace unprotects a staged envelope. The
+//! read side ([`reconcile_staged_writes_at_startup`]) revalidates each envelope
+//! through `RedbRecoveryStore::verify_staged_envelope`, which compares the
+//! envelope's ORIGINAL recorded digest against its ORIGINAL recorded payload and
+//! never decodes it, so the `MissingKey` / `DecryptionFailure` arms of
+//! `RedbRecoveryStore::report_recovery_problem` have no producer on this route.
+//! What I5.2 forbids is still preserved here: nothing in this module reads a
+//! staged envelope as plaintext, recomputes a digest in place of checking the
+//! recorded one, or deletes a staged record.
 //!
 //! ## Startup recovery over the same envelopes
 //!
@@ -155,29 +161,27 @@ use eliot_store_api::{
 
 /// Key-provider label carried on reservation envelopes.
 ///
-/// This is the installation secret provider `I15.4` names for the first
-/// Windows line — "Windows Credential Manager/DPAPI-protected `SecretRef`
-/// values behind the ELIOT secret-provider facade" — and it is the exact
-/// provider identity the platform adapter already recognises
-/// (`eliot_platform_windows::is_windows_secret_provider`). It is a label, never
-/// secret material: the bytes are produced by
-/// [`WindowsPlatform::protect_secret`](eliot_platform_windows::WindowsPlatform::protect_secret)
-/// and the recovery owner reverses them with
-/// [`WindowsPlatform::unprotect_secret`](eliot_platform_windows::WindowsPlatform::unprotect_secret),
-/// so the label names a provider that exists rather than one this module
-/// wishes for. The staging boundary in [`reserve_for_transition`] still never
-/// treats the label as evidence of protection: [`refuse_plaintext_payload`]
-/// independently proves the staged bytes are not the admitted plaintext.
-pub const RESERVATION_KEY_PROVIDER: &str = "dpapi";
+/// Labels only; no secret bytes live here or cross this boundary. This names
+/// the identity a caller *asks* the installation secret provider to resolve,
+/// and it is deliberately NOT the name of the protection primitive: nothing in
+/// this workspace resolves this label, so a well-formed reference built from it
+/// is not proof of key availability, retrievability, or authenticated
+/// decoding. The staging boundary in [`reserve_for_transition`] therefore never
+/// treats the label as evidence of protection — `refuse_plaintext_payload`
+/// independently proves the staged bytes are not the admitted plaintext — and
+/// `RedbRecoveryStore::verify_staged_envelope` revalidates the envelope's own
+/// recorded digest without ever resolving it.
+///
+/// The value is unchanged from the reservation contract's established key
+/// reference, which `tests/data/store_write_reservation.json` and the existing
+/// `store_write_reservation_tests` fixtures assert.
+pub const RESERVATION_KEY_PROVIDER: &str = "kernel-reservation-key";
 /// Requested key name under [`RESERVATION_KEY_PROVIDER`] for store-write
 /// reservations.
 ///
-/// Under the DPAPI provider the key reference names the protection *lineage*
-/// the owner seals against, not a retrievable named secret: the Windows user's
-/// DPAPI scope resolves it, and `eliot_platform_windows` recognises no
-/// per-lineage credential target for it. The lineage label is what lets a
-/// recovery owner refuse a foreign lineage instead of silently opening bytes
-/// it was not given.
+/// Same caveat as the provider label: a key reference becomes evidence only
+/// when the installation secret provider resolves it, never from the string
+/// itself.
 pub const RESERVATION_KEY_NAME: &str = "store-write-reservation-v1";
 /// Visibility label preserved on every reservation envelope without
 /// interpretation by ORS.
@@ -1343,32 +1347,42 @@ pub fn recovery_page(
 
 /// Builds the composition-owned reservation seed for one admitted transition.
 ///
-/// This is the producer the live reserved write route uses. The staged bytes
-/// are the admitted transition's own canonical JSON, sealed by the
+/// This is the only payload producer this crate has, and it exists because the
+/// two honest `I5.2` payload shapes resolve to one of them here: the staged
+/// bytes are the admitted transition's own canonical JSON, sealed by the
 /// installation secret owner `I15.4` names
 /// ([`WindowsPlatform::protect_secret`](eliot_platform_windows::WindowsPlatform::protect_secret)),
-/// and the seed carries the key reference that same owner sealed against —
-/// so the `RecoveryPayload::Encrypted` claim ORS is told is true, and the
-/// recovery owner can reverse it with the same primitive. This function adds
-/// no cipher, no key material, and no second encoding: the previous revision
-/// serialized the plaintext straight into `payload_bytes` under the same
-/// label, which `I5.2` forbids ("plaintext fallback and silent deletion are
-/// forbidden") and which [`refuse_plaintext_payload`] still refuses
-/// independently before any ORS mutation.
+/// so the `RecoveryPayload::Encrypted` claim ORS is told is true. An earlier
+/// revision of this function refused instead; an earlier revision of the file
+/// staged the admitted plaintext under the same `Encrypted` label, which I5.2
+/// forbids and which `refuse_plaintext_payload` still refuses independently
+/// before any ORS mutation. This revision adds no cipher, no key material and
+/// no second encoding.
 ///
 /// The operation identity is the admitted one, byte for byte, and the ORS
 /// reservation label is derived from that same identity rather than supplied
-/// beside it — so a replay under the same operation id re-derives the same
-/// reservation and the same envelope, and no caller can pair one operation's
-/// identity with another operation's reservation. `heads` is the head set the
-/// caller observed; [`reserve_for_transition`] independently re-derives the
-/// same scope/sequence comparison against the admitted expectations and
+/// beside it, so no caller can pair one operation's identity with another
+/// operation's reservation. DPAPI seals are freshly randomized per call, so a
+/// re-seeded replay of the same operation identity produces different
+/// ciphertext; the durable envelope stays the one ORS already holds for that
+/// reservation id, and this function never rewrites it. `heads` is the head
+/// set the caller observed; [`reserve_for_transition`] independently re-derives
+/// the same scope/sequence comparison against the admitted expectations and
 /// refuses a mismatch, so this list is evidence, never the authority.
 ///
 /// A platform that cannot protect (no DPAPI, no user scope) refuses here with
 /// the preserved operation identity. It never falls back to plaintext, and it
 /// never downgrades the envelope to the root-transition-only
 /// `RecoveryPayload::CanonicalRequest` variant.
+///
+/// This producer has no production caller yet, and that is recorded rather
+/// than worked around: the only route that consumes a seed is
+/// `KernelStoreGateway::apply_reserved`, which cannot be reached from the live
+/// canonical write because the Store backend installs no reserved-write
+/// execution generation (see the "Consequence for the write route" note in
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs`). It is kept honest here
+/// so that the moment the backend advertises the capability the producer is
+/// already correct rather than a refusal.
 pub fn gateway_seed(
     platform: &eliot_platform_windows::WindowsPlatform,
     transition: &PreparedTransition,

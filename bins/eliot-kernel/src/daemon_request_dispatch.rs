@@ -6498,41 +6498,55 @@ impl KernelComposition {
         let gateway = self.retained_store_gateway()?;
         // Reserved-write route boundary (issue #1925, I5.2/I5.5/I5.6).
         //
-        // The producer now exists: `store_write_reservation::gateway_seed`
-        // seals the admitted transition's canonical bytes with the
-        // installation secret owner I15.4 names
-        // (`WindowsPlatform::protect_secret`, reachable from this composition
-        // through `KernelComposition::platform`) and hands ORS the reference it
-        // sealed against, so the `RecoveryPayload::Encrypted` claim is true.
-        // The prior revision of this file recorded the opposite — that no
-        // honest producer existed — and that premise was wrong.
+        // The owner audit named three defects: `KernelStoreGateway::apply_reserved`
+        // had no production caller, `store_write_reservation::gateway_seed` had
+        // no caller at all, and therefore the live canonical write reaches no
+        // recovery seed/reservation envelope. Two of the three are now closed on
+        // the Kernel side: `gateway_seed` is a real producer again (it seals the
+        // admitted transition's canonical bytes with
+        // `WindowsPlatform::protect_secret`, reachable from this composition
+        // through `KernelComposition::platform`, so the `RecoveryPayload::Encrypted`
+        // claim ORS is told is true), and the startup recovery owner below already
+        // enumerates and reconciles whatever envelope ORS holds.
         //
-        // Two store-side facts still keep this request on the ordinary
-        // `apply` path, and both are code facts on main rather than owner
-        // decisions:
+        // The third defect cannot be closed from this file, and it is not an owner
+        // decision — it is a store-side code fact, verified by searched negatives:
         //
-        // 1. `eliot_store_surreal` never installs a `WriteExecution`
-        //    generation (`install_concurrent_execution` /
-        //    `install_serial_execution` have no non-test caller), so
-        //    `SurrealStoreAdapter::apply_reserved_write` takes its
-        //    `execution_handle()` `None` arm and refuses
-        //    `StoreError::UnknownOperation` before any provider I/O. Routing
-        //    live writes through `apply_reserved` today would refuse every
-        //    production write.
-        // 2. `CAPABILITY_RESERVED_WRITE` is deliberately absent from
-        //    `eliot_store_api::CAPABILITIES`, so the EBP handshake never
-        //    admits the capability this wire would have to select.
+        // 1. `KernelStoreGateway::apply_reserved` ends in the Store's
+        //    `ReservedWrite` wire operation. On the store side
+        //    `SurrealStoreAdapter::apply_reserved_write`
+        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:749`) takes
+        //    the `execution_handle()` `None` arm and returns
+        //    `StoreError::UnknownOperation` before any provider I/O. The two
+        //    methods that can install a generation,
+        //    `SurrealStoreAdapter::install_concurrent_execution`
+        //    (`.../src/lib.rs:269`) and `install_serial_execution`
+        //    (`.../src/lib.rs:296`), have no non-test caller anywhere in the
+        //    workspace; the only production construction path,
+        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs:349`),
+        //    never installs one. Routing live writes through `apply_reserved`
+        //    today would therefore refuse every production canonical write.
+        // 2. `CAPABILITY_RESERVED_WRITE`
+        //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is deliberately
+        //    absent from the advertised `CAPABILITIES` list (`wire.rs:88`), so
+        //    the handshake never admits the capability this wire would select.
         //
-        // `store.apply` is also a wait-for-commit request: it carries no
-        // `response_mode` and returns the canonical `WriteReceipt`, so it
-        // never observes or claims `ACCEPTED_PENDING` (I5.5). I5.2 forbids
-        // `accepted_pending` outright when ORS cannot durably stage the
-        // complete opaque operation, so a live write that could not stage
-        // must not report it — the ordinary `apply` path reports neither.
-        // The startup recovery owner (`store_recovery_operation` ->
-        // `KernelStoreGateway::reconcile_staged_writes`) already enumerates,
-        // revalidates, and reconciles the same envelope by operation identity
-        // whenever ORS does hold one.
+        // Both live in the storage/store-bridge owners, outside this issue's
+        // file set; nothing here works around them, and there is no configuration
+        // switch, second route or `attach_*` probe that manufactures one call.
+        //
+        // `store.apply` is also a wait-for-commit request: `StoreApplyOperation`
+        // carries no `response_mode` and the route returns the canonical
+        // `WriteReceipt`, so it never observes or claims `ACCEPTED_PENDING`
+        // (I5.5). I5.2 forbids `accepted_pending` outright when ORS cannot
+        // durably stage the complete opaque operation, and a live write that
+        // could not stage must not report it. This is not a silent fallback for
+        // `accept_after_stage`: there is no `accept_after_stage` request on this
+        // wire to fall back from. The startup recovery owner
+        // (`store_recovery_operation` -> `KernelStoreGateway::reconcile_staged_writes`)
+        // enumerates, revalidates by the envelope's recorded hash, and reconciles
+        // by operation identity into either the canonical receipt or a durable
+        // Recovery Problem whenever ORS does hold one.
         match gateway
             .apply(
                 &operation.context,
