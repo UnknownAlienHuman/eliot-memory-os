@@ -35,6 +35,7 @@ $docsEvidenceCheck = Join-Path $PSScriptRoot 'documentation_evidence_check.py'
 $codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
 $docsClosureAudit = Join-Path $PSScriptRoot 'docs_closure_audit.py'
 $standaloneCrates = Join-Path $PSScriptRoot 'verify-standalone-crates.py'
+$donorDispositions = Join-Path $PSScriptRoot 'verify-cognitive-donor-dispositions-816.py'
 $dependencyPolicyVerifier = Join-Path $PSScriptRoot 'verify-dependency-policy.py'
 $dependencyPolicyReceiptPath = Join-Path $repoRoot (
     Join-Path '.eliot' ('dependency-policy-run-{0}.json' -f [Guid]::NewGuid().ToString('N'))
@@ -63,6 +64,7 @@ $allGates = @(
     [pscustomobject]@{ Name = 'documentation-closure-audit'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsClosureAudit --root $repoRoot } },
     [pscustomobject]@{ Name = 'documentation-evidence-check-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsEvidenceCheck --self-test } },
     [pscustomobject]@{ Name = 'standalone-crates'; Profiles = @('Quick', 'Review'); Command = { python $standaloneCrates --root $repoRoot } },
+    [pscustomobject]@{ Name = 'cognitive-donor-dispositions'; Profiles = @('Quick', 'Review'); Command = { python $donorDispositions --root $repoRoot } },
     [pscustomobject]@{ Name = 'core-daemon-inventory-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $coreDaemonInventoryVerifier --self-test } },
     [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
     [pscustomobject]@{ Name = 'normative-pair'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') } },

@@ -25,6 +25,29 @@ This verifier discovers those crates from the tree rather than a hand-written
 list, and runs fmt, clippy and the tests for each one. It does not admit any
 crate to the workspace and does not change any admission decision.
 
+It also proves that the workspace member set and the standalone-crate set are
+one consistent pair, which discovery alone cannot do. `standalone_crates`
+subtracts the member set, so a crate that is simultaneously a member and a
+declared standalone crate would simply vanish from its output; the consistency
+check therefore compares three INDEPENDENT sources instead of re-checking one
+of them against itself:
+
+- the workspace member set as Cargo itself resolves it
+  (`cargo metadata --locked --no-deps`), which is the one existing owner of
+  `[workspace] members`, compared against the root manifest's own array;
+- the standalone-crate set declared in
+  `workstreams/security/standalone-crate-dispositions.toml`, the checked-in
+  disposition set that already owns these crates;
+- the standalone-crate set discovered from the tree by the rule above.
+
+Each non-member crate's resolver identity is bound to what its own resolver will
+act on: `[package] name` and `version` read from that crate's own manifest and
+cross-checked against its declared row. The crate is additionally required to be
+absent from the root `Cargo.lock`, which is the root resolver's identity set.
+Nothing here adds a second member registry, a second lock or a second owner:
+crate identity stays Cargo's, and the standalone disposition stays owned by the
+disposition file.
+
 Closed `--mode compile` (accepted issue #3004, selected only by the
 `MergeCompile` verification profile) keeps the same runtime discovery but
 compiles every discovered target without executing any test binary: fmt check,
@@ -36,10 +59,21 @@ distinction. A mode named compile never calls the execution path.
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+# The one existing owner of the standalone-crate disposition set. This gate
+# reads it to CHECK consistency; it never discovers from it and never writes it.
+DISPOSITIONS_REL = Path("workstreams/security/standalone-crate-dispositions.toml")
+LOCK_REL = Path("Cargo.lock")
+# `cargo metadata --locked --no-deps` resolves the workspace without building
+# anything and without touching the network: `--locked` refuses a lockfile that
+# would change and `--no-deps` resolves workspace members only.
+CARGO_METADATA = ("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
 
 STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fmt", ("cargo", "fmt", "--manifest-path", "{manifest}", "--", "--check")),
@@ -147,6 +181,137 @@ def exclude_crates(root: Path) -> list[Path]:
     return found
 
 
+def cargo_resolved_members(root: Path) -> set[str]:
+    """The workspace member set exactly as Cargo itself resolves it.
+
+    Cargo is the one existing owner of `[workspace] members`; this gate reads its
+    resolution instead of re-deriving the array, so the comparison below never
+    checks the root manifest against itself (A0.3: a second ungoverned canonical
+    owner is a hard boundary). A resolution failure is a failure, never an
+    empty set.
+    """
+    completed = subprocess.run(
+        list(CARGO_METADATA), cwd=root, capture_output=True, text=True
+    )
+    if completed.returncode != 0:
+        tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-8:]
+        raise SystemExit(
+            "STANDALONE_CRATES: FAIL cargo could not resolve the workspace member "
+            "set: " + " | ".join(tail)
+        )
+    members: set[str] = set()
+    for package in json.loads(completed.stdout)["packages"]:
+        directory = Path(package["manifest_path"]).resolve().parent
+        try:
+            members.add(directory.relative_to(root).as_posix())
+        except ValueError as error:
+            raise SystemExit(
+                "STANDALONE_CRATES: FAIL cargo resolved a member outside the "
+                f"repository: {package['manifest_path']}"
+            ) from error
+    return members
+
+
+def declared_standalone_rows(root: Path) -> dict[str, dict]:
+    """The declared standalone-crate set, read from its one owning record."""
+    path = root / DISPOSITIONS_REL
+    if not path.is_file():
+        raise SystemExit(
+            f"STANDALONE_CRATES: FAIL missing {DISPOSITIONS_REL.as_posix()}, the "
+            "one owning record of the standalone-crate set"
+        )
+    rows = tomllib.loads(path.read_text(encoding="utf-8")).get("crate", [])
+    return {str(row.get("path")): row for row in rows if isinstance(row, dict)}
+
+
+def root_locked_packages(root: Path) -> set[str]:
+    """Package identities the ROOT resolver locked, read from the root lockfile."""
+    lock = root / LOCK_REL
+    if not lock.is_file():
+        return set()
+    return set(re.findall(r'name\s*=\s*"([^"]+)"', lock.read_text(encoding="utf-8")))
+
+
+def set_consistency_failures(root: Path, crates: list[Path], excluded: list[Path]) -> list[str]:
+    """The member set and the standalone set, compared as independent sets.
+
+    `crates` is derived by subtracting the member set, so it cannot detect a
+    crate that is in both. This compares the Cargo-resolved member set, the root
+    manifest's own member array, the declared disposition set and the discovered
+    set against one another, and binds each non-member crate's resolver identity
+    to its own manifest.
+    """
+    failures: list[str] = []
+    resolved_members = cargo_resolved_members(root)
+    declared_members, declared_exclude = workspace_paths(root)
+    rows = declared_standalone_rows(root)
+
+    # The member set: Cargo's resolution against the declared array.
+    unresolved = sorted(declared_members - resolved_members)
+    undeclared = sorted(resolved_members - declared_members)
+    if unresolved:
+        failures.append(f"declared workspace members Cargo does not resolve: {unresolved}")
+    if undeclared:
+        failures.append(f"Cargo resolves members the root manifest does not declare: {undeclared}")
+
+    # The standalone-crate set: the declared record against tree discovery.
+    discovered = {crate.relative_to(root).as_posix() for crate in crates}
+    declared = set(rows)
+    missing = sorted(discovered - declared)
+    stale = sorted(declared - discovered)
+    if missing:
+        failures.append(f"discovered standalone crates without a declared row: {missing}")
+    if stale:
+        failures.append(f"declared standalone rows that are not standalone crates: {stale}")
+
+    # Disjointness, in both directions against both member-side sets.
+    for relative in sorted(declared & (resolved_members | declared_members | declared_exclude)):
+        failures.append(
+            f"{relative}: declared standalone crate is also an admitted or excluded "
+            "workspace input"
+        )
+    for relative in sorted(discovered & (resolved_members | declared_members)):
+        failures.append(
+            f"{relative}: discovered standalone crate is also a workspace member"
+        )
+
+    # Resolver identity: bound to the crate's own manifest, and absent from the
+    # root resolver's identity set.
+    locked = root_locked_packages(root)
+    for relative in sorted(discovered | set(c for c in declared_exclude)):
+        manifest = root / relative / "Cargo.toml"
+        if not manifest.is_file():
+            failures.append(f"{relative}: no readable Cargo.toml for its resolver identity")
+            continue
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        package = data.get("package")
+        if not isinstance(package, dict):
+            failures.append(f"{relative}: manifest carries no [package] to bind an identity")
+            continue
+        name = str(package.get("name", ""))
+        version = str(package.get("version", ""))
+        if not name or not version:
+            failures.append(f"{relative}: resolver identity needs [package] name and version")
+            continue
+        if "workspace" not in data:
+            failures.append(
+                f"{relative}: a non-member crate must carry its own [workspace] table so "
+                "the root resolver does not own it"
+            )
+        if name in locked:
+            failures.append(
+                f"{relative}: {name} is in the root Cargo.lock, so the root resolver "
+                "owns an identity this gate treats as non-member"
+            )
+        row = rows.get(relative)
+        if row is not None and str(row.get("package", "")) != name:
+            failures.append(
+                f"{relative}: declared package {row.get('package')!r} disagrees with the "
+                f"crate's own manifest name {name!r}"
+            )
+    return failures
+
+
 def run_crate_steps(root: Path, crate: Path, steps: tuple[tuple[str, tuple[str, ...]], ...]) -> list[str]:
     relative = crate.relative_to(root).as_posix()
     manifest = str(crate / "Cargo.toml")
@@ -179,6 +344,18 @@ def main() -> int:
 
     crates = standalone_crates(root)
     excluded = exclude_crates(root)
+    # Fail closed before anything is reported or run: a `--list` printed from an
+    # inconsistent pair is exactly the denominator receipt this issue's
+    # consistency property exists to keep honest.
+    consistency = set_consistency_failures(root, crates, excluded)
+    if consistency:
+        print(
+            f"STANDALONE_CRATES: FAIL set-consistency issues={len(consistency)} "
+            f"crates={len(crates)} excluded={len(excluded)}"
+        )
+        for failure in consistency:
+            print(f"  - {failure}")
+        return 1
     if args.list:
         for path in crates:
             print(path.relative_to(root).as_posix())
