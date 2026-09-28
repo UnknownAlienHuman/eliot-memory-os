@@ -3143,7 +3143,7 @@ impl DaemonComposition {
                         receipt.scope.scope_ref.as_str(),
                     )
                     .map_err(DaemonError::Composition)?;
-                Ok(task_binding_admission::TaskSelectionResponse::Absent(intake))
+                Ok(task_binding_admission::TaskSelectionResponse::Absent(Box::new(intake)))
             }
             task_binding_admission::TaskSelectionDisposition::Exploratory {
                 task_ref,

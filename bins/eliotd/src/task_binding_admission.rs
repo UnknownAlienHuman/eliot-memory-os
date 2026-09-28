@@ -310,7 +310,7 @@ pub enum TaskSelectionDisposition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSelectionResponse {
     /// No current selection; caller can answer with this scope's intake shape.
-    Absent(eliot_workscope::TaskSelectionRequired),
+    Absent(Box<eliot_workscope::TaskSelectionRequired>),
     /// Exploratory binding stays explicitly read-only, not material task work.
     Exploratory {
         task_ref: String,
@@ -324,7 +324,7 @@ pub enum TaskSelectionResponse {
         task_ref: String,
         task_revision: u64,
     },
-    /// One exact current TaskContract revision with its owner evidence.
+    /// One exact current `TaskContract` revision with its owner evidence.
     Current(TaskSelectionEvidence),
 }
 
@@ -541,7 +541,6 @@ pub fn admit_task_bound_with_observed_scope(
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
 /// ambiguity is reported, never resolved. The task-intake owner producer is
 /// absent pending issue #8.
-#[must_use]
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
