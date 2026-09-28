@@ -141,6 +141,11 @@ impl HostFingerprint {
 }
 
 /// Separation of discovery, probe, and production evidence (I7.22).
+///
+/// The tier is fixed by the issuing constructor
+/// ([`CapabilityEvidence::candidate_discovery`],
+/// [`CapabilityEvidence::conformance_probe`],
+/// [`CapabilityEvidence::production_observation`]) and never caller-chosen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceTier {
     /// Declared candidate profile from installation discovery only.
@@ -167,12 +172,111 @@ pub struct CapabilityEvidence {
 }
 
 impl CapabilityEvidence {
-    /// Issues capability evidence, validating every field fail-closed.
-    pub fn new(
+    /// Issues declared candidate-discovery evidence from installation
+    /// discovery (I7.22 "Discovery").
+    ///
+    /// The tier is fixed by the constructor and never caller-chosen: this
+    /// entry can only ever be [`EvidenceTier::CandidateDiscovery`], which
+    /// [`require_verified_capability`] always rejects with
+    /// [`ConformanceError::CandidateOnlyWhereVerifiedRequired`].
+    pub fn candidate_discovery(
         fingerprint: &HostFingerprint,
-        tier: EvidenceTier,
         scope: impl Into<String>,
         proof_ceiling: impl Into<String>,
+        expires_unix_ms: u64,
+        evidence_links: Vec<String>,
+        invalidation_dependencies: Vec<HostFingerprint>,
+    ) -> Result<Self, ConformanceError> {
+        Self::issue(
+            fingerprint,
+            EvidenceTier::CandidateDiscovery,
+            scope.into(),
+            proof_ceiling.into(),
+            expires_unix_ms,
+            evidence_links,
+            invalidation_dependencies,
+        )
+    }
+
+    /// Issues bounded conformance-probe evidence (I7.22 "Conformance").
+    ///
+    /// The tier is fixed by the constructor and never caller-chosen: this
+    /// entry can only ever be [`EvidenceTier::ConformanceProbe`].
+    pub fn conformance_probe(
+        fingerprint: &HostFingerprint,
+        scope: impl Into<String>,
+        proof_ceiling: impl Into<String>,
+        expires_unix_ms: u64,
+        evidence_links: Vec<String>,
+        invalidation_dependencies: Vec<HostFingerprint>,
+    ) -> Result<Self, ConformanceError> {
+        Self::issue(
+            fingerprint,
+            EvidenceTier::ConformanceProbe,
+            scope.into(),
+            proof_ceiling.into(),
+            expires_unix_ms,
+            evidence_links,
+            invalidation_dependencies,
+        )
+    }
+
+    /// Issues production-observation evidence confirming the same capability
+    /// on the exact active fingerprint (I7.22 "Production observation").
+    ///
+    /// There is deliberately no caller-tier or caller scope/ceiling input:
+    /// the fingerprint, scope, and proof ceiling are projected (exact
+    /// readback) from a live [`EvidenceTier::ConformanceProbe`] entry bound
+    /// to the exact `active` fingerprint, so a self-minted observation with
+    /// no probe lineage cannot be constructed. Only the observation event
+    /// link and the observation expiry are supplied; everything that names
+    /// the capability comes from the checked probe.
+    pub fn production_observation(
+        probe: &CapabilityEvidence,
+        active: &HostFingerprint,
+        observation_link: impl Into<String>,
+        expires_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<Self, ConformanceError> {
+        active.validate()?;
+        if probe.tier() != EvidenceTier::ConformanceProbe {
+            return Err(ConformanceError::InvalidInput);
+        }
+        let active_canonical = active.canonical();
+        if probe.fingerprint() != active_canonical {
+            return Err(ConformanceError::FingerprintMismatch);
+        }
+        if probe.is_invalidated() {
+            return Err(ConformanceError::BrokenEvidence);
+        }
+        if !probe.is_live(now_unix_ms) {
+            return Err(ConformanceError::StaleEvidence);
+        }
+        let observation_link = observation_link.into();
+        if !is_token(&observation_link) {
+            return Err(ConformanceError::InvalidInput);
+        }
+        if expires_unix_ms <= now_unix_ms {
+            return Err(ConformanceError::InvalidInput);
+        }
+        Self::issue(
+            active,
+            EvidenceTier::ProductionObservation,
+            probe.scope().to_owned(),
+            probe.proof_ceiling().to_owned(),
+            expires_unix_ms,
+            vec![observation_link],
+            probe.invalidation_dependencies().to_vec(),
+        )
+    }
+
+    /// Issues capability evidence with a constructor-fixed tier, validating
+    /// every field fail-closed.
+    fn issue(
+        fingerprint: &HostFingerprint,
+        tier: EvidenceTier,
+        scope: String,
+        proof_ceiling: String,
         expires_unix_ms: u64,
         evidence_links: Vec<String>,
         invalidation_dependencies: Vec<HostFingerprint>,
@@ -180,8 +284,8 @@ impl CapabilityEvidence {
         let evidence = Self {
             fingerprint: fingerprint.canonical(),
             tier,
-            scope: scope.into(),
-            proof_ceiling: proof_ceiling.into(),
+            scope,
+            proof_ceiling,
             expires_unix_ms,
             evidence_links,
             invalidation_dependencies,
