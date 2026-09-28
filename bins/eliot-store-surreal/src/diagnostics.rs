@@ -1070,17 +1070,6 @@ pub enum CompatibilityDecision {
     NonWriterMaintenance,
 }
 
-impl CompatibilityDecision {
-    /// Stable machine code for this decision.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::WriterAdmitted => "writer_admitted",
-            Self::NonWriterMaintenance => "non_writer_maintenance",
-        }
-    }
-}
-
 /// Bounded, typed projection of one installation-visible compatibility
 /// decision (issue #1932, I5.9).
 ///
@@ -1099,12 +1088,6 @@ impl CompatibilityHealth {
     #[must_use]
     pub const fn decision(&self) -> CompatibilityDecision {
         self.decision
-    }
-
-    /// Returns true only for a qualified canonical writer.
-    #[must_use]
-    pub const fn is_writer_admitted(&self) -> bool {
-        matches!(self.decision, CompatibilityDecision::WriterAdmitted)
     }
 
     /// Returns the bounded decision report line, when the gate produced one
