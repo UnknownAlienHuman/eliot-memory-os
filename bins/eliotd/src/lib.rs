@@ -147,7 +147,8 @@ pub use capability_outcome::{
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
-    controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
+    controlboard_notification_refresh_refusal_body, controlboard_result_body,
+    is_controlboard_read_tool, serve_controlboard_view,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;

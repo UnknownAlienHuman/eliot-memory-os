@@ -301,6 +301,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+    use eliot_controlboard::{NotificationInbox, NotificationMetrics};
     use eliot_ipc::TransportLimits;
     use eliot_protocol::{FrameKind, MessageType, ProtocolError};
 
@@ -395,6 +396,10 @@ mod tests {
                 ),
                 row("ghost-component", ControlBoardRowDisposition::Missing, None),
             ],
+            notifications: NotificationInbox {
+                rows: Vec::new(),
+                metrics: NotificationMetrics::default(),
+            },
             observed_count: 7,
             missing_count: 1,
             unexpected_observed: vec!["extra-entry".to_owned()],
