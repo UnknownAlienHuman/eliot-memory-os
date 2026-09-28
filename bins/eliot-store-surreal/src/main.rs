@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eliot_observability_runtime::{
@@ -12,15 +12,16 @@ use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
 use eliot_store_surreal::diagnostics::{
-    BoundedEventLog, BridgeBoundary, BridgeIdentity, emit_dispatch_outcome, emit_lifecycle,
-    emit_received, emit_validation_rejected, install_startup_subscriber, report_events,
+    BoundedEventLog, BridgeBoundary, BridgeIdentity, CompatibilityDecision,
+    emit_dispatch_outcome, emit_lifecycle, emit_received, emit_validation_rejected,
+    install_startup_subscriber, project_compatibility_health, report_events,
 };
 use eliot_store_surreal::{
     CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
-    admit_authenticated_handshake, dispatch_with_log, load_compatibility_for_config, load_config,
-    load_evidence_snapshot_verification, observed_identity_verdict,
-    require_semantic_ready_for_pipe, resolve_compatibility_verdict, store_bootstrap_descriptor,
-    validate_request_frame_with_log,
+    admit_authenticated_handshake, dispatch_with_log, install_compatibility_decision,
+    load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
+    observed_identity_verdict, parse_compatibility_bytes, require_semantic_ready_for_pipe,
+    resolve_compatibility_verdict, store_bootstrap_descriptor, validate_request_frame_with_log,
 };
 
 mod launch_mode;
@@ -45,6 +46,21 @@ const OPERATIONAL_LOG_GENERATIONS: u32 =
 /// the crate's own declared ceiling.
 const OPERATIONAL_LOG_QUEUED_RECORDS: usize =
     eliot_observability_runtime::config::MAX_ROLLING_QUEUED_RECORDS;
+
+/// Store launch config an installation / release owner wants the I5.9
+/// compatibility decision installed beside (issue #1932).
+///
+/// Setting this variable turns the launch into the one-shot decision
+/// installation; leaving it unset is the normal writer launch.
+const COMPATIBILITY_CONFIG_VARIABLE: &str = "ELIOT_STORE_SURREAL_COMPATIBILITY_CONFIG";
+
+/// Owner-decided `compatibility.toml` bytes for that Store config. The owner
+/// decides the record; the bridge only renders, qualifies and installs it.
+const COMPATIBILITY_RECORD_VARIABLE: &str = "ELIOT_STORE_SURREAL_COMPATIBILITY_RECORD";
+
+/// I0.5 `CurrentSystemEvidenceSnapshot` document the owner-decided record
+/// cites, by its `evidence_snapshot_sha256`.
+const COMPATIBILITY_EVIDENCE_VARIABLE: &str = "ELIOT_STORE_SURREAL_COMPATIBILITY_EVIDENCE";
 
 /// Derives the process observability configuration from the launch contour and
 /// the loaded `StoreLaunchConfig`.
@@ -246,13 +262,87 @@ fn enforce_store_compatibility(
 ) -> CompatibilityVerdict {
     let verdict = enforce_store_compatibility_inner(config);
     eprintln!("{SERVICE_NAME}: {}", verdict.report());
-    report_stage_outcome(
-        BridgeBoundary::CompatibilityGate,
-        "compatibility_gate",
-        &BridgeIdentity::new(),
-        verdict.is_writer_admitted(),
-    );
+    // The decision is projected to the typed diagnostics health projection and
+    // recorded at its own boundary, so the structured record carries the same
+    // decision the gate reached. A maintenance verdict is recorded as a
+    // validation rejection: visible non-writer readiness, never a silent
+    // writer.
+    let health = project_compatibility_health(&verdict);
+    let mut identity = BridgeIdentity::new();
+    if let Some(decision_report) = health.decision_report() {
+        identity = identity.with_evidence_ref(decision_report);
+    }
+    let mut events = BoundedEventLog::new();
+    match health.decision() {
+        CompatibilityDecision::WriterAdmitted => emit_lifecycle(
+            &mut events,
+            BridgeBoundary::CompatibilityGate,
+            "compatibility_gate",
+            &identity,
+            None,
+        ),
+        CompatibilityDecision::NonWriterMaintenance => emit_validation_rejected(
+            &mut events,
+            BridgeBoundary::CompatibilityGate,
+            "compatibility_gate",
+            &identity,
+            None,
+        ),
+    }
+    report_events(&events);
     verdict
+}
+
+/// One-shot production producer of the installation-visible I5.9
+/// compatibility decision (issue #1932).
+///
+/// I5.9 makes `compatibility.toml` the installation-visible source of the
+/// active store decision and names the installation / release owner as the
+/// party that decides it. This is the bridge binary's production install path
+/// for that decision pair: the owner points this launch at its decided record
+/// and at the I0.5 `CurrentSystemEvidenceSnapshot` document the record cites,
+/// and [`install_compatibility_decision`] renders, qualifies and installs both
+/// beside the selected Store config.
+///
+/// The bridge decides nothing here. Every value comes from the owner's files,
+/// the record is parsed and validated by the same gate parser this process
+/// later reads with, and a pair whose evidence document does not carry the
+/// recorded content address is refused before anything is written. An
+/// installation that cannot be qualified therefore leaves the previous
+/// decision — or no decision, which is fail-closed maintenance — in place.
+///
+/// Returns true when this launch was that installation, so the caller serves
+/// nothing afterwards.
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+fn install_release_compatibility_decision() -> Result<bool, String> {
+    let Some(config_path) = std::env::var_os(COMPATIBILITY_CONFIG_VARIABLE).map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    let record_path = owner_supplied_path(COMPATIBILITY_RECORD_VARIABLE)?;
+    let evidence_path = owner_supplied_path(COMPATIBILITY_EVIDENCE_VARIABLE)?;
+    let record_bytes = std::fs::read(&record_path)
+        .map_err(|error| format!("read the owner-supplied compatibility record: {error}"))?;
+    let record = parse_compatibility_bytes(&record_bytes)
+        .map_err(|error| format!("owner-supplied compatibility record: {error}"))?
+        .surrealdb;
+    let evidence_snapshot_bytes = std::fs::read(&evidence_path)
+        .map_err(|error| format!("read the owner-supplied evidence snapshot: {error}"))?;
+    install_compatibility_decision(&config_path, &record, &evidence_snapshot_bytes)?;
+    eprintln!(
+        "{SERVICE_NAME}: installed the installation-visible compatibility decision for {config_path:?}"
+    );
+    Ok(true)
+}
+
+/// Resolves one required owner-supplied path for the compatibility
+/// installation, failing closed when a requested installation is incomplete.
+#[cfg(windows)]
+fn owner_supplied_path(variable: &str) -> Result<PathBuf, String> {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{variable} is required to install the compatibility decision"))
 }
 
 #[cfg(windows)]
@@ -648,6 +738,14 @@ async fn serve_handshake_loop(
 // and the visible non-writer readiness state must be reported there.
 #[allow(clippy::print_stderr)]
 async fn run() -> Result<(), String> {
+    // I5.9 (issue #1932): the one-shot compatibility decision installation runs
+    // before any launch-mode decode, so the installation / release owner can
+    // install the installation-visible decision for a Store config without a
+    // launch profile. An unset variable is the normal writer launch and changes
+    // nothing.
+    if install_release_compatibility_decision()? {
+        return Ok(());
+    }
     let mode = match parse_launch_mode(std::env::args_os().skip(1)) {
         Ok(mode) => {
             let mut events = BoundedEventLog::new();

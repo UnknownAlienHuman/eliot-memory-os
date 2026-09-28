@@ -81,10 +81,10 @@ mod compatibility;
 pub use compatibility::{
     ADMITTED_TRANSPORT, COMPATIBILITY_FILE_NAME, CompatibilityFile, CompatibilityVerdict,
     EVIDENCE_SNAPSHOT_FILE_NAME, EvidenceSnapshotVerification, SurrealCompatibility,
-    compatibility_path_for_config, evaluate_compatibility, load_compatibility_for_config,
-    load_evidence_snapshot_verification, observed_identity_verdict, parse_compatibility_bytes,
-    require_compatibility_for_writer, require_installation_writer, require_observed_identity_match,
-    resolve_compatibility_verdict,
+    compatibility_path_for_config, evaluate_compatibility, install_compatibility_decision,
+    load_compatibility_for_config, load_evidence_snapshot_verification, observed_identity_verdict,
+    parse_compatibility_bytes, require_compatibility_for_writer, require_installation_writer,
+    require_observed_identity_match, resolve_compatibility_verdict,
 };
 mod schema_bootstrap_contract;
 use schema_bootstrap_contract::{
