@@ -732,6 +732,15 @@ struct StoreRecoveryOperation {
     maintenance_trigger_pending_continuation: Option<String>,
 }
 
+/// Payload for staging one complete trigger record. The transport routing key
+/// is removed before this closed decode, keeping the producer operation bytes
+/// distinct from Kernel's top-level operation name.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerIntakeOperation {
+    record: MaintenanceTriggerRecord,
+}
 /// Cursor and page bound for one retained maintenance-trigger scan.
 #[cfg(windows)]
 #[derive(Deserialize)]
@@ -4027,7 +4036,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerPageOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if operation.limit == 0 || operation.limit as usize > MAX_MAINTENANCE_TRIGGER_PAGE_MEMBERS {
             return Ok(Self::maintenance_trigger_input_failure_response(
                 MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
@@ -4093,7 +4103,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerClaimOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let now = unix_ms();
         let Some(maximum_deadline) = now.checked_add(MAINTENANCE_TRIGGER_CLAIM_MAX_LEASE_MS) else {
             return Ok(Self::maintenance_trigger_input_failure_response(
@@ -4177,7 +4188,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerDeliveryReadOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let Ok(gateway) = self.retained_store_gateway() else {
             return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
                 MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND,
@@ -4217,7 +4229,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerDecisionOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.receipt.validate() {
             return Ok(Self::maintenance_trigger_lifecycle_failure_response(
                 MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
@@ -4270,7 +4283,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerDecisionReconcileOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if operation.trigger_id.trim().is_empty()
             || operation.trigger_id.chars().any(char::is_control)
         {
@@ -4331,7 +4345,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let ack: MaintenanceTriggerAck =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = ack.validate() {
             return Ok(Self::maintenance_trigger_lifecycle_failure_response(
                 MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
@@ -4389,7 +4404,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let terminal: MaintenanceTriggerTerminalDisposition =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = terminal.validate() {
             return Ok(Self::maintenance_trigger_lifecycle_failure_response(
                 MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
@@ -4442,7 +4458,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerGapRecordOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.gap.validate() {
             return Ok(Self::maintenance_trigger_lifecycle_failure_response(
                 MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
@@ -4493,7 +4510,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerGapPageOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if operation.limit == 0 || operation.limit as usize > MAX_MAINTENANCE_TRIGGER_PAGE_GAPS {
             return Ok(Self::maintenance_trigger_input_failure_response(
                 MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
@@ -4546,7 +4564,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerRetentionOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.proof.validate() {
             return Ok(Self::maintenance_trigger_lifecycle_failure_response(
                 MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
@@ -4593,7 +4612,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
         let operation: MaintenanceTriggerCompactOperation =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let Ok(gateway) = self.retained_store_gateway() else {
             return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
                 MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
@@ -4629,8 +4649,10 @@ impl KernelComposition {
         request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
         Self::validate_activation_submitter(session, request_identity)?;
-        let record: MaintenanceTriggerRecord =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let operation: MaintenanceTriggerIntakeOperation =
+            serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let record = operation.record;
         let retry_identity = record.source_event_identity().canonical_hex();
         // Shape-check first. The gateway checks applicability and source-fence
         // equality only after an exact retained replay lookup, so a lost intake

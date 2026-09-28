@@ -4374,6 +4374,7 @@ fn create_pending_maintenance_trigger_lifecycle(
         claim_record: None,
         decision_record: None,
         downstream_intent_record: None,
+        recovered_from_store: false,
         downstream_intent_origin_claim_record: None,
         acknowledgement_record: None,
         revocation_record: None,
@@ -6078,6 +6079,7 @@ fn persist_maintenance_trigger_lifecycle(
             });
         }
         validate_maintenance_trigger_intent_origin_transition(prior, lifecycle)?;
+        validate_recovered_from_store_transition(prior, lifecycle)?;
     }
     let sequence_key = maintenance_trigger_sequence_key(lifecycle.intake_sequence);
     let indexed_active = {
@@ -6170,6 +6172,44 @@ fn validate_maintenance_trigger_intent_origin_transition(
                     .to_owned(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_recovered_from_store_transition(
+    prior: &MaintenanceTriggerLifecycleRecord,
+    next: &MaintenanceTriggerLifecycleRecord,
+) -> Result<(), OrsError> {
+    if prior.recovered_from_store {
+        if !next.recovered_from_store
+            || prior.decision_record.as_ref() != next.decision_record.as_ref()
+            || prior.downstream_intent_record.as_ref() != next.downstream_intent_record.as_ref()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: "recovered Store provenance and its exact decision/intent are immutable"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    }
+
+    if next.recovered_from_store
+        && (prior.phase != MaintenanceTriggerLifecyclePhase::Claimed
+            || prior.claim.is_none()
+            || prior.decision_record.is_some()
+            || prior.downstream_intent_record.is_some()
+            || prior.claim.as_ref() != next.claim.as_ref()
+            || prior.claim_record.as_ref() != next.claim_record.as_ref()
+            || next.phase != MaintenanceTriggerLifecyclePhase::DecisionRecorded
+            || next.decision_record.is_none()
+            || next.downstream_intent_record.is_none())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_lifecycle",
+            reason: "recovered Store provenance may be set only with the first decision/intent under the same fresh claim"
+                .to_owned(),
+        });
     }
     Ok(())
 }
@@ -6743,6 +6783,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// Retains the exact canonical decision receipt and downstream intent
     /// under the active claim before the owner acknowledges the trigger.
     fn record_maintenance_trigger_decision(
+        &self,
+        trigger_id: &str,
+        expected_state_revision: u64,
+        claim: &MaintenanceTriggerClaimBinding,
+        decision_record: MaintenanceTriggerCanonicalRecord,
+        downstream_intent_record: MaintenanceTriggerCanonicalRecord,
+        now_ms: u64,
+    ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError>;
+    /// Persists a Store decision recovered from its exact committed owner and
+    /// receipt records. This may set recovered provenance only on a fresh
+    /// Claimed lifecycle with no previously retained decision or intent.
+    fn record_recovered_maintenance_trigger_decision(
         &self,
         trigger_id: &str,
         expected_state_revision: u64,
@@ -34883,6 +34935,65 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
     }
 
+    fn record_recovered_maintenance_trigger_decision(
+        &self,
+        trigger_id: &str,
+        expected_state_revision: u64,
+        claim: &MaintenanceTriggerClaimBinding,
+        decision_record: MaintenanceTriggerCanonicalRecord,
+        downstream_intent_record: MaintenanceTriggerCanonicalRecord,
+        now_ms: u64,
+    ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
+        validate_text(trigger_id, "maintenance_trigger_id")?;
+        claim.validate()?;
+        decision_record.validate()?;
+        downstream_intent_record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut lifecycle = load_maintenance_trigger_lifecycle_for_update(&write, trigger_id)?;
+        if lifecycle.claim.as_ref() != Some(claim) {
+            return Err(OrsError::DuplicateConflict);
+        }
+
+        if lifecycle.recovered_from_store {
+            if lifecycle.decision_record.as_ref() == Some(&decision_record)
+                && lifecycle.downstream_intent_record.as_ref() == Some(&downstream_intent_record)
+                && matches!(
+                    lifecycle.phase,
+                    MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                        | MaintenanceTriggerLifecyclePhase::Acknowledged
+                        | MaintenanceTriggerLifecyclePhase::Reconciling
+                )
+            {
+                return commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+
+        // Recovered provenance can be established only at the first decision
+        // write. An ordinary retained decision/intent is never upgraded based
+        // on a later Store lookup or a matching origin claim.
+        if lifecycle.decision_record.is_some() || lifecycle.downstream_intent_record.is_some() {
+            return Err(OrsError::DuplicateConflict);
+        }
+        if expected_state_revision != lifecycle.state_revision
+            || claim.claim_deadline_ms <= now_ms
+            || lifecycle
+                .expires_at_ms
+                .is_some_and(|deadline| now_ms >= deadline)
+            || lifecycle.phase != MaintenanceTriggerLifecyclePhase::Claimed
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+
+        lifecycle.decision_record = Some(decision_record);
+        retain_maintenance_trigger_downstream_intent(&mut lifecycle, downstream_intent_record)?;
+        lifecycle.recovered_from_store = true;
+        lifecycle.phase = MaintenanceTriggerLifecyclePhase::DecisionRecorded;
+        advance_maintenance_trigger_lifecycle(&mut lifecycle, now_ms)?;
+        persist_maintenance_trigger_lifecycle(&write, &lifecycle)?;
+        commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
+    }
+
     fn mark_maintenance_trigger_reconciling(
         &self,
         trigger_id: &str,
@@ -36190,6 +36301,28 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         now_ms: u64,
     ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
         self.store.record_maintenance_trigger_decision(
+            trigger_id,
+            expected_state_revision,
+            claim,
+            decision_record,
+            downstream_intent_record,
+            now_ms,
+        )
+    }
+
+    /// Persists an exact decision/intent pair after its committed Store owner
+    /// and receipt were validated under the active fence. Only a fresh claim
+    /// without any retained decision or intent can establish this marker.
+    pub fn record_recovered_maintenance_trigger_decision(
+        &self,
+        trigger_id: &str,
+        expected_state_revision: u64,
+        claim: &MaintenanceTriggerClaimBinding,
+        decision_record: MaintenanceTriggerCanonicalRecord,
+        downstream_intent_record: MaintenanceTriggerCanonicalRecord,
+        now_ms: u64,
+    ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
+        self.store.record_recovered_maintenance_trigger_decision(
             trigger_id,
             expected_state_revision,
             claim,
