@@ -6496,21 +6496,43 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
-        // Response-mode boundary (issue #1925, I5.5): `store.apply` is a
-        // wait-for-commit request — it carries no `response_mode`, returns the
-        // canonical `WriteReceipt`, and has no `accept_after_stage` form on this
-        // wire — so this route never observes or claims `ACCEPTED_PENDING`.
-        // That is not a weaker substitute for the reserved path: I5.2 forbids
-        // `accepted_pending` outright when ORS cannot durably stage the complete
-        // opaque operation, and no honest `ReservationSeed` payload producer
-        // exists for this composition yet (see the "Consequence for the write
-        // route" section of `eliot_kernel_service::store_write_reservation`).
-        // Until one does, the reserved envelope is not staged here, and the
-        // startup recovery owner above keeps the I1.11 step 6 gate honest about
-        // whatever ORS does hold. Routing this call through
-        // `KernelStoreGateway::apply_reserved` requires a real producer; calling
-        // it with invented protected bytes would stage a false `Encrypted`
-        // label, which I5.2 forbids.
+        // Reserved-write route boundary (issue #1925, I5.2/I5.5/I5.6).
+        //
+        // The producer now exists: `store_write_reservation::gateway_seed`
+        // seals the admitted transition's canonical bytes with the
+        // installation secret owner I15.4 names
+        // (`WindowsPlatform::protect_secret`, reachable from this composition
+        // through `KernelComposition::platform`) and hands ORS the reference it
+        // sealed against, so the `RecoveryPayload::Encrypted` claim is true.
+        // The prior revision of this file recorded the opposite — that no
+        // honest producer existed — and that premise was wrong.
+        //
+        // Two store-side facts still keep this request on the ordinary
+        // `apply` path, and both are code facts on main rather than owner
+        // decisions:
+        //
+        // 1. `eliot_store_surreal` never installs a `WriteExecution`
+        //    generation (`install_concurrent_execution` /
+        //    `install_serial_execution` have no non-test caller), so
+        //    `SurrealStoreAdapter::apply_reserved_write` takes its
+        //    `execution_handle()` `None` arm and refuses
+        //    `StoreError::UnknownOperation` before any provider I/O. Routing
+        //    live writes through `apply_reserved` today would refuse every
+        //    production write.
+        // 2. `CAPABILITY_RESERVED_WRITE` is deliberately absent from
+        //    `eliot_store_api::CAPABILITIES`, so the EBP handshake never
+        //    admits the capability this wire would have to select.
+        //
+        // `store.apply` is also a wait-for-commit request: it carries no
+        // `response_mode` and returns the canonical `WriteReceipt`, so it
+        // never observes or claims `ACCEPTED_PENDING` (I5.5). I5.2 forbids
+        // `accepted_pending` outright when ORS cannot durably stage the
+        // complete opaque operation, so a live write that could not stage
+        // must not report it — the ordinary `apply` path reports neither.
+        // The startup recovery owner (`store_recovery_operation` ->
+        // `KernelStoreGateway::reconcile_staged_writes`) already enumerates,
+        // revalidates, and reconciles the same envelope by operation identity
+        // whenever ORS does hold one.
         match gateway
             .apply(
                 &operation.context,
