@@ -61,6 +61,10 @@ struct CodexExecPlan {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "fields keep the canonical identity vocabulary shared with CLI args, protocol bindings, and store contracts (#838)"
+)]
 struct DogfoodCodexScope {
     project_id: ProjectId,
     task_id: TaskId,
@@ -458,6 +462,14 @@ pub(crate) async fn start(root: &Path) -> Result<()> {
     }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one non-rederived CLI scope contract: root plus 7 exact identity args, each independently validated (#838)"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered run-codex scenario stays whole: root, manifest, binding, config, status, launch, scope, store (#838)"
+)]
 pub(crate) async fn run_codex(
     root: &Path,
     project_id: &str,
@@ -568,25 +580,17 @@ pub(crate) async fn run_codex(
     {
         Vec::new()
     } else {
-        match codex_event_task_action_write_ids(&process.stdout) {
-            Ok(write_ids) => write_ids,
-            Err(_) => {
-                blockers.push("codex_event_stream_invalid".to_owned());
-                Vec::new()
-            }
-        }
+        codex_event_task_action_write_ids(&process.stdout)
+            .inspect_err(|_| blockers.push("codex_event_stream_invalid".to_owned()))
+            .unwrap_or_default()
     };
     let model_invoked_task_action_request = !model_action_write_ids.is_empty();
     if !model_invoked_task_action_request {
         blockers.push("model_task_action_request_not_observed".to_owned());
     }
-    let final_message = match validate_codex_final_message(&launch.plan.output_last_message_path) {
-        Ok(message) => Some(message),
-        Err(_) => {
-            blockers.push("codex_final_message_invalid".to_owned());
-            None
-        }
-    };
+    let final_message = validate_codex_final_message(&launch.plan.output_last_message_path)
+        .inspect_err(|_| blockers.push("codex_final_message_invalid".to_owned()))
+        .ok();
     if final_message
         .as_ref()
         .is_none_or(|message| message.outcome != DogfoodCodexOutcome::Completed)
@@ -711,6 +715,10 @@ pub(crate) async fn run_codex(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered provider launch stays whole: prompt, identity, env allowlist, scope token, run, revoke (#838)"
+)]
 async fn run_codex_provider(
     manifest: &DogfoodManifest,
     launch: &ValidatedCodexLaunch,
@@ -1036,8 +1044,7 @@ fn codex_event_task_action_write_ids(bytes: &[u8]) -> Result<Vec<WriteId>> {
             .and_then(Value::as_str);
         let exact_tool = matches!(
             tool,
-            Some("eliot_task_action_request")
-                | Some("mcp__eliot-governor__eliot_task_action_request")
+            Some("eliot_task_action_request" | "mcp__eliot-governor__eliot_task_action_request")
         );
         let exact_server = item
             .get("server")
@@ -1090,6 +1097,10 @@ fn codex_executable_identity(path: &Path) -> Result<CodexExecutableIdentity> {
     }
     let mut file = File::open(path).context("open installed Codex CLI for hashing")?;
     let mut hasher = Sha256::new();
+    #[expect(
+        clippy::large_stack_arrays,
+        reason = "1 MiB stack scratch for one bounded hash loop; heap migration is an allocation change needing focused byte-equivalence proof (#838)"
+    )]
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -1581,6 +1592,10 @@ const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "PE slice lengths proven by the preceding bounds guards, so try_into is infallible; error-path conversion needs focused PE-equivalence proof (#838)"
+)]
 fn pe_machine(bytes: &[u8]) -> Result<String> {
     if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
         bail!("SurrealDB executable is not a PE image");

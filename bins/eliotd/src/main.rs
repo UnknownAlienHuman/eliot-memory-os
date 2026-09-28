@@ -11,6 +11,10 @@ mod observability;
 
 use eliotd::{PROTOCOL_VERSION, SERVICE_NAME};
 
+#[expect(
+    clippy::print_stderr,
+    reason = "last-resort operator stderr only after structured write_json failed; statement-level expect is unsupported here (#838)"
+)]
 fn main() {
     // #740: one bounded stderr subscriber for the process. Protocol/status
     // stdout bytes and framing stay unchanged; init failure keeps the first
