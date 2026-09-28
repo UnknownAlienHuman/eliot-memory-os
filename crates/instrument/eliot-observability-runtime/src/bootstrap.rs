@@ -288,7 +288,7 @@ pub fn install(
 /// refusal is recorded rather than promoted to an install failure.
 fn export_bridge_startup_record(bridge: &OtlpBridge, profile: RuntimeProfile) {
     let record = OtlpExport {
-        event: OTLP_STARTUP_EVENT.to_owned(),
+        event: OTLP_STARTUP_EVENT,
         labels: vec![
             ("target".to_owned(), OBSERVABILITY_TARGET.to_owned()),
             ("profile".to_owned(), profile.as_str().to_owned()),

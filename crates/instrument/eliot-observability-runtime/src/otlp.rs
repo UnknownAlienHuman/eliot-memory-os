@@ -105,7 +105,7 @@ impl OtlpDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OtlpExport {
     /// Stable event name, carried as the log record's body.
-    pub event: String,
+    pub event: &'static str,
     /// Bounded low-cardinality labels.
     pub labels: Vec<(String, String)>,
 }
