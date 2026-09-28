@@ -257,7 +257,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -279,10 +279,10 @@ impl KernelComposition {
                 {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                campaign_packet_admission(envelope, tool)?;
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
-                campaign_packet_admission(envelope, tool)?;
                 if !candidate.campaign_packet_attempt.is_owned_by(session) {
                     let generation = candidate
                         .campaign_packet_attempt
@@ -330,7 +330,7 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -350,10 +350,10 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                let invocation = task_controller_admission(envelope, tool)?;
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
-                let invocation = task_controller_admission(envelope, tool)?;
                 if !candidate.task_controller_attempt.is_owned_by(session) {
                     let generation = candidate
                         .task_controller_attempt
@@ -521,7 +521,7 @@ impl KernelComposition {
     ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, FinishAttempt)>, TransportError>
     {
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -541,10 +541,10 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope)? {
+                finish_admission(envelope, tool)?;
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
-                finish_admission(envelope, tool)?;
                 if !candidate.finish_attempt.is_owned_by(session) {
                     let generation = candidate
                         .finish_attempt

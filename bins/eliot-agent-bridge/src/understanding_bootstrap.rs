@@ -24,6 +24,11 @@
 //! projection stays comparable without duplicating that contract.
 
 use eliot_governor::ColdStartSurfaceView;
+use eliot_integration_coverage::{
+    EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
+    LogicalEvent,
+};
+use eliot_workscope::TaskBindingState;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -44,6 +49,8 @@ pub const MAX_CANDIDATE_HANDLES: usize = 16;
 pub const MAX_HANDLES: usize = 32;
 /// Maximum limiting integration evidence handles.
 pub const MAX_EVIDENCE_HANDLES: usize = 8;
+/// Maximum changed handles carried in one bounded boot delta preview.
+pub const MAX_BOOT_DELTA_HANDLES: usize = 16;
 /// Maximum length of one opaque handle or reference.
 pub const MAX_HANDLE_LEN: usize = 256;
 
@@ -98,17 +105,192 @@ pub enum ReadinessDisposition {
     Conflicted,
 }
 
-/// Actual Governor-derived profile with its limiting integration evidence.
+/// Actual coverage and Governor-derived profiles projected with their
+/// coverage-level gap evidence (I7.16).
 ///
-/// `limiting_integration_evidence` carries the concrete coverage handles that
-/// bound authority (I7.16); at least one is required so a bootstrap can never
-/// present an unbounded profile.
+/// The complete typed owner profiles remain attached so event disposition,
+/// ordering, completeness, proof ceiling, source, gaps, authorization, and
+/// freshness axes are not reduced to a label. The gap list is copied verbatim
+/// from the integration owner as a bounded preview; the attached coverage
+/// profile retains every gap. It may be empty when the owner reports no
+/// profile-level gaps; absence of gaps does not itself claim readiness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernanceEvidence {
     pub profile_ref: String,
     pub profile_revision: String,
+    pub coverage_profile: IntegrationCoverageProfile,
+    pub governance_profile: GovernanceProfile,
     pub limiting_integration_evidence: Vec<String>,
+}
+
+impl GovernanceEvidence {
+    /// Projects the typed coverage and governance snapshots supplied by their
+    /// owners (I7.8 step 4, I7.16; issue #1746 W5).
+    ///
+    /// This constructor projects the supplied owner profiles without
+    /// summarizing away either profile. It refuses ways a caller-authored
+    /// readiness could otherwise imply full authority:
+    ///
+    /// - `IntegrationCoverageProfile::validate` requires every one of the ten
+    ///   logical events to be present, so an empty sensor list is rejected by
+    ///   the owner itself and can never be presented as coverage;
+    /// - `GovernanceProfile` must agree with coverage identity, verification,
+    ///   completeness, and the owner's derivation formula for both
+    ///   authorization axes; all authorization and freshness fields remain in
+    ///   the output. These structural checks do not authenticate the snapshot's
+    ///   origin or prove its freshness; the owner transport remains STITCH;
+    /// - the bounded gap preview copies the first owner gap handles verbatim;
+    ///   the attached `IntegrationCoverageProfile` retains every gap and all
+    ///   event dispositions, ordering, completeness, source and proof ceiling.
+    ///   A complete profile with no gaps carries an empty preview.
+    ///
+    /// `profile_ref` is the exact coverage fingerprint and
+    /// `profile_revision` the canonical decimal Governor revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns `COVERAGE_INVALID` when the owner coverage does not validate,
+    /// `GOVERNANCE_FINGERPRINT_MISMATCH`, `GOVERNANCE_COVERAGE_UNVERIFIED`,
+    /// `GOVERNANCE_COMPLETENESS_MISMATCH`, or
+    /// `GOVERNANCE_DERIVATION_MISMATCH` when the profile disagrees with the
+    /// coverage or its derivation axes.
+    pub fn from_owner_profiles(
+        coverage: &IntegrationCoverageProfile,
+        profile: &GovernanceProfile,
+    ) -> Result<Self, BootstrapError> {
+        coverage.validate().map_err(|error| {
+            BootstrapError::new(
+                "COVERAGE_INVALID",
+                format!("integration coverage profile is not valid: {error}"),
+            )
+        })?;
+        if profile.fingerprint != coverage.fingerprint {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_FINGERPRINT_MISMATCH",
+                "derived governance profile names another active coverage fingerprint",
+            ));
+        }
+        if profile.verified != coverage.verified {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COVERAGE_UNVERIFIED",
+                "derived governance profile claims a verification state its coverage does not carry",
+            ));
+        }
+        if !coverage.verified {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COVERAGE_UNVERIFIED",
+                "Governor derivation requires verified production coverage",
+            ));
+        }
+        if profile.completeness != coverage.completeness {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COMPLETENESS_MISMATCH",
+                "derived governance profile claims a completeness its coverage does not carry",
+            ));
+        }
+        if profile.revision == 0 {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_REVISION_MISSING",
+                "derived governance profile has no current revision",
+            ));
+        }
+        validate_governance_axes(coverage, profile)?;
+        // The complete gap set remains in coverage_profile. This list is only
+        // the bounded inline preview; a valid owner profile may have more gaps.
+        let gaps: Vec<String> = coverage
+            .gaps
+            .iter()
+            .take(MAX_EVIDENCE_HANDLES)
+            .cloned()
+            .collect();
+        Ok(Self {
+            profile_ref: coverage.fingerprint.clone(),
+            profile_revision: profile.revision.to_string(),
+            coverage_profile: coverage.clone(),
+            governance_profile: profile.clone(),
+            limiting_integration_evidence: gaps,
+        })
+    }
+}
+
+/// Bounded boot delta carried alongside the readiness surface (I7.8 step 4,
+/// issue #1746 W5).
+///
+/// A boot delta is additive only. It names the readiness receipt revision it is
+/// relative to and the owner-issued handles that changed, plus one expansion
+/// handle for the full delta; it never replaces the required selection,
+/// authority, or recovery information, which [`validate_context`] still demands
+/// in full. Budgeting the preview to a bounded handle list therefore cannot drop
+/// the floor: the expanded delta sits behind the handle while the floor stays
+/// inline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootDelta {
+    /// Readiness receipt revision the last delivered bootstrap carried. `None`
+    /// for the first bootstrap of a session, where there is nothing to delta
+    /// against; it is never defaulted to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_receipt_revision: Option<u64>,
+    /// Receipt revision this delta moves to.
+    pub receipt_revision: u64,
+    /// Bounded owner-issued change handles.
+    #[serde(default)]
+    pub changed_handles: Vec<String>,
+    /// Bounded owner handle that expands the full delta.
+    pub expansion_handle: String,
+}
+
+impl BootDelta {
+    /// Validates the delta's own shape and its relationship to the readiness
+    /// surface it accompanies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BOOT_DELTA_REVISION_MISSING` for a zero revision,
+    /// `BOOT_DELTA_REVISION_STALE` when the delta does not move the receipt
+    /// forward from the revision it names, `BOOT_DELTA_EXPANSION_MISSING` for a
+    /// blank or over-long expansion handle, and `BOOT_DELTA_BOUND` for a
+    /// changed-handle list that is not bounded.
+    pub fn validate(&self, receipt_revision: u64) -> Result<(), BootstrapError> {
+        if self.receipt_revision == 0 {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_MISSING",
+                "boot delta carries a zero readiness receipt revision",
+            ));
+        }
+        if self.receipt_revision != receipt_revision {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_STALE",
+                "boot delta names another readiness receipt revision than the surface it accompanies",
+            ));
+        }
+        if let Some(previous) = self.previous_receipt_revision
+            && previous >= self.receipt_revision
+        {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_REVISION_STALE",
+                "boot delta does not move the readiness receipt forward",
+            ));
+        }
+        if self.expansion_handle.trim().is_empty() {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_EXPANSION_MISSING",
+                "boot delta must carry a non-blank expansion handle",
+            ));
+        }
+        if self.expansion_handle.len() > MAX_HANDLE_LEN {
+            return Err(BootstrapError::new(
+                "BOOT_DELTA_EXPANSION_MISSING",
+                "boot delta expansion handle exceeds bound",
+            ));
+        }
+        bounded_list(
+            &self.changed_handles,
+            "BOOT_DELTA_BOUND",
+            MAX_BOOT_DELTA_HANDLES,
+        )
+    }
 }
 
 /// One task candidate considered for binding.
@@ -247,6 +429,14 @@ pub struct BootstrapContext {
     #[serde(default)]
     pub conflicts_unknowns: Vec<String>,
     pub next_safe_expansion: String,
+    /// Bounded boot delta relative to the previous delivered bootstrap.
+    ///
+    /// Purely additive (I7.8 step 4): it never replaces the readiness, task
+    /// selection, authority, or recovery fields above, so budgeting the preview
+    /// cannot drop them. `None` when the owner produced no delta for this
+    /// surface; it is never defaulted into an empty "nothing changed" claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_delta: Option<BootDelta>,
 }
 
 impl BootstrapContext {
@@ -316,6 +506,7 @@ impl BootstrapContext {
             candidate_count,
             conflicts_unknowns,
             next_safe_expansion,
+            boot_delta: None,
         };
         validate_context(&context)?;
         Ok(context)
@@ -361,7 +552,26 @@ impl BootstrapContext {
         candidate_count: u32,
         conflicts_unknowns: Vec<String>,
         next_safe_expansion: String,
+        boot_delta: Option<BootDelta>,
     ) -> Result<Self, BootstrapError> {
+        if principal_ref != surface.principal_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_PRINCIPAL_MISMATCH",
+                "caller principal disagrees with the compiled owner surface",
+            ));
+        }
+        if workscope_ref != surface.scope.scope_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_SCOPE_MISMATCH",
+                "caller WorkScope disagrees with the compiled owner surface",
+            ));
+        }
+        if route_profile_ref != surface.route_profile_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_ROUTE_PROFILE_MISMATCH",
+                "caller route profile disagrees with the compiled owner surface",
+            ));
+        }
         let onboarding_disposition = match surface.readiness.as_str() {
             "UNSEEN" => ReadinessDisposition::Unseen,
             "SCANNING" => ReadinessDisposition::Scanning,
@@ -379,6 +589,12 @@ impl BootstrapContext {
                 ));
             }
         };
+        if onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_STATE_FENCE_UNBOUND",
+                "material readiness cannot be projected while the supplied fence is opaque and cannot be compared with the typed owner fence",
+            ));
+        }
         Self::from_receipt(
             surface.receipt_ref.clone(),
             principal_ref,
@@ -406,6 +622,116 @@ impl BootstrapContext {
             conflicts_unknowns,
             next_safe_expansion,
         )
+        .and_then(|mut context| {
+            // The boot delta is bound to this exact compiled receipt revision,
+            // so a delta left over from an earlier surface fails closed here
+            // instead of being projected against a readiness it never described.
+            context.boot_delta = boot_delta;
+            validate_context(&context)?;
+            Ok(context)
+        })
+    }
+}
+
+/// Checks that caller-provided task inputs preserve the task disposition and
+/// exact task content carried by the compiled owner surface. Selection
+/// provenance still depends on the authenticated #8 producer; the bridge
+/// never treats a matching caller-provided reason/source as owner evidence.
+pub(crate) fn validate_task_inputs_match_surface(
+    surface: &ColdStartSurfaceView,
+    tasks: &BootstrapTaskInputs,
+) -> Result<(), BootstrapError> {
+    validate_tasks(tasks)?;
+    let task_mismatch = || {
+        BootstrapError::new(
+            "BOOTSTRAP_TASK_SURFACE_MISMATCH",
+            "caller task inputs disagree with the task or selection state in the compiled owner surface",
+        )
+    };
+    let exact_task_candidate = |task_ref: &str,
+                                task_revision: u64,
+                                acceptance_digest: &str|
+     -> Result<(), BootstrapError> {
+        if tasks.scope_level != ScopeLevel::Task
+            || tasks.candidates.len() != 1
+            || tasks.candidates[0].handle != task_ref
+            || tasks.candidates[0].task_revision != Some(task_revision)
+            || tasks.candidates[0].acceptance_digest.as_deref() != Some(acceptance_digest)
+            || tasks.candidates[0].historical
+            || tasks.candidates[0].prior_evaluation_candidate_only
+            || tasks.candidates[0].independent_binding_supplied
+        {
+            return Err(task_mismatch());
+        }
+        if tasks.authoritative_selection.is_some() {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_SELECTION_PROVENANCE_UNAVAILABLE",
+                "compiled owner task binding carries no authenticated selection source or reason for caller-provided authoritative selection",
+            ));
+        }
+        Ok(())
+    };
+
+    match &surface.task_binding {
+        TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        }
+        | TaskBindingState::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => exact_task_candidate(task_ref, *task_revision, acceptance_digest),
+        TaskBindingState::Ambiguous { candidate_handles } => {
+            if tasks.scope_level != ScopeLevel::Task
+                || candidate_handles.len() < 2
+                || tasks.authoritative_selection.is_some()
+                || tasks.candidates.len() != candidate_handles.len()
+                || tasks
+                    .candidates
+                    .iter()
+                    .zip(candidate_handles)
+                    .any(|(candidate, handle)| {
+                        candidate.handle != *handle
+                            || candidate.task_revision.is_some()
+                            || candidate.acceptance_digest.is_some()
+                            || candidate.historical
+                            || candidate.prior_evaluation_candidate_only
+                            || candidate.independent_binding_supplied
+                    })
+            {
+                return Err(task_mismatch());
+            }
+            Ok(())
+        }
+        TaskBindingState::None_ => {
+            if !tasks.candidates.is_empty() || tasks.authoritative_selection.is_some() {
+                return Err(task_mismatch());
+            }
+            Ok(())
+        }
+        TaskBindingState::Stale {
+            task_ref,
+            task_revision,
+        } => {
+            if tasks.scope_level != ScopeLevel::Task
+                || tasks.candidates.len() != 1
+                || tasks.candidates[0].handle != *task_ref
+                || tasks.candidates[0].task_revision != Some(*task_revision)
+                || tasks.candidates[0].acceptance_digest.is_some()
+                || tasks.candidates[0].historical
+                || tasks.candidates[0].prior_evaluation_candidate_only
+                || tasks.candidates[0].independent_binding_supplied
+                || tasks.authoritative_selection.is_some()
+            {
+                return Err(task_mismatch());
+            }
+            Err(BootstrapError::new(
+                "BOOTSTRAP_TASK_STALE",
+                "compiled owner surface carries a stale task binding that cannot be represented as a current bridge selection",
+            ))
+        }
     }
 }
 
@@ -482,6 +808,9 @@ pub struct UnderstandingBootstrap {
     pub revision_refs: Vec<String>,
     pub conflicts_unknowns: Vec<String>,
     pub next_safe_expansion: String,
+    /// Bounded boot delta projected from the owner (I7.8 step 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_delta: Option<BootDelta>,
     pub governance: GovernanceEvidence,
 }
 
@@ -529,13 +858,93 @@ fn bounded_list(values: &[String], field: &'static str, max: usize) -> Result<()
     Ok(())
 }
 
+/// Checks the two `GovernanceProfile` authorization axes against the derivation
+/// contract. Freshness inputs remain owner-supplied fields in the typed
+/// profile; this consistency check does not authenticate their origin.
+fn validate_governance_axes(
+    coverage: &IntegrationCoverageProfile,
+    profile: &GovernanceProfile,
+) -> Result<(), BootstrapError> {
+    let pre_action_enforced = coverage.disposition(LogicalEvent::PreToolUse)
+        == Some(EventDisposition::Enforced)
+        && coverage.disposition(LogicalEvent::PermissionRequest)
+            == Some(EventDisposition::Enforced);
+    let expected_enforcement =
+        coverage.verified && pre_action_enforced && profile.watchdog_fresh && profile.trace_fresh;
+    let expected_complete_ops = coverage.verified
+        && coverage.completeness == EventCompleteness::Complete
+        && profile.watchdog_fresh
+        && profile.trace_fresh;
+    if profile.authorizes_enforcement != expected_enforcement
+        || profile.authorizes_complete_coverage_ops != expected_complete_ops
+    {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_DERIVATION_MISMATCH",
+            "governance authorization axes disagree with coverage and freshness",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_governance(governance: &GovernanceEvidence) -> Result<(), BootstrapError> {
     non_blank(&governance.profile_ref, "GOVERNANCE_PROFILE_MISSING")?;
     non_blank(&governance.profile_revision, "GOVERNANCE_REVISION_MISSING")?;
-    if governance.limiting_integration_evidence.is_empty() {
+    governance.coverage_profile.validate().map_err(|error| {
+        BootstrapError::new(
+            "COVERAGE_INVALID",
+            format!("integration coverage profile is not valid: {error}"),
+        )
+    })?;
+    let profile = &governance.governance_profile;
+    let coverage = &governance.coverage_profile;
+    if governance.profile_ref != coverage.fingerprint || profile.fingerprint != coverage.fingerprint
+    {
         return Err(BootstrapError::new(
-            "GOVERNANCE_EVIDENCE_MISSING",
-            "actual GovernanceProfile must carry at least one limiting integration evidence handle",
+            "GOVERNANCE_FINGERPRINT_MISMATCH",
+            "governance evidence is not bound to its attached coverage fingerprint",
+        ));
+    }
+    if profile.revision == 0 || governance.profile_revision != profile.revision.to_string() {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_REVISION_MISMATCH",
+            "governance evidence does not carry the exact current profile revision",
+        ));
+    }
+    if profile.verified != coverage.verified {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COVERAGE_UNVERIFIED",
+            "governance and coverage verification states disagree",
+        ));
+    }
+    if !coverage.verified {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COVERAGE_UNVERIFIED",
+            "Governor derivation requires verified production coverage",
+        ));
+    }
+    if profile.completeness != coverage.completeness {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COMPLETENESS_MISMATCH",
+            "governance and coverage completeness states disagree",
+        ));
+    }
+    validate_governance_axes(coverage, profile)?;
+    let expected_preview: Vec<String> = coverage
+        .gaps
+        .iter()
+        .take(MAX_EVIDENCE_HANDLES)
+        .cloned()
+        .collect();
+    if governance.limiting_integration_evidence != expected_preview {
+        let code =
+            if governance.limiting_integration_evidence.is_empty() && !coverage.gaps.is_empty() {
+                "GOVERNANCE_EVIDENCE_MISSING"
+            } else {
+                "GOVERNANCE_EVIDENCE_MISMATCH"
+            };
+        return Err(BootstrapError::new(
+            code,
+            "limiting integration evidence does not preserve the owner coverage gaps",
         ));
     }
     bounded_list(
@@ -612,6 +1021,9 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
         "FLOOR_BOUND",
         MAX_EVIDENCE_HANDLES,
     )?;
+    if let Some(delta) = &context.boot_delta {
+        delta.validate(context.receipt_revision)?;
+    }
     validate_governance(&context.governance)
 }
 
@@ -882,12 +1294,21 @@ fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, B
 /// `READY` (I4.4.1: `READY_MATERIAL` is always tied to one `TaskContract`
 /// revision). Fails closed whenever governance evidence, identity,
 /// revisions, acceptance, or selection integrity are missing.
+/// This bridge context carries only an opaque fence reference, so this
+/// projection also refuses `READY_MATERIAL` until an authenticated route can
+/// supply a typed fence comparable to the live attach.
 pub fn get_understanding_bootstrap(
     context: &BootstrapContext,
     tasks: &BootstrapTaskInputs,
     requested_assessment: CurrentAssessment,
 ) -> Result<UnderstandingBootstrap, BootstrapError> {
     validate_context(context)?;
+    if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_STATE_FENCE_UNBOUND",
+            "material readiness cannot be projected from a context carrying only an opaque fence reference",
+        ));
+    }
     validate_tasks(tasks)?;
     let task_selection = compose_selection(tasks)?;
     let mut relevant_handles = context.orientation_handles.clone();
@@ -934,6 +1355,7 @@ pub fn get_understanding_bootstrap(
         revision_refs: context.revision_refs.clone(),
         conflicts_unknowns: context.conflicts_unknowns.clone(),
         next_safe_expansion: context.next_safe_expansion.clone(),
+        boot_delta: context.boot_delta.clone(),
         governance: context.governance.clone(),
     })
 }
@@ -978,15 +1400,53 @@ impl BootstrapSession {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_integration_coverage::{
+        ALL_EVENTS, DispatchOrdering, EventCoverage, GovernorCoverageDerivation,
+    };
 
     fn fixture_governance() -> GovernanceEvidence {
+        let coverage_profile = IntegrationCoverageProfile {
+            fingerprint: "governance-profile-1".to_owned(),
+            verified: true,
+            events: ALL_EVENTS
+                .iter()
+                .map(|event| EventCoverage {
+                    event: *event,
+                    disposition: if *event == LogicalEvent::PreToolUse {
+                        EventDisposition::Observed
+                    } else {
+                        EventDisposition::Enforced
+                    },
+                    ordering: DispatchOrdering::PreDispatch,
+                    completeness: EventCompleteness::Complete,
+                    proof_ceiling: "read-only".to_owned(),
+                    source: "owner-observation".to_owned(),
+                    gaps: Vec::new(),
+                })
+                .collect(),
+            completeness: EventCompleteness::Unknown,
+            proof_ceiling: "read-only".to_owned(),
+            source: "integration-owner".to_owned(),
+            gaps: vec!["coverage-gap:source-freshness".to_owned()],
+        };
+        let mut derivation = GovernorCoverageDerivation::new();
+        let governance_profile = derivation
+            .derive(
+                &coverage_profile,
+                &eliot_integration_coverage::WatchdogEvidence {
+                    supervisor_id: "watchdog:fixture".to_owned(),
+                    fresh: true,
+                    summary: "test fixture supervision".to_owned(),
+                },
+                eliot_integration_coverage::TraceFreshness::Fresh,
+            )
+            .expect("verified owner coverage derives a governance profile");
         GovernanceEvidence {
             profile_ref: "governance-profile-1".to_owned(),
-            profile_revision: "rev-7".to_owned(),
-            limiting_integration_evidence: vec![
-                "coverage:PreToolUse:ENFORCED".to_owned(),
-                "coverage:PostToolUse:OBSERVED".to_owned(),
-            ],
+            profile_revision: "1".to_owned(),
+            governance_profile,
+            limiting_integration_evidence: coverage_profile.gaps.clone(),
+            coverage_profile,
         }
     }
 
@@ -1020,6 +1480,7 @@ mod tests {
             candidate_count: 1,
             conflicts_unknowns: vec![],
             next_safe_expansion: "bind task before material effects".to_owned(),
+            boot_delta: None,
         }
     }
 
@@ -1053,7 +1514,7 @@ mod tests {
         );
         assert_eq!(first.current_assessment, CurrentAssessment::NotOnboarded);
         assert_eq!(first.governance.profile_ref, "governance-profile-1");
-        assert_eq!(first.governance.profile_revision, "rev-7");
+        assert_eq!(first.governance.profile_revision, "1");
         assert!(!first.governance.limiting_integration_evidence.is_empty());
         assert!(first.task_selection.candidate_task_handles.len() <= MAX_CANDIDATE_HANDLES);
         assert!(first.relevant_handles.len() <= MAX_HANDLES);

@@ -100,8 +100,9 @@ pub use transport_profile::{
     LoopbackHttpProfile, TransportAdmissionError, TransportProfile, admit_loopback_http,
     loopback_http_route, validate_credential, validate_host, validate_origin,
 };
+use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
-    AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
+    AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
     BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
     SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
     UnderstandingBootstrap, get_understanding_bootstrap,
@@ -3844,6 +3845,59 @@ impl BootstrapSnapshot {
         Ok(())
     }
 
+    /// Requires the typed owner surface to overlap the live activation on
+    /// principal, session, `WorkScope`, exact task revision, and the typed
+    /// epoch/generation carried by both sides. The bridge has no defined
+    /// encoding for `BootstrapContext::state_fence_ref`, so material readiness
+    /// is already refused by `from_compiled_surface`; this check does not
+    /// manufacture equivalence for that opaque value or for source/profile
+    /// references absent from `AttachBinding`.
+    fn owner_surface_matches_binding(
+        surface: &eliot_governor::ColdStartSurfaceView,
+        binding: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        let mismatch = || {
+            BootstrapError {
+            code: "BOOTSTRAP_OWNER_BINDING_MISMATCH",
+            detail: "compiled readiness owner surface disagrees with the live authenticated attach binding".to_owned(),
+        }
+        };
+        if surface.principal_ref != binding.principal_id().as_str()
+            || surface.session_ref != binding.session_id().as_str()
+            || surface.scope.scope_ref != binding.task_binding().work_scope_id()
+            || !surface
+                .state_fence
+                .authority_epoch
+                .is_same_authority(binding.state_fence().authority_epoch())
+            || surface.state_fence.resource_generation.value()
+                != binding.state_fence().generation().get()
+            || surface.state_fence.task_revision.is_some_and(|revision| {
+                revision.value().to_string() != binding.task_binding().task_revision()
+            })
+        {
+            return Err(mismatch());
+        }
+        match &surface.task_binding {
+            eliot_workscope::TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                ..
+            }
+            | eliot_workscope::TaskBindingState::Exploratory {
+                task_ref,
+                task_revision,
+                ..
+            } if task_ref.as_str() == binding.task_binding().task_id().as_str()
+                && task_revision.to_string() == binding.task_binding().task_revision() => Ok(()),
+            eliot_workscope::TaskBindingState::None_
+            | eliot_workscope::TaskBindingState::Ambiguous { .. } => Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_SELECTION_REQUIRED",
+                detail: "compiled owner surface has no unique task binding for the live attach; refusing to store an unusable bootstrap".to_owned(),
+            }),
+            _ => Err(mismatch()),
+        }
+    }
+
     /// Requires a composed task selection to agree with the sealed activation task and revision.
     ///
     /// The sealed attach binding carries the activation-resolved task; a
@@ -4390,11 +4444,20 @@ impl BridgeRunner {
     /// explicitly request the intended task without filesystem search. A
     /// wrong-principal or wrong-worktree packet is refused at note time; a
     /// later session, fence, or scope/task move refuses at compose time.
+    /// Material readiness is refused on this generic context path because
+    /// its fence is only an opaque reference, not a typed value comparable to
+    /// the live attach fence.
     pub fn note_owner_snapshot(
         &mut self,
         context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
+        if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_STATE_FENCE_UNBOUND",
+                detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
+            });
+        }
         get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
@@ -4406,6 +4469,109 @@ impl BridgeRunner {
             binding,
         });
         Ok(())
+    }
+
+    /// Notes one bootstrap projection over the Governor's compiled readiness
+    /// surface, exact `IntegrationCoverageProfile`, typed owner-supplied
+    /// `GovernanceProfile` snapshot,
+    /// bounded boot delta, and task inputs (issue #1746 W5, I7.8 step 4).
+    ///
+    /// The projection retains both typed integration/governance profiles and
+    /// checks their fingerprint, revision, verification, completeness, and
+    /// authorization-axis consistency. It carries all owner-supplied
+    /// authorization and freshness fields; these checks do not authenticate
+    /// snapshot provenance. The readiness half
+    /// (`onboarding_readiness_ref`, `onboarding_disposition`,
+    /// `smallest_missing_question`, `lease_deadline`, `receipt_revision`,
+    /// `workspace_instance_ref`, `projection_source_ref`,
+    /// `projection_generation`) comes from the Governor's
+    /// [`eliot_governor::ColdStartSurfaceView`], the governance half from
+    /// [`GovernanceEvidence::from_owner_profiles`] over the exact coverage and
+    /// typed governance snapshot, and the delta is bound to that receipt
+    /// revision. An
+    /// unknown readiness token, a coverage that does not validate, a derived
+    /// profile that disagrees with its coverage, and a delta that does not move
+    /// this receipt forward all fail closed with their own codes; none of them
+    /// degrades into a caller READY flag.
+    ///
+    /// The supplied principal, `WorkScope`, and route-profile refs must equal the
+    /// corresponding owner fields. Task-selection content must preserve the
+    /// owner task/selection disposition. When attached, the surface must also
+    /// match the live principal, session, scope, task revision, and overlapping
+    /// typed fence fields. Material readiness remains closed because the
+    /// caller's state-fence ref is opaque and no typed compatible carrier is
+    /// present here. These comparisons do not authenticate the surface
+    /// producer, validate a stored receipt digest, or bind separately supplied
+    /// coverage/governance snapshots to the surface's opaque profile refs;
+    /// those facts remain dependent on the live authenticated #8 producer.
+    /// A no-task or ambiguous surface cannot be delivered through this
+    /// attach-bound route: it needs an authenticated preselection transport
+    /// before a snapshot can be retained or served.
+    ///
+    /// # Live status
+    ///
+    /// `caller: STITCH`. There is no production caller: `main.rs::handle_bootstrap`
+    /// still accepts a client-supplied `BootstrapContext` and calls
+    /// [`Self::note_owner_snapshot`]. #8 must provide the authenticated live
+    /// producer/transport, original receipt integrity/freshness proof, and a
+    /// typed compatible fence/profile binding before this path can publish
+    /// Material readiness. No synthetic caller was added.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_owner_surface(
+        &mut self,
+        surface: &eliot_governor::ColdStartSurfaceView,
+        coverage: &eliot_integration_coverage::IntegrationCoverageProfile,
+        governance_profile: &eliot_integration_coverage::GovernanceProfile,
+        boot_delta: Option<BootDelta>,
+        tasks: BootstrapTaskInputs,
+        principal_ref: String,
+        profile_ref: String,
+        workscope_ref: String,
+        revision_refs: Vec<String>,
+        orientation_handles: Vec<String>,
+        attention_handles: Vec<String>,
+        problem_handles: Vec<String>,
+        role_lease_ref: String,
+        state_fence_ref: String,
+        route_profile_ref: String,
+        decision_safety_floor_refs: Vec<String>,
+        supported_count: u32,
+        verified_count: u32,
+        candidate_count: u32,
+        conflicts_unknowns: Vec<String>,
+        next_safe_expansion: String,
+    ) -> Result<(), BootstrapError> {
+        validate_task_inputs_match_surface(surface, &tasks)?;
+        let Some(binding) = self.attach_view().map(|view| view.binding().clone()) else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_ATTACH_REQUIRED",
+                detail: "compiled owner surface requires a live authenticated attach before it can be retained for retrieval".to_owned(),
+            });
+        };
+        BootstrapSnapshot::owner_surface_matches_binding(surface, &binding)?;
+        let governance = GovernanceEvidence::from_owner_profiles(coverage, governance_profile)?;
+        let context = BootstrapContext::from_compiled_surface(
+            surface,
+            principal_ref,
+            profile_ref,
+            workscope_ref,
+            revision_refs,
+            orientation_handles,
+            attention_handles,
+            problem_handles,
+            role_lease_ref,
+            state_fence_ref,
+            governance,
+            route_profile_ref,
+            decision_safety_floor_refs,
+            supported_count,
+            verified_count,
+            candidate_count,
+            conflicts_unknowns,
+            next_safe_expansion,
+            boot_delta,
+        )?;
+        self.note_owner_snapshot(context, tasks)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
