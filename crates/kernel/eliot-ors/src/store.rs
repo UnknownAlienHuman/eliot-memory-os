@@ -2562,6 +2562,13 @@ const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
 /// every distinct denied operation keeps its own durable escalation.
 const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_effect_replay_reconciliations_v1");
+/// Durable manifest-side restart escalation intents (issue #1884; I1.9). Keyed
+/// by `{module_id}::{generation}` with the same key the execution manifest
+/// uses, so a refused restart of one generation updates one row instead of
+/// growing the table. A restart is not an effect replay, so these items name no
+/// operation identity and cannot use the effect-replay family.
+const KERNEL_RESTART_RECONCILIATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_kernel_restart_reconciliations_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const RECOVERY_RESERVATION_REVISION: &str = "ors_recovery_reservations_revision_v1";
 const RECOVERY_OPERATIONAL_CURRENT_REVISION: &str = "ors_recovery_operational_current_revision_v1";
@@ -20704,6 +20711,84 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Persists one Governor-admitted execution manifest (issue #1884; I1.9,
+    /// W1.1).
+    ///
+    /// This is the only write path into `KERNEL_EXECUTION_MANIFESTS`. The row
+    /// is built by [`crate::KernelExecutionManifest::admit`], the only
+    /// validating construction path, so a projection that carries no accepted
+    /// Module Catalog revision, no Policy revision or no Governor
+    /// lifecycle/admission receipt is refused here and never reaches durable
+    /// state. `admit` runs `AdmittedModuleGeneration::validate`, which requires
+    /// both revisions to be non-zero and the receipt to be non-blank, and then
+    /// re-derives `manifest_sha256` over the recorded admission and projection
+    /// and checks it through `KernelExecutionManifest::validate` before the row
+    /// is written; the digest is validated against the recorded fields, not
+    /// recomputed over the value this method holds.
+    ///
+    /// The admitted revision and receipt are compared with THIS persist rather
+    /// than merely accepted because one is present: the row key is the admitted
+    /// module identity and generation, and `admit`'s admitted-bounds check
+    /// refuses a projection whose effect ceiling exceeds the admitted ceiling or
+    /// whose allowed scopes are not a subset of the admitted scopes, so a
+    /// manifest cannot claim authority the Catalog did not admit for it. An
+    /// exact re-persist of the same admission and projection is idempotent.
+    pub fn persist_admitted_kernel_execution_manifest(
+        &self,
+        admission: &crate::AdmittedModuleGeneration,
+        projection: &crate::KernelExecutionProjection,
+    ) -> Result<String, OrsError> {
+        let manifest =
+            crate::KernelExecutionManifest::admit(admission.clone(), projection.clone())?;
+        let key = Self::effect_manifest_key(
+            manifest.admission.module_id.as_str(),
+            manifest.admission.generation.value(),
+        );
+        let payload = encode(&manifest)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut manifests = write
+                .open_table(KERNEL_EXECUTION_MANIFESTS)
+                .map_err(storage)?;
+            manifests
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(manifest.manifest_sha256)
+    }
+
+    /// Persists one manifest-side restart escalation (issue #1884; I1.9, W1.5).
+    ///
+    /// A missing, stale, incompatible, revoked or receipt-less manifest is
+    /// refused by `verify_kernel_execution_restart` with
+    /// `KernelServiceAdmission::None`, and the reconciliation item it returns is
+    /// the affected generation's only preserved evidence of that refusal. A
+    /// restart is not an effect replay, so that item names no operation
+    /// identity and `Self::persist_effect_replay_reconciliation` refuses it;
+    /// this is its durable home instead. Same item type, same `validate()`,
+    /// same persistence codec, keyed by `{module_id}::{generation}` so a
+    /// repeated refusal of one generation updates one row instead of growing
+    /// the table. An exact re-persist is idempotent.
+    pub fn persist_kernel_restart_reconciliation(
+        &self,
+        item: &crate::KernelReconciliationItem,
+    ) -> Result<(), OrsError> {
+        item.validate()?;
+        let key = Self::effect_manifest_key(item.module_id.as_str(), item.generation.value());
+        let payload = encode(item)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut intents = write
+                .open_table(KERNEL_RESTART_RECONCILIATIONS)
+                .map_err(storage)?;
+            intents
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
     /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
     ///
     /// A denied, expired or unknown replay escalates here instead of being
@@ -21262,6 +21347,15 @@ impl RedbRecoveryStore {
         drop(
             write
                 .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?,
+        );
+        // #1884: the manifest-side restart-reconciliation family is part of the
+        // base family too, materialized empty on every open like every other
+        // base table, so a refused restart escalates into a real table instead
+        // of failing on a missing one. No row is backfilled or inferred here.
+        drop(
+            write
+                .open_table(KERNEL_RESTART_RECONCILIATIONS)
                 .map_err(storage)?,
         );
         // #2571: the logical host-request index is part of the base family,
