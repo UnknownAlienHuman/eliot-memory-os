@@ -58,15 +58,16 @@
 schema = "eliot.crate-extraction-decision.v1"
 revision = "2026-09-27.2"
 
-# Intentionally empty. Every production-admitted, binary-unreachable workspace package
-# is currently UNCLASSIFIED under the #1720 four-verb vocabulary and is reported as an
-# admission defect by the inventory.
-#
-# This is still the honest state for #1720: the registry mechanism, the four decision
-# types, the facade obligations and the fail-closed admission-defect path are
-# implemented and enforced, and populating these rows requires a human to supply a
-# genuine owner, expiry, successor and removal condition per unreachable package.
-# Writing them here would fabricate exactly the authority this issue forbids inventing.
+# Honest residual, recorded rather than hidden: `decision` is STILL EMPTY. No
+# decision row has ever been recorded here - the array has been empty since this
+# registry was created for #1720, so nothing was ever decided in this layer. Every
+# production-admitted, binary-unreachable workspace package is therefore UNCLASSIFIED
+# under the #1720 four-verb vocabulary and is reported as an admission defect by the
+# inventory, which is the correct outcome until a human supplies a genuine owner,
+# expiry, successor and removal condition per unreachable package. Writing rows here
+# to silence that defect would fabricate exactly the authority this issue forbids
+# inventing; the registry mechanism, the four decision types, the facade obligations
+# and the fail-closed admission-defect path are implemented and enforced regardless.
 # The I2.23 admission decisions for the wave-admitted packages are recorded below, in
 # the record shape and vocabulary I2.23 fixes for them.
 decision = []
@@ -76,7 +77,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies serde_json (crates.io); no build script; declared consumers agent mailbox compiler, Human attention proposal"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-clarification"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-clarification/src/tests/strict_regressions.rs::routing_owner_mismatch_is_rejected_after_resealing; cargo test -p eliot-dreamer-clarification --lib routing_owner_mismatch_is_rejected_after_resealing"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares agent mailbox compiler as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares agent mailbox compiler (and Human attention proposal) as the intended consumer, but that name is not a package in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 3679 non-blank lines and 45 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -92,7 +93,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies eliot-epistemic-contracts (path), eliot-receipts (path); no build script; declared consumers Dreamer self-query surface, ELIOT self-scope Edge proof"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-architecture-brief"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-architecture-brief/tests/architecture_brief.rs::minimal_accepted_architecture_brief_is_complete; cargo test -p eliot-dreamer-architecture-brief --test architecture_brief minimal_accepted_architecture_brief_is_complete"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares Dreamer self-query surface as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Dreamer self-query surface (and ELIOT self-scope Edge proof) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 2637 non-blank lines and 30 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -108,7 +109,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-conformance-contracts (path), eliot-contracts (path), eliot-dreamer-contracts (path); dev dependencies eliot-epistemic-contracts (path), eliot-receipts (path); no build script; declared consumers Dreamer self-query surface, ELIOT self-scope Edge proof"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-implementation-brief"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-implementation-brief/tests/implementation_brief.rs::minimal_implementation_brief; cargo test -p eliot-dreamer-implementation-brief --test implementation_brief minimal_implementation_brief"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares Dreamer self-query surface as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Dreamer self-query surface (and ELIOT self-scope Edge proof) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 4102 non-blank lines and 39 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -124,7 +125,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-dreamer-contracts (path), eliot-receipts (path); dev dependencies eliot-contracts (path), eliot-evidence (path); no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-failure"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-failure/tests/failure.rs::exact_failure_produces_sealed_hypothesis_decision; cargo test -p eliot-dreamer-failure --test failure exact_failure_produces_sealed_hypothesis_decision"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares eliot-dreamer-curation as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 6599 non-blank lines and 55 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -140,7 +141,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-structure-repair"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::case_01_valid_merge_completes_with_rewrite_manifest; cargo test -p eliot-dreamer-structure-repair --lib case_01_valid_merge_completes_with_rewrite_manifest"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares eliot-dreamer-curation as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 3184 non-blank lines and 8 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -156,7 +157,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-reconsolidation"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::case_01_valid_derived_completes_with_allocation_request; cargo test -p eliot-dreamer-reconsolidation --lib case_01_valid_derived_completes_with_allocation_request"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares eliot-dreamer-curation as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5048 non-blank lines and 64 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -172,7 +173,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evaluation-contracts (path), eliot-evidence (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-accessibility"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-accessibility/src/lib.rs::case_01_accessibility_only_typed_payload_completes; cargo test -p eliot-dreamer-accessibility --lib case_01_accessibility_only_typed_payload_completes"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares eliot-dreamer-curation as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 4145 non-blank lines and 59 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -188,7 +189,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-dreamer-contracts (path), eliot-evidence (path), eliot-security-contracts (path); dev dependencies none; no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-memory-repair"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::a03_port_binds_repair_wire_kind_and_preserves_candidate_content; cargo test -p eliot-dreamer-memory-repair --lib a03_port_binds_repair_wire_kind_and_preserves_candidate_content"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares eliot-dreamer-curation as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5016 non-blank lines and 71 test cases; measured Cargo reverse fan-out is no Cargo dependent"
@@ -252,7 +253,7 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.learning
 current_source_dependency_and_change_closure = "path dependencies eliot-contracts (path), eliot-evidence (path), eliot-learning-contracts (path); dev dependencies eliot-agent-contracts (path); no build script; declared consumers Governor local admission, Context Compiler"
 proposed_package_boundary = "workspace/core :: eliot-learning-overlay"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-learning-overlay/tests/overlay.rs::composes_disjoint_add_replace_remove_with_exact_inverses; cargo test -p eliot-learning-overlay --test overlay composes_disjoint_add_replace_remove_with_exact_inverses"
-first_real_consumer_or_time_bounded_migration_facade = "no production caller today; the crate's own module manifest declares Context Compiler as the first consumer, which does not construct the capability yet; bounded migration expiry 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares Context Compiler (and Governor local admission) as the intended consumer, but those names are not packages in this repository and no Cargo dependent constructs the capability; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish is unset; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
 expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 5704 non-blank lines and 58 test cases; measured Cargo reverse fan-out is no Cargo dependent"
