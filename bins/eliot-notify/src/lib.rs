@@ -224,6 +224,29 @@ const DELIVER_QUIET_HOURS_SUPPRESSED: &str = "deliver:quiet-hours-suppressed";
 /// and the request defect must not read as a delivered notification.
 const DELIVER_QUIET_HOURS_REJECTED: &str = "deliver:quiet-hours-rejected";
 
+/// Stable wire code for a failure the owning providers could not serve.
+///
+/// A plan gap means a required owner was absent, so the process answers its
+/// caller with the provider-rejection code and a non-zero exit.
+pub const NOTIFICATION_PROVIDER_REJECTED: &str = "NOTIFICATION_PROVIDER_REJECTED";
+/// Stable wire code for a failure the request itself caused.
+pub const NOTIFICATION_REQUEST_REJECTED: &str = "NOTIFICATION_REQUEST_REJECTED";
+
+/// Classifies one core failure onto its stable wire code.
+///
+/// This is the single classifier for the process: the terminal response
+/// projection and the recorded-degradation projection both read it, so
+/// recording a delivery obligation can never change the exit semantics the
+/// caller observes for the same failure.
+#[must_use]
+pub const fn notify_error_code(error: &eliot_notify_core::NotifyError) -> &'static str {
+    if matches!(error, eliot_notify_core::NotifyError::PlanGap { .. }) {
+        NOTIFICATION_PROVIDER_REJECTED
+    } else {
+        NOTIFICATION_REQUEST_REJECTED
+    }
+}
+
 /// Which delivery contour recorded the unsatisfied obligation.
 ///
 /// The contour selects the condition code only; it never changes what is
@@ -285,10 +308,45 @@ pub struct UnsatisfiedObligation {
     /// Whether a durable no-session marker is still readable from the spool.
     /// Read back from the owning store, never assumed from the write.
     pub spool_obligation_available: bool,
-    /// The canonical obligation read back from the canonical owner, when this
-    /// notification has a canonical scope to read. The owner's own unresolved
-    /// flag is reported as observed; delivery loss never writes a resolution.
-    pub canonical: Option<CanonicalObligation>,
+    /// The canonical obligation read back from the canonical owner. The three
+    /// states are reported verbatim: the owner's own unresolved flag is never
+    /// inferred here, an owner that could not be read is never reported as an
+    /// absent record, and delivery loss never writes a resolution.
+    pub canonical: CanonicalObligationRead,
+}
+
+/// The canonical-obligation leg of one recorded delivery degradation.
+///
+/// The three states are kept apart because a *read that could not be answered*
+/// is not a *record that is absent*, and the difference is the whole of what
+/// the operator is told. I11.6:19 makes the canonical notification state
+/// durable in its owning store; I11.7:8 requires a failed delivery to remain
+/// visible. Collapsing an unreadable owner into "no canonical item" would
+/// report the canonical state as missing at the exact moment delivery degraded,
+/// which is the mis-projection this typed leg removes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum CanonicalObligationRead {
+    /// This contour has no canonical record to read: the signed Watchdog
+    /// fallback envelope carries none by design (I11.6:9-11), and a request
+    /// refused before its upsert never wrote one. The Event Log / spool above
+    /// is the whole obligation on those contours.
+    NotApplicable,
+    /// The canonical owner answered with the record and its own unresolved
+    /// flag, observed rather than inferred.
+    Observed {
+        /// The record exactly as its owning store returned it.
+        obligation: CanonicalObligation,
+    },
+    /// The canonical owner could not be read on this contour. Nothing was
+    /// resolved, acknowledged or removed by that failure — the delivery
+    /// degradation recorded beside it is the durable record, and the code says
+    /// which class of failure the read hit.
+    Unavailable {
+        /// Stable classification from [`notify_error_code`]; no payload, path,
+        /// identity or secret.
+        code: &'static str,
+    },
 }
 
 /// One delivery contour's complete result: the adapter's verdict and the
@@ -804,6 +862,12 @@ impl NotificationComposition {
     /// quiet-hours policy rejection also yields no canonical record — the
     /// delivery was refused before the upsert — so its read back reports no
     /// canonical item rather than failing.
+    ///
+    /// A read that the owner *fails* is not a record that is absent. The typed
+    /// failure is kept and reported as [`CanonicalObligationRead::Unavailable`];
+    /// it is never dropped, because "the canonical owner could not be reached"
+    /// and "the canonical state is not there" are opposite claims about the
+    /// store I11.6:19 requires to keep the item durable.
     fn record_unsatisfied_obligation(
         &mut self,
         notification_id: &PlatformHandle,
@@ -814,11 +878,20 @@ impl NotificationComposition {
     ) -> UnsatisfiedObligation {
         let condition = cause.condition_code(contour);
         let persisted = no_session_persist::record_no_session(condition);
-        let canonical = affected_scope.and_then(|scope| {
-            self.core
-                .canonical_obligation(notification_id, scope, request)
-                .ok()
-        });
+        let canonical = match affected_scope {
+            None => CanonicalObligationRead::NotApplicable,
+            Some(scope) => {
+                match self
+                    .core
+                    .canonical_obligation(notification_id, scope, request)
+                {
+                    Ok(obligation) => CanonicalObligationRead::Observed { obligation },
+                    Err(error) => CanonicalObligationRead::Unavailable {
+                        code: notify_error_code(&error),
+                    },
+                }
+            }
+        };
         UnsatisfiedObligation {
             claimed_toast: false,
             reason_code: persisted.reason_code,
