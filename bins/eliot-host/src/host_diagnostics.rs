@@ -776,3 +776,14 @@ fn publish_projected_event_log_record(projection: &HostRequestProjection) {
         "host event log admission outcome"
     );
 }
+
+/// The single `tracing` emission surface for the whole Host binary.
+///
+/// Every leaf module reaches the tracing macros through this re-export
+/// instead of naming `tracing::` itself, so this facade remains the one
+/// place that owns the emission spelling for a process whose subscriber is
+/// installed exactly once by [`install_host_diagnostics`]. The macros are
+/// re-exported unchanged: this facade owns *where* an observation is emitted
+/// from, never the field vocabulary or the lifecycle meaning of a call site,
+/// which stay with the owning module.
+pub use tracing::{info, warn};

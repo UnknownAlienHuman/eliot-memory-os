@@ -415,7 +415,7 @@ fn observe_prepare_progress(
     let op = crate::host_diagnostics::bound_field(op);
     let phase = crate::host_diagnostics::bound_field(phase);
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.prepare_phase",
         op = op.text(),
@@ -441,7 +441,7 @@ fn note_prepare_error(
     let phase = crate::host_diagnostics::bound_field(phase);
     let category = crate::host_diagnostics::bound_field(category);
     let field = crate::host_diagnostics::bound_field(field);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.prepare_refusal",
         op = op.text(),

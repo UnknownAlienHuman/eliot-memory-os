@@ -116,7 +116,7 @@ owner = 891
 
 [[file]]
 path = "bins/eliot-host/src/backup_config_projection.rs"
-sha256 = "7bbba650bf1246a473db9d4e238c4cb52e6c8d92f2aab00b79a81445fceb1309"
+sha256 = "b0f8db57133413d403e4a4dc2dfb10b7b0b628a934a6782599ab965c78cd6c5a"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -126,7 +126,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_cutover.rs"
-sha256 = "17d608ae1490245709e206edd10e40f222cc6dd71f073ccd7db29fba3cba88ce"
+sha256 = "ed71ad534890680342f414641ba5a17683e1877fbfa7c7a69bd13b2cde89a415"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -136,7 +136,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_preparation.rs"
-sha256 = "d097f7a7f1bc5d7aecef9698ca5fc4ca4e22d01aa62e499ae2b99daca44a79f2"
+sha256 = "20d7df25540244302876865d5f41604119ab22b5463503a9bb832c26436a95fb"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -216,7 +216,7 @@ owner = 982
 
 [[file]]
 path = "bins/eliot-host/src/host_diagnostics.rs"
-sha256 = "d1851ac22a9a2f108fddeb74784d63e8dee11f1458461f259ca3f2bb8764bcb5"
+sha256 = "3bf37eec18d285c7cf35027d8e5ccf297c9c27db7322d1e7ed03063c11913daf"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -2913,12 +2913,12 @@ ceiling_detail_bytes = 1024
 [[boundary.site]]
 start = 407
 end = 428
-digest = "69d223911c6fdaf5aca88fbe0da49af390d349bc884d054e36a27b65dede14db"
+digest = "40bbf173988ceae6fd77e7ff0c74833d2cdecf5f00065ee7aa3cccefab5a2126"
 markers = ["observe_prepare_progress", "host.backup.prepare_phase"]
 [[boundary.site]]
 start = 432
 end = 455
-digest = "7ed4c97d81ef8300353d411335b99b6cee8b8fa989af8f1218213067c1231248"
+digest = "6d1582f40ddeece7d7d347db353031a89a4e2df98e3a208d2aa2a3dda2bcefdc"
 markers = ["note_prepare_error", "host.backup.prepare_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
@@ -2942,17 +2942,17 @@ ceiling_detail_bytes = 1024
 [[boundary.site]]
 start = 175
 end = 197
-digest = "6fd534c871a32dccf4a4c7220665dc45c766a0d0226996cb969c760fe8db0466"
+digest = "50f542bdd09fb58c7c32f1d75e947bf3794e2c2719ee8c580440c55e25feb422"
 markers = ["observe_config_progress", "host.backup.config_phase"]
 [[boundary.site]]
 start = 200
 end = 211
-digest = "569e913d2b692b1e360d2b18183cabc614dbd32fe30fbfa87cc7f91a02caa0b4"
+digest = "f084133779bd6edff1671bc23ab2a8ffbde4ba6f2843d95c47a617a4424a1c98"
 markers = ["observe_bind_progress", "host.backup.config_phase"]
 [[boundary.site]]
 start = 215
 end = 230
-digest = "217142e805e45c3ea40f4c7850e2ad912ba61cdc4bb124bc512a0cbf6c521a5d"
+digest = "bb854363d8faafb9e2a0cbdf3ba40fb4bd2057b1483b5dcfdc5b138e25f37954"
 markers = ["note_config_error", "host.backup.config_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
@@ -2976,17 +2976,17 @@ ceiling_detail_bytes = 1024
 [[boundary.site]]
 start = 1469
 end = 1488
-digest = "bf52f57e1d138c23aaf30aefafa99fe8364aacbb9a8360532bf5dad88f861f1b"
+digest = "d7841ca1799c4569ec615a1164094ad7a7fbf4b13d00efae71762a8963246918"
 markers = ["observe_cutover_progress", "host.backup.cutover_phase"]
 [[boundary.site]]
 start = 1492
 end = 1505
-digest = "82b553abe6be800af03145bac729af39fd74a9e479cb3a47431b91193a39b366"
+digest = "3b5840c51e30f98ce1d08510fec2715af07f09a32042005cd26f72e9056d6a4a"
 markers = ["note_cutover_error", "host.backup.cutover_refusal"]
 [[boundary.site]]
 start = 1516
 end = 1527
-digest = "44c440f7f03143e2dffeab44c3af60eca907543a8532bccb91259d64bfe6ba34"
+digest = "5962be33db5ed609ba67966c77dc1bebe0af92211679df61b87b6ac193bfaad9"
 markers = ["note_cutover_read_error", "host.backup.cutover_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]

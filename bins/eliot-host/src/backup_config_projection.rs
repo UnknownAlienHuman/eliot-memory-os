@@ -183,7 +183,7 @@ fn observe_config_progress(
     backup_config_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_phase",
         op = op.text(),
@@ -200,7 +200,7 @@ fn observe_config_progress(
 fn observe_bind_progress(outcome: &'static str, artifact_count: u64) {
     backup_config_note_event_log_unavailable();
     let outcome = crate::host_diagnostics::bound_field(outcome);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_phase",
         op = "bind_build",
@@ -218,7 +218,7 @@ fn note_config_error(op: &'static str, error: ProjectionError) -> ProjectionErro
     let op = crate::host_diagnostics::bound_field(op);
     let category = crate::host_diagnostics::bound_field(category);
     let field = crate::host_diagnostics::bound_field(field);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.config_refusal",
         op = op.text(),

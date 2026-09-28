@@ -1476,7 +1476,7 @@ fn observe_cutover_progress(
     let op = crate::host_diagnostics::bound_field(op);
     let outcome = crate::host_diagnostics::bound_field(outcome);
     let disposition = crate::host_diagnostics::bound_field(disposition);
-    tracing::info!(
+    crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_phase",
         op = op.text(),
@@ -1494,7 +1494,7 @@ fn note_cutover_error(op: &'static str, error: CutoverError) -> CutoverError {
     let category = cutover_error_category(&error);
     let op = crate::host_diagnostics::bound_field(op);
     let category = crate::host_diagnostics::bound_field(category);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_refusal",
         op = op.text(),
@@ -1516,7 +1516,7 @@ fn note_cutover_error(op: &'static str, error: CutoverError) -> CutoverError {
 fn note_cutover_read_error(op: &'static str, error: super::HostError) -> super::HostError {
     backup_cutover_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
-    tracing::warn!(
+    crate::host_diagnostics::warn!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_refusal",
         op = op.text(),
