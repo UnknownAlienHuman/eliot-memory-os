@@ -127,6 +127,19 @@ impl AuthorityCeiling {
     fn allows_material(self) -> bool {
         matches!(self, Self::Material | Self::Critical)
     }
+
+    /// Strictness rank binding a caller-presented ceiling to the recorded
+    /// Governor-issued one (I7.16, #1935 AUD1): a presented profile admits
+    /// only within the issued ceiling, never above it.
+    #[must_use]
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Inspection => 0,
+            Self::LowImpact => 1,
+            Self::Material => 2,
+            Self::Critical => 3,
+        }
+    }
 }
 
 /// Observation axis of the Governance Profile (A7.7).
@@ -659,11 +672,14 @@ impl StartupCoordinator {
     /// Returns the blocking [`StartupRejection`] or a profile-ceiling
     /// rejection when the profile does not permit Material authority.
     ///
-    /// Production does not reach this directly. Every production
-    /// Material/Critical effect, including the origin-control decide path,
-    /// reaches it through
+    /// Production never reaches this with an unbound caller-minted profile.
+    /// Every production Material/Critical effect, including the
+    /// origin-control decide path, reaches it through
     /// [`KernelComposition::admit_material_authority_for_governor_issued_fence`](super::KernelComposition::admit_material_authority_for_governor_issued_fence),
-    /// which first binds the current Governor-issued governance profile; it is
+    /// which first binds the current Governor-issued governance profile, or
+    /// through the bound caller-presented entry
+    /// [`KernelComposition::admit_material_authority`](super::KernelComposition::admit_material_authority),
+    /// which refuses above the recorded Governor-issued ceiling; it is
     /// the startup-gate half of that decision, and the dynamic
     /// Watchdog-coverage half is
     /// [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).

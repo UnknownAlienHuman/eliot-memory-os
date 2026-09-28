@@ -2750,18 +2750,21 @@ impl KernelComposition {
         }
     }
 
-    /// Material/Critical authority admission for one Governance Profile.
-    /// Startup completeness is checked first with its named prerequisite;
-    /// the profile ceiling alone decides once startup is complete.
+    /// Material/Critical authority admission for one caller-presented
+    /// Governance Profile. Startup completeness is checked first with its
+    /// named prerequisite; the profile ceiling alone decides once startup
+    /// is complete.
     ///
-    /// This is the startup-gate half of the Material decision. It is not the
-    /// production Material/Critical boundary: every production effect,
-    /// including origin-control decide, goes through
+    /// Issue #1935 AUD1: a caller-presented profile mints no authority by
+    /// itself (I7.16: the profile is Governor-derived). The presented
+    /// profile is bound to the recorded Governor-issued projection: while
+    /// no projection is current every call refuses closed, and a presented
+    /// ceiling above the recorded one refuses, so coverage loss revokes
+    /// this path exactly like the fenced gates. Every production effect,
+    /// including origin-control decide, additionally passes
     /// [`Self::admit_material_authority_for_governor_issued_fence`], which
-    /// first requires the current Governor-issued governance profile. It
-    /// stands neither for that recorded profile nor for current independent
-    /// Watchdog coverage: a protected effect that must be admitted as
-    /// independently supervised additionally passes
+    /// admits under the recorded profile itself. A protected effect that
+    /// must be admitted as independently supervised additionally passes
     /// [`Self::admit_material_authority_for_fence`], which verifies the live
     /// Watchdog branch for the exact target fence.
     ///
@@ -2769,7 +2772,8 @@ impl KernelComposition {
     ///
     /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
     /// as a platform error when the Kernel is unavailable, otherwise the
-    /// blocking [`StartupRejection`] or the profile-ceiling rejection.
+    /// Governor-binding refusal, the blocking [`StartupRejection`], or the
+    /// profile-ceiling rejection.
     pub fn admit_material_authority(
         &self,
         profile: GovernanceProfile,
@@ -2778,10 +2782,32 @@ impl KernelComposition {
             self.observed_kernel_availability(),
         )
         .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
+        let lock_poisoned =
+            || KernelServiceError::Platform("startup gate lock poisoned".to_owned());
+        let issued = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| lock_poisoned())?
+            .current_governor_issued_authority()
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "material authority refused: no Governor-derived coverage profile is current for this Kernel"
+                        .to_owned(),
+                )
+            })?;
         let coordinator = self
             .startup_coordinator
             .lock()
-            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+            .map_err(|_| lock_poisoned())?;
+        let issued_ceiling = coordinator.authority_ceiling(issued.profile());
+        let presented_ceiling = coordinator.authority_ceiling(profile);
+        if presented_ceiling.rank() > issued_ceiling.rank() {
+            return Err(KernelServiceError::Platform(format!(
+                "material authority refused: presented governance profile ceiling is '{}'; recorded Governor-issued ceiling is '{}'",
+                presented_ceiling.as_str(),
+                issued_ceiling.as_str(),
+            )));
+        }
         coordinator
             .admit_material_authority(profile)
             .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
