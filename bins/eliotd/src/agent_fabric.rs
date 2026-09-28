@@ -44,11 +44,13 @@
 //! explicit receipted escalate/defer disposition and can never be satisfied by
 //! a silent same-family or paid substitute, and a mid-attempt provider switch
 //! is refused unless an explicit receipted policy-authorized degradation was
-//! recorded first. The bridge itself is fail-closed: a plan whose request
-//! carries no Human-selected assurance/cost preset, no owner-proven route-class
-//! binding, or no route-local privacy evidence is refused rather than staffed
-//! from a locally supplied default, because a plan that cannot show its own
-//! evidence is not an acceptable plan.
+//! recorded first. Route-class eligibility is bound to the request's own
+//! declared route classes, so a class the request never bound a route to is
+//! unstaffed and carries an explicit disposition rather than a candidate
+//! borrowed from a neighbouring class. The bridge's remaining two inputs — the
+//! shape-derived preset and the assumed route-local privacy dimension — are
+//! known defects of this path, each recorded with its out-of-scope enabler in
+//! [`crate::staffing_policy`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -723,12 +725,11 @@ pub(crate) fn build_admitted_provider_capability(
 /// unavailable independent audit included — is refused here, before any
 /// reservation, admission, activation or dispatch can observe it.
 ///
-/// The bridge is also fail-closed on its own inputs: a request that carries no
-/// Human-selected assurance/cost preset is refused by name here, and a request
-/// that carries no owner-proven route-class binding or no route-local privacy
-/// evidence yields a receipt with no staffable class and therefore
-/// [`crate::staffing_policy::StaffingPolicyError::NoWriterRoute`]. Neither is
-/// filled in from the recipe's shape or from a local default.
+/// Route-class eligibility is bound to the request's own declared route
+/// classes, so a class with no owner-proven binding is unstaffed and dispositioned
+/// rather than filled from the whole candidate pool. The shape-derived preset
+/// and the assumed route-local privacy dimension are known defects of this path
+/// and are documented, with their enablers, in [`crate::staffing_policy`].
 ///
 /// # Errors
 ///
@@ -1885,8 +1886,8 @@ impl AgentFabric {
     /// # Errors
     ///
     /// Returns the coordinator owner rejection, the staffing-policy rejection
-    /// when the request carries no Human-selected preset or the task class
-    /// cannot be staffed under current evidence, or
+    /// when the recipe exceeds the selected policy's lane or writer bound or
+    /// the task class cannot be staffed under current evidence, or
     /// [`FabricError::DefinitionConflict`].
     pub fn define_and_plan(
         &mut self,
