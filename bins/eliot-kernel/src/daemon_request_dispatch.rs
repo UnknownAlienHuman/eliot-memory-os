@@ -9035,13 +9035,12 @@ fn restore_pre_stage_corrections(
         // An inconsistent journal is refused as a whole: the gate restores
         // nothing rather than partially adopting a record it could not prove,
         // so this cache stays empty and keeps re-reading the same journal on
-        // every later request. The error is not turned into a request failure
-        // because this is best-effort startup recovery and refusing to restore
-        // is the fail-closed outcome: no refusal is loaded, so no correction
-        // lineage can be claimed from a journal this gate could not verify.
-        if guard.restore(snapshot).is_err() {
-            return;
-        }
+        // every later request. The outcome is deliberately not turned into a
+        // request failure: this is best-effort startup recovery, refusing to
+        // restore IS the fail-closed response, and with no refusal loaded no
+        // correction lineage can be claimed from a journal this gate could not
+        // verify.
+        let _ = guard.restore(snapshot);
     }
 }
 
