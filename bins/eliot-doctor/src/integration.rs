@@ -296,7 +296,59 @@ fn expectation_from_install_receipt(
                 .to_owned(),
         ));
     }
-    Ok(expectation)
+    Ok(LoadedExpectation {
+        expectation,
+        install_status: Some(install_status_from_receipt(document)?),
+    })
+}
+
+/// Reads the installation status the delivery itself recorded in the install
+/// receipt: `status`, `code`, and `completed`.
+///
+/// These are the receipt's own values, read as recorded — never recomputed
+/// from what the read side holds, and never derived from the preview-digest
+/// check, which proves only that the embedded preview is un-drifted and says
+/// nothing about whether an install ran. A receipt that omits `completed` is
+/// a typed input error rather than an assumed success: the one field that
+/// decides whether an installation happened cannot be filled in by this front
+/// door. `status` and `code` are carried verbatim for reporting, so a
+/// `completed: true` receipt whose `status` still says the install was not
+/// attempted is reported with both facts visible rather than reconciled away.
+fn install_status_from_receipt(
+    document: &serde_json::Value,
+) -> Result<InstallStatus, IntegrationError> {
+    let status = document
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no installation status; refusing to report an installation whose outcome the record does not state"
+                    .to_owned(),
+            )
+        })?;
+    let code = document
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no installation code; refusing to report an installation whose outcome the record does not state"
+                    .to_owned(),
+            )
+        })?;
+    let completed = document
+        .get("completed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no boolean completed flag; refusing to assume an installation happened"
+                    .to_owned(),
+            )
+        })?;
+    Ok(InstallStatus {
+        status: status.to_owned(),
+        code: code.to_owned(),
+        completed,
+    })
 }
 
 /// Loads an observation document. The path must be absolute.
