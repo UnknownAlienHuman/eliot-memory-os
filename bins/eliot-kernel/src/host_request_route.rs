@@ -1532,8 +1532,9 @@ impl KernelComposition {
     /// the retained activation binding is `IdentityConflict`: the request must
     /// re-activate under the new binding, it is never silently rebound or
     /// rewritten. A claim matching the retained binding whose application
-    /// session is unknown, terminal, epoch-mismatched, or never bound to the
-    /// presenting connection is `SessionFenced`.
+    /// session is unknown, terminal, epoch-mismatched, never bound to the
+    /// presenting connection, or carries an expired or revoked session-bound
+    /// lease is `SessionFenced`.
     fn host_request_application_binding_gate_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1558,6 +1559,7 @@ impl KernelComposition {
             if claimed != retained.session_id {
                 return Err(TransportError::IdentityConflict);
             }
+            let now = unix_ms();
             let sessions = self
                 .agent_application_sessions
                 .lock()
@@ -1571,6 +1573,10 @@ impl KernelComposition {
                         .transport_bindings()
                         .iter()
                         .any(|binding| binding.binding_id == envelope.connection_id)
+                    && session
+                        .bound_leases()
+                        .values()
+                        .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
             });
             if !live {
                 return Err(TransportError::SessionFenced);
@@ -2058,12 +2064,13 @@ impl KernelComposition {
     ///
     /// Admission verified the claims; this closes the window between enqueue
     /// and claim. A pair whose claimed session is unknown, terminal,
-    /// epoch-mismatched, or never bound to the presenting connection is not
-    /// claimable, and neither is a pair whose claimed task, scope, or task
-    /// revision drifted from this connection's retained `Resolved`
-    /// activation binding. Pairs without a claim carry nothing to revalidate
-    /// on that leg. An unclaimable pair keeps its original identity and is
-    /// skipped for later reconciliation, never refused or rewritten here.
+    /// epoch-mismatched, never bound to the presenting connection, or carrying
+    /// an expired or revoked session-bound lease is not claimable, and neither
+    /// is a pair whose claimed task, scope, or task revision drifted from this
+    /// connection's retained `Resolved` activation binding. Pairs without a
+    /// claim carry nothing to revalidate on that leg. An unclaimable pair keeps
+    /// its original identity and is skipped for later reconciliation, never
+    /// refused or rewritten here.
     fn application_binding_live_for_claim(
         &self,
         envelope: &HostRequestEnvelope,
@@ -2104,6 +2111,7 @@ impl KernelComposition {
         let Some(claimed) = envelope.identity.session_id.as_deref() else {
             return Ok(true);
         };
+        let now = unix_ms();
         let sessions = self
             .agent_application_sessions
             .lock()
@@ -2117,6 +2125,10 @@ impl KernelComposition {
                     .transport_bindings()
                     .iter()
                     .any(|binding| binding.binding_id == envelope.connection_id)
+                && session
+                    .bound_leases()
+                    .values()
+                    .all(|lease| !lease.revoked && now < lease.expires_at_unix_ms)
         }))
     }
 
