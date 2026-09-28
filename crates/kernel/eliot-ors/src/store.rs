@@ -2867,12 +2867,12 @@ fn load_maintenance_trigger_gap_index(
     write: &redb::WriteTransaction,
     sequence_key: &str,
 ) -> Result<Option<String>, OrsError> {
-    write
+    Ok(write
         .open_table(MAINTENANCE_TRIGGER_GAP_SEQUENCE_INDEX)
         .map_err(storage)?
         .get(sequence_key)
         .map_err(storage)?
-        .map(|value| value.value().to_owned())
+        .map(|value| value.value().to_owned()))
 }
 
 fn persist_maintenance_trigger_gap(
@@ -3267,10 +3267,8 @@ fn try_replay_compacted_maintenance_trigger_intake(
     write: &redb::WriteTransaction,
     record: &MaintenanceTriggerIntakeStorageRecord,
 ) -> Result<Option<MaintenanceTriggerIntakeStorageProjection>, OrsError> {
-    let (existing, pin_source_event) = load_maintenance_trigger_intake_and_pin(
-        write,
-        record.envelope_operation_id.as_str(),
-    )?;
+    let (existing, pin_source_event) =
+        load_maintenance_trigger_intake_and_pin(write, record.envelope_operation_id.as_str())?;
     let Some(existing) = existing else {
         return Ok(None);
     };
@@ -3281,11 +3279,12 @@ fn try_replay_compacted_maintenance_trigger_intake(
     if pin_source_event.is_some() {
         return Ok(None);
     }
-    let lifecycle = load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
-        .ok_or_else(|| OrsError::IntegrityProblem {
-            record_type: "maintenance_trigger_lifecycle",
-            reason: "compacted intake has no retained lifecycle row".to_owned(),
-        })?;
+    let lifecycle =
+        load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: "compacted intake has no retained lifecycle row".to_owned(),
+            })?;
     lifecycle.validate()?;
     if lifecycle.trigger_id != record.trigger_id
         || lifecycle.source_event_identity != record.source_event_identity
@@ -3334,10 +3333,8 @@ fn validate_maintenance_trigger_intake_identity_indexes(
     record: &MaintenanceTriggerIntakeStorageRecord,
     lifecycle: &MaintenanceTriggerLifecycleRecord,
 ) -> Result<(), OrsError> {
-    let indexed_event = load_maintenance_trigger_event_index(
-        write,
-        record.source_event_identity.as_str(),
-    )?;
+    let indexed_event =
+        load_maintenance_trigger_event_index(write, record.source_event_identity.as_str())?;
     let indexed_trigger = write
         .open_table(MAINTENANCE_TRIGGER_IDS)
         .map_err(storage)?
@@ -3401,12 +3398,12 @@ fn load_maintenance_trigger_event_index(
     write: &redb::WriteTransaction,
     source_event_identity: &str,
 ) -> Result<Option<String>, OrsError> {
-    write
+    Ok(write
         .open_table(MAINTENANCE_TRIGGER_EVENTS)
         .map_err(storage)?
         .get(source_event_identity)
         .map_err(storage)?
-        .map(|value| value.value().to_owned())
+        .map(|value| value.value().to_owned()))
 }
 
 fn load_maintenance_trigger_intake_and_pin(
@@ -3670,11 +3667,12 @@ fn readback_maintenance_trigger_intake_rows(
             reason: "staged row changed during transaction read-back".to_owned(),
         });
     }
-    let lifecycle = load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
-        .ok_or_else(|| OrsError::IntegrityProblem {
-            record_type: "maintenance_trigger_lifecycle",
-            reason: "retained intake has no lifecycle row".to_owned(),
-        })?;
+    let lifecycle =
+        load_maintenance_trigger_lifecycle_from_write(write, record.trigger_id.as_str())?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_lifecycle",
+                reason: "retained intake has no lifecycle row".to_owned(),
+            })?;
     lifecycle.validate()?;
     if lifecycle.source_event_identity != record.source_event_identity
         || lifecycle.trigger_id != record.trigger_id
@@ -3725,10 +3723,8 @@ fn validate_maintenance_trigger_intake_index_readback(
             reason: "envelope-keyed pin failed transaction read-back".to_owned(),
         });
     }
-    let indexed_event = load_maintenance_trigger_event_index(
-        write,
-        record.source_event_identity.as_str(),
-    )?;
+    let indexed_event =
+        load_maintenance_trigger_event_index(write, record.source_event_identity.as_str())?;
     let trigger_envelope = write
         .open_table(MAINTENANCE_TRIGGER_IDS)
         .map_err(storage)?
@@ -3740,7 +3736,8 @@ fn validate_maintenance_trigger_intake_index_readback(
     {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_intake_index",
-            reason: "source-event or trigger identity index failed transaction read-back".to_owned(),
+            reason: "source-event or trigger identity index failed transaction read-back"
+                .to_owned(),
         });
     }
     Ok(())
@@ -4323,9 +4320,9 @@ fn validate_maintenance_trigger_page_request(
     if limit == 0 || limit > crate::MAX_MAINTENANCE_TRIGGER_PAGE {
         return Err(OrsError::InvalidCursorLimit);
     }
-    if continuation.is_some_and(|token| {
-        validate_digest(token, "maintenance_trigger_continuation").is_err()
-    }) {
+    if continuation
+        .is_some_and(|token| validate_digest(token, "maintenance_trigger_continuation").is_err())
+    {
         return Err(OrsError::InvalidCursorLimit);
     }
     Ok(())
@@ -4393,10 +4390,9 @@ fn resolve_maintenance_trigger_recovery_cursor(
         return Err(OrsError::DuplicateConflict);
     }
     let high_water_sequence = maintenance_trigger_sequence_high_water(write)?;
-    let active_sequences =
-        snapshot_active_maintenance_trigger_members(write, high_water_sequence)?;
-    let active_member_count = u64::try_from(active_sequences.len())
-        .map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let active_sequences = snapshot_active_maintenance_trigger_members(write, high_water_sequence)?;
+    let active_member_count =
+        u64::try_from(active_sequences.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
     let cursor_id = crate::model::sha256_hex(
         format!(
             "eliot.ors.maintenance-trigger-recovery-cursor.v1\0{cursor_key}\0{high_water_sequence}\0{limit}"
@@ -4421,7 +4417,11 @@ fn resolve_maintenance_trigger_recovery_cursor(
         has_more: false,
         served: true,
     })?;
-    persist_maintenance_trigger_recovery_page_members(write, cursor_id.as_str(), &active_sequences)?;
+    persist_maintenance_trigger_recovery_page_members(
+        write,
+        cursor_id.as_str(),
+        &active_sequences,
+    )?;
     persist_maintenance_trigger_page_cursor(write, cursor_key.as_str(), &state)?;
     Ok((state, false))
 }
@@ -4715,12 +4715,7 @@ fn load_maintenance_trigger_lifecycle_for_update(
         &intake,
         &lifecycle,
     )?;
-    validate_maintenance_trigger_write_payload(
-        write,
-        &envelope_operation,
-        &intake,
-        &lifecycle,
-    )?;
+    validate_maintenance_trigger_write_payload(write, &envelope_operation, &intake, &lifecycle)?;
     Ok(lifecycle)
 }
 
@@ -5002,10 +4997,10 @@ fn validate_maintenance_trigger_active_snapshot(
     snapshot: &MaintenanceTriggerActiveSnapshot,
     high_water_sequence: u64,
 ) -> Result<(), OrsError> {
-    let lifecycle_count =
-        u64::try_from(snapshot.lifecycle_rows.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
-    let sequence_index_count =
-        u64::try_from(snapshot.sequence_index.len()).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let lifecycle_count = u64::try_from(snapshot.lifecycle_rows.len())
+        .map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let sequence_index_count = u64::try_from(snapshot.sequence_index.len())
+        .map_err(|_| OrsError::ProjectionLimitExceeded)?;
     if lifecycle_count != sequence_index_count
         || lifecycle_count != snapshot.intake_count
         || lifecycle_count != snapshot.trigger_index_count
@@ -29309,20 +29304,16 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
 
         validate_maintenance_trigger_intake_envelope(&write, record)?;
-        let indexed_envelope = load_maintenance_trigger_event_index(
-            &write,
-            record.source_event_identity.as_str(),
-        )?;
+        let indexed_envelope =
+            load_maintenance_trigger_event_index(&write, record.source_event_identity.as_str())?;
         if indexed_envelope
             .as_deref()
             .is_some_and(|value| value != record.envelope_operation_id.as_str())
         {
             return Err(OrsError::DuplicateConflict);
         }
-        let (existing, pin_source_event) = load_maintenance_trigger_intake_and_pin(
-            &write,
-            record.envelope_operation_id.as_str(),
-        )?;
+        let (existing, pin_source_event) =
+            load_maintenance_trigger_intake_and_pin(&write, record.envelope_operation_id.as_str())?;
         let replayed = validate_maintenance_trigger_intake_replay(
             &write,
             record,
@@ -29338,7 +29329,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
 
         let read = self.database.begin_read().map_err(storage)?;
         let persisted = readback_committed_maintenance_trigger_intake(&read, record)?;
-        Ok(MaintenanceTriggerIntakeStorageProjection { record: persisted, replayed })
+        Ok(MaintenanceTriggerIntakeStorageProjection {
+            record: persisted,
+            replayed,
+        })
     }
     fn load_maintenance_trigger_intake(
         &self,
@@ -29783,11 +29777,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             });
         }
         persist_maintenance_trigger_gap(&write, &gap, sequence_key.as_str())?;
-        validate_maintenance_trigger_gap_write_readback(
-            &write,
-            &gap,
-            sequence_key.as_str(),
-        )?;
+        validate_maintenance_trigger_gap_write_readback(&write, &gap, sequence_key.as_str())?;
         write.commit().map_err(storage)?;
         let read = self.database.begin_read().map_err(storage)?;
         readback_maintenance_trigger_gap(&read, &gap, false)
@@ -29889,16 +29879,18 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if now_ms < retention.retained_until_ms {
             return Err(OrsError::InvalidTransition);
         }
-        let (intake, envelope) =
-            load_maintenance_trigger_compaction_payloads(&write, trigger_id)?;
-        validate_maintenance_trigger_compaction_binding(trigger_id, &lifecycle, &intake, &envelope)?;
+        let (intake, envelope) = load_maintenance_trigger_compaction_payloads(&write, trigger_id)?;
+        validate_maintenance_trigger_compaction_binding(
+            trigger_id, &lifecycle, &intake, &envelope,
+        )?;
         validate_maintenance_trigger_compaction_safety(&write, &intake, &envelope, now_ms)?;
         remove_maintenance_trigger_payload(&write, &intake)?;
         lifecycle.payload_compacted_at_ms = Some(now_ms);
         advance_maintenance_trigger_lifecycle(&mut lifecycle, now_ms)?;
         persist_maintenance_trigger_lifecycle(&write, &lifecycle)?;
         commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
-    }    /// Retains one visible durable Recovery Problem for a staged
+    }
+    /// Retains one visible durable Recovery Problem for a staged
     /// `PreparedTransition` that this build refuses to execute (issue #1927,
     /// I05-06).
     ///

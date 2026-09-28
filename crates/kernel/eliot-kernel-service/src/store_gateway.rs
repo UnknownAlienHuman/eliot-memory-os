@@ -51,10 +51,9 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOper
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_PAGE_WIRE_ID, MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION, MaintenanceTriggerAck,
     MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDisposition,
-    MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerPage,
-    MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord, MaintenanceTriggerRevocation,
-    MaintenanceTriggerRoutingClass, MaintenanceTriggerTerminalDisposition,
-    MaintenanceTriggerTerminalKind, ProtocolError,
+    MaintenanceTriggerGap, MaintenanceTriggerPage, MaintenanceTriggerPendingSummary,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind, ProtocolError,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -167,6 +166,8 @@ pub enum MaintenanceTriggerIntakeFailure {
     SourceFenceMismatch,
     /// This composition has no usable ORS owner.
     OrsUnavailable,
+    /// The operating-system clock did not produce a usable Unix timestamp.
+    ClockUnavailable,
     /// The referenced ORS envelope is not retained.
     EnvelopeNotRetained,
     /// The retained envelope does not bind the requested identity.
@@ -613,9 +614,9 @@ fn mark_maintenance_trigger_reconciling_checked(
     {
         return Err(OrsError::IntegrityProblem {
             record_type: "maintenance_trigger_lifecycle",
-            key: trigger_id.to_owned(),
-            detail: "reconciliation intent read-back does not match the exact claim and bytes"
-                .to_owned(),
+            reason: format!(
+                "{trigger_id}: reconciliation intent read-back does not match the exact claim and bytes"
+            ),
         });
     }
     Ok(stored)
@@ -2135,8 +2136,10 @@ impl KernelStoreGateway {
                 .ok_or_else(|| MaintenanceTriggerIntakeFailure::Ors {
                     error: OrsError::IntegrityProblem {
                         record_type: "maintenance_trigger_lifecycle",
-                        key: record.trigger_id.clone(),
-                        detail: "retained intake has no lifecycle row".to_owned(),
+                        reason: format!(
+                            "{}: retained intake has no lifecycle row",
+                            record.trigger_id
+                        ),
                     },
                     commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
                 })?;
@@ -2171,7 +2174,9 @@ impl KernelStoreGateway {
             // New intake must be current and eligible. Exact retained replay
             // above may carry the State Fence and applicability deadline it
             // was admitted under, even after replacement or expiry.
-            record.validate_at(unix_ms()).map_err(|error| {
+            let now_ms = maintenance_trigger_now_ms()
+                .map_err(|_| MaintenanceTriggerIntakeFailure::ClockUnavailable)?;
+            record.validate_at(now_ms).map_err(|error| {
                 MaintenanceTriggerIntakeFailure::Protocol {
                     error,
                     commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
@@ -2450,9 +2455,10 @@ impl KernelStoreGateway {
             return Err(MaintenanceTriggerLifecycleFailure::Ors {
                 error: OrsError::IntegrityProblem {
                     record_type: "maintenance_trigger_lifecycle",
-                    key: trigger.trigger_id,
-                    detail: "claim read-back does not match the authenticated delivery request"
-                        .to_owned(),
+                    reason: format!(
+                        "{}: claim read-back does not match the authenticated delivery request",
+                        trigger.trigger_id
+                    ),
                 },
                 commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
             });

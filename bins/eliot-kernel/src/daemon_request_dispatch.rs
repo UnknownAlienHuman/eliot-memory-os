@@ -23,9 +23,8 @@ use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, MaintenanceTriggerCommitOutcome,
     MaintenanceTriggerIntakeFailure, MaintenanceTriggerLifecycleFailure, NamedReadGatewayError,
     PreStageRejection, StoreApplyRefusal, UserAutomationDueWakeRejection,
-    UserAutomationDueWakeResolution,
-    UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
-    UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
+    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
@@ -4559,6 +4558,9 @@ impl KernelComposition {
                 "MAINTENANCE_TRIGGER_ACTIVE_ROUTE_MISMATCH"
             }
             MaintenanceTriggerIntakeFailure::InvalidRecord => "MAINTENANCE_TRIGGER_INVALID_RECORD",
+            MaintenanceTriggerIntakeFailure::ClockUnavailable => {
+                "MAINTENANCE_TRIGGER_CLOCK_UNAVAILABLE"
+            }
             MaintenanceTriggerIntakeFailure::CanonicalSerialization(_) => {
                 "MAINTENANCE_TRIGGER_CANONICAL_SERIALIZATION"
             }
