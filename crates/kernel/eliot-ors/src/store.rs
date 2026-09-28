@@ -20963,6 +20963,11 @@ impl RedbRecoveryStore {
         };
         store.initialize()?;
         store.recover_interrupted_execution()?;
+        // Reached only after both steps above have committed and dropped their
+        // transactions, so the store-owned retention pass opens its own write
+        // transaction without contending with them. A refusal here refuses the
+        // open rather than being swallowed.
+        store.reconcile_restore_journal_retention()?;
         Ok(store)
     }
 
@@ -20984,6 +20989,7 @@ impl RedbRecoveryStore {
         };
         store.initialize()?;
         store.recover_interrupted_execution()?;
+        store.reconcile_restore_journal_retention()?;
         Ok(store)
     }
 

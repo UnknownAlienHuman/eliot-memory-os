@@ -19,6 +19,11 @@
 //! budget preconditions and the current predecessor. A refused append therefore
 //! cannot commit a reclamation, and an exact replay cannot reclaim the very row
 //! whose persisted receipt it returns.
+//!
+//! The same bounded pass is also a maintenance operation the store itself owns:
+//! it runs while the store is being opened, in its own write transaction per
+//! stream, over the store's own persisted binding index, and its outcome is a
+//! reclaimed-member count that is never folded into an append receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1537,6 +1542,78 @@ impl RedbRecoveryStore {
         Ok(self
             .run_restore_journal_retention(stream, policy.keep_resolved)?
             .removed_members)
+    }
+
+    /// The store-owned maintenance entry for the bounded restore-journal
+    /// retention pass, run while this store is being opened.
+    ///
+    /// It is reached from `RedbRecoveryStore::open` and
+    /// `RedbRecoveryStore::open_with_evidence` after `initialize` and
+    /// `recover_interrupted_execution` have each committed and dropped their
+    /// transactions, so it holds no write transaction of its own and the pass it
+    /// drives opens its own without contending with the store's single writer.
+    ///
+    /// The reclaimed set belongs to the store. The stream names come from the
+    /// journal closure this store re-derives through its own strict read path,
+    /// and every stream in that closure holds a persisted binding because
+    /// `validate_stream_closures` refuses a held stream that does not. No name is
+    /// supplied, guessed, configured or remembered by a caller, and
+    /// `apply_restore_journal_retention` re-proves each one against its persisted
+    /// binding inside its own transaction, so the binding requirement is
+    /// unchanged.
+    ///
+    /// The outcome is a reclaimed-member count, NOT an append receipt: this
+    /// operation runs at open, never inside an append transaction, and every
+    /// stream reclaims through the same `retain_restore_journal_locked` and the
+    /// same accepted policy the append path uses. A refusal is returned to the
+    /// caller as the typed `OrsError` it is, which refuses the open exactly as
+    /// `initialize` already refuses a journal migration error.
+    pub(super) fn reconcile_restore_journal_retention(&self) -> Result<u64, OrsError> {
+        if !self.restore_journal_binds_any_stream()? {
+            return Ok(0);
+        }
+        let policy = RestoreJournalRetentionPolicy::accepted();
+        policy.validate()?;
+        let state = self.read_restore_journal_state()?;
+        let mut reclaimed_members = 0_u64;
+        // The closure is keyed by stream name in sorted order, so the passes
+        // below run in a deterministic order over the store's own durable set.
+        for (stream, stream_state) in &state.streams {
+            if !restore_journal_under_retention_pressure(stream_state, &policy) {
+                continue;
+            }
+            let report = self.apply_restore_journal_retention(stream)?;
+            reclaimed_members = reclaimed_members.saturating_add(report.record.removed_members);
+        }
+        Ok(reclaimed_members)
+    }
+
+    /// Reports whether this store durably holds ANY restore-journal stream
+    /// binding, without decoding a value and without validating the journal
+    /// closure.
+    ///
+    /// This is a bounded metadata KEY scan, not a second closure read, so a
+    /// store that never admitted a restore-journal stream pays no closure
+    /// validation from this entry point. The unconditional validation that
+    /// `initialize_restore_journal_schema` already performs on every open is
+    /// left untouched.
+    ///
+    /// The table-family check runs FIRST, so a family that vanished after this
+    /// store adopted it is refused as a migration error instead of being
+    /// reported as a healthy absence, and every pass this gates then goes
+    /// through `run_restore_journal_retention` and its adoption guard.
+    fn restore_journal_binds_any_stream(&self) -> Result<bool, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        validate_journal_table_names(&read)?;
+        let meta = read.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
+        for (scanned, entry) in meta.iter().map_err(storage)?.enumerate() {
+            ensure_work(scanned, 1)?;
+            let (key, _value) = entry.map_err(storage)?;
+            if namespace_value(key.value(), BINDING_PREFIX).is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Applies the ACCEPTED retention policy to one stream and reports what it
