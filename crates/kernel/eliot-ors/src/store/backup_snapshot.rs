@@ -280,7 +280,7 @@ use crate::backup_snapshot::{
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
-    StreamRecoveryReconciliationState,
+    StreamRecoveryReconciliation, StreamRecoveryReconciliationState,
     VersionedArtifactEntry,
 };
 
@@ -308,20 +308,26 @@ impl super::RedbRecoveryStore {
     ///   disagreement refuses the whole driver with zero writes.
     /// - every row is then pre-flighted against the destination's CURRENT
     ///   durable row for the same `(operation, stream)` key, still before the
-    ///   first write, through [`restore_row_refusal`], which mirrors the
-    ///   refusals the family's write body applies to a restored row: differing
-    ///   evidence axes, an activation the destination may not become, an
+    ///   first write, through [`restore_row_refusal`], which MIRRORS the
+    ///   refusals the family's write body applies to a restored row — the write
+    ///   body is the owner of every one of them. The mirrored set is: differing
+    ///   evidence axes; an activation the destination may not become; an
     ///   archived `Retired` row landing on a destination row that is not already
-    ///   `Retired` (a restore must not terminate a live row), a restore
+    ///   `Retired` (a restore must not terminate a live row); a restore
     ///   rewriting the retained reconciliation of an already `Retired`
-    ///   destination row, and a restore introducing a `Reconciled` handoff
-    ///   readback onto a destination row that does not already carry one. Any
-    ///   of these refuses the whole driver with zero writes, so a page is never
-    ///   left half-restored by a refusal the driver could have seen in advance.
-    ///   The pre-pass is strictly stronger than the write body for the
-    ///   terminal-over-live case: it refuses that page even when the archived
-    ///   row is byte-identical to the destination row apart from the
-    ///   activation.
+    ///   destination row; and the write-once `Reconciled` handoff rule, in ALL
+    ///   THREE of its clauses and in BOTH branches of the check — a destination
+    ///   that is not `Reconciled` may not be moved into it, one that is may not
+    ///   be moved out of it, and one that is already `Reconciled` may not have
+    ///   its owner or its `handoff_sha256` changed. Any of these refuses the
+    ///   whole driver with zero writes, so a page is never left half-restored
+    ///   by a refusal the driver could have seen in advance. The pre-pass is
+    ///   strictly stronger than the write body for the terminal-over-live case:
+    ///   it refuses that page even when the archived row is byte-identical to
+    ///   the destination row apart from the activation. The pre-pass has no
+    ///   case for an EMPTY `(operation, stream)` key, because the write body
+    ///   has none either: the disclosed residual is that an archived
+    ///   `Reconciled` row lands on a fresh key carrying its digest.
     ///
     /// The pre-pass reads destination state in one read transaction that is
     /// dropped before the first write, so the zero-write property is exact for
@@ -414,6 +420,15 @@ impl super::RedbRecoveryStore {
 /// Whether one archived row must be refused against the destination's current
 /// durable row for the same `(operation, stream)` key.
 ///
+/// THE WRITE BODY IS THE OWNER OF EVERY RULE MIRRORED HERE. This pre-pass
+/// duplicates them on purpose, so that the driver's documented "any
+/// disagreement refuses the whole driver with zero writes" property holds and
+/// the pre-pass can never say `Ok(None)` where the write body will refuse; the
+/// duplication is accepted rather than factored into a cross-module helper
+/// because a shared helper would put the rule outside the write body it
+/// describes. If a rule changes in `RedbRecoveryStore`'s write body, it changes
+/// here in the same item.
+///
 /// The activation an archived row imports as is restated here exactly as
 /// [`RedbRecoveryStore::import_process_stream_recovery_suspended`] maps it,
 /// which is the single owner of that rule: an already `Retired` row stays
@@ -427,6 +442,13 @@ impl super::RedbRecoveryStore {
 /// That single stricter case is disclosed at its own write path rather than
 /// closed here, because closing it would break "an archived `Retired` row stays
 /// `Retired`" (merged W7).
+///
+/// The caller invokes this only for a key the destination already holds; for
+/// an EMPTY `(operation, stream)` key it is not called, and neither is the write
+/// body able to compare any of its rules against anything, so an archived
+/// `Reconciled` row lands on a fresh key with its digest. That is the one
+/// remaining author of a `Reconciled` handoff and it is disclosed, not closed,
+/// at [`RedbRecoveryStore::import_process_stream_recovery_suspended`].
 fn restore_row_refusal(
     record_id: &str,
     archived: &ProcessStreamRecoveryProjection,
@@ -449,32 +471,35 @@ fn restore_row_refusal(
         StreamRecoveryActivation::Suspended
     };
     let terminal_restore = imported == StreamRecoveryActivation::Retired;
+    // The write-once `Reconciled` handoff rule, mirrored into BOTH branches
+    // below, because the write body applies it above its whole `match`.
+    let handoff_rewrite =
+        reconciled_handoff_rewrite(&destination.reconciliation, &archived.reconciliation);
     if destination.activation == imported {
         // Observation-advance arm of the write body, which cannot move
         // activation. The write body's blanket "a non-admitted writer may not
         // change a durable row's reconciliation" rule does NOT apply here,
-        // because a restore is admitted; what still applies in that arm is the
-        // retained-history rule, which is exactly the comparison below, and it
-        // has two halves. A restore may never rewrite the retained
-        // reconciliation of an already `Retired` destination row, and it may
-        // never introduce a `Reconciled` handoff readback onto a row that does
-        // not already carry it. Mirroring both here is what keeps this
-        // pre-pass faithful to the write body it stands in front of, so the
-        // documented "any disagreement refuses the whole driver with zero
-        // writes" property holds for these conflicts instead of aborting the
-        // page after an earlier row was written.
-        if destination.reconciliation != archived.reconciliation
-            && (terminal_restore
-                || archived.reconciliation.state == StreamRecoveryReconciliationState::Reconciled)
-        {
+        // because a restore is admitted; what still applies is the write-once
+        // handoff rule mirrored above, and the retained-history rule, which is
+        // the comparison below. Mirroring both is what keeps this pre-pass
+        // faithful to the write body it stands in front of, so the documented
+        // "any disagreement refuses the whole driver with zero writes" property
+        // holds for these conflicts instead of aborting the page after an
+        // earlier row was written.
+        if let Some(reason) = handoff_rewrite {
+            return Ok(Some(refusal(reason.to_owned())));
+        }
+        if terminal_restore && destination.reconciliation != archived.reconciliation {
             return Ok(Some(refusal(
-                "a restore must not rewrite an already retired destination row's retained \
-                 reconciliation, and must not author a reconciled handoff readback onto a row \
-                 that does not already carry one"
+                "a restore must not rewrite the retained reconciliation of an already retired \
+                 destination row"
                     .to_owned(),
             )));
         }
         return Ok(None);
+    }
+    if let Some(reason) = handoff_rewrite {
+        return Ok(Some(refusal(reason.to_owned())));
     }
     if terminal_restore || !destination.activation.permits_transition_to(imported) {
         return Ok(Some(refusal(format!(
@@ -484,6 +509,52 @@ fn restore_row_refusal(
         ))));
     }
     Ok(None)
+}
+
+/// The refusal reason for a write that rewrites a `Reconciled` handoff on a
+/// durable row, or `None` for a write that does not.
+///
+/// This MIRRORS `RedbRecoveryStore`'s write-body rule and is not its owner: the
+/// write body applies that rule above its whole `match`, for every writer, and
+/// this pre-pass must agree with it in both the same-activation branch and the
+/// transition branch or the driver's zero-write property would not hold. Three
+/// clauses, exactly as the write body states them: a reconciliation that is not
+/// `Reconciled` is never moved into it, a `Reconciled` one is never moved out
+/// of it, and a row already `Reconciled` keeps its `owner` and its
+/// `handoff_sha256` byte for byte.
+///
+/// A `destination` that is not `Reconciled` may still change owner and move
+/// between the other three states — that is the ordinary cross-installation
+/// restore, which legitimately presents a different `owner` and carries no
+/// proof.
+fn reconciled_handoff_rewrite(
+    destination: &StreamRecoveryReconciliation,
+    archived: &StreamRecoveryReconciliation,
+) -> Option<&'static str> {
+    let reconciled = StreamRecoveryReconciliationState::Reconciled;
+    match (
+        destination.state == reconciled,
+        archived.state == reconciled,
+    ) {
+        (false, true) => Some(
+            "a durable reconciliation is never moved into Reconciled by a restore, so an archived \
+             reconciled handoff cannot be placed on a row that does not already carry one",
+        ),
+        (true, false) => Some(
+            "a durable Reconciled handoff is write-once, so a restore may never move it out of \
+             Reconciled",
+        ),
+        (true, true)
+            if archived.owner != destination.owner
+                || archived.handoff_sha256 != destination.handoff_sha256 =>
+        {
+            Some(
+                "a durable Reconciled handoff is write-once and immutable, so a restore may not \
+                 re-point its owner or its handoff digest",
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
