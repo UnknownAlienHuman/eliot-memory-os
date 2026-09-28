@@ -1375,14 +1375,19 @@ pub fn recovery_page(
 /// never downgrades the envelope to the root-transition-only
 /// `RecoveryPayload::CanonicalRequest` variant.
 ///
-/// This producer has no production caller yet, and that is recorded rather
-/// than worked around: the only route that consumes a seed is
-/// `KernelStoreGateway::apply_reserved`, which cannot be reached from the live
-/// canonical write because the Store backend installs no reserved-write
-/// execution generation (see the "Consequence for the write route" note in
-/// `bins/eliot-kernel/src/daemon_request_dispatch.rs`). It is kept honest here
-/// so that the moment the backend advertises the capability the producer is
-/// already correct rather than a refusal.
+/// This producer has no production caller, and that is recorded rather than
+/// worked around: the only route that consumes a seed is
+/// `KernelStoreGateway::apply_reserved`, which no live route reaches, and
+/// `ReservationSeed { .. }` is constructed nowhere else in production. It is
+/// kept honest here so that when the reserved route becomes reachable the
+/// producer is already correct rather than a refusal. The four searched
+/// negatives that keep the route unreachable — the Store's uninstalled
+/// reserved-write execution generation, the unadvertised
+/// `CAPABILITY_RESERVED_WRITE`, the missing production source for
+/// [`ObservedHead::expected_head_digest`], and ORS's unbound
+/// `CanonicalEvidenceProvider` — are each cited with file and line at the live
+/// canonical write call site in
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs`.
 pub fn gateway_seed(
     platform: &eliot_platform_windows::WindowsPlatform,
     transition: &PreparedTransition,
