@@ -658,16 +658,16 @@ pub(super) fn package_staging_unknown_port_error(
     request: &InstallationEffectRequest,
     error: &PackageStagingError,
 ) -> PortError {
-    if let PackageStagingError::Win32 { stage, code } = error {
-        if let Ok(reference) = package_staging_unknown_reference(request, *stage, *code) {
-            return PortError::ProviderReference {
-                error: ProviderError {
-                    code: ProviderErrorCode::Failed,
-                    retryable: false,
-                },
-                reference,
-            };
-        }
+    if let PackageStagingError::Win32 { stage, code } = error
+        && let Ok(reference) = package_staging_unknown_reference(request, *stage, *code)
+    {
+        return PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference,
+        };
     }
     package_port_error(error)
 }

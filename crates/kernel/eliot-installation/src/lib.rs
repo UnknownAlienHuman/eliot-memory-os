@@ -5333,69 +5333,7 @@ impl WindowsInstallationEffectPort {
                 })
             }
             HostCredentialControlResponse::Deleted { absence_digest } => {
-                let prior = host_request
-                    .expected_receipt
-                    .as_ref()
-                    .ok_or(PortError::IdentityConflict)?;
-                let expected = credential_deleted_response_digest(
-                    &host_request.intent.request_digest,
-                    &prior.host_owner_epoch,
-                    &prior.host_process_identity,
-                    &prior.marker,
-                )
-                .map_err(|_| PortError::IdentityConflict)?;
-                if expected != absence_digest {
-                    return Err(PortError::IdentityConflict);
-                }
-                // s33.3 (#1313): a delete acknowledgement without a typed
-                // absence snapshot cannot pass the strict rollback gate
-                // (`validate()` requires os/credential/package). Preserve the
-                // admitted credential snapshot verbatim when the rollback
-                // request already carries it (fixed inspect followed by
-                // reconcile). Otherwise independently re-observe absence now
-                // through an `Inspect` Host call and bind its snapshot via
-                // `with_credential_snapshot` — never fabricated from the plan.
-                // The delete digest stays in evidence alongside the fresh
-                // absent digest so both the authenticated delete and the
-                // re-observed absence are bound. Any non-absent re-readback
-                // fails closed.
-                if request.precondition.credential_snapshot.is_some() {
-                    return Ok(InstallationEffectObservation::Absent {
-                        observed_precondition: request.precondition.clone(),
-                        evidence: vec![absence_digest],
-                        service_runtime_lineage: None,
-                    });
-                }
-                let inspect_request = Self::host_credential_request(
-                    request,
-                    HostCredentialControlOperation::Inspect,
-                    Vec::new(),
-                )?;
-                match self.call_credential_host(&inspect_request)? {
-                    HostCredentialControlResponse::Absent {
-                        snapshot,
-                        response_digest,
-                    } => {
-                        if response_digest
-                            != credential_absent_response_digest(
-                                &inspect_request.intent.request_digest,
-                                &snapshot,
-                            )
-                            .map_err(|_| PortError::IdentityConflict)?
-                        {
-                            return Err(PortError::IdentityConflict);
-                        }
-                        Ok(InstallationEffectObservation::Absent {
-                            observed_precondition: request
-                                .precondition
-                                .with_credential_snapshot(snapshot)
-                                .map_err(|_| PortError::InvalidRequestMetadata)?,
-                            evidence: vec![absence_digest, response_digest],
-                            service_runtime_lineage: None,
-                        })
-                    }
-                    _ => Err(PortError::IdentityConflict),
-                }
+                self.credential_deleted_observation(request, &host_request, absence_digest)
             }
             HostCredentialControlResponse::PhaseBReady { .. }
             | HostCredentialControlResponse::PhaseBPrepared { .. } => {
@@ -5404,6 +5342,82 @@ impl WindowsInstallationEffectPort {
             HostCredentialControlResponse::Unknown { pending_ref } => {
                 Ok(InstallationEffectObservation::Mismatch { pending_ref })
             }
+        }
+    }
+
+    /// Observes the post-delete absence bound to a delete acknowledgement.
+    ///
+    /// Pure split from `credential_observation` (s33.3, #1313): the expected
+    /// delete digest is still compared exactly against the recorded receipt
+    /// and never recomputed, and the snapshot rules are unchanged.
+    fn credential_deleted_observation(
+        &self,
+        request: &InstallationEffectRequest,
+        host_request: &HostCredentialControlRequest,
+        absence_digest: PlatformHandle,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let prior = host_request
+            .expected_receipt
+            .as_ref()
+            .ok_or(PortError::IdentityConflict)?;
+        let expected = credential_deleted_response_digest(
+            &host_request.intent.request_digest,
+            &prior.host_owner_epoch,
+            &prior.host_process_identity,
+            &prior.marker,
+        )
+        .map_err(|_| PortError::IdentityConflict)?;
+        if expected != absence_digest {
+            return Err(PortError::IdentityConflict);
+        }
+        // s33.3 (#1313): a delete acknowledgement without a typed
+        // absence snapshot cannot pass the strict rollback gate
+        // (`validate()` requires os/credential/package). Preserve the
+        // admitted credential snapshot verbatim when the rollback
+        // request already carries it (fixed inspect followed by
+        // reconcile). Otherwise independently re-observe absence now
+        // through an `Inspect` Host call and bind its snapshot via
+        // `with_credential_snapshot` — never fabricated from the plan.
+        // The delete digest stays in evidence alongside the fresh
+        // absent digest so both the authenticated delete and the
+        // re-observed absence are bound. Any non-absent re-readback
+        // fails closed.
+        if request.precondition.credential_snapshot.is_some() {
+            return Ok(InstallationEffectObservation::Absent {
+                observed_precondition: request.precondition.clone(),
+                evidence: vec![absence_digest],
+                service_runtime_lineage: None,
+            });
+        }
+        let inspect_request = Self::host_credential_request(
+            request,
+            HostCredentialControlOperation::Inspect,
+            Vec::new(),
+        )?;
+        match self.call_credential_host(&inspect_request)? {
+            HostCredentialControlResponse::Absent {
+                snapshot,
+                response_digest,
+            } => {
+                if response_digest
+                    != credential_absent_response_digest(
+                        &inspect_request.intent.request_digest,
+                        &snapshot,
+                    )
+                    .map_err(|_| PortError::IdentityConflict)?
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                Ok(InstallationEffectObservation::Absent {
+                    observed_precondition: request
+                        .precondition
+                        .with_credential_snapshot(snapshot)
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    evidence: vec![absence_digest, response_digest],
+                    service_runtime_lineage: None,
+                })
+            }
+            _ => Err(PortError::IdentityConflict),
         }
     }
 
@@ -6958,16 +6972,16 @@ fn installer_root_reconcile_error(
     request: &InstallationEffectRequest,
     error: InstallerRootError,
 ) -> PortError {
-    if let InstallerRootError::Win32 { stage, code } = error {
-        if let Ok(reference) = installer_root_unknown_reference(request, stage, code) {
-            return PortError::ProviderReference {
-                error: ProviderError {
-                    code: ProviderErrorCode::Failed,
-                    retryable: false,
-                },
-                reference,
-            };
-        }
+    if let InstallerRootError::Win32 { stage, code } = error
+        && let Ok(reference) = installer_root_unknown_reference(request, stage, code)
+    {
+        return PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference,
+        };
     }
     root_port_error(error)
 }
