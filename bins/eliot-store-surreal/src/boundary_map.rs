@@ -429,7 +429,8 @@ impl StoreBoundaryMap {
             let holders = self.contours_holding(role);
             if holders.len() != 1 {
                 return Err(format!(
-                    "boundary map must name exactly one holder of the {role:?} credential, found {}",
+                    "boundary map must name exactly one holder of the {role:?} credential, \
+                     found {}",
                     holders.len()
                 ));
             }
