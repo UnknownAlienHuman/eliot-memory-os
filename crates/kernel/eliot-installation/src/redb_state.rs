@@ -27,7 +27,8 @@ use super::canary_removal::{
 use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
-    InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
+    InstallationError, InstallationRoots, InstallationStage, InstallationStepOutcome,
+    InstallationTransaction,
     InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest, SetupBinding,
     SetupMilestone, SetupStatus, decode_installation_transaction_json_from_store, handle,
     runtime_sha256_handle,
@@ -519,6 +520,8 @@ pub struct SourceBundlePublicationJournal {
     pub parent_identity: FileIdentity,
     /// Candidate generation identity.
     pub generation: PlatformHandle,
+    /// Exact I3.1 root binding used to materialize this source bundle.
+    pub profile_governed_roots: InstallationRoots,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
     /// Complete twelve-role artifact evidence digest.
@@ -569,7 +572,7 @@ pub struct SourceBundlePublicationRole {
 }
 
 /// Current source-bundle publication journal wire version.
-pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 3;
+pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 4;
 
 /// Derive the stable operation key for one exact source-bundle publication.
 pub fn source_bundle_publication_operation_id(
@@ -899,8 +902,14 @@ impl RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v25 state"
                         .to_owned(),
+            });
+        }
+        if transaction.profile_governed_roots.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "planned transaction cannot be persisted without its retained I3.1 profile-root binding"
+                    .to_owned(),
             });
         }
         let path = path.as_ref();
@@ -2368,8 +2377,14 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v25 state"
                         .to_owned(),
+            });
+        }
+        if transaction.profile_governed_roots.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "planned transaction cannot be persisted without its retained I3.1 profile-root binding"
+                    .to_owned(),
             });
         }
         require_publication_for_stage_package(self, transaction)?;
@@ -2597,6 +2612,12 @@ fn validate_publication_journal(
             reason: "invalid publication journal identity or path".to_owned(),
         });
     }
+    journal.profile_governed_roots.validate(
+        journal
+            .profile_governed_roots
+            .runtime_state_roots
+            .profile,
+    )?;
     for (value, field) in [
         (&journal.operation_id, "publication.operation_id"),
         (&journal.transaction_id, "publication.transaction_id"),
@@ -3057,6 +3078,7 @@ fn publication_journal_identity_matches(
         && left.temporary_name == right.temporary_name
         && left.parent_identity == right.parent_identity
         && left.generation == right.generation
+        && left.profile_governed_roots == right.profile_governed_roots
         && left.manifest_digest == right.manifest_digest
         && left.evidence_digest == right.evidence_digest
         && left.precommit_digest == right.precommit_digest
@@ -3229,17 +3251,18 @@ fn decode_publication_journal(
     let journal_wire = journal_value
         .and_then(|journal| journal.get("wire_version"))
         .and_then(serde_json::Value::as_u64);
-    let has_v3_restart_authority = journal_value.is_some_and(|journal| {
+    let has_v4_profile_and_restart_authority = journal_value.is_some_and(|journal| {
         journal.get("temporary_path").is_some()
             && journal.get("temporary_name").is_some()
             && journal.get("parent_identity").is_some()
+            && journal.get("profile_governed_roots").is_some()
     });
     if envelope_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
         || journal_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
-        || !has_v3_restart_authority
+        || !has_v4_profile_and_restart_authority
     {
         return Err(InstallationError::MigrationRequired {
-            reason: "source publication journal predates the mandatory v3 temporary publication authority"
+            reason: "source publication journal predates the mandatory v4 I3.1 binding and temporary publication authority"
                 .to_owned(),
         });
     }
@@ -3313,6 +3336,7 @@ pub fn require_published_source_bundle_journal(
         || journal.output_bundle != output
         || journal.transaction_id != transaction.transaction_id
         || journal.generation != *generation
+        || transaction.profile_governed_roots.as_ref() != Some(&journal.profile_governed_roots)
         || journal.manifest_digest.as_str() != manifest.canonical_digest()
         || journal.evidence_digest
             != GenerationPackagePlanner::artifact_set_evidence_digest(manifest, expected)?
@@ -3455,6 +3479,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use crate::{InstallationProfile, RuntimeStateRoots};
 
     const LEGACY_TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
         TableDefinition::new("installation_transactions_v2");
@@ -3468,6 +3493,26 @@ mod tests {
             "eliot-installation-transaction-{name}-{}.redb",
             std::process::id()
         ))
+    }
+
+    fn publication_profile_binding() -> InstallationRoots {
+        let profile_root = PlatformHandle::new(r"C:\eliot-publication-fixture")
+            .expect("fixture profile root");
+        let runtime_state_roots = RuntimeStateRoots::derived(
+            InstallationProfile::PortableDev,
+            profile_root.clone(),
+            profile_root,
+        )
+        .expect("fixture runtime roots");
+        InstallationRoots::new(
+            InstallationProfile::PortableDev,
+            r"C:\eliot-publication-fixture\target\eliot-dev\generation-fixture",
+            r"C:\eliot-publication-fixture\.eliot-dev\state",
+            r"C:\eliot-publication-fixture\.eliot-dev\config",
+            r"C:\eliot-publication-fixture\.eliot-dev\cache",
+            runtime_state_roots,
+        )
+        .expect("fixture I3.1 profile binding")
     }
 
     #[expect(
@@ -3591,6 +3636,7 @@ mod tests {
                 file_index: 303,
             },
             generation,
+            profile_governed_roots: publication_profile_binding(),
             manifest_digest: PlatformHandle::new(manifest.canonical_digest())
                 .expect("manifest digest"),
             evidence_digest,
@@ -3718,6 +3764,7 @@ mod tests {
             temporary_name: publication.temporary_name().to_owned(),
             parent_identity: publication.parent_identity(),
             generation,
+            profile_governed_roots: publication_profile_binding(),
             manifest_digest: PlatformHandle::new(manifest.canonical_digest()).expect("manifest"),
             evidence_digest,
             precommit_digest,

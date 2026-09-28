@@ -79,8 +79,8 @@ fn required_anchor(
 /// The I3.1 root set resolved for one explicitly selected profile.
 ///
 /// `user_cache` is the sibling root of `user_config` where I3.1 publishes the
-/// `config|cache` pair; for `system_service`, whose user root is a single
-/// `%LocalAppData%\Eliot`, both name that same root.
+/// `config|cache` pair for `user_mode` and `portable_dev`. `system_service`
+/// retains its single `%LocalAppData%\Eliot` user root in both role fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileGovernedRoots {

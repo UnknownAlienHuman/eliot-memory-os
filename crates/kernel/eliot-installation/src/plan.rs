@@ -58,6 +58,12 @@ pub enum InstallerEffectPlan {
         manifest: PackageManifest,
         /// Destination root for the immutable generation.
         staging_root: PlatformHandle,
+        /// Exact selected I3.1 immutable-binaries destination. When present,
+        /// this is the final generation directory itself; logical `generation`
+        /// remains a separate manifest identity and is never appended to this
+        /// path.
+        #[serde(default)]
+        destination_root: Option<PlatformHandle>,
         /// Expected file bytes bound to the candidate artifact set.
         expected_file_digests: Vec<PackageArtifactDigest>,
         /// Digest of the complete candidate manifest, including runtime argv.
@@ -176,6 +182,7 @@ impl InstallerEffectPlan {
                 generation,
                 manifest,
                 staging_root,
+                destination_root,
                 expected_file_digests,
                 candidate_manifest_digest,
                 package_manifest_digest,
@@ -183,6 +190,9 @@ impl InstallerEffectPlan {
             } => {
                 approved_path(source_bundle, "installer_effect.source_bundle")?;
                 approved_path(staging_root, "installer_effect.staging_root")?;
+                if let Some(destination_root) = destination_root {
+                    approved_path(destination_root, "installer_effect.destination_root")?;
+                }
                 handle(generation, "installer_effect.generation")?;
                 if source_bundle_identity.volume_serial_number == 0
                     || source_bundle_identity.file_index == 0

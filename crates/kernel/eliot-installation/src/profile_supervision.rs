@@ -1,4 +1,4 @@
-//! Profile supervision composition and unprivileged-selection proof (I3.1).
+//! Profile supervision composition and no-service-authority proof (I3.1).
 //!
 //! I3.1 states that the installation profile "determines both process
 //! supervision and writable roots", and that a `user_mode` installation
@@ -9,15 +9,13 @@
 //! supervision for the selected profile, the guarantees that profile
 //! actually enforces, the guarantees it does not, and a structural proof
 //! that a non-`system_service` selection carries no SCM, administrative or
-//! `ProgramData` dependency.
+//! `ProgramData`-anchor dependency.
 //!
-//! The proof is structural, not textual. It re-reads the OS-proved
-//! `ProgramData` contour through the Windows adapter, compares it with
-//! [`WindowsPathIdentity`] component containment against every resolved and
-//! every retained root, and requires the selected profile to be one that
-//! claims no administrative authority. A profile that merely *says* it is
-//! unprivileged is refused; only a layout that is provably outside the
-//! service contour passes.
+//! The proof is structural, not textual. It revalidates the selected
+//! current-user or repository anchor, compares each resolved I3.1 role to its
+//! exact profile layout, and requires the profile to claim neither SCM
+//! supervision nor administrative authority. Non-service selection does not
+//! query, receive, or depend on a ProgramData anchor.
 //!
 //! Normative basis: I3.1 (exact layouts, default profile, supervision, and
 //! owner/session binding). This module resolves no new root and mints no
@@ -30,7 +28,10 @@ use serde::{Deserialize, Serialize};
 
 use super::profile_governed_roots::ProfileGovernedRoots;
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
-use super::{InstallationError, PlatformHandle, WindowsPathIdentity, protected_program_data_root};
+use super::{
+    InstallationError, PlatformHandle, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
+    joined_windows_path, text,
+};
 
 /// The supervision path a selected profile is intended to use.
 ///
@@ -88,21 +89,25 @@ pub struct ProfileGovernanceReport {
     pub unsupported_guarantees: Vec<String>,
 }
 
-/// Evidence that the selected profile depends on no service-only authority.
+/// Evidence that the selected profile depends on no service-profile authority.
 ///
 /// The fields are the structural facts the proof established, retained so a
 /// caller can report what was proved rather than re-deriving it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UnprivilegedSelectionProof {
-    /// Profile that was proved unprivileged.
+pub struct NoServiceProfileAuthorityProof {
+    /// Profile whose service-only dependencies were checked.
     pub profile: InstallationProfile,
+    /// Whether the selected profile requires SCM supervision. Always `false`.
+    pub selects_scm_supervision: bool,
     /// Whether the selected profile claims administrative authority. Always
     /// `false` for a value this type can exist for.
     pub requires_admin: bool,
-    /// Number of root roles and retained runtime roots compared against the
-    /// OS-proved service contours.
-    pub compared_roots: u32,
+    /// Whether selection requires an OS-known ProgramData anchor. Always
+    /// `false` for a value this type can exist for.
+    pub requires_program_data_anchor: bool,
+    /// Number of I3.1 root roles whose exact profile layout was verified.
+    pub verified_root_roles: u32,
 }
 
 /// Returns the supervision path I3.1 names for `profile`.
@@ -209,85 +214,130 @@ impl ProfileGovernedRoots {
     }
 }
 
-/// Proves that a resolved selection depends on no service-only authority.
+/// Proves that a resolved selection depends on no service-profile authority.
 ///
 /// The proof is refused for `system_service`, whose supervision path *is* the
 /// SCM. For every other profile it establishes, structurally:
 ///
-/// 1. the selected profile claims no administrative installation authority;
-/// 2. no resolved root role lies under the OS-proved `ProgramData` contour;
-/// 3. no retained runtime root — the profile anchor, the installation root, or
-///    any of the fixed runtime root roles — lies under that contour either.
+/// 1. the selected current-user or repository anchor is revalidated through
+///    the existing OS adapter;
+/// 2. all four I3.1 root roles exactly match the layout derived from that
+///    anchor; and
+/// 3. the profile does not claim SCM supervision or administrative authority.
 ///
-/// The `ProgramData` contour is read from the Windows adapter, so a caller
-/// cannot satisfy this proof by passing a convenient path.
+/// This proof does not claim lexical exclusion from a hypothetical
+/// ProgramData path. Non-service selection receives no ProgramData anchor and
+/// makes no ProgramData known-folder query.
 ///
 /// # Errors
 ///
 /// Returns [`InstallationError::ProfileViolation`] when the profile claims
-/// administrative authority or when any compared root lies inside the service
-/// `ProgramData` contour, and [`InstallationError::InvalidField`] when a
-/// compared root is not a usable absolute path.
-pub fn prove_unprivileged_selection(
+/// service authority or a root differs from its exact profile layout,
+/// [`InstallationError::InvalidField`] when a selected root is not a usable
+/// absolute path, and [`InstallationError::Platform`] when OS anchor
+/// revalidation fails.
+pub fn prove_no_service_profile_authority_dependency(
     governed: &ProfileGovernedRoots,
     runtime_state_roots: &RuntimeStateRoots,
-) -> Result<UnprivilegedSelectionProof, InstallationError> {
+    component: &str,
+    version: &str,
+    generation: Option<&str>,
+) -> Result<NoServiceProfileAuthorityProof, InstallationError> {
     if governed.profile.requires_admin() {
         return Err(InstallationError::ProfileViolation(format!(
             "{:?} supervision depends on SCM and administrative service rights",
             governed.profile
         )));
     }
-    let program_data = protected_program_data_root().map_err(|error| {
-        InstallationError::Platform(format!("service ProgramData contour is unproved: {error}"))
-    })?;
-    let program_data_text = program_data.to_string_lossy().into_owned();
-    let program_data = WindowsPathIdentity::parse_root(&program_data_text, "program_data")?;
-
-    let mut compared: Vec<(&'static str, PlatformHandle)> = Vec::with_capacity(13);
-    for (field, value) in [
-        ("immutable_binaries", &governed.immutable_binaries),
-        ("durable_data", &governed.durable_data),
-        ("user_config", &governed.user_config),
-        ("user_cache", &governed.user_cache),
-    ] {
-        compared.push((
-            field,
-            PlatformHandle::new((*value).clone()).map_err(|error| {
-                InstallationError::InvalidField {
-                    field: (*field).to_owned(),
-                    reason: error.to_string(),
-                }
-            })?,
+    if runtime_state_roots.profile != governed.profile {
+        return Err(InstallationError::ProfileViolation(
+            "profile selection and runtime roots disagree".to_owned(),
         ));
     }
-    compared.push((
-        "profile_anchor_root",
-        runtime_state_roots.profile_anchor_root.clone(),
-    ));
-    compared.push((
-        "installation_root",
-        runtime_state_roots.installation_root.clone(),
-    ));
-    for (field, root) in runtime_state_roots.root_fields() {
-        compared.push((field, root.clone()));
-    }
+    runtime_state_roots.validate()?;
+    let _anchor_proof = WindowsRuntimeRootLeaseProvider::for_roots(runtime_state_roots)?;
 
-    let mut compared_roots: u32 = 0;
-    for (field, candidate) in &compared {
-        compared_roots = compared_roots.saturating_add(1);
-        let identity = WindowsPathIdentity::parse_root(candidate.as_str(), field)?;
-        if program_data.contains(&identity) {
+    let anchor = runtime_state_roots.profile_anchor_root.as_str();
+    let expected = match governed.profile {
+        InstallationProfile::SystemService => unreachable!("service profile rejected above"),
+        InstallationProfile::UserMode => {
+            text(component, "profile_component")?;
+            text(version, "profile_version")?;
+            [
+                (
+                    "immutable_binaries",
+                    joined_windows_path(
+                        &joined_windows_path(
+                            &joined_windows_path(
+                                &joined_windows_path(anchor, "Programs"),
+                                "Eliot",
+                            ),
+                            component,
+                        ),
+                        version,
+                    ),
+                ),
+                (
+                    "durable_data",
+                    joined_windows_path(&joined_windows_path(anchor, "Eliot"), "data"),
+                ),
+                (
+                    "user_config",
+                    joined_windows_path(&joined_windows_path(anchor, "Eliot"), "config"),
+                ),
+                (
+                    "user_cache",
+                    joined_windows_path(&joined_windows_path(anchor, "Eliot"), "cache"),
+                ),
+            ]
+        }
+        InstallationProfile::PortableDev => {
+            let generation = generation.ok_or_else(|| {
+                InstallationError::ProfileViolation(
+                    "portable_dev root proof requires its selected generation identity".to_owned(),
+                )
+            })?;
+            text(generation, "profile_generation")?;
+            let state = joined_windows_path(anchor, ".eliot-dev");
+            [
+                (
+                    "immutable_binaries",
+                    joined_windows_path(
+                        &joined_windows_path(anchor, "target\\eliot-dev"),
+                        generation,
+                    ),
+                ),
+                ("durable_data", joined_windows_path(&state, "state")),
+                ("user_config", joined_windows_path(&state, "config")),
+                ("user_cache", joined_windows_path(&state, "cache")),
+            ]
+        }
+    };
+    let actual = [
+        ("immutable_binaries", governed.immutable_binaries.as_str()),
+        ("durable_data", governed.durable_data.as_str()),
+        ("user_config", governed.user_config.as_str()),
+        ("user_cache", governed.user_cache.as_str()),
+    ];
+    for ((expected_field, expected_path), (actual_field, actual_path)) in
+        expected.into_iter().zip(actual)
+    {
+        if expected_field != actual_field
+            || WindowsPathIdentity::parse_root(&expected_path, expected_field)?
+                != WindowsPathIdentity::parse_root(actual_path, actual_field)?
+        {
             return Err(InstallationError::ProfileViolation(format!(
-                "{field} lies inside the system_service ProgramData contour; {:?} may not depend on it",
+                "{actual_field} differs from the exact {:?} root derived from its retained profile anchor",
                 governed.profile
             )));
         }
     }
 
-    Ok(UnprivilegedSelectionProof {
+    Ok(NoServiceProfileAuthorityProof {
         profile: governed.profile,
+        selects_scm_supervision: false,
         requires_admin: false,
-        compared_roots,
+        requires_program_data_anchor: false,
+        verified_root_roles: 4,
     })
 }

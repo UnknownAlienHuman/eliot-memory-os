@@ -19,10 +19,10 @@ use crate::{
     PackageArtifactDigest, PlannedChange, ProfileGovernanceReport, ProfileRootAnchors,
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    SupervisionAuthorityProvisionPlan, UnprivilegedSelectionProof,
+    SupervisionAuthorityProvisionPlan, NoServiceProfileAuthorityProof,
     candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, provider_bootstrap_credential_target_for_store_target,
-    prove_unprivileged_selection, select_profile_roots,
+    prove_no_service_profile_authority_dependency, select_profile_roots,
     supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
@@ -338,11 +338,12 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order fourteen-file Phase-A inventory.  Each fact contains
-/// the validated relative path, executable bit, exact byte size, and lowercase
-/// SHA-256.  Source identities and other volatile filesystem observations are
-/// deliberately excluded; the retained-source and destination receipt gates
-/// bind those observations transitively to this immutable fact set.
+/// and the complete, fixed-order fourteen-file Phase-A inventory. Each fact
+/// contains the validated relative path, executable bit, exact byte size, and
+/// lowercase SHA-256. Source identities and other volatile filesystem
+/// observations are deliberately excluded; the retained-source and
+/// destination receipt gates bind those observations transitively to this
+/// immutable fact set.
 pub(crate) fn artifact_set_evidence_digest(
     manifest: &PackageManifest,
     expected: &[PackageArtifactDigest],
@@ -1126,10 +1127,11 @@ pub struct ProfileSelectionResolution {
     /// Selected profile, intended supervision and enforced/unsupported
     /// guarantees. Contains no key, secret or credential value.
     pub governance: ProfileGovernanceReport,
-    /// Evidence that a non-service selection depends on no service-only
-    /// authority. Always present, and always the proved fact rather than a
-    /// claim.
-    pub unprivileged_proof: UnprivilegedSelectionProof,
+    /// Evidence that a non-service selection does not require SCM,
+    /// administrative authority or a ProgramData anchor. `system_service`
+    /// uses SCM by definition, so it has no such proof; its requirements are
+    /// reported by the selected profile's governance report instead.
+    pub no_service_authority_proof: Option<NoServiceProfileAuthorityProof>,
 }
 
 /// The sole production package/transaction composition seam.
@@ -1138,9 +1140,10 @@ pub struct GenerationPackagePlanner;
 impl GenerationPackagePlanner {
     /// Computes the canonical full fourteen-role artifact evidence reference.
     ///
-    /// This associated wrapper is the single public entry point for producers
-    /// that materialize the retained source bundle before invoking
-    /// [`Self::plan_with_source_publication_binding`].
+    /// This associated wrapper is the public entry point for producers that
+    /// need the fixed-order inventory digest. Production planning separately
+    /// consumes the retained source publication through
+    /// [`Self::plan_with_published_profile_binding`].
     pub fn artifact_set_evidence_digest(
         manifest: &PackageManifest,
         expected: &[PackageArtifactDigest],
@@ -1161,18 +1164,23 @@ impl GenerationPackagePlanner {
 
     /// Build a fresh self-observed binding solely for same-crate planner
     /// fixtures. Production callers must present the materializer publication
-    /// proof through [`Self::plan_with_source_publication_binding`].
+    /// proof and exact resolved profile binding through
+    /// [`Self::plan_with_published_profile_binding`].
     #[cfg(test)]
     pub(crate) fn plan_unbound_for_test(
         input: GenerationPackagePlanInput,
     ) -> Result<InstallationTransaction, InstallationError> {
         let publication_binding = test_source_publication_binding(&input)?;
-        Self::plan_with_binding(input, &publication_binding, false)
+        let selection = Self::test_profile_selection(&input)?;
+        let resolution = Self::resolve_profile_selection(&selection)?;
+        Self::plan_with_binding(input, &publication_binding, false, &selection, &resolution)
     }
 
-    /// Plan from a source directory whose exact materializer publication facts
-    /// must match the planner's fresh retained observation.  The binding is
-    /// consumed in memory and is not a transaction-wire field.
+    /// Test-only planner seam: compare publication facts with a fresh retained
+    /// observation. Production callers use
+    /// [`Self::plan_with_published_profile_binding`] so the retained I3.1 root
+    /// selection is required at the same boundary.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn plan_with_source_publication_binding(
         input: GenerationPackagePlanInput,
         source_identity: FileIdentity,
@@ -1184,10 +1192,71 @@ impl GenerationPackagePlanner {
             files,
             evidence_digest,
         };
-        Self::plan_with_binding(input, &publication_binding, true)
+        let selection = Self::test_profile_selection(&input)?;
+        let resolution = Self::resolve_profile_selection(&selection)?;
+        Self::plan_with_binding(input, &publication_binding, true, &selection, &resolution)
     }
 
-    /// Plan through the I3.1 profile-governed root selector before effects.
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_profile_selection(
+        input: &GenerationPackagePlanInput,
+    ) -> Result<ProfileSelectionInput, InstallationError> {
+        let fixed_test_anchor = |value: &str, field: &str| {
+            PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: error.to_string(),
+            })
+        };
+        let local_app_data = match input.profile {
+            InstallationProfile::UserMode => input.profile_anchor_root.clone(),
+            InstallationProfile::SystemService | InstallationProfile::PortableDev => {
+                fixed_test_anchor(
+                    r"C:\Users\eliot-profile-test\AppData\Local",
+                    "test_profile_selection.local_app_data",
+                )?
+            }
+        };
+        let (program_files, program_data, repository_root) = match input.profile {
+            InstallationProfile::SystemService => (
+                Some(fixed_test_anchor(
+                    r"C:\Program Files",
+                    "test_profile_selection.program_files",
+                )?),
+                Some(input.profile_anchor_root.clone()),
+                None,
+            ),
+            InstallationProfile::UserMode => (
+                None,
+                None,
+                None,
+            ),
+            InstallationProfile::PortableDev => (
+                None,
+                None,
+                Some(input.profile_anchor_root.clone()),
+            ),
+        };
+        Ok(ProfileSelectionInput {
+            profile: input.profile,
+            anchors: ProfileRootAnchors {
+                program_files,
+                program_data,
+                local_app_data,
+                repository_root,
+            },
+            profile_anchor_root: input.profile_anchor_root.clone(),
+            installation_key: input.installation_key.clone(),
+            component: "eliot-tests".to_owned(),
+            version: "0.0.0-test".to_owned(),
+            generation: (input.profile == InstallationProfile::PortableDev)
+                .then(|| input.generation.as_str().to_owned()),
+            source_root: input.source_root.clone(),
+            staging_root: input.staging_root.clone(),
+        })
+    }
+
+    /// Test-support-only planner seam that resolves I3.1 roots without a
+    /// retained source-publication root binding.
     ///
     /// The selector resolves the exact root row for the explicitly selected
     /// profile from the caller-supplied OS-proved anchors, and the complete
@@ -1198,16 +1267,17 @@ impl GenerationPackagePlanner {
     /// binaries are refused here, before any effect is derived. Planning stays
     /// read-only: nothing is created, reserved or mutated.
     ///
-    /// The returned binding is the versioned layout the registry store
-    /// persists with the transaction and restart recovery rehydrates and
-    /// revalidates; threading it through the out-of-crate runtime consumers
-    /// and launch owners is stitching work owned by those consumers.
+    /// Production planning must use
+    /// [`Self::plan_with_published_profile_binding`], which compares this
+    /// independently resolved layout with the root binding retained by source
+    /// publication before deriving transaction effects.
     ///
     /// # Errors
     ///
     /// Returns [`InstallationError::ProfileViolation`] for an invalid profile,
     /// a missing or ambiguous anchor, a conflicting binding, or a planned
     /// write into the versioned immutable binaries root.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn plan_with_profile_governed_roots(
         input: GenerationPackagePlanInput,
         selection: &ProfileRootSelectionInput,
@@ -1219,7 +1289,7 @@ impl GenerationPackagePlanner {
         // guards, and — for a non-service profile — the structural proof that
         // the selection carries no SCM, administrative or `ProgramData`
         // dependency.
-        let resolution = Self::resolve_profile_selection(&ProfileSelectionInput {
+        let profile_selection = ProfileSelectionInput {
             profile: input.profile,
             anchors: selection.anchors.clone(),
             profile_anchor_root: input.profile_anchor_root.clone(),
@@ -1229,25 +1299,72 @@ impl GenerationPackagePlanner {
             generation: selection.generation.clone(),
             source_root: input.source_root.clone(),
             staging_root: input.staging_root.clone(),
-        })?;
-        let mut transaction = Self::plan_with_source_publication_binding(
-            input,
+        };
+        let resolution = Self::resolve_profile_selection(&profile_selection)?;
+        let publication_binding = SourceBundlePublicationBinding {
             source_identity,
             files,
             evidence_digest,
+        };
+        let transaction = Self::plan_with_binding(
+            input,
+            &publication_binding,
+            true,
+            &profile_selection,
+            &resolution,
         )?;
-        transaction.profile_governed_roots = Some(resolution.roots.clone());
-        transaction.validate()?;
         Ok((transaction, resolution.roots))
+    }
+
+    /// Plan from the exact I3.1 root binding retained by source publication.
+    ///
+    /// The explicit selection is independently resolved and compared with the
+    /// durable publication binding before the transaction can be constructed.
+    /// The matched publication binding, rather than a newly inferred layout,
+    /// is written to the transaction wire for registry persistence and restart
+    /// revalidation.
+    pub fn plan_with_published_profile_binding(
+        input: GenerationPackagePlanInput,
+        selection: &ProfileSelectionInput,
+        published_roots: InstallationRoots,
+        source_identity: FileIdentity,
+        files: Vec<PackageArtifactDigest>,
+        evidence_digest: PlatformHandle,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        if input.profile != selection.profile
+            || input.profile_anchor_root != selection.profile_anchor_root
+            || input.installation_key != selection.installation_key
+            || input.source_root != selection.source_root
+            || input.staging_root != selection.staging_root
+            || (input.profile == InstallationProfile::PortableDev
+                && selection.generation.as_deref() != Some(input.generation.as_str()))
+        {
+            return Err(InstallationError::ProfileViolation(
+                "package plan inputs differ from the retained profile selection".to_owned(),
+            ));
+        }
+        let resolution = Self::resolve_profile_selection(selection)?;
+        if resolution.roots != published_roots {
+            return Err(InstallationError::ProfileViolation(
+                "source publication profile binding differs from the resolved I3.1 selection"
+                    .to_owned(),
+            ));
+        }
+        let publication_binding = SourceBundlePublicationBinding {
+            source_identity,
+            files,
+            evidence_digest,
+        };
+        Self::plan_with_binding(input, &publication_binding, true, selection, &resolution)
     }
 
     /// Resolves the I3.1 selection for one explicit profile, read-only.
     ///
     /// This is the single place the selected profile's roots, supervision
     /// path, honest guarantee report and unprivileged-dependency proof are
-    /// produced, and it is the same resolution
-    /// [`Self::plan_with_profile_governed_roots`] performs before it derives
-    /// any effect. It is exposed so a caller can inspect exactly what a
+    /// produced; production planning invokes it and compares its result with
+    /// the root binding retained by source publication before deriving an
+    /// effect. It is exposed so a caller can inspect exactly what a
     /// profile governs before asking for a plan. Nothing here creates a root,
     /// reserves a service, or mutates durable state: an invalid profile, a
     /// missing or ambiguous anchor, a write into the versioned immutable
@@ -1262,6 +1379,11 @@ impl GenerationPackagePlanner {
     pub fn resolve_profile_selection(
         selection: &ProfileSelectionInput,
     ) -> Result<ProfileSelectionResolution, InstallationError> {
+        if !selection.profile.requires_admin() && selection.anchors.program_data.is_some() {
+            return Err(InstallationError::ProfileViolation(
+                "non-service profile selection must not receive a ProgramData anchor".to_owned(),
+            ));
+        }
         let governed = select_profile_roots(
             selection.profile,
             selection.component.as_str(),
@@ -1295,13 +1417,23 @@ impl GenerationPackagePlanner {
             }
         };
         let runtime_state_roots = runtime_state_roots?;
-        let unprivileged_proof = prove_unprivileged_selection(&governed, &runtime_state_roots)?;
+        let no_service_authority_proof = if governed.profile.requires_admin() {
+            None
+        } else {
+            Some(prove_no_service_profile_authority_dependency(
+                &governed,
+                &runtime_state_roots,
+                selection.component.as_str(),
+                selection.version.as_str(),
+                selection.generation.as_deref(),
+            )?)
+        };
         let governance = governed.governance_report();
         let roots = governed.into_installation_roots(runtime_state_roots)?;
         Ok(ProfileSelectionResolution {
             roots,
             governance,
-            unprivileged_proof,
+            no_service_authority_proof,
         })
     }
 
@@ -1353,7 +1485,22 @@ impl GenerationPackagePlanner {
         input: GenerationPackagePlanInput,
         publication_binding: &SourceBundlePublicationBinding,
         enforce_store_config: bool,
+        profile_selection: &ProfileSelectionInput,
+        profile_resolution: &ProfileSelectionResolution,
     ) -> Result<InstallationTransaction, InstallationError> {
+        if input.profile != profile_selection.profile
+            || input.profile_anchor_root != profile_selection.profile_anchor_root
+            || input.installation_key != profile_selection.installation_key
+            || input.source_root != profile_selection.source_root
+            || input.staging_root != profile_selection.staging_root
+            || (input.profile == InstallationProfile::PortableDev
+                && profile_selection.generation.as_deref() != Some(input.generation.as_str()))
+        {
+            return Err(InstallationError::ProfileViolation(
+                "package plan inputs differ from the resolved I3.1 profile selection".to_owned(),
+            ));
+        }
+        profile_resolution.roots.validate(input.profile)?;
         handle(&input.transaction_id, "generation.transaction_id")?;
         input.installation_epoch.validate()?;
         approved_path(&input.profile_anchor_root, "generation.profile_anchor_root")?;
@@ -1378,6 +1525,12 @@ impl GenerationPackagePlanner {
         }
 
         let roots = Self::planner_runtime_roots(&input)?;
+        if roots != profile_resolution.roots.runtime_state_roots {
+            return Err(InstallationError::ProfileViolation(
+                "resolved I3.1 binding differs from the planner runtime-root projection"
+                    .to_owned(),
+            ));
+        }
         if let Some(expected_staging_root) = roots.expected_staging_root()?
             && !crate::same_windows_root(
                 input.staging_root.as_str(),
@@ -1429,8 +1582,7 @@ impl GenerationPackagePlanner {
                 lease,
                 validate_source_store_config(
                     &bytes,
-                    &Path::new(input.staging_root.as_str())
-                        .join(input.generation.as_str())
+                    Path::new(&profile_resolution.roots.immutable_binaries)
                         .join("generation.json"),
                 )?,
             ))
@@ -1453,8 +1605,14 @@ impl GenerationPackagePlanner {
         let package_manifest = PackageManifest::new(input.generation.as_str(), files)
             .map_err(|error| package_plan_error(&error))?;
 
-        let generation_root =
-            Path::new(input.staging_root.as_str()).join(input.generation.as_str());
+        let destination_root = PlatformHandle::new(
+            profile_resolution.roots.immutable_binaries.clone(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "generation.destination_root".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let generation_root = PathBuf::from(destination_root.as_str());
         let destination = |name: &str| {
             PlatformHandle::new(generation_root.join(name).to_string_lossy().into_owned()).map_err(
                 |error| InstallationError::InvalidField {
@@ -1718,6 +1876,20 @@ impl GenerationPackagePlanner {
         ])?;
         let launch = RuntimeLaunchDescriptor {
             profile: input.profile,
+            profile_component: PlatformHandle::new(profile_selection.component.clone()).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.profile_component".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?,
+            profile_version: PlatformHandle::new(profile_selection.version.clone()).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.profile_version".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?,
+            profile_installation_key: profile_selection.installation_key.clone(),
+            profile_governed_roots: profile_resolution.roots.clone(),
             portable_root: (input.profile == InstallationProfile::PortableDev)
                 .then(|| input.profile_anchor_root.clone()),
             installation_epoch: input.installation_epoch.clone(),
@@ -1908,6 +2080,7 @@ impl GenerationPackagePlanner {
             generation: input.generation.clone(),
             manifest: package_manifest,
             staging_root: input.staging_root.clone(),
+            destination_root: Some(destination_root.clone()),
             expected_file_digests,
             candidate_manifest_digest: candidate_manifest_digest.clone(),
             package_manifest_digest,
@@ -2117,7 +2290,14 @@ impl GenerationPackagePlanner {
                 let target = match effect {
                     InstallerEffectPlan::CreateRoot { root, .. }
                     | InstallerEffectPlan::ApplyAcl { root, .. } => root.clone(),
-                    InstallerEffectPlan::StagePackage { staging_root, .. } => staging_root.clone(),
+                    InstallerEffectPlan::StagePackage {
+                        staging_root,
+                        destination_root,
+                        ..
+                    } => destination_root
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| staging_root.clone()),
                     InstallerEffectPlan::RegisterService { service_name, .. }
                     | InstallerEffectPlan::StartService { service_name, .. } => {
                         service_name.clone()
@@ -2170,7 +2350,7 @@ impl GenerationPackagePlanner {
                 reason: error.to_string(),
             })?,
         ];
-        let transaction = InstallationTransaction::new(
+        let mut transaction = InstallationTransaction::new(
             input.transaction_id,
             input.installation_epoch,
             input.profile,
@@ -2184,6 +2364,8 @@ impl GenerationPackagePlanner {
             precondition_evidence,
             input.recovery_command,
         )?;
+        transaction.profile_governed_roots = Some(profile_resolution.roots.clone());
+        transaction.validate()?;
         if let Some((lease, config)) = source_store_config.as_ref() {
             if config.runtime_launch != transaction.candidate_manifest.runtime_launch {
                 return Err(InstallationError::IdentityConflict);
@@ -2561,6 +2743,7 @@ impl SealedPackagePlanner {
             generation: candidate_manifest.generation.clone(),
             manifest: manifest.clone(),
             staging_root: staging_root.clone(),
+            destination_root: None,
             expected_file_digests,
             candidate_manifest_digest,
             package_manifest_digest,
@@ -2606,7 +2789,11 @@ impl SealedPackagePlanner {
         planned_changes.extend_from_slice(&planned_changes_without_package[insert_idx..]);
 
         drop(source);
-        InstallationTransaction::new(
+        let profile_governed_roots = candidate_manifest
+            .runtime_launch
+            .profile_governed_roots
+            .clone();
+        let mut transaction = InstallationTransaction::new(
             transaction_id,
             installation_epoch,
             profile,
@@ -2619,7 +2806,10 @@ impl SealedPackagePlanner {
             minimum_store_available_bytes,
             precondition_evidence,
             recovery_command,
-        )
+        )?;
+        transaction.profile_governed_roots = Some(profile_governed_roots);
+        transaction.validate()?;
+        Ok(transaction)
     }
 
     /// Reopen the source bundle and revalidate the exact retained facts.
@@ -2811,11 +3001,41 @@ mod tests {
     ) -> CandidateManifest {
         let epoch = make_epoch();
         let kernel_artifact_digest = h("6".repeat(64));
+        let generation = h("candidate");
+        let profile_governed_roots = crate::InstallationRoots {
+            binding_version: crate::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: Path::new(portable_root.as_str())
+                .join("target")
+                .join("eliot-dev")
+                .join(generation.as_str())
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: Path::new(portable_root.as_str())
+                .join(".eliot-dev")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+            user_config: Path::new(portable_root.as_str())
+                .join(".eliot-dev")
+                .join("config")
+                .to_string_lossy()
+                .into_owned(),
+            user_cache: Path::new(portable_root.as_str())
+                .join(".eliot-dev")
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_state_roots: roots.clone(),
+        };
         let mut desc = crate::RuntimeLaunchDescriptor {
             profile: crate::InstallationProfile::PortableDev,
+            profile_component: h("eliot-tests"),
+            profile_version: h("0.0.0-test"),
+            profile_installation_key: None,
+            profile_governed_roots,
             portable_root: Some(portable_root.clone()),
             installation_epoch: epoch.clone(),
-            generation: h("candidate"),
+            generation: generation.clone(),
             authority_generation: eliot_contracts::ResourceGeneration::genesis(),
             authority_state_fence: eliot_contracts::StateFence::new(
                 planner_epoch(1),
@@ -2899,7 +3119,7 @@ mod tests {
             .collect();
         desc.descriptor_digest = h(crate::sha256_hex(&desc.unsigned_bytes().unwrap()));
         CandidateManifest {
-            generation: h("candidate"),
+            generation,
             components: vec![h("component:test")],
             kernel_artifact_digest,
             store_bridge_artifact_digest: h("1".repeat(64)),

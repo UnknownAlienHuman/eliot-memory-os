@@ -16,7 +16,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::sha256_hex;
 use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
-use eliot_installation::{CandidateManifest, InstallerServiceRole};
+use eliot_installation::{CandidateManifest, InstallationRoots, InstallerServiceRole};
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_runtime_contracts::{HealthDimension, SupervisionLeaseVerifier};
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,11 @@ pub struct RuntimeStatusReport {
     pub status: String,
     pub host_state_root: String,
     pub active_generation: Option<String>,
+    /// Persisted I3.1 roots from the validated active registry manifest.
+    /// This is absent when status could not validate an active generation;
+    /// it is never re-resolved from the current process environment.
+    #[serde(default)]
+    pub active_profile_governed_roots: Option<InstallationRoots>,
     pub last_known_good_generation: Option<String>,
     pub generations: Vec<String>,
     pub host_journal: HostJournalContour,
@@ -1740,13 +1745,17 @@ pub fn collect_status_with_observers(
     };
 
     let _keep_root_alive = retained_root;
+    let active_profile_governed_roots = active_manifest
+        .as_ref()
+        .map(|manifest| manifest.runtime_launch.profile_governed_roots.clone());
 
     Ok(RuntimeStatusReport {
         contract: "eliot.runtime.live".to_owned(),
-        contract_version: "1.1.0".to_owned(),
+        contract_version: "1.2.0".to_owned(),
         status: overall.to_owned(),
         host_state_root: canonical_path.to_string_lossy().into_owned(),
         active_generation: active_gen,
+        active_profile_governed_roots,
         last_known_good_generation: lkg_gen,
         generations,
         host_journal: journal_contour,
@@ -3015,6 +3024,38 @@ mod honest_tests {
         fixture_handle(root.join(name).to_string_lossy().into_owned())
     }
 
+    fn fixture_profile_roots(
+        portable_root: &Path,
+        generation: &str,
+        runtime_state_roots: &eliot_installation::RuntimeStateRoots,
+    ) -> eliot_installation::InstallationRoots {
+        eliot_installation::InstallationRoots {
+            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: portable_root
+                .join("target")
+                .join("eliot-dev")
+                .join(generation)
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: portable_root
+                .join(".eliot-dev")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+            user_config: portable_root
+                .join(".eliot-dev")
+                .join("config")
+                .to_string_lossy()
+                .into_owned(),
+            user_cache: portable_root
+                .join(".eliot-dev")
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_state_roots: runtime_state_roots.clone(),
+        }
+    }
+
     fn fixture_provisioned_supervision_authority(
         installation_id: &str,
         candidate_generation: &str,
@@ -3075,9 +3116,17 @@ mod honest_tests {
             lineage_id: fixture_handle("lineage:txn-stage-test"),
             sequence: 1,
         };
-        let generation = fixture_handle("generation:txn-stage-test");
+        let generation = fixture_handle("generation-txn-stage-test");
         let mut runtime_launch = eliot_installation::RuntimeLaunchDescriptor {
             profile: eliot_installation::InstallationProfile::PortableDev,
+            profile_component: fixture_handle("eliot"),
+            profile_version: fixture_handle("test-version"),
+            profile_installation_key: None,
+            profile_governed_roots: fixture_profile_roots(
+                &portable_root,
+                generation.as_str(),
+                &runtime_state_roots,
+            ),
             portable_root: Some(fixture_handle(portable_root.to_string_lossy().into_owned())),
             installation_epoch: installation_epoch.clone(),
             generation: generation.clone(),
@@ -3740,6 +3789,14 @@ mod store_currentness_production_tests {
     ) -> eliot_installation::RuntimeLaunchDescriptor {
         eliot_installation::RuntimeLaunchDescriptor {
             profile: eliot_installation::InstallationProfile::PortableDev,
+            profile_component: h("eliot"),
+            profile_version: h("test-version"),
+            profile_installation_key: None,
+            profile_governed_roots: fixture_profile_roots(
+                Path::new(portable),
+                "gen-1",
+                roots,
+            ),
             portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
             installation_epoch: eliot_installation::InstallationEpoch {
                 installation: h("install-1"),
@@ -4313,6 +4370,14 @@ mod live_production_observer_tests {
                 runtime_state_roots_digest: roots.roots_digest.clone(),
                 runtime_launch: eliot_installation::RuntimeLaunchDescriptor {
                     profile: eliot_installation::InstallationProfile::PortableDev,
+                    profile_component: h("eliot"),
+                    profile_version: h("test-version"),
+                    profile_installation_key: None,
+                    profile_governed_roots: fixture_profile_roots(
+                        Path::new(portable),
+                        "gen-1",
+                        roots,
+                    ),
                     portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
                     installation_epoch: eliot_installation::InstallationEpoch {
                         installation: h("install-1"),
