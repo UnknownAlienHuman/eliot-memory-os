@@ -9,6 +9,10 @@
 
 use super::*;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "completion semantics stay next to the dispatch that depends on them: derive, submit, fenced transition (#838)"
+)]
 pub(super) async fn dispatch_task_action_request(
     state: &McpState,
     context: AuthenticatedRequestContext,

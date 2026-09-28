@@ -2064,6 +2064,10 @@ impl McpDaemon {
         .transpose()?)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one non-rederived host-scope request contract: profile, session, plus 5 optional scope facets (#838)"
+    )]
     pub(crate) fn authoritative_host_scope(
         &self,
         profile: &str,

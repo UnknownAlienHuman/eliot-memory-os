@@ -3576,6 +3576,10 @@ fn managed_launch_observation_identity(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered grant chain stays whole: identities, contract, grant, bind, observations, persist (#838)"
+)]
 async fn grant_role_with_writer(
     root: &Path,
     store: &CanonicalStore,
