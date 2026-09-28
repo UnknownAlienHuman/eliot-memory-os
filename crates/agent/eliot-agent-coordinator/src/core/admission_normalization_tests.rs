@@ -377,6 +377,7 @@ fn admission_receipt(
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: proof_ref.to_owned(),
         durable_job_ref: "durable-job-normalization".to_owned(),
+        expires_at_unix_ms: u64::MAX,
         admitted_lanes,
     })
 }
