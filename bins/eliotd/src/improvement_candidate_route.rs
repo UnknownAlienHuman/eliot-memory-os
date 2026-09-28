@@ -205,10 +205,16 @@ pub fn reconcile_improvement_unknown(
 
 /// Returns whether one candidate disposition permits a retry attempt.
 ///
-/// Production caller of [`eliot_maintenance::improvement_retry_permitted`]. An
-/// unresolved external effect closes this gate because its owner has not
-/// settled what happened. A rejection, an inconclusive, a regression, a block,
-/// and a no-progress decision each carry their own owner and remedy instead.
+/// Production caller of [`eliot_maintenance::improvement_retry_permitted`]. The
+/// Governor gate it forwards to is exhaustive, so this wrapper inherits a
+/// decided answer for every disposition and re-decides none of them here. An
+/// unresolved external effect closes the gate because its owner has not settled
+/// what happened, and a retained historical completed-rollback value closes it
+/// too: the Governor pipeline holds no owner-validated rollback result, so a
+/// contract reference alone is not evidence that a rollback completed. A
+/// rejection, an inconclusive, a typed regression, a block, an exact repeat, and
+/// a bound advisory handoff each leave the gate open because each carries its
+/// own owner and remedy, and a fresh attempt is that owner's to make.
 #[must_use]
 pub fn improvement_candidate_retry_permitted(
     disposition: &eliot_maintenance::ImprovementTerminalDisposition,
