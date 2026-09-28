@@ -1182,6 +1182,9 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         // Every remaining class is a bounded-field, bound, conflict or
         // lifecycle refusal with no authority claim to mismatch against.
         OrsError::BridgeEventCapacityExceeded(_) => invalid_field("bridge_event_capacity"),
+        OrsError::BridgeRecoveryWindowCapacityExceeded => {
+            invalid_field("bridge_recovery_window_capacity")
+        }
         OrsError::UnsupportedContractVersion(_) => invalid_field("envelope_contract_version"),
         OrsError::PayloadTooLarge => invalid_field("payload_length"),
         OrsError::PayloadIntegrityMismatch => invalid_field("payload_integrity"),

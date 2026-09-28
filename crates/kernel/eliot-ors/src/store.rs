@@ -338,10 +338,6 @@ const BRIDGE_OWNER_LIST_SEQUENCE_KEY: &str = "bridge_owner_list_sequence";
 const BRIDGE_RECOVERY_WINDOW_SEQUENCE_KEY: &str = "bridge_recovery_window_sequence";
 const BRIDGE_RECOVERY_SOURCE_REVISION_KEY_PREFIX: &str = "bridge_recovery_source_revision::";
 const BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY: &str = "bridge_recovery_legacy_unproven_v1";
-/// Committed-and-acknowledged bridge-event rows retained per stream for
-/// duplicate suppression. Compaction evicts only acked rows older than this
-/// window; cursors are never evicted.
-const RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM: u64 = 512;
 /// Stored phase of a durably staged bridge event. The stage entry is the
 /// durable relation, so staging always persists `DURABLE`; `RECEIVED` is the
 /// pre-stage transport fact answered without a row.
@@ -1281,30 +1277,13 @@ impl persistence_codec::PersistedValue for BridgeEventGapRow {
 /// the Governor/coordinator intake; this row only proves the durable event
 /// reached the handoff and whether reconcile has covered it.
 ///
-/// Issue #2731 records the exact receiving-owner receipt on the reconciled
-/// transition: the consumed sequence the receiver presented, with the owner
-/// revision and incarnation that admitted it. That triple binds the
-/// stream/incarnation/event/content identity below to the receiving
-/// operation (the owner-checked consumed-frontier acceptance at that
-/// binding), so the later retirement transaction can validate the receiver
-/// evidence instead of trusting the bare `reconciled` string. It is custody
-/// acceptance — the receiver took the delivery obligation into its recovery
-/// scope — never an application claim: APPLIED, REJECTED and UNKNOWN stay
-/// owned downstream and are never minted or confused here. Rows reconciled
-/// before this evidence existed decode with empty fields and are treated as
-/// carrying no receiver evidence: they keep validating and keep serving
-/// reads, but they never become retirement-eligible on their old state
-/// string alone. Legacy ownerless rows never carry evidence at all.
-///
-/// Issue #1934 fixes the scope of the whole relation, because the reconcile
-/// transition is driven by the PRESENTING producer's own `consumed`
-/// frontier and joins no receiving Governor normalization or application
-/// receipt. What this row therefore records is a PERMITTED STAGING CURSOR:
-/// the store accepted the producer's custody receipt for the delivery. It is
-/// not the host/native cursor, whose advance requires the full I7.23 durable
-/// relation held by the receiving consumer. Nothing in this row may be
-/// consumed, replayed, or reported as evidence of downstream normalization
-/// or application.
+/// The reconciled transition stores the presenting stream owner's consumed
+/// frontier and owner revision/incarnation. It is producer-presented
+/// acknowledgement metadata, not proof that a receiving owner durably
+/// accepted this handoff or its remaining application obligation. Nothing in
+/// this row may be reported as evidence of downstream normalization or
+/// application. Until the receiving owner supplies a separately admitted
+/// terminal disposition, a reconciled row remains pending and cannot retire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventHandoffRow {
@@ -1325,18 +1304,18 @@ struct BridgeEventHandoffRow {
     /// stream namespace and are keyed by it.
     #[serde(default)]
     owner_namespace: String,
-    /// Consumed sequence the receiver presented when this handoff reconciled
-    /// (issue #2731, item 1): the receiving operation's durable-acceptance
-    /// frontier. Always covers `sequence`; zero means no receiver evidence
-    /// was recorded (legacy row).
+    /// Consumed sequence the presenting stream owner supplied when this
+    /// handoff reconciled. It records producer acknowledgement metadata and
+    /// is not a receiving-owner acceptance frontier. Zero means no reconcile
+    /// tuple was recorded (legacy row).
     #[serde(default)]
     reconcile_acked_sequence: u64,
-    /// Owner revision that admitted the reconciling presentation (issue
-    /// #2731, item 1). Zero means no receiver evidence was recorded.
+    /// Owner revision on the presenting stream owner's reconcile request.
+    /// Zero means no reconcile tuple was recorded.
     #[serde(default)]
     reconcile_owner_revision: u64,
-    /// Stream incarnation that admitted the reconciling presentation (issue
-    /// #2731, item 1). Zero means no receiver evidence was recorded.
+    /// Stream incarnation on the presenting stream owner's reconcile
+    /// request. Zero means no reconcile tuple was recorded.
     #[serde(default)]
     reconcile_owner_incarnation: u64,
 }
@@ -1373,7 +1352,7 @@ impl BridgeEventHandoffRow {
             {
                 return Err(OrsError::InvalidField {
                     field: "reconcile_key",
-                    reason: "an unreconciled handoff carries no reconcile receipt",
+                    reason: "an unreconciled handoff carries no reconcile tuple",
                 });
             }
         } else {
@@ -1384,12 +1363,10 @@ impl BridgeEventHandoffRow {
                     reason: "a reconciled handoff carries its reconcile time",
                 });
             }
-            // Receiver evidence (issue #2731, item 1) is all-or-nothing: a
-            // reconciled row either carries the full presented receipt
-            // (nonzero frontier covering its sequence with the admitting
-            // revision/incarnation) or none of it (a row reconciled before
-            // the receipt existed, which validates but never retires on its
-            // old state string alone). Partial evidence fails closed as
+            // Producer reconcile metadata is all-or-nothing: a reconciled
+            // row either carries the full presented tuple (nonzero frontier
+            // covering its sequence with the presenting owner's
+            // revision/incarnation) or none of it. Partial metadata fails closed as
             // corruption instead of retiring on a guess.
             let evidence_fields = [
                 self.reconcile_acked_sequence,
@@ -1411,41 +1388,21 @@ impl BridgeEventHandoffRow {
         Ok(())
     }
 
-    /// Checks the persisted reconcile tuple. Despite this helper's legacy
-    /// name, the tuple is recorded from the presenting producer's frontier
-    /// and owner snapshot; it is not proof of receiving-owner durable
-    /// acceptance. Ownerless rows and rows reconciled before the tuple existed
-    /// report false.
-    fn has_receiver_receipt(&self) -> bool {
-        self.state == BRIDGE_EVENT_HANDOFF_RECONCILED
-            && !self.owner_namespace.is_empty()
-            && self.sequence != 0
-            && self.reconcile_acked_sequence >= self.sequence
-            && self.reconcile_owner_revision != 0
-            && self.reconcile_owner_incarnation != 0
-    }
-
-    /// Reports the current eligibility decision (issue #2731). The existing
-    /// reconcile tuple is only producer-presented frontier/owner data, not a
-    /// receiver's durable receipt, so this predicate does not establish the
-    /// complete handoff terminal condition. This edit only rejects a
-    /// `handed_off` row without that tuple after producer acknowledgement and
-    /// compaction pass it. The pre-existing tuple-based path remains
-    /// unproven; the full receiving-owner disposition contract is unresolved.
-    fn retirement_eligible(&self, acked_cursor: u64, compacted_boundary: u64) -> bool {
-        if self.owner_namespace.is_empty() || self.sequence == 0 {
+    /// Reports whether the retained owner evidence permits retirement
+    /// (issue #2731). The row's reconcile tuple is producer-presented metadata,
+    /// not proof of receiving-owner durable acceptance or terminal disposition.
+    /// The current row contract has no receiver receipt, so reconciled rows
+    /// remain pending until that evidence is represented by this contract.
+    fn retirement_eligible(&self) -> bool {
+        if self.state != BRIDGE_EVENT_HANDOFF_RECONCILED
+            || self.owner_namespace.is_empty()
+            || self.sequence == 0
+        {
             return false;
         }
-        if self.has_receiver_receipt() && self.sequence <= acked_cursor {
-            return true;
-        }
-        if self.sequence > compacted_boundary {
-            return false;
-        }
-        if self.has_receiver_receipt() {
-            return true;
-        }
-        self.has_receiver_receipt()
+        // Row state and identity checks do not prove receiving-owner custody.
+        // No receiver terminal evidence exists in this persisted contract.
+        false
     }
 }
 
@@ -9668,17 +9625,14 @@ impl RedbRecoveryStore {
     }
 
     /// Advances the per-stream acked cursor monotonically, never past the
-    /// durable cursor, and compacts acknowledged rows past the retention
-    /// window in the same transaction.
+    /// durable cursor. A producer-presented acknowledgement does not authorize
+    /// payload or projection eviction; only an owner-issued terminal handoff
+    /// disposition can do that.
     ///
-    /// Only durable rows at or below the new acked frontier are eligible,
-    /// and only past `RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM` newest acked rows
-    /// per stream: staged-but-uncommitted rows, unacknowledged rows, the
-    /// retention window (duplicate-suppression frontier), and the cursor facts
-    /// themselves are never touched. Re-presentation of a compacted sequence
-    /// at or below the acked cursor answers from the cursor frontier as a
-    /// duplicate instead of minting a second logical event. Returns the cursor
-    /// outcome plus the pruned row count.
+    /// Durable rows and projections remain available to recovery and replay,
+    /// including rows with no handoff record. The legacy response retains its
+    /// `pruned` field and reports zero until receiver-owned terminal evidence is
+    /// available.
     pub fn acknowledge_bridge_events(
         &self,
         stream_id: &str,
@@ -9700,33 +9654,7 @@ impl RedbRecoveryStore {
             acked = sequence;
             Self::write_bridge_cursors_in(&write, stream_id, durable, acked)?;
         }
-        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
-        let mut pruned = 0_u64;
-        if floor > 0 {
-            let victims: Vec<String> = {
-                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-                let mut found = Vec::new();
-                for entry in records.iter().map_err(storage)? {
-                    let (key, value) = entry.map_err(storage)?;
-                    let row: BridgeEventRow = decode(value.value())?;
-                    row.validate()?;
-                    if row.stream_id == stream_id
-                        && row.sequence <= floor
-                        && row.phase == BRIDGE_EVENT_PHASE_DURABLE
-                    {
-                        found.push(key.value().to_owned());
-                    }
-                }
-                found
-            };
-            if !victims.is_empty() {
-                let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-                for victim in &victims {
-                    records.remove(victim.as_str()).map_err(storage)?;
-                    pruned += 1;
-                }
-            }
-        }
+        let pruned = 0_u64;
         write.commit().map_err(storage)?;
         Ok(json!({
             "stream_id": stream_id,
@@ -10697,7 +10625,7 @@ impl RedbRecoveryStore {
                 .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
                 .map_err(storage)?;
             if windows.len().map_err(storage)? >= MAX_BRIDGE_RECOVERY_WINDOWS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeRecoveryWindowCapacityExceeded);
             }
         }
         let sequence = {
@@ -14051,8 +13979,10 @@ impl RedbRecoveryStore {
     /// principal and the requested sequence. The single write transaction
     /// first validates every item — shape, contradictory duplicates,
     /// stored binding, expected revision/incarnation, lineage/principal
-    /// equality, and phase/frontier — and only then advances the cursors
-    /// and compacts. Any failure aborts the transaction, so a foreign or
+    /// equality, and phase/frontier — and only then advances the cursors.
+    /// Producer acknowledgement does not compact retained payloads or
+    /// projections; those remain pending until receiver-owned terminal
+    /// evidence exists. Any failure aborts the transaction, so a foreign or
     /// stale item changes no batch cursor or retained payload. The commit
     /// is the last fallible operation: after it, only infallible JSON
     /// assembly remains, so a storage/response failure past the commit is
@@ -14109,14 +14039,8 @@ impl RedbRecoveryStore {
                     acked,
                 )?;
             }
-            let pruned = Self::compact_bridge_events_in_checked(
-                &write,
-                &access,
-                &owner.local_stream,
-                durable,
-                acked,
-            )?;
-            if acked > prior_acked || pruned > 0 {
+            let pruned = 0_u64;
+            if acked > prior_acked {
                 Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
             }
             outcomes.push(json!({
@@ -14203,12 +14127,10 @@ impl RedbRecoveryStore {
         Ok(parsed)
     }
 
-    /// Builds the retained replay commitment for one evicted payload row
-    /// (issues #2730 and #2731, item 4): the original admitted identity and
-    /// content commitment with its representation facts, so the admitted
-    /// identity and content commitment outlives payload eviction. Shared by
-    /// window-driven compaction and receipt-driven retirement, so both
-    /// eviction paths retain identical evidence.
+    /// Builds the retained replay commitment for one payload row eligible for
+    /// terminal handoff retirement (issues #2730 and #2731, item 4): the
+    /// original admitted identity and content commitment with its
+    /// representation facts, so those identities outlive payload eviction.
     fn bridge_replay_commitment_for(
         victim: &BridgeEventRow,
         now_ms: u64,
@@ -14237,101 +14159,6 @@ impl RedbRecoveryStore {
             compacted_at_ms: now_ms,
             acked_at_compaction: acked,
         }
-    }
-
-    /// Compacts acknowledged rows of one owner namespace past the
-    /// retention window inside the acknowledgement transaction (issue
-    /// #2729). Only durable rows at or below the acked frontier minus the
-    /// retained window are eligible; unacknowledged rows, the retention
-    /// window, and the cursor facts are never touched.
-    ///
-    /// Issue #2730 retains identity before evicting payload: every
-    /// compacted row first persists its original admitted commitment
-    /// (identity, original content commitment, representation facts) in
-    /// the same transaction, and the cursor's compacted boundary advances
-    /// to the highest compacted sequence with it. The ordered position
-    /// binding is never removed — one admitted position keeps naming its
-    /// one logical event. Exact replays afterwards answer from the
-    /// commitment with `fresh: false`; changed content under a committed
-    /// identity conflicts instead of committing.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "compaction keeps commitment retention, eviction, and boundary advance in one auditable step"
-    )]
-    fn compact_bridge_events_in_checked(
-        write: &redb::WriteTransaction,
-        access: &BridgeStreamAccess,
-        local_stream: &str,
-        durable: u64,
-        acked: u64,
-    ) -> Result<u64, OrsError> {
-        access.require(BridgeStreamRight::Acknowledge)?;
-        let now_ms = current_unix_ms_u64()?;
-        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
-        if floor == 0 {
-            return Ok(0);
-        }
-        let victims: Vec<BridgeEventRow> = {
-            let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            let mut found = Vec::new();
-            for entry in records.iter().map_err(storage)? {
-                let (_, value) = entry.map_err(storage)?;
-                let row: BridgeEventRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == access.namespace
-                    && row.sequence <= floor
-                    && row.phase == BRIDGE_EVENT_PHASE_DURABLE
-                {
-                    found.push(row);
-                }
-            }
-            found
-        };
-        if victims.is_empty() {
-            return Ok(0);
-        }
-        let mut pruned = 0_u64;
-        let mut compacted_boundary = 0_u64;
-        for victim in &victims {
-            let commitment = Self::bridge_replay_commitment_for(victim, now_ms, acked);
-            // A legacy-shaped row predating the privacy decision stores
-            // its verbatim bytes bound by the identity digest; its
-            // commitment is the admissible form, never a projection.
-            Self::write_bridge_commitment_in(write, &commitment)?;
-            compacted_boundary = compacted_boundary.max(victim.sequence);
-            pruned += 1;
-        }
-        {
-            let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for victim in &victims {
-                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
-                records.remove(key.as_str()).map_err(storage)?;
-            }
-        }
-        // The normalized projection is retired with its record (issue #1934):
-        // the retained commitment is the admissible representation of a
-        // compacted event, so a projection left behind under the same key would
-        // be a projection whose raw-or-redacted record no longer exists. Both
-        // removals commit in the transaction that writes the commitment and the
-        // compacted boundary.
-        {
-            let mut projections = write
-                .open_table(BRIDGE_EVENT_PROJECTIONS)
-                .map_err(storage)?;
-            for victim in &victims {
-                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
-                projections.remove(key.as_str()).map_err(storage)?;
-            }
-        }
-        Self::write_bridge_cursors_compacted_in(
-            write,
-            access,
-            local_stream,
-            durable,
-            acked,
-            compacted_boundary,
-        )?;
-        Ok(pruned)
     }
 
     /// Rebuilds the bridge position index and reconciles replay state
@@ -15103,12 +14930,10 @@ impl RedbRecoveryStore {
                     BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
                     reconcile_key.clone_into(&mut row.reconcile_key);
                     row.reconciled_at_ms = now_ms;
-                    // Receiving-owner receipt (issue #2731, item 1): the
-                    // presented consumed frontier with the admitting owner
-                    // revision/incarnation is recorded on the transition, so
-                    // retirement validates this receipt instead of the bare
-                    // state string. Custody acceptance only — the frontier
-                    // never claims downstream application.
+                    // Preserve the presenting stream owner's consumed
+                    // frontier and owner snapshot as reconcile metadata. This
+                    // does not prove receiving-owner acceptance and cannot
+                    // authorize retirement or claim downstream application.
                     row.reconcile_acked_sequence = acked_sequence;
                     row.reconcile_owner_revision = owner.revision;
                     row.reconcile_owner_incarnation = owner.incarnation;
@@ -15223,34 +15048,18 @@ impl RedbRecoveryStore {
     /// Retires eligible handoff rows of one admitted namespace with a finite
     /// work budget and continuation (issue #2731, items 4 and 5).
     ///
-    /// Only rows whose delivery obligation is terminal retire: an
-    /// owner-checked row with no live payload left, carrying either the
-    /// exact receiving-owner receipt (reconciled with the presented
-    /// frontier plus its admitting revision/incarnation, covered by the
-    /// acked cursor even above the compacted boundary so quiet streams
-    /// release their charges) or the admitted terminal disposition
-    /// (`handed_off` but covered by the receiver's acked cursor at or below
-    /// the retained compacted boundary, whose missing row already answers
-    /// the explicit retired disposition). A receipt-complete row whose
-    /// payload is still retained terminalizes instead of lingering: its
-    /// #2730 replay commitment is retained before the payload and handoff
-    /// delete together. Retirement deletes exactly those rows — the
-    /// capacity charge releases exactly once because a re-run finds no row
-    /// to delete again — while the #2730 position binding, replay
-    /// commitment, and compacted boundary keep answering old occurrences
-    /// as retired, never fresh. Ownerless legacy rows, live payloads
-    /// without receiver evidence, and torn record/handoff identities never
-    /// retire: unknown and pending work is never evicted to admit new work,
-    /// and legacy reconciled rows are never bulk-deleted by their old state
-    /// string. Expected revision/incarnation are validated against the
-    /// owner row in the same transaction, so an owner change between
-    /// resolution and commit fails closed with
-    /// [`OrsError::StaleWriterEpoch`]. At most
-    /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] rows retire per call;
-    /// `retirement_continuation` resumes the next legitimate recovery entry.
-    /// If no safe retirement exists the table stays full and admission keeps
-    /// answering backpressure — cursors are never reset and missing evidence
-    /// is never declared complete.
+    /// Only rows with an admitted receiving-owner terminal disposition may
+    /// retire. The current row records only the presenting producer's
+    /// reconcile tuple; it has no receiver receipt, so no current row is
+    /// eligible. Existing owner revision/incarnation checks still reject a
+    /// stale writer, but do not substitute for terminal evidence. At most
+    /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] safely eligible rows retire
+    /// per call; `retirement_continuation` reports only eligible rows beyond
+    /// the budget, not whether unresolved handoffs exist. Pending rows and
+    /// their payload/projection/replay identities stay intact. When the
+    /// bounded handoff table fills, admission returns typed backpressure;
+    /// cursors are never reset and missing evidence is never declared
+    /// complete.
     pub fn retire_bridge_event_handoffs_checked(
         &self,
         request: &serde_json::Value,
@@ -15431,18 +15240,15 @@ impl RedbRecoveryStore {
         }))
     }
 
-    /// Collects one namespace's retirement-eligible handoffs with their keys
-    /// (issue #2731, item 5): the per-row
-    /// [`BridgeEventHandoffRow::retirement_eligible`] decision against the
-    /// current acked cursor and compacted boundary, sorted by sequence then
-    /// key so terminalization advances the boundary in order. Called by
-    /// [`Self::retire_bridge_handoffs_in`]; kept separate so the recovery
-    /// transaction stays within its line budget.
+    /// Collects one namespace's handoffs that have owner-issued terminal
+    /// evidence (issue #2731, item 5), sorted by sequence then key so any
+    /// terminalization advances the boundary in order. The current persisted
+    /// producer reconcile tuple is insufficient, so those rows remain
+    /// pending. Called by [`Self::retire_bridge_handoffs_in`]; kept separate
+    /// so the recovery transaction stays within its line budget.
     fn bridge_retire_eligible_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
-        acked: u64,
-        compacted: u64,
     ) -> Result<Vec<(u64, String, BridgeEventHandoffRow)>, OrsError> {
         let prefix = format!("{}::", access.namespace);
         let mut eligible: Vec<(u64, String, BridgeEventHandoffRow)> = Vec::new();
@@ -15457,7 +15263,7 @@ impl RedbRecoveryStore {
             if row.owner_namespace != access.namespace {
                 continue;
             }
-            if row.retirement_eligible(acked, compacted) {
+            if row.retirement_eligible() {
                 eligible.push((row.sequence, key.value().to_owned(), row));
             }
         }
@@ -15465,33 +15271,17 @@ impl RedbRecoveryStore {
         Ok(eligible)
     }
 
-    /// Retires one namespace's eligible handoffs inside the recovery
-    /// transaction (issue #2731, items 4 and 5). Eligibility is evaluated
-    /// per row by [`BridgeEventHandoffRow::retirement_eligible`] against
-    /// the current acked cursor and compacted boundary. Its existing
-    /// `has_receiver_receipt` predicate is producer-presented frontier/owner
-    /// data, not a receiving-owner durable receipt; tuple-based retirement
-    /// therefore remains unproven. An eligible row with no live payload
-    /// deletes by exact key under the current predicate. An eligible row
-    /// matching that producer-presented tuple whose payload is still retained
-    /// terminalizes: its #2730 replay commitment
-    /// is written first — the identical evidence window-driven compaction
-    /// retains, under the same per-stream and total pressure bounds — then
-    /// the payload record and the handoff row delete together and the
-    /// compacted boundary advances past the terminalized sequences, so
-    /// exact replays keep answering duplicate from the commitment, old
-    /// occurrences below the boundary keep answering retired, and the
-    /// repair step (which restores handoffs only for retained records)
-    /// never resurrects them. Rows with a live payload but without the
-    /// persisted producer-presented tuple are never touched; this only blocks
-    /// the separate `handed_off` plus acked/compacted fallback and does not
-    /// make tuple-based retirement safe. The producer tuple's downstream
-    /// disposition is not verified here; torn record/handoff identity
-    /// mismatches fail closed by skipping the row instead of guessing. Deletes are by
-    /// exact
-    /// key, so the charge releases exactly once. At most `budget` rows
-    /// delete or terminalize per call; `retirement_continuation` reports
-    /// whether eligible rows remain for the next legitimate recovery entry.
+    /// Retires one namespace's handoffs inside the recovery transaction
+    /// (issue #2731, items 4 and 5). Eligibility is evaluated per row by
+    /// [`BridgeEventHandoffRow::retirement_eligible`]. The stored reconcile
+    /// tuple is producer-presented frontier/owner data, not a receiving-owner
+    /// receipt or admitted terminal disposition; therefore no current row is
+    /// eligible. Pending payloads and handoffs, replay commitments, and
+    /// cursors remain untouched. In the result,
+    /// `retirement_continuation` means additional safely eligible rows remain
+    /// beyond this call's budget; false does not mean there are no unresolved
+    /// handoffs. Admission at the existing handoff capacity continues to
+    /// return typed pending-handoff backpressure instead of evicting them.
     fn retire_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -15517,7 +15307,7 @@ impl RedbRecoveryStore {
                 row.last_compacted_sequence,
             )
         });
-        let eligible = Self::bridge_retire_eligible_in(write, &access, acked, compacted)?;
+        let eligible = Self::bridge_retire_eligible_in(write, &access)?;
         if eligible.is_empty() {
             return Ok(json!({
                 "namespace": access.namespace,
@@ -15562,7 +15352,7 @@ impl RedbRecoveryStore {
             {
                 continue;
             }
-            if !(row.has_receiver_receipt() && row.sequence <= acked) {
+            if !row.retirement_eligible() {
                 continue;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
