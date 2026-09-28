@@ -79,6 +79,7 @@ impl std::error::Error for NotifyBuildError {}
 pub struct NotificationComposition {
     core: NotifyCore<NotificationPlatform>,
     quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
+    messaging_bridge: Option<eliot_messaging_bridge::MessagingBridge>,
 }
 
 struct NotificationPlatform {
@@ -399,6 +400,7 @@ impl NotificationComposition {
         Ok(Self {
             core: NotifyCore::new(NotificationPlatform::recovery_banner(platform), ports),
             quiet_hours: None,
+            messaging_bridge: None,
         })
     }
 
@@ -420,6 +422,7 @@ impl NotificationComposition {
             core: NotifyCore::new(NotificationPlatform::normal(platform), ports)
                 .with_popup_selector(select_popup),
             quiet_hours,
+            messaging_bridge: None,
         }
     }
 
@@ -1498,6 +1501,7 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 pub mod automation_notification_adapter;
 mod fallback_verification;
 pub mod installed_binary;
+pub mod messaging_bridge_adapter;
 pub mod no_session_persist;
 pub mod notify_declaration;
 pub mod notify_launch;

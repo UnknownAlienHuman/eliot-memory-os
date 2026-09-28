@@ -2591,6 +2591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-messaging-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
@@ -2670,6 +2679,7 @@ dependencies = [
  "eliot-config",
  "eliot-contracts",
  "eliot-kernel-service",
+ "eliot-messaging-bridge",
  "eliot-notify-core",
  "eliot-platform",
  "eliot-platform-windows",
