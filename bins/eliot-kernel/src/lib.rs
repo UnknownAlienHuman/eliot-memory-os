@@ -3567,6 +3567,18 @@ impl KernelComposition {
             DaemonSupervisionRenewalOutcome::DegradedNoRenewal => {
                 progress.note_missed_renewal();
                 if progress.stale_renewal_expired(policy, now_ms) {
+                    // The third expiry decision of this join, and the same
+                    // terminal as the two above: a degraded observation that
+                    // ages the lease out refuses the renewal exactly as a
+                    // silent lease and a refused join do. The lease-expiry
+                    // observation belongs at the decision that refuses the
+                    // renewal, so leaving it out here would under-report one
+                    // real terminal expiry against I16.5 while the durable
+                    // audit event downstream still records it. I1.5: renewal
+                    // must carry fresh observed evidence, so a lease that can
+                    // no longer prove renewal ends at expiry whether the
+                    // blockage was silence, a refused join, or degradation.
+                    observe_supervision_lease_expiry();
                     return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
                 }
             }
