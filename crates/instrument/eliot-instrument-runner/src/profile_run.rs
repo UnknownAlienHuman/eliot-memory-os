@@ -648,7 +648,12 @@ impl InstrumentRun {
 ///
 /// Missing or failed required stages dominate: they can never be represented
 /// as [`AggregateStatus::Succeeded`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The status serializes with its persisted profile-run record (issue #1802,
+/// I18.6 step 9) under the same screaming wire case as the execution axis, so
+/// a renamed status fails readback instead of decoding as another outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AggregateStatus {
     /// Every required stage succeeded and every optional stage succeeded.
     Succeeded,

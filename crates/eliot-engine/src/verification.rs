@@ -15,9 +15,11 @@ mod test_cost;
 pub use test_cost::TestCostService;
 
 mod current;
+mod dev_fast;
 mod governed;
 
 mod report_clusters;
+pub use dev_fast::{DevFastEvidenceCommit, DevFastGovernedService};
 /// Environment class the admitted instrument specs declare for their stages.
 ///
 /// Composition roots pass this exact class into
