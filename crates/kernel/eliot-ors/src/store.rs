@@ -2307,13 +2307,44 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// retired lookup answers the typed recovery limitation instead of absence.
 /// Tombstones are never deleted. Historical unmarked rows are represented
 /// only by a separately versioned presence marker; this primary link never
-/// infers or returns their operation identity. Record/byte ceilings and a
-/// numeric replay horizon are not declared by the current contract: growth is
-/// bounded only by staged operations, and fresh stages beyond legitimate
-/// history fail closed through the typed errors below rather than through a
-/// capacity counter.
+/// infers or returns their operation identity. The retention denominator is
+/// one entry per staged operation, bounded by
+/// [`MAX_HOST_REQUEST_LOGICAL_RECORDS`] records and
+/// [`MAX_HOST_REQUEST_LOGICAL_LINK_BYTES`] bytes per link value: a fresh
+/// stage beyond either ceiling fails with
+/// [`OrsError::ProjectionLimitExceeded`] (typed backpressure) while exact
+/// replays and retired-key limitation answers keep succeeding. The replay
+/// horizon is terminal-state-driven, not wall-clock: links live while their
+/// winner row stays unretired, unresolved effects/results never expire
+/// without canonical reconciliation (I5.2), and retirement swaps the link
+/// for a tombstone only under exact terminal evidence, so a retired key
+/// answers the typed recovery limitation instead of absence and is never
+/// reusable.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
+/// Maximum staged logical host-request index entries (issue #2571).
+///
+/// Mirrors [`MAX_BRIDGE_EVENT_RECORDS`] (the I14.2 canonical-writes pool,
+/// 2048 items): the nearest durable replay-table precedent in this owner.
+/// Breach fails fresh stages with [`OrsError::ProjectionLimitExceeded`]
+/// (typed backpressure), never with silent loss or fresh-absence treatment.
+/// Exact replays of staged keys and retired-key limitation answers never
+/// consume capacity, and unresolved winners plus tombstones are never
+/// evicted to make room: a full table is a refusal, not a reclamation.
+const MAX_HOST_REQUEST_LOGICAL_RECORDS: usize = 2048;
+/// Maximum encoded bytes of one logical-index link or tombstone value
+/// (issue #2571).
+///
+/// Composes two existing owner ceilings: six bytes per bounded-text byte
+/// (the `MAX_BRIDGE_POSITION_RECORD_BYTES` JSON-escaping math over the
+/// `validate_text`-bounded `operation_id`) plus one [`MAX_ORS_MARKER_BYTES`]
+/// for the fixed fields (digests, tombstone marker, framing). An
+/// over-ceiling value fails with [`OrsError::ProjectionLimitExceeded`].
+/// The derived index total (`MAX_HOST_REQUEST_LOGICAL_RECORDS` times this
+/// ceiling) stays under the existing backup byte ceiling
+/// ([`crate::backup_snapshot::MAX_BACKUP_BYTES`]), so retention introduces
+/// no second byte-policy owner.
+const MAX_HOST_REQUEST_LOGICAL_LINK_BYTES: usize = 6 * 1_024 + MAX_ORS_MARKER_BYTES;
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
 /// Format marker carried by every logical host-request tombstone (issue #2571).
@@ -5763,7 +5794,7 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
-            let mut links = write
+            let links = write
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?;
             if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
@@ -5808,10 +5839,7 @@ impl RedbRecoveryStore {
                     operation_id: staged.operation_id.clone(),
                     request_digest: staged.request_digest.clone(),
                 };
-                let payload = encode(&link)?;
-                links
-                    .insert(logical_key.as_str(), payload.as_str())
-                    .map_err(storage)?;
+                Self::stage_host_request_logical_link_in(&write, logical_key.as_str(), &link)?;
                 staged
             }
         };
@@ -6163,15 +6191,44 @@ impl RedbRecoveryStore {
                 operation_id: staged.operation_id.clone(),
                 request_digest: staged.request_digest.clone(),
             };
-            let payload = encode(&link)?;
-            let mut links = write
-                .open_table(HOST_REQUEST_LOGICAL_KEYS)
-                .map_err(storage)?;
-            links
-                .insert(logical_key, payload.as_str())
-                .map_err(storage)?;
+            Self::stage_host_request_logical_link_in(write, logical_key, &link)?;
         }
         Ok(staged)
+    }
+
+    /// Stages one logical-index link under the index capacity ceilings
+    /// (issue #2571).
+    ///
+    /// Both fresh-stage entries claim through here, so the operation row and
+    /// its link still commit atomically in the caller's owner transaction.
+    /// The encoded link value is compared against
+    /// [`MAX_HOST_REQUEST_LOGICAL_LINK_BYTES`] and a fresh key is admitted
+    /// only while the table holds fewer than
+    /// [`MAX_HOST_REQUEST_LOGICAL_RECORDS`] entries; either breach fails
+    /// with [`OrsError::ProjectionLimitExceeded`] (typed backpressure).
+    /// Exact replays never reach here — they resolve through the staged link
+    /// above — and tombstones are written by retirement, not by staging, so
+    /// a full table refuses fresh growth without evicting unresolved
+    /// winners or tombstones and without answering absence.
+    fn stage_host_request_logical_link_in(
+        write: &redb::WriteTransaction,
+        logical_key: &str,
+        link: &HostRequestLogicalLink,
+    ) -> Result<(), OrsError> {
+        let payload = encode(link)?;
+        if payload.len() > MAX_HOST_REQUEST_LOGICAL_LINK_BYTES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let mut links = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        if links.len().map_err(storage)? >= MAX_HOST_REQUEST_LOGICAL_RECORDS as u64 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        links
+            .insert(logical_key, payload.as_str())
+            .map_err(storage)?;
+        Ok(())
     }
 
     /// Derives bounded historical occurrence spellings that could represent

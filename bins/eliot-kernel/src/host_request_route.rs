@@ -653,6 +653,11 @@ impl KernelComposition {
                 OrsError::HostRequestLegacyCorrelationUnresolved => {
                     TransportError::LegacyCorrelationUnresolved
                 }
+                // A full logical index sheds fresh stages with typed
+                // backpressure (issue #2571): the agent-facing caller waits
+                // and resubmits the exact bytes instead of observing a stale
+                // fence or a fresh absence.
+                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
                 _ => TransportError::SessionFenced,
             })?;
 
