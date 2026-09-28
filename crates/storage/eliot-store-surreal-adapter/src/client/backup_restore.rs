@@ -239,19 +239,26 @@ IF array::len($placement_create ?? []) != 1 { THROW 'restore_placement_create_co
 /// call is never mistaken for a check: a destination head that does not carry
 /// the revision this operation was admitted against aborts the whole commit.
 ///
-/// An absent head row is a moved head, not a passing check. The admitted
-/// expectation is non-zero by contract, so a destination that serves no such
-/// head has diverged from the expectation; the branch shape is the same
-/// present/absent discipline `crate::schema::TX_CANONICAL_OWNER` already uses
-/// for its own fenced CAS.
-const RESTORE_STATEMENT_REVISION_HEAD_GUARD: &str = "LET $restore_revision_guard{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($restore_revision_table, $restore_revision_key{i})); IF type::is_object($restore_revision_guard{i}) { IF $restore_revision_guard{i}.revision != $restore_expected_revision{i} OR $restore_revision_guard{i}.state_fence != $restore_expected_state_fence { THROW 'restore_revision_head_changed'; }; } ELSE { THROW 'restore_revision_head_changed'; };";
+/// The head is addressed exactly as the canonical owner addresses it —
+/// `type::record(revision_head, revision_key)`, the same record id
+/// [`crate::schema::TX_UPSERT_REVISION`] updates — and it is read from `body`,
+/// the same projection [`crate::schema::READ_REVISION_HEADS_BY_KEYS`] returns.
+///
+/// The guard is conditional on the head existing, which is the owner's own
+/// discipline: [`crate::schema::TX_UPSERT_REVISION`] compare-and-sets a present
+/// head and [`crate::schema::TX_CREATE_REVISION`] establishes an absent one from
+/// the floor. So a destination that publishes no head at this key is the
+/// create-from-floor case rather than a moved head, while a head that exists and
+/// carries a different revision is a moved head and aborts.
+const RESTORE_STATEMENT_REVISION_HEAD_GUARD: &str = "LET $restore_revision_guard{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($restore_revision_table, $restore_revision_key{i})); IF type::is_object($restore_revision_guard{i}) AND ($restore_revision_guard{i}.revision != $restore_expected_revision{i} OR $restore_revision_guard{i}.state_fence != $restore_expected_state_fence) { THROW 'restore_revision_head_changed'; };";
 
 /// Expected-ordering-head precondition of the apply transaction.
 ///
 /// `{i}` selects the binding index. Same discipline as the revision guard: the
-/// destination's own ordering head is compared inside the commit transaction,
-/// and an absent head row aborts it too.
-const RESTORE_STATEMENT_ORDERING_HEAD_GUARD: &str = "LET $restore_ordering_guard{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence } FROM ONLY type::record($restore_ordering_table, $restore_ordering_scope{i})); IF type::is_object($restore_ordering_guard{i}) { IF $restore_ordering_guard{i}.sequence != $restore_expected_sequence{i} OR $restore_ordering_guard{i}.state_fence != $restore_expected_state_fence { THROW 'restore_ordering_head_changed'; }; } ELSE { THROW 'restore_ordering_head_changed'; };";
+/// destination's own ordering head is addressed and read the way the canonical
+/// owner addresses and reads it, and a head that exists and carries a different
+/// sequence aborts the commit.
+const RESTORE_STATEMENT_ORDERING_HEAD_GUARD: &str = "LET $restore_ordering_guard{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence } FROM ONLY type::record($restore_ordering_table, $restore_ordering_scope{i})); IF type::is_object($restore_ordering_guard{i}) AND ($restore_ordering_guard{i}.sequence != $restore_expected_sequence{i} OR $restore_ordering_guard{i}.state_fence != $restore_expected_state_fence) { THROW 'restore_ordering_head_changed'; };";
 
 /// Current-purge-obligation precondition of the apply transaction.
 ///

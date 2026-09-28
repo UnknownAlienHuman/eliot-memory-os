@@ -36,6 +36,17 @@
 //! imported, and invariant checks are never disabled. Nothing here activates an
 //! installation, unblocks effects, or retires a source.
 //!
+//! Bounded execution: one batch is bounded on all four axes the contract names.
+//! *Batches* by the member ceiling `MAX_RESTORE_MEMBERS`; *bytes* by the
+//! cumulative `MAX_RESTORE_BYTES` accounting that now covers the canonical
+//! payload bytes an apply imports, not only its bookkeeping document; *duration*
+//! by `MAX_RESTORE_DURATION_MS`, measured from the destination's preparation and,
+//! on a resume, from the operation's own first durable write; and *work* by the
+//! shape of the single composed transaction, whose indexed clause families are
+//! exactly the batch's head counts, its two purge obligations and its resolved
+//! members. No unbounded retry, fan-out or background loop exists, so the work a
+//! single apply can perform is the work its bounded shape already names.
+//!
 //! Local attempt ownership: an apply is owned by a private, non-cloneable
 //! [`RestoreAttemptGuard`] acquired before the first suspension that needs
 //! exclusion and bound to the destination/adapter owner namespace, the admitted
@@ -2438,9 +2449,12 @@ async fn read_canonical_body(
 
 /// The head field one canonical class publishes for compare-and-set purposes.
 ///
-/// The destination's own head value is read through its canonical read path,
-/// so the field is the one the canonical owner writes under `body` for that
-/// class. No caller chooses the field.
+/// The destination's own head value is read through the record address the
+/// canonical owner itself uses (`type::record(revision_head, revision_key)` and
+/// `type::record(ordering_head, ordering_scope)`, per `schema::TX_UPSERT_REVISION`
+/// and `schema::READ_REVISION_HEADS_BY_KEYS`), and the field is the one the owner
+/// writes under `body` for that class. No caller chooses either the address or
+/// the field.
 const fn head_value_field(class: RestoreRecordClass) -> &'static str {
     match class {
         RestoreRecordClass::RevisionHead => "revision",
@@ -2481,11 +2495,14 @@ async fn read_destination_heads(
 ///
 /// The same rule the commit transaction applies, applied before the write so a
 /// batch whose expectation has already moved is refused rather than submitted.
-/// The admitted expectation is non-zero by contract, so a destination that
-/// publishes no head at that key has moved just as surely as one that publishes
-/// a different value: absence is a conflict, not a pass. `mismatch` is the
-/// lane's typed conflict, so a revision move never reads as an ordering move or
-/// the other way round.
+/// A head the destination publishes must carry exactly the revision or sequence
+/// this operation was admitted against. A head it does not publish yet is the
+/// create-from-floor case the canonical owner itself distinguishes
+/// (`schema::TX_UPSERT_REVISION` compare-and-sets a present head,
+/// `schema::TX_CREATE_REVISION` establishes an absent one), so absence is not a
+/// contradiction here either — and this preflight must not be stricter than the
+/// transaction guard it precedes. `mismatch` is the lane's typed conflict, so a
+/// revision move never reads as an ordering move or the other way round.
 fn check_observed_heads(
     expected: &[u64],
     observed: &[Option<u64>],
@@ -2495,7 +2512,7 @@ fn check_observed_heads(
         return Err(StoreError::InvalidReceipt);
     }
     for (expected, observed) in expected.iter().zip(observed) {
-        if observed.is_none_or(|observed| observed == *expected) {
+        if !observed.is_none_or(|observed| observed == *expected) {
             return Err(mismatch);
         }
     }
