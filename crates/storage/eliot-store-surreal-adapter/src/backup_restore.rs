@@ -1727,6 +1727,31 @@ fn validate_reference_closure_against(
     Ok(())
 }
 
+/// Keys a planned per-member disposition set by each member's own destination
+/// identity.
+///
+/// The planned set is derived by iterating the batch's own members, so each entry
+/// is that member's disposition under its own [`member_reference`] key. The guard
+/// then looks dispositions up by identity, which is the same key the durable
+/// readback path binds by, so one member's disposition can never be read as
+/// another's.
+fn dispositions_by_member(
+    batch: &CanonicalRestoreBatch,
+    dispositions: &[MemberDisposition],
+) -> BTreeMap<String, MemberDisposition> {
+    batch
+        .members
+        .iter()
+        .zip(dispositions)
+        .map(|(member, disposition)| {
+            (
+                member_reference(&batch.archive_member_digest, &member.logical_identity()),
+                *disposition,
+            )
+        })
+        .collect()
+}
+
 /// Reports whether archive content is suppressed by the current purge policy.
 ///
 /// Content captured under any purge revision other than the current one —
@@ -3846,7 +3871,8 @@ impl SurrealStoreAdapter {
         // member this batch actually imports, in the same obligation domain.
         // Unverified derived data cannot grant completion, so a dangling edge
         // refuses the batch rather than being committed and reported.
-        validate_reference_closure_against(batch, &dispositions)?;
+        let dispositions_by_member = dispositions_by_member(batch, &dispositions);
+        validate_reference_closure_against(batch, &dispositions_by_member)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let (completeness, mutation) = planned_outcome(&dispositions);
