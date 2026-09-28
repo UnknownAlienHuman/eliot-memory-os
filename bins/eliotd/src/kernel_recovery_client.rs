@@ -95,6 +95,14 @@ impl KernelRecoveryPort for DaemonKernelClient {
                 &self.snapshot.protected_snapshot_digest,
             )
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        // #740 A8: the Governor's rebuild request validated against the
+        // admitted snapshot, so the rebuild is requested under the validated
+        // owner digest. In-progress and completed follow below at the Store
+        // submit and the validated receipt; the three phases stay distinct.
+        let _ = crate::diagnostics::emit_rebuild(
+            crate::diagnostics::RebuildState::Requested,
+            &request.protected_snapshot_digest,
+        );
         let identity = stable_genesis_identity(self, request)?;
         let context = identity.request.metadata.clone();
         let owner_records = request
@@ -123,6 +131,13 @@ impl KernelRecoveryPort for DaemonKernelClient {
         store_request
             .validate_for_context(&context)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        // #740 A8: the validated rebuild is now submitted to the Store
+        // owner, so it is in progress; completion is only the validated
+        // receipt below, never this submission.
+        let _ = crate::diagnostics::emit_rebuild(
+            crate::diagnostics::RebuildState::InProgress,
+            &request.protected_snapshot_digest,
+        );
         let value = self.request_blocking_with_identity(
             "store_initialize_genesis",
             serde_json::json!({
@@ -144,6 +159,12 @@ impl KernelRecoveryPort for DaemonKernelClient {
         }
         validate_genesis_receipt_envelope(&identity.request.metadata, &store_request, &receipt)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        // #740 A8: the Store receipt envelope validated against the exact
+        // submitted request, so the rebuild is completed with owner evidence.
+        let _ = crate::diagnostics::emit_rebuild(
+            crate::diagnostics::RebuildState::Completed,
+            &request.protected_snapshot_digest,
+        );
         Ok(())
     }
 

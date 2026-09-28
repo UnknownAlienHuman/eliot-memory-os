@@ -1344,7 +1344,22 @@ impl DaemonKernelClient {
         }
         tokio::select! {
             result = transport.receive_frame(limits) => {
-                result.map_err(|error| KernelClientError::Unknown(error.to_string()))
+                result.map_err(|error| {
+                    // #740 A17: only proven connection loss emits the
+                    // disconnect record under the original connection id.
+                    // Timeouts, shutdown abandonment, correlation mismatches
+                    // and wire-decode failures stay Unknown without one, and
+                    // the emit itself performs no Kernel operation.
+                    if matches!(
+                        error,
+                        eliot_ipc::TransportError::Io(_)
+                            | eliot_ipc::TransportError::UnknownOutcome
+                    ) {
+                        let _ =
+                            crate::diagnostics::KernelDisconnect::of(&self.connection_id).emit();
+                    }
+                    KernelClientError::Unknown(error.to_string())
+                })
             }
             changed = shutdown.changed() => {
                 // A dropped sender is the same observation: this client is
