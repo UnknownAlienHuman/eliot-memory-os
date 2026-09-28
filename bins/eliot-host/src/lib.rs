@@ -92,6 +92,63 @@ fn host_lifecycle_observe_scm(boundary: &'static HostLifecycleBoundary) {
     );
 }
 
+/// Observes one SCM lifecycle boundary with the already-owned runtime-control
+/// request identity that the plain boundary event cannot carry.
+///
+/// This stays on the existing #889 bounded-detail facade. It projects the
+/// installation, Host plan generation, current process, typed operation name,
+/// and request digest without logging raw request payload or revalidating or
+/// re-evaluating the operation.
+fn host_lifecycle_observe_scm_with_runtime_control_request(
+    boundary: &'static HostLifecycleBoundary,
+    launch_options: &HostLaunchOptions,
+    request: &HostRuntimeControlRequest,
+) {
+    note_event_log_sink_status();
+    let installation = host_diagnostics::bound_field(launch_options.installation().as_str());
+    let request_digest = request.request_digest.as_str();
+    let request_digest_is_sha256 = request_digest.len() == 64
+        && request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    let request_digest = if request_digest_is_sha256 {
+        request_digest
+    } else {
+        "missing"
+    };
+    let detail = format!(
+        "{} installation={} installation_truncated={} process={} generation={} operation={} request_digest={} request_digest_shape_valid={}",
+        host_lifecycle_frozen_event(boundary),
+        installation.text(),
+        installation.truncated(),
+        std::process::id(),
+        launch_options.transaction_plan_generation(),
+        host_runtime_control_operation_name(&request.operation),
+        request_digest,
+        request_digest_is_sha256,
+    );
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ScmDispatch,
+        &detail,
+    );
+}
+
+fn host_runtime_control_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel => "RestartKernel",
+        HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
+        HostRuntimeControlOperation::RecoverStore => "RecoverStore",
+        HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+            "AdmitUserAutomationOccurrence"
+        }
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "CancelUserAutomationPendingWakes"
+        }
+    }
+}
+
 fn host_lifecycle_observe_drain(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
@@ -659,10 +716,10 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
     },
     HostLifecycleBoundary {
         name: "start.requested",
-        source_item: "HostComposition::start_approved_contour",
+        source_item: "HostComposition::start_approved_contour; start_approved_manifest_contour",
         owner_state: "approved generation/launch descriptor",
         event: "host.start requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "HostComposition::open; exported HostComposition::start_approved_contour has no in-repo caller",
         test: "891/case-2",
     },
     HostLifecycleBoundary {
@@ -5450,6 +5507,9 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
     let (_, store_artifact) = manifest
         .host_child_artifact_digests()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    // F-LOG-HOST-1: the approved start is requested here on the live startup
+    // path; manifest launch, process start, and readiness stay distinct.
+    host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
     port.start_approved_manifest(
         manifest,
         branch,
@@ -7383,16 +7443,15 @@ impl HostComposition {
         // completion. Unsupported op stays typed Unknown, never false-success.
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
-        // F-LOG-HOST-1 case 15: the restart sighting correlates on the
-        // installation and generation already held in `launch_options`, plus
-        // this process's own id from `std::process::id()` - the same
-        // `HostProcessBinding` identity the owner already records elsewhere,
-        // read here as a pure value (no probe, no handle, no lock). The
-        // `operation` slot stays explicitly missing: this dispatch is a
-        // runtime-control (SCM) action, and `AdmittedEvent` admits service
-        // start/stop/failure only, so no fitting taxonomy value exists here
-        // and none is guessed.
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_REQUESTED,
+            &self.launch_options,
+            request,
+        );
+        // The companion host.request projection still leaves its typed
+        // `AdmittedEvent` slot missing because RestartKernel is not a service
+        // start/stop Event Log category. The lifecycle record above carries
+        // this request's exact operation name and digest in bounded detail.
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,
@@ -7402,7 +7461,11 @@ impl HostComposition {
         );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK,
+                &self.launch_options,
+                request,
+            );
             return self.reconcile_kernel_restart_request(request);
         }
         if self
@@ -7411,7 +7474,11 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -7421,13 +7488,21 @@ impl HostComposition {
         let result = self.execute_kernel_restart(request);
         match result {
             Ok(receipt) => {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION,
+                    &self.launch_options,
+                    request,
+                );
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             }
             Err(_error) => {
                 // Unsupported op, pending/unknown, or failed restart all stay
                 // typed Unknown preserving identity; never false-success.
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_UNKNOWN,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
@@ -7447,14 +7522,22 @@ impl HostComposition {
         // false-success and never rewrites the durable receipt. Timeout or
         // possible state change stays Unknown until reconciliation evidence.
         // One terminal per Unknown outcome; success readback is replay.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED,
+            &self.launch_options,
+            request,
+        );
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -7462,7 +7545,11 @@ impl HostComposition {
             );
         }
         if request.validate().is_err() {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -7472,12 +7559,18 @@ impl HostComposition {
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
             return if let Ok(receipt) = rebind_runtime_restart_receipt(&receipt, request) {
-                host_lifecycle_observe_scm(
+                host_lifecycle_observe_scm_with_runtime_control_request(
                     BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY,
+                    &self.launch_options,
+                    request,
                 );
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             } else {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
@@ -7489,7 +7582,11 @@ impl HostComposition {
             Ok(true) | Err(_) => {
                 // Pending or unreadable pending stays Unknown; a timeout is
                 // never proof of effect or non-effect.
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
@@ -7501,7 +7598,11 @@ impl HostComposition {
         let snapshot = match self.journal.snapshot() {
             Ok(s) => s,
             Err(_e) => {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
@@ -7512,7 +7613,11 @@ impl HostComposition {
         if let Some(kernel) = snapshot.kernel.as_ref() {
             let _ = kernel;
         }
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN,
+            &self.launch_options,
+            request,
+        );
         host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
         HostRuntimeControlResponse::unknown_for(
             request,
@@ -7533,7 +7638,11 @@ impl HostComposition {
     ) -> Result<HostKernelRestartReceipt, HostError> {
         // F-LOG-HOST-1: inner phase only; outer `handle_kernel_restart_request`
         // owns the single terminal. Unsupported op stays typed, never success.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED,
+            &self.launch_options,
+            request,
+        );
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RestartKernel {
             return Err(HostError::ProcessContour(
@@ -7837,7 +7946,11 @@ impl HostComposition {
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
         // F-LOG-HOST-1: receipt (restart) is distinct from reconcile readback.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT,
+            &self.launch_options,
+            request,
+        );
         Ok(receipt)
     }
 
