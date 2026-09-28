@@ -742,6 +742,14 @@ pub(super) fn run() -> Result<(), String> {
     // #2560: the same evaluation that produced the ready/degraded record reaches
     // diagnostics, so stdout, diagnostics and dispatch cannot disagree.
     eliotd::startup_readiness::emit_startup_readiness_record(&startup_readiness, &readiness);
+    // Trigger recovery is retained as an operational projection and remains
+    // separate from readiness: ordinary pending debt does not block unrelated
+    // safe work. This aggregate diagnostic omits member identities and opaque
+    // continuation tokens; the authenticated recovery owner reads the typed
+    // bounded page from the composition.
+    eliotd::startup_readiness::emit_maintenance_trigger_recovery_record(
+        composition.maintenance_trigger_recovery(),
+    );
     let status = DaemonStatus {
         ready: readiness.ready,
         degraded: readiness.degraded,
