@@ -509,7 +509,9 @@ public sealed record UserAutomationNormalizedSchedule(
     [property: JsonPropertyName("dst_gap")] string DstGap,
     [property: JsonPropertyName("start_at")] string StartAt,
     [property: JsonPropertyName("end_at")] string? EndAt,
-    [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences)
+    [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences,
+    [property: JsonPropertyName("normalization_receipt")]
+        UserAutomationScheduleNormalizationReceipt NormalizationReceipt)
 {
     /// <summary>
     /// Validates the bounded wire shape and the exact supported contract version
