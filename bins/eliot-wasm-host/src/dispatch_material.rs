@@ -88,6 +88,26 @@ pub const WASM_DISPATCH_MATERIAL_WIRE_VERSION: u16 = 1;
 /// vectors, never dumps.
 pub const DISPATCH_MATERIAL_MAX_BYTES: u64 = 64 * 1024;
 
+/// Owner generation-slot parent directory name, mirrored exactly with the
+/// owner publisher (`eliot-kernel-service::wasm_dispatch`). Each owner
+/// publication stages one immutable slot here before it exposes the
+/// fixed-name set this reader consumes. Mirrored because the claim half
+/// owns the read path; the owner publisher stays the authority for the
+/// value.
+pub const WASM_DELIVERY_SLOT_DIR_NAME: &str = "eliot-wasm-host.generations";
+/// Owner pending-publication marker, mirrored exactly with the publisher.
+pub const WASM_DELIVERY_PENDING_FILE_NAME: &str = "PENDING.json";
+/// Owner ready-publication marker, mirrored exactly with the publisher. The
+/// owner writes it last, so its presence is the owner's proof that the whole
+/// immutable set was staged before the fixed names were exposed.
+pub const WASM_DELIVERY_READY_FILE_NAME: &str = "READY.json";
+/// Owner failed-publication marker, mirrored exactly with the publisher.
+pub const WASM_DELIVERY_FAILED_FILE_NAME: &str = "FAILED.json";
+/// Owner-issued delivery-identity wire version, mirrored exactly with the
+/// publisher. A slot record carrying any other version is refused rather than
+/// reinterpreted.
+pub const WASM_DELIVERY_IDENTITY_VERSION: u16 = 1;
+
 /// Control-delivery envelope wire identity, mirrored exactly with the owner
 /// publisher (`eliot-kernel-service::wasm_control`).
 pub const WASM_CONTROL_DELIVERY_WIRE_ID: &str = "eliot.wasm.control-delivery";
@@ -1194,12 +1214,20 @@ pub fn consume_staged(path: &std::path::Path) -> ReclaimOutcome {
 /// Owner-issued delivery identity bound at claim time (#2786 steps 1/3).
 ///
 /// Derived verbatim from the staged envelope plus re-proven digests against
-/// the existing `WasmPublishedBundle`/`WasmJoinGate` wire shape (sibling
-/// kernel half unmerged; no field is generated locally). A directory/path is
-/// only a locator: this identity — claim, operation, generation, launch
-/// nonce, grant and fence generation, artifact/input digests, admission and
-/// expiry window, authority epoch — is what the claim binds. Envelope digest
-/// and publication incarnation/revision await the kernel publisher half.
+/// the existing `WasmPublishedBundle`/`WasmJoinGate` wire shape (no field is
+/// generated locally). A directory/path is only a locator: this identity —
+/// claim, operation, generation, launch nonce, grant and fence generation,
+/// artifact/input digests, admission and expiry window, authority epoch, the
+/// material-set digest of the exact staged envelope bytes, and the
+/// installation binding — is what the claim binds.
+///
+/// `envelope_digest` is the ORIGINAL recorded binding, measured once from the
+/// exact envelope bytes this claim was parsed from. Every later comparison
+/// re-hashes the bytes found on disk and compares them against this recorded
+/// value; a re-parse of a replacement envelope that happens to carry the same
+/// typed field values is a different delivery, never a match. The owner's
+/// publication incarnation/revision stay in the owner slot record
+/// ([`OwnerDeliveryIdentity`]) and are cross-checked there.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedDeliveryIdentity {
     /// Admitted claim identity.
@@ -1224,12 +1252,24 @@ pub struct StagedDeliveryIdentity {
     pub expires_at: u64,
     /// Canonical live-authority-epoch JSON bound at admission.
     pub authority_epoch_json: String,
+    /// Measured digest of the exact staged envelope bytes this identity was
+    /// parsed from (hex).
+    pub envelope_digest: Sha256Digest,
+    /// Owner-measured installed child image digest (hex): the installation
+    /// binding the owner recorded for this delivery.
+    pub host_artifact_digest: Sha256Digest,
 }
 
 impl StagedDeliveryIdentity {
-    /// Captures the delivery identity from validated material.
+    /// Captures the delivery identity from validated material plus the
+    /// measured digest of the exact staged envelope bytes it was parsed
+    /// from. No field is generated locally: every value is either carried
+    /// by the envelope or measured over its bytes.
     #[must_use]
-    pub fn from_material(material: &ValidatedDispatchMaterial) -> Self {
+    pub fn from_material(
+        material: &ValidatedDispatchMaterial,
+        envelope_digest: Sha256Digest,
+    ) -> Self {
         Self {
             claim_id: material.claim_id.clone(),
             operation_id: material.operation_id.clone(),
@@ -1242,35 +1282,9 @@ impl StagedDeliveryIdentity {
             admitted_at_unix_ms: material.admitted_at_unix_ms,
             expires_at: material.grant.expires_at,
             authority_epoch_json: material.authority_epoch_json.clone(),
+            envelope_digest,
+            host_artifact_digest: material.host_artifact_digest.clone(),
         }
-    }
-
-    /// Captures the delivery identity from a parsed envelope input,
-    /// before payload bytes are attached. Field-for-field with
-    /// [`from_material`](Self::from_material): the envelope claim selects
-    /// the operation, never the colocated bytes.
-    #[must_use]
-    pub fn from_input(input: &DispatchMaterialInput) -> Self {
-        Self {
-            claim_id: input.claim_id.clone(),
-            operation_id: input.operation_id.clone(),
-            generation: input.generation,
-            launch_nonce: input.launch_nonce.clone(),
-            grant_digest: input.grant_digest.clone(),
-            fence_generation: input.grant_fence_generation,
-            artifact_digest: input.ceilings.artifact_digest.clone(),
-            input_digest: input.ceilings.input_digest.clone(),
-            admitted_at_unix_ms: input.admitted_at_unix_ms,
-            expires_at: input.grant_expires_at,
-            authority_epoch_json: input.authority_epoch_json.clone(),
-        }
-    }
-
-    /// Whether staged material still names this exact identity, including
-    /// the grant/artifact/input digests (preserved #2895 comparison).
-    #[must_use]
-    pub fn matches_material(&self, material: &ValidatedDispatchMaterial) -> bool {
-        self == &Self::from_material(material)
     }
 }
 
@@ -1288,11 +1302,16 @@ pub struct DeliveryClaim {
 impl DeliveryClaim {
     /// Claims the exact ready generation named by claim-first material.
     /// The material bound only because its envelope snapshot survived the
-    /// payload reads unchanged, so this claim is that pre-read identity.
+    /// payload reads unchanged, and `envelope_digest` is measured over those
+    /// exact bytes, so this claim is that pre-read identity — never a copy
+    /// derived after the fact from whatever the fixed names hold now.
     #[must_use]
-    pub fn from_material(material: &ValidatedDispatchMaterial) -> Self {
+    pub fn from_material(
+        material: &ValidatedDispatchMaterial,
+        envelope_digest: Sha256Digest,
+    ) -> Self {
         Self {
-            identity: StagedDeliveryIdentity::from_material(material),
+            identity: StagedDeliveryIdentity::from_material(material, envelope_digest),
         }
     }
 
@@ -1306,12 +1325,6 @@ impl DeliveryClaim {
     #[must_use]
     pub fn into_identity(self) -> StagedDeliveryIdentity {
         self.identity
-    }
-
-    /// Whether staged material still names the claimed generation.
-    #[must_use]
-    pub fn matches(&self, material: &ValidatedDispatchMaterial) -> bool {
-        self.identity.matches_material(material)
     }
 }
 
@@ -1489,28 +1502,32 @@ pub fn reclaim_claimed_file(
 ///
 /// The set pre-check re-reads the staged set through the claim-first
 /// loader and compares the full identity (claim, operation, generation,
-/// nonce, grant/fence, digests, window, epoch); anything else is a
-/// replacement left untouched. Each removal then re-verifies on its own:
-/// the fixed name is renamed aside under the claimed-identity name and
-/// only aside bytes that still verify against the claim are deleted, so
-/// a replacement B landing after the pre-check is restored, never
-/// deleted. A matching readable served marker is required before reclaim:
-/// absent or uncertain served state leaves the claimed bytes for recovery.
-/// No single-owner condition is asserted — the owner publisher
-/// stages replacements and retires expired sets concurrently by design —
-/// which is exactly why every deletion re-verifies after the move.
-/// Residual windows: the Unix restore path without hard-link support
-/// (see `restore_aside_if_absent`), and a crash between rename-aside
-/// and restore/delete orphaning one aside (removed on the next reclaim;
-/// the fixed set heals on the owner's next publication). The sibling
-/// kernel half fixes the analogous publisher-side race; coordination is
-/// by protocol (aside names never collide with publisher partials).
+/// nonce, grant/fence, digests, window, epoch, material-set digest,
+/// installation binding); anything else is a replacement left untouched.
+/// Each removal then re-verifies on its own: the fixed name is renamed
+/// aside under the claimed-identity name and only aside bytes that still
+/// verify against the claim are deleted, so a replacement B landing after
+/// the pre-check is restored, never deleted. The envelope check re-hashes
+/// the claimed aside bytes against the material-set digest recorded when
+/// this claim was taken, so a replacement envelope that merely carries the
+/// same typed field values is never deleted either. A matching readable
+/// served marker is required before reclaim: absent or uncertain served
+/// state leaves the claimed bytes for recovery. No single-owner condition
+/// is asserted — the owner publisher stages replacements and retires
+/// expired sets concurrently by design — which is exactly why every
+/// deletion re-verifies after the move. Residual windows: the Unix restore
+/// path without hard-link support (see `restore_aside_if_absent`), and a
+/// crash between rename-aside and restore/delete orphaning one aside
+/// (removed on the next reclaim; the fixed set heals on the owner's next
+/// publication). The sibling kernel half fixes the analogous
+/// publisher-side race; coordination is by protocol (aside names never
+/// collide with publisher partials).
 #[must_use]
 pub fn reclaim_claimed_delivery(
     claim: &DeliveryClaim,
     install_dir: &std::path::Path,
 ) -> ClaimedReclamation {
-    let staged = match read_dispatch_material_from(install_dir) {
+    let staged = match read_claimed_dispatch_material_from(install_dir) {
         Ok(Some(current)) => current,
         Ok(None) => {
             return ClaimedReclamation::AlreadyGone {
@@ -1523,7 +1540,7 @@ pub fn reclaim_claimed_delivery(
             };
         }
     };
-    if !claim.matches(&staged) {
+    if staged.0.identity() != claim.identity() {
         return ClaimedReclamation::ReplacementPreserved {
             claimed: claim.identity().clone(),
         };
@@ -1553,10 +1570,7 @@ pub fn reclaim_claimed_delivery(
         install_dir,
         WASM_HOST_MATERIAL_FILE_NAME,
         identity,
-        |bytes| match parse_envelope(bytes) {
-            Ok(input) => StagedDeliveryIdentity::from_input(&input) == *identity,
-            Err(_) => false,
-        },
+        |bytes| Sha256Digest::of_bytes(bytes) == identity.envelope_digest,
     );
     // Any preserved file means a replacement owns the fixed names now:
     // already-removed files were exactly-claimed verified bytes, and the
@@ -1601,15 +1615,277 @@ pub fn reclaim_claimed_delivery(
     })
 }
 
+/// Requires one owner-recorded field to be a well-formed lowercase digest.
+/// Shape only: the owner measured these values, so nothing is recomputed
+/// here and no digest is trusted for a decision it did not record.
+fn require_owner_digest(value: &str, field: &'static str) -> Result<(), MaterialError> {
+    hex_digest(value, field).map(|_digest| ())
+}
+
+/// Owner-issued delivery-set identity as the owner recorded it in a
+/// generation slot marker (#2786 steps 1/3/7). Wire mirror of
+/// `eliot_kernel_service::WasmDeliveryIdentity`, field for field and
+/// version for version; the owner publisher stays the sole issuer and
+/// this struct never generates a value. Marker bodies and owner failure
+/// reasons are never echoed to a caller.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerDeliveryIdentity {
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Claiming generation (non-zero).
+    pub generation: u64,
+    /// Claim-bound launch nonce.
+    pub launch_nonce: String,
+    /// Owner-issued grant digest (hex).
+    pub grant_digest: String,
+    /// Grant fence generation.
+    pub fence_generation: u64,
+    /// Re-proven artifact digest (hex).
+    pub artifact_digest: String,
+    /// Re-proven input digest (hex).
+    pub input_digest: String,
+    /// Durable admission time in Unix milliseconds.
+    pub admitted_at_unix_ms: u64,
+    /// Grant expiry in Unix milliseconds.
+    pub expires_at: u64,
+    /// Canonical live-authority-epoch JSON bound at admission.
+    pub authority_epoch_json: String,
+    /// Delivery-identity wire version the owner issued.
+    pub delivery_version: u16,
+    /// Owner-measured material-set digest of the staged envelope (hex).
+    pub envelope_digest: String,
+    /// Owner-measured installed child image digest (hex).
+    pub host_artifact_digest: String,
+    /// Owner publication incarnation.
+    pub publication_incarnation: u64,
+    /// Owner publication revision.
+    pub publication_revision: u64,
+}
+
+impl OwnerDeliveryIdentity {
+    /// Whether this owner record names exactly the claimed delivery.
+    /// Compared field-for-field against the values the owner recorded,
+    /// never recomputed from what the child happens to hold: a matching
+    /// pathname or a well-formed token is not a match.
+    #[must_use]
+    pub fn names(&self, claim: &StagedDeliveryIdentity) -> bool {
+        self.claim_id == claim.claim_id
+            && self.operation_id == claim.operation_id
+            && self.generation == claim.generation
+            && self.launch_nonce == claim.launch_nonce
+            && self.grant_digest == claim.grant_digest
+            && self.fence_generation == claim.fence_generation
+            && self.artifact_digest == claim.artifact_digest
+            && self.input_digest == claim.input_digest
+            && self.admitted_at_unix_ms == claim.admitted_at_unix_ms
+            && self.expires_at == claim.expires_at
+            && self.authority_epoch_json == claim.authority_epoch_json
+            && self.envelope_digest == claim.envelope_digest.as_str()
+            && self.host_artifact_digest == claim.host_artifact_digest.as_str()
+    }
+
+    /// Rejects a record the owner could not have issued under the mirrored
+    /// version: an unknown identity version, a zero generation or
+    /// publication revision, an empty window, or a malformed digest. A
+    /// record that fails here is never reinterpreted under this version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaterialError`] when any field fails shape validation.
+    fn validate(&self) -> Result<(), MaterialError> {
+        if self.delivery_version != WASM_DELIVERY_IDENTITY_VERSION {
+            return Err(MaterialError::Malformed);
+        }
+        require_nonblank(&self.claim_id, "owner-delivery-claim-id")?;
+        require_nonblank(&self.operation_id, "owner-delivery-operation-id")?;
+        require_nonblank(&self.launch_nonce, "owner-delivery-launch-nonce")?;
+        require_nonblank(&self.authority_epoch_json, "owner-delivery-authority-epoch")?;
+        if self.generation == 0
+            || self.publication_incarnation == 0
+            || self.publication_revision == 0
+            || self.admitted_at_unix_ms == 0
+            || self.expires_at <= self.admitted_at_unix_ms
+        {
+            return Err(MaterialError::Malformed);
+        }
+        require_owner_digest(&self.grant_digest, "owner-delivery-grant-digest")?;
+        require_owner_digest(&self.artifact_digest, "owner-delivery-artifact-digest")?;
+        require_owner_digest(&self.input_digest, "owner-delivery-input-digest")?;
+        require_owner_digest(&self.envelope_digest, "owner-delivery-envelope-digest")?;
+        require_owner_digest(
+            &self.host_artifact_digest,
+            "owner-delivery-host-artifact-digest",
+        )?;
+        Ok(())
+    }
+}
+
+/// Owner publication state for one generation slot (#2786 steps 2/3/7):
+/// wire mirror of `eliot_kernel_service::WasmPublicationState`. The owner
+/// writes `PENDING` before staging payloads, the ready marker last, and
+/// `FAILED` with recovery evidence when staging fails, so a slot without a
+/// ready marker is never a complete set. The failure reason is retained
+/// here for shape only and never echoed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum OwnerPublicationState {
+    /// Publication started; the immutable set is not yet complete.
+    Pending {
+        /// Publishing delivery identity.
+        identity: OwnerDeliveryIdentity,
+    },
+    /// Immutable slot set complete under this identity.
+    Ready {
+        /// Published delivery identity.
+        identity: OwnerDeliveryIdentity,
+    },
+    /// Publication failed; the retained identity is recovery evidence.
+    Failed {
+        /// Failed delivery identity.
+        identity: OwnerDeliveryIdentity,
+        /// Stable owner failure reason. Parsed for shape and deliberately
+        /// not retained: the reason is owner recovery evidence the child
+        /// never interprets and never echoes.
+        #[serde(rename = "reason")]
+        _reason: String,
+    },
+}
+
+impl OwnerPublicationState {
+    /// Borrows the identity this state was recorded under.
+    #[must_use]
+    pub fn identity(&self) -> &OwnerDeliveryIdentity {
+        match self {
+            Self::Pending { identity }
+            | Self::Ready { identity }
+            | Self::Failed { identity, .. } => identity,
+        }
+    }
+
+    /// Stable owner state code, mirrored from the publisher.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Pending { .. } => "DELIVERY_PENDING",
+            Self::Ready { .. } => "DELIVERY_READY",
+            Self::Failed { .. } => "DELIVERY_FAILED",
+        }
+    }
+
+    /// Whether the owner recorded the immutable set complete.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Whether this owner state names exactly the claimed delivery.
+    #[must_use]
+    pub fn names(&self, claim: &StagedDeliveryIdentity) -> bool {
+        self.identity().names(claim)
+    }
+
+    /// Validates the recorded identity under the mirrored version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaterialError`] when the recorded identity is malformed
+    /// or carries an unsupported version.
+    fn validate(&self) -> Result<(), MaterialError> {
+        self.identity().validate()
+    }
+}
+
+/// Immutable slot locator for one claimed delivery, derived exactly as the
+/// owner publisher derives it: zero-padded generation plus the leading
+/// material-set digest. The directory is only a locator; the identity in
+/// the marker is what authorizes anything, and the digest used here comes
+/// from the claim rather than from any owner input.
+fn delivery_slot_dir(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+) -> std::path::PathBuf {
+    let digest = claim.envelope_digest.as_str();
+    let prefix = digest.get(..16).unwrap_or(digest);
+    install_dir
+        .join(WASM_DELIVERY_SLOT_DIR_NAME)
+        .join(format!("{:020}-{prefix}", claim.generation))
+}
+
+/// Reads the owner publication state for the claimed generation's slot.
+///
+/// Restart discovers owner publication state here, not arbitrary files
+/// alone: the marker is looked up by the claim's own generation and
+/// material-set digest, and a marker naming another delivery is reported
+/// as such rather than treated as this claim's evidence. The owner's
+/// precedence is mirrored exactly — ready, then failed, then pending — so a
+/// slot that both failed and kept its pending marker reports the failure.
+/// A slot with no parsable marker is not a state at all, never a complete
+/// set.
+///
+/// `Ok(None)` means the owner recorded no publication for this delivery:
+/// the legacy v1 fixed-name compatibility state, which the caller admits
+/// only under full admission with the staged identity verbatim.
+///
+/// # Errors
+///
+/// Returns [`MaterialError`] when a marker is oversized, unreadable,
+/// malformed, or records an identity the owner could not have issued
+/// under the mirrored version.
+pub fn read_delivery_publication(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+) -> Result<Option<OwnerPublicationState>, MaterialError> {
+    let slot = delivery_slot_dir(install_dir, claim);
+    for file_name in [
+        WASM_DELIVERY_READY_FILE_NAME,
+        WASM_DELIVERY_FAILED_FILE_NAME,
+        WASM_DELIVERY_PENDING_FILE_NAME,
+    ] {
+        let bytes = match read_staged_bytes(&slot.join(file_name)) {
+            Err(MaterialError::Missing) => continue,
+            Err(error) => return Err(error),
+            Ok(bytes) => bytes,
+        };
+        let state: OwnerPublicationState =
+            serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+        // A marker whose payload does not name the file it was read from
+        // is refused rather than trusted: the owner writes exactly one
+        // state per marker name.
+        let expected = matches!(
+            (&state, file_name),
+            (
+                OwnerPublicationState::Ready { .. },
+                WASM_DELIVERY_READY_FILE_NAME
+            ) | (
+                OwnerPublicationState::Failed { .. },
+                WASM_DELIVERY_FAILED_FILE_NAME
+            ) | (
+                OwnerPublicationState::Pending { .. },
+                WASM_DELIVERY_PENDING_FILE_NAME
+            )
+        );
+        if !expected {
+            return Err(MaterialError::Malformed);
+        }
+        state.validate()?;
+        return Ok(Some(state));
+    }
+    Ok(None)
+}
+
 /// Restart/discovery classification (#2786 step 7): restart discovers owner
-/// publication/claim state through staged identity plus durable retention,
-/// not arbitrary files alone. Legacy v1 fixed-name sets are an explicit
-/// compatibility state — consumed only under full admission with the staged
-/// identity verbatim, never reinterpreted as a fresh generation with new
-/// identity. `InFlight` sets reconcile through the durable pre-execution
-/// claim marker and terminal-unacknowledged sets through the durable
-/// served marker; cross-operation owner ack/retirement stays with the
-/// kernel publisher half.
+/// publication/claim state through the owner's own generation-slot marker
+/// ([`read_delivery_publication`]) plus durable retention, not arbitrary
+/// files alone. Legacy v1 fixed-name sets are an explicit compatibility
+/// state — a staged set with no owner slot record, consumed only under full
+/// admission with the staged identity verbatim, never reinterpreted as a
+/// fresh generation with new identity. `InFlight` sets reconcile through the
+/// durable pre-execution claim marker and terminal-unacknowledged sets
+/// through the durable served marker; cross-operation owner
+/// ack/retirement stays with the kernel publisher half.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StagedDeliveryState {
     /// Staged set matches served state: replay, no second guest effect.
@@ -1618,42 +1894,53 @@ pub enum StagedDeliveryState {
     LegacyV1FixedName { identity: StagedDeliveryIdentity },
 }
 
-/// Classifies staged material against served retention. Same identity — or
-/// the same grant digest under any differing generation/operation/digests —
-/// is a replay of spent one-shot authority, never a fresh execution. The
-/// served set carries every identity this drive served, so an older grant
-/// re-staged after a newer serve still replays instead of re-executing. The
-/// durable markers extend the same rule across restart: a staged set the
-/// served marker names is terminal-unacknowledged (a crash between publish
-/// and reclaim), and a staged set the `InFlight` marker names was claimed for
-/// execution (a crash between claim and served durability), so both replay
-/// instead of re-executing.
+/// Classifies the claimed staged delivery against served retention. Same
+/// identity — or the same grant digest under any differing
+/// generation/operation/digests — is a replay of spent one-shot authority,
+/// never a fresh execution. The served set carries every identity this drive
+/// served, so an older grant re-staged after a newer serve still replays
+/// instead of re-executing. The durable markers extend the same rule across
+/// restart: a staged set the served marker names is terminal-unacknowledged
+/// (a crash between publish and reclaim), and a staged set the `InFlight`
+/// marker names was claimed for execution (a crash between claim and served
+/// durability), so both replay instead of re-executing.
+///
+/// The classification reads the claim taken before the payload bytes were
+/// trusted, never a re-derivation from whatever the fixed names hold at
+/// classification time.
 #[must_use]
 pub fn classify_staged_delivery(
-    material: &ValidatedDispatchMaterial,
+    identity: &StagedDeliveryIdentity,
     served: &[StagedDeliveryIdentity],
     marker: Option<&ServedDeliveryMarker>,
     inflight: Option<&InFlightDeliveryMarker>,
 ) -> StagedDeliveryState {
-    let identity = StagedDeliveryIdentity::from_material(material);
-    if served.contains(&identity)
+    if served.contains(identity)
         || served
             .iter()
             .any(|prior| prior.grant_digest == identity.grant_digest)
     {
-        return StagedDeliveryState::Replay { identity };
+        return StagedDeliveryState::Replay {
+            identity: identity.clone(),
+        };
     }
     if let Some(mark) = inflight
-        && (mark.names(&identity) || mark.grant_digest == identity.grant_digest)
+        && (mark.names(identity) || mark.grant_digest == identity.grant_digest)
     {
-        return StagedDeliveryState::Replay { identity };
+        return StagedDeliveryState::Replay {
+            identity: identity.clone(),
+        };
     }
     match marker {
-        Some(mark) if mark.names(&identity) => StagedDeliveryState::Replay { identity },
-        Some(mark) if mark.grant_digest == identity.grant_digest => {
-            StagedDeliveryState::Replay { identity }
-        }
-        _ => StagedDeliveryState::LegacyV1FixedName { identity },
+        Some(mark) if mark.names(identity) => StagedDeliveryState::Replay {
+            identity: identity.clone(),
+        },
+        Some(mark) if mark.grant_digest == identity.grant_digest => StagedDeliveryState::Replay {
+            identity: identity.clone(),
+        },
+        _ => StagedDeliveryState::LegacyV1FixedName {
+            identity: identity.clone(),
+        },
     }
 }
 
@@ -2325,15 +2612,21 @@ fn parse_envelope(bytes: &[u8]) -> Result<DispatchMaterialInput, MaterialError> 
 
 /// Reads and validates one staged dispatch material set from the install
 /// directory, claim-first: the small envelope file (claim/identity plus
-/// digests) is snapshotted and parsed BEFORE the payload files read, the
-/// payload digests re-hash against that pre-read claim at bind, and the
-/// envelope is re-read and confirmed byte-identical before anything
-/// binds. The fixed names are dumb locators; the pre-read claim selects
-/// the operation. A missing envelope is `Ok(None)` — the caller keeps its
+/// digests) is snapshotted, hashed, and parsed BEFORE the payload files
+/// read, the payload digests re-hash against that pre-read claim at bind,
+/// and the envelope is re-read and confirmed byte-identical before anything
+/// binds. The fixed names are dumb locators; the pre-read claim selects the
+/// operation. A missing envelope is `Ok(None)` — the caller keeps its
 /// fail-closed path; anything present but invalid, or an envelope that
 /// moved during the payload reads, fails closed and never executes.
 /// Identical payload bytes across generations are why the envelope
 /// re-confirm exists: digests alone cannot tell them apart.
+///
+/// The claim-first reader
+/// ([`read_claimed_dispatch_material_from`]) owns the read, because the
+/// pre-read material-set digest it measures is part of the claim this
+/// reader's callers must later re-verify; this entry point is that reader
+/// without the claim.
 ///
 /// Honest residual — cases this ordering cannot exclude, by protocol, not
 /// by omission: no cross-process reservation or lease exists on the child
@@ -2353,25 +2646,8 @@ fn parse_envelope(bytes: &[u8]) -> Result<DispatchMaterialInput, MaterialError> 
 pub fn read_dispatch_material_from(
     install_dir: &std::path::Path,
 ) -> Result<Option<ValidatedDispatchMaterial>, MaterialError> {
-    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
-    let envelope_bytes = match read_staged_bytes(&material_path) {
-        Err(MaterialError::Missing) => return Ok(None),
-        Err(error) => return Err(error),
-        Ok(bytes) => bytes,
-    };
-    let mut input = parse_envelope(&envelope_bytes)?;
-    input.artifact_bytes =
-        read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))?;
-    input.input_bytes = read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))?;
-    // Envelope re-confirm BEFORE binding: a replacement staged during the
-    // payload reads aborts here, never executes — even when the payload
-    // bytes are identical across generations. Any drift, disappearance,
-    // or re-read fault is a torn set, never absence.
-    match read_staged_bytes(&material_path) {
-        Ok(current) if current == envelope_bytes => {}
-        _ => return Err(MaterialError::DigestMismatch),
-    }
-    bind_dispatch_material(input).map(Some)
+    read_claimed_dispatch_material_from(install_dir)
+        .map(|staged| staged.map(|(_, material)| material))
 }
 
 /// Reads staged dispatch material from the executable directory
@@ -2394,7 +2670,11 @@ pub fn read_dispatch_material() -> Result<Option<ValidatedDispatchMaterial>, Mat
 /// Claim-first read returning the pre-read claim with the material bound
 /// under it: one call, one snapshot, so the claim the loop serves and
 /// reclaims is the identity that selected the operation — never a copy
-/// derived after the fact from whatever the names happen to hold.
+/// derived after the fact from whatever the names happen to hold. The
+/// material-set digest in that claim is measured over the exact envelope
+/// bytes this read snapshotted, before the payload reads and before the
+/// envelope re-confirm, so every later comparison of the same fixed name
+/// re-hashes what it finds against that original value.
 ///
 /// # Errors
 ///
@@ -2402,8 +2682,30 @@ pub fn read_dispatch_material() -> Result<Option<ValidatedDispatchMaterial>, Mat
 pub fn read_claimed_dispatch_material_from(
     install_dir: &std::path::Path,
 ) -> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
-    read_dispatch_material_from(install_dir)
-        .map(|staged| staged.map(|material| (DeliveryClaim::from_material(&material), material)))
+    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+    let envelope_bytes = match read_staged_bytes(&material_path) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
+    };
+    let envelope_digest = Sha256Digest::of_bytes(&envelope_bytes);
+    let mut input = parse_envelope(&envelope_bytes)?;
+    input.artifact_bytes =
+        read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))?;
+    input.input_bytes = read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))?;
+    // Envelope re-confirm BEFORE binding: a replacement staged during the
+    // payload reads aborts here, never executes — even when the payload
+    // bytes are identical across generations. Any drift, disappearance,
+    // or re-read fault is a torn set, never absence.
+    match read_staged_bytes(&material_path) {
+        Ok(current) if current == envelope_bytes => {}
+        _ => return Err(MaterialError::DigestMismatch),
+    }
+    let material = bind_dispatch_material(input)?;
+    Ok(Some((
+        DeliveryClaim::from_material(&material, envelope_digest),
+        material,
+    )))
 }
 
 /// Claim-first read from the executable directory (`current_exe`, never
