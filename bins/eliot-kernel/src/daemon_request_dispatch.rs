@@ -6152,18 +6152,39 @@ impl KernelComposition {
             }
         };
         let gateway = self.retained_store_gateway()?;
+        let recovery_fence = operation.request.state_fence.clone();
         match gateway.recovery(operation.request).await {
             Ok(snapshot) => {
-                // Implements #1967 W4 (I1.11 step 6): the gateway returns
-                // only a validated same-fence snapshot (shape, fence, and
-                // record binding are checked inside `recovery`), so a
-                // successful recovery proves pending/unknown operations are
-                // reconciled before normal writes are enabled.
-                self.record_startup_evidence(6)
-                    .map_err(|_| TransportError::SessionFenced)?;
+                // Implements #1925 W3 (I1.11 step 6, I5.2): the Store snapshot
+                // alone does not prove that the ORS staged write envelopes are
+                // reconciled. The same route now runs the ORS pending-reservation
+                // reconciliation over the composition-bound ORS, revalidates
+                // every reported staged envelope through its owner, and reports
+                // the durable Recovery Problems a corrupted or unreadable staged
+                // payload leaves behind. Step 6 is recorded only when that scan
+                // is exhaustive and clean; an unresolved reservation, a retained
+                // problem, or a truncated scan keeps normal writes gated, and
+                // nothing is retried, decoded, or dropped to reach readiness.
+                let staged = match gateway
+                    .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
+                    .await
+                {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        return Ok(Self::store_error_response_text("store_recovery", &error));
+                    }
+                };
+                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready {
+                    // The Store snapshot is same-fence validated above and the
+                    // staged envelopes are reconciled under that same fence, so
+                    // both halves of step 6 now hold.
+                    self.record_startup_evidence(6)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                }
                 Ok(store_recovery_response(
                     &snapshot,
                     &self.process_stream_recovery_status_view(&stream_identities),
+                    &staged_write_recovery_view(&staged),
                 ))
             }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
@@ -6408,6 +6429,21 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
+        // Response-mode boundary (issue #1925, I5.5): `store.apply` is a
+        // wait-for-commit request — it carries no `response_mode`, returns the
+        // canonical `WriteReceipt`, and has no `accept_after_stage` form on this
+        // wire — so this route never observes or claims `ACCEPTED_PENDING`.
+        // That is not a weaker substitute for the reserved path: I5.2 forbids
+        // `accepted_pending` outright when ORS cannot durably stage the complete
+        // opaque operation, and no honest `ReservationSeed` payload producer
+        // exists for this composition yet (see the "Consequence for the write
+        // route" section of `eliot_kernel_service::store_write_reservation`).
+        // Until one does, the reserved envelope is not staged here, and the
+        // startup recovery owner above keeps the I1.11 step 6 gate honest about
+        // whatever ORS does hold. Routing this call through
+        // `KernelStoreGateway::apply_reserved` requires a real producer; calling
+        // it with invented protected bytes would stage a false `Encrypted`
+        // label, which I5.2 forbids.
         match gateway
             .apply(
                 &operation.context,
@@ -8458,17 +8494,19 @@ fn process_stream_recovery_load_disposition(
     }
 }
 
-/// Same-fence Store recovery answer, plus the ORS process-stream recovery view.
+/// Same-fence Store recovery answer, plus the ORS process-stream recovery view
+/// and the ORS staged write recovery view.
 ///
-/// The extra `process_stream_recovery` member is a SIBLING of `kind`/`value`
-/// inside the typed application object, so the retained daemon client's
-/// `kind_value` reader — which resolves `kind` then `value` by name — keeps
-/// decoding the identical `StoreRecoverySnapshot` it always did. It is explicit
+/// Both extra members are SIBLINGS of `kind`/`value` inside the typed
+/// application object, so the retained daemon client's `kind_value` reader —
+/// which resolves `kind` then `value` by name — keeps decoding the identical
+/// `StoreRecoverySnapshot` it always did. `process_stream_recovery` is explicit
 /// `null` when the request selected no operation (I5.16: a field that does not
 /// apply stays explicit `None`), never omitted, so the answer shape is stable.
 fn store_recovery_response(
     snapshot: &StoreRecoverySnapshot,
     process_stream_recovery: &serde_json::Value,
+    staged_write_recovery: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
@@ -8476,8 +8514,149 @@ fn store_recovery_response(
             "kind": "store_recovery",
             "value": snapshot,
             "process_stream_recovery": process_stream_recovery,
+            "staged_write_recovery": staged_write_recovery,
         },
         "recovery": null,
+    })
+}
+
+/// Projects the ORS staged write recovery report for the daemon (issue #1925,
+/// I5.2/I5.6).
+///
+/// Diagnostic projection of owner-validated state only. The staged payload
+/// bytes are never read, decoded, or carried here: each envelope appears as the
+/// operation identity it was enumerated under, its lifecycle state, and the
+/// integrity bindings the owner already validated. The reservation digest is
+/// the owner's own scan digest, and `readiness` is the same verdict that gates
+/// I1.11 step 6, so an operator reads the gate's actual state rather than a
+/// derived claim about it.
+fn staged_write_recovery_view(
+    staged: &eliot_kernel_service::StagedWriteRecovery,
+) -> serde_json::Value {
+    let reservations = &staged.reservations;
+    let envelopes: Vec<serde_json::Value> = staged
+        .envelopes
+        .iter()
+        .map(|envelope| {
+            serde_json::json!({
+                "operation_id": envelope.operation_id,
+                "reservation_order": envelope.reservation_order,
+                "state": reservation_state_label(envelope.state),
+                "contract_version": envelope.contract_version,
+                "payload_kind": envelope.payload_kind,
+                "payload_sha256": envelope.payload_sha256,
+                "payload_length": envelope.payload_length,
+                "authority_epoch": {
+                    "lineage_id": envelope.authority_epoch_lineage,
+                    "epoch": envelope.authority_epoch_sequence,
+                },
+                "state_fence_sha256": envelope.state_fence_sha256,
+            })
+        })
+        .collect();
+    let problems: Vec<serde_json::Value> = staged
+        .problems
+        .iter()
+        .map(|problem| {
+            serde_json::json!({
+                "operation_id": problem.operation_id,
+                "reservation_order": problem.reservation_order,
+                "reason": problem.reason,
+            })
+        })
+        .collect();
+    let retained_problems: Vec<serde_json::Value> = staged
+        .retained_problems
+        .iter()
+        .map(|problem| {
+            // Bound outside the `json!` literal: the macro would otherwise wrap
+            // each accessor in a redundant closure.
+            let operation_id = problem.operation_or_checkpoint_id.as_str();
+            let reservation_id = problem
+                .reservation_id
+                .as_ref()
+                .map(eliot_ors::OpaqueLabel::as_str);
+            let detail = problem.detail.as_str();
+            let recovery_owner = problem.recovery_owner.as_str();
+            serde_json::json!({
+                "operation_id": operation_id,
+                "reservation_id": reservation_id,
+                "kind": recovery_problem_kind_label(problem.kind),
+                "detail": detail,
+                "payload_sha256": problem.payload_sha256,
+                "envelope_sha256": problem.envelope_sha256,
+                "recovery_owner": recovery_owner,
+                "resolved": problem.is_resolved(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "scan_source": reservations.scan_source,
+        "fence": reservations.fence,
+        "digest": reservations.digest,
+        "scanned": reservations.scanned,
+        "scan_limit": reservations.scan_limit,
+        "cursor_start_after_order": reservations.cursor_start_after_order,
+        "last_reservation_order": reservations.last_reservation_order,
+        "next_after_order": reservations.next_after_order,
+        "truncated": reservations.truncated,
+        "pending": reservations.pending.iter().map(startup_pending_view).collect::<Vec<_>>(),
+        "unknown": reservations.unknown.iter().map(startup_unknown_view).collect::<Vec<_>>(),
+        "envelopes": envelopes,
+        "envelope_problems": problems,
+        "retained_problems": retained_problems,
+        "readiness": match staged.readiness() {
+            eliot_kernel_service::StagedWriteReadiness::Ready => "ready",
+            eliot_kernel_service::StagedWriteReadiness::Blocked => "blocked",
+        },
+    })
+}
+
+/// Fixed lifecycle label for one recovered reservation state.
+fn reservation_state_label(state: eliot_ors::ReservationState) -> &'static str {
+    match state {
+        eliot_ors::ReservationState::Reserved => "reserved",
+        eliot_ors::ReservationState::Eligible => "eligible",
+        eliot_ors::ReservationState::Executing => "executing",
+        eliot_ors::ReservationState::Reconciling => "reconciling",
+        eliot_ors::ReservationState::Finalized => "finalized",
+        eliot_ors::ReservationState::Released => "released",
+    }
+}
+
+/// Fixed label for one durable Recovery Problem kind.
+fn recovery_problem_kind_label(kind: eliot_ors::RecoveryProblemKind) -> &'static str {
+    match kind {
+        eliot_ors::RecoveryProblemKind::HashMismatch => "hash-mismatch",
+        eliot_ors::RecoveryProblemKind::EnvelopeIntegrity => "envelope-integrity",
+        eliot_ors::RecoveryProblemKind::MissingKey => "missing-key",
+        eliot_ors::RecoveryProblemKind::DecryptionFailure => "decryption-failure",
+    }
+}
+
+fn startup_pending_view(
+    operation: &eliot_kernel_service::StartupPendingOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": operation.operation_id,
+        "reservation_order": operation.reservation_order,
+        "scopes": operation.scopes,
+        "state": reservation_state_label(operation.state),
+        "recovery_owner": operation.recovery_owner,
+        "reason": operation.reason,
+    })
+}
+
+fn startup_unknown_view(
+    operation: &eliot_kernel_service::StartupUnknownOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": operation.operation_id,
+        "reservation_order": operation.reservation_order,
+        "scopes": operation.scopes,
+        "state": reservation_state_label(operation.state),
+        "recovery_owner": operation.recovery_owner,
+        "reason": operation.reason,
     })
 }
 

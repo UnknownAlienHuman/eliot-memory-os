@@ -90,6 +90,46 @@
 //! under a Blob lineage the Kernel does not own. Rather than invent a
 //! provider, a key id, or a cipher, [`gateway_seed`] refuses.
 //!
+//! ### Consequence for the write route (issue #1925, W3)
+//!
+//! I5.2 offers exactly two honest shapes for the staged payload — real
+//! ciphertext under a resolved installation-secret key reference, or an
+//! immutable local payload locator whose bytes some owner already holds — and
+//! this composition has neither:
+//!
+//! ```text
+//! RecoveryPayload::Encrypted        blocked: no installation secret owner
+//! RecoveryPayload::ImmutableLocator blocked: no ORS- or Kernel-owned
+//!                                   immutable local staging location exists,
+//!                                   and ORS publishes no path to create one
+//! RecoveryPayload::CanonicalRequest not applicable: ORS reserves it for one
+//!                                   root-transition commit (model.rs
+//!                                   RecoveryPayloadEnvelope::validate and
+//!                                   RedbRecoveryStore::mutate_operational)
+//! ```
+//!
+//! So the reserved write route has no production producer, and the live
+//! canonical write cannot stage its recovery envelope: no caller can supply
+//! [`ReservationSeed`] bytes that ORS would not be told a false thing about.
+//! `accept_after_stage` is therefore *not* available on the live daemon write
+//! boundary, which is the correct fail-closed reading of I5.2 ("if ORS cannot
+//! durably stage the complete opaque operation, `accepted_pending` is
+//! forbidden") rather than a weaker check on a weaker payload. Wiring the
+//! producer needs one of the two missing owners, not a second encoding here.
+//!
+//! ## Startup recovery over the same envelopes
+//!
+//! [`reconcile_staged_writes_at_startup`] is the read side of the envelope
+//! [`reserve_for_transition`] stages, and it is the I1.11 step 6 owner for it:
+//! every unresolved reservation is enumerated by operation identity, observed
+//! against its exact canonical Store receipt, and revalidated through
+//! [`RedbRecoveryStore::verify_staged_envelope`]. A corrupted or unreadable
+//! staged payload keeps a durable [`eliot_ors::RecoveryProblem`] and stays
+//! available for disposition; nothing is decoded, re-hashed, defaulted to
+//! plaintext, or deleted, and an unresolved reservation is never retried or
+//! force-released. It runs whether or not a producer exists, because the ORS
+//! rows it reads outlive the process that wrote them.
+//!
 //! ## Send ordering (no orphaned tokens)
 //!
 //! ```text
@@ -1808,5 +1848,230 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
         pending,
         unknown,
         truncated: scan.truncated,
+    })
+}
+
+/// Fixed payload-shape label for one owner-validated staged envelope.
+///
+/// The `Encrypted` and `ImmutableLocator` labels are restated from the shape ORS
+/// itself holds; `canonical-request` is unreachable for a reservation envelope
+/// (I5.2 admits only the key/ciphertext or immutable-locator form there) and is
+/// named only so this projection stays total instead of silently reclassifying
+/// an unexpected shape.
+fn staged_payload_kind(payload: &eliot_ors::RecoveryPayload) -> &'static str {
+    match payload {
+        eliot_ors::RecoveryPayload::Encrypted { .. } => "encrypted",
+        eliot_ors::RecoveryPayload::ImmutableLocator { .. } => "immutable-locator",
+        eliot_ors::RecoveryPayload::CanonicalRequest { .. } => "canonical-request",
+    }
+}
+
+/// One staged `RecoveryPayloadEnvelope` enumerated by the startup recovery scan
+/// (issue #1925, I5.2/I5.6).
+///
+/// A reference to owner-validated evidence, never a payload: the staged bytes
+/// stay inside ORS and are not read, copied, decoded, or returned here. The
+/// reported `payload_sha256`/`payload_length` are the envelope's OWN recorded
+/// bindings, restated only after the owner decoded the envelope, compared its
+/// identity against the requested operation, and ran
+/// `RecoveryPayloadEnvelope::validate` over the recorded payload and recorded
+/// digest. Nothing is re-hashed here, so this projection can never replace the
+/// recorded integrity proof with a fresh checksum of what the reader holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupStagedEnvelope {
+    /// Operation identity the envelope was enumerated and validated under.
+    pub operation_id: String,
+    /// ORS-assigned reservation order of the owning reservation.
+    pub reservation_order: u64,
+    /// Lifecycle state the reconciliation scan observed for that reservation.
+    pub state: ReservationState,
+    /// Envelope contract version the owner validated.
+    pub contract_version: u16,
+    /// Fixed payload-shape label (`encrypted` or `immutable-locator`).
+    pub payload_kind: &'static str,
+    /// Owner-recorded integrity digest of the staged payload.
+    pub payload_sha256: String,
+    /// Owner-recorded length of the staged payload.
+    pub payload_length: u64,
+    /// Authority-epoch lineage the envelope is bound to.
+    pub authority_epoch_lineage: String,
+    /// Authority-epoch sequence the envelope is bound to.
+    pub authority_epoch_sequence: u64,
+    /// State-fence digest the envelope is bound to.
+    pub state_fence_sha256: String,
+}
+
+/// One staged operation whose envelope could not be validated at startup.
+///
+/// I5.2 requires a durable Recovery Problem here, never plaintext fallback and
+/// never silent deletion: ORS retained one before returning
+/// `RecoveryProblemRetained`, and the staged record stays available for
+/// disposition. `reason` uses a fixed vocabulary so the report stays a bounded
+/// diagnostic, not an error log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupEnvelopeProblem {
+    /// Operation identity whose staged envelope failed validation.
+    pub operation_id: String,
+    /// ORS-assigned reservation order of the owning reservation.
+    pub reservation_order: u64,
+    /// Fixed-vocabulary cause (`recovery-problem-retained`).
+    pub reason: &'static str,
+}
+
+/// Bounded startup verdict over the staged write envelopes (I1.11 step 6,
+/// I5.2/I5.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagedWriteReadiness {
+    /// Every enumerated staged envelope validated by hash, every reservation
+    /// reached its canonical receipt, and no Recovery Problem is retained.
+    Ready,
+    /// A reservation is unresolved, a staged envelope failed validation, a
+    /// Recovery Problem is retained, or the bounded scan did not reach
+    /// exhaustion. Normal writes stay gated until exact reconciliation or an
+    /// explicit disposition.
+    Blocked,
+}
+
+/// Bounded startup recovery report over the durable staged write envelopes
+/// (issue #1925, I5.2/I5.6).
+///
+/// This is the read side of the same envelope the reserved write route stages:
+/// every operation the scan left unresolved is re-enumerated by identity, its
+/// envelope is revalidated by the owner, and its outcome is either a canonical
+/// receipt (closed inside [`reconcile_pending_at_startup`]) or a visible
+/// Recovery Problem. It adds no payload decoding, no second state owner, and no
+/// expiry: a retained problem and an unresolved reservation both stay exactly
+/// as ORS holds them.
+#[derive(Clone, Debug)]
+pub struct StagedWriteRecovery {
+    /// Reservation-level reconciliation, including its exact scan digest.
+    pub reservations: StartupReconciliation,
+    /// Staged envelopes the scan enumerated and the owner validated by hash.
+    pub envelopes: Vec<StartupStagedEnvelope>,
+    /// Operations whose staged envelope failed validation.
+    pub problems: Vec<StartupEnvelopeProblem>,
+    /// Every durable Recovery Problem ORS retains, in operation-identity order.
+    pub retained_problems: Vec<eliot_ors::RecoveryProblem>,
+}
+
+impl StagedWriteRecovery {
+    /// Returns the step-6 verdict for the staged envelopes and their
+    /// reservations.
+    ///
+    /// A bounded scan that stopped early is `Blocked`: a partial read has not
+    /// proven anything about the rows it did not reach, so it can never certify
+    /// readiness.
+    #[must_use]
+    pub fn readiness(&self) -> StagedWriteReadiness {
+        if self.reservations.readiness() == StartupReconciliationReadiness::Ready
+            && self.problems.is_empty()
+            && self
+                .retained_problems
+                .iter()
+                .all(eliot_ors::RecoveryProblem::is_resolved)
+        {
+            StagedWriteReadiness::Ready
+        } else {
+            StagedWriteReadiness::Blocked
+        }
+    }
+}
+
+/// Enumerates and reconciles the durable staged write envelopes at startup
+/// (issue #1925, I1.11 step 6, I5.2/I5.6).
+///
+/// Three owner-scoped reads, all over the composition-bound ORS and the exact
+/// Store the writer used:
+///
+/// ```text
+/// reconcile_pending_at_startup  -> each unresolved reservation is observed by
+///                                  exact operation identity and either closed
+///                                  by its canonical receipt or reported
+///                                  pending/unknown (never force-released);
+/// verify_staged_envelope        -> each reported operation's envelope is
+///                                  re-read and revalidated by the owner, and a
+///                                  failure leaves a durable Recovery Problem;
+/// list_recovery_problems        -> every retained problem is reported so a
+///                                  staged payload stays visible for
+///                                  disposition instead of being dropped.
+/// ```
+///
+/// A failed check is an error, never a synthetic empty report: an unreadable
+/// ORS, an undecodable envelope that is not already a retained problem, or a
+/// transport failure of a receipt lookup all propagate, so the caller keeps
+/// step 6 incomplete rather than claiming a clean scan.
+///
+/// Bounds: `limit` is the whole-scan ceiling for both the reservation scan and
+/// the retained-problem listing, exactly as in
+/// [`reconcile_pending_at_startup`]. Nothing here interprets a payload, resolves
+/// a key, or deletes a staged record.
+pub async fn reconcile_staged_writes_at_startup<T: EbpStoreTransport + 'static>(
+    owner: &CompositionReservation,
+    fence: &StateFence,
+    store: &EbpCanonicalStoreClient<T>,
+    limit: u16,
+) -> Result<StagedWriteRecovery, ReservationWriteError> {
+    let reservations = reconcile_pending_at_startup(owner, fence, store, limit).await?;
+    let mut envelopes = Vec::new();
+    let mut problems = Vec::new();
+    // Pending and unknown are the same operation population read from the two
+    // report vectors, so the envelope pass visits each identity once.
+    let unresolved = reservations
+        .pending
+        .iter()
+        .map(|entry| {
+            (
+                entry.operation_id.as_str(),
+                entry.reservation_order,
+                entry.state,
+            )
+        })
+        .chain(reservations.unknown.iter().map(|entry| {
+            (
+                entry.operation_id.as_str(),
+                entry.reservation_order,
+                entry.state,
+            )
+        }));
+    for (operation_id, reservation_order, state) in unresolved {
+        let identity =
+            OrsOperationIdentity::new(operation_id).map_err(ReservationWriteError::Ors)?;
+        match owner.ors.verify_staged_envelope(&identity) {
+            Ok(envelope) => envelopes.push(StartupStagedEnvelope {
+                operation_id: operation_id.to_owned(),
+                reservation_order,
+                state,
+                contract_version: envelope.contract_version,
+                payload_kind: staged_payload_kind(&envelope.payload),
+                payload_sha256: envelope.payload_sha256,
+                payload_length: envelope.payload_length,
+                authority_epoch_lineage: envelope
+                    .authority_epoch
+                    .current
+                    .lineage_id
+                    .as_str()
+                    .to_owned(),
+                authority_epoch_sequence: envelope.authority_epoch.current.epoch,
+                state_fence_sha256: envelope.state_fence.sha256,
+            }),
+            // The owner already retained a durable Recovery Problem for this
+            // staged operation; the record stays available for disposition and
+            // is reported instead of being read, replaced, or dropped here.
+            Err(eliot_ors::OrsError::RecoveryProblemRetained { .. }) => {
+                problems.push(StartupEnvelopeProblem {
+                    operation_id: operation_id.to_owned(),
+                    reservation_order,
+                    reason: "recovery-problem-retained",
+                });
+            }
+            Err(error) => return Err(ReservationWriteError::Ors(error)),
+        }
+    }
+    let retained_problems = owner.ors.list_recovery_problems(limit)?;
+    Ok(StagedWriteRecovery {
+        reservations,
+        envelopes,
+        problems,
+        retained_problems,
     })
 }
