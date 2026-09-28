@@ -341,6 +341,84 @@ function Get-IntegrationHarnessRedactedText {
     }
 }
 
+# Applies the module's own redactor to every string leaf of an arbitrary
+# evidence value, in place of nothing: the caller passes the value it is about
+# to persist and uses the returned copy. $State carries the two observed facts
+# of the pass itself - whether the redactor ever failed, and whether it actually
+# changed anything - so the caller reports what happened instead of asserting a
+# constant. A redactor that fails drops the affected detail and the pass
+# continues: redaction never aborts the run, never touches cleanup records and
+# never changes a terminal disposition.
+function ConvertTo-IntegrationHarnessRedactedValue {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value,
+        [Parameter(Mandatory)]
+        [hashtable]$State
+    )
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [string]) {
+        $redacted = $null
+        try {
+            $redacted = Get-IntegrationHarnessRedactedText -Text ([string]$Value) -MaxBytes 16777216
+        } catch {
+            $State['redactionFailed'] = $true
+            $State['rewritten'] = $true
+            return ''
+        }
+        if ($null -eq $redacted -or [bool]$redacted.redactionFailed) {
+            $State['redactionFailed'] = $true
+            $State['rewritten'] = $true
+            return ''
+        }
+        if ([string]$redacted.text -cne [string]$Value) {
+            $State['rewritten'] = $true
+        }
+        return [string]$redacted.text
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = @{}
+        foreach ($key in @($Value.Keys)) {
+            $copy[$key] = ConvertTo-IntegrationHarnessRedactedValue -Value $Value[$key] -State $State
+        }
+        return $copy
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) {
+            [void]$items.Add((ConvertTo-IntegrationHarnessRedactedValue -Value $item -State $State))
+        }
+        return , @($items)
+    }
+    # A provider payload is routinely a PSCustomObject rather than a hashtable,
+    # and PSCustomObject is neither IDictionary nor IEnumerable, so returning it
+    # unchanged would carry its string leaves past the redactor entirely: a
+    # readiness observation holding connectionString = 'Password=...' or an
+    # executedReceipt quoting a private source path would reach the persisted
+    # record, and the verification walk below shares this same blind spot and
+    # would report the record clean. Any remaining object is therefore walked
+    # through its own properties, which is where a payload's text lives.
+    if ($null -ne $Value.PSObject -and $null -ne $Value.PSObject.Properties) {
+        $members = @($Value.PSObject.Properties | Where-Object {
+            $_.MemberType -in @('NoteProperty', 'Property', 'ScriptProperty', 'AliasProperty')
+        })
+        if ($members.Count -gt 0) {
+            $copy = @{}
+            foreach ($member in $members) {
+                $copy[[string]$member.Name] =
+                    ConvertTo-IntegrationHarnessRedactedValue -Value $member.Value -State $State
+            }
+            return $copy
+        }
+    }
+    return $Value
+}
+
 function Test-IntegrationHarnessNoReparsePoint {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -1547,6 +1625,103 @@ function Move-IntegrationHarnessState {
     return $next
 }
 
+# The single resource identity of a plan or of a cleanup target. Preparation,
+# approval and cleanup all read the key through this one projection, so no stage
+# can order or stop a resource under a name another stage would not.
+function Get-IntegrationHarnessPlanResourceKey {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Plan
+    )
+    if ($Plan -is [hashtable]) {
+        if ($Plan.ContainsKey('resourceKey') -and $null -ne $Plan['resourceKey']) {
+            return [string]$Plan['resourceKey']
+        }
+        if ($Plan.ContainsKey('allocation') -and $null -ne $Plan['allocation']) {
+            return [string]$Plan['allocation']
+        }
+    }
+    return [string]$Plan
+}
+
+# The deterministic dependency order of a plan set. A plan's rank is one past
+# the deepest rank among the dependencies declared for it that are present in
+# THIS plan set, so every dependency always precedes its dependent; ranks equal
+# are broken by the resource key, so the order is total and reproducible. A
+# declared edge to a plan outside the set, or an edge cycle, is a plan defect
+# and is refused here rather than silently ignored.
+function Get-IntegrationHarnessDependencyOrder {
+    [CmdletBinding()]
+    [OutputType([hashtable[]])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Plans
+    )
+    $byKey = @{}
+    foreach ($plan in $Plans) {
+        $key = Get-IntegrationHarnessPlanResourceKey -Plan $plan
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-PLAN: plan entry carries no resource key.')
+        }
+        if ($byKey.ContainsKey($key)) {
+            throw [System.InvalidOperationException]::new("HARNESS-DUPLICATE-EVIDENCE: duplicate plan resource key '$key'.")
+        }
+        $byKey[$key] = $plan
+    }
+    $ranks = @{}
+    $ranked = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in @($byKey.Keys | Sort-Object -Culture '' -CaseSensitive)) {
+        $pending.Add([string]$key)
+    }
+    while ($pending.Count -gt 0) {
+        $progressed = $false
+        foreach ($key in @($pending)) {
+            $plan = $byKey[$key]
+            $dependencies = @()
+            if ($plan -is [hashtable] -and $plan.ContainsKey('dependsOn') -and $null -ne $plan['dependsOn']) {
+                $dependencies = @($plan['dependsOn'])
+            }
+            $ready = $true
+            $deepest = 0
+            foreach ($dependency in $dependencies) {
+                $dependencyKey = [string]$dependency
+                if ([string]::IsNullOrWhiteSpace($dependencyKey) -or -not $byKey.ContainsKey($dependencyKey)) {
+                    throw [System.ArgumentException]::new(
+                        "HARNESS-INVALID-PLAN: plan '$key' depends on '$dependencyKey', which is not in the plan set.")
+                }
+                if (-not $ranked.Contains($dependencyKey)) {
+                    $ready = $false
+                    break
+                }
+                $deepest = [Math]::Max($deepest, [int]$ranks[$dependencyKey] + 1)
+            }
+            if ($ready) {
+                $ranks[$key] = $deepest
+                [void]$ranked.Add($key)
+                $progressed = $true
+            }
+        }
+        if (-not $progressed) {
+            $cycle = (@($pending) -join ',')
+            throw [System.ArgumentException]::new(
+                "HARNESS-INVALID-PLAN: plan dependency cycle among '$cycle'.")
+        }
+        foreach ($key in @($pending)) {
+            if ($ranked.Contains($key)) {
+                [void]$pending.Remove($key)
+            }
+        }
+    }
+    $ordered = @($byKey.Keys | Sort-Object -Property {
+        ('{0:D6}:{1}' -f [int]$ranks[[string]$_], [string]$_)
+    } -Culture '' -CaseSensitive)
+    return @($ordered | ForEach-Object { $byKey[[string]$_] })
+}
+
 function Approve-IntegrationHarnessProviderPlan {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -1599,12 +1774,18 @@ function Approve-IntegrationHarnessProviderPlan {
         }
         $seenKeys[$key] = $true
     }
-    $ordered = @($Plans | Sort-Object -Property { [string]$_['resourceKey'] })
+    # The accepted order is the dependency order of this plan set, and it is
+    # recorded on the run: preparation walks this list forward and cleanup walks
+    # its exact reverse, so the two stages cannot disagree about the order.
+    $ordered = @(Get-IntegrationHarnessDependencyOrder -Plans $Plans)
     $next = @{}
     foreach ($key in $Run.Keys) {
         $next[$key] = $Run[$key]
     }
     $next['acceptedPlans'] = @($ordered)
+    $next['acceptedPlanOrder'] = @($ordered | ForEach-Object {
+        [string](Get-IntegrationHarnessPlanResourceKey -Plan $_)
+    })
     $next['state'] = 'AcceptedProviderPlans'
     $history = @()
     if ($Run.ContainsKey('history') -and $null -ne $Run['history']) {
@@ -1762,11 +1943,11 @@ function Invoke-IntegrationHarnessPrepare {
         throw [System.ArgumentException]::new('HARNESS-BOUNDS-EXCEEDED: plan exceeds the resource bound.')
     }
     $approved = Approve-IntegrationHarnessProviderPlan -Run $Run -Plans $Plans
-    $ordered = @($approved['acceptedPlans'] | Sort-Object -Property {
-        $depends = 0
-        if ($_['dependsOn']) { $depends = @($_['dependsOn']).Count }
-        ('{0:D6}:{1}' -f $depends, [string]$_['resourceKey'])
-    })
+    # Allocate is dispatched in the dependency order approval just recorded on
+    # the run. The order is not re-derived here: this list is the order, and
+    # cleanup stops its exact reverse.
+    $ordered = @($approved['acceptedPlans'])
+    $prepareOrder = @($approved['acceptedPlanOrder'])
     $started = [System.Collections.Generic.List[hashtable]]::new()
     $allocated = [System.Collections.Generic.List[hashtable]]::new()
     $primaryFailure = $null
@@ -1805,6 +1986,8 @@ function Invoke-IntegrationHarnessPrepare {
             cleanupRecords  = @($cleanup['records'])
             cleanupState    = [string]$cleanup['overallState']
             startedCount    = $started.Count
+            prepareOrder    = @($prepareOrder)
+            stopOrder       = @($cleanup['stopOrder'])
             nextState       = 'CleanupRequested'
         }
     }
@@ -1815,6 +1998,7 @@ function Invoke-IntegrationHarnessPrepare {
         cleanupRecords  = @()
         cleanupState    = $null
         startedCount    = $started.Count
+        prepareOrder    = @($prepareOrder)
         allocations     = @($allocated)
         nextState       = 'Allocation'
     }
@@ -1838,34 +2022,62 @@ function Invoke-IntegrationHarnessCleanup {
         throw [System.ArgumentException]::new('HARNESS-INVALID-RUN: run has no binding.')
     }
     $binding = $Run['binding']
-    # Cleanup is the true reverse of prepare order: prepare sorts ascending by the
-    # (dependencyCount, resourceKey) pair, so cleanup sorts the identical pair
-    # in reverse order (descending). Dependents stop before their dependencies.
-    $ordered = @($Resources | Sort-Object -Property {
-        $depends = 0
-        if ($_ -is [hashtable] -and $_['dependsOn']) { $depends = @($_['dependsOn']).Count }
-        $sortKey = ''
-        if ($_ -is [hashtable] -and $_.ContainsKey('resourceKey')) {
-            $sortKey = [string]$_['resourceKey']
-        } elseif ($_ -is [hashtable] -and $_.ContainsKey('allocation')) {
-            $sortKey = [string]$_['allocation']
-        } else {
-            $sortKey = [string]$_
+    # Cleanup stops in the exact reverse of the recorded prepare order. When the
+    # run carries that order - every run that prepared resources does - it is the
+    # only authority and nothing is re-derived here, so a dependent can never be
+    # stopped before a dependency it was started after. A caller that stops
+    # resources on a run with no recorded order gets the same dependency rank,
+    # reversed, so the reverse-order guarantee holds there as well.
+    $byKey = @{}
+    $unkeyed = [System.Collections.Generic.List[object]]::new()
+    foreach ($resource in $Resources) {
+        $resourceKey = ''
+        if ($resource -is [hashtable]) {
+            if ($resource.ContainsKey('resourceKey') -and $null -ne $resource['resourceKey']) {
+                $resourceKey = [string]$resource['resourceKey']
+            } elseif ($resource.ContainsKey('allocation') -and $null -ne $resource['allocation']) {
+                $resourceKey = [string]$resource['allocation']
+            }
         }
-        ('{0:D6}:{1}' -f $depends, $sortKey)
-    } -Descending)
+        if ([string]::IsNullOrWhiteSpace($resourceKey)) {
+            [void]$unkeyed.Add($resource)
+            continue
+        }
+        $byKey[$resourceKey] = $resource
+    }
+    $stopOrder = @()
+    if ($Run.ContainsKey('acceptedPlanOrder') -and $null -ne $Run['acceptedPlanOrder']) {
+        $recorded = @($Run['acceptedPlanOrder'])
+        $absent = @($byKey.Keys | Where-Object { $recorded -cnotcontains [string]$_ } |
+            Sort-Object -Culture '' -CaseSensitive)
+        if ($absent.Count -gt 0) {
+            throw [System.ArgumentException]::new(
+                "HARNESS-INVALID-PLAN: cleanup resource(s) '$($absent -join ',')' are not in the recorded prepare order.")
+        }
+        $stopOrder = @($recorded | Where-Object { $byKey.ContainsKey([string]$_) } |
+            ForEach-Object { $byKey[[string]$_] })
+    } else {
+        $stopOrder = @(Get-IntegrationHarnessDependencyOrder -Plans @($byKey.Values))
+    }
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    for ($position = $stopOrder.Count - 1; $position -ge 0; $position--) {
+        [void]$ordered.Add($stopOrder[$position])
+    }
+    foreach ($resource in $unkeyed) {
+        [void]$ordered.Add($resource)
+    }
+    $stopKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($resource in $ordered) {
+        $stopKey = Get-IntegrationHarnessPlanResourceKey -Plan $resource
+        if (-not [string]::IsNullOrWhiteSpace($stopKey)) {
+            [void]$stopKeys.Add($stopKey)
+        }
+    }
     $records = [System.Collections.Generic.List[hashtable]]::new()
     $failures = [System.Collections.Generic.List[string]]::new()
     $unknown = $false
     foreach ($resource in $ordered) {
-        $key = $null
-        if ($resource -is [hashtable] -and $resource.ContainsKey('resourceKey')) {
-            $key = [string]$resource['resourceKey']
-        } elseif ($resource -is [hashtable] -and $resource.ContainsKey('allocation')) {
-            $key = [string]$resource['allocation']
-        } else {
-            $key = [string]$resource
-        }
+        $key = Get-IntegrationHarnessPlanResourceKey -Plan $resource
         if ([string]::IsNullOrWhiteSpace($key)) {
             [void]$failures.Add('cleanup-record-missing-key')
             $unknown = $true
@@ -1939,6 +2151,7 @@ function Invoke-IntegrationHarnessCleanup {
     }
     return @{
         overallState   = $overall
+        stopOrder      = @($stopKeys)
         records        = @($records)
         failures       = @($failures)
         primaryFailure = $primaryFailure
@@ -2190,13 +2403,30 @@ function New-IntegrationHarnessRunEvidence {
         }
         proofCeiling        = $Script:ProofCeiling
         groupCount          = @($Groups).Count
-        redactionFailed     = $false
     }
     if ($Run.ContainsKey('acceptedPlans') -and $null -ne $Run['acceptedPlans']) {
         $evidence['planRecords'] = @($Run['acceptedPlans'])
         $evidence['resourceRecords'] = @($Run['acceptedPlans'])
     }
-    if (Test-IntegrationHarnessModelLoaded) {
+    # Redaction happens on the way INTO the record, not as a claim about it: the
+    # source and worktree identities, the provider payloads carried in the
+    # receipts and every private user path that reaches the record pass through
+    # the module's own redactor, and the reported status is what that pass
+    # actually did. A redactor that fails drops the affected detail here; it
+    # never aborts the run, never edits a cleanup record and never changes a
+    # terminal disposition.
+    $redactionState = @{ redactionFailed = $false; rewritten = $false }
+    $evidence = ConvertTo-IntegrationHarnessRedactedValue -Value $evidence -State $redactionState
+    $evidence['redactionFailed'] = [bool]$redactionState['redactionFailed']
+    # A redaction that could not be completed leaves a record that is knowingly
+    # not the complete evidence the Model check demands: the affected leaves were
+    # dropped rather than emitted, so a structural field can be empty. Running
+    # the completeness check on it anyway would turn a redaction failure into a
+    # thrown proof-ceiling error, which is exactly the outcome change this issue
+    # forbids. The failure is reported on the record and the gate reports the
+    # evidence non-green; the run keeps its cleanup records and its terminal
+    # disposition either way.
+    if (-not [bool]$redactionState['redactionFailed'] -and (Test-IntegrationHarnessModelLoaded)) {
         $command = Get-Command -Name 'Test-IntegrationHarnessRunEvidence' -ErrorAction SilentlyContinue
         if ($null -ne $command) {
             [void](Test-IntegrationHarnessRunEvidence -Evidence $evidence)
@@ -2212,11 +2442,30 @@ function Test-IntegrationHarnessEvidenceComplete {
         [Parameter(Mandatory)]
         [hashtable]$Evidence
     )
+    # The redaction verdict is settled FIRST, and a redaction that could not be
+    # completed is reported as non-green evidence rather than thrown. Throwing
+    # here would abort the run before Complete-IntegrationHarnessRun computes the
+    # terminal disposition, so a redaction failure would decide the primary test
+    # outcome and no result artifact or evidence log would be written at all -
+    # the exact inversion of "redaction/sink failure is recorded but never alters
+    # cleanup records or the primary terminal outcome". The caller reads the
+    # returned verdict; the failure itself is on the record as redactionFailed.
+    if (-not $Evidence.ContainsKey('redactionFailed') -or $null -eq $Evidence['redactionFailed']) {
+        throw [System.InvalidOperationException]::new(
+            "HARNESS-MISSING-EVIDENCE: missing 'redactionFailed'.")
+    }
+    if ([bool]$Evidence['redactionFailed']) {
+        return $false
+    }
+    $modelComplete = $true
     if (Test-IntegrationHarnessModelLoaded) {
         $command = Get-Command -Name 'Test-IntegrationHarnessRunEvidence' -ErrorAction SilentlyContinue
         if ($null -ne $command) {
-            return (Test-IntegrationHarnessRunEvidence -Evidence $Evidence)
+            $modelComplete = (Test-IntegrationHarnessRunEvidence -Evidence $Evidence)
         }
+    }
+    if (-not $modelComplete) {
+        return $false
     }
     foreach ($field in @(
         'sourceIdentity', 'inventoryDigest', 'selectedRowDigests', 'harnessVersion',
@@ -2224,6 +2473,19 @@ function Test-IntegrationHarnessEvidenceComplete {
         if (-not $Evidence.ContainsKey($field) -or $null -eq $Evidence[$field]) {
             throw [System.InvalidOperationException]::new("HARNESS-MISSING-EVIDENCE: missing '$field'.")
         }
+    }
+    # The redaction proof is performed here, not taken on trust. The reported
+    # status is only the report: the record is walked again with the module's own
+    # redactor, and any secret or private user path that still survives the walk
+    # means the record is not complete evidence. That case is thrown, because it
+    # means the pass reported success while material survived - persisting that
+    # record would be blessing a leak, which is a different failure from a
+    # redaction that could not be completed.
+    $verifyState = @{ redactionFailed = $false; rewritten = $false }
+    [void](ConvertTo-IntegrationHarnessRedactedValue -Value $Evidence -State $verifyState)
+    if ([bool]$verifyState['rewritten']) {
+        throw [System.InvalidOperationException]::new(
+            'HARNESS-UNREDACTED-EVIDENCE: evidence still carries redacted secret or private user path material.')
     }
     return $true
 }
@@ -3497,9 +3759,16 @@ function Invoke-HarnessRun {
             -WorktreeIdentity $worktreeIdentity -ToolIdentities $toolIdentities -Bounds $bounds
         # Readiness observations are bound here: the evidence constructor
         # carries no readiness channel, so the collected records attach
-        # post-hoc before the completeness gate below.
-        $evidence['readinessRecords'] = @($readinessRecords)
-        $evidence['boundedRuntime'] = $boundedRuntime
+        # post-hoc before the completeness gate below. They are provider
+        # payloads, so they are redacted on the way in with the same redactor
+        # the constructor used; a redaction failure only updates the reported
+        # status and never a disposition, a cleanup record or the outcome.
+        $attachState = @{ redactionFailed = $false; rewritten = $false }
+        $evidence['readinessRecords'] = ConvertTo-IntegrationHarnessRedactedValue -Value @($readinessRecords) -State $attachState
+        $evidence['boundedRuntime'] = ConvertTo-IntegrationHarnessRedactedValue -Value $boundedRuntime -State $attachState
+        if ([bool]$attachState['redactionFailed']) {
+            $evidence['redactionFailed'] = $true
+        }
         [void](Test-IntegrationHarnessEvidenceComplete -Evidence $evidence)
         $completed = Complete-IntegrationHarnessRun -Run $run -Evidence $evidence `
             -CleanupRecords @($finalCleanupRecords)
@@ -3509,12 +3778,25 @@ function Invoke-HarnessRun {
         if ($outcome -ceq 'Complete') {
             $exitCode = 0
         }
+        # The two persisted sinks below are the result artifact and the evidence
+        # log, and both carry the resolved inventory path beside the evidence
+        # record. Redacting only the record would leave an unredacted private user
+        # path in the adjacent field of the very artifact that holds a redacted
+        # one, so the sinks carry the same redacted value the record does.
+        $sinkState = @{ redactionFailed = $false; rewritten = $false }
+        $redactedInventory =
+            ConvertTo-IntegrationHarnessRedactedValue -Value $resolved -State $sinkState
+        if ([bool]$sinkState['redactionFailed']) {
+            $evidence['redactionFailed'] = $true
+        }
+        $redactedSelection =
+            ConvertTo-IntegrationHarnessRedactedValue -Value @($sorted) -State $sinkState
         $result = [pscustomobject][ordered]@{
             status                   = 'Completed'
             outcome                  = $outcome
             state                    = [string]$completed['state']
             runId                    = $runId
-            inventory                = $resolved
+            inventory                = $redactedInventory
             selectionCount           = $sorted.Count
             executed_test_count      = [int]$evidence['arithmetic']['executedCount']
             exit_code                = $exitCode
@@ -3532,8 +3814,8 @@ function Invoke-HarnessRun {
                     runId       = $runId
                     outcome     = $outcome
                     state       = [string]$completed['state']
-                    inventory   = $resolved
-                    selection   = @($sorted)
+                    inventory   = $redactedInventory
+                    selection   = @($redactedSelection)
                     arithmetic  = $evidence['arithmetic']
                     fingerprint = [string]$evidence['failureFingerprint']
                 } | ConvertTo-Json -Compress -Depth 16)
