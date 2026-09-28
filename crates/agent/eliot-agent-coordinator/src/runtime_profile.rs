@@ -83,8 +83,10 @@
 //!
 //! # Bounded behaviour
 //!
-//! The read is bounded by [`RUNTIME_PROFILE_MAX_BYTES`]; a larger file is a
-//! refusal, not a truncated parse. The loader reads no environment variable,
+//! The read is bounded by [`RUNTIME_PROFILE_MAX_BYTES`] and stops at the first
+//! byte past that bound, so a larger file is a refusal, not a truncated parse.
+//! The bounded reader is the enforcement point, so the bound holds for a file
+//! that grows while it is being read. The loader reads no environment variable,
 //! no working directory, no clock, no network and no process, takes no
 //! authority, mutates no state and publishes no receipt. `profile_revision` is
 //! required rather than synthesized so every pull outcome can be attributed to
@@ -100,6 +102,7 @@
 //! `AgentCoordinator::next_ready` is exercised only from in-crate tests. The
 //! composition root that compiles this document is a separate owner.
 
+use std::io::Read;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -123,11 +126,14 @@ pub const RUNTIME_PROFILE_FILE_NAME: &str = "runtime.toml";
 /// be read by a loader that does not understand it.
 pub const RUNTIME_PROFILE_SCHEMA_VERSION: &str = "eliot-agent-coordinator/runtime-profile-v1";
 
-/// Upper bound on the bytes read from one runtime configuration document.
+/// Upper bound on the bytes kept from one runtime configuration document.
 ///
 /// Nine class entries with a handful of scalars each are kilobytes; this bound
 /// is two orders of magnitude above any real document. It bounds the read, not
-/// a queue profile: I14.2 fixes no number here.
+/// a queue profile: I14.2 fixes no number here. The loader reads one byte past
+/// it so an exact-bound document stays distinguishable from an oversized one,
+/// which is why it is an upper bound on retained bytes and the enforced read
+/// limit is this plus one.
 pub const RUNTIME_PROFILE_MAX_BYTES: usize = 64 * 1024;
 
 /// Typed refusals of the Kernel runtime configuration surface.
@@ -257,6 +263,11 @@ impl RuntimeProfileDocument {
 /// configuration location is a decision of the composition root rather than
 /// ambient state.
 ///
+/// The document is read through a reader capped at one byte past
+/// [`RUNTIME_PROFILE_MAX_BYTES`] rather than in full, so a mistakenly supplied
+/// oversized file is refused after a bounded read instead of after a whole-file
+/// allocation.
+///
 /// # Errors
 /// Returns [`RuntimeProfileRejection::Absent`] when no document exists at
 /// `path`, [`RuntimeProfileRejection::Unreadable`] when it cannot be read as
@@ -265,25 +276,38 @@ impl RuntimeProfileDocument {
 pub fn load_runtime_profile_document(
     path: &Path,
 ) -> Result<RuntimeProfileDocument, CoordinatorError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(RuntimeProfileRejection::Absent(path.display().to_string()).into());
+    let refusal = |error: std::io::Error| -> CoordinatorError {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return RuntimeProfileRejection::Absent(path.display().to_string()).into();
         }
-        Err(error) => {
-            return Err(RuntimeProfileRejection::Unreadable(format!(
-                "{}: {error}",
-                path.display()
-            ))
-            .into());
-        }
+        RuntimeProfileRejection::Unreadable(format!("{}: {error}", path.display())).into()
     };
-    if bytes.len() > RUNTIME_PROFILE_MAX_BYTES {
-        return Err(RuntimeProfileRejection::Unreadable(format!(
+    let oversized = || {
+        RuntimeProfileRejection::Unreadable(format!(
             "{}: document exceeds the {RUNTIME_PROFILE_MAX_BYTES} byte read bound",
             path.display()
         ))
-        .into());
+    };
+    let file = std::fs::File::open(path).map_err(refusal)?;
+    // The bound is enforced by capping the reader itself, not by measuring a
+    // whole-file read afterwards: `Take` yields at most
+    // `RUNTIME_PROFILE_MAX_BYTES + 1` bytes over the whole call, so that is the
+    // most that can ever be read from the file. The one extra byte is what
+    // distinguishes an exact-bound document from an oversized one, so nothing is
+    // truncated and then accepted. The conversion is checked rather than an
+    // unchecked narrowing cast, and no filesystem metadata is consulted: the
+    // file may grow after it is opened, and the bounded reader stays the
+    // enforcement point either way.
+    let read_limit = u64::try_from(RUNTIME_PROFILE_MAX_BYTES)
+        .ok()
+        .and_then(|bound| bound.checked_add(1))
+        .ok_or_else(oversized)?;
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(refusal)?;
+    if bytes.len() > RUNTIME_PROFILE_MAX_BYTES {
+        return Err(oversized().into());
     }
     let text = String::from_utf8(bytes).map_err(|_| {
         RuntimeProfileRejection::Unreadable(format!("{}: not UTF-8", path.display()))
