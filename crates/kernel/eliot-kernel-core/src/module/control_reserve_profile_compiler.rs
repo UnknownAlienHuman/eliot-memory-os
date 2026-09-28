@@ -265,3 +265,86 @@ fn contradiction(bottleneck: CapacityBottleneck, reason: &'static str) -> Kernel
         reason,
     }
 }
+
+/// The observable face of exactly one compiled profile row (issue #1679, W10).
+///
+/// The nested [`BottleneckCapacityProfile`] is copied whole and in its own
+/// unit: quantities from different bottlenecks are never summed, averaged, or
+/// otherwise joined here, so bytes, handles, transactions and slots can never
+/// collapse into one percentage. The row carries no permit semantics; holding
+/// a projected row grants no capacity and admits no operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlReserveStatusRow {
+    /// The exact compiled row for one bottleneck dimension.
+    pub row: BottleneckCapacityProfile,
+    /// Whether this dimension's guarantee is lowered, i.e. its
+    /// `bottleneck:coverage` name appears in the profile's
+    /// `unsupported_or_unknown_guarantees`.
+    pub guarantee_lowered: bool,
+}
+
+/// A bounded status and recovery snapshot of one compiled profile.
+///
+/// One row per bottleneck, in the profile's own order, plus the canonical
+/// lowered-guarantee names a recovery consumer needs to name the exhausted
+/// resource without re-deriving it. The snapshot is read-only data: it opens
+/// no clock, reads no environment, performs no owner I/O, allocates nothing
+/// beyond the snapshot itself, and grants no authority.
+///
+/// Consequently this projection currently has no in-tree consumer. The status
+/// and recovery surfaces that render it do not exist in this tree. `STITCH`:
+/// the projection is landed without a caller rather than given a manufactured
+/// one (no startup hook, no `fn main` call, no discarded-result statement).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlReserveStatusSnapshot {
+    /// Stable profile identity of the projected profile.
+    pub profile_id: String,
+    /// Immutable revision of the projected profile.
+    pub profile_revision: String,
+    /// Exact configuration snapshot the projected rows were read from.
+    pub config_snapshot_ref: String,
+    /// Canonical typed Authority Epoch the projected rows are bound to.
+    pub authority_epoch_ref: EpochId,
+    /// Composition-supplied compilation time in Unix milliseconds.
+    pub compiled_at_ms: u64,
+    /// Exactly one row per bottleneck, in the profile's own row order.
+    pub rows: Vec<ControlReserveStatusRow>,
+    /// Canonical lowered-guarantee names of the projected profile.
+    pub lowered_guarantees: Vec<String>,
+}
+
+/// Projects the complete current profile into a bounded status snapshot.
+///
+/// The profile is accepted only when the existing
+/// [`ControlReserveProfile::validate`] accepts it, so a hand-built profile
+/// that is not denominator-canonical fails here rather than projecting a
+/// partial vector as a complete one. No second legality check is added.
+///
+/// # Errors
+///
+/// Returns the existing runtime-contract error when the profile is not
+/// contract-canonical.
+pub fn project_control_reserve_status(
+    profile: &ControlReserveProfile,
+) -> KernelResult<ControlReserveStatusSnapshot> {
+    profile.validate()?;
+    let mut rows = Vec::with_capacity(profile.bottleneck_rows.len());
+    for row in &profile.bottleneck_rows {
+        let lowered_name = lowered_guarantee(row.bottleneck, row.coverage_state);
+        rows.push(ControlReserveStatusRow {
+            row: row.clone(),
+            guarantee_lowered: profile
+                .unsupported_or_unknown_guarantees
+                .contains(&lowered_name),
+        });
+    }
+    Ok(ControlReserveStatusSnapshot {
+        profile_id: profile.profile_id.clone(),
+        profile_revision: profile.profile_revision.clone(),
+        config_snapshot_ref: profile.config_snapshot_ref.clone(),
+        authority_epoch_ref: profile.authority_epoch_ref.clone(),
+        compiled_at_ms: profile.compiled_at_ms,
+        rows,
+        lowered_guarantees: profile.unsupported_or_unknown_guarantees.clone(),
+    })
+}
