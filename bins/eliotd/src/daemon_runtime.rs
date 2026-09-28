@@ -63,6 +63,7 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
+use eliotd::diagnostics::RepeatedFailureGuard;
 use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
     StartupCapabilityBindings,
@@ -137,6 +138,7 @@ impl DeferredSupervisionActivity {
 struct HealthHeartbeatCompletion {
     result: Result<(), String>,
     supervision_progress: Option<eliotd::SupervisionProgressProducer>,
+    failure_guard: RepeatedFailureGuard,
 }
 
 struct HealthHeartbeatFlightState {
@@ -1357,6 +1359,12 @@ async fn run_loop(
     // when idle and its completion branch settles it back, exactly like the
     // other flights. No second owner and no untracked spawn exist.
     let mut owner_feed_flight = OwnerFeedFlight::Idle;
+    // #740 A14: one repeated-failure guard per repeating diagnostic stream.
+    // Each guard travels with its own flight future and returns at
+    // settlement, so capped output never conflates distinct operations.
+    let mut owner_feed_failure_guard = RepeatedFailureGuard::new();
+    let mut maintenance_failure_guard = RepeatedFailureGuard::new();
+    let mut health_heartbeat_failure_guard = RepeatedFailureGuard::new();
     // Sole owner of TestD owner drain state (issue #325). The same tick
     // drives it independently of the other flights: one bounded drain step
     // binds pending verifier dispatches, publishes terminal verifier facts,
@@ -1372,6 +1380,7 @@ async fn run_loop(
         &composition,
         startup_maintenance_observations,
         &mut maintenance_flight,
+        &mut maintenance_failure_guard,
     );
     // Health is a one-slot polled flight: a busy tick is coalesced and the
     // sole supervision producer moves into the future until settlement.
@@ -1387,6 +1396,7 @@ async fn run_loop(
         &composition,
         &mut owner_feed,
         &mut owner_feed_flight,
+        &mut owner_feed_failure_guard,
     );
     loop {
         tokio::select! {
@@ -1467,6 +1477,7 @@ async fn run_loop(
                     &composition,
                     &flight,
                     &mut maintenance_flight,
+                    &mut maintenance_failure_guard,
                 );
             }
             completion = next_activation_completion(&mut flight) => {
@@ -1517,10 +1528,15 @@ async fn run_loop(
                     owner_feed_trigger,
                     &mut owner_feed,
                     &mut owner_feed_flight,
+                    &mut owner_feed_failure_guard,
                 );
             }
-            () = next_maintenance_completion(&mut maintenance_flight) => {
-                settle_maintenance_completion(&mut maintenance_flight);
+            maintenance_guard = next_maintenance_completion(&mut maintenance_flight) => {
+                settle_maintenance_completion(
+                    maintenance_guard,
+                    &mut maintenance_flight,
+                    &mut maintenance_failure_guard,
+                );
             }
             heartbeat_completion = next_health_heartbeat_completion(&mut health_heartbeat_flight) => {
                 settle_health_heartbeat_completion(
@@ -1529,6 +1545,7 @@ async fn run_loop(
                     &mut supervision_progress,
                     &mut deferred_supervision_activity,
                     true,
+                    &mut health_heartbeat_failure_guard,
                 )?;
                 // Preserve the existing health-before-owner-feed ordering.
                 maybe_start_owner_feed_sync(
@@ -1536,6 +1553,7 @@ async fn run_loop(
                     &composition,
                     &mut owner_feed,
                     &mut owner_feed_flight,
+                    &mut owner_feed_failure_guard,
                 );
             }
             _ = cadence.health_heartbeat.tick() => {
@@ -1546,6 +1564,7 @@ async fn run_loop(
                     &mut supervision_progress,
                     matches!(flight, ActivationFlight::InFlight(_)),
                     &mut health_heartbeat_flight,
+                    &mut health_heartbeat_failure_guard,
                 );
             }
         }
@@ -1770,6 +1789,7 @@ fn maintenance_observation(
 fn maintenance_notification_candidate(
     composition: &DaemonComposition,
     observation: MaintenanceObservation,
+    failure_guard: &mut RepeatedFailureGuard,
 ) -> Option<(
     eliot_contracts::StateFence,
     eliot_maintenance::AutomationTriggerDecision,
@@ -1777,7 +1797,12 @@ fn maintenance_notification_candidate(
     let decision = match composition.evaluate_maintenance_trigger(observation) {
         Ok(decision) => decision,
         Err(error) => {
-            let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            // #740 A14: the cadence re-evaluates every tick, so a standing
+            // refusal gates its record on this stream's guard instead of
+            // emitting unbounded repeats.
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            }
             return None;
         }
     };
@@ -1787,7 +1812,9 @@ fn maintenance_notification_candidate(
             // No exchange is attempted until the composition exposes an
             // admitted Kernel fence. This remains a diagnostic gap, never a
             // startup or readiness gate.
-            let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            }
             None
         }
     }
@@ -1800,13 +1827,14 @@ async fn evaluate_and_emit_maintenance_notification(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     let candidate = {
         let guard = composition.lock().await;
-        maintenance_notification_candidate(&guard, observation)
+        maintenance_notification_candidate(&guard, observation, failure_guard)
     };
     if let Some((fence, decision)) = candidate {
-        note_blocked_automation_notification(kernel, fence, &decision).await;
+        note_blocked_automation_notification(kernel, fence, &decision, failure_guard).await;
     }
 }
 
@@ -1818,18 +1846,26 @@ fn maybe_start_startup_maintenance_triggers(
     composition: &SharedComposition,
     observations: [MaintenanceObservation; 2],
     flight: &mut MaintenanceFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     if !matches!(flight, MaintenanceFlight::Idle) {
         return;
     }
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = MaintenanceFlight::InFlight(MaintenanceFlightState {
         future: Box::pin(async move {
             for observation in observations {
-                evaluate_and_emit_maintenance_notification(&kernel, &composition, observation)
-                    .await;
+                evaluate_and_emit_maintenance_notification(
+                    &kernel,
+                    &composition,
+                    observation,
+                    &mut failure_guard,
+                )
+                .await;
             }
+            failure_guard
         }),
     });
 }
@@ -1858,6 +1894,7 @@ fn maybe_start_idle_maintenance_trigger(
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
     flight: &mut MaintenanceFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     if !matches!(flight, MaintenanceFlight::Idle) {
         return;
@@ -1865,24 +1902,40 @@ fn maybe_start_idle_maintenance_trigger(
     let observation = idle_maintenance_observation(activation_flight);
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
+    // #740 A14: the stream's repeated-failure guard travels with the future
+    // exactly like the heartbeat and owner-feed guards, so a standing
+    // per-cadence refusal cannot emit unbounded records.
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = MaintenanceFlight::InFlight(MaintenanceFlightState {
         future: Box::pin(async move {
-            evaluate_and_emit_maintenance_notification(&kernel, &composition, observation).await;
+            evaluate_and_emit_maintenance_notification(
+                &kernel,
+                &composition,
+                observation,
+                &mut failure_guard,
+            )
+            .await;
+            failure_guard
         }),
     });
 }
 
 /// Polls one retained maintenance evaluation, pending forever while idle.
-async fn next_maintenance_completion(flight: &mut MaintenanceFlight) {
+async fn next_maintenance_completion(flight: &mut MaintenanceFlight) -> RepeatedFailureGuard {
     match flight {
-        MaintenanceFlight::Idle => std::future::pending::<()>().await,
+        MaintenanceFlight::Idle => std::future::pending::<RepeatedFailureGuard>().await,
         MaintenanceFlight::InFlight(state) => (&mut state.future).await,
     }
 }
 
 /// Releases a completed maintenance flight so a later cadence observation can
 /// start. Settlement itself is synchronous and cannot block the run loop.
-fn settle_maintenance_completion(flight: &mut MaintenanceFlight) {
+fn settle_maintenance_completion(
+    completion: RepeatedFailureGuard,
+    flight: &mut MaintenanceFlight,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    *failure_guard = completion;
     *flight = MaintenanceFlight::Idle;
 }
 
@@ -1904,6 +1957,7 @@ async fn note_blocked_automation_notification(
     kernel: &Arc<DaemonKernelClient>,
     fence: eliot_contracts::StateFence,
     decision: &eliot_maintenance::AutomationTriggerDecision,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     match eliotd::notification_state_emit::emit_blocked_automation_notification(
         kernel, fence, decision,
@@ -1925,19 +1979,26 @@ async fn note_blocked_automation_notification(
         }
         Ok(None) => {}
         Err(error) => {
-            let _ = eliotd::diagnostics::ErrorRecord::of(
-                eliotd::diagnostics::OwningComponent::DaemonRuntime,
-                "notification-state",
-                &error.to_string(),
-            )
-            .emit();
+            // #740 A14: both callers re-notify every tick while blocked, so
+            // the record gates on the caller's stream guard instead of
+            // emitting unbounded repeats.
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "notification-state",
+                    &error.to_string(),
+                )
+                .emit();
+            }
         }
     }
 }
 
 /// Starts one health tick when its slot is idle. The activation state is
 /// captured with the timer event, and the sole supervision producer travels
-/// with the future until its ordered acknowledgement sequence completes.
+/// with the future until its ordered acknowledgement sequence completes. The
+/// stream's repeated-failure guard travels the same way (#740 A14), so a
+/// standing per-tick refusal cannot emit unbounded records.
 fn maybe_start_health_heartbeat_tick(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -1945,6 +2006,7 @@ fn maybe_start_health_heartbeat_tick(
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     activation_in_flight: bool,
     flight: &mut HealthHeartbeatFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     if !matches!(flight, HealthHeartbeatFlight::Idle) {
         return;
@@ -1954,6 +2016,7 @@ fn maybe_start_health_heartbeat_tick(
     let startup_readiness = Rc::clone(startup_readiness);
     let mut producer = supervision_progress.take();
     let owns_supervision_producer = producer.is_some();
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = HealthHeartbeatFlight::InFlight(HealthHeartbeatFlightState {
         future: Box::pin(async move {
             let result = run_health_heartbeat_tick(
@@ -1962,11 +2025,13 @@ fn maybe_start_health_heartbeat_tick(
                 producer.as_mut(),
                 activation_in_flight,
                 &startup_readiness,
+                &mut failure_guard,
             )
             .await;
             HealthHeartbeatCompletion {
                 result,
                 supervision_progress: producer,
+                failure_guard,
             }
         }),
         owns_supervision_producer,
@@ -1993,8 +2058,10 @@ fn settle_health_heartbeat_completion(
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     deferred_activity: &mut DeferredSupervisionActivity,
     apply_deferred_activity: bool,
+    failure_guard: &mut RepeatedFailureGuard,
 ) -> Result<(), String> {
     *flight = HealthHeartbeatFlight::Idle;
+    *failure_guard = completion.failure_guard;
     *supervision_progress = completion.supervision_progress;
     if apply_deferred_activity
         && completion.result.is_ok()
@@ -2004,6 +2071,22 @@ fn settle_health_heartbeat_completion(
     }
     deferred_activity.clear();
     completion.result
+}
+
+/// Emits one #740 cache-health record from an owner `StoreHealth` poll
+/// (#740 A8). Ready and Degraded project to their distinct cache states
+/// under the manifest digest the poll actually returned; Unavailable emits
+/// nothing because `CacheState` cannot represent it and merging it into
+/// Degraded would conflate two distinct owner states.
+fn emit_cache_health_from_store_poll(health: &StoreHealth) {
+    let state = match health.status {
+        StoreHealthStatus::Ready => Some(eliotd::diagnostics::CacheState::Healthy),
+        StoreHealthStatus::Degraded => Some(eliotd::diagnostics::CacheState::Degraded),
+        StoreHealthStatus::Unavailable => None,
+    };
+    if let Some(state) = state {
+        let _ = eliotd::diagnostics::emit_cache_health(state, health.manifest_digest.as_str());
+    }
 }
 
 /// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
@@ -2024,10 +2107,12 @@ async fn run_health_heartbeat_tick(
     supervision_progress: Option<&mut eliotd::SupervisionProgressProducer>,
     activation_in_flight: bool,
     startup_readiness: &SharedStartupReadiness,
+    failure_guard: &mut RepeatedFailureGuard,
 ) -> Result<(), String> {
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
         .await
         .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+    emit_cache_health_from_store_poll(&health);
     // #1688 (I14.22): the Kernel health poll is this daemon's one admitted
     // self-observation per heartbeat, so it is the admitted-observation
     // trigger. The evidence identities are the observed health status and the
@@ -2077,20 +2162,27 @@ async fn run_health_heartbeat_tick(
                 // A not-ready composition is a typed refusal, not a reason to
                 // pretend there is no blocked automation: it is recorded with
                 // the same minimal diagnostics the evaluation refusal uses.
+                // #740 A14: both refusal records below gate on this tick
+                // stream's guard, so a standing per-tick refusal cannot emit
+                // unbounded repeats.
                 Err(error) => {
-                    let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                    if failure_guard.should_emit() {
+                        let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                    }
                     None
                 }
             },
             Err(error) => {
-                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                }
                 None
             }
         };
         (readiness_verdict, readiness_report, blocked_automation)
     };
     if let Some((fence, decision)) = blocked_automation {
-        note_blocked_automation_notification(kernel, fence, &decision).await;
+        note_blocked_automation_notification(kernel, fence, &decision, failure_guard).await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core
@@ -2359,6 +2451,9 @@ async fn drain_flights_on_shutdown(
     let _span = tracing::info_span!("eliotd.activation_drain").entered();
     let deadline = Instant::now() + SHUTDOWN_ACTIVATION_DRAIN;
     let mut no_supervision: Option<eliotd::SupervisionProgressProducer> = None;
+    // #740 A14: the drain settles in-flight guards into this throwaway slot
+    // because no new tick starts here; counts are meaningless at shutdown.
+    let mut shutdown_failure_guard = RepeatedFailureGuard::new();
     let mut activation_exit = RunLoopExit::Shutdown;
     loop {
         if matches!(flight, ActivationFlight::Idle)
@@ -2445,10 +2540,19 @@ async fn drain_flights_on_shutdown(
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
             }
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
-                settle_owner_feed_completion(owner_feed_trigger, owner_feed, owner_feed_flight);
+                settle_owner_feed_completion(
+                    owner_feed_trigger,
+                    owner_feed,
+                    owner_feed_flight,
+                    &mut shutdown_failure_guard,
+                );
             }
-            () = next_maintenance_completion(maintenance_flight) => {
-                settle_maintenance_completion(maintenance_flight);
+            maintenance_guard = next_maintenance_completion(maintenance_flight) => {
+                settle_maintenance_completion(
+                    maintenance_guard,
+                    maintenance_flight,
+                    &mut shutdown_failure_guard,
+                );
             }
             heartbeat_completion = next_health_heartbeat_completion(health_heartbeat_flight) => {
                 discard_shutdown_heartbeat_completion(
@@ -2456,6 +2560,7 @@ async fn drain_flights_on_shutdown(
                     health_heartbeat_flight,
                     supervision_progress,
                     deferred_activity,
+                    &mut shutdown_failure_guard,
                 );
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -2485,6 +2590,7 @@ fn discard_shutdown_heartbeat_completion(
     flight: &mut HealthHeartbeatFlight,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     deferred_activity: &mut DeferredSupervisionActivity,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     let _ = settle_health_heartbeat_completion(
         completion,
@@ -2492,6 +2598,7 @@ fn discard_shutdown_heartbeat_completion(
         supervision_progress,
         deferred_activity,
         false,
+        failure_guard,
     );
 }
 
@@ -2527,7 +2634,9 @@ fn activation_exit_after_drain_timeout(
 /// completion, so exactly one trigger exists across passes: no clone of
 /// mutable state and no renewal race.
 struct OwnerFeedFlightState {
-    future: Pin<Box<dyn std::future::Future<Output = eliotd::OwnerFeedTrigger>>>,
+    future: Pin<
+        Box<dyn std::future::Future<Output = (eliotd::OwnerFeedTrigger, RepeatedFailureGuard)>>,
+    >,
 }
 
 /// Sole owner of owner-feed sync state in `run_loop`, mirroring
@@ -2543,7 +2652,7 @@ enum OwnerFeedFlight {
 /// completes. The observation is captured from the activation state at start
 /// time; no later tick replaces or mutates it while waiting for composition.
 struct MaintenanceFlightState {
-    future: Pin<Box<dyn std::future::Future<Output = ()>>>,
+    future: Pin<Box<dyn std::future::Future<Output = RepeatedFailureGuard>>>,
 }
 
 /// Sole owner of the cadence maintenance observation currently being
@@ -2558,12 +2667,15 @@ enum MaintenanceFlight {
 /// polled flight. The pass keeps its composition borrow inside the flight
 /// future (issue #2559): when the owner borrow must span the Kernel
 /// read->publish->readback exchange, that bounded future is retained as a
-/// polled flight rather than awaited inside the health tick.
+/// polled flight rather than awaited inside the health tick. The stream's
+/// repeated-failure guard travels with the future exactly like the trigger
+/// (#740 A14), so a standing feed failure cannot emit unbounded records.
 fn maybe_start_owner_feed_sync(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
     flight: &mut OwnerFeedFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     if !matches!(flight, OwnerFeedFlight::Idle) {
         return;
@@ -2573,18 +2685,30 @@ fn maybe_start_owner_feed_sync(
     };
     let kernel_clone = Arc::clone(kernel);
     let composition_clone = Arc::clone(composition);
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = OwnerFeedFlight::InFlight(OwnerFeedFlightState {
         future: Box::pin(async move {
-            run_owner_feed_sync(&kernel_clone, composition_clone, trigger).await
+            let trigger = run_owner_feed_sync(
+                &kernel_clone,
+                composition_clone,
+                trigger,
+                &mut failure_guard,
+            )
+            .await;
+            (trigger, failure_guard)
         }),
     });
 }
 
 /// Polls the one in-flight owner-feed step, pending forever while idle so
 /// health and shutdown stay pollable with no step outstanding.
-async fn next_owner_feed_completion(flight: &mut OwnerFeedFlight) -> eliotd::OwnerFeedTrigger {
+async fn next_owner_feed_completion(
+    flight: &mut OwnerFeedFlight,
+) -> (eliotd::OwnerFeedTrigger, RepeatedFailureGuard) {
     match flight {
-        OwnerFeedFlight::Idle => std::future::pending::<eliotd::OwnerFeedTrigger>().await,
+        OwnerFeedFlight::Idle => {
+            std::future::pending::<(eliotd::OwnerFeedTrigger, RepeatedFailureGuard)>().await
+        }
         OwnerFeedFlight::InFlight(state) => (&mut state.future).await,
     }
 }
@@ -2595,11 +2719,13 @@ async fn next_owner_feed_completion(flight: &mut OwnerFeedFlight) -> eliotd::Own
 /// pending for a later pass. The feed never gates readiness and never fails
 /// the daemon.
 fn settle_owner_feed_completion(
-    trigger: eliotd::OwnerFeedTrigger,
+    completion: (eliotd::OwnerFeedTrigger, RepeatedFailureGuard),
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
     flight: &mut OwnerFeedFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
-    *owner_feed = Some(trigger);
+    *owner_feed = Some(completion.0);
+    *failure_guard = completion.1;
     *flight = OwnerFeedFlight::Idle;
 }
 
@@ -2618,6 +2744,7 @@ async fn run_owner_feed_sync(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut trigger: eliotd::OwnerFeedTrigger,
+    failure_guard: &mut RepeatedFailureGuard,
 ) -> eliotd::OwnerFeedTrigger {
     let plan = {
         let guard = composition.lock().await;
@@ -2637,12 +2764,17 @@ async fn run_owner_feed_sync(
         }
         Ok(None) => {}
         Err(error) => {
-            let _ = eliotd::diagnostics::ErrorRecord::of(
-                eliotd::diagnostics::OwningComponent::DaemonRuntime,
-                "owner-feed",
-                &error.to_string(),
-            )
-            .emit();
+            // #740 A14: the feed retries on a later tick, so a standing
+            // failure gates its record on this stream's guard instead of
+            // emitting unbounded repeats.
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "owner-feed",
+                    &error.to_string(),
+                )
+                .emit();
+            }
         }
     }
     trigger
