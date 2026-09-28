@@ -871,9 +871,15 @@ fn admit_all_slots(
 }
 
 /// Admits one slot binding and records the compiled bound slot. The bound
-/// pins echo the caller-presented binding verbatim; [`check_bound_slot`]
-/// rejects any drift against the staffed slot before the digest seals the
-/// record.
+/// pins echo the caller-presented binding verbatim. The digest seals the
+/// record first, exactly as the staffing owner seals `slot_digest`
+/// immediately after construction, and only then does [`check_bound_slot`]
+/// run: its final branch compares the stored `slot_binding_digest` against a
+/// canonical digest that is never empty, so it can only be a tamper guard
+/// once the record is sealed. Validating first would compare the still-empty
+/// field against a canonical digest and refuse every honest handoff.
+/// [`check_bound_slot`] still runs every other check first and still fails
+/// closed, digest closure included.
 fn admit_one_slot(
     binding: &SwarmSlotAdmission,
     staffed: &StaffedSlot,
@@ -899,7 +905,7 @@ fn admit_one_slot(
         runtime_generation: binding.admitted_route.runtime_generation,
         slot_binding_digest: String::new(),
     };
-    check_bound_slot(&bound, staffed, plan_id, admission)?;
     bound.slot_binding_digest = bound.digest(plan_id)?;
+    check_bound_slot(&bound, staffed, plan_id, admission)?;
     Ok(bound)
 }
