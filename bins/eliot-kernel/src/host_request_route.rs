@@ -604,12 +604,35 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        self.admit_host_request_envelope_with_tool_binding_under_transition(envelope, None)
+    }
+
+    /// Admits an envelope after a linked canonical tool has supplied the
+    /// operation-specific task-binding requirement. `None` means the caller
+    /// has only an envelope and therefore cannot resolve an operation whose
+    /// suboperation changes its binding contract.
+    fn admit_host_request_envelope_with_tool_binding_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        task_relative_tool: Option<bool>,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         Self::validate_host_request_admission(envelope)?;
         let now = unix_ms();
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
-        self.host_request_application_binding_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(
+            envelope,
+            task_relative_tool,
+        )?;
+        if matches!(
+            envelope.kind,
+            HostRequestKind::Cancellation
+                | HostRequestKind::Status
+                | HostRequestKind::Reconciliation
+        ) {
+            self.validate_host_request_parent_owner_under_transition(envelope, &descriptor)?;
+        }
         self.host_request_service_gate(&descriptor, envelope)?;
         let binding = bridge_process_binding(&descriptor, &receipt, &envelope.connection_id)?;
 
@@ -1218,7 +1241,7 @@ impl KernelComposition {
             .session_id
             .clone()
             .ok_or(TransportError::SessionFenced)?;
-        self.host_request_application_binding_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(envelope, None)?;
         self.host_request_service_gate(&descriptor, envelope)?;
         {
             let profile = self
@@ -1751,6 +1774,7 @@ impl KernelComposition {
     fn host_request_application_binding_gate_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
+        task_relative_tool: Option<bool>,
     ) -> Result<(), TransportError> {
         if envelope.kind == HostRequestKind::Activation {
             return Ok(());
@@ -1855,13 +1879,26 @@ impl KernelComposition {
         }
         // A task-relative/effectful Invocation is the case I7.8 steps 7-12
         // and the A1 acceptance forbid without task-bound authority: its
-        // envelope must carry the retained task, scope, and revision. The
-        // explicitly safe Invocation capabilities may omit task fields only
-        // after a Resolved activation. Status, Cancellation, and Reconciliation
-        // use their exact parent/session authority instead of task binding.
+        // envelope must carry the retained task, scope, and revision. A
+        // suboperation-sensitive capability must arrive with a digest-linked
+        // ToolRequest classification; `eliot.observe` cannot inherit the safe
+        // capability default from an envelope alone. Status, Cancellation,
+        // and Reconciliation use their exact parent/session authority instead
+        // of task binding.
         if envelope.kind == HostRequestKind::Invocation
-            && host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+            && envelope.identity.capability == OBSERVE_CAPABILITY
+            && task_relative_tool.is_none()
         {
+            // `eliot.observe` has both cold raw-capture and task-relative
+            // InfluenceAck suboperations. An envelope-only caller cannot
+            // claim either classification; the linked ToolRequest bytes are
+            // required before this capability is admitted.
+            return Err(TransportError::SessionFenced);
+        }
+        let task_relative = task_relative_tool.unwrap_or_else(|| {
+            host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+        });
+        if envelope.kind == HostRequestKind::Invocation && task_relative {
             let task_named =
                 envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
             let scope_named =
@@ -1914,6 +1951,106 @@ impl KernelComposition {
         // generation continuity below is enforced without the `Ready`-only
         // state line of the strict profile check.
         self.validate_bridge_profile_continuity(descriptor)
+    }
+
+    /// Returns the activation binding retained for the authenticated
+    /// connection that presented a parent-targeted recovery request.
+    fn retained_parent_request_binding(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        self.agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&envelope.connection_id)
+            .and_then(|state| state.activated_binding.clone())
+            .ok_or(TransportError::SessionFenced)
+    }
+
+    /// Binds a parent operation to the authenticated retained application
+    /// owner before status, cancellation or reconciliation touches it.
+    ///
+    /// Parentless-session recovery rows are limited to the exact connection
+    /// that created them (the activation/legacy case); a copied operation
+    /// handle alone is not authority. Rows with a semantic Session remain
+    /// shareable only within that same authenticated application Session.
+    /// Optional task/scope selectors must agree with the original parent row,
+    /// keeping recovery attached to the original operation identity.
+    fn require_host_request_parent_owner(
+        &self,
+        envelope: &HostRequestEnvelope,
+        parent: &HostRequestRecord,
+        retained: &super::ActivatedApplicationBinding,
+        pending: &super::AgentActivationPendingState,
+    ) -> Result<(), TransportError> {
+        if !self.activation_result_still_retained(
+            pending,
+            retained,
+            &envelope.connection_id,
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        if envelope
+            .identity
+            .session_id
+            .as_deref()
+            .is_some_and(|claimed| claimed != retained.session_id)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let same_application_owner = parent
+            .session_ref
+            .as_ref()
+            .is_some_and(|session| session.as_str() == retained.session_id)
+            || (parent.session_ref.is_none()
+                && parent.connection_ref.as_str() == envelope.connection_id);
+        if !same_application_owner {
+            return Err(TransportError::IdentityConflict);
+        }
+        if envelope
+            .identity
+            .task_id
+            .as_deref()
+            .is_some_and(|claimed| parent.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed))
+            || envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .is_some_and(|claimed| {
+                    parent.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+                })
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Preflights parent ownership before a Status, Cancellation or
+    /// Reconciliation child can be staged or acknowledged.
+    fn validate_host_request_parent_owner_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        descriptor: &AgentBridgeAdmissionDescriptor,
+    ) -> Result<(), TransportError> {
+        let retained = self.retained_parent_request_binding(envelope)?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let (parent_operation, parent_digest) = parent_operation_key(envelope)?;
+        let parent = self
+            .generation_gateway
+            .ors
+            .load_host_request(&parent_operation, &parent_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        require_current_generation_parent(&parent, descriptor)?;
+        self.require_host_request_parent_owner(
+            envelope,
+            &parent,
+            &retained,
+            &admission_owner,
+        )
     }
 
     /// Verifies descriptor, candidate, and generation continuity without
@@ -2042,10 +2179,11 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
+        let retained = self.retained_parent_request_binding(envelope)?;
         // Serialize cancellation's parent transition against Observe queue
         // publication. Submit admission uses the same transition-read then
         // pending-owner order for its final durable-state reread and fill.
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2057,6 +2195,12 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
+        self.require_host_request_parent_owner(
+            envelope,
+            &parent,
+            &retained,
+            &admission_owner,
+        )?;
         let settled = self
             .generation_gateway
             .ors
@@ -2094,6 +2238,11 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
+        let retained = self.retained_parent_request_binding(envelope)?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let (parent_operation, parent_digest) = parent_operation_key(envelope)?;
         let parent = self
             .generation_gateway
@@ -2101,7 +2250,13 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &parent_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
-        require_current_generation_parent(&parent, descriptor)
+        require_current_generation_parent(&parent, descriptor)?;
+        self.require_host_request_parent_owner(
+            envelope,
+            &parent,
+            &retained,
+            &admission_owner,
+        )
     }
 
     /// Moves an `Unknown` parent of a Reconciliation envelope to `Reconciling`.
@@ -2113,6 +2268,11 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
+        let retained = self.retained_parent_request_binding(envelope)?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let (parent_operation, parent_digest) = parent_operation_key(envelope)?;
         let parent = self
             .generation_gateway
@@ -2121,6 +2281,12 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
+        self.require_host_request_parent_owner(
+            envelope,
+            &parent,
+            &retained,
+            &admission_owner,
+        )?;
         if parent.state == HostRequestState::Unknown {
             let _ = self.generation_gateway.ors.advance_host_request(
                 &parent_operation,
@@ -2355,6 +2521,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         pending: &super::AgentActivationPendingState,
+        task_relative_tool: bool,
     ) -> Result<bool, TransportError> {
         let retained = {
             let connections = self
@@ -2366,7 +2533,10 @@ impl KernelComposition {
                 .and_then(|state| state.activated_binding.clone())
         };
         let task_relative = envelope.kind == HostRequestKind::Invocation
-            && host_request_capability_is_task_relative(envelope.identity.capability.as_str());
+            && (task_relative_tool
+                || host_request_capability_is_task_relative(
+                    envelope.identity.capability.as_str(),
+                ));
         let session_id = if let Some(retained) = retained.as_ref() {
             if !self.activation_result_still_retained(
                 pending,
@@ -2516,7 +2686,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, false)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -3232,8 +3402,9 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 ///   which is control/action work and needs the same exact task binding;
 /// - `eliot.state` and `eliot.query` are authenticated discovery/read-only and
 ///   may omit task fields after a `Resolved` activation;
-/// - `eliot.observe` stays safe raw capture with no task effect, and the
-///   Watchdog intent route is a parentless observation submission; and
+/// - `eliot.observe` is resolved from its digest-linked suboperation: four
+///   kinds are safe raw capture and `influence_ack` is task-relative; and
+///   the Watchdog intent route is a parentless observation submission; and
 /// - every other capability, including an unclassified future name, remains
 ///   task-relative until an explicit safe classification exists. The current
 ///   HostRequest route does not provide preselection access when activation
@@ -3315,7 +3486,7 @@ pub(crate) enum ObserveDeferDisposition {
 pub(crate) fn check_observe_tool_linkage(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
-) -> Result<(), TransportError> {
+) -> Result<bool, TransportError> {
     HostRequestInvokeReadPayload {
         wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
         wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
@@ -3345,7 +3516,34 @@ pub(crate) fn check_observe_tool_linkage(
     if round_tripped != *tool {
         return Err(TransportError::SessionFenced);
     }
-    Ok(())
+    observe_tool_requires_exact_task_binding(tool)
+}
+
+/// Resolves the binding class of one digest-linked canonical Observe tool.
+///
+/// This mirrors `CanonicalOperation::requirement()` for the Observe variants
+/// at the Kernel boundary, where the exact bytes are available but the
+/// `eliot-mcp` semantic crate is intentionally not a Kernel dependency. The
+/// four raw-capture discriminators stay cold; `influence_ack` requires the
+/// exact retained task binding. An absent or unknown discriminator is
+/// ambiguous and fails closed rather than inheriting the capability's safe
+/// raw-capture treatment.
+fn observe_tool_requires_exact_task_binding(
+    tool: &serde_json::Value,
+) -> Result<bool, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some(OBSERVE_CAPABILITY) {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    match arguments.get("kind").and_then(serde_json::Value::as_str) {
+        Some("observation" | "decision" | "failure" | "outcome") => Ok(false),
+        Some("influence_ack") => Ok(true),
+        _ => Err(TransportError::SessionFenced),
+    }
 }
 
 impl KernelComposition {
@@ -3357,13 +3555,14 @@ impl KernelComposition {
         tool: Option<&serde_json::Value>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
-        if envelope.identity.capability == OBSERVE_CAPABILITY
-            && let Some(tool) = tool
-        {
-            check_observe_tool_linkage(envelope, tool)?;
-        }
         let is_observe = envelope.identity.capability == OBSERVE_CAPABILITY
             && envelope.kind == HostRequestKind::Invocation;
+        let task_relative_tool = if is_observe {
+            tool.map(|tool| check_observe_tool_linkage(envelope, tool))
+                .transpose()?
+        } else {
+            None
+        };
         let Some(tool) = tool.filter(|_| is_observe) else {
             return self.admit_host_request_envelope_under_transition(envelope);
         };
@@ -3386,7 +3585,11 @@ impl KernelComposition {
                         | HostRequestState::Reconciling
                 )
         }) {
-            let admitted = self.admit_host_request_envelope_under_transition(envelope)?;
+            let admitted = self
+                .admit_host_request_envelope_with_tool_binding_under_transition(
+                    envelope,
+                    task_relative_tool,
+                )?;
             self.remove_observe_pair_if_not_executable(
                 admitted.1.operation_id.as_str(),
                 &envelope.envelope_sha256,
@@ -3398,7 +3601,12 @@ impl KernelComposition {
         let operation_id = operation.as_str().to_owned();
         let reservation = self.reserve_observe_queue_slot(envelope, &operation_id)?;
 
-        let admitted = match self.admit_host_request_envelope_under_transition(envelope) {
+        let admitted = match self
+            .admit_host_request_envelope_with_tool_binding_under_transition(
+                envelope,
+                task_relative_tool,
+            )
+        {
             Ok(admitted) => admitted,
             Err(error) => {
                 if let ObserveQueueReservation::Reserved {
@@ -3748,7 +3956,12 @@ impl KernelComposition {
                     position += 1;
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope, &admission_owner)? {
+                let task_relative_tool = check_observe_tool_linkage(envelope, tool)?;
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    task_relative_tool,
+                )? {
                     position += 1;
                     continue;
                 }
