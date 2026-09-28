@@ -1043,23 +1043,25 @@ pub fn canary_removal_operation_id(
 /// Resolves the exact installed canary target and returns the frozen,
 /// read-only removal plan.
 ///
-/// This step loads the accepted installation registry and the original
-/// transaction read-only and creates no file, secret, service, reservation or
-/// transaction row. A foreign, ambiguous, replaced, production or
-/// last-known-good target is refused here, before any destructive path exists.
+/// This step loads the accepted installation registry, the original
+/// transaction and any already admitted removal record read-only and creates
+/// no file, secret, service, reservation or transaction row. A foreign,
+/// ambiguous, replaced, production or last-known-good target is refused here,
+/// before any destructive path exists. A reused removal identity with changed
+/// inputs is refused here as well, so a conflicting re-admission fails fast
+/// at the plan boundary instead of only at apply.
 #[allow(
     clippy::too_many_lines,
     reason = "read-only target resolution keeps every refusal in one auditable boundary"
 )]
-pub(crate) fn plan_canary_removal<P, S>(
-    coordinator: &InstallationCoordinator<P, S>,
+pub(crate) fn plan_canary_removal<P>(
+    coordinator: &InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
     request: &ManagedEnvironmentChangeRequest,
     generation: &PlatformHandle,
 ) -> Result<CanaryRemovalPlan, InstallationError>
 where
     P: InstallationEffectPort,
-    S: InstallationTransactionStore,
 {
     request.validate()?;
     if request.action != ManagedEnvironmentAction::Remove {
@@ -1157,6 +1159,20 @@ where
     };
     plan.plan_digest = plan.computed_digest()?;
     plan.validate()?;
+    // The admission fence fails fast at the plan boundary as well as durably
+    // at apply: a removal already admitted for this exact target under
+    // different inputs is an identity conflict here, mirroring
+    // `admit_or_resume`. An identical digest proceeds so an idempotent re-plan
+    // still resumes through the same operation identity.
+    if let Some(existing) = coordinator
+        .store()
+        .load_canary_removal_for_generation(&plan.install_transaction_id, generation)?
+    {
+        existing.validate()?;
+        if existing.plan.plan_digest != plan.plan_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
     Ok(plan)
 }
 
@@ -1740,18 +1756,23 @@ where
         }
         Err(error) => return Err(error),
     };
-    if !already_retired && projection.revision() != plan.registry_revision {
-        return Err(InstallationError::CompareAndSaveConflict {
-            expected: plan.registry_revision,
-            actual: projection.revision(),
-        });
-    }
+    // The admission fence is re-observed before the revision pin: a pending
+    // activation staged for the dying generation after the plan was frozen is
+    // a fence refusal naming the exact race, not a generic revision drift. All
+    // other registry drift still conflicts below, so unrelated staging can
+    // never green-light a destructive call either.
     if let Some(pending) = &projection.pending_activation
         && pending.manifest.generation == plan.generation
     {
         return Err(InstallationError::IncompleteObservation(
             "the removal target is staged in a pending activation".to_owned(),
         ));
+    }
+    if !already_retired && projection.revision() != plan.registry_revision {
+        return Err(InstallationError::CompareAndSaveConflict {
+            expected: plan.registry_revision,
+            actual: projection.revision(),
+        });
     }
     // The retirement barrier is the drain evidence a dependent stop/delete has
     // to follow: the activation owner's own committed cutover receipt naming
