@@ -195,13 +195,12 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// Disposition of the one retained consumed-frontier offer (issue #2800).
 ///
 /// `Prepared`, `HandedToTransport`, and `OutcomeUnknown` are unresolved:
-/// the exact frontier stays retryable under the same identity. Only the
-/// joint core/cache import moves an offer to `OwnerConfirmed`, and only
-/// after a fully validated owner reply proves the offer binding, the exact
-/// offered frontier, and acknowledged cursors at or beyond the accepted
-/// prefix. A proved successor marks its predecessor `Replaced`; that offer
-/// is never replayed under the successor. Transport custody (`Delivered`)
-/// never confirms.
+/// the exact frontier stays retryable under the same identity. A validated
+/// Kernel acknowledgement receipt or the joint core/cache import moves an
+/// offer to `OwnerConfirmed`, after proving the exact owner tuple, offered
+/// frontier, and acknowledged cursor. A proved successor marks its
+/// predecessor `Replaced`; that offer is never replayed under the successor.
+/// Transport custody (`Delivered`) never confirms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsumedOfferDisposition {
     /// Prepared from a local snapshot; not yet handed to the transport.
@@ -212,12 +211,7 @@ enum ConsumedOfferDisposition {
     /// Send failure, missing reply, or rejected answer; retryable under the
     /// same identity. Unconfirmed.
     OutcomeUnknown,
-    /// The owner returned the exact committed acknowledgement receipt, but
-    /// a follow-up read or handoff mutation remains unresolved. Keep replaying
-    /// this same offer until a later import proves its cursor; mutation
-    /// receipts are not read-completion evidence.
-    AckCommittedFollowupUnknown,
-    /// Terminal: confirmed inside the joint core/cache import.
+    /// Terminal: exact Kernel ack receipt or joint import confirmed the offer.
     OwnerConfirmed,
     /// Terminal: an exact successor owner proof replaced at least one
     /// stream identity in this offer; its bytes must never be replayed under
@@ -280,6 +274,23 @@ struct DeliveredEventReceipt {
     /// Set only after an exact recovery page binds this receipt to the
     /// currently adopted stream identity.
     owner_identity: Option<OwnerStreamIdentity>,
+}
+
+impl OwnerStreamIdentity {
+    fn from_facts(stream: &RecoveredStreamFacts) -> Option<Self> {
+        let owner_namespace = stream.owner_namespace()?.to_owned();
+        let (producer_id, incarnation) = stream.owner_identity()?;
+        let cut = stream.recovery_cut()?;
+        if cut.owner_incarnation() != incarnation {
+            return None;
+        }
+        Some(Self {
+            owner_namespace,
+            producer_id: producer_id.to_owned(),
+            incarnation,
+            owner_revision: cut.owner_revision(),
+        })
+    }
 }
 
 fn project_reconciled_owner_ack_state(
@@ -409,13 +420,13 @@ fn consumed_payload_digest(payload: &[serde_json::Value]) -> Result<String, Prov
     Ok(sha256_hex(&bytes))
 }
 
-/// Validates and retains a Kernel acknowledgement receipt against the exact
-/// frontier and owner tuple held by the unresolved offer. The receipt remains
-/// write evidence only; its independent read has not completed.
+/// Validates a Kernel acknowledgement receipt against the exact frontier and
+/// owner tuple held by the unresolved offer. The receipt proves ack progress
+/// only; its independent read has not completed.
 fn validate_acknowledgement_receipt(
     receipt: &serde_json::Value,
     offer: &ConsumedFrontierOffer,
-) -> Result<(), ProviderFailure> {
+) -> Result<BTreeMap<String, u64>, ProviderFailure> {
     let invalid = || {
         event_shape_failure(
             "reconciliation refused: acknowledgement receipt does not bind the retained offer",
@@ -450,7 +461,9 @@ fn validate_acknowledgement_receipt(
             || namespace != identity.owner_namespace
             || recovery_cursor(item, "expected_revision")? != identity.owner_revision
             || recovery_cursor(item, "expected_incarnation")? != identity.incarnation
-            || requested_namespaces.insert(namespace, sequence).is_some()
+            || requested_namespaces
+                .insert(namespace, (stream_id, sequence))
+                .is_some()
         {
             return Err(invalid());
         }
@@ -486,20 +499,20 @@ fn validate_acknowledgement_receipt(
         return Err(invalid());
     }
     let mut seen_outcome_namespaces = BTreeSet::new();
+    let mut acknowledged = BTreeMap::new();
     for stream in outcome_streams {
         let namespace = recovery_digest(stream, "namespace")?;
-        let expected_sequence = requested_namespaces
-            .get(&namespace)
-            .copied()
-            .ok_or_else(invalid)?;
+        let (stream_id, expected_sequence) =
+            requested_namespaces.get(&namespace).ok_or_else(invalid)?;
         let durable_cursor = recovery_cursor(stream, "durable_cursor")?;
         let acked_cursor = recovery_cursor(stream, "acked_cursor")?;
         if !seen_outcome_namespaces.insert(namespace)
-            || acked_cursor < expected_sequence
+            || acked_cursor < *expected_sequence
             || durable_cursor < acked_cursor
         {
             return Err(invalid());
         }
+        acknowledged.insert(stream_id.clone(), acked_cursor);
     }
     if recovery_digest(receipt, "request_sha256")? != request_sha256
         || recovery_digest(receipt, "operation_sha256")? != operation_sha256
@@ -516,7 +529,7 @@ fn validate_acknowledgement_receipt(
     {
         return Err(invalid());
     }
-    Ok(())
+    Ok(acknowledged)
 }
 
 /// Typed local-state-unavailable failure for the consumed-frontier path.
@@ -2865,9 +2878,8 @@ impl KernelMcpForwardingPort {
     /// the transport once a reply frame arrives, outcome-unknown on send
     /// failure, missing reply, or rejected answer.
     ///
-    /// Never marks `OwnerConfirmed`: only the joint core/cache import
-    /// confirms, so transport custody can never impersonate owner
-    /// acknowledgement. A borrow conflict keeps the older disposition,
+    /// Never marks `OwnerConfirmed`: transport custody can never impersonate
+    /// owner acknowledgement. A borrow conflict keeps the older disposition,
     /// which is still unresolved — the safe direction on an already
     /// failing path.
     fn mark_consumed_offer_disposition(&mut self, disposition: ConsumedOfferDisposition) {
@@ -2888,19 +2900,12 @@ impl KernelMcpForwardingPort {
         ) {
             return;
         }
-        if offer.disposition == ConsumedOfferDisposition::AckCommittedFollowupUnknown
-            && disposition != ConsumedOfferDisposition::OwnerConfirmed
-        {
-            return;
-        }
         offer.disposition = disposition;
     }
 
     /// Retains the exact Kernel mutation receipt when its acknowledgement
-    /// committed but the subsequent owner read failed. This records only the
-    /// write receipt: no page facts, cursor proofs, or read commitment exist
-    /// in that response, so the offer remains unresolved and idempotently
-    /// replayable under its original identity.
+    /// committed. The receipt may resolve the offered ack frontier, but it
+    /// never supplies read facts, cursor proofs, or a read commitment.
     fn retain_acknowledgement_read_unknown(
         &mut self,
         value: &serde_json::Value,
@@ -2955,7 +2960,8 @@ impl KernelMcpForwardingPort {
             .shared
             .try_borrow_mut()
             .map_err(|_| local_state_failure())?;
-        let offer = owner.consumed_offer.as_mut().ok_or_else(|| {
+        let owner = &mut *owner;
+        let offer = owner.consumed_offer.as_ref().ok_or_else(|| {
             event_shape_failure(
                 "reconciliation refused: acknowledgement receipt has no retained consumed offer",
             )
@@ -2963,15 +2969,55 @@ impl KernelMcpForwardingPort {
         if !matches!(
             offer.disposition,
             ConsumedOfferDisposition::HandedToTransport
-                | ConsumedOfferDisposition::AckCommittedFollowupUnknown
         ) {
             return Err(event_shape_failure(
                 "reconciliation refused: acknowledgement receipt does not match transport custody",
             ));
         }
-        validate_acknowledgement_receipt(receipt, offer)?;
-        offer.acknowledgement_receipt = Some(receipt.clone());
-        offer.disposition = ConsumedOfferDisposition::AckCommittedFollowupUnknown;
+        let acknowledged = validate_acknowledgement_receipt(receipt, offer)?;
+        if offer
+            .stream_identities
+            .iter()
+            .any(|(stream_id, identity)| owner.owner_identity.get(stream_id) != Some(identity))
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: acknowledgement receipt is exact for a predecessor owner identity that is no longer adopted",
+            ));
+        }
+        // Build both replacement caches before touching shared state. If an
+        // allocation or validation fails, the offer and caches stay intact.
+        let stream_identities = offer.stream_identities.clone();
+        let mut owner_acked = owner.owner_acked.clone();
+        let mut delivered_sequences = owner.delivered_sequences.clone();
+        let acknowledgement_receipt = receipt.clone();
+        for (stream_id, acked_cursor) in acknowledged {
+            let confirmed_cursor = owner_acked
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(0)
+                .max(acked_cursor);
+            owner_acked.insert(stream_id.clone(), confirmed_cursor);
+            if let Some(held) = delivered_sequences.get_mut(&stream_id) {
+                let identity = &stream_identities[&stream_id];
+                held.retain(|sequence, delivered| {
+                    *sequence > confirmed_cursor
+                        || delivered.owner_identity.as_ref() != Some(identity)
+                });
+                if held.is_empty() {
+                    delivered_sequences.remove(&stream_id);
+                }
+            }
+        }
+        let offer = owner.consumed_offer.as_mut().ok_or_else(|| {
+            event_shape_failure(
+                "reconciliation refused: retained consumed offer disappeared during receipt validation",
+            )
+        })?;
+        // Infallible swap after all parsing, validation, and allocation.
+        owner.owner_acked = owner_acked;
+        owner.delivered_sequences = delivered_sequences;
+        offer.acknowledgement_receipt = Some(acknowledgement_receipt);
+        offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
         Ok(())
     }
 
@@ -3018,16 +3064,31 @@ impl KernelMcpForwardingPort {
             return;
         }
         let adopted = &owner.owner_identity;
+        let candidate_streams = result.recovery_candidate_stream_facts();
+        if candidate_streams.is_empty() {
+            return;
+        }
         let proven = offer.frontiers.iter().all(|(stream_id, frontier)| {
-            window
-                .stream_facts()
+            candidate_streams
                 .iter()
                 .find(|facts| facts.stream_id() == stream_id)
                 .is_some_and(|facts| {
-                    let Some(identity) = OwnerStreamIdentity::from_facts(facts) else {
-                        return false;
+                    let identity = OwnerStreamIdentity {
+                        owner_namespace: facts.owner_namespace().to_owned(),
+                        producer_id: facts.producer_id().to_owned(),
+                        incarnation: facts.owner_incarnation(),
+                        owner_revision: facts.owner_revision(),
                     };
+                    let page_is_consistent = window
+                        .stream_facts()
+                        .iter()
+                        .find(|page| page.stream_id() == stream_id)
+                        .is_none_or(|page| {
+                            OwnerStreamIdentity::from_facts(page).as_ref() == Some(&identity)
+                                && page.acked_cursor() <= facts.acked_cursor()
+                        });
                     facts.acked_cursor() >= *frontier
+                        && page_is_consistent
                         && offer.stream_identities.get(stream_id) == Some(&identity)
                         && adopted.get(stream_id) == Some(&identity)
                 })
@@ -3261,6 +3322,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 return Err(error);
             }
         }
+        if let Err(error) = self.retain_acknowledgement_receipt(&value, false) {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(error);
+        }
         match decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
@@ -3433,21 +3498,22 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                  must present the validated continuity binding",
             ));
         }
+        let offer_was_replaced = owner.consumed_offer.as_ref().is_some_and(|offer| {
+            replaced_offer_streams.iter().any(|stream_id| {
+                offer
+                    .stream_identities
+                    .get(stream_id)
+                    .zip(owner_identity.get(stream_id))
+                    .is_some_and(|(offered, current)| offered != current)
+            })
+        });
         // One infallible bounded swap; no parsing, allocation, owner call,
         // validation, or other fallible work follows on this path.
         owner.owner_acked = owner_acked;
         owner.delivered_sequences = delivered_sequences;
         owner.owner_identity = owner_identity;
-        if let Some(offer) = owner.consumed_offer.as_mut() {
-            if replaced_offer_streams.iter().any(|stream_id| {
-                offer
-                    .stream_identities
-                    .get(stream_id)
-                    .zip(owner.owner_identity.get(stream_id))
-                    .is_some_and(|(offered, current)| offered != current)
-            }) {
-                offer.disposition = ConsumedOfferDisposition::Replaced;
-            }
+        if offer_was_replaced && let Some(offer) = owner.consumed_offer.as_mut() {
+            offer.disposition = ConsumedOfferDisposition::Replaced;
         }
         // Rebind the retained offer to this import's window key under the
         // same held borrow (pure field write; cannot fail).
