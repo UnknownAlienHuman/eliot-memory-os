@@ -91,6 +91,7 @@ pub use settled_plan_transport::{
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
     admit_producer_feed, governor_assess, render_admission_fence,
 };
+use understanding_bootstrap::validate_task_inputs_match_surface;
 /// Agent-facing transport profiles and their admission policy (I7.5): the
 /// stdio shim default route, the optional loopback HTTP profile with its
 /// literal-loopback bind admission, scoped short-lived bearer credential,
@@ -3844,6 +3845,55 @@ impl BootstrapSnapshot {
         Ok(())
     }
 
+    /// Requires the typed owner surface to overlap the live activation on
+    /// principal, session, WorkScope, exact task revision, and the typed
+    /// epoch/generation carried by both sides. The bridge has no defined
+    /// encoding for `BootstrapContext::state_fence_ref`, so material readiness
+    /// is already refused by `from_compiled_surface`; this check does not
+    /// manufacture equivalence for that opaque value or for source/profile
+    /// references absent from `AttachBinding`.
+    fn owner_surface_matches_binding(
+        surface: &eliot_governor::ColdStartSurfaceView,
+        binding: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        let mismatch = || BootstrapError {
+            code: "BOOTSTRAP_OWNER_BINDING_MISMATCH",
+            detail: "compiled readiness owner surface disagrees with the live authenticated attach binding".to_owned(),
+        };
+        if surface.principal_ref != binding.principal_id().as_str()
+            || surface.session_ref != binding.session_id().as_str()
+            || surface.scope.scope_ref != binding.task_binding().work_scope_id()
+            || !surface
+                .state_fence
+                .authority_epoch
+                .is_same_authority(binding.state_fence().authority_epoch())
+            || surface.state_fence.resource_generation.value()
+                != binding.state_fence().generation().get()
+            || surface
+                .state_fence
+                .task_revision
+                .is_some_and(|revision| {
+                    revision.value().to_string() != binding.task_binding().task_revision()
+                })
+        {
+            return Err(mismatch());
+        }
+        match &surface.task_binding {
+            eliot_workscope::TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                ..
+            }
+            | eliot_workscope::TaskBindingState::Exploratory {
+                task_ref,
+                task_revision,
+                ..
+            } if task_ref.as_str() == binding.task_binding().task_id().as_str()
+                && task_revision.to_string() == binding.task_binding().task_revision() => Ok(()),
+            _ => Err(mismatch()),
+        }
+    }
+
     /// Requires a composed task selection to agree with the sealed activation task and revision.
     ///
     /// The sealed attach binding carries the activation-resolved task; a
@@ -4361,11 +4411,20 @@ impl BridgeRunner {
     /// explicitly request the intended task without filesystem search. A
     /// wrong-principal or wrong-worktree packet is refused at note time; a
     /// later session, fence, or scope/task move refuses at compose time.
+    /// Material readiness is refused on this generic context path because
+    /// its fence is only an opaque reference, not a typed value comparable to
+    /// the live attach fence.
     pub fn note_owner_snapshot(
         &mut self,
         context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
+        if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_STATE_FENCE_UNBOUND",
+                detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
+            });
+        }
         get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
@@ -4402,23 +4461,27 @@ impl BridgeRunner {
     /// this receipt forward all fail closed with their own codes; none of them
     /// degrades into a caller READY flag.
     ///
-    /// Everything is then sealed to the live attach binding exactly as
-    /// [`Self::note_owner_snapshot`] seals, so a wrong principal, another
-    /// `WorkScope`, or a stale fence can never project through this path
-    /// either. The context is stored through the same retained snapshot, so the
-    /// once-per-session auto-boot and bounded explicit retrieval compose from
-    /// these inputs. This helper cannot establish that separately supplied
-    /// task/source/session values came from the same readiness receipt:
-    /// `ColdStartSurfaceView` does not carry those bindings.
+    /// The supplied principal, WorkScope, and route-profile refs must equal the
+    /// corresponding owner fields. Task-selection content must preserve the
+    /// owner task/selection disposition. When attached, the surface must also
+    /// match the live principal, session, scope, task revision, and overlapping
+    /// typed fence fields. Material readiness remains closed because the
+    /// caller's state-fence ref is opaque and no typed compatible carrier is
+    /// present here. These comparisons do not authenticate the surface
+    /// producer, validate a stored receipt digest, or bind separately supplied
+    /// coverage/governance snapshots to the surface's opaque profile refs;
+    /// those facts remain dependent on the live authenticated #8 producer.
+    /// A no-task or ambiguous diagnostic surface can be retained while
+    /// detached, but cannot be matched to the concrete task in a live attach.
     ///
     /// # Live status
     ///
     /// `caller: STITCH`. There is no production caller: `main.rs::handle_bootstrap`
     /// still accepts a client-supplied `BootstrapContext` and calls
-    /// [`Self::note_owner_snapshot`]. The owner transport must carry the
-    /// readiness receipt's session/scope/task/source bindings together with
-    /// the Governor surface and profiles before this helper can prove their
-    /// common binding. No synthetic caller was added.
+    /// [`Self::note_owner_snapshot`]. #8 must provide the authenticated live
+    /// producer/transport, original receipt integrity/freshness proof, and a
+    /// typed compatible fence/profile binding before this path can publish
+    /// Material readiness. No synthetic caller was added.
     #[allow(clippy::too_many_arguments)]
     pub fn note_owner_surface(
         &mut self,
@@ -4444,6 +4507,7 @@ impl BridgeRunner {
         conflicts_unknowns: Vec<String>,
         next_safe_expansion: String,
     ) -> Result<(), BootstrapError> {
+        validate_task_inputs_match_surface(surface, &tasks)?;
         let governance = GovernanceEvidence::from_owner_profiles(coverage, governance_profile)?;
         let context = BootstrapContext::from_compiled_surface(
             surface,
@@ -4466,6 +4530,9 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
+        if let Some(binding) = self.attach_view().map(|view| view.binding().clone()) {
+            BootstrapSnapshot::owner_surface_matches_binding(surface, &binding)?;
+        }
         self.note_owner_snapshot(context, tasks)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.

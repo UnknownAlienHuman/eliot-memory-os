@@ -28,6 +28,7 @@ use eliot_integration_coverage::{
     EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
     LogicalEvent,
 };
+use eliot_workscope::TaskBindingState;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -553,6 +554,24 @@ impl BootstrapContext {
         next_safe_expansion: String,
         boot_delta: Option<BootDelta>,
     ) -> Result<Self, BootstrapError> {
+        if principal_ref != surface.principal_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_PRINCIPAL_MISMATCH",
+                "caller principal disagrees with the compiled owner surface",
+            ));
+        }
+        if workscope_ref != surface.scope.scope_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_SCOPE_MISMATCH",
+                "caller WorkScope disagrees with the compiled owner surface",
+            ));
+        }
+        if route_profile_ref != surface.route_profile_ref {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_ROUTE_PROFILE_MISMATCH",
+                "caller route profile disagrees with the compiled owner surface",
+            ));
+        }
         let onboarding_disposition = match surface.readiness.as_str() {
             "UNSEEN" => ReadinessDisposition::Unseen,
             "SCANNING" => ReadinessDisposition::Scanning,
@@ -570,6 +589,12 @@ impl BootstrapContext {
                 ));
             }
         };
+        if onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_STATE_FENCE_UNBOUND",
+                "material readiness cannot be projected while the supplied fence is opaque and cannot be compared with the typed owner fence",
+            ));
+        }
         Self::from_receipt(
             surface.receipt_ref.clone(),
             principal_ref,
@@ -605,6 +630,108 @@ impl BootstrapContext {
             validate_context(&context)?;
             Ok(context)
         })
+    }
+}
+
+/// Checks that caller-provided task inputs preserve the task disposition and
+/// exact task content carried by the compiled owner surface. Selection
+/// provenance still depends on the authenticated #8 producer; the bridge
+/// never treats a matching caller-provided reason/source as owner evidence.
+pub(crate) fn validate_task_inputs_match_surface(
+    surface: &ColdStartSurfaceView,
+    tasks: &BootstrapTaskInputs,
+) -> Result<(), BootstrapError> {
+    validate_tasks(tasks)?;
+    let task_mismatch = || {
+        BootstrapError::new(
+            "BOOTSTRAP_TASK_SURFACE_MISMATCH",
+            "caller task inputs disagree with the task or selection state in the compiled owner surface",
+        )
+    };
+    let exact_task_candidate = |task_ref: &str,
+                                task_revision: u64,
+                                acceptance_digest: &str|
+     -> Result<(), BootstrapError> {
+        if tasks.scope_level != ScopeLevel::Task
+            || tasks.candidates.len() != 1
+            || tasks.candidates[0].handle != task_ref
+            || tasks.candidates[0].task_revision != Some(task_revision)
+            || tasks.candidates[0].acceptance_digest.as_deref() != Some(acceptance_digest)
+            || tasks.candidates[0].historical
+            || tasks.candidates[0].prior_evaluation_candidate_only
+            || tasks.candidates[0].independent_binding_supplied
+        {
+            return Err(task_mismatch());
+        }
+        if tasks.authoritative_selection.is_some() {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_SELECTION_PROVENANCE_UNAVAILABLE",
+                "compiled owner task binding carries no authenticated selection source or reason for caller-provided authoritative selection",
+            ));
+        }
+        Ok(())
+    };
+
+    match &surface.task_binding {
+        TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        }
+        | TaskBindingState::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => exact_task_candidate(task_ref, *task_revision, acceptance_digest),
+        TaskBindingState::Ambiguous { candidate_handles } => {
+            if tasks.scope_level != ScopeLevel::Task
+                || candidate_handles.len() < 2
+                || tasks.authoritative_selection.is_some()
+                || tasks.candidates.len() != candidate_handles.len()
+                || tasks
+                    .candidates
+                    .iter()
+                    .zip(candidate_handles)
+                    .any(|(candidate, handle)| {
+                        candidate.handle != *handle
+                            || candidate.task_revision.is_some()
+                            || candidate.acceptance_digest.is_some()
+                            || candidate.historical
+                            || candidate.prior_evaluation_candidate_only
+                            || candidate.independent_binding_supplied
+                    })
+            {
+                return Err(task_mismatch());
+            }
+            Ok(())
+        }
+        TaskBindingState::None_ => {
+            if !tasks.candidates.is_empty() || tasks.authoritative_selection.is_some() {
+                return Err(task_mismatch());
+            }
+            Ok(())
+        }
+        TaskBindingState::Stale {
+            task_ref,
+            task_revision,
+        } => {
+            if tasks.scope_level != ScopeLevel::Task
+                || tasks.candidates.len() != 1
+                || tasks.candidates[0].handle != *task_ref
+                || tasks.candidates[0].task_revision != Some(*task_revision)
+                || tasks.candidates[0].acceptance_digest.is_some()
+                || tasks.candidates[0].historical
+                || tasks.candidates[0].prior_evaluation_candidate_only
+                || tasks.candidates[0].independent_binding_supplied
+                || tasks.authoritative_selection.is_some()
+            {
+                return Err(task_mismatch());
+            }
+            Err(BootstrapError::new(
+                "BOOTSTRAP_TASK_STALE",
+                "compiled owner surface carries a stale task binding that cannot be represented as a current bridge selection",
+            ))
+        }
     }
 }
 
@@ -1168,12 +1295,21 @@ fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, B
 /// `READY` (I4.4.1: `READY_MATERIAL` is always tied to one `TaskContract`
 /// revision). Fails closed whenever governance evidence, identity,
 /// revisions, acceptance, or selection integrity are missing.
+/// This bridge context carries only an opaque fence reference, so this
+/// projection also refuses `READY_MATERIAL` until an authenticated route can
+/// supply a typed fence comparable to the live attach.
 pub fn get_understanding_bootstrap(
     context: &BootstrapContext,
     tasks: &BootstrapTaskInputs,
     requested_assessment: CurrentAssessment,
 ) -> Result<UnderstandingBootstrap, BootstrapError> {
     validate_context(context)?;
+    if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_STATE_FENCE_UNBOUND",
+            "material readiness cannot be projected from a context carrying only an opaque fence reference",
+        ));
+    }
     validate_tasks(tasks)?;
     let task_selection = compose_selection(tasks)?;
     let mut relevant_handles = context.orientation_handles.clone();
