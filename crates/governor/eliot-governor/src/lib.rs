@@ -145,7 +145,9 @@ pub use controlboard_projection::{
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
+pub use eliot_canonical::{
+    CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome, WriteResponseMode,
+};
 pub use eliot_finish::FinishDecisionReceipt;
 /// Admission-receipt type re-exported so the daemon composition root can name
 /// the exact delivery-gate receipt type without a second dependency path (same

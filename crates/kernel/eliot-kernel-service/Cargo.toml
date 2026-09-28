@@ -17,6 +17,7 @@ source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-kernel-service"
 
 [dependencies]
+eliot-canonical.workspace = true
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
 # Issue #40 W5: the kernel-local lifecycle admission owner
@@ -61,10 +62,6 @@ eliot-ors = { workspace = true, features = ["test-support"] }
 # edges never enter the production dependency graph or the runtime boundary.
 eliot-store-surreal-adapter.workspace = true
 eliot-read = { path = "../../governor/eliot-read", version = "0.1.0" }
-# Issue #1905 mutation legs: tests play the legitimate Governor caller via
-# the owned revision encoder, and build payloads from the exact contract
-# types. Test-only; production accepts caller-supplied typed payloads.
-eliot-canonical.workspace = true
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
 # Issue #1779 failure history: adapter tests drive the real reference
 # contour (never a fake store) through the canonical failure leg.

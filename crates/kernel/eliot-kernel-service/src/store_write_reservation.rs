@@ -111,11 +111,11 @@ use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
-    OperationalCurrentRecoveryCursor, OperationalPhase, OperationalRecoveryStore,
+    OperationalCurrentRecoveryCursor, OperationalPhase, OperationalRecoveryStore, RecoveryCursor,
     RecoveryInboxDisposition, RecoveryInboxRecoveryCursor, RecoveryInventorySnapshot,
-    RecoveryInventorySource, RecoveryProblem, RecoveryProblemRecoveryCursor, RedbRecoveryStore,
-    ReservationRecord, ReservationState, StateFenceSnapshot, WriteIdempotencyRecoveryCursor,
-    WriteReservationRecoveryCursor, WriterReservationToken,
+    RecoveryInventorySource, RecoveryPage, RecoveryProblem, RecoveryProblemRecoveryCursor,
+    RedbRecoveryStore, ReservationRecord, ReservationState, StateFenceSnapshot,
+    WriteIdempotencyRecoveryCursor, WriteReservationRecoveryCursor, WriterReservationToken,
 };
 use eliot_receipts::{ReceiptDispositionKind, ReceiptKind};
 use eliot_store_api::{
@@ -1036,6 +1036,10 @@ pub fn reconcile_receipt(
 ///
 /// Staging step shared with [`reconcile_receipt`] so the constructor stays a
 /// composition of audited checks rather than one long body.
+#[expect(
+    clippy::too_many_lines,
+    reason = "exact receipt binding is checked in one auditable operation"
+)]
 fn check_receipt_token_binding(
     token: &WriterReservationToken,
     receipt: &WriteReceipt,
@@ -1089,7 +1093,7 @@ fn check_receipt_token_binding(
     let mut bound_scopes: Vec<_> = write_binding
         .ordering_scopes
         .iter()
-        .map(|scope| scope.as_str())
+        .map(eliot_ors::OpaqueLabel::as_str)
         .collect();
     let mut token_scopes: Vec<_> = token
         .scopes
@@ -1819,7 +1823,6 @@ fn increment_recovery_record_count(
 struct StartupRecoverySourceCoverageBuilder {
     source: &'static str,
     source_revision: u64,
-    snapshot_sha256: String,
     page_count: u64,
     record_count: u64,
     start_cursor_sha256: Option<String>,
@@ -1968,7 +1971,6 @@ impl StartupRecoverySourceCoverageBuilder {
         Self {
             source,
             source_revision,
-            snapshot_sha256: snapshot_sha256.to_owned(),
             page_count: 0,
             record_count: 0,
             start_cursor_sha256: None,
@@ -2148,6 +2150,10 @@ fn startup_serialized_sha256<T: serde::Serialize>(
 /// ORS are passed back verbatim, including empty reservation-index phases.
 /// Every page is bound to the same five-source revision snapshot and a final
 /// snapshot validation closes the whole inventory before the caller can use it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "five ORS sources share one frozen inventory snapshot"
+)]
 fn scan_startup_recovery_inventory(
     ors: &RedbRecoveryStore,
     limit: u16,
@@ -2478,6 +2484,10 @@ struct StartupStagedProjection {
     problem_count: u64,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded lookup and final full coverage remain visible in one audit path"
+)]
 async fn reconcile_pending_at_startup_inner(
     owner: &CompositionReservation,
     fence: &StateFence,
@@ -2505,9 +2515,7 @@ async fn reconcile_pending_at_startup_inner(
     let mut lookup = StartupReservationLookupTrace::new();
     let mut after_page_snapshot: Option<RecoveryInventorySnapshot> = None;
     let mut reservation_cursor: Option<WriteReservationRecoveryCursor> = None;
-    let mut reservation_lookup_suffix_exhausted = false;
-
-    loop {
+    let reservation_lookup_suffix_exhausted = loop {
         if reservation_cursor.is_none() {
             let snapshot = owner.ors.begin_recovery_inventory_snapshot()?;
             snapshot.validate()?;
@@ -2650,8 +2658,7 @@ async fn reconcile_pending_at_startup_inner(
         }
 
         if page.complete {
-            reservation_lookup_suffix_exhausted = true;
-            break;
+            break true;
         }
         if page_has_active_rows {
             after_reservation_id = page_last_reservation_id;
@@ -2672,7 +2679,7 @@ async fn reconcile_pending_at_startup_inner(
                 ));
             }
         }
-    }
+    };
 
     // This second exhaustive scan is the only post-reconciliation inventory
     // used for readiness. Its from-start cursor covers the whole reservation
@@ -2829,13 +2836,20 @@ pub struct StartupStagedEnvelope {
 #[derive(Debug)]
 pub enum StartupEnvelopeProblemCause {
     /// ORS retained a durable Recovery Problem for this operation.
-    RecoveryProblemRetained { reported_operation_id: String },
+    RecoveryProblemRetained {
+        /// Operation identity attached to the durable problem.
+        reported_operation_id: String,
+    },
     /// ORS could not persist the Recovery Problem. Both the original read
     /// failure and the recorder failure remain typed and available to callers.
     RecoveryProblemRecordFailed {
+        /// Original operation whose envelope check failed.
         reported_operation_id: eliot_ors::OperationIdentity,
+        /// Reservation holding the unreadable envelope.
         reported_reservation_id: eliot_ors::OperationIdentity,
+        /// Exact validation failure retained without caller-visible secret text.
         original: Box<eliot_ors::OrsError>,
+        /// Exact failure to persist the Recovery Problem.
         recorder: Box<eliot_ors::OrsError>,
     },
 }

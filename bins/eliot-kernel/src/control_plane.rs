@@ -21,6 +21,7 @@
 //! its public API while the control-plane lifecycle gateway has a bounded home.
 
 use super::*;
+use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
@@ -362,12 +363,11 @@ impl KernelComposition {
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
-            let gateway = match self
+            let Ok(gateway) = self
                 .connect_canonical_store(Duration::from_millis(handoff.requirement.timeout_ms()))
                 .await
-            {
-                Ok(gateway) => gateway,
-                Err(_) => return Err(TransportError::SessionFenced.into()),
+            else {
+                return Err(TransportError::SessionFenced.into());
             };
             // I1.11 step 6 cannot be inferred from a connected Store. Before
             // BootstrapStore returns, attempt bounded enumeration and
@@ -378,7 +378,11 @@ impl KernelComposition {
             // unrecorded, so dependent normal writes remain gated while this
             // independent control path stays available for recovery
             // inspection/retry.
-            if self.startup_status(GovernanceProfile::minimal()).completed_step < 6 {
+            if self
+                .startup_status(GovernanceProfile::minimal())
+                .completed_step
+                < 6
+            {
                 let recovery_fence =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
                 match gateway

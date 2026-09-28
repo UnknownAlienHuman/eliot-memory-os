@@ -42,14 +42,14 @@ use eliot_authority::{
     RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
+use eliot_canonical::write_envelope::accept_after_stage_handle;
+pub use eliot_canonical::write_envelope::{
+    AcceptAfterStageHandle, VersionedWriteRefusal, VersionedWriteSubmission,
+};
 use eliot_canonical::{
     AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
     WriteResponseMode,
 };
-pub use eliot_canonical::write_envelope::{
-    AcceptAfterStageHandle, VersionedWriteRefusal, VersionedWriteSubmission,
-};
-use eliot_canonical::write_envelope::accept_after_stage_handle;
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
@@ -209,23 +209,25 @@ pub trait KernelTransitionPort: Send + Sync {
 /// `wait_for_commit` request can become `ACCEPTED_PENDING` only after ORS
 /// proves complete durable staging under the same operation binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "status",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum KernelVersionedWriteOutcome {
     /// Canonical Store receipt returned for the exact prepared operation.
     Committed {
         requested_mode: WriteResponseMode,
-        receipt: WriteReceipt,
+        receipt: Box<WriteReceipt>,
     },
     /// Exact ORS owner evidence that the full operation is durably staged.
     AcceptedPending {
         requested_mode: WriteResponseMode,
-        staging: eliot_ors::AcceptedPending,
+        staging: Box<eliot_ors::AcceptedPending>,
         handle: AcceptAfterStageHandle,
     },
     /// Typed, request-bound refusal before staging, ORS, or Store effect.
-    Refused {
-        refusal: VersionedWriteRefusal,
-    },
+    Refused { refusal: Box<VersionedWriteRefusal> },
 }
 
 /// Validates the durable identity returned for one staged versioned write.
@@ -255,9 +257,8 @@ pub fn validate_accepted_pending_binding(
     staging.validate().map_err(|error| error.to_string())?;
     let expected_digest = eliot_store_api::prepared_transition_digest(transition)
         .map_err(|error| error.to_string())?;
-    let expected_handle =
-        accept_after_stage_handle(&transition.identity.operation_id, true)
-    .map_err(|error| error.to_string())?;
+    let expected_handle = accept_after_stage_handle(&transition.identity.operation_id, true)
+        .map_err(|error| error.to_string())?;
     let binding = &staging.write_binding;
     binding
         .authority_epoch
@@ -266,12 +267,12 @@ pub fn validate_accepted_pending_binding(
     let mut expected_scopes: Vec<_> = transition
         .ordering_scopes
         .iter()
-        .map(|scope| scope.as_str())
+        .map(eliot_store_api::OrderingScopeId::as_str)
         .collect();
     let mut bound_scopes: Vec<_> = binding
         .ordering_scopes
         .iter()
-        .map(|scope| scope.as_str())
+        .map(eliot_ors::OpaqueLabel::as_str)
         .collect();
     expected_scopes.sort_unstable();
     bound_scopes.sort_unstable();
@@ -282,14 +283,13 @@ pub fn validate_accepted_pending_binding(
     )
     .map_err(|error| error.to_string())?;
     if requested_mode != submission.response_mode
-        || staging.operation_id.operation_id.as_str() != submission.operation_id().as_str()
+        || staging.operation_id.as_str() != submission.operation_id().as_str()
         || staging.prepared_transition_sha256 != expected_digest
         || binding.write_envelope_protocol_version != submission.protocol_version
-        || binding.operation_id.operation_id.as_str() != submission.operation_id().as_str()
+        || binding.operation_id.as_str() != submission.operation_id().as_str()
         || binding.write_intent_id.as_str() != submission.write_intent_id.as_str()
         || binding.idempotency_key.as_str() != submission.idempotency_key()
-        || binding.canonical_request_sha256.as_str()
-            != submission.canonical_request_hash.as_str()
+        || binding.canonical_request_sha256.as_str() != submission.canonical_request_hash.as_str()
         || binding.prepared_transition_sha256 != expected_digest
         || bound_scopes != expected_scopes
         || binding.admission_contract_set_digest.as_str()
@@ -2930,8 +2930,7 @@ impl CanonicalAdmissionOwner {
             || transition.state_fence != identity.request.metadata.state_fence
         {
             return Err(CompositionError::Provider(
-                "prepared transition does not match the admitted versioned submission"
-                    .to_owned(),
+                "prepared transition does not match the admitted versioned submission".to_owned(),
             ));
         }
         let expected_response_mode = submission.response_mode;

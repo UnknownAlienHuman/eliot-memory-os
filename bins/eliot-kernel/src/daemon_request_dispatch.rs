@@ -1297,7 +1297,7 @@ struct StoreApplyOperation {
 #[serde(deny_unknown_fields)]
 struct StoreApplyVersionedOperation {
     context: RequestMeta,
-    submission: eliot_canonical::write_envelope::VersionedWriteSubmission,
+    submission: eliot_kernel_service::VersionedWriteSubmission,
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
@@ -2182,12 +2182,7 @@ impl KernelComposition {
                     .await
             }
             "apply_versioned_submission" => {
-                Box::pin(self.store_apply_versioned_operation(
-                    session,
-                    request_id.clone(),
-                    payload.clone(),
-                ))
-                .await
+                Self::store_apply_versioned_operation(session, &request_id, payload.clone())
             }
             NOTIFICATION_STATE_MUTATION_OPERATION => {
                 Box::pin(self.notification_state_operation(
@@ -6381,16 +6376,15 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    async fn store_apply_versioned_operation(
-        &self,
+    fn store_apply_versioned_operation(
         session: &Session,
-        request_id: RequestId,
+        request_id: &RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyVersionedOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
-        if operation.context.request_id != request_id
+        if &operation.context.request_id != request_id
             || operation.context.source_id.as_str() != ACTIVE_DAEMON_CALLER
             || session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
         {
@@ -6420,11 +6414,10 @@ impl KernelComposition {
         // limits are available, so this route must not reserve, send, or
         // report ACCEPTED_PENDING. Preserve the exact request and no-effect
         // state in a typed refusal instead of collapsing it into generic text.
-        let refusal =
-            eliot_canonical::write_envelope::VersionedWriteRefusal::missing_staging_owners(
-                &operation.submission,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+        let refusal = eliot_kernel_service::VersionedWriteRefusal::missing_staging_owners(
+            &operation.submission,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
             "status": "known",
             "value": {
@@ -6436,10 +6429,9 @@ impl KernelComposition {
     }
 
     #[cfg(not(windows))]
-    async fn store_apply_versioned_operation(
-        &self,
+    fn store_apply_versioned_operation(
         _session: &Session,
-        _request_id: RequestId,
+        _request_id: &RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;

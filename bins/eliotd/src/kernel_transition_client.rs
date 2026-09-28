@@ -10,11 +10,10 @@
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
-use eliot_canonical::WriteResponseMode;
 use eliot_governor::{
     KernelPortError, KernelPortFuture, KernelTransitionPort, KernelVersionedWriteOutcome,
     TaskControllerCampaignSourceHeads, VersionedWriteRefusal, VersionedWriteSubmission,
-    validate_accepted_pending_binding,
+    WriteResponseMode, validate_accepted_pending_binding,
 };
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignSourceRole, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -295,6 +294,10 @@ impl KernelTransitionPort for DaemonKernelClient {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one authenticated versioned-write request/result identity join"
+    )]
     fn apply_versioned_submission<'a>(
         &'a self,
         identity: &RequestIdentity,
@@ -361,7 +364,9 @@ impl KernelTransitionPort for DaemonKernelClient {
                         refusal
                             .validate_for_submission(&expected_submission)
                             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                        return Ok(KernelVersionedWriteOutcome::Refused { refusal });
+                        return Ok(KernelVersionedWriteOutcome::Refused {
+                            refusal: Box::new(refusal),
+                        });
                     }
                     Some("versioned_write_outcome") => {}
                     _ => {
