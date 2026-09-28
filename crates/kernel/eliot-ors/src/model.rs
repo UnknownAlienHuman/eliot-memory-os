@@ -6631,7 +6631,10 @@ impl HostRequestRetainedLineage {
             ));
         }
         if let Some(receipt) = &self.semantic_receipt_ref {
-            validate_text(receipt, "host_request_retained_lineage_semantic_receipt_ref")?;
+            validate_text(
+                receipt,
+                "host_request_retained_lineage_semantic_receipt_ref",
+            )?;
         }
         Ok(())
     }

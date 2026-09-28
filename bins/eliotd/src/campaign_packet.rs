@@ -35,8 +35,8 @@ use eliot_learning_state_view::{
 };
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt,
-    host_request_operation_id,
+    HostRequestInvokeReadPayload, HostRequestResultBody, HostRequestResultLineage,
+    LocalReadAttempt, host_request_operation_id,
 };
 use eliot_reactive_context_plan::RetrievalPlan;
 use eliot_store_api::{

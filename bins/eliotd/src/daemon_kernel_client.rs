@@ -26,8 +26,7 @@ use eliot_protocol::{
     AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
-    MessageType,
-    ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
+    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;

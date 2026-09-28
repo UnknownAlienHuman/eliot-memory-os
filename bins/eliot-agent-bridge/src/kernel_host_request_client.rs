@@ -763,7 +763,11 @@ impl KernelHostRequestClient {
         // is the disclosure owner's decision, which has no producer on this
         // path; the check below only refuses the case where the owner recorded
         // nothing at all.
-        match record.result_lineage.as_ref().map(|lineage| lineage.result_class) {
+        match record
+            .result_lineage
+            .as_ref()
+            .map(|lineage| lineage.result_class)
+        {
             Some(HostRequestResultClass::Unclassified) | None => {
                 return Err(resource_source_refused());
             }
