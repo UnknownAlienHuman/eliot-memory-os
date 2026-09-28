@@ -2704,18 +2704,30 @@ fn check_expected_state(
 }
 
 /// Digests the expected revision/ordering heads of one batch.
-fn expected_head_digests(batch: &CanonicalRestoreBatch) -> (Vec<String>, Vec<String>) {
+///
+/// The digest exists only to bind *this* batch's expectation into its durable
+/// record, so a head that cannot be canonically encoded is a refusal rather than
+/// a digest of empty bytes: a fallback would let two different head lists hash
+/// to the same stored expectation. This stores the expectation; the destination's
+/// actual head values are compared inside the commit transaction by
+/// [`check_observed_heads`].
+fn expected_head_digests(
+    batch: &CanonicalRestoreBatch,
+) -> Result<(Vec<String>, Vec<String>), StoreError> {
+    let digest = |head: &RevisionHeadExpectation| -> Result<String, StoreError> {
+        Ok(sha256_hex(&canonical_digest_bytes(head)?))
+    };
     let revision_digests = batch
         .expected_revision_heads
         .iter()
-        .map(|head| sha256_hex(&canonical_json_bytes(head).unwrap_or_default()))
-        .collect();
+        .map(digest)
+        .collect::<Result<Vec<_>, _>>()?;
     let ordering_digests = batch
         .expected_ordering_heads
         .iter()
-        .map(|head| sha256_hex(&canonical_json_bytes(head).unwrap_or_default()))
-        .collect();
-    (revision_digests, ordering_digests)
+        .map(digest)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((revision_digests, ordering_digests))
 }
 
 /// Verifies that a durable record belongs to exactly this batch: same
@@ -3694,8 +3706,8 @@ impl SurrealStoreAdapter {
                 MemberDisposition::Suppressed => MemberDisposition::Suppressed,
                 MemberDisposition::Unresolved => MemberDisposition::Unresolved,
                 // A reference edge is never a record the import can write, so it
-                // is rejected as a row, not left unresolved. Its closure was
-                // already proved against the resolved payloads above.
+                // is rejected as a row, not left unresolved. Its closure is
+                // proved against this collected set below.
                 MemberDisposition::Restored => {
                     if member.member_type == SnapshotMemberType::Reference {
                         MemberDisposition::Rejected
@@ -3718,9 +3730,12 @@ impl SurrealStoreAdapter {
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let (completeness, mutation) = planned_outcome(&dispositions);
-        // The durable record names the class and the address this commit writes.
-        // It deliberately carries no import digest: that digest can only come
-        // from the destination's readback, which has not happened yet.
+        // The durable record names the class, the address and the exact content
+        // digest this commit writes for each member. That digest is fixed here
+        // from the payload already bound into the transaction, and the
+        // post-commit readback has to reproduce it before the member can be
+        // reported restored — so a record written without a matching import is
+        // re-read as unresolved rather than certified.
         let planned = planned_evidence(batch, &imports);
         let members = member_records(
             batch,
