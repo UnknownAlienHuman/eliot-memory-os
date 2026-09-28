@@ -22,9 +22,11 @@
 //!
 //! Two probes in particular are never inferred here. Context/output limits and
 //! compaction are **measured**, never read from the provider catalogue's
-//! advertised capacity, and the equal-stack comparison needs a second route's
-//! own run — so both remain unobserved until a pilot that can actually observe
-//! them runs.
+//! advertised capacity, so they remain unobserved until a pilot that can
+//! actually observe them runs. The equal-stack comparison needs a second
+//! route's own retained run, supplied by the operator alongside the candidate
+//! run ([`opencode_pilot_observation_with_fallback`]); from the candidate run
+//! alone it is never claimed.
 
 use crate::{
     AvailabilityState, NoAuthorityRunResult, OpenCodePilotObservation, OpenCodeProbeReading,
@@ -74,6 +76,76 @@ pub fn opencode_pilot_observation(result: &NoAuthorityRunResult) -> OpenCodePilo
         // claimed from this one.
         equal_stack_comparison_retained: OpenCodeProbeReading::NotObserved,
     }
+}
+
+/// Derives the six mandated probe readings from one real bounded candidate run
+/// plus the retained bounded run of the equal-stack fallback route.
+///
+/// The first five readings are exactly what [`opencode_pilot_observation`]
+/// derives from the candidate run alone; the sixth —
+/// [`OpenCodePilotObservation::equal_stack_comparison_retained`] — is derived
+/// from the pair by [`opencode_equal_stack_comparison`]. The fallback run is
+/// operator-supplied retained evidence of the same controlled task run against
+/// the fallback route, never an automatic second attempt: this harness runs
+/// nothing on its own, and task sameness across the two runs is the operator's
+/// precondition, stated here because the run receipts do not carry the prompt.
+#[must_use]
+pub fn opencode_pilot_observation_with_fallback(
+    candidate: &NoAuthorityRunResult,
+    fallback: &NoAuthorityRunResult,
+) -> OpenCodePilotObservation {
+    let mut observation = opencode_pilot_observation(candidate);
+    observation.equal_stack_comparison_retained =
+        opencode_equal_stack_comparison(candidate, fallback);
+    observation
+}
+
+/// Whether the candidate run and the retained fallback run form the
+/// equal-stack comparison I10.11 mandates for its sixth probe ("controlled
+/// implementation tasks are compared with an equal-stack fallback route").
+///
+/// `Observed` requires all of: both runs succeeded, because a failed attempt
+/// produced no evidence for any probe; both retained their actual-route
+/// receipts on the same observed stack — the same endpoint and the same
+/// installed server version (I10.6 keeps the route provisional until the exact
+/// installed server passes the gate); and both retained an identified route
+/// with the two route fingerprints differing, so a run compared with itself
+/// can never read as a fallback comparison. Any absence reads
+/// [`OpenCodeProbeReading::NotObserved`]: absence is never a pass.
+#[must_use]
+pub fn opencode_equal_stack_comparison(
+    candidate: &NoAuthorityRunResult,
+    fallback: &NoAuthorityRunResult,
+) -> OpenCodeProbeReading {
+    if candidate.status != RunStatus::Succeeded || fallback.status != RunStatus::Succeeded {
+        return OpenCodeProbeReading::NotObserved;
+    }
+    let candidate_route = &candidate.actual_route;
+    let fallback_route = &fallback.actual_route;
+    let equal_stack = same_observed(
+        candidate_route.endpoint.as_ref(),
+        fallback_route.endpoint.as_ref(),
+    ) && same_observed(
+        candidate_route.server_version.as_ref(),
+        fallback_route.server_version.as_ref(),
+    );
+    let distinct_routes = distinct_observed(
+        candidate_route.route_fingerprint.as_ref(),
+        fallback_route.route_fingerprint.as_ref(),
+    );
+    reading(equal_stack && distinct_routes)
+}
+
+/// Whether both runs retained the same observed value: present on both sides
+/// and equal. Compared for equality only, never parsed.
+fn same_observed(first: Option<&String>, second: Option<&String>) -> bool {
+    matches!((first, second), (Some(a), Some(b)) if a == b)
+}
+
+/// Whether both runs retained an identified route and the two identities
+/// differ. Compared for equality only, never parsed.
+fn distinct_observed(first: Option<&String>, second: Option<&String>) -> bool {
+    matches!((first, second), (Some(a), Some(b)) if a != b)
 }
 
 fn reading(observed: bool) -> OpenCodeProbeReading {

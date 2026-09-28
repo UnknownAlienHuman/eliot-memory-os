@@ -7,8 +7,8 @@ use eliot_agent_opencode::{
     LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRouteAdmission,
     OpenCodeRouteRole, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
     classify_sealed_candidate, opencode_adapter_contract, opencode_pilot_observation,
-    opencode_pilot_probe_evidence, redact_route_diagnostics, select_opencode_route,
-    validate_opencode_adapter_contract,
+    opencode_pilot_observation_with_fallback, opencode_pilot_probe_evidence,
+    redact_route_diagnostics, select_opencode_route, validate_opencode_adapter_contract,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use secrecy::SecretString;
@@ -22,13 +22,21 @@ use std::process::ExitCode;
 const MAX_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 const PROVIDER_ID: &str = "opencode-go";
 const MODEL_ID: &str = "deepseek-v4-flash";
-const USAGE: &str = "usage: eliot-opencode-bootstrap <loopback-endpoint> <absolute-directory> <prompt-file>\n       eliot-opencode-bootstrap --pilot <loopback-endpoint> <absolute-directory> <prompt-file>\n       eliot-opencode-bootstrap --admitted <loopback-endpoint> <absolute-directory> <prompt-file> <admission-envelope-json-file>\n\noptional admitted-route environment:\n  ELIOT_OPENCODE_EXECUTABLE_FP  expected server executable fingerprint\n  ELIOT_OPENCODE_ENV_ALLOWLIST  comma-separated environment allowlist";
+const USAGE: &str = "usage: eliot-opencode-bootstrap <loopback-endpoint> <absolute-directory> <prompt-file>\n       eliot-opencode-bootstrap --pilot <loopback-endpoint> <absolute-directory> <prompt-file> [fallback-receipt-json-file]\n       eliot-opencode-bootstrap --admitted <loopback-endpoint> <absolute-directory> <prompt-file> <admission-envelope-json-file>\n\noptional admitted-route environment:\n  ELIOT_OPENCODE_EXECUTABLE_FP  expected server executable fingerprint\n  ELIOT_OPENCODE_ENV_ALLOWLIST  comma-separated environment allowlist";
 
 #[derive(Debug, Eq, PartialEq)]
 struct CliArgs {
     endpoint: String,
     directory: PathBuf,
     prompt_file: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PilotCliArgs {
+    endpoint: String,
+    directory: PathBuf,
+    prompt_file: PathBuf,
+    fallback_receipt_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -77,6 +85,7 @@ enum CliError {
     Request(String),
     Run(String),
     Envelope(String),
+    FallbackReceipt(String),
     Output(String),
 }
 
@@ -102,6 +111,9 @@ impl std::fmt::Display for CliError {
             Self::Request(message) => write!(formatter, "invalid read-only request: {message}"),
             Self::Run(message) => write!(formatter, "OpenCode bootstrap failed: {message}"),
             Self::Envelope(message) => write!(formatter, "invalid admission envelope: {message}"),
+            Self::FallbackReceipt(message) => {
+                write!(formatter, "invalid fallback receipt: {message}")
+            }
             Self::Output(message) => write!(formatter, "cannot write result: {message}"),
         }
     }
@@ -141,6 +153,30 @@ fn parse_args(args: &[OsString]) -> Result<CliArgs, CliError> {
         endpoint,
         directory,
         prompt_file,
+    })
+}
+
+fn parse_pilot_args(args: &[OsString]) -> Result<PilotCliArgs, CliError> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(CliError::Usage);
+    }
+    let base = parse_args(&args[..4])?;
+    let fallback_receipt_file = if args.len() == 5 {
+        let path = PathBuf::from(&args[4]);
+        if path.as_os_str().is_empty() {
+            return Err(CliError::InvalidArgument(
+                "fallback receipt file must not be empty",
+            ));
+        }
+        Some(path)
+    } else {
+        None
+    };
+    Ok(PilotCliArgs {
+        endpoint: base.endpoint,
+        directory: base.directory,
+        prompt_file: base.prompt_file,
+        fallback_receipt_file,
     })
 }
 
@@ -274,6 +310,39 @@ fn read_envelope(path: &std::path::Path) -> Result<AdmittedEnvelope, CliError> {
         .map_err(|error| CliError::Envelope(sanitize_error(&error.to_string(), "")))
 }
 
+fn read_fallback_receipt(path: &std::path::Path) -> Result<NoAuthorityRunResult, CliError> {
+    let file = File::open(path).map_err(|error| CliError::FallbackReceipt(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CliError::FallbackReceipt(error.to_string()))?;
+    if metadata.len() > MAX_PROMPT_BYTES as u64 {
+        let observed = match usize::try_from(metadata.len()) {
+            Ok(length) => length,
+            Err(_) => MAX_PROMPT_BYTES,
+        };
+        return Err(CliError::FallbackReceipt(format!(
+            "fallback receipt file exceeds {MAX_PROMPT_BYTES} bytes (observed {observed})"
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_or(MAX_PROMPT_BYTES, |length| length.min(MAX_PROMPT_BYTES));
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_PROMPT_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CliError::FallbackReceipt(error.to_string()))?;
+    let text = decode_prompt(bytes).map_err(|error| match error {
+        CliError::PromptTooLarge { limit, observed } => CliError::FallbackReceipt(format!(
+            "fallback receipt file exceeds {limit} bytes (observed {observed})"
+        )),
+        CliError::PromptNotUtf8 => {
+            CliError::FallbackReceipt("fallback receipt file is not valid UTF-8".to_owned())
+        }
+        other => other,
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|error| CliError::FallbackReceipt(sanitize_error(&error.to_string(), "")))
+}
+
 fn sanitize_error(message: &str, secret: &str) -> String {
     let redacted = if secret.is_empty() {
         message.to_owned()
@@ -338,8 +407,11 @@ fn gate_bridge_contract(route: &RouteFingerprint, password: &str) -> Result<(), 
 /// demonstrate is emitted as `FAILED` with its artifact reference, so the
 /// resulting evidence cannot admit a route the live stack did not prove. The
 /// route profile configuration itself is operator-supplied through the
-/// `--admitted` envelope; this form only produces the evidence half.
-async fn run_pilot(args: CliArgs) -> Result<(), CliError> {
+/// `--admitted` envelope; this form only produces the evidence half. When the
+/// operator also supplies the retained fallback-route run of the same
+/// controlled task, the sixth probe (equal-stack fallback comparison) is
+/// measured from the pair; without it, the sixth probe stays `FAILED`.
+async fn run_pilot(args: PilotCliArgs) -> Result<(), CliError> {
     let password = std::env::var("OPENCODE_SERVER_PASSWORD")
         .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
     if password.is_empty() {
@@ -364,6 +436,10 @@ async fn run_pilot(args: CliArgs) -> Result<(), CliError> {
     let model = model_selection()?;
     let request = ReadOnlyRunRequest::new(prompt, model)
         .map_err(|error| CliError::Request(sanitize_error(&error.to_string(), &password)))?;
+    let fallback = match &args.fallback_receipt_file {
+        Some(path) => Some(read_fallback_receipt(path)?),
+        None => None,
+    };
     let policy = OpenCodeRunPolicy::new(args.directory)
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
     let client = OpenCodeClient::new(endpoint, auth, policy)
@@ -372,7 +448,11 @@ async fn run_pilot(args: CliArgs) -> Result<(), CliError> {
         .run_read_only(&request)
         .await
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
-    let evidence = opencode_pilot_probe_evidence(&opencode_pilot_observation(&result));
+    let observation = match &fallback {
+        Some(fallback_result) => opencode_pilot_observation_with_fallback(&result, fallback_result),
+        None => opencode_pilot_observation(&result),
+    };
+    let evidence = opencode_pilot_probe_evidence(&observation);
     let encoded = serde_json::to_string(&evidence)
         .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), &password)))?;
     let stdout = io::stdout();
@@ -564,7 +644,7 @@ async fn run() -> Result<(), CliError> {
         return run_admitted(admitted_args).await;
     }
     if is_pilot_form(&raw_args) {
-        let args = parse_args(&raw_args[1..])?;
+        let args = parse_pilot_args(&raw_args[1..])?;
         return run_pilot(args).await;
     }
     let args = parse_args(&raw_args)?;
