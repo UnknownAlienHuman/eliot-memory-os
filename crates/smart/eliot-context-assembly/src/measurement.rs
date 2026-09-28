@@ -101,10 +101,22 @@ pub(crate) fn verify(
 /// through `params`; nothing here synthesizes an identity, digest, capacity
 /// number, revision or timestamp.
 ///
-/// Assembly itself is unchanged: the returned measurement is still bound to
-/// the canonical rendered payload by this module's `verify`, and a
+/// The returned measurement is still bound to the canonical rendered payload
+/// by this module's `verify` - unchanged and still authoritative - and a
 /// `ContextError` from the owner stays typed as [`AssemblyError::Contract`]
 /// rather than being collapsed into a string or a generic code.
+///
+/// [`assemble_active_view`] itself is not modified, but this entry is not
+/// ceiling-equivalent to it. `AssemblyPolicy::validate` rejects only a zero
+/// `max_serialized_bytes`, so the injected-callback path bounds the payload
+/// by the policy alone. The owner additionally refuses a payload above its
+/// own `MAX_MEASUREMENT_BYTES` (16 MiB) and above
+/// `params.max_serialized_bytes`, so the effective ceiling here is
+/// `min(policy.max_serialized_bytes, params.max_serialized_bytes,
+/// 16 MiB)` and a payload admitted under a larger policy bound can be
+/// refused here as `ContextError::Bounds`. A caller must keep
+/// `params.max_serialized_bytes` consistent with its policy; this is a
+/// narrowing, never a widening, and no check is skipped to reach it.
 pub fn assemble_active_view_with_measurement(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
