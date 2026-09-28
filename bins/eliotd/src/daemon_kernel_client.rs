@@ -25,7 +25,8 @@ use eliot_protocol::{
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestResultBody, LocalReadAttempt, LocalReadExecutionEvidence, MessageType,
+    HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
+    MessageType,
     ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
@@ -2367,7 +2368,7 @@ impl DaemonKernelClient {
                 "Kernel local read answer is not an admission".to_owned(),
             ));
         }
-        let (operation_id, body_digest, body_response) =
+        let (operation_id, body_digest, body_response, body_lineage) =
             Self::admitted_local_read_halves(admitted, &pair.envelope)?;
         // Rebuilt, never decoded: the ORS record carries the digest-bound
         // response halves, while the operation handle, envelope binding, and
@@ -2382,7 +2383,14 @@ impl DaemonKernelClient {
             result_digest: body_digest.to_owned(),
             response: body_response,
             attempt: Some(attempt),
-            lineage: None,
+            // The retained result lineage the owner bound to this exact result
+            // travels with the rebuild (issue #1809 W2). It is decoded from the
+            // OWNER'S OWN retained record and re-bound here by comparing its
+            // recorded `output_digest` with this row's recorded `result_digest`;
+            // nothing is recomputed over the bytes in hand, which would replace
+            // the owner's proof with a fresh checksum. A row that carries no
+            // lineage keeps the honest `None` — unknown, never clean.
+            lineage: body_lineage,
             evidence: Some(Self::forward_local_read_evidence(
                 admitted,
                 operation_id,
@@ -2410,7 +2418,8 @@ impl DaemonKernelClient {
     fn admitted_local_read_halves<'a>(
         admitted: &'a serde_json::Map<String, serde_json::Value>,
         envelope: &HostRequestEnvelope,
-    ) -> Result<(&'a str, &'a str, serde_json::Value), KernelPortError> {
+    ) -> Result<(&'a str, &'a str, serde_json::Value, Option<HostRequestResultLineage>), KernelPortError>
+    {
         let operation_id = admitted
             .get("operation_id")
             .and_then(serde_json::Value::as_str)
@@ -2444,7 +2453,34 @@ impl DaemonKernelClient {
                         .to_owned(),
                 )
             })?;
-        Ok((operation_id, body_digest, body_response))
+        // The retained lineage is carried only when the owner actually recorded
+        // one, and only when it describes THIS result: the recorded
+        // `output_digest` must equal this row's recorded `result_digest`. A
+        // lineage that names a different output, or one that cannot be decoded
+        // at all, is refused rather than adopted, and a row with no lineage
+        // stays `None`.
+        let body_lineage = match admitted
+            .get("record")
+            .and_then(|record| record.get("result_lineage"))
+        {
+            None | Some(serde_json::Value::Null) => None,
+            Some(lineage_value) => {
+                let lineage: HostRequestResultLineage =
+                    serde_json::from_value(lineage_value.clone()).map_err(|error| {
+                        KernelPortError::Contract(format!(
+                            "Kernel local read admission carries an undecodable retained lineage: {error}"
+                        ))
+                    })?;
+                if lineage.output_digest != body_digest {
+                    return Err(KernelPortError::Contract(
+                        "Kernel local read admission carries a retained lineage that does not describe this result"
+                            .to_owned(),
+                    ));
+                }
+                Some(lineage)
+            }
+        };
+        Ok((operation_id, body_digest, body_response, body_lineage))
     }
 
     /// Builds the daemon-observed execution evidence for one forwarded

@@ -3827,7 +3827,7 @@ pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-
 /// existing evidence read from a newly produced candidate instead of
 /// inferring it from the word "result". Stored version-2/3/4 rows predate the
 /// class and still decode (the field defaults to
-/// [`HostRequestResultClass::Unknown`], which is never an admitted claim).
+/// [`HostRequestResultClass::Unclassified`], which is never an admitted claim).
 pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 5;
 const HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION: u16 = 2;
 const HOST_REQUEST_RESULT_BODY_V3_READBACK_WIRE_VERSION: u16 = 3;
