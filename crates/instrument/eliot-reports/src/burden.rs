@@ -818,6 +818,31 @@ impl ContractSurfaceProfile {
                 )?;
             }
         }
+        self.projections_markdown(&mut output)?;
+        self.orientation_markdown(&mut output)?;
+        output.push_str("\n## Proof and product pulse dependencies\n\n");
+        if self.proof_and_product_pulse_dependencies.is_empty() {
+            output.push_str("No proof or product-pulse dependency was read.\n");
+        } else {
+            output.push_str("| Dependency | Kind | Surface | Observed by |\n|---|---|---|---|\n");
+            for row in &self.proof_and_product_pulse_dependencies {
+                writeln!(
+                    output,
+                    "| `{}` | `{}` | `{}` | `{}`@`{}` |",
+                    escape_markdown(&row.dependency_id),
+                    dependency_text(row.kind),
+                    escape_markdown(&row.surface_id),
+                    escape_markdown(&row.observed_by.input_id),
+                    row.observed_by.revision
+                )?;
+            }
+        }
+        write_input_revisions(&mut output, &self.input_revisions())?;
+        Ok(output)
+    }
+
+    /// Renders the three projection observations, keeping them apart.
+    fn projections_markdown(&self, output: &mut String) -> Result<(), BurdenError> {
         output.push_str("\n## Stale or conflicting projections\n\n");
         if self.stale_or_conflicting_projections.is_empty() {
             output.push_str("No stale or conflicting projection was read.\n");
@@ -859,26 +884,7 @@ impl ContractSurfaceProfile {
             escape_markdown(&definitions.observed_by.input_id),
             definitions.observed_by.revision
         )?;
-        self.orientation_markdown(&mut output)?;
-        output.push_str("\n## Proof and product pulse dependencies\n\n");
-        if self.proof_and_product_pulse_dependencies.is_empty() {
-            output.push_str("No proof or product-pulse dependency was read.\n");
-        } else {
-            output.push_str("| Dependency | Kind | Surface | Observed by |\n|---|---|---|---|\n");
-            for row in &self.proof_and_product_pulse_dependencies {
-                writeln!(
-                    output,
-                    "| `{}` | `{}` | `{}` | `{}`@`{}` |",
-                    escape_markdown(&row.dependency_id),
-                    dependency_text(row.kind),
-                    escape_markdown(&row.surface_id),
-                    escape_markdown(&row.observed_by.input_id),
-                    row.observed_by.revision
-                )?;
-            }
-        }
-        write_input_revisions(&mut output, &self.input_revisions())?;
-        Ok(output)
+        Ok(())
     }
 
     /// Renders the three orientation observations, keeping them apart.
@@ -1660,9 +1666,19 @@ fn valid_order<'a>(
 /// Sorts and deduplicates a collected input-revision set.
 ///
 /// The key is the source, identity, and revision of each reference, which is the
-/// canonical order the projection surface already uses.
+/// canonical order the projection surface already uses
+/// (`ReportInputRevision::sort_key`). That helper is private to its own module,
+/// so the same order is expressed here with `sort_by` rather than
+/// `sort_by_key`: a sort key may not borrow from the element being sorted, and
+/// the key here is the identity string the element owns.
 fn canonical_input_revisions(mut inputs: Vec<ReportInputRevision>) -> Vec<ReportInputRevision> {
-    inputs.sort_by_key(|input| (input.source, input.input_id.as_str(), input.revision));
+    inputs.sort_by(|left, right| {
+        (&left.source, left.input_id.as_str(), left.revision).cmp(&(
+            &right.source,
+            right.input_id.as_str(),
+            right.revision,
+        ))
+    });
     inputs.dedup();
     inputs
 }
