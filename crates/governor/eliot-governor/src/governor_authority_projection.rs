@@ -84,6 +84,12 @@ pub struct LiveGovernorAuthority {
     derivation: GovernorCoverageDerivation,
 }
 
+impl Default for LiveGovernorAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LiveGovernorAuthority {
     /// Starts with no derived profile: nothing is authorized until the first
     /// `refresh` derives from live observation.
