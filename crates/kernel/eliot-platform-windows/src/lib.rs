@@ -245,8 +245,9 @@ pub use process_job::{
     JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
     RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
     SuspendedExistingJobChild, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
-    SuspendedValidationError, TerminatedExistingJobChild, TerminatedJobChild,
-    ValidatedSuspendedExistingJobChild, ValidatedSuspendedJobChild, cancel_capture_thread_io,
+    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedValidationError, TerminatedExistingJobChild,
+    TerminatedJobChild, ValidatedSuspendedExistingJobChild, ValidatedSuspendedJobChild,
+    cancel_capture_thread_io,
 };
 pub use process_path_lease::RetainedProcessPathLease;
 pub use protected_path::{
