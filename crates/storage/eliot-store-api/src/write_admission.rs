@@ -153,6 +153,17 @@
 //! and no epoch. When a sealed reservation projection exists, its
 //! `reservation_id` is the owner-issued ORS label under this same module owner.
 //!
+//! The HANDLE and the STATE are separate claims and only the handle is
+//! derived. `ors_stage_ref` is a pure function of the operation identity, so it
+//! is computable before any ORS exists. `WriteSubmissionState::Staged` is the
+//! pre-ORS admission DECISION to stage, taken at the I5.6 steps 1-12 gate
+//! boundary; the ORS-backed staging act of I5.6 step 13 follows it and is the
+//! first point at which an owner-issued stage record exists. Nothing in this
+//! crate keys ORS state by the handle, and a `staged` submission is not
+//! evidence that ORS accepted anything — it is evidence that this exact
+//! operation identity is the one the owner will stage next, and that the
+//! caller must not create a duplicate.
+//!
 //! # Activated named-mutation inventory
 //!
 //! Issue #1874 asks for every existing named mutation to be inventoried against
@@ -1180,6 +1191,13 @@ pub const NOT_ACCEPTED_RETRY_IDENTITY_RULE: &str = "a corrected payload uses a n
 ///
 /// I5.19: the exact operation identity is accepted once, so the caller must not
 /// create a duplicate and may poll.
+///
+/// The acceptance named here is scoped to the admission DECISION to stage, and
+/// that scope is exact: the rule is decided at the I5.6 steps 1-12 gate
+/// boundary, strictly before the I5.6 step 13 ORS-backed staging act. It binds
+/// the caller to one operation identity for the request and nothing more; it
+/// grants no Ordering Scope sequence, no epoch, and no external effect, and it
+/// is not evidence that ORS holds a record for this operation.
 pub const STAGED_RETRY_IDENTITY_RULE: &str = "the exact operation identity is accepted once; the caller must not create a duplicate and \
      may poll for the terminal receipt";
 
@@ -1209,8 +1227,19 @@ pub enum WriteSubmissionState {
     /// The requested domain mutation was not staged, no Ordering Scope sequence
     /// was reserved, and no external effect was issued.
     NotAccepted,
-    /// The exact operation identity was accepted under one stage handle; the
-    /// caller must not create a duplicate and may poll.
+    /// The admission decision to stage the exact operation identity under one
+    /// stage handle, taken at the pre-ORS gate boundary.
+    ///
+    /// The scope of this claim is exact and is deliberately narrower than the
+    /// word "staged" suggests on its own. This state says: the request passed
+    /// the pre-ORS gates, and this is the one operation identity the owner will
+    /// stage next, under the derived handle carried beside it. It does NOT say
+    /// ORS has accepted the operation. The decision is emitted before the ORS
+    /// exists in the call — strictly before the I5.6 step 13 ORS-backed
+    /// staging act, which is the separate act that will key an owner-issued
+    /// stage record under that handle. Nothing at this point has reserved a
+    /// sequence, issued an epoch, or produced an external effect, and this
+    /// state grants none of those.
     Staged,
     /// An already final canonical receipt exists for the idempotency key.
     ResolvedExisting,
@@ -1339,7 +1368,8 @@ impl SplitDirective {
 /// rather than by convention: a `not_accepted` submission can claim no stage
 /// and no receipt and must name a reason, a `staged` submission must carry the
 /// stage handle and no receipt, and a `resolved_existing` submission must point
-/// at the final receipt it resolved to.
+/// at the final receipt it resolved to and must carry no stage handle, because
+/// an already final operation stages nothing.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteSubmission {
@@ -1402,6 +1432,11 @@ impl WriteSubmission {
     /// owner and the caller name the same staged operation without a second
     /// identity scheme. No final receipt is referenced: a staged submission is
     /// not final.
+    ///
+    /// The claim is scoped to the decision, not to ORS. This value is produced
+    /// at the pre-ORS admission gate, strictly before the I5.6 step 13
+    /// ORS-backed staging act that the derived handle will key, and nothing
+    /// here observes an ORS record.
     pub fn staged(operation_id: &OperationId, request_hash: &str) -> Result<Self, StoreError> {
         let submission = Self {
             submission_id: derive_submission_id(operation_id, request_hash)?,
@@ -1460,13 +1495,23 @@ impl WriteSubmission {
 
     /// Checks the state against the evidence this submission claims.
     ///
-    /// The identity fields are checked with this module's own label and digest
-    /// helpers, and every state-specific requirement is a typed refusal
-    /// against the existing [`StoreError`] surface rather than a described
-    /// convention.
+    /// The text and digest fields are checked with this module's own label and
+    /// digest helpers, so a wire-decoded submission cannot carry unbounded or
+    /// malformed text in any of them. The two operation identities are closed
+    /// [`OperationId`] values whose owning contract already refuses blank or
+    /// control-bearing text in its own constructor; what this check adds on top
+    /// is this module's own bounded-label rule for a mirrored identity label,
+    /// so the two identity fields are held to the same bound as every other
+    /// text this struct carries rather than escaping it. Every state-specific
+    /// requirement is a typed refusal against the existing [`StoreError`]
+    /// surface rather than a described convention.
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_digest(&self.submission_id, "submission.submission_id")?;
         validate_digest(&self.request_hash, "submission.request_hash")?;
+        validate_label(self.operation_id.as_str(), "submission.operation_id")?;
+        if let Some(receipt_ref) = &self.canonical_receipt_ref {
+            validate_label(receipt_ref.as_str(), "submission.canonical_receipt_ref")?;
+        }
         validate_label(&self.retry_identity_rule, "submission.retry_identity_rule")?;
         validate_label(&self.next_allowed_action, "submission.next_allowed_action")?;
         if self.reason_codes.len() > MAX_WRITE_SUBMISSION_REASON_CODES {
@@ -1537,6 +1582,23 @@ impl WriteSubmission {
                 }
             }
             WriteSubmissionState::ResolvedExisting => {
+                // I5.19: `resolved_existing` points at an ALREADY FINAL receipt
+                // for the idempotency key. The operation is final, so this
+                // decision stages nothing and claims no stage handle. That is
+                // the same invariant the other two arms already police in
+                // opposite directions — a refusal forbids the handle because it
+                // staged nothing, a staged decision requires it because it did
+                // — and an unpolled third arm would let a wire-decoded
+                // submission carry a stage handle for an operation that will
+                // never be staged under it, which is exactly the false
+                // "ORS accepted this" claim `WriteSubmissionState::Staged`
+                // documents that it does not make.
+                if self.ors_stage_ref.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "submission.ors_stage_ref",
+                        reason: "a resolved submission points at an already final receipt and stages nothing",
+                    });
+                }
                 if self.canonical_receipt_ref.is_none() {
                     return Err(StoreError::Empty {
                         field: "submission.canonical_receipt_ref",
@@ -1600,7 +1662,11 @@ pub fn derive_submission_id(
 /// The handle is derived, not issued: it names the staged operation for its
 /// exact operation identity so the owner stages and the caller polls under the
 /// same value, without a second identity scheme and without a clock, sequence,
-/// epoch, or ORS authority.
+/// epoch, or ORS authority. Because it is a pure function of the operation
+/// identity it is computable before ORS exists in the call, and nothing in this
+/// crate keys an ORS record by it: it is the key the later I5.6 step 13
+/// ORS-backed staging act will use, not evidence that such a record is
+/// already held.
 #[must_use = "a derived stage handle must be used or checked"]
 pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
     sha256_hex(
@@ -1625,7 +1691,9 @@ pub fn derive_ors_stage_ref(operation_id: &OperationId) -> String {
 /// - a gate refusal is a typed `not_accepted` decision carrying the closed
 ///   reason code and, for an over-bound envelope, the split directive;
 /// - an accepted exact operation identity with no final receipt is `staged`
-///   under the stage handle derived from that identity.
+///   under the stage handle derived from that identity. That is the decision
+///   to stage, taken at the pre-ORS gate; it precedes the I5.6 step 13
+///   ORS-backed staging act and observes no ORS record.
 ///
 /// A request whose own identity is unnameable — a malformed operation identity
 /// or canonical request hash — has no submission identity to report a decision
@@ -1762,6 +1830,18 @@ fn reason_code_for(refusal: &StoreError) -> ErrorCode {
 /// other mirrored label in this module. A refusal that leaves a plan outside
 /// current support is never told to retry as-is: it names recovery, matching
 /// the I5.6 rule that a preserved plan is not reinterpreted under newer code.
+///
+/// The split composition stays inside
+/// [`MAX_WRITE_ADMISSION_LABEL_BYTES`] and the bound is asserted on the
+/// resulting text, not assumed: [`WriteSubmission::not_accepted`] runs
+/// [`WriteSubmission::validate`], which applies the same `validate_label`
+/// bound to `next_allowed_action`. The two parts are the longest base action
+/// plus [`SplitDirective::render`], whose only unbounded-looking part is two
+/// `u64` measurements, so the composition cannot approach the bound by
+/// construction. The cost of that bound being enforced here is deliberate and
+/// fails closed: if a future render format ever did exceed it, this function
+/// would be the place that refuses, because no second limit is invented to
+/// paper over a render that outgrew the label it must fit in.
 fn next_allowed_action_for(
     refusal: &StoreError,
     split_directive: Option<SplitDirective>,

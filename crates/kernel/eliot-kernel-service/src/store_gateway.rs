@@ -701,19 +701,24 @@ impl KernelStoreGateway {
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err("transition caller is not the active daemon".to_owned());
         }
-        let admission = admit_prepared_transition(
+        // I5.19: `admit_prepared_transition` is the single decision point for
+        // this route. It returns the typed `staged` decision on its accepted
+        // arm and `Err` on every other outcome, so a `not_accepted` or
+        // `resolved_existing` value can never reach the store send below and no
+        // state re-check is owed here. There is deliberately no second
+        // `admission.state != Staged` guard: that check could not fire, and
+        // claiming it as a live defence against a second canonical transition
+        // for one identity would assert a guarantee the code never performs.
+        // A gate that later resolves an existing receipt must refuse inside
+        // `admit_prepared_transition` (it has no existing-receipt lookup
+        // today) rather than return that decision as a success this route
+        // would then have to re-inspect.
+        admit_prepared_transition(
             context,
             &transition,
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
-        // I5.19: the unreserved `apply` route executes only a `staged` decision.
-        // The state is re-checked here rather than trusted, so an admission that
-        // later resolves an existing receipt refuses the write instead of
-        // creating a second canonical transition for one identity.
-        if admission.state != WriteSubmissionState::Staged {
-            return Err(admission.to_string());
-        }
 
         let lease = {
             let service = self
@@ -5508,11 +5513,15 @@ fn refuse_determinate_reserved_write(
 /// ORS. The reserved-write path is a different owner with a different act and
 /// deliberately does not come through here.
 ///
-/// The accepted arm returns the `staged` decision, and this function has no
-/// existing-receipt lookup in front of it, so it can only ever return `staged`
-/// or refuse. [`KernelStoreGateway::apply`] still checks the state before
-/// executing, so a future admission that resolves an existing receipt refuses
-/// the write instead of creating a second canonical transition.
+/// The accepted arm returns the typed `staged` decision, and this function has
+/// no existing-receipt lookup in front of it, so it can only ever return
+/// `staged` or refuse. Every non-`staged` decision is therefore converted
+/// into the `Err` arm HERE, which is why the decision point is this function
+/// and not [`KernelStoreGateway::apply`]: there is no second state check
+/// downstream that a `not_accepted` or `resolved_existing` value would have to
+/// be caught by. The composed refusal text keeps both the typed decision and
+/// the gate's own cause, so the operational response can name the I5.19
+/// decision that was taken and the specific refusal under it.
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
