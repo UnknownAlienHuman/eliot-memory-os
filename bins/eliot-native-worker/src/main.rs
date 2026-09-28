@@ -210,7 +210,8 @@ fn run() -> i32 {
 /// entry composes this shape from the dispatch file plus the canonical
 /// intent rule on every admitted invocation. Issue #1912 re-proves the
 /// explicit job envelope at the serve boundary and leaves a visible
-/// coverage-gap record when the serve ends cancelled or unknown.
+/// coverage-gap record when the serve ends cancelled or unknown, whether
+/// the loop ends cleanly or fails.
 ///
 /// `admission` is a handle to the exact admission port injected into
 /// `worker` above; the terminal coverage-gap checkpoint binds the granted
@@ -286,6 +287,20 @@ where
             0
         }
         Err(error) => {
+            // Issue #1912 (A3): a serve that fails while the worker is
+            // cancelled or holding an unknown outcome still leaves the
+            // visible coverage-gap record. Verified partial output stays
+            // under the original claim for reconciliation, so the gap is
+            // persisted-then-emitted exactly as on the clean path instead
+            // of being silently lost behind the failure line. Any other
+            // lifecycle served nothing partial and keeps the failure alone.
+            if let Some(gap) =
+                eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle())
+            {
+                let (durable, detail) =
+                    persist_coverage_gap_checkpoint(worker, material, admission, &gap);
+                emit_coverage_gap(&gap, durable, &detail);
+            }
             emit(ADMITTED_DRIVE_FAILED, &error.to_string());
             ADMITTED_DRIVE_FAILED_EXIT
         }
