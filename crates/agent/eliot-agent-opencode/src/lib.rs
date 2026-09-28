@@ -58,7 +58,10 @@ pub use ingress::{
     encode_host_event_response, handle_host_event, parse_http_head, response_commitment,
     response_commitment_message, verify_response_commitment,
 };
-pub use pilot::opencode_pilot_observation;
+pub use pilot::{
+    opencode_equal_stack_comparison, opencode_pilot_observation,
+    opencode_pilot_observation_with_fallback,
+};
 pub use route_admission::{
     OPENCODE_MANDATED_PROBES, OPENCODE_ROUTE_ADMISSION_SCHEMA_VERSION, OpenCodePilotObservation,
     OpenCodeProbeOutcome, OpenCodeProbeReading, OpenCodeRouteAdmission,
