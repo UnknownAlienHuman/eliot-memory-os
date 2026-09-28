@@ -2762,10 +2762,70 @@ fn expected_head_digests(
     Ok((revision_digests, ordering_digests))
 }
 
+/// Binds a durable record's per-member rows to this batch's members by each
+/// member's own deterministic destination identity.
+///
+/// The binding key is [`member_reference`] — the admitted archive member digest
+/// plus the member's domain-qualified logical identity — so a disposition
+/// recorded for one member can never be read as the disposition of a different
+/// one. A same-identity replay that carries a *different* member set names
+/// members this operation never recorded, which is an identity conflict: changed
+/// input conflicts, and only a byte-identical member set reconciles to the
+/// original receipt.
+///
+/// Identity is what makes the downstream per-member lookup sound. A positional or
+/// length-only coupling would let a replay place a reference edge at an index
+/// whose durable disposition is `Restored`, where the closure guard skips it, and
+/// report a closed graph that was never closed. Here both sides must be distinct,
+/// fully covered and equal, so each batch member has exactly one durable row and
+/// no row is left over.
+fn recorded_members_by_identity<'record>(
+    batch: &CanonicalRestoreBatch,
+    document: &'record RestoreRecordDocument,
+) -> Result<Vec<&'record RestoreMemberRecord>, StoreError> {
+    let durable: BTreeSet<&str> = document
+        .members
+        .iter()
+        .map(|row| row.member_ref.as_str())
+        .collect();
+    // A record names one member identity once; a repeat cannot be attributed to
+    // a single member, so it is not a record this batch can be read back from.
+    if durable.len() != document.members.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let claimed: BTreeSet<String> = batch
+        .members
+        .iter()
+        .map(|member| member_reference(&batch.archive_member_digest, &member.logical_identity()))
+        .collect();
+    if claimed.len() != batch.members.len() {
+        return Err(StoreError::IdentityConflict);
+    }
+    if !claimed
+        .iter()
+        .all(|member_ref| durable.contains(member_ref.as_str()))
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    batch
+        .members
+        .iter()
+        .map(|member| {
+            let member_ref =
+                member_reference(&batch.archive_member_digest, &member.logical_identity());
+            document
+                .members
+                .iter()
+                .find(|row| row.member_ref == member_ref)
+                .ok_or(StoreError::IdentityConflict)
+        })
+        .collect()
+}
+
 /// Verifies that a durable record belongs to exactly this batch: same
 /// operation identity and canonical request hash, destination, source identity,
-/// member digest, schema, purge policy, expected state and denominator. Any
-/// divergence is an identity conflict, never a silent overwrite.
+/// member digest, schema, purge policy, expected state, denominator and member
+/// set. Any divergence is an identity conflict, never a silent overwrite.
 #[allow(clippy::too_many_arguments)]
 fn check_record_binding(
     document: &RestoreRecordDocument,
