@@ -689,9 +689,11 @@ impl BriefStateFence {
 /// the bounded causal event timeline from the canonical audit chain, the exact
 /// bounded `LogWindowRef` references, the correlated change hypotheses, the
 /// dependency relations, the prior failures and attempted repairs, the
-/// unknowns, the observation gaps, and exactly one next step — all under one
-/// State Fence and one invalidation condition. It never carries a cause, and
-/// it never carries rolling log content.
+/// unknowns, the observation gaps, and exactly one next step - all under one
+/// State Fence and the closed set of invalidation conditions that actually
+/// govern it ([`BriefInvalidation::ALL`], which is the list
+/// [`BriefStateFence::observe_invalidation`] checks). It never carries a
+/// cause, and it never carries rolling log content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticBrief {
