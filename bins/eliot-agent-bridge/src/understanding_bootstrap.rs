@@ -26,6 +26,7 @@
 use eliot_governor::ColdStartSurfaceView;
 use eliot_integration_coverage::{
     EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
+    LogicalEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -103,58 +104,58 @@ pub enum ReadinessDisposition {
     Conflicted,
 }
 
-/// Actual Governor-derived profile with its limiting integration evidence.
+/// Actual coverage and Governor-derived profiles projected with their
+/// coverage-level gap evidence (I7.16).
 ///
-/// `limiting_integration_evidence` carries the concrete coverage handles that
-/// bound authority (I7.16); at least one is required so a bootstrap can never
-/// present an unbounded profile.
+/// The complete typed owner profiles remain attached so event disposition,
+/// ordering, completeness, proof ceiling, source, gaps, authorization, and
+/// freshness axes are not reduced to a label. The gap list is copied verbatim
+/// from the integration owner. It may be empty when the owner reports no
+/// profile-level gaps; absence of gaps does not itself claim readiness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernanceEvidence {
     pub profile_ref: String,
     pub profile_revision: String,
+    pub coverage_profile: IntegrationCoverageProfile,
+    pub governance_profile: GovernanceProfile,
     pub limiting_integration_evidence: Vec<String>,
 }
 
 impl GovernanceEvidence {
-    /// Derives the bootstrap's governance evidence from the actual
-    /// `IntegrationCoverageProfile` and the `GovernanceProfile` the Governor
-    /// derived from it (I7.8 step 4, I7.16; issue #1746 W5).
+    /// Projects the typed coverage and governance snapshots supplied by their
+    /// owners (I7.8 step 4, I7.16; issue #1746 W5).
     ///
-    /// This is the only constructor that produces owner-backed governance
-    /// evidence. It refuses three ways a caller-authored readiness could
-    /// otherwise imply full authority:
+    /// This constructor projects the supplied owner profiles without
+    /// summarizing away either profile. It refuses ways a caller-authored
+    /// readiness could otherwise imply full authority:
     ///
     /// - `IntegrationCoverageProfile::validate` requires every one of the ten
     ///   logical events to be present, so an empty sensor list is rejected by
     ///   the owner itself and can never be presented as coverage;
-    /// - the derived `GovernanceProfile` must name the *same* active
-    ///   fingerprint, the *same* verification state, and the *same*
-    ///   completeness as the coverage it was derived from, so a verified
-    ///   profile over an unverified candidate coverage (or a `COMPLETE`
-    ///   profile over a `PARTIAL` one) is refused rather than projected;
-    /// - the limiting evidence is derived from the coverage's own gap handles
-    ///   and from every event whose observation is not enforced-and-complete,
-    ///   in coverage order. Unknown, unavailable, and partial evidence is
-    ///   therefore preserved verbatim instead of being summarised away. A
-    ///   coverage that genuinely declares no gap and no limiting event still
-    ///   yields one handle: the owner-issued proof ceiling it was graded
-    ///   against, so the "at least one limiting handle" rule stays
-    ///   satisfiable without inventing content.
+    /// - `GovernanceProfile` must agree with coverage identity, verification,
+    ///   completeness, and the owner's derivation formula for both
+    ///   authorization axes; all authorization and freshness fields remain in
+    ///   the output. These structural checks do not authenticate the snapshot's
+    ///   origin or prove its freshness; the owner transport remains STITCH;
+    /// - the gap evidence is copied verbatim from coverage, while all event
+    ///   dispositions, ordering, completeness, source, proof-ceiling, and event
+    ///   gaps remain in the copied `IntegrationCoverageProfile`. If the bounded
+    ///   gap preview exceeds its established bound, this constructor fails
+    ///   closed rather than silently dropping evidence. A complete profile
+    ///   with no limiting evidence is valid and carries an empty gap preview.
     ///
-    /// `profile_ref` is the exact active fingerprint the derivation was bound
-    /// to and `profile_revision` its canonical decimal revision, so a later
-    /// coverage change moves both and cannot be presented as the same profile.
+    /// `profile_ref` is the exact coverage fingerprint and
+    /// `profile_revision` the canonical decimal Governor revision.
     ///
     /// # Errors
     ///
     /// Returns `COVERAGE_INVALID` when the owner coverage does not validate,
-    /// `GOVERNANCE_FINGERPRINT_MISMATCH`,
-    /// `GOVERNANCE_COVERAGE_UNVERIFIED`, or
-    /// `GOVERNANCE_COMPLETENESS_MISMATCH` when the derived profile disagrees
-    /// with the coverage it claims to come from, and
-    /// `GOVERNANCE_EVIDENCE_BOUND` when the derived handle list exceeds
-    /// `MAX_EVIDENCE_HANDLES`.
+    /// `GOVERNANCE_FINGERPRINT_MISMATCH`, `GOVERNANCE_COVERAGE_UNVERIFIED`,
+    /// `GOVERNANCE_COMPLETENESS_MISMATCH`, or
+    /// `GOVERNANCE_DERIVATION_MISMATCH` when the profile disagrees with the
+    /// coverage or its derivation axes, and `GOVERNANCE_EVIDENCE_BOUND` when
+    /// coverage gap evidence exceeds `MAX_EVIDENCE_HANDLES`.
     pub fn from_owner_profiles(
         coverage: &IntegrationCoverageProfile,
         profile: &GovernanceProfile,
@@ -177,33 +178,33 @@ impl GovernanceEvidence {
                 "derived governance profile claims a verification state its coverage does not carry",
             ));
         }
+        if !coverage.verified {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_COVERAGE_UNVERIFIED",
+                "Governor derivation requires verified production coverage",
+            ));
+        }
         if profile.completeness != coverage.completeness {
             return Err(BootstrapError::new(
                 "GOVERNANCE_COMPLETENESS_MISMATCH",
                 "derived governance profile claims a completeness its coverage does not carry",
             ));
         }
-        let mut handles: Vec<String> = coverage.gaps.clone();
-        for event in &coverage.events {
-            if event.completeness != EventCompleteness::Complete
-                || event.disposition != EventDisposition::Enforced
-            {
-                let mut handle = format!("coverage:{:?}:{:?}", event.event, event.disposition);
-                handle.truncate(MAX_HANDLE_LEN);
-                handles.push(handle);
-            }
+        if profile.revision == 0 {
+            return Err(BootstrapError::new(
+                "GOVERNANCE_REVISION_MISSING",
+                "derived governance profile has no current revision",
+            ));
         }
-        if handles.is_empty() {
-            let mut handle = format!("coverage:proof-ceiling:{}", coverage.proof_ceiling);
-            handle.truncate(MAX_HANDLE_LEN);
-            handles.push(handle);
-        }
-        handles.truncate(MAX_EVIDENCE_HANDLES);
-        bounded_list(&handles, "GOVERNANCE_EVIDENCE_BOUND", MAX_EVIDENCE_HANDLES)?;
+        validate_governance_axes(coverage, profile)?;
+        let gaps = coverage.gaps.clone();
+        bounded_list(&gaps, "GOVERNANCE_EVIDENCE_BOUND", MAX_EVIDENCE_HANDLES)?;
         Ok(Self {
             profile_ref: coverage.fingerprint.clone(),
             profile_revision: profile.revision.to_string(),
-            limiting_integration_evidence: handles,
+            coverage_profile: coverage.clone(),
+            governance_profile: profile.clone(),
+            limiting_integration_evidence: gaps,
         })
     }
 }
@@ -726,13 +727,88 @@ fn bounded_list(values: &[String], field: &'static str, max: usize) -> Result<()
     Ok(())
 }
 
+/// Checks the two GovernanceProfile authorization axes against the derivation
+/// contract. Freshness inputs remain owner-supplied fields in the typed
+/// profile; this consistency check does not authenticate their origin.
+fn validate_governance_axes(
+    coverage: &IntegrationCoverageProfile,
+    profile: &GovernanceProfile,
+) -> Result<(), BootstrapError> {
+    let pre_action_enforced = coverage.disposition(LogicalEvent::PreToolUse)
+        == Some(EventDisposition::Enforced)
+        && coverage.disposition(LogicalEvent::PermissionRequest)
+            == Some(EventDisposition::Enforced);
+    let expected_enforcement =
+        coverage.verified && pre_action_enforced && profile.watchdog_fresh && profile.trace_fresh;
+    let expected_complete_ops = coverage.verified
+        && coverage.completeness == EventCompleteness::Complete
+        && profile.watchdog_fresh
+        && profile.trace_fresh;
+    if profile.authorizes_enforcement != expected_enforcement
+        || profile.authorizes_complete_coverage_ops != expected_complete_ops
+    {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_DERIVATION_MISMATCH",
+            "governance authorization axes disagree with coverage and freshness",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_governance(governance: &GovernanceEvidence) -> Result<(), BootstrapError> {
     non_blank(&governance.profile_ref, "GOVERNANCE_PROFILE_MISSING")?;
     non_blank(&governance.profile_revision, "GOVERNANCE_REVISION_MISSING")?;
-    if governance.limiting_integration_evidence.is_empty() {
+    governance.coverage_profile.validate().map_err(|error| {
+        BootstrapError::new(
+            "COVERAGE_INVALID",
+            format!("integration coverage profile is not valid: {error}"),
+        )
+    })?;
+    let profile = &governance.governance_profile;
+    let coverage = &governance.coverage_profile;
+    if governance.profile_ref != coverage.fingerprint
+        || profile.fingerprint != coverage.fingerprint
+    {
         return Err(BootstrapError::new(
-            "GOVERNANCE_EVIDENCE_MISSING",
-            "actual GovernanceProfile must carry at least one limiting integration evidence handle",
+            "GOVERNANCE_FINGERPRINT_MISMATCH",
+            "governance evidence is not bound to its attached coverage fingerprint",
+        ));
+    }
+    if profile.revision == 0 || governance.profile_revision != profile.revision.to_string() {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_REVISION_MISMATCH",
+            "governance evidence does not carry the exact current profile revision",
+        ));
+    }
+    if profile.verified != coverage.verified {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COVERAGE_UNVERIFIED",
+            "governance and coverage verification states disagree",
+        ));
+    }
+    if !coverage.verified {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COVERAGE_UNVERIFIED",
+            "Governor derivation requires verified production coverage",
+        ));
+    }
+    if profile.completeness != coverage.completeness {
+        return Err(BootstrapError::new(
+            "GOVERNANCE_COMPLETENESS_MISMATCH",
+            "governance and coverage completeness states disagree",
+        ));
+    }
+    validate_governance_axes(coverage, profile)?;
+    if governance.limiting_integration_evidence != coverage.gaps {
+        let code = if governance.limiting_integration_evidence.is_empty() && !coverage.gaps.is_empty()
+        {
+            "GOVERNANCE_EVIDENCE_MISSING"
+        } else {
+            "GOVERNANCE_EVIDENCE_MISMATCH"
+        };
+        return Err(BootstrapError::new(
+            code,
+            "limiting integration evidence does not preserve the owner coverage gaps",
         ));
     }
     bounded_list(
@@ -1179,15 +1255,53 @@ impl BootstrapSession {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_integration_coverage::{
+        DispatchOrdering, EventCoverage, GovernorCoverageDerivation, ALL_EVENTS,
+    };
 
     fn fixture_governance() -> GovernanceEvidence {
+        let coverage_profile = IntegrationCoverageProfile {
+            fingerprint: "governance-profile-1".to_owned(),
+            verified: true,
+            events: ALL_EVENTS
+                .iter()
+                .map(|event| EventCoverage {
+                    event: *event,
+                    disposition: if *event == LogicalEvent::PreToolUse {
+                        EventDisposition::Observed
+                    } else {
+                        EventDisposition::Enforced
+                    },
+                    ordering: DispatchOrdering::PreDispatch,
+                    completeness: EventCompleteness::Complete,
+                    proof_ceiling: "read-only".to_owned(),
+                    source: "owner-observation".to_owned(),
+                    gaps: Vec::new(),
+                })
+                .collect(),
+            completeness: EventCompleteness::Unknown,
+            proof_ceiling: "read-only".to_owned(),
+            source: "integration-owner".to_owned(),
+            gaps: vec!["coverage-gap:source-freshness".to_owned()],
+        };
+        let mut derivation = GovernorCoverageDerivation::new();
+        let governance_profile = derivation
+            .derive(
+                &coverage_profile,
+                &eliot_integration_coverage::WatchdogEvidence {
+                    supervisor_id: "watchdog:fixture".to_owned(),
+                    fresh: true,
+                    summary: "test fixture supervision".to_owned(),
+                },
+                eliot_integration_coverage::TraceFreshness::Fresh,
+            )
+            .expect("verified owner coverage derives a governance profile");
         GovernanceEvidence {
             profile_ref: "governance-profile-1".to_owned(),
-            profile_revision: "rev-7".to_owned(),
-            limiting_integration_evidence: vec![
-                "coverage:PreToolUse:ENFORCED".to_owned(),
-                "coverage:PostToolUse:OBSERVED".to_owned(),
-            ],
+            profile_revision: "1".to_owned(),
+            governance_profile,
+            limiting_integration_evidence: coverage_profile.gaps.clone(),
+            coverage_profile,
         }
     }
 
@@ -1255,7 +1369,7 @@ mod tests {
         );
         assert_eq!(first.current_assessment, CurrentAssessment::NotOnboarded);
         assert_eq!(first.governance.profile_ref, "governance-profile-1");
-        assert_eq!(first.governance.profile_revision, "rev-7");
+        assert_eq!(first.governance.profile_revision, "1");
         assert!(!first.governance.limiting_integration_evidence.is_empty());
         assert!(first.task_selection.candidate_task_handles.len() <= MAX_CANDIDATE_HANDLES);
         assert!(first.relevant_handles.len() <= MAX_HANDLES);

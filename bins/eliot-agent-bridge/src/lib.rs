@@ -3568,21 +3568,24 @@ impl BridgeRunner {
         Ok(())
     }
 
-    /// Notes one bootstrap assembled from the real owners: the Governor's
-    /// compiled readiness surface, the actual `IntegrationCoverageProfile`, the
-    /// `GovernanceProfile` the Governor derived from it, the bounded boot
-    /// delta, and the task inputs that came with them (issue #1746 W5, I7.8
-    /// step 4).
+    /// Notes one bootstrap projection over the Governor's compiled readiness
+    /// surface, exact `IntegrationCoverageProfile`, typed owner-supplied
+    /// `GovernanceProfile` snapshot,
+    /// bounded boot delta, and task inputs (issue #1746 W5, I7.8 step 4).
     ///
-    /// This is the I7.8 bootstrap assembled end to end from real owners instead
-    /// of from a host-authored readiness string. The readiness half
+    /// The projection retains both typed integration/governance profiles and
+    /// checks their fingerprint, revision, verification, completeness, and
+    /// authorization-axis consistency. It carries all owner-supplied
+    /// authorization and freshness fields; these checks do not authenticate
+    /// snapshot provenance. The readiness half
     /// (`onboarding_readiness_ref`, `onboarding_disposition`,
     /// `smallest_missing_question`, `lease_deadline`, `receipt_revision`,
     /// `workspace_instance_ref`, `projection_source_ref`,
     /// `projection_generation`) comes from the Governor's
     /// [`eliot_governor::ColdStartSurfaceView`], the governance half from
     /// [`GovernanceEvidence::from_owner_profiles`] over the exact coverage and
-    /// derived profile, and the delta is bound to that receipt revision. An
+    /// typed governance snapshot, and the delta is bound to that receipt
+    /// revision. An
     /// unknown readiness token, a coverage that does not validate, a derived
     /// profile that disagrees with its coverage, and a delta that does not move
     /// this receipt forward all fail closed with their own codes; none of them
@@ -3592,16 +3595,19 @@ impl BridgeRunner {
     /// [`Self::note_owner_snapshot`] seals, so a wrong principal, another
     /// `WorkScope`, or a stale fence can never project through this path
     /// either. The context is stored through the same retained snapshot, so the
-    /// once-per-session auto-boot and the bounded explicit retrieval both
-    /// compose from these owner inputs.
+    /// once-per-session auto-boot and bounded explicit retrieval compose from
+    /// these inputs. This helper cannot establish that separately supplied
+    /// task/source/session values came from the same readiness receipt:
+    /// `ColdStartSurfaceView` does not carry those bindings.
     ///
     /// # Live status
     ///
-    /// `caller: STITCH`. The bridge delivery transport that would carry the
-    /// Governor surface and the coverage profile from `eliotd` into this intake
-    /// is owned by the bridge-transport wiring (the same owner that already
-    /// blocks [`Self::note_bootstrap_context`]'s host-authored path from being
-    /// authority). No synthetic caller was added.
+    /// `caller: STITCH`. There is no production caller: `main.rs::handle_bootstrap`
+    /// still accepts a client-supplied `BootstrapContext` and calls
+    /// [`Self::note_owner_snapshot`]. The owner transport must carry the
+    /// readiness receipt's session/scope/task/source bindings together with
+    /// the Governor surface and profiles before this helper can prove their
+    /// common binding. No synthetic caller was added.
     #[allow(clippy::too_many_arguments)]
     pub fn note_owner_surface(
         &mut self,
