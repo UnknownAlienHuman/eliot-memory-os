@@ -5385,14 +5385,21 @@ impl BackupVerificationResultRecord {
     /// declared counts and carry no presence flag, because a real count of zero
     /// is a real answer and an absent one is not representable.
     ///
-    /// Four fields are retained BOTH flat on the row and inside the nested
-    /// identity, and all four are cross-checked here. `request_digest` against
+    /// Seven fields are retained BOTH flat on the row and inside the nested
+    /// identity, and all seven are cross-checked here. `request_digest` against
     /// `identity.identity_digest` existed from the start; `archive_sha256`
     /// against `identity.archive_sha256`, `class` against
     /// `identity.evidenced_class`, and `capture_receipt` against
     /// `identity.capture_receipt` are checked for the same reason and were the
-    /// gap this closes. Without them a bit-rotted row could carry
-    /// `identity.archive_sha256 = X` next to `archive_sha256 = Y`, pass every
+    /// gap this closes. #2862 added the fourth group the same way:
+    /// `archive_handle` against `identity.archive_handle`, and
+    /// `capture_receipt_digest` / `validity_attestation_digest` against their
+    /// identity siblings, because those three are the owner-evidence references
+    /// a provenance-qualified answer would rest on and a row that carried a
+    /// different reference flat than nested would project one the accepted
+    /// request identity never vouched for. Without these checks a bit-rotted row
+    /// could carry `identity.archive_sha256 = X` next to `archive_sha256 = Y`,
+    /// pass every
     /// other check, pass the reconciliation archive comparison — which reads the
     /// IDENTITY side — and then project `integrity_sha256 = Y`, a digest the
     /// accepted request identity never vouched for. These checks strictly
@@ -5404,7 +5411,7 @@ impl BackupVerificationResultRecord {
     /// would hide the shape of each comparison. They share one reason string
     /// naming the field pair, declared before the first of them.
     pub fn validate(&self) -> Result<(), OrsError> {
-        /// One shared reason string for all four drift checks, naming the
+        /// One shared reason string for every drift check, naming the
         /// relationship rather than the values so no stored value can leak.
         const DRIFT: &str = "flat field must equal the same field in the nested request identity";
         if self.contract_version != CONTRACT_VERSION {
