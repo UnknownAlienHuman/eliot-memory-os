@@ -826,7 +826,10 @@ pub fn compile_swarm_admission_plan(
 
 /// Admits the exact one-to-one denominator: the binding count must equal the
 /// staffed slot count, every binding names a distinct staffed slot, and every
-/// staffed slot resolves to exactly one binding.
+/// staffed slot resolves to exactly one binding. Duplicate work-unit, attempt,
+/// lease, or route-receipt bindings fail closed here, mirroring the plan-level
+/// denominator check, so a crossed or replayed admission identity cannot pass
+/// the entry even before per-slot validation runs.
 fn admit_all_slots(
     request: &SwarmAdmissionBindRequest,
 ) -> Result<Vec<SwarmBoundSlot>, SwarmAdmissionBindError> {
@@ -838,6 +841,10 @@ fn admit_all_slots(
         ));
     }
     let mut seen_slot_ids = BTreeSet::new();
+    let mut seen_work_units = BTreeSet::new();
+    let mut seen_attempts = BTreeSet::new();
+    let mut seen_leases = BTreeSet::new();
+    let mut seen_route_receipts = BTreeSet::new();
     for binding in &request.bindings {
         validate_text(&binding.slot_id, "admission.slot")?;
         validate_text(&binding.selection_id, "admission.selection")?;
@@ -846,6 +853,15 @@ fn admit_all_slots(
         validate_canonical_digest(&binding.preference_policy_digest, "admission.selection")?;
         if !seen_slot_ids.insert(binding.slot_id.as_str()) {
             return Err(SwarmAdmissionBindError::DuplicateIdentity("admission.slot"));
+        }
+        if !seen_work_units.insert(&binding.work_unit_id)
+            || !seen_attempts.insert(&binding.attempt_id)
+            || !seen_leases.insert(&binding.lease_id)
+            || !seen_route_receipts.insert(binding.admitted_route.self_digest.as_str())
+        {
+            return Err(SwarmAdmissionBindError::InvalidField(
+                "admission.denominator",
+            ));
         }
     }
     let mut slots = Vec::with_capacity(request.bindings.len());
