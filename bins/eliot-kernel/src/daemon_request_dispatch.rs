@@ -4299,13 +4299,12 @@ impl KernelComposition {
                 MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
             ));
         };
-        let receipt = match gateway
-            .load_maintenance_trigger_decision_receipt(
-                &session.module_generation.state_fence,
-                &session.connection_id,
-                &operation.trigger_id,
-            )
-            .await
+        let receipt = match Box::pin(gateway.load_maintenance_trigger_decision_receipt(
+            &session.module_generation.state_fence,
+            &session.connection_id,
+            &operation.trigger_id,
+        ))
+        .await
         {
             Ok(Some(receipt)) => receipt,
             Ok(None) => {
