@@ -382,6 +382,22 @@ pub trait KernelRecoveryPort: Send + Sync {
         state_fence: &StateFence,
         protected_snapshot_digest: &str,
     ) -> Result<Vec<MaintenanceJob>, KernelPortError>;
+
+    /// Reads one bounded page of the Kernel-owned operational maintenance
+    /// trigger recovery projection. The cursors resume independent claim
+    /// revocation and pending-member scans; this surface carries no evaluator,
+    /// policy, or route-owner decision.
+    fn maintenance_trigger_recovery_page(
+        &self,
+        _state_fence: &StateFence,
+        _protected_snapshot_digest: &str,
+        _claim_continuation: Option<&str>,
+        _pending_continuation: Option<&str>,
+    ) -> Result<MaintenanceTriggerRecoveryProjection, KernelPortError> {
+        Err(KernelPortError::NotAdmitted(
+            "Kernel maintenance trigger recovery projection is not admitted".to_owned(),
+        ))
+    }
 }
 
 /// Explicit Kernel-owned service observation route used after owner recovery.
@@ -698,6 +714,119 @@ pub struct KernelServiceRecovery {
     pub observation: ServiceObservation,
 }
 
+/// Bounded owner-issued summaries returned by the Kernel recovery route.
+/// Members and gap summaries remain opaque JSON because eliotd does not own
+/// their lifecycle meaning. The exact envelope is retained so fields added by
+/// the Kernel remain available to the registered recovery reader.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceTriggerRecoveryPage {
+    /// Kernel application kind naming this operational projection.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Bounded pending members; `None` means the Kernel did not provide a page.
+    #[serde(default)]
+    pub members: Option<Vec<serde_json::Value>>,
+    /// Whether another pending-member page exists.
+    #[serde(default)]
+    pub has_more: Option<bool>,
+    /// Opaque cursor for the next pending-member page.
+    #[serde(default)]
+    pub continuation: Option<String>,
+    /// Whether more active claims remain in the revocation scan.
+    #[serde(default)]
+    pub claim_has_more: bool,
+    /// Opaque cursor for the next active-claim revocation page.
+    #[serde(default)]
+    pub claim_continuation: Option<String>,
+    /// Whether the claim-revocation scan reached a known closed boundary.
+    #[serde(default)]
+    pub claim_recovery_complete: bool,
+    /// Whether both bounded scans completed without unresolved gaps.
+    #[serde(default)]
+    pub reconciliation_complete: bool,
+    /// Explicit proof that the pending membership is empty; absent when unknown.
+    #[serde(default)]
+    pub empty_membership_proven: Option<bool>,
+    /// Claim-revocation gaps, retained separately from pending-page gaps.
+    #[serde(default)]
+    pub claim_gaps: Vec<serde_json::Value>,
+    /// Pending-page gaps, retained separately from claim-revocation gaps.
+    #[serde(default)]
+    pub pending_gaps: Vec<serde_json::Value>,
+    /// Bounded compatibility union of the two gap pages.
+    #[serde(default)]
+    pub gaps: Vec<serde_json::Value>,
+    /// Whether the claim-gap page was available.
+    #[serde(default)]
+    pub claim_gap_page_available: bool,
+    /// Whether the pending-gap page was available.
+    #[serde(default)]
+    pub pending_gap_page_available: bool,
+    /// Whether the owner truncated either reported gap page.
+    #[serde(default)]
+    pub gaps_truncated: bool,
+    /// Owner-reported claim scan failure, when present.
+    #[serde(default)]
+    pub claim_recovery_failure: Option<serde_json::Value>,
+    /// Owner-reported pending page failure, when present.
+    #[serde(default)]
+    pub pending_page_failure: Option<serde_json::Value>,
+    /// Active claims revoked during this request.
+    #[serde(default)]
+    pub revoked_claims: u64,
+    /// Claim pages scanned during this request.
+    #[serde(default)]
+    pub pages_scanned: u64,
+}
+
+/// Authenticated operational maintenance-trigger recovery reported by Kernel.
+///
+/// `status`, `value`, `recovery`, and `raw_envelope` preserve the returned
+/// response. `unavailable_detail` is set only when the request itself failed;
+/// that state does not claim empty membership or reconciliation completion.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerRecoveryProjection {
+    /// Exact status string returned by the Kernel envelope, if received.
+    pub status: Option<String>,
+    /// Typed bounded page content, if the envelope included an object value.
+    pub value: Option<MaintenanceTriggerRecoveryPage>,
+    /// Exact recovery field returned by Kernel; null remains explicit.
+    pub recovery: serde_json::Value,
+    /// Exact optional outer error field returned by Kernel.
+    pub error: serde_json::Value,
+    /// Raw Kernel envelope, preserving any additional owner-issued fields.
+    pub raw_envelope: Option<serde_json::Value>,
+    /// Local transport/decoding failure when no valid Kernel envelope arrived.
+    pub unavailable_detail: Option<String>,
+}
+
+impl MaintenanceTriggerRecoveryProjection {
+    /// Returns true only when Kernel reported a known, complete reconciliation.
+    #[must_use]
+    pub fn reconciliation_complete(&self) -> bool {
+        self.status.as_deref() == Some("known")
+            && self
+                .value
+                .as_ref()
+                .is_some_and(|value| value.reconciliation_complete)
+    }
+
+    /// Retains request failure as unavailable operational evidence, not as an
+    /// empty pending set or a successful recovery result.
+    #[must_use]
+    pub fn unavailable(detail: String) -> Self {
+        Self {
+            status: None,
+            value: None,
+            recovery: serde_json::Value::Null,
+            error: serde_json::Value::Null,
+            raw_envelope: None,
+            unavailable_detail: Some(detail),
+        }
+    }
+}
+
 /// The complete typed result of Kernel recovery required before readiness.
 ///
 /// Every field is provider-owned evidence.  The daemon never constructs this
@@ -722,6 +851,10 @@ pub struct GovernorRecoverySnapshot {
     pub receipts: Vec<WriteReceipt>,
     /// Durable application jobs recovered by the Kernel-owned job route.
     pub durable_jobs: Vec<MaintenanceJob>,
+    /// Bounded operational trigger recovery from the authenticated Kernel.
+    /// Ordinary pending members and incomplete continuation pages do not gate
+    /// readiness; their exact owner-issued state remains readable here.
+    pub maintenance_trigger_recovery: MaintenanceTriggerRecoveryProjection,
 }
 
 impl GovernorRecoverySnapshot {
@@ -4782,6 +4915,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.recovery
     }
 
+    /// Reads the next bounded maintenance-trigger recovery page through the
+    /// already authenticated Kernel port. Continuations are opaque, caller
+    /// supplied cursors retained from the prior owner-issued page.
+    pub fn maintenance_trigger_recovery_page(
+        &self,
+        claim_continuation: Option<&str>,
+        pending_continuation: Option<&str>,
+    ) -> Result<MaintenanceTriggerRecoveryProjection, CompositionError> {
+        self.kernel
+            .maintenance_trigger_recovery_page(
+                &self.snapshot.state_fence,
+                &self.snapshot.protected_snapshot_digest,
+                claim_continuation,
+                pending_continuation,
+            )
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
     /// Returns the separate Kernel-owned service observations used for ordered
     /// Governor admission; these are not part of owner recovery.
     #[must_use]
@@ -8488,6 +8639,14 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
             protected_snapshot_digest: protected_snapshot_digest.to_owned(),
         })
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    // Trigger debt is operational recovery state, not a prerequisite for
+    // unrelated safe work. Preserve either the authenticated bounded page or
+    // an explicit unavailable state without converting failure into emptiness.
+    let maintenance_trigger_recovery = kernel
+        .maintenance_trigger_recovery_page(state_fence, protected_snapshot_digest, None, None)
+        .unwrap_or_else(|error| {
+            MaintenanceTriggerRecoveryProjection::unavailable(error.to_string())
+        });
     Ok(GovernorRecoverySnapshot {
         state_fence: state_fence.clone(),
         protected_snapshot_digest: protected_snapshot_digest.to_owned(),
@@ -8496,6 +8655,7 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
         canonical_scope,
         receipts,
         durable_jobs,
+        maintenance_trigger_recovery,
     })
 }
 

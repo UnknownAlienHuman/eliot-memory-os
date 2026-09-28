@@ -21,16 +21,17 @@ use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, MaintenanceTriggerCommitOutcome,
-    MaintenanceTriggerIntakeFailure, MaintenanceTriggerLifecycleFailure, NamedReadGatewayError,
-    PreStageRejection, StoreApplyRefusal, UserAutomationDueWakeRejection,
-    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
-    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    MaintenanceTriggerIntakeFailure, MaintenanceTriggerLifecycleFailure,
+    MaintenanceTriggerSessionRecovery, NamedReadGatewayError, PreStageRejection, StoreApplyRefusal,
+    UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
+    UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 #[cfg(windows)]
 use eliot_ors::{MaintenanceTriggerDownstreamRetentionProof, MaintenanceTriggerLifecycleRecord};
@@ -713,6 +714,15 @@ struct StoreRecoveryOperation {
     /// a real ORS operation identity before the durable read.
     #[serde(default)]
     process_stream_recovery_operations: Option<Vec<String>>,
+    /// Exact continuation for the bounded maintenance claim-recovery scan.
+    /// The returned token is ORS-owned and resumes the same frozen window.
+    #[serde(default)]
+    maintenance_trigger_claim_continuation: Option<String>,
+    /// Exact continuation for the bounded pending maintenance-trigger page.
+    /// This remains independent of claim recovery so a pending page is visible
+    /// while a larger claim scan is still in progress.
+    #[serde(default)]
+    maintenance_trigger_pending_continuation: Option<String>,
 }
 
 /// Cursor and page bound for one retained maintenance-trigger scan.
@@ -3771,47 +3781,159 @@ impl KernelComposition {
 
     #[cfg(windows)]
     fn maintenance_trigger_session_recovery_view(
-        revoked_claims: u64,
-        gaps: &[MaintenanceTriggerGap],
-        gaps_truncated: bool,
-        pages_scanned: u64,
-        pending_members: &[MaintenanceTriggerPendingSummary],
-        pending_has_more: bool,
-        pending_continuation: Option<&str>,
-        empty_membership_proven: bool,
+        claim_recovery: Result<
+            MaintenanceTriggerSessionRecovery,
+            MaintenanceTriggerLifecycleFailure,
+        >,
+        pending_page: Result<Option<MaintenanceTriggerPage>, MaintenanceTriggerLifecycleFailure>,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let revoked_claims = claim_recovery
+            .as_ref()
+            .map_or(0, |recovery| u64::from(recovery.revoked_claims));
+        let claim_recovery_complete = claim_recovery.as_ref().is_ok_and(|recovery| {
+            !recovery.has_more && recovery.continuation.is_none() && recovery.gaps.is_empty()
+        });
+        let claim_has_more = claim_recovery
+            .as_ref()
+            .is_ok_and(|recovery| recovery.has_more);
+        let claim_continuation = claim_recovery
+            .as_ref()
+            .ok()
+            .and_then(|recovery| recovery.continuation.as_deref());
+        let claim_gaps = claim_recovery
+            .as_ref()
+            .ok()
+            .map_or(&[][..], |recovery| recovery.gaps.as_slice());
+        let pending_members = match &pending_page {
+            Ok(Some(page)) => Some(page.members.as_slice()),
+            Ok(None) => Some(&[][..]),
+            Err(_) => None,
+        };
+        let pending_gaps = pending_page
+            .as_ref()
+            .ok()
+            .and_then(|page| page.as_ref().map(|page| page.gaps.as_slice()))
+            .unwrap_or(&[]);
+        let pending_has_more = match &pending_page {
+            Ok(Some(page)) => Some(page.has_more),
+            Ok(None) => Some(false),
+            Err(_) => None,
+        };
+        let pending_continuation = pending_page
+            .as_ref()
+            .ok()
+            .and_then(|page| page.as_ref().and_then(|page| page.continuation.as_deref()));
+        let empty_membership_proven = pending_page.as_ref().ok().map(|page| page.is_none());
+        // Each source page is independently bounded by the owner contract.
+        // Preserve both lists and allow their combined compatibility view up
+        // to twice the per-page gap limit rather than losing a second-page gap.
+        let mut gaps = Vec::with_capacity(claim_gaps.len() + pending_gaps.len());
+        for gap in claim_gaps.iter().chain(pending_gaps.iter()) {
+            if gaps
+                .iter()
+                .any(|retained: &MaintenanceTriggerGap| retained.gap_id == gap.gap_id)
+            {
+                continue;
+            }
+            gaps.push(gap.clone());
+        }
+        let reconciliation_complete = claim_recovery_complete
+            && pending_members.is_some()
+            && pending_has_more == Some(false)
+            && pending_continuation.is_none()
+            && gaps.is_empty();
+        let view = serde_json::json!({
             "status": "known",
             "value": {
                 "kind": "maintenance_trigger_session_recovery",
                 "revoked_claims": revoked_claims,
-                "pages_scanned": pages_scanned,
-                "claim_recovery_complete": true,
-                "reconciliation_complete": !gaps_truncated
-                    && !pending_has_more
-                    && pending_continuation.is_none(),
-                "members": pending_members.iter().map(|member| serde_json::json!({
+                "pages_scanned": if claim_recovery.is_ok() { 1_u64 } else { 0_u64 },
+                "claim_recovery_complete": claim_recovery_complete,
+                "claim_has_more": claim_has_more,
+                "claim_continuation": claim_continuation,
+                "reconciliation_complete": reconciliation_complete,
+                "members": pending_members.map(|members| members.iter().map(|member| serde_json::json!({
                     "trigger_id": member.trigger_id,
                     "operation_hash": member.operation_hash,
                     "revision": member.revision,
                     "disposition": member.disposition,
                     "applicable_until_unix_ms": member.applicable_until_unix_ms,
-                })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>()),
                 "has_more": pending_has_more,
                 "continuation": pending_continuation,
                 "empty_membership_proven": empty_membership_proven,
-                "gaps_truncated": gaps_truncated,
+                "claim_gap_page_available": claim_recovery.is_ok(),
+                "pending_gap_page_available": pending_page.is_ok(),
+                "gaps_truncated": false,
+                "claim_gaps": claim_gaps.iter().map(Self::maintenance_trigger_gap_summary)
+                    .collect::<Vec<_>>(),
+                "pending_gaps": pending_gaps.iter().map(Self::maintenance_trigger_gap_summary)
+                    .collect::<Vec<_>>(),
                 "gaps": gaps.iter().map(Self::maintenance_trigger_gap_summary)
                     .collect::<Vec<_>>(),
             },
             "recovery": null,
-        })
+        });
+
+        let claim_failure = claim_recovery.as_ref().err();
+        let pending_failure = pending_page.as_ref().err();
+        if claim_failure.is_none() && pending_failure.is_none() {
+            return view;
+        }
+
+        let Some(primary_failure) = claim_failure.or(pending_failure) else {
+            return view;
+        };
+        let mut response =
+            Self::maintenance_trigger_recovery_failure_response(primary_failure, revoked_claims);
+        let mut pending_failure_unknown = false;
+        if let (Some(response_value), Some(view_value)) = (
+            response
+                .get_mut("value")
+                .and_then(serde_json::Value::as_object_mut),
+            view.get("value").and_then(serde_json::Value::as_object),
+        ) {
+            response_value.extend(view_value.clone());
+            if let Some(failure) = claim_failure {
+                response_value.insert(
+                    "claim_recovery_failure".to_owned(),
+                    Self::maintenance_trigger_lifecycle_failure_response(
+                        "maintenance_trigger_session_recovery",
+                        failure,
+                    )["value"]
+                        .clone(),
+                );
+            }
+            if let Some(failure) = pending_failure {
+                let pending_error = Self::maintenance_trigger_lifecycle_failure_response(
+                    "maintenance_trigger_pending_page",
+                    failure,
+                );
+                let pending_error_unknown = pending_error
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("unknown");
+                response_value.insert(
+                    "pending_page_failure".to_owned(),
+                    pending_error["value"].clone(),
+                );
+                pending_failure_unknown = pending_error_unknown;
+            }
+        }
+        // Claim recovery can commit per-trigger revocations before a later
+        // row fails, so an error from that bounded scan does not prove that
+        // the aggregate operation had no durable effect. Likewise, a
+        // successful revocation followed by a failed pending read is partial.
+        if claim_failure.is_some() || pending_failure_unknown || revoked_claims > 0 {
+            response["status"] = serde_json::Value::String("unknown".to_owned());
+            response["value"]["commit_outcome"] = serde_json::Value::String("UNKNOWN".to_owned());
+        }
+        response
     }
 
     /// Preserves the lower layer's stable failure code while accounting for
-    /// claims that earlier pages durably revoked during this same startup
-    /// recovery request. The aggregate result is unknown until every page is
-    /// read back.
+    /// claims durably revoked before a later part of this recovery request
+    /// failed.
     #[cfg(windows)]
     fn maintenance_trigger_recovery_failure_response(
         failure: &MaintenanceTriggerLifecycleFailure,
@@ -7616,207 +7738,51 @@ impl KernelComposition {
                 };
                 let maintenance_trigger_recovery = match super::caller_binding(session) {
                     Ok((owner, _)) if owner.module_id() == ACTIVE_DAEMON_CALLER => {
-                        let mut continuation: Option<String> = None;
-                        let mut seen_continuations = BTreeSet::new();
-                        let mut revoked_claims = 0_u64;
-                        let mut pages_scanned = 0_u64;
-                        let mut recovery_gaps = Vec::new();
-                        let mut gaps_truncated = false;
-                        loop {
-                            let recovery = match gateway.recover_maintenance_trigger_session(
-                                &recovery_fence,
-                                &session.connection_id,
-                                owner.principal_digest(),
-                                request_id.as_str(),
-                                continuation.as_deref(),
-                                eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
-                            ) {
-                                Ok(recovery) => recovery,
-                                Err(failure) => {
-                                    break Self::maintenance_trigger_recovery_failure_response(
-                                        &failure,
-                                        revoked_claims,
-                                    );
+                        let claim_recovery = gateway.recover_maintenance_trigger_session(
+                            &recovery_fence,
+                            &session.connection_id,
+                            owner.principal_digest(),
+                            request_id.as_str(),
+                            operation.maintenance_trigger_claim_continuation.as_deref(),
+                            eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
+                        );
+                        let pending_page = match gateway.maintenance_trigger_page(
+                            &recovery_fence,
+                            &session.connection_id,
+                            request_id.as_str(),
+                            operation
+                                .maintenance_trigger_pending_continuation
+                                .as_deref(),
+                            eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
+                        ) {
+                            Ok(page) => page.validate().map(|()| Some(page)).map_err(|error| {
+                                MaintenanceTriggerLifecycleFailure::Protocol {
+                                    error,
+                                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
                                 }
-                            };
-                            let Some(next_page_count) = pages_scanned.checked_add(1) else {
-                                break serde_json::json!({
-                                    "status": "unknown",
-                                    "value": {
-                                        "kind": "maintenance_trigger_session_recovery",
-                                        "accepted": false,
-                                        "failure_code": "MAINTENANCE_TRIGGER_RECOVERY_COUNT_OVERFLOW",
-                                        "commit_outcome": "UNKNOWN",
-                                    },
-                                    "recovery": null,
-                                });
-                            };
-                            pages_scanned = next_page_count;
-                            let Some(total_revoked_claims) =
-                                revoked_claims.checked_add(u64::from(recovery.revoked_claims))
-                            else {
-                                break serde_json::json!({
-                                    "status": "unknown",
-                                    "value": {
-                                        "kind": "maintenance_trigger_session_recovery",
-                                        "accepted": false,
-                                        "failure_code": "MAINTENANCE_TRIGGER_RECOVERY_COUNT_OVERFLOW",
-                                        "commit_outcome": "UNKNOWN",
-                                    },
-                                    "recovery": null,
-                                });
-                            };
-                            revoked_claims = total_revoked_claims;
-                            for gap in recovery.gaps {
-                                if recovery_gaps
-                                    .iter()
-                                    .any(|retained: &MaintenanceTriggerGap| {
-                                        retained.gap_id == gap.gap_id
-                                    })
-                                {
-                                    continue;
-                                }
-                                if recovery_gaps.len() < MAX_MAINTENANCE_TRIGGER_PAGE_GAPS as usize
-                                {
-                                    recovery_gaps.push(gap);
-                                } else {
-                                    gaps_truncated = true;
-                                }
+                            }),
+                            // The gateway emits this exact failure only when
+                            // ORS proves the frozen high-water window is empty.
+                            // Other empty-looking failures stay unknown.
+                            Err(MaintenanceTriggerLifecycleFailure::EmptyPageWithoutGap) => {
+                                Ok(None)
                             }
-                            if !recovery.has_more {
-                                let pending_page = match gateway.maintenance_trigger_page(
-                                    &recovery_fence,
-                                    &session.connection_id,
-                                    request_id.as_str(),
-                                    None,
-                                    eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
-                                ) {
-                                    Ok(page) => match page.validate() {
-                                        Ok(()) => Some(page),
-                                        Err(error) => {
-                                            let failure =
-                                                MaintenanceTriggerLifecycleFailure::Protocol {
-                                                    error,
-                                                    commit_outcome:
-                                                        MaintenanceTriggerCommitOutcome::NotAttempted,
-                                                };
-                                            break Self::maintenance_trigger_recovery_failure_response(
-                                                &failure,
-                                                revoked_claims,
-                                            );
-                                        }
-                                    },
-                                    // The gateway emits this exact failure only
-                                    // when ORS proves the frozen high-water window
-                                    // is empty. Other empty-looking failures stay
-                                    // unknown or incomplete.
-                                    Err(
-                                        MaintenanceTriggerLifecycleFailure::EmptyPageWithoutGap,
-                                    ) => None,
-                                    Err(failure) => {
-                                        break Self::maintenance_trigger_recovery_failure_response(
-                                            &failure,
-                                            revoked_claims,
-                                        );
-                                    }
-                                };
-                                let mut pending_members = Vec::new();
-                                let mut pending_has_more = false;
-                                let mut pending_continuation = None;
-                                let empty_membership_proven = pending_page.is_none();
-                                if let Some(page) = pending_page {
-                                    for gap in &page.gaps {
-                                        if recovery_gaps.iter().any(
-                                            |retained: &MaintenanceTriggerGap| {
-                                                retained.gap_id == gap.gap_id
-                                            },
-                                        ) {
-                                            continue;
-                                        }
-                                        if recovery_gaps.len()
-                                            < MAX_MAINTENANCE_TRIGGER_PAGE_GAPS as usize
-                                        {
-                                            recovery_gaps.push(gap.clone());
-                                        } else {
-                                            gaps_truncated = true;
-                                        }
-                                    }
-                                    pending_members = page.members;
-                                    pending_has_more = page.has_more;
-                                    pending_continuation = page.continuation;
-                                }
-                                break Self::maintenance_trigger_session_recovery_view(
-                                    revoked_claims,
-                                    &recovery_gaps,
-                                    gaps_truncated,
-                                    pages_scanned,
-                                    &pending_members,
-                                    pending_has_more,
-                                    pending_continuation.as_deref(),
-                                    empty_membership_proven,
-                                );
-                            }
-                            let Some(next_continuation) = recovery.continuation else {
-                                let failure =
-                                    MaintenanceTriggerLifecycleFailure::ContinuationNotRetained;
-                                break Self::maintenance_trigger_recovery_failure_response(
-                                    &failure,
-                                    revoked_claims,
-                                );
-                            };
-                            if !seen_continuations.insert(next_continuation.clone()) {
-                                let failure =
-                                    MaintenanceTriggerLifecycleFailure::ContinuationNotRetained;
-                                break Self::maintenance_trigger_recovery_failure_response(
-                                    &failure,
-                                    revoked_claims,
-                                );
-                            }
-                            continuation = Some(next_continuation);
-                        }
+                            Err(failure) => Err(failure),
+                        };
+                        Self::maintenance_trigger_session_recovery_view(
+                            claim_recovery,
+                            pending_page,
+                        )
                     }
                     _ => Self::maintenance_trigger_input_failure_response(
                         "maintenance_trigger_session_recovery",
                         "MAINTENANCE_TRIGGER_AUTHENTICATED_OWNER_UNAVAILABLE",
                     ),
                 };
-                let maintenance_trigger_recovery_complete = maintenance_trigger_recovery
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("known")
-                    && maintenance_trigger_recovery
-                        .pointer("/value/reconciliation_complete")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    && maintenance_trigger_recovery
-                        .pointer("/value/claim_recovery_complete")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    && maintenance_trigger_recovery
-                        .pointer("/value/gaps_truncated")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(false)
-                    && maintenance_trigger_recovery
-                        .pointer("/value/members")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some()
-                    && maintenance_trigger_recovery
-                        .pointer("/value/has_more")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(false)
-                    && maintenance_trigger_recovery
-                        .pointer("/value/continuation")
-                        .is_some_and(serde_json::Value::is_null)
-                    && maintenance_trigger_recovery
-                        .pointer("/value/empty_membership_proven")
-                        .and_then(serde_json::Value::as_bool)
-                        .is_some();
-                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready
-                    && maintenance_trigger_recovery_complete
-                {
-                    // The Store snapshot is same-fence validated above and the
-                    // staged envelopes are reconciled under that same fence, so
-                    // both halves of step 6 now hold.
+                // Maintenance debt is surfaced on its bounded route above. It
+                // does not hold unrelated startup work open: step 6 remains
+                // gated by same-fence Store and staged-write readiness only.
+                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready {
                     self.record_startup_evidence(6)
                         .map_err(|_| TransportError::SessionFenced)?;
                 }

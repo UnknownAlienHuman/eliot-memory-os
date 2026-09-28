@@ -786,6 +786,28 @@ fn maintenance_trigger_retained_claim(
 }
 
 #[cfg(windows)]
+fn maintenance_trigger_downstream_intent_origin_claim(
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<MaintenanceTriggerClaim, MaintenanceTriggerLifecycleFailure> {
+    let origin_record = lifecycle
+        .downstream_intent_origin_claim_record
+        .as_ref()
+        .ok_or(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch)?;
+    let origin_claim: MaintenanceTriggerClaim = maintenance_trigger_parse_canonical(origin_record)?;
+    origin_claim
+        .validate()
+        .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+    if origin_record.record_identity != maintenance_trigger_claim_record_identity(&origin_claim)?
+        || origin_claim.trigger_id != lifecycle.trigger_id
+        || origin_claim.revision != lifecycle.retained_revision
+        || lifecycle.downstream_intent_record.is_none()
+    {
+        return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+    }
+    Ok(origin_claim)
+}
+
+#[cfg(windows)]
 fn maintenance_trigger_decision_record(
     receipt: &MaintenanceTriggerDecisionReceipt,
 ) -> Result<MaintenanceTriggerCanonicalRecord, MaintenanceTriggerLifecycleFailure> {
@@ -2770,14 +2792,11 @@ impl KernelStoreGateway {
             return Err(MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound);
         }
 
-        // A replacement claim may own recovery of an older committed effect.
-        // Preserve the prior claim fence from the exact revocation record when
-        // it exists; otherwise the retained current claim is the effect fence.
-        let origin_fence = if lifecycle.downstream_intent_record.is_some()
-            && let Some(revocation_record) = lifecycle.revocation_record.as_ref()
-        {
-            maintenance_trigger_parse_canonical::<MaintenanceTriggerRevocation>(revocation_record)?
-                .daemon_fence
+        // A replacement claim may recover an older committed effect. Bind
+        // receipt recovery to the immutable claim captured with first intent
+        // persistence; the latest revocation can describe a later claim.
+        let origin_fence = if lifecycle.downstream_intent_record.is_some() {
+            maintenance_trigger_downstream_intent_origin_claim(lifecycle)?.daemon_fence
         } else {
             maintenance_trigger_retained_claim(lifecycle)?.daemon_fence
         };

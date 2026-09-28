@@ -998,6 +998,38 @@ pub fn emit_startup_readiness_record(
     );
 }
 
+/// Emits aggregate maintenance-trigger recovery progress on the existing
+/// diagnostics sink. The full bounded owner-issued page remains available on
+/// `GovernorRecoverySnapshot`; member identities and opaque continuation
+/// tokens are intentionally excluded from general logs.
+pub fn emit_maintenance_trigger_recovery_record(
+    recovery: &eliot_governor::MaintenanceTriggerRecoveryProjection,
+) {
+    let page = recovery.value.as_ref();
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.maintenance_trigger_recovery",
+        status = recovery.status.as_deref().unwrap_or("unavailable"),
+        unavailable = recovery.unavailable_detail.is_some(),
+        members_available = page.and_then(|value| value.members.as_ref()).is_some(),
+        members = page.and_then(|value| value.members.as_ref()).map_or(0, Vec::len),
+        empty_membership_proven = ?page.and_then(|value| value.empty_membership_proven),
+        pending_has_more = ?page.and_then(|value| value.has_more),
+        pending_continuation_present = page.is_some_and(|value| value.continuation.is_some()),
+        claim_has_more = page.is_some_and(|value| value.claim_has_more),
+        claim_continuation_present = page.is_some_and(|value| value.claim_continuation.is_some()),
+        claim_recovery_complete = page.is_some_and(|value| value.claim_recovery_complete),
+        reconciliation_complete = recovery.reconciliation_complete(),
+        claim_gaps = page.map_or(0, |value| value.claim_gaps.len()),
+        pending_gaps = page.map_or(0, |value| value.pending_gaps.len()),
+        gaps_truncated = page.is_some_and(|value| value.gaps_truncated),
+        claim_gap_page_available = page.is_some_and(|value| value.claim_gap_page_available),
+        pending_gap_page_available = page.is_some_and(|value| value.pending_gap_page_available),
+        claim_failure_present = page.is_some_and(|value| value.claim_recovery_failure.is_some()),
+        pending_failure_present = page.is_some_and(|value| value.pending_page_failure.is_some()),
+    );
+}
+
 /// Re-evaluates exactly one declared capability from evidence an admitted
 /// demand produced, and reports what the reevaluation changed.
 ///
