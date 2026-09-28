@@ -872,6 +872,241 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
     )
 }
 
+/// Human maintenance-policy evidence for one family and scope (I14.22 W1, issue #1692).
+///
+/// I14.22: "Human policy selects one `MaintenanceAutomationMode` per family."
+/// The per-family revision/digest, the affected scope, the override provenance,
+/// the separate `interactive_maintenance` permission, and the effect/budget
+/// ceilings travel with that selection, so a mode value alone never authorizes
+/// work. No Human maintenance-policy publisher exists on this seam yet, so the
+/// only constructor records unpublished provenance (no revision/digest, no
+/// override, no separate permission, no ceilings) around the registry-selected
+/// mode; the fail-closed `Off` for every family comes from the caller's
+/// registry, and the five non-Off modes are enforced by
+/// [`MaintenanceController::evaluate_trigger`], which already implements the
+/// whole deterministic decision surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenancePolicyEvidence {
+    /// Registered maintenance family this evidence concerns.
+    pub family: MaintenanceFamily,
+    /// Affected scope this evidence was issued for.
+    pub scope_ref: String,
+    /// Selected automation mode.
+    pub mode: MaintenanceAutomationMode,
+    /// Publisher revision, when a Human policy owner publishes one.
+    pub revision: Option<u64>,
+    /// Digest of the canonical published policy bytes, when published.
+    pub digest: Option<String>,
+    /// Provenance of a Human override, when an override is in force.
+    pub override_provenance: Option<String>,
+    /// Separate `interactive_maintenance` permission (I14.22).
+    pub interactive_permission: bool,
+    /// Effect ceiling the publisher admits, when published.
+    pub effect_ceiling: Option<String>,
+    /// Budget ceiling the publisher admits, when published.
+    pub budget_ceiling: Option<String>,
+}
+
+impl MaintenancePolicyEvidence {
+    /// Records unpublished provenance around the registry-selected mode: no
+    /// publisher revision/digest, no override, no separate interactive
+    /// permission, and no effect/budget ceilings. The mode value itself comes
+    /// from the caller's registry (the maintenance-family catalog), so this
+    /// type never invents a second mode source; it carries the provenance the
+    /// registry does not.
+    #[must_use]
+    pub fn unpublished(
+        mode: MaintenanceAutomationMode,
+        family: MaintenanceFamily,
+        scope_ref: String,
+    ) -> Self {
+        Self {
+            family,
+            scope_ref,
+            mode,
+            revision: None,
+            digest: None,
+            override_provenance: None,
+            interactive_permission: false,
+            effect_ceiling: None,
+            budget_ceiling: None,
+        }
+    }
+
+    /// Selected automation mode.
+    #[must_use]
+    pub const fn mode(&self) -> MaintenanceAutomationMode {
+        self.mode
+    }
+
+    /// Whether interactive work is permitted by the separate policy.
+    #[must_use]
+    pub const fn requires_interactive_session(&self) -> bool {
+        self.interactive_permission
+    }
+}
+
+/// Service-safe route/credential evidence (I14.22 W2, issue #1692).
+///
+/// I14.22: "Scheduled/background maintenance may use only service-safe routes
+/// and credentials explicitly admitted for unattended operation." The selected
+/// capability fingerprint/generation, the credential reference, and the
+/// unattended-use suitability travel together, so `route_available` is decided
+/// from an owner rather than a bare boolean. No route/credential owner
+/// publishes to this seam yet, so the only constructor records the
+/// unpublished, fail-closed evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceRouteEvidence {
+    /// Admitted capability fingerprint, when published.
+    pub capability_fingerprint: Option<String>,
+    /// Admitted capability generation, when published.
+    pub generation: Option<u64>,
+    /// Credential reference admitted for unattended use, when published.
+    pub credential_ref: Option<String>,
+    /// Whether the published route is suitable for unattended operation.
+    pub unattended_suitable: bool,
+}
+
+impl MaintenanceRouteEvidence {
+    /// Records unpublished route evidence: nothing admitted, not suitable.
+    #[must_use]
+    pub const fn unpublished() -> Self {
+        Self {
+            capability_fingerprint: None,
+            generation: None,
+            credential_ref: None,
+            unattended_suitable: false,
+        }
+    }
+
+    /// Whether a service-safe execution route is available: suitability plus
+    /// the exact admitted fingerprint, generation, and credential reference.
+    /// A partial record grants nothing.
+    #[must_use]
+    pub fn is_service_safe(&self) -> bool {
+        self.unattended_suitable
+            && self.capability_fingerprint.is_some()
+            && self.generation.is_some()
+            && self.credential_ref.is_some()
+    }
+}
+
+/// Admitted budget evidence (I14.22 W1, issue #1692).
+///
+/// No maintenance budget/quota owner publishes to this seam yet, so the only
+/// constructor records the unpublished, fail-closed evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceBudgetEvidence {
+    /// Budget reference admitted for this work, when published.
+    pub budget_ref: Option<String>,
+    /// Whether an admitted cost/quota slice remains.
+    pub remaining: bool,
+}
+
+impl MaintenanceBudgetEvidence {
+    /// Records unpublished budget evidence: no reference, nothing remaining.
+    #[must_use]
+    pub const fn unpublished() -> Self {
+        Self {
+            budget_ref: None,
+            remaining: false,
+        }
+    }
+
+    /// Whether an admitted cost/quota budget remains. A bare flag without the
+    /// admitted reference grants nothing.
+    #[must_use]
+    pub fn has_budget(&self) -> bool {
+        self.remaining && self.budget_ref.is_some()
+    }
+}
+
+/// Approved schedule-window evidence (I14.22, issue #1692).
+///
+/// The window is a real Host wake / Task Scheduler occurrence, never a locally
+/// invented one. `eliotd` holds no such occurrence, so the only constructor
+/// records the unpublished, fail-closed evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceScheduleEvidence {
+    /// Whether a real approved schedule occurrence is current.
+    pub window_open: bool,
+}
+
+impl MaintenanceScheduleEvidence {
+    /// Records unpublished schedule evidence: no approved window.
+    #[must_use]
+    pub const fn unpublished() -> Self {
+        Self { window_open: false }
+    }
+
+    /// Whether the current time is inside the approved window.
+    #[must_use]
+    pub const fn is_current_window(&self) -> bool {
+        self.window_open
+    }
+}
+
+/// User Broker session evidence (I14.22/I14.24 W3, issue #1692).
+///
+/// I14.22 requires an active authenticated User Broker plus a separate
+/// `interactive_maintenance` policy for subscription-, IDE-, browser- or
+/// desktop-bound work; I14.24 requires broker loss/revocation to stop affected
+/// interactive work while service-safe routes continue. The daemon's retained
+/// transport-session facts are not User Broker evidence and never satisfy a
+/// broker gate on their own: no broker lease/session observation is joined
+/// here yet, so interactive admission stays fail-closed and the stored flag
+/// only reports transport presence for the existing input field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceBrokerEvidence {
+    /// Whether the daemon retains a validated transport session.
+    pub transport_session_present: bool,
+}
+
+impl MaintenanceBrokerEvidence {
+    /// Records transport-only presence: the one gate the daemon genuinely
+    /// observes, explicitly not broker admission.
+    #[must_use]
+    pub const fn transport_only(present: bool) -> Self {
+        Self {
+            transport_session_present: present,
+        }
+    }
+
+    /// Transport presence carried by the existing input field. This is not
+    /// broker admission; `requires_interactive_session` stays denied until a
+    /// real broker observation plus the separate policy arrive.
+    #[must_use]
+    pub const fn transport_present(&self) -> bool {
+        self.transport_session_present
+    }
+}
+
+/// Mandatory safety/recovery obligation evidence (I14.22, issue #1692).
+///
+/// Only a verified mandatory safety/recovery obligation published by its
+/// owning authority may set this; a caller-projected flag never satisfies it.
+/// No such owner publishes to this seam yet, so the only constructor records
+/// the unpublished, fail-closed evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceSafetyEvidence {
+    /// Whether a verified mandatory obligation is in force.
+    pub required: bool,
+}
+
+impl MaintenanceSafetyEvidence {
+    /// Records unpublished safety evidence: no verified obligation.
+    #[must_use]
+    pub const fn unpublished() -> Self {
+        Self { required: false }
+    }
+
+    /// Whether a verified mandatory safety/recovery obligation is in force.
+    #[must_use]
+    pub const fn is_required(&self) -> bool {
+        self.required
+    }
+}
+
 fn text(value: &str, field: &'static str) -> Result<(), MaintenanceError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(MaintenanceError::InvalidField(field));
