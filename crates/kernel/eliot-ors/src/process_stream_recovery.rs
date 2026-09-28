@@ -16,9 +16,20 @@
 //!
 //! Structural no-synthetic-locator guarantee: a locator is only ever obtained
 //! from [`DurableProcessStreamSource`], whose own deserializer rejects the
-//! `raw`/`memory`/`process-memory` schemes, and [`ProcessStreamRecoveryProjection::validate`]
-//! re-asserts the same rule at the ORS boundary. See
-//! [`ProcessStreamRecoveryProjection::reject_synthetic_locator`].
+//! `raw`/`memory`/`process-memory` schemes, and
+//! [`ProcessStreamObservation::validate`] re-asserts the same rule at the ORS
+//! boundary. See [`ProcessStreamObservation::reject_synthetic_locator`].
+//!
+//! One stream shape, two durable users (issue #269, A1):
+//! [`ProcessStreamObservation`] is the byte-free observation itself, and
+//! [`ProcessStreamRecoveryProjection`] IS that observation plus the durable
+//! recovery axes. Both validate through the one
+//! [`ProcessStreamObservation::validate`], and the byte-free process-evidence
+//! row (`model::ProcessEvidenceRecord`) reduces its stdout/stderr through
+//! [`ProcessStreamObservation::from_stream_evidence`]. So the closed
+//! `raw:`-locator rule, the transport/persistence matrix and the preview
+//! invariants have exactly one implementation, and an accepted evidence value
+//! can never reach a durable ORS row with its bytes attached.
 //!
 //! Implementation: I5.16 durable fields, I14.6 execution axes, I14.26 recovery
 //! view. This module owns no `BlobStore`, no process, no parser, no evaluator,
@@ -248,6 +259,271 @@ pub struct StreamRecoveryPreview {
     pub omitted_ranges: Vec<StreamByteRange>,
 }
 
+/// Byte-free ORS observation of exactly one observed physical stream (issue
+/// #269, A1).
+///
+/// This is the ONE ORS-owned shape a stream observation is reduced to. It keeps
+/// the evidence identity, the exact digests and counts, the immutable locator
+/// plus ready receipt, the typed transport/persistence axes, the exact gap set
+/// and the preview's identity/counts/omission metadata — and it holds no payload
+/// of any kind: no `Vec<u8>`, no preview bytes, no stderr/stdout text.
+///
+/// It is not a second scheme. [`ProcessStreamRecoveryProjection`] is exactly this
+/// observation plus the durable recovery axes, and both validate through this one
+/// [`validate`](Self::validate), so the closed `raw:`-locator rule and the
+/// transport/persistence/preview invariants cannot drift between the recovery
+/// projection and the byte-free process-evidence row.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStreamObservation {
+    /// Which physical stream this observation describes.
+    pub stream: ProcessStreamKind,
+    /// Typed physical transport completion, preserved exactly.
+    pub transport: StreamTransportStatus,
+    /// SHA-256 over every physical transport byte observed.
+    pub observed_sha256: String,
+    /// Number of physical transport bytes observed.
+    pub observed_bytes: u64,
+    /// Typed source durability, preserved exactly and never promoted.
+    pub persistence: StreamPersistenceStatus,
+    /// Immutable locator plus ready receipt, when a durable source exists.
+    pub source: Option<DurableProcessStreamSource>,
+    /// Exact durable coverage of `source`, when a durable source exists.
+    pub durable_coverage: Option<StreamRecoveryCoverage>,
+    /// Exact physical transport-prefix identity when a shorter exact source is
+    /// the durable one.
+    pub transport_prefix_identity: Option<ProcessStreamTransportPrefixIdentity>,
+    /// Preview identity, counts and omission metadata; never preview bytes.
+    pub preview: StreamRecoveryPreview,
+    /// Policy, privacy, visibility, retention and redaction identities fixed
+    /// before persistence.
+    pub policy: ProcessStreamPolicyBinding,
+    /// Exact coverage gap set, canonically sorted and unique.
+    pub gaps: Vec<StreamEvidenceGap>,
+}
+
+impl ProcessStreamObservation {
+    /// Reduces one accepted stream observation to its byte-free ORS shape.
+    ///
+    /// `evidence` is read, never copied: its bounded inline preview bytes are
+    /// deliberately not retained here, and its digest over those bytes is not
+    /// recomputed, so the reduction cannot be mistaken for a re-derivation of the
+    /// original bytes.
+    pub fn from_stream_evidence(evidence: &ProcessStreamEvidence) -> Result<Self, OrsError> {
+        let source = evidence.source().cloned();
+        let durable_coverage = match &source {
+            Some(source) => Some(StreamRecoveryCoverage {
+                sha256: source.sha256().to_owned(),
+                byte_length: source.byte_length(),
+                range: StreamRecoveryRange::new(0, source.byte_length())?,
+            }),
+            None => None,
+        };
+        let observation = Self {
+            stream: evidence.stream(),
+            transport: evidence.transport(),
+            observed_sha256: evidence.observed_sha256().to_owned(),
+            observed_bytes: evidence.observed_bytes(),
+            persistence: evidence.persistence(),
+            source,
+            durable_coverage,
+            transport_prefix_identity: evidence.transport_prefix_identity().cloned(),
+            preview: preview_summary(evidence.preview()),
+            policy: evidence.policy().clone(),
+            gaps: evidence.gaps().to_vec(),
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    /// Fail-closed validation of every cross-field stream invariant.
+    ///
+    /// Mirrors the accepted evidence contract's closed locator rule at the ORS
+    /// boundary: a synthetic `raw:` (or process-memory) locator can never become
+    /// durable ORS state, and a missing or mismatched receipt can never be
+    /// represented as complete evidence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.validate_observed_axes()?;
+        self.validate_source_axes()?;
+        self.validate_preview()
+    }
+
+    fn validate_observed_axes(&self) -> Result<(), OrsError> {
+        validate_digest(&self.observed_sha256, "stream_observation_observed_sha256")?;
+        if self.observed_bytes == 0 && self.observed_sha256 != sha256_hex(&[]) {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_observed_sha256",
+                reason: "a zero-byte observed stream must use the empty SHA-256 identity",
+            });
+        }
+        if self.gaps.len() > MAX_STREAM_RECOVERY_GAPS {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        if !self.gaps.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_gaps",
+                reason: "gap reasons must be unique and canonically sorted",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_source_axes(&self) -> Result<(), OrsError> {
+        if let Some(source) = &self.source {
+            Self::reject_synthetic_locator(source.locator())?;
+        }
+        if let Some(prefix) = &self.transport_prefix_identity {
+            if self.source.is_none() {
+                return Err(OrsError::InvalidField {
+                    field: "stream_observation_transport_prefix_identity",
+                    reason: "a durable-prefix identity requires a durable source",
+                });
+            }
+            if prefix.byte_length() > self.observed_bytes {
+                return Err(OrsError::InvalidField {
+                    field: "stream_observation_transport_prefix_identity",
+                    reason: "a durable-prefix identity cannot exceed the observed transport bytes",
+                });
+            }
+        }
+        if self.durable_coverage.is_some() != self.source.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_durable_coverage",
+                reason: "durable coverage must be present exactly when a durable source is",
+            });
+        }
+        if let (Some(coverage), Some(source)) = (&self.durable_coverage, &self.source) {
+            Self::validate_durable_coverage(coverage, source)?;
+        }
+        self.validate_persistence_matrix()
+    }
+
+    fn validate_durable_coverage(
+        coverage: &StreamRecoveryCoverage,
+        source: &DurableProcessStreamSource,
+    ) -> Result<(), OrsError> {
+        validate_digest(&coverage.sha256, "stream_observation_coverage_sha256")?;
+        if coverage.sha256 != source.sha256()
+            || coverage.byte_length != source.byte_length()
+            || coverage.range.start() != 0
+            || coverage.range.end_exclusive() != coverage.byte_length
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_stream_observation",
+                reason: "durable coverage does not bind the immutable locator identity".to_owned(),
+            });
+        }
+        // A zero-byte complete source round-trips with exact coverage: the
+        // covered interval is empty and the digest is the empty SHA-256.
+        if coverage.byte_length == 0
+            && (!coverage.range.is_empty() || coverage.sha256 != sha256_hex(&[]))
+        {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_coverage_sha256",
+                reason: "a zero-byte durable source must carry empty coverage and the empty digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Mirrors the accepted evidence contract's closed locator rule at the ORS
+    /// boundary. A synthetic `raw:` (or process-memory) locator can never
+    /// become durable recovery state, and a missing or mismatched receipt can
+    /// never be represented as complete evidence.
+    fn reject_synthetic_locator(locator: &str) -> Result<(), OrsError> {
+        let scheme = locator
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(
+            scheme.as_str(),
+            "raw" | "memory" | "process-memory" | "process_memory"
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_locator",
+                reason: "synthetic and process-memory stream locators are forbidden in ORS",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_persistence_matrix(&self) -> Result<(), OrsError> {
+        match self.persistence {
+            StreamPersistenceStatus::CompleteSource => {
+                if self.source.is_none() {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_observation_persistence",
+                        reason: "a complete source requires an immutable locator and ready receipt",
+                    });
+                }
+                if self.transport != StreamTransportStatus::Complete || !self.gaps.is_empty() {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_observation_persistence",
+                        reason: "a complete source requires EOF and no coverage gaps",
+                    });
+                }
+            }
+            StreamPersistenceStatus::PartialSource => {
+                if self.source.is_none() {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_observation_persistence",
+                        reason: "a partial source requires an immutable locator and ready receipt",
+                    });
+                }
+                if self.gaps.is_empty() {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_observation_gaps",
+                        reason: "a partial source requires an explicit coverage gap",
+                    });
+                }
+            }
+            StreamPersistenceStatus::SourceUnavailable => {
+                if self.source.is_some() || self.transport_prefix_identity.is_some() {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_observation_source",
+                        reason: "source-unavailable evidence cannot carry a durable locator",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_preview(&self) -> Result<(), OrsError> {
+        validate_digest(&self.preview.sha256, "stream_observation_preview_sha256")?;
+        if self.preview.retained_bytes > self.preview.represented_bytes {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_preview_retained_bytes",
+                reason: "retained preview bytes cannot exceed represented bytes",
+            });
+        }
+        if self.preview.omitted_ranges.len() > MAX_STREAM_RECOVERY_OMITTED_RANGES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        if self.preview.representation == StreamPreviewRepresentation::WithheldByPolicy {
+            if self.preview.retained_bytes != 0
+                || self.preview.sha256 != sha256_hex(&[])
+                || !self.preview.omitted_ranges.is_empty()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "stream_observation_preview",
+                    reason: "a policy-withheld preview cannot retain byte material",
+                });
+            }
+            return Ok(());
+        }
+        if self.preview.omitted_ranges
+            != omitted_suffix(self.preview.retained_bytes, self.preview.represented_bytes)?
+        {
+            return Err(OrsError::InvalidField {
+                field: "stream_observation_preview_omitted_ranges",
+                reason: "a retained prefix must expose exactly the omitted suffix",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Why the durable source is not usable after revalidation.
 ///
 /// Missing, corrupt, revoked and purged sources stay distinguishable; none of
@@ -397,15 +673,7 @@ impl ProcessStreamRecoveryProjection {
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))?;
         let process = evidence.binding();
-        let source = evidence.source().cloned();
-        let durable_coverage = match &source {
-            Some(source) => Some(StreamRecoveryCoverage {
-                sha256: source.sha256().to_owned(),
-                byte_length: source.byte_length(),
-                range: StreamRecoveryRange::new(0, source.byte_length())?,
-            }),
-            None => None,
-        };
+        let observation = ProcessStreamObservation::from_stream_evidence(evidence)?;
         let projection = Self {
             contract_version: CONTRACT_VERSION,
             stream_contract_revision: evidence.schema_version().to_owned(),
@@ -416,22 +684,22 @@ impl ProcessStreamRecoveryProjection {
             job_id: OpaqueLabel::new(process.job_id().as_str())?,
             image_id: OpaqueLabel::new(process.image_id().as_str())?,
             session_id: OpaqueLabel::new(process.session_id().as_str())?,
-            stream: evidence.stream(),
+            stream: observation.stream,
             authority_epoch: process.authority_epoch().clone(),
             generation: process.state_fence().generation().get(),
             writer_epoch: binding.writer_epoch,
             state_fence_digest: binding.state_fence_digest,
             policy_revision: binding.policy_revision,
-            transport: evidence.transport(),
-            observed_sha256: evidence.observed_sha256().to_owned(),
-            observed_bytes: evidence.observed_bytes(),
-            persistence: evidence.persistence(),
-            source,
-            durable_coverage,
-            transport_prefix_identity: evidence.transport_prefix_identity().cloned(),
-            preview: preview_summary(evidence.preview()),
-            policy: evidence.policy().clone(),
-            gaps: evidence.gaps().to_vec(),
+            transport: observation.transport,
+            observed_sha256: observation.observed_sha256,
+            observed_bytes: observation.observed_bytes,
+            persistence: observation.persistence,
+            source: observation.source,
+            durable_coverage: observation.durable_coverage,
+            transport_prefix_identity: observation.transport_prefix_identity,
+            preview: observation.preview,
+            policy: observation.policy,
+            gaps: observation.gaps,
             availability: StreamRecoveryAvailability::Unrevalidated,
             reconciliation: StreamRecoveryReconciliation::unreconciled(
                 binding.reconciliation_owner,
@@ -441,6 +709,28 @@ impl ProcessStreamRecoveryProjection {
         };
         projection.validate()?;
         Ok(projection)
+    }
+
+    /// The byte-free stream observation this projection retains.
+    ///
+    /// The projection IS this observation plus its durable recovery axes, so both
+    /// shapes validate through [`ProcessStreamObservation::validate`] and the
+    /// closed `raw:`-locator rule and the transport/persistence/preview
+    /// invariants have exactly one implementation.
+    pub fn stream_observation(&self) -> ProcessStreamObservation {
+        ProcessStreamObservation {
+            stream: self.stream,
+            transport: self.transport,
+            observed_sha256: self.observed_sha256.clone(),
+            observed_bytes: self.observed_bytes,
+            persistence: self.persistence,
+            source: self.source.clone(),
+            durable_coverage: self.durable_coverage.clone(),
+            transport_prefix_identity: self.transport_prefix_identity.clone(),
+            preview: self.preview.clone(),
+            policy: self.policy.clone(),
+            gaps: self.gaps.clone(),
+        }
     }
 
     /// Stable physical-stream key. Stdout and stderr never share a key.
@@ -559,9 +849,7 @@ impl ProcessStreamRecoveryProjection {
     /// Fail-closed validation of every cross-field recovery invariant.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.validate_identity()?;
-        self.validate_observed_axes()?;
-        self.validate_source_axes()?;
-        self.validate_preview()?;
+        self.stream_observation().validate()?;
         self.reconciliation.validate()?;
         Ok(())
     }
@@ -622,181 +910,6 @@ impl ProcessStreamRecoveryProjection {
                 != self.writer_epoch.current.lineage_id.as_str()
         {
             return Err(OrsError::FenceMismatch);
-        }
-        Ok(())
-    }
-
-    fn validate_observed_axes(&self) -> Result<(), OrsError> {
-        validate_digest(&self.observed_sha256, "stream_recovery_observed_sha256")?;
-        if self.observed_bytes == 0 && self.observed_sha256 != sha256_hex(&[]) {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_observed_sha256",
-                reason: "a zero-byte observed stream must use the empty SHA-256 identity",
-            });
-        }
-        if self.gaps.len() > MAX_STREAM_RECOVERY_GAPS {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        if !self.gaps.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_gaps",
-                reason: "gap reasons must be unique and canonically sorted",
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_source_axes(&self) -> Result<(), OrsError> {
-        if let Some(source) = &self.source {
-            Self::reject_synthetic_locator(source.locator())?;
-        }
-        if let Some(prefix) = &self.transport_prefix_identity {
-            if self.source.is_none() {
-                return Err(OrsError::InvalidField {
-                    field: "stream_recovery_transport_prefix_identity",
-                    reason: "a durable-prefix identity requires a durable source",
-                });
-            }
-            if prefix.byte_length() > self.observed_bytes {
-                return Err(OrsError::InvalidField {
-                    field: "stream_recovery_transport_prefix_identity",
-                    reason: "a durable-prefix identity cannot exceed the observed transport bytes",
-                });
-            }
-        }
-        if self.durable_coverage.is_some() != self.source.is_some() {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_durable_coverage",
-                reason: "durable coverage must be present exactly when a durable source is",
-            });
-        }
-        if let (Some(coverage), Some(source)) = (&self.durable_coverage, &self.source) {
-            Self::validate_durable_coverage(coverage, source)?;
-        }
-        self.validate_persistence_matrix()
-    }
-
-    fn validate_durable_coverage(
-        coverage: &StreamRecoveryCoverage,
-        source: &DurableProcessStreamSource,
-    ) -> Result<(), OrsError> {
-        validate_digest(&coverage.sha256, "stream_recovery_coverage_sha256")?;
-        if coverage.sha256 != source.sha256()
-            || coverage.byte_length != source.byte_length()
-            || coverage.range.start() != 0
-            || coverage.range.end_exclusive() != coverage.byte_length
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "process_stream_recovery",
-                reason: "durable coverage does not bind the immutable locator identity".to_owned(),
-            });
-        }
-        // A zero-byte complete source round-trips with exact coverage: the
-        // covered interval is empty and the digest is the empty SHA-256.
-        if coverage.byte_length == 0
-            && (!coverage.range.is_empty() || coverage.sha256 != sha256_hex(&[]))
-        {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_coverage_sha256",
-                reason: "a zero-byte durable source must carry empty coverage and the empty digest",
-            });
-        }
-        Ok(())
-    }
-
-    /// Mirrors the accepted evidence contract's closed locator rule at the ORS
-    /// boundary. A synthetic `raw:` (or process-memory) locator can never
-    /// become durable recovery state, and a missing or mismatched receipt can
-    /// never be represented as complete evidence.
-    fn reject_synthetic_locator(locator: &str) -> Result<(), OrsError> {
-        let scheme = locator
-            .split_once(':')
-            .map(|(scheme, _)| scheme.to_ascii_lowercase())
-            .unwrap_or_default();
-        if matches!(
-            scheme.as_str(),
-            "raw" | "memory" | "process-memory" | "process_memory"
-        ) {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_locator",
-                reason: "synthetic and process-memory stream locators are forbidden in ORS",
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_persistence_matrix(&self) -> Result<(), OrsError> {
-        match self.persistence {
-            StreamPersistenceStatus::CompleteSource => {
-                if self.source.is_none() {
-                    return Err(OrsError::InvalidField {
-                        field: "stream_recovery_persistence",
-                        reason: "a complete source requires an immutable locator and ready receipt",
-                    });
-                }
-                if self.transport != StreamTransportStatus::Complete || !self.gaps.is_empty() {
-                    return Err(OrsError::InvalidField {
-                        field: "stream_recovery_persistence",
-                        reason: "a complete source requires EOF and no coverage gaps",
-                    });
-                }
-            }
-            StreamPersistenceStatus::PartialSource => {
-                if self.source.is_none() {
-                    return Err(OrsError::InvalidField {
-                        field: "stream_recovery_persistence",
-                        reason: "a partial source requires an immutable locator and ready receipt",
-                    });
-                }
-                if self.gaps.is_empty() {
-                    return Err(OrsError::InvalidField {
-                        field: "stream_recovery_gaps",
-                        reason: "a partial source requires an explicit coverage gap",
-                    });
-                }
-            }
-            StreamPersistenceStatus::SourceUnavailable => {
-                if self.source.is_some() || self.transport_prefix_identity.is_some() {
-                    return Err(OrsError::InvalidField {
-                        field: "stream_recovery_source",
-                        reason: "source-unavailable evidence cannot carry a durable locator",
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_preview(&self) -> Result<(), OrsError> {
-        validate_digest(&self.preview.sha256, "stream_recovery_preview_sha256")?;
-        if self.preview.retained_bytes > self.preview.represented_bytes {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_preview_retained_bytes",
-                reason: "retained preview bytes cannot exceed represented bytes",
-            });
-        }
-        if self.preview.omitted_ranges.len() > MAX_STREAM_RECOVERY_OMITTED_RANGES {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        if self.preview.representation == StreamPreviewRepresentation::WithheldByPolicy {
-            if self.preview.retained_bytes != 0
-                || self.preview.sha256 != sha256_hex(&[])
-                || !self.preview.omitted_ranges.is_empty()
-            {
-                return Err(OrsError::InvalidField {
-                    field: "stream_recovery_preview",
-                    reason: "a policy-withheld preview cannot retain byte material",
-                });
-            }
-            return Ok(());
-        }
-        if self.preview.omitted_ranges
-            != omitted_suffix(self.preview.retained_bytes, self.preview.represented_bytes)?
-        {
-            return Err(OrsError::InvalidField {
-                field: "stream_recovery_preview_omitted_ranges",
-                reason: "a retained prefix must expose exactly the omitted suffix",
-            });
         }
         Ok(())
     }

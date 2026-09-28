@@ -3,6 +3,7 @@ use eliot_contracts::{
     canonical_json_bytes,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
+use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
     AuthorityBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration, ProofCeiling,
     ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
@@ -25,6 +26,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::process_stream_recovery::ProcessStreamObservation;
 use crate::reservation_model::ReservationRecord;
 use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1084,6 +1086,108 @@ pub enum AuthorityHandoffBegin {
     Existing(AuthorityHandoffRecord),
 }
 
+/// ORS wire/storage revision of the byte-free process-evidence observation row
+/// (issue #269, A1).
+///
+/// Rows written before this revision existed carry the accepted
+/// `ProcessEvidence` value inline, bounded preview bytes included. The codec
+/// dispatches on the row's `observation_schema_version` field: a row that
+/// carries this value is decoded as a byte-free observation, a row that does not
+/// carry the field at all is a pre-#269 row and is dispositioned, and a row that
+/// carries a different value is refused as a typed codec-version mismatch. No
+/// pre-#269 row is rewritten, stripped or deleted.
+pub const PROCESS_EVIDENCE_OBSERVATION_SCHEMA: &str = "eliot-ors-process-observation-v2";
+
+/// Byte-free ORS observation of one `ProcessEvidence` value (issue #269, A1).
+///
+/// This is the observation ORS retains. It keeps the byte-free process execution
+/// view, the C0-05 observation-only axes, and one byte-free
+/// [`ProcessStreamObservation`] per observed physical stream, so the evidence
+/// identity, the immutable locator plus ready receipt and the exact digests and
+/// counts survive and a reader can revalidate them against the Blob owner.
+///
+/// It holds no stdout/stderr payload. The digest over the ORIGINAL observed
+/// bytes is not here and is not recomputed: it stays on the record as
+/// `evidence_digest`, taken once at the write boundary over the bytes the
+/// executor actually produced, so a reader revalidates that digest against the
+/// Blob owner rather than against a payload ORS must not keep.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessEvidenceObservation {
+    /// Accepted reconciliation-evidence contract revision `evidence_digest` was
+    /// computed over. A move of this string is refused, never reinterpreted.
+    pub evidence_schema_version: String,
+    /// Byte-free process execution view of the observation.
+    pub view: eliot_process::ProcessExecutionView,
+    /// C0-05 observation-only evidence axes, retained verbatim.
+    ///
+    /// Held as the accepted evidence contract's own JSON projection rather than
+    /// as a re-declared ORS enum, so the retained axes are exactly the ones the
+    /// producer emitted and ORS adds no second spelling of a C0-05 axis. It
+    /// carries no payload.
+    pub axes: Value,
+    /// Byte-free stdout observation, when one was observed.
+    pub stdout: Option<ProcessStreamObservation>,
+    /// Byte-free stderr observation, when one was observed.
+    pub stderr: Option<ProcessStreamObservation>,
+}
+
+impl ProcessEvidenceObservation {
+    /// Reduces one accepted evidence value to its byte-free ORS observation.
+    ///
+    /// `evidence` is read, never copied: its bounded inline preview bytes are
+    /// deliberately not retained, and nothing here re-derives a digest over them.
+    pub fn from_evidence(evidence: &eliot_process::ProcessEvidence) -> Result<Self, OrsError> {
+        let observation = Self {
+            evidence_schema_version: evidence.schema_version().to_owned(),
+            view: evidence.view().clone(),
+            axes: serde_json::to_value(evidence.axes())
+                .map_err(|error| OrsError::Encoding(error.to_string()))?,
+            stdout: evidence
+                .stdout()
+                .map(ProcessStreamObservation::from_stream_evidence)
+                .transpose()?,
+            stderr: evidence
+                .stderr()
+                .map(ProcessStreamObservation::from_stream_evidence)
+                .transpose()?,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.evidence_schema_version != eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION {
+            return Err(OrsError::Contract(format!(
+                "process evidence observation is bound to evidence contract revision {}, \
+                 not the accepted revision {}",
+                self.evidence_schema_version,
+                eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+            )));
+        }
+        // Observation-only C0-05 axes, the same judgement the byte-bearing row
+        // made and the reason it existed: ORS retains no authority claim, so a
+        // row that escalates is refused instead of stored. The literals are the
+        // accepted evidence contract's own spellings.
+        if self.axes.get("status").and_then(Value::as_str) != Some("OBSERVED")
+            || self.axes.get("assertability").and_then(Value::as_str)
+                != Some("NON_ASSERTABLE_UNVERIFIED")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "process evidence is not observation-only C0 evidence".to_owned(),
+            });
+        }
+        for observation in [self.stdout.as_ref(), self.stderr.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            observation.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Observation-only process evidence retained by ORS.
 ///
 /// The authority epoch is the lineage-aware [`EpochId`] exact tuple
@@ -1092,10 +1196,24 @@ pub enum AuthorityHandoffBegin {
 /// owners without canonical lineage evidence cannot produce active authority
 /// and fail closed. Adjacent `AuthorityHandoffRecord` u64 contours are
 /// intentionally not widened here (flagged residual).
+///
+/// Issue #269 removed the raw payload from this row. It is the byte-free
+/// [`ProcessEvidenceObservation`] plus the owner's identity, the digests that
+/// bind it, and the observation time; the bounded inline preview bytes the
+/// executor produced are not stored here. `evidence_digest` is therefore the
+/// digest over the ORIGINAL observed bytes, taken once at the write boundary,
+/// and it is the proof a reader revalidates against the Blob owner. It is not
+/// re-derivable from the retained row, and pretending otherwise is exactly the
+/// "strip the bytes and keep the digest" failure this revision removes, so
+/// [`validate`](Self::validate) checks its shape and its cross-field bindings,
+/// never a recomputation over absent bytes.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessEvidenceRecord {
     pub contract_version: u16,
+    /// ORS process-evidence observation revision of this row; see
+    /// [`PROCESS_EVIDENCE_OBSERVATION_SCHEMA`].
+    pub observation_schema_version: String,
     pub operation_id: OperationIdentity,
     pub request_digest: String,
     pub process_tree_id: OpaqueLabel,
@@ -1109,7 +1227,7 @@ pub struct ProcessEvidenceRecord {
     pub binding_digest: String,
     pub evidence_digest: String,
     pub observed_at_ms: i64,
-    pub evidence: eliot_process::ProcessEvidence,
+    pub evidence: ProcessEvidenceObservation,
 }
 
 #[derive(Serialize)]
@@ -1125,7 +1243,7 @@ struct ProcessEvidenceRecordIdentity<'a> {
 
 impl ProcessEvidenceRecord {
     pub fn from_evidence(
-        evidence: eliot_process::ProcessEvidence,
+        evidence: &eliot_process::ProcessEvidence,
         owner: eliot_process::ProcessOwnerBinding,
         observed_at_ms: i64,
     ) -> Result<Self, OrsError> {
@@ -1134,14 +1252,19 @@ impl ProcessEvidenceRecord {
             serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
         let state_fence_bytes = serde_json::to_vec(binding.state_fence())
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        // Taken over the ORIGINAL observation-only evidence value, bounded
+        // preview bytes included; the bytes are then dropped. This digest is the
+        // retained proof of which bytes were observed and is never recomputed
+        // from a byte-free row.
         let evidence_bytes =
-            serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+            serde_json::to_vec(evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
         // Lineage-aware binding (Implements #64): the active epoch comes only
         // from the owner's canonical `EpochId` via `authority_epoch`.
         // No scalar-to-authority coercion exists.
         let authority_epoch = owner.authority_epoch().clone();
         let record = Self {
             contract_version: CONTRACT_VERSION,
+            observation_schema_version: PROCESS_EVIDENCE_OBSERVATION_SCHEMA.to_owned(),
             operation_id: OperationIdentity::new(binding.operation_id().as_str())?,
             request_digest: binding.request_digest().to_owned(),
             process_tree_id: OpaqueLabel::new(binding.process_tree_id().as_str())?,
@@ -1155,7 +1278,7 @@ impl ProcessEvidenceRecord {
             binding_digest: sha256_hex(&binding_bytes),
             evidence_digest: sha256_hex(&evidence_bytes),
             observed_at_ms,
-            evidence,
+            evidence: ProcessEvidenceObservation::from_evidence(evidence)?,
         };
         record.validate()?;
         Ok(record)
@@ -1164,6 +1287,15 @@ impl ProcessEvidenceRecord {
     /// Returns the canonical immutable key for this one observation.
     pub fn record_key(&self) -> Result<String, OrsError> {
         self.validate()?;
+        Ok(self.canonical_record_key())
+    }
+
+    /// The canonical durable key implied by this row's own identity fields.
+    ///
+    /// Split out from [`record_key`](Self::record_key) so the store's readback
+    /// can compare a decoded row against its durable key without re-running the
+    /// whole fail-closed validation.
+    pub(crate) fn canonical_record_key(&self) -> String {
         let identity = ProcessEvidenceRecordIdentity {
             operation_id: self.operation_id.as_str(),
             process_tree_id: self.process_tree_id.as_str(),
@@ -1173,13 +1305,12 @@ impl ProcessEvidenceRecord {
             evidence_digest: &self.evidence_digest,
             observed_at_ms: self.observed_at_ms,
         };
-        let identity_bytes =
-            serde_json::to_vec(&identity).map_err(|error| OrsError::Encoding(error.to_string()))?;
-        Ok(format!(
-            "{}::{:}",
+        let identity_bytes = serde_json::to_vec(&identity).unwrap_or_default();
+        format!(
+            "{}::{}",
             self.operation_id.as_str(),
             sha256_hex(&identity_bytes)
-        ))
+        )
     }
 
     #[allow(
@@ -1189,6 +1320,12 @@ impl ProcessEvidenceRecord {
     pub(crate) fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.observation_schema_version != PROCESS_EVIDENCE_OBSERVATION_SCHEMA {
+            return Err(OrsError::Contract(format!(
+                "process evidence observation revision {:?} is not the current ORS observation revision {PROCESS_EVIDENCE_OBSERVATION_SCHEMA}",
+                self.observation_schema_version
+            )));
         }
         validate_text(self.operation_id.as_str(), "process_evidence_operation_id")?;
         validate_digest(&self.request_digest, "process_evidence_request_digest")?;
@@ -1214,24 +1351,7 @@ impl ProcessEvidenceRecord {
                 reason: "epoch, generation, and observation time must be positive",
             });
         }
-        self.evidence
-            .validate()
-            .map_err(|error| OrsError::IntegrityProblem {
-                record_type: "process_evidence",
-                reason: error.to_string(),
-            })?;
-        let axes = self.evidence.axes();
-        let axes =
-            serde_json::to_value(axes).map_err(|error| OrsError::Encoding(error.to_string()))?;
-        if axes.get("status").and_then(Value::as_str) != Some("OBSERVED")
-            || axes.get("assertability").and_then(Value::as_str)
-                != Some("NON_ASSERTABLE_UNVERIFIED")
-        {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "process_evidence",
-                reason: "process evidence is not observation-only C0 evidence".to_owned(),
-            });
-        }
+        self.evidence.validate()?;
         let owner = eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
@@ -1250,15 +1370,15 @@ impl ProcessEvidenceRecord {
         if owner != self.owner
             || !self.authority_epoch.is_same_authority(owner_canonical)
             || self.generation != self.owner.generation().get()
-            || self.operation_id.as_str() != self.evidence.operation_id().as_str()
-            || self.request_digest != self.evidence.request_digest()
+            || self.operation_id.as_str() != self.evidence.view.operation_id().as_str()
+            || self.request_digest != self.evidence.view.request_digest()
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: "process_evidence",
                 reason: "evidence identity does not match its durable projection".to_owned(),
             });
         }
-        let binding = self.evidence.binding();
+        let binding = self.evidence.view.binding();
         if self.process_tree_id.as_str() != binding.process_tree_id().as_str()
             || self.job_id.as_str() != binding.job_id().as_str()
             || self.image_id.as_str() != binding.image_id().as_str()
@@ -1269,15 +1389,16 @@ impl ProcessEvidenceRecord {
                 reason: "evidence identity does not match its durable projection".to_owned(),
             });
         }
+        // Both digests are re-derived from the retained byte-free view's own
+        // binding, so a row cannot claim a fence or binding its retained view
+        // does not carry. `evidence_digest` is deliberately NOT re-derived: the
+        // bytes it covers are the ones this revision stopped retaining.
         let binding_bytes =
             serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
         let state_fence_bytes = serde_json::to_vec(binding.state_fence())
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
-        let evidence_bytes = serde_json::to_vec(&self.evidence)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
         if sha256_hex(&binding_bytes) != self.binding_digest
             || sha256_hex(&state_fence_bytes) != self.state_fence_digest
-            || sha256_hex(&evidence_bytes) != self.evidence_digest
         {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
@@ -1297,7 +1418,98 @@ impl ProcessEvidenceRecord {
         if fence_generation != self.generation {
             return Err(OrsError::FenceMismatch);
         }
+        // Stdout and stderr stay independent and exact: each observation must sit
+        // under its own stream field, so one can never be read back as the other.
+        for (observation, expected) in [
+            (self.evidence.stdout.as_ref(), ProcessStreamKind::Stdout),
+            (self.evidence.stderr.as_ref(), ProcessStreamKind::Stderr),
+        ] {
+            if let Some(observation) = observation
+                && observation.stream != expected
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_evidence",
+                    reason: "a stream observation does not sit under its own stream field"
+                        .to_owned(),
+                });
+            }
+        }
         Ok(())
+    }
+}
+
+/// Explicit read disposition of one pre-#269 `ors_process_evidence_v1` row.
+///
+/// Issue #269, A1. The row still holds the accepted `ProcessEvidence` value
+/// inline, bounded preview bytes included. ORS no longer retains that payload
+/// and no longer has a writer for it, so the row is reported, never rewritten
+/// and never deleted.
+///
+/// The reported `evidence_digest` is UNVERIFIED on purpose: ORS cannot revalidate
+/// a digest over the very bytes it must not keep, and revalidating it and then
+/// dropping the bytes would be indistinguishable from stripping them. A row in
+/// this disposition therefore can never be read back as a complete observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessInlineEvidenceRow {
+    /// Canonical durable key the row is stored under.
+    pub record_key: String,
+    /// Operation the row observes.
+    pub operation_id: OperationIdentity,
+    /// Accepted evidence contract revision the row was written under.
+    pub evidence_schema_version: String,
+    /// The row's own digest over the original observed bytes; UNVERIFIED, see
+    /// the type documentation.
+    pub evidence_digest: String,
+    /// Observation time in Unix milliseconds.
+    pub observed_at_ms: i64,
+    /// Which physical streams the row still carries inline payload for.
+    pub inline_streams: Vec<ProcessStreamKind>,
+}
+
+/// One durable process-evidence row as ORS reads it back (issue #269, A1).
+///
+/// The two variants ARE the codec's explicit version transition. A byte-free
+/// observation row is [`Observation`](Self::Observation); a pre-#269 row
+/// carrying the inline payload is
+/// [`InlinePayloadNotRetained`](Self::InlinePayloadNotRetained) and is
+/// dispositioned rather than reinterpreted. Nothing else decodes.
+///
+/// The current row is boxed because it is two orders of magnitude larger than
+/// the disposition, and a readback of one operation's history carries both
+/// shapes: sizing the enum to the row would make the common legacy-disposition
+/// read pay for a row it will never hold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessEvidenceReadback {
+    /// Current byte-free observation row.
+    Observation(Box<ProcessEvidenceRecord>),
+    /// A pre-#269 row that still holds the inline stdout/stderr payload.
+    InlinePayloadNotRetained(ProcessInlineEvidenceRow),
+}
+
+impl ProcessEvidenceReadback {
+    /// Observation time, so a readback can be ordered in observation order.
+    pub fn observed_at_ms(&self) -> i64 {
+        match self {
+            Self::Observation(record) => record.observed_at_ms,
+            Self::InlinePayloadNotRetained(row) => row.observed_at_ms,
+        }
+    }
+
+    /// The row's digest over the original observed bytes.
+    pub fn evidence_digest(&self) -> &str {
+        match self {
+            Self::Observation(record) => &record.evidence_digest,
+            Self::InlinePayloadNotRetained(row) => &row.evidence_digest,
+        }
+    }
+
+    /// Canonical durable key of the row.
+    pub fn record_key(&self) -> String {
+        match self {
+            Self::Observation(record) => record.canonical_record_key(),
+            Self::InlinePayloadNotRetained(row) => row.record_key.clone(),
+        }
     }
 }
 
