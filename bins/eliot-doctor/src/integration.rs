@@ -206,7 +206,7 @@ const INSTALL_RECEIPT_CONTRACT: &str = "eliot.plugin.install";
 /// `eliot plugin install`, whose embedded preview record becomes the
 /// expectation after its digest binding is verified. Verification mismatches
 /// stay data inside the report either way; only malformed inputs are `Err`.
-pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, IntegrationError> {
+pub fn load_expectation(path: &Path) -> Result<LoadedExpectation, IntegrationError> {
     if !path.is_absolute() {
         return Err(IntegrationError::InputInvalid(
             "expectation path must be absolute".to_owned(),
@@ -230,7 +230,14 @@ pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, Integrati
             "expectation profile must be non-empty".to_owned(),
         ));
     }
-    Ok(expectation)
+    // A plain expectation record states no installation status, so none is
+    // carried. Absence is not read as success and not read as failure: the
+    // record makes no claim about whether an install ran, and this front door
+    // does not invent one on its behalf.
+    Ok(LoadedExpectation {
+        expectation,
+        install_status: None,
+    })
 }
 
 /// Extracts the verification expectation from an install receipt, binding
