@@ -447,6 +447,23 @@ struct ExpiredClaimObservation<'a> {
     presented_generation: Option<u64>,
 }
 
+impl<'a> ExpiredClaimObservation<'a> {
+    /// Observes a deadline-passed pair detected at admission time, before
+    /// routing, when no lane served the operation and no attempt was
+    /// presented (issue #1839).
+    fn unrouted(stored: &'a HostRequestRecord) -> Self {
+        Self {
+            session: None,
+            stored,
+            lane: "unrouted",
+            retire: None,
+            phase: "admission",
+            presented_attempt_id: None,
+            presented_generation: None,
+        }
+    }
+}
+
 impl KernelComposition {
     fn persist_observe_claim_attempt(
         &self,
@@ -643,15 +660,7 @@ impl KernelComposition {
             // Routing has not run, so no lane served this operation yet: the
             // record stands alone and cleanup lands on the submit legs (which
             // retire the dead pair) or on disconnect fencing.
-            return self.expired_claim_timeout(ExpiredClaimObservation {
-                session: None,
-                stored: &stored,
-                lane: "unrouted",
-                retire: None,
-                phase: "admission",
-                presented_attempt_id: None,
-                presented_generation: None,
-            });
+            return self.expired_claim_timeout(ExpiredClaimObservation::unrouted(&stored));
         }
 
         let admitted = if stored.state == HostRequestState::Requested {
