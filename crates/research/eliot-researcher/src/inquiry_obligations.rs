@@ -267,11 +267,23 @@ impl InquiryObligation {
     /// Whether this obligation is satisfied by an admitted certificate of its
     /// declared kind.
     ///
+    /// `presented` is the kind of the certificate the caller actually admitted.
     /// A status is never enough on its own: only the certificate kind the
-    /// obligation declared can verify it.
+    /// obligation declared can verify it, so a `Verified` obligation presented
+    /// with any other kind is not verified by that certificate.
+    ///
+    /// This used to take no argument and answer from `status` alone. It declared
+    /// a kind comparison it could not perform — nothing on this type carried a
+    /// presented certificate — so an obligation built with `status: Verified`
+    /// satisfied this method while declaring, say,
+    /// `ExactSourceIdentityAndPassage` and never producing that certificate.
+    /// Comparing the presented kind against `acceptance_certificate_kind` is what
+    /// makes the guarantee above true; the status alone is a caller-declared
+    /// literal.
     #[must_use]
-    pub fn is_verified_by_certificate(&self) -> bool {
-        matches!(self.status, InquiryObligationStatus::Verified)
+    pub fn is_verified_by_certificate(&self, presented: AcceptanceCertificateKind) -> bool {
+        self.status == InquiryObligationStatus::Verified
+            && presented == self.acceptance_certificate_kind
     }
 
     /// Retains the invalidating cause, the resources spent and the reusable
