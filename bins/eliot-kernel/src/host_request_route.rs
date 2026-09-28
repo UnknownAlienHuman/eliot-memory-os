@@ -66,8 +66,8 @@ use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
-    HostRequestRetainedSourceRevision, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
-    RedbRecoveryStore,
+    HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
+    OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -4744,6 +4744,27 @@ fn retained_result_provenance(
             closure_refs: lineage.closure_refs.clone(),
             policy_fence: lineage.policy_fence.clone(),
             origin_evidence_refs: lineage.origin_evidence_refs.clone(),
+            semantic_receipt_ref: lineage.semantic_receipt_ref.clone(),
+            result_class: match lineage.result_class {
+                eliot_protocol::HostRequestResultClass::Unclassified => {
+                    HostRequestRetainedResultClass::Unclassified
+                }
+                eliot_protocol::HostRequestResultClass::ExistingEvidenceRead => {
+                    HostRequestRetainedResultClass::ExistingEvidenceRead
+                }
+                eliot_protocol::HostRequestResultClass::NewCandidate => {
+                    HostRequestRetainedResultClass::NewCandidate
+                }
+                eliot_protocol::HostRequestResultClass::VerifierObservation => {
+                    HostRequestRetainedResultClass::VerifierObservation
+                }
+                eliot_protocol::HostRequestResultClass::CanonicalWriteReceipt => {
+                    HostRequestRetainedResultClass::CanonicalWriteReceipt
+                }
+                eliot_protocol::HostRequestResultClass::RetainedDeliveryRecord => {
+                    HostRequestRetainedResultClass::RetainedDeliveryRecord
+                }
+            },
             proof_ceiling: lineage.proof_ceiling,
             influence_state: lineage.influence_state,
             instruction_taint: lineage.instruction_taint,
