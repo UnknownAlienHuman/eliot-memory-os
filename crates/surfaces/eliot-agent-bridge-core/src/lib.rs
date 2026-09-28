@@ -1003,6 +1003,8 @@ pub struct RecoveryView {
     live_generation: u64,
     streams: Vec<RecoveryStreamView>,
     unscoped_gaps: u64,
+    stream_list_total: u64,
+    unscoped_gap_total: u64,
     unproven_scope_present: bool,
     stream_list_complete: bool,
     unscoped_gaps_complete: bool,
@@ -1029,6 +1031,15 @@ impl RecoveryView {
 
     pub const fn unscoped_gaps(&self) -> u64 {
         self.unscoped_gaps
+    }
+
+    pub const fn stream_list_total(&self) -> u64 {
+        self.stream_list_total
+    }
+
+    /// Owner namespaces in the unscoped-gap denominator, not gap fact count.
+    pub const fn unscoped_gap_total(&self) -> u64 {
+        self.unscoped_gap_total
     }
 
     pub const fn unproven_scope_present(&self) -> bool {
@@ -1728,6 +1739,7 @@ pub struct ReconciliationPortResult {
     receipt_ref: ReconciliationReceiptRef,
     window: Option<Box<RecoveryWindowFacts>>,
     consumed_frontiers: Vec<ReconciliationConsumedFrontier>,
+    pure_recovery_read: bool,
 }
 
 /// A locally derived consumed frontier offered to the owner in a reconcile
@@ -1773,6 +1785,7 @@ impl ReconciliationPortResult {
             receipt_ref,
             window: None,
             consumed_frontiers: Vec::new(),
+            pure_recovery_read: false,
         })
     }
 
@@ -1797,8 +1810,10 @@ impl ReconciliationPortResult {
         handoffs_reconciled: u64,
         stream_facts: Vec<RecoveredStreamFacts>,
         unscoped_gaps: Vec<RecoveredGapFact>,
+        stream_list_total: u64,
         stream_list_complete: bool,
         stream_list_continuation: Option<String>,
+        unscoped_gap_total: u64,
         unscoped_gaps_complete: bool,
         unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
     ) -> Result<Self, BridgeError> {
@@ -1817,8 +1832,10 @@ impl ReconciliationPortResult {
             handoffs_reconciled,
             stream_facts,
             unscoped_gaps,
+            stream_list_total,
             stream_list_complete,
             stream_list_continuation,
+            unscoped_gap_total,
             unscoped_gaps_complete,
             unscoped_gaps_continuation,
         )?;
@@ -1830,7 +1847,15 @@ impl ReconciliationPortResult {
             receipt_ref,
             window: Some(Box::new(window)),
             consumed_frontiers: Vec::new(),
+            pure_recovery_read: false,
         })
+    }
+
+    /// Marks this reconciliation as a read-only recovery continuation.
+    #[must_use]
+    pub fn as_pure_recovery_read(mut self) -> Self {
+        self.pure_recovery_read = true;
+        self
     }
 
     /// Carries the exact frontiers included in the request so the real
@@ -1854,6 +1879,10 @@ impl ReconciliationPortResult {
 
     pub fn consumed_frontiers(&self) -> &[ReconciliationConsumedFrontier] {
         &self.consumed_frontiers
+    }
+
+    pub const fn is_pure_recovery_read(&self) -> bool {
+        self.pure_recovery_read
     }
 }
 
@@ -2525,7 +2554,8 @@ impl RecoveredStreamFacts {
 /// explicitly excluded from the key preimage and from completion proof.
 /// `stream_list_complete` is false when the stream enumeration itself hit
 /// the negotiated bound: stream-list coverage needs its own bounded
-/// continuation.
+/// continuation. The stream and unscoped-gap totals are the immutable owner
+/// denominators bound to this window key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryWindowFacts {
     window_key: String,
@@ -2537,8 +2567,10 @@ pub struct RecoveryWindowFacts {
     handoffs_reconciled: u64,
     stream_facts: Vec<RecoveredStreamFacts>,
     unscoped_gaps: Vec<RecoveredGapFact>,
+    stream_list_total: u64,
     stream_list_complete: bool,
     stream_list_continuation: Option<String>,
+    unscoped_gap_total: u64,
     unscoped_gaps_complete: bool,
     unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
 }
@@ -2558,8 +2590,10 @@ impl RecoveryWindowFacts {
         handoffs_reconciled: u64,
         stream_facts: Vec<RecoveredStreamFacts>,
         unscoped_gaps: Vec<RecoveredGapFact>,
+        stream_list_total: u64,
         stream_list_complete: bool,
         stream_list_continuation: Option<String>,
+        unscoped_gap_total: u64,
         unscoped_gaps_complete: bool,
         unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
     ) -> Result<Self, BridgeError> {
@@ -2620,6 +2654,15 @@ impl RecoveryWindowFacts {
                 });
             }
         }
+        if window_status == RecoveryWindowStatus::Active
+            && (stream_facts.len() as u64 > stream_list_total
+                || (!unscoped_gaps.is_empty() && unscoped_gap_total == 0))
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.owner_totals",
+                reason: "active recovery facts exceed the owner-issued denominator",
+            });
+        }
         Ok(Self {
             window_key,
             expires_at_ms,
@@ -2630,8 +2673,10 @@ impl RecoveryWindowFacts {
             handoffs_reconciled,
             stream_facts,
             unscoped_gaps,
+            stream_list_total,
             stream_list_complete,
             stream_list_continuation,
+            unscoped_gap_total,
             unscoped_gaps_complete,
             unscoped_gaps_continuation,
         })
@@ -2669,8 +2714,17 @@ impl RecoveryWindowFacts {
         &self.stream_facts
     }
 
+    pub const fn stream_list_total(&self) -> u64 {
+        self.stream_list_total
+    }
+
     pub fn unscoped_gaps(&self) -> &[RecoveredGapFact] {
         &self.unscoped_gaps
+    }
+
+    /// Owner namespaces in the unscoped-gap denominator, not gap fact count.
+    pub const fn unscoped_gap_total(&self) -> u64 {
+        self.unscoped_gap_total
     }
 
     pub const fn stream_list_complete(&self) -> bool {
@@ -3228,6 +3282,8 @@ struct RecoveryWindow {
     stream_order: Vec<String>,
     streams: BTreeMap<String, RecoveryStreamProgress>,
     unscoped_gaps: BTreeMap<String, RecoveredGapFact>,
+    stream_list_total: u64,
+    unscoped_gap_total: u64,
     unproven_scope_present: bool,
     stream_list_complete: bool,
     stream_list_continuation: Option<String>,
@@ -3298,6 +3354,8 @@ impl RecoveryWindow {
                 })
                 .collect(),
             unscoped_gaps: self.unscoped_gaps.len() as u64,
+            stream_list_total: self.stream_list_total,
+            unscoped_gap_total: self.unscoped_gap_total,
             unproven_scope_present: self.unproven_scope_present,
             stream_list_complete: self.stream_list_complete,
             unscoped_gaps_complete: self.unscoped_gaps_complete,
@@ -3307,6 +3365,13 @@ impl RecoveryWindow {
 
     #[allow(clippy::result_large_err)]
     fn next_request(&self, binding: &AttachBinding) -> Result<RecoveryReadRequest, BridgeError> {
+        if self.incomplete_reason == Some(RECOVERY_PARTIAL_WINDOW_MOVED)
+            || self.incomplete_reason == Some(RECOVERY_PARTIAL_WINDOW_EXPIRED)
+        {
+            return Err(BridgeError::InvalidTransition(
+                "recovery window requires explicit reconcile refresh",
+            ));
+        }
         let generation = binding.activation_generation.get();
         let connection = binding.connection_id.as_str().to_owned();
         if let Some(next) = self.stream_order.iter().find(|stream_id| {
@@ -3550,7 +3615,12 @@ impl AgentBridgeCore {
         let prepared = if let Some(window) = permit.window.as_deref() {
             let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
             let mut candidate = active.recovery.clone();
-            let disposition = Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
+            // An explicit no-selector reconcile may stage a distinct
+            // owner-issued window as a refresh candidate, even while the
+            // core still holds its earlier view. The live walk remains
+            // untouched until the joint cache/core commit below succeeds.
+            let disposition =
+                Self::apply_recovery_window(&active.binding, &mut candidate, true, window)?;
             Some((candidate, disposition))
         } else {
             None
@@ -3658,7 +3728,8 @@ impl AgentBridgeCore {
                     "bounded recovery continuation requires a windowed owner answer",
                 ))?;
             let mut candidate = active.recovery.clone();
-            let disposition = Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
+            let disposition =
+                Self::apply_recovery_window(&active.binding, &mut candidate, false, window)?;
             (candidate, disposition)
         };
         // Joint commit (issue #2799): the transport half swaps first; the
@@ -3785,6 +3856,7 @@ impl AgentBridgeCore {
     fn apply_recovery_window(
         binding: &AttachBinding,
         recovery: &mut Option<RecoveryWindow>,
+        allow_refresh_candidate: bool,
         facts: &RecoveryWindowFacts,
     ) -> Result<RecoveryDisposition, BridgeError> {
         if facts.presenting_connection != binding.connection_id {
@@ -3793,63 +3865,89 @@ impl AgentBridgeCore {
         if facts.live_generation != binding.activation_generation {
             return Err(BridgeError::StaleAuthority);
         }
-        let new_window = recovery
-            .as_ref()
-            .is_none_or(|window| window.live_generation != facts.live_generation.get());
-        let window = match recovery {
-            Some(window) if window.live_generation == facts.live_generation.get() => {
-                if window.window_key != facts.window_key
-                    || window.expires_at_ms != facts.expires_at_ms
-                {
-                    return Err(BridgeError::StaleAuthority);
-                }
-                window
-            }
-            _ => {
-                *recovery = Some(RecoveryWindow {
-                    window_key: facts.window_key.clone(),
-                    expires_at_ms: facts.expires_at_ms,
-                    live_generation: facts.live_generation.get(),
-                    import_revision: 0,
-                    stream_order: Vec::new(),
-                    streams: BTreeMap::new(),
-                    unscoped_gaps: BTreeMap::new(),
-                    unproven_scope_present: false,
-                    stream_list_complete: true,
-                    stream_list_continuation: None,
-                    unscoped_gaps_complete: true,
-                    unscoped_gaps_continuation: None,
-                    incomplete_reason: None,
-                });
-                recovery.as_mut().ok_or(BridgeError::NotAttached)?
-            }
-        };
-        let mut changed = new_window;
+        let (new_window, window) =
+            Self::stage_recovery_window(recovery, facts, allow_refresh_candidate)?;
         let previous_incomplete_reason = window.incomplete_reason;
-        match facts.window_status {
-            RecoveryWindowStatus::Active => {}
-            RecoveryWindowStatus::Moved => {
-                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
-                if window.incomplete_reason != previous_incomplete_reason {
-                    changed = true;
-                }
-                Self::bump_recovery_import_revision(window, changed)?;
-                return Ok(window.disposition());
+        let facts_changed = Self::apply_recovery_window_facts(window, facts)?;
+        let mut changed = new_window || facts_changed;
+        let incomplete_reason = match facts.window_status {
+            RecoveryWindowStatus::Active => {
+                Self::validate_recovery_window_totals(window)?;
+                None
             }
-            RecoveryWindowStatus::Expired => {
-                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_EXPIRED);
-                if window.incomplete_reason != previous_incomplete_reason {
-                    changed = true;
-                }
-                Self::bump_recovery_import_revision(window, changed)?;
-                return Ok(window.disposition());
+            RecoveryWindowStatus::Moved => Some(RECOVERY_PARTIAL_WINDOW_MOVED),
+            RecoveryWindowStatus::Expired => Some(RECOVERY_PARTIAL_WINDOW_EXPIRED),
+        };
+        if let Some(reason) = incomplete_reason {
+            changed |= window.incomplete_reason != Some(reason);
+            window.incomplete_reason = Some(reason);
+        }
+        changed |= window.incomplete_reason != previous_incomplete_reason;
+        Self::bump_recovery_import_revision(window, changed)?;
+        Ok(window.disposition())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn stage_recovery_window<'a>(
+        recovery: &'a mut Option<RecoveryWindow>,
+        facts: &RecoveryWindowFacts,
+        allow_refresh_candidate: bool,
+    ) -> Result<(bool, &'a mut RecoveryWindow), BridgeError> {
+        let same_generation = recovery
+            .as_ref()
+            .is_some_and(|window| window.live_generation == facts.live_generation.get());
+        let refresh_candidate = same_generation
+            && recovery
+                .as_ref()
+                .is_some_and(|window| window.window_key != facts.window_key);
+        if refresh_candidate && !allow_refresh_candidate {
+            return Err(BridgeError::StaleAuthority);
+        }
+        if same_generation && !refresh_candidate {
+            let window = recovery.as_ref().ok_or(BridgeError::NotAttached)?;
+            if window.expires_at_ms != facts.expires_at_ms
+                || window.stream_list_total != facts.stream_list_total
+                || window.unscoped_gap_total != facts.unscoped_gap_total
+            {
+                return Err(BridgeError::StaleAuthority);
             }
         }
-        changed |= window.stream_list_complete != facts.stream_list_complete;
-        changed |= window.stream_list_continuation != facts.stream_list_continuation;
-        changed |= window.unscoped_gaps_complete != facts.unscoped_gaps_complete;
-        changed |= window.unscoped_gaps_continuation != facts.unscoped_gaps_continuation;
-        changed |= !window.unproven_scope_present && facts.unproven_scope_present;
+        let new_window = !same_generation || refresh_candidate;
+        if new_window {
+            *recovery = Some(RecoveryWindow {
+                window_key: facts.window_key.clone(),
+                expires_at_ms: facts.expires_at_ms,
+                live_generation: facts.live_generation.get(),
+                import_revision: 0,
+                stream_order: Vec::new(),
+                streams: BTreeMap::new(),
+                unscoped_gaps: BTreeMap::new(),
+                stream_list_total: facts.stream_list_total,
+                unscoped_gap_total: facts.unscoped_gap_total,
+                unproven_scope_present: false,
+                stream_list_complete: true,
+                stream_list_continuation: None,
+                unscoped_gaps_complete: true,
+                unscoped_gaps_continuation: None,
+                incomplete_reason: None,
+            });
+        }
+        Ok((
+            new_window,
+            recovery.as_mut().ok_or(BridgeError::NotAttached)?,
+        ))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn apply_recovery_window_facts(
+        window: &mut RecoveryWindow,
+        facts: &RecoveryWindowFacts,
+    ) -> Result<bool, BridgeError> {
+        let mut changed = window.stream_list_complete != facts.stream_list_complete
+            || window.stream_list_continuation != facts.stream_list_continuation
+            || window.unscoped_gaps_complete != facts.unscoped_gaps_complete
+            || window.unscoped_gaps_continuation != facts.unscoped_gaps_continuation
+            || (!window.unproven_scope_present && facts.unproven_scope_present);
         window.stream_list_complete = facts.stream_list_complete;
         window
             .stream_list_continuation
@@ -3876,12 +3974,20 @@ impl AgentBridgeCore {
                 }
             }
         }
-        // Streams that fall out of the enumeration keep their progress but
-        // cannot prove completeness; a vanished incomplete stream holds the
-        // gate with an explicit reason instead of clearing silently.
-        changed |= window.incomplete_reason != previous_incomplete_reason;
-        Self::bump_recovery_import_revision(window, changed)?;
-        Ok(window.disposition())
+        Ok(changed)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_recovery_window_totals(window: &RecoveryWindow) -> Result<(), BridgeError> {
+        if window.stream_order.len() as u64 > window.stream_list_total
+            || (!window.unscoped_gaps.is_empty() && window.unscoped_gap_total == 0)
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.owner_totals",
+                reason: "active recovery facts exceed the owner-issued denominator",
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]

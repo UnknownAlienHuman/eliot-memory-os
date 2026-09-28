@@ -5214,6 +5214,7 @@ impl KernelComposition {
         let presenter = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_connection": evidence.connection,
         });
         let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
