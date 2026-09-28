@@ -38,14 +38,15 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, bind_issue18_receipt, canonical_json_bytes, canonical_request_hash,
-    decode_automation_mutation, decode_erasure_surfaces, decode_notification_mutation,
-    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
-    genesis_manifest, genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
-    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
-    validate_automation_read_params, validate_genesis_receipt_envelope,
-    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
-    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
+    audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
+    canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
+    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
+    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
+    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
+    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -3638,6 +3639,12 @@ fn transaction_receipt(
         admission_digest: transition.admission_digest.clone(),
         mutation_plan_digest: transition.mutation_plan_digest.clone(),
         semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        // I5.19: the policy/configuration/schema versions in force are copied
+        // exactly from the admitted transition, never defaulted; equality is
+        // enforced by the receipt-issuing path.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            transition,
+        ),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{:016}", plan.commit_sequence)),
@@ -4880,12 +4887,18 @@ fn genesis_receipt(
         admission_digest: issue18_transition.admission_digest.clone(),
         mutation_plan_digest: issue18_transition.mutation_plan_digest.clone(),
         semantic_source_revisions: Vec::new(),
+        // I5.19: bound from the canonical genesis transition below, never
+        // defaulted; equality is enforced by the genesis receipt-issuing path.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            &issue18_transition,
+        ),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
         envelope: None,
     };
     bind_issue18_receipt(&issue18_transition, &mut receipt, &[]);
+    bind_policy_config_schema_versions(&issue18_transition, &mut receipt);
     receipt.envelope = Some(issue_genesis_receipt_envelope(
         context,
         request,

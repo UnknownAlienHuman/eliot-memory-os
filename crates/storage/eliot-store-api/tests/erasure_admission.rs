@@ -11,12 +11,13 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration};
 use eliot_store_api::{
-    CommitId, ERASURE_STATE_IRREVERSIBLE_CONSTRAINT, EffectClass, ErasureAdmissionRequest,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId,
-    SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    admit_erasure_transition, decode_erasure_surfaces, encode_erasure_surfaces,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CONTRACT_VERSION, CommitId, ERASURE_STATE_IRREVERSIBLE_CONSTRAINT, EffectClass,
+    ErasureAdmissionRequest, EventProjectionRelationIntents, NamedMutationOperation,
+    NamedMutationRequest, OPERATION_CATALOGUE_PROFILE, OperationIdentity, OperationManifestDigest,
+    OrderingScopeId, PolicyConfigSchemaVersions, Resubmission, ScopeId, SecurityContext,
+    StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus, admit_erasure_transition,
+    decode_erasure_surfaces, encode_erasure_surfaces, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -257,6 +258,15 @@ fn restore_probe_receipt(operation: &str, class: TransitionClass) -> WriteReceip
         admission_digest: "d".repeat(64),
         mutation_plan_digest: "f".repeat(64),
         semantic_source_revisions: Vec::new(),
+        // I5.19: no `PreparedTransition` is in scope in this probe, so the
+        // record is built explicitly from the crate's own in-force constants.
+        // `fence()` carries no policy binding, so `policy_revision` is `None`
+        // and still agrees with the fence above.
+        policy_config_schema_versions: PolicyConfigSchemaVersions {
+            policy_revision: fence().policy_revision,
+            config_profile: OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: CONTRACT_VERSION,
+        },
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{operation}")),

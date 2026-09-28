@@ -1700,6 +1700,11 @@ mod tests {
             admission_digest: transition.admission_digest.clone(),
             mutation_plan_digest: transition.mutation_plan_digest.clone(),
             semantic_source_revisions: transition.semantic_source_revisions.clone(),
+            // I5.19: bound from the admitted transition, never defaulted;
+            // equality is enforced by the receipt-issuing path below.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+                transition,
+            ),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some(format!("commit-sequence-{sequence:016}")),
