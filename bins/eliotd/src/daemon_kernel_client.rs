@@ -272,6 +272,18 @@ where
     }
 }
 
+/// The exact halves one admitted `local_read` answer carries for a completed
+/// operation: the operation handle, the recorded result digest, the recorded
+/// bounded response, and the retained result lineage the owner bound to THAT
+/// result. The lineage is `None` only for a row that carries none, which stays
+/// an honest unknown (issue #1809 item 2).
+type AdmittedLocalReadHalves<'a> = (
+    &'a str,
+    &'a str,
+    serde_json::Value,
+    Option<HostRequestResultLineage>,
+);
+
 /// Typed outcome of one `local_read_result` submit (Implements #18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalReadSubmitOutcome {
@@ -2418,8 +2430,7 @@ impl DaemonKernelClient {
     fn admitted_local_read_halves<'a>(
         admitted: &'a serde_json::Map<String, serde_json::Value>,
         envelope: &HostRequestEnvelope,
-    ) -> Result<(&'a str, &'a str, serde_json::Value, Option<HostRequestResultLineage>), KernelPortError>
-    {
+    ) -> Result<AdmittedLocalReadHalves<'a>, KernelPortError> {
         let operation_id = admitted
             .get("operation_id")
             .and_then(serde_json::Value::as_str)
