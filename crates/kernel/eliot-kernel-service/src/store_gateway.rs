@@ -4626,6 +4626,20 @@ impl KernelStoreGateway {
     /// [`DreamerJobGatewayError::Uncertain`] answer instead, so the caller
     /// receives the recorded outcome and evidence as values.
     ///
+    /// An already-terminal record is answered from the record itself, on this
+    /// side of the observation-only receipt read, and that ordering is the
+    /// point rather than an accident. The `Open | Terminal` destructuring below
+    /// binds `record` for BOTH classified states, so one guard placed here
+    /// afterwards is provably reached by each of them, while a guard written
+    /// into either arm of that match would be reachable only from the arm it
+    /// sits in. Once a disposition is durably recorded the outcome is settled:
+    /// a store read that reports "no receipt" for a key ORS already holds as
+    /// `Committed` is no longer evidence about that key, and treating it as
+    /// such would replace a proven terminal result with an open Problem State
+    /// and fence the caller for a mutation that provably did commit. This is
+    /// what makes replay after a restart or a lost response return the same
+    /// outcome without a second mutation and without a store read at all.
+    ///
     /// An unreadable record is never absent: [`classify_retained_commit`]
     /// returns the typed ORS failure rather than an empty answer, and the
     /// comparison runs against the operation's own proven scope set — the exact
@@ -4645,6 +4659,19 @@ impl KernelStoreGateway {
                 record
             }
         };
+        // The already-terminal check sits ABOVE the match's per-arm work and
+        // ABOVE the observation-only receipt read, and `record` above is bound
+        // for both the `Open` and the `Terminal` arm, so neither can bypass it
+        // and no arm-specific edit can reintroduce the ordering. A terminal
+        // record keeps its recorded outcome and evidence digest as values: it
+        // releases the pause its own earlier disposition may have left open,
+        // and it never reads the store, because a receipt that cannot be read
+        // says nothing about a disposition ORS has already durably recorded.
+        if record.outcome.is_some() {
+            return Err(DreamerJobGatewayError::Uncertain(
+                self.replay_terminal_retained_answer(record)?,
+            ));
+        }
         // The typed answer is the caller-facing report. It travels as itself so
         // the caller can act on the distinction between a reconciled commit, a
         // preserved earlier disposition, a disposition whose pause release is
@@ -4799,12 +4826,19 @@ impl KernelStoreGateway {
     /// preserved exactly as staged and is never rewritten to today's epoch.
     ///
     /// Evidence handling follows the existing receipt classifier and
-    /// resubmission policy, not an enum name:
+    /// resubmission policy, not an enum name.
     ///
-    /// * a committed receipt persists or reuses K's terminal disposition,
-    ///   retains its digest, releases only the scopes no other open record
-    ///   covers, and returns committed-recovery evidence with the remaining
-    ///   ledger-read obligation — no resend;
+    /// Only a record that is still OPEN reaches this function.
+    /// `reach_retained_dreamer_recovery` answers an already-terminal record
+    /// from the record itself, before the read below, because a store
+    /// observation cannot unsettle a disposition ORS has already durably
+    /// recorded. What this function decides is therefore only what an open
+    /// record does with the receipt it can reach:
+    ///
+    /// * a committed receipt persists K's terminal disposition, retains its
+    ///   digest, releases only the scopes no other open record covers, and
+    ///   returns committed-recovery evidence with the remaining ledger-read
+    ///   obligation — no resend;
     /// * a proven noncommit whose `Resubmission` still allows the identical
     ///   identity, observed while K is open, permits one bounded
     ///   same-identity retry through the caller's normal path;
@@ -4813,14 +4847,24 @@ impl KernelStoreGateway {
     /// * a missing, unavailable or inconclusive receipt keeps K and its
     ///   pauses unresolved: no resend, no automatic rollback, and no false
     ///   no-effect result;
-    /// * an identity, content, or terminal-evidence conflict rejects the
-    ///   adoption, preserves the old history and exposes the exact conflict.
+    /// * an identity or content conflict rejects the adoption, preserves the
+    ///   old history and exposes the exact conflict.
     async fn reconcile_retained_dreamer_operation(
         &self,
         identity: &OperationIdentity,
         ordering_scopes: &[String],
         record: &UnknownCommitRecord,
     ) -> Result<DreamerRetainedOutcome, CommitRecoveryError> {
+        // Precondition, asserted once at the function boundary rather than per
+        // arm: `record` is open here and only here. `reach_retained_dreamer_recovery`
+        // tests `record.outcome.is_some()` before it forwards ANY retained record
+        // to this function, and it tests it on the ONE `record` binding that both
+        // arms of its `Open | Terminal` destructuring produce, so no arm of that
+        // match can bypass the test and no per-arm edit can reintroduce the
+        // ordering. That single hoist is also why the terminal projection has
+        // exactly one owner, `Self::replay_terminal_retained_answer`, and why this
+        // function needs no second copy of it.
+        debug_assert!(record.is_open());
         let key = identity.idempotency_key.as_str();
         // Protected recovery admission: a retained unknown commit is
         // `UnknownOutcomeReconciliation` work, not normal workload, so
@@ -4898,45 +4942,14 @@ impl KernelStoreGateway {
             CommitRecoveryClass::NeedsNewIdentity(outcome) => outcome,
         };
         let evidence_receipt_digest = receipt_evidence_digest(&receipt);
-        if record.outcome.is_some() {
-            // An already-terminal record keeps its recorded outcome: the
-            // later evidence is compared against it, and a contradiction is a
-            // conflict rather than a replacement. This is what makes replay
-            // after a restart or a lost response return the same outcome
-            // without a second mutation.
-            verify_terminal_evidence(record, outcome, &evidence_receipt_digest)?;
-            let (recorded_outcome, recorded_digest) = retained_terminal_evidence(key, record)?;
-            let release = self.release_dreamer_scopes(record);
-            return Ok(DreamerRetainedOutcome::Settled(match release {
-                // The recorded terminal disposition stands; only the release
-                // bookkeeping is incomplete, and that limitation is reported
-                // instead of being dropped.
-                PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
-                    DreamerCommitUncertain::ReconciledWithRefreshLimitation {
-                        idempotency_key: key.to_owned(),
-                        outcome: recorded_outcome,
-                        evidence_receipt_digest: recorded_digest,
-                        refresh_limitation: detail,
-                    }
-                }
-                _ => DreamerCommitUncertain::AlreadyDispositioned {
-                    idempotency_key: key.to_owned(),
-                    outcome: recorded_outcome,
-                    evidence_receipt_digest: recorded_digest,
-                },
-            }));
-        }
         // A proven noncommit that the Store's own resubmission policy
         // still allows under this identical identity. The record stays
         // open, so it keeps owning the retry; the caller re-enters normal
         // admission and the other-key pause check for one bounded send.
-        // A record that is already terminal cannot legally reopen, so
-        // that case never reaches here.
         if matches!(
             classify_commit_receipt(&receipt),
             CommitRecoveryClass::KnownRollback
         ) {
-            debug_assert!(record.is_open());
             Ok(DreamerRetainedOutcome::SameIdentityRetryPermitted)
         } else {
             Ok(DreamerRetainedOutcome::Settled(
@@ -5046,24 +5059,11 @@ impl KernelStoreGateway {
                 };
                 let evidence_receipt_digest = receipt_evidence_digest(receipt);
                 // A wrong receipt or a changed terminal digest cannot resolve
-                // the record: it is rejected and the recorded history stands.
+                // the record: it is rejected here, before the projection runs,
+                // and the recorded history stands. The projection itself is
+                // the same single owner the retained-replay path uses.
                 verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)?;
-                return match self.release_dreamer_scopes(&record) {
-                    // The terminal disposition stands and the recorded
-                    // outcome is preserved; only the pause release is
-                    // incomplete, and that is stated rather than hidden.
-                    PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
-                        let (recorded_outcome, recorded_digest) =
-                            retained_terminal_evidence(key, &record)?;
-                        Ok(DreamerCommitUncertain::ReconciledWithRefreshLimitation {
-                            idempotency_key: key.to_owned(),
-                            outcome: recorded_outcome,
-                            evidence_receipt_digest: recorded_digest,
-                            refresh_limitation: detail,
-                        })
-                    }
-                    _ => dreamer_dispositioned(key, &record),
-                };
+                return self.replay_terminal_retained_answer(&record);
             }
         }
         let outcome = match classify_commit_receipt(receipt) {
@@ -5156,6 +5156,63 @@ impl KernelStoreGateway {
             &record.ordering_scopes,
             record.idempotency_key.as_str(),
         )
+    }
+
+    /// Projects one already-terminal retained Dreamer record into the typed
+    /// answer its caller must be given (issue #2764 items 5 and 6).
+    ///
+    /// This is the single terminal projection for the two RECONCILING sites —
+    /// the retained-replay path and the receipt-adoption path — so neither can
+    /// reach a differently-shaped copy of the same decision, and the two no
+    /// longer have to be kept in agreement by hand. It is not the only place in
+    /// this file where a terminal record can become a caller answer:
+    /// [`Self::preserve_dreamer_operation`] keeps its own independent
+    /// already-resolved guard and projects through the scope-free
+    /// `dreamer_dispositioned` helper, because that leg stages rather than
+    /// releases and has no Ordering-Scope bookkeeping to report a limitation
+    /// for. The recorded outcome and its evidence digest are returned here as
+    /// the values the record holds: `Committed` and `RolledBack` are different
+    /// proven facts and neither is reduced to an ambiguous success.
+    ///
+    /// The Ordering Scopes this record itself paused are released here, so a
+    /// replay also repairs a pause left behind by an earlier disposition whose
+    /// release could not be proven complete. When the release still cannot be
+    /// proven, the recorded disposition stands and that limitation is reported
+    /// rather than dropped.
+    ///
+    /// The projection reads nothing from the Store. Once a disposition is
+    /// durably recorded its outcome is settled, so a store observation is no
+    /// longer evidence about that key: it can neither replace the recorded
+    /// outcome nor turn it back into an open Problem State. Each of its two
+    /// callers therefore reaches it only after its own binding has been
+    /// verified: the retained-replay path through `verify_retained_binding`
+    /// inside `classify_retained_commit`, and the receipt-adoption path
+    /// through `verify_receipt_binding` plus `verify_terminal_evidence`.
+    fn replay_terminal_retained_answer(
+        &self,
+        record: &UnknownCommitRecord,
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
+        // The recorded terminal disposition stands; only the release
+        // bookkeeping can be incomplete, and that limitation is reported
+        // instead of being dropped.
+        let release = self.release_dreamer_scopes(record);
+        let (outcome, evidence_receipt_digest) =
+            retained_terminal_evidence(record.idempotency_key.as_str(), record)?;
+        Ok(match release {
+            PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
+                DreamerCommitUncertain::ReconciledWithRefreshLimitation {
+                    idempotency_key: record.idempotency_key.clone(),
+                    outcome,
+                    evidence_receipt_digest,
+                    refresh_limitation: detail,
+                }
+            }
+            _ => DreamerCommitUncertain::AlreadyDispositioned {
+                idempotency_key: record.idempotency_key.clone(),
+                outcome,
+                evidence_receipt_digest,
+            },
+        })
     }
 
     /// Preserves one still-unknown Dreamer operation and opens its recoverable
