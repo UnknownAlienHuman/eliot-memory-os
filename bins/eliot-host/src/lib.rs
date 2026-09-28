@@ -8998,6 +8998,20 @@ impl HostComposition {
         // reconcile's own outcome rather than becoming one: this contour is a
         // process/readiness reconcile, not a cutover gate, so a cutover
         // disposition is never allowed to steer it.
+        //
+        // The corroboration lives in the projection, not here, and the value is
+        // deliberately not consumed by this caller. The observed artifact is
+        // the `observe_cutover_progress` record the projection emits, and that
+        // projection already resolves the disposition from BOTH owners: a
+        // retained `pending_cutover` reaches `Prepared` only when the
+        // installation registry's active generation is still the intent's own
+        // durable `expected_predecessor` and the cross-store pair read as one
+        // moment, mirroring `reconcile_cutover_outcome` exactly. A journal slot
+        // alone therefore cannot emit `Prepared` for a state the full owner
+        // read model calls ambiguous, so there is nothing downstream to correct
+        // — and a reader of the observed word sees the same state the two-owner
+        // path reports. Nothing here needs the returned outcome, and reading it
+        // would add a gate this contour does not have.
         let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
