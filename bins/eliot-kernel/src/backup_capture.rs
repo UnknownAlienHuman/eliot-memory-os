@@ -835,16 +835,13 @@ impl KernelBackupCapture {
         // content, through the same adapter the capture contour uses, so a decoded
         // archive reports the same one-disposition-per-member set the capture
         // contour produced.
-        member_dispositions.extend(
-            owner_fence_dispositions(
-                &bundle.export_fence,
-                bundle.ors_snapshot.as_ref(),
-                bundle.watchdog_spool.as_ref(),
-                bundle.host_audit.as_ref(),
-            )?
-            .iter()
-            .cloned(),
-        );
+        let owner_declared = owner_fence_dispositions(
+            &bundle.export_fence,
+            bundle.ors_snapshot.as_ref(),
+            bundle.watchdog_spool.as_ref(),
+            bundle.host_audit.as_ref(),
+        )?;
+        member_dispositions.extend(owner_declared);
         let state = if class == BackupClass::FullRecovery {
             CaptureState::Complete
         } else {
