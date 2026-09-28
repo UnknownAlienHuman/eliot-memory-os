@@ -2242,13 +2242,18 @@ pub fn check_supersession(
 /// Only the affected owner's lease is replaced: the definition, admission,
 /// wave, root, state and coverage bindings are preserved verbatim, so spend
 /// is never reset and `UNKNOWN_OUTCOME` never becomes a clean failure.
-/// History survives; only permission moves.
+/// History survives; only permission moves. The incoming epoch must advance
+/// past the retained one: a reassignment that does not move authority forward
+/// is a stale presenter, never a new owner.
 pub fn reassign_coordinator(
     execution: &SwarmExecutionRevision,
     new_coordinator: &SwarmCoordinatorLease,
 ) -> Result<SwarmExecutionRevision, ContractError> {
     execution.validate()?;
     new_coordinator.validate()?;
+    if new_coordinator.epoch <= execution.coordinator.epoch {
+        return Err(ContractError::StaleLease("swarm coordinator"));
+    }
     let mut next = execution.clone();
     next.coordinator = new_coordinator.clone();
     next.validate()?;
