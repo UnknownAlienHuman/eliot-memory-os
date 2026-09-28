@@ -528,12 +528,12 @@ fn stage_deferral_code(error: &BrokerNotifyError) -> &'static str {
         BrokerNotifyError::InvalidDeclaration => "INVALID_DECLARATION",
         BrokerNotifyError::BindingRejected => "BINDING_REJECTED",
         BrokerNotifyError::NotNotifyImage => "NOT_NOTIFY_IMAGE",
-        // The two request-time admission refusals never reach staging, for the
+        // This request-time admission refusal never reaches staging, for the
         // same reason as the arms above: staging runs at broker startup, before
-        // any request exists to carry a payload or to be composed into a line.
-        // The variants are named rather than folded into a sibling so a future
-        // caller that does reach this match cannot silently report a request
-        // refusal as a deferred declaration.
+        // any request exists to carry a payload. The variant is named rather
+        // than folded into a sibling so a future caller that does reach this
+        // match cannot silently report a request refusal as a deferred
+        // declaration.
         BrokerNotifyError::UnexpectedStdinPayload => "UNEXPECTED_STDIN_PAYLOAD",
     }
 }

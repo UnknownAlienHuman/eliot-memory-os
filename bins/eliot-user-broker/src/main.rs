@@ -50,27 +50,6 @@ enum Request {
         #[serde(default)]
         authority: Option<HumanStateAuthority>,
     },
-    /// Records one authenticated Human's acknowledgement of a canonical
-    /// notification by spawning the same admitted Notify image and handing it
-    /// the rendered one-shot request line on standard input.
-    ///
-    /// The acknowledged record's identity travels as typed fields, never as
-    /// caller-supplied bytes: the request line is composed by the broker from
-    /// the authenticated principal, and `request.stdin_payload` on the inbound
-    /// request is REPLACED by it. The generic and delivery operations both
-    /// refuse a caller-supplied payload, so this is the only request shape that
-    /// can put bytes on a Notify child's standard input.
-    ///
-    /// Acknowledgement suppresses repeated toast, not the problem: the record
-    /// stays unresolved and stays on the board (I11.7:5-6), and the admitted
-    /// Kernel route re-validates the transition before the store applies it.
-    NotifyAcknowledge {
-        request: LaunchRequest,
-        parent: NotificationRequest,
-        notification_id: PlatformHandle,
-        #[serde(default)]
-        authority: Option<HumanStateAuthority>,
-    },
     /// Spawns the notification adapter to record one authenticated Human
     /// acknowledgement of one canonical notification (issue #1780, A2).
     ///
@@ -90,6 +69,20 @@ enum Request {
     /// record stays unresolved (I11.7:5). The same `admit_human_state_change`
     /// and the same notify-image binding gate as delivery apply before
     /// anything is dispatched.
+    ///
+    /// The acknowledged record's identity travels as typed fields and never as
+    /// caller bytes: the acknowledged principal is deliberately NOT a wire
+    /// field here — [`NotifyAcknowledge`] names only the record — and the line
+    /// the child reads is composed by this broker from the principal it
+    /// admitted. `request.stdin_payload` on the inbound request is REPLACED by
+    /// that line, and the generic `Launch` and `NotifyLaunch` operations both
+    /// refuse a caller-supplied payload, so this is the only request shape
+    /// that can put bytes on a Notify child's standard input.
+    ///
+    /// Acknowledgement suppresses repeated toast, not the problem: the record
+    /// stays unresolved and a critical item stays on the board
+    /// (I11.7:5-6), and the admitted Kernel route re-validates the transition
+    /// before the store applies it.
     NotifyAcknowledge {
         request: LaunchRequest,
         acknowledgement: NotifyAcknowledge,
