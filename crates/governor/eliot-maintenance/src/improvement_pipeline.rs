@@ -1738,16 +1738,38 @@ fn unknown_effect_of(
 /// Returns whether a disposition permits a retry attempt.
 ///
 /// One gate over the whole terminal disposition, so a caller reads the retry
-/// answer from the typed outcome instead of re-deciding it. An unresolved
-/// [`ImprovementUnknownEffect`] always blocks because no validated owner outcome
-/// seam is available here. Other dispositions retain their existing owner and
-/// remedy behavior; this gate does not discharge their obligations.
+/// answer from the typed outcome instead of re-deciding it. The match names
+/// every variant and carries no wildcard, so the answer for a variant is read
+/// off that variant rather than inherited from an unexamined default: adding a
+/// disposition is a compile error here until its retry answer is decided from
+/// the evidence the pipeline actually holds.
 pub fn improvement_retry_permitted(disposition: &ImprovementTerminalDisposition) -> bool {
     match disposition {
+        // The one disposition whose own owner has not settled what happened.
+        // The answer is read from the obligation itself rather than assumed.
         ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
             obligation.retry_permitted()
         }
-        _ => true,
+        // The retained historical completed-rollback representation. This
+        // pipeline holds no owner-validated rollback result — it receives a
+        // contract, never an execution or readback receipt — so a bare
+        // `contract_ref` is not the owner evidence a completed rollback
+        // requires, and the gate refuses rather than certifying a fresh
+        // attempt from an unverified historical value. Naming this arm is what
+        // keeps that refusal explicit: under a wildcard the same variant would
+        // have inherited permission without ever being examined.
+        ImprovementTerminalDisposition::RolledBack { .. } => false,
+        // Every remaining outcome names the owner that holds the next step, and
+        // a fresh attempt is that owner's to make: the rejection, the typed
+        // regression, the evidence gap, the missing prerequisite, the exact
+        // repeat, and the bound advisory handoff each carry their own owner and
+        // remedy, and this gate does not discharge any of them.
+        ImprovementTerminalDisposition::Rejected { .. }
+        | ImprovementTerminalDisposition::Inconclusive { .. }
+        | ImprovementTerminalDisposition::RegressionRejected { .. }
+        | ImprovementTerminalDisposition::NoProgress { .. }
+        | ImprovementTerminalDisposition::Blocked { .. }
+        | ImprovementTerminalDisposition::CanaryAdmitted { .. } => true,
     }
 }
 
