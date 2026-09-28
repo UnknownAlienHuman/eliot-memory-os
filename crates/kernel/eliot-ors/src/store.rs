@@ -1153,6 +1153,12 @@ struct BridgeEventHandoffScanCursor {
     upper_sequence: u64,
 }
 
+struct BridgeRetirementPage {
+    eligible: Vec<(u64, String, BridgeEventHandoffRow)>,
+    continuation: bool,
+    after_sequence: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventOwnerMaintenanceCursorRow {
@@ -15644,6 +15650,10 @@ impl RedbRecoveryStore {
     /// missing source at or below that boundary is historical. The persisted
     /// continuation is owner/revision bound and reports whether more indexed
     /// rows remain to scan, not whether the whole owner is repaired.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The bounded source join, capacity preflight, cursor advance, and repair inserts must remain one reviewable write-transaction flow."
+    )]
     fn repair_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -15768,13 +15778,12 @@ impl RedbRecoveryStore {
         let mut now_ms = None;
         let mut repaired = 0_u64;
         for (key, row) in missing {
-            let handed_off_at_ms = match now_ms {
-                Some(timestamp) => timestamp,
-                None => {
-                    let timestamp = current_unix_ms_u64()?;
-                    now_ms = Some(timestamp);
-                    timestamp
-                }
+            let handed_off_at_ms = if let Some(timestamp) = now_ms {
+                timestamp
+            } else {
+                let timestamp = current_unix_ms_u64()?;
+                now_ms = Some(timestamp);
+                timestamp
             };
             let handoff = BridgeEventHandoffRow {
                 contract_version: crate::CONTRACT_VERSION,
@@ -15832,7 +15841,7 @@ impl RedbRecoveryStore {
         cursor: &BridgeEventCursorRow,
         scan: &BridgeEventHandoffScanCursor,
         budget: usize,
-    ) -> Result<(Vec<(u64, String, BridgeEventHandoffRow)>, bool, Option<u64>), OrsError> {
+    ) -> Result<BridgeRetirementPage, OrsError> {
         let (positions, continuation) =
             Self::bridge_handoff_position_page_in(write, access, scan, budget)?;
         let after_sequence = positions.last().map(|(sequence, _)| *sequence);
@@ -15896,7 +15905,11 @@ impl RedbRecoveryStore {
                 eligible.push((row.sequence, key, row));
             }
         }
-        Ok((eligible, continuation, after_sequence))
+        Ok(BridgeRetirementPage {
+            eligible,
+            continuation,
+            after_sequence,
+        })
     }
 
     /// Retires one namespace's handoffs inside the recovery transaction
@@ -15911,6 +15924,10 @@ impl RedbRecoveryStore {
     /// that there are no unresolved handoffs. Admission at the existing
     /// handoff capacity continues to return typed pending-handoff
     /// backpressure instead of evicting them.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The owner-bound retirement proof, payload/projection mutation, and cursor update must remain one atomic write-transaction flow."
+    )]
     fn retire_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -15967,8 +15984,11 @@ impl RedbRecoveryStore {
                 "handoff_scan_bytes": scan_bytes,
             }));
         };
-        let (eligible, continuation, after_sequence) =
-            Self::bridge_retire_eligible_in(write, &access, &owner, &cursor, &scan, budget)?;
+        let BridgeRetirementPage {
+            eligible,
+            continuation,
+            after_sequence,
+        } = Self::bridge_retire_eligible_in(write, &access, &owner, &cursor, &scan, budget)?;
         let now_ms = current_unix_ms_u64()?;
         let retired = 0_u64;
         let mut terminalized = 0_u64;
@@ -16106,7 +16126,7 @@ impl RedbRecoveryStore {
                     MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY,
                 )?;
                 let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, &owner.namespace)?;
-                let mut item = Self::bridge_maintenance_result_object(retirement)?;
+                let mut item = Self::bridge_maintenance_result_object(&retirement)?;
                 Self::validate_bridge_maintenance_namespace(&item, &owner.namespace)?;
                 item.insert("repaired".to_owned(), json!(0_u64));
                 item.insert("repair_continuation".to_owned(), json!(continuation));
@@ -16120,9 +16140,9 @@ impl RedbRecoveryStore {
             }
             Err(error) => return Err(error),
         };
-        let mut item = Self::bridge_maintenance_result_object(retirement)?;
+        let mut item = Self::bridge_maintenance_result_object(&retirement)?;
         Self::validate_bridge_maintenance_namespace(&item, &owner.namespace)?;
-        let repair = Self::bridge_maintenance_result_object(repair)?;
+        let repair = Self::bridge_maintenance_result_object(&repair)?;
         Self::validate_bridge_maintenance_namespace(&repair, &owner.namespace)?;
         for (key, value) in repair {
             item.insert(key, value);
@@ -16144,7 +16164,7 @@ impl RedbRecoveryStore {
     }
 
     fn bridge_maintenance_result_object(
-        value: serde_json::Value,
+        value: &serde_json::Value,
     ) -> Result<serde_json::Map<String, serde_json::Value>, OrsError> {
         value
             .as_object()
