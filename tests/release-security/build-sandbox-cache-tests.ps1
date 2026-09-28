@@ -179,20 +179,25 @@ Add-Record 'forbidden_secret_denied' 'PROVEN' @{
 # 2. Observable network deny / authorized acquisition.
 # ---------------------------------------------------------------------------
 $builderText = Get-Content -LiteralPath (Join-Path $repo 'scripts/build-eliot-windows-x64-release.ps1') -Raw
-if ($builderText -notmatch '--locked --offline') {
-    throw 'BUILD_SANDBOX_PROOF: release builder does not pin locked offline cargo builds'
+# The release network policy is the cargo argv template the builder actually
+# executes. A file-wide search for a pin string would also match descriptive
+# manifest projections and comments, so it is not evidence of the policy.
+$buildArgvLines = @($builderText -split "`r?`n" | Where-Object { $_ -match '^\s*\$buildArgvTemplate\s*=' })
+if ($buildArgvLines.Count -ne 1) {
+    throw "BUILD_SANDBOX_PROOF: the release builder declares $($buildArgvLines.Count) cargo build argv templates, expected exactly one"
 }
-if ($builderText -notmatch '--frozen') {
-    throw 'BUILD_SANDBOX_PROOF: release builder does not freeze cargo builds against lockfile/network acquisition'
+foreach ($cargoPin in @('--frozen', '--locked', '--offline')) {
+    if ($buildArgvLines[0] -notmatch [regex]::Escape($cargoPin)) {
+        throw "BUILD_SANDBOX_PROOF: the executed release cargo build argv template no longer pins $cargoPin"
+    }
 }
 $lockBytes = [System.IO.File]::ReadAllBytes((Join-Path $repo 'Cargo.lock'))
 $lockDigest = ([System.Security.Cryptography.SHA256]::Create().ComputeHash($lockBytes) | ForEach-Object { $_.ToString('x2') }) -join ''
 $metadataJson = (& cargo metadata --locked --offline --no-deps --format-version 1 2>$null | Out-String)
 if ($LASTEXITCODE -ne 0) { throw 'BUILD_SANDBOX_PROOF: locked offline metadata (authorized acquisition) failed' }
 Add-Record 'network_deny_or_authorized' 'PROVEN' @{
-    policy              = 'frozen+locked+offline only; --offline/--frozen makes any network acquisition a hard cargo error (deny by construction)'
-    builder_pins_offline = $true
-    no_download_rule    = '--frozen pinned in release builder (cargo build --frozen --locked --offline --release)'
+    policy              = 'the executed release cargo build argv template pins --frozen --locked --offline, so any network acquisition is a hard cargo error (deny by construction); no unauthorized acquisition is attempted here, the authorized acquisition is recorded below'
+    release_build_argv  = $buildArgvLines[0].Trim()
     authorized_record   = "cargo metadata --locked --offline exit 0; Cargo.lock sha256=$lockDigest"
     controlled_build_offline_exit = $buildExit
 }
@@ -270,6 +275,12 @@ Add-Record 'acl_boundaries' $aclStatus @{
 
 # ---------------------------------------------------------------------------
 # 4. Cache isolation across trust/source/toolchain fingerprints.
+#    The governed build cache key is derived by the in-repo owner
+#    (CacheLane::identity_for) and every reuse passes the store's trust gate
+#    (DerivedCacheStore::lookup -> TrustPolicy::authenticate). This section
+#    inspects those real owners and the real CI cargo cache key. It never
+#    re-implements a key of its own and never treats a locally computed
+#    digest as proof about the product's cache.
 # ---------------------------------------------------------------------------
 $ciText = Get-Content -LiteralPath (Join-Path $repo '.github/workflows/ci.yml') -Raw
 $ciKeyLines = @($ciText -split "`r?`n" | Where-Object { $_ -match 'key:\s*\$\{\{' })
@@ -277,72 +288,66 @@ $ciKeyLine = $ciKeyLines -join ' | '
 $ciKeyCoversTrust = ($ciKeyLines -join "`n") -match '(?i)trust|toolchain|producer|BuildFingerprint|env\.|runner\.arch'
 $rustcVersion = (& rustc --version 2>$null | Out-String).Trim()
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
-function Get-LaneKey([string]$trust, [string]$commit, [string]$lock, [string]$toolchain, [string]$features, [string]$environment, [string]$producer, [string]$cacheRoot) {
-    $raw = "trust=$trust;source=$commit;lock=$lock;toolchain=$toolchain;features=$features;environment=$environment;producer=$producer;cache-root=$cacheRoot"
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
-    return ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
-}
-$laneChecks = [System.Collections.Generic.List[object]]::new()
-$lanePairs = @(
-    [ordered]@{ dimension = 'trust'; a = @{ trust = 'lane-a-untrusted' }; b = @{ trust = 'lane-b-release' } },
-    [ordered]@{ dimension = 'source'; a = @{ commit = $sourceCommit }; b = @{ commit = 'source-fingerprint-b' } },
-    [ordered]@{ dimension = 'toolchain'; a = @{ toolchain = $rustcVersion }; b = @{ toolchain = "$rustcVersion-alt" } }
-)
-$laneBase = @{
-    trust       = 'lane-a-untrusted'
-    commit      = $sourceCommit
-    lock        = $lockDigest
-    toolchain   = $rustcVersion
-    features    = 'release'
-    environment = 'cargo-net-offline=true'
-    producer    = 'eliot-1923-local-probe'
-    cacheRoot   = $isolatedTarget
-}
-foreach ($pair in $lanePairs) {
-    $a = $laneBase.Clone()
-    $b = $laneBase.Clone()
-    foreach ($name in @($pair.a.Keys)) { $a[$name] = $pair.a[$name] }
-    foreach ($name in @($pair.b.Keys)) { $b[$name] = $pair.b[$name] }
-    $laneA = Get-LaneKey $a.trust $a.commit $a.lock $a.toolchain $a.features $a.environment $a.producer $a.cacheRoot
-    $laneB = Get-LaneKey $b.trust $b.commit $b.lock $b.toolchain $b.features $b.environment $b.producer $b.cacheRoot
-    if ($laneA -eq $laneB) { throw "BUILD_SANDBOX_PROOF: lane keys must differ across $($pair.dimension)" }
-    $laneADir = Join-Path $isolatedTarget ("lane-" + $laneA.Substring(0, 16))
-    $laneBDir = Join-Path $isolatedTarget ("lane-" + $laneB.Substring(0, 16))
-    New-Item -ItemType Directory -Path $laneADir -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $laneADir 'artifact.bin') -Value "lane-a $($pair.dimension) bytes" -Encoding ascii -NoNewline
-    if (Test-Path -LiteralPath (Join-Path $laneBDir 'artifact.bin')) {
-        throw "BUILD_SANDBOX_PROOF: lane-B key resolved a lane-A artifact across $($pair.dimension)"
+
+$cacheLaneRelative = 'crates/instrument/eliot-instrument-runner/src/cache_lane.rs'
+$derivedCacheRelative = 'crates/instrument/eliot-build-test-graph/src/derived_cache.rs'
+foreach ($ownerRelative in @($cacheLaneRelative, $derivedCacheRelative)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $repo $ownerRelative) -PathType Leaf)) {
+        throw "BUILD_SANDBOX_PROOF: the governed build cache owner is missing: $ownerRelative"
     }
-    $laneChecks.Add([ordered]@{
-            dimension = $pair.dimension
-            lane_a = $laneA.Substring(0, 16)
-            lane_b = $laneB.Substring(0, 16)
-            lane_b_artifact_reused = $false
-        }) | Out-Null
+}
+$cacheLaneText = Get-Content -LiteralPath (Join-Path $repo $cacheLaneRelative) -Raw
+$derivedCacheText = Get-Content -LiteralPath (Join-Path $repo $derivedCacheRelative) -Raw
+$identityForBody = [regex]::Match($cacheLaneText, '(?s)pub fn identity_for\(.*?\n    \}').Value
+if ([string]::IsNullOrWhiteSpace($identityForBody)) {
+    throw "BUILD_SANDBOX_PROOF: the governed build cache key owner CacheLane::identity_for is gone ($cacheLaneRelative)"
+}
+# Every fingerprint this item names must reach the real cache identity. A
+# dimension that stops binding fails the suite instead of being narrated.
+$governedKeyDimensions = [ordered]@{
+    source    = @('source_digest', 'generated_input_digest')
+    toolchain = @('toolchain_version', 'compiler_version')
+    trust     = @('producer_id', 'root_identity', 'root_acl_digest')
+}
+foreach ($dimension in $governedKeyDimensions.Keys) {
+    foreach ($fingerprint in @($governedKeyDimensions[$dimension])) {
+        if ($identityForBody -notmatch ('\b' + [regex]::Escape($fingerprint) + '\b')) {
+            throw "BUILD_SANDBOX_PROOF: the governed build cache key no longer binds the $dimension fingerprint '$fingerprint' ($cacheLaneRelative)"
+        }
+    }
+}
+if ($derivedCacheText -notmatch '(?s)pub fn lookup\(.*?trust\.authenticate\(identity\)') {
+    throw "BUILD_SANDBOX_PROOF: the governed cache store no longer gates every lookup through the trust policy ($derivedCacheRelative)"
 }
 Add-Record 'cache_isolation' 'FALLBACK_REQUIRED' @{
-    reason              = 'CI cargo cache key binds only OS+lockfile+profile; it does not cover the I02.22/I10.8.14 closure (trust, toolchain identity, producer identity, env fingerprint, cache-root ACL). Cross-trust reuse must not be claimed locally.'
-    ci_cache_key        = $ciKeyLine
-    ci_key_covers_trust = [bool]$ciKeyCoversTrust
-    lane_demo           = @($laneChecks)
-    rustc               = $rustcVersion
-    source_commit       = $sourceCommit
-    required_key        = 'trust + source + Cargo.lock + toolchain + features/profile + env + producer + cache-root identity (I02.22)'
-    fallback            = 'VM/lab runner with exact-fingerprint cache or cold cache; record selected runner in release evidence'
+    reason                     = 'The CI cargo cache key binds only OS+lockfile+profile, so it does not cover the I02.22/I10.8.14 closure. The in-repo governed cache key owner does bind source/toolchain/trust and gates every lookup through the trust policy, but GovernedBuildRuntime::run (crates/eliot-engine/src/governed_build.rs) has no production caller in this repository, so no cross-trust refusal is executed here and none is claimed.'
+    ci_cache_key               = $ciKeyLine
+    ci_key_covers_trust        = [bool]$ciKeyCoversTrust
+    governed_key_owner         = "$cacheLaneRelative CacheLane::identity_for"
+    governed_key_dimensions    = $governedKeyDimensions
+    governed_trust_gate        = "$derivedCacheRelative DerivedCacheStore::lookup -> TrustPolicy::authenticate"
+    governed_production_caller = 'none: GovernedBuildRuntime::run and ::run_admitted are referenced only from their own cfg(test) case in crates/eliot-engine/src/governed_build.rs'
+    rustc                      = $rustcVersion
+    source_commit              = $sourceCommit
+    required_key               = 'trust + source + Cargo.lock + toolchain + features/profile + env + producer + cache-root identity (I02.22)'
+    fallback                   = 'VM/lab runner with exact-fingerprint cache or cold cache; record selected runner in release evidence'
 }
 
 # ---------------------------------------------------------------------------
 # 5. Bounded (oversized-output) handling.
+#    Two executions, both real: a capped reader that drains an 8 MiB child
+#    stdout while retaining a bounded prefix, and the release runner that
+#    actually launches release child processes. A proof that never touches
+#    the runner is not a proof about the runner.
 # ---------------------------------------------------------------------------
-# Drain an actual child stdout stream while retaining only a bounded byte
-# count. A file-only producer would not exercise the pipe-saturation path.
 $byteCap = 1048576
 $childBytes = 8388608
+$childCommand = "`$bytes = [byte[]]::new($childBytes); [Console]::OpenStandardOutput().Write(`$bytes, 0, `$bytes.Length)"
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = 'powershell'
 $psi.ArgumentList.Add('-NoProfile')
 $psi.ArgumentList.Add('-Command')
-$psi.ArgumentList.Add("`$bytes = [byte[]]::new($childBytes); [Console]::OpenStandardOutput().Write(`$bytes, 0, `$bytes.Length)")
+$psi.ArgumentList.Add($childCommand)
 $psi.RedirectStandardOutput = $true
 $psi.UseShellExecute = $false
 $proc = [System.Diagnostics.Process]::new()
@@ -379,29 +384,70 @@ finally {
     $stream.Dispose()
     $proc.Dispose()
 }
+
+# The release runner must survive the same oversized child. Its retention is
+# measured, not asserted: the receipt states what the runner actually kept.
+$runnerRun = Invoke-CapturedNativeProcess 'powershell' @('-NoProfile', '-Command', $childCommand) $repo 'bounded-output-child'
+if ($runnerRun.exit_code -ne 0) {
+    throw "BUILD_SANDBOX_PROOF: the release runner failed the oversized-output child with exit $($runnerRun.exit_code): $($runnerRun.stderr)"
+}
+$runnerLogBytes = [System.IO.File]::ReadAllBytes($runnerRun.stdout_path).Length
+if ($runnerLogBytes -lt $childBytes) {
+    throw "BUILD_SANDBOX_PROOF: the release runner lost oversized stdout ($runnerLogBytes of $childBytes bytes)"
+}
+$runnerRetained = ([string]$runnerRun.stdout).Length
 Add-Record 'bounded_output' 'PROVEN' @{
-    child_bytes_emit = $childBytes
-    stream_bytes_drained = $totalBytes
-    capture_cap      = $byteCap
-    captured_bytes   = $captured
-    runner_completed = $true
+    child_bytes_emit       = $childBytes
+    stream_bytes_drained   = $totalBytes
+    capture_cap            = $byteCap
+    captured_bytes         = $captured
+    runner_owner           = 'scripts/build-eliot-windows-x64-release.ps1 Invoke-CapturedNativeProcess'
+    runner_exit            = $runnerRun.exit_code
+    runner_stdout_log_bytes = $runnerLogBytes
+    runner_retained_bytes  = $runnerRetained
+    runner_retention_bound = $(if ($runnerRetained -le $byteCap) { "bounded at $byteCap bytes" } else { 'unbounded: the runner retains the whole stream, so only non-deadlock is proven for it' })
+    runner_completed       = $true
     child_exited     = $boundedChildExited
 }
 
 # ---------------------------------------------------------------------------
 # 6. Artifact-to-release-hash binding (SBOM/license/advisory/provenance).
+#    The in-repo owner of the SBOM/license/advisory run artifacts is executed
+#    here, not inferred from the release builder's wording: a co-occurrence of
+#    "sbom" and "SHA-256" somewhere in a 4k-line script is not a binding.
 # ---------------------------------------------------------------------------
 foreach ($needle in @('SHA-256', 'source commit', 'not-issued', 'Test-ReleaseBundle')) {
     if ($builderText -notmatch [regex]::Escape($needle)) {
         throw "BUILD_SANDBOX_PROOF: release builder no longer binds manifest evidence ($needle)"
     }
 }
-$hasSbomBinder = ($builderText -match '(?i)sbom') -and ($builderText -match '(?i)SHA-256.*sbom|sbom.*SHA-256')
+$dependencyPolicyPath = Join-Path $repo 'scripts/verify-dependency-policy.py'
+if (-not (Test-Path -LiteralPath $dependencyPolicyPath -PathType Leaf)) {
+    throw 'BUILD_SANDBOX_PROOF: the dependency-policy owner of the SBOM/license/advisory run artifacts is missing'
+}
+$generatorPython = Get-PinnedCommandFile 'python' 'dependency-policy SBOM/license/advisory generator'
+$generatorRun = Invoke-CapturedNativeProcess $generatorPython.FullName @($dependencyPolicyPath, '--self-test') $repo 'dependency-policy-generator'
+if ($generatorRun.exit_code -ne 0) {
+    throw "BUILD_SANDBOX_PROOF: the in-repo SBOM/license/advisory generators failed their own run (exit $($generatorRun.exit_code)): $($generatorRun.stdout) $($generatorRun.stderr)"
+}
+# What is still unproven is the release half: staging must place those three
+# artifacts inside the manifest whose per-file SHA-256 is the release hash.
+$releaseArtifactRequests = @(
+    [ordered]@{ flag = '--sbom-out'; artifact = 'sbom.json' }
+    [ordered]@{ flag = '--license-report-out'; artifact = 'licenses.json' }
+    [ordered]@{ flag = '--advisory-report-out'; artifact = 'advisories.json' }
+)
+$unstagedReleaseArtifacts = @($releaseArtifactRequests | Where-Object { $builderText -notmatch [regex]::Escape([string]$_.flag) } | ForEach-Object { [string]$_.artifact })
+if ($unstagedReleaseArtifacts.Count -eq 0) {
+    throw 'BUILD_SANDBOX_PROOF: release staging now requests the generated SBOM/license/advisory artifacts; this claim must be re-derived from the staged release manifest, not from a source-text scan'
+}
 Add-Record 'provenance_binding' 'FALLBACK_REQUIRED' @{
-    reason            = 'RELEASE.json / SHA256SUMS.json / RUNTIME_ARTIFACTS.json bind source commit plus per-file SHA-256/size with signature_evidence:not-issued when unsigned (verified statically). No in-repo SBOM/license/advisory generator binds those artifacts to exact release hashes; that binding must come from the signing/provenance provider.'
-    manifest_evidence = 'source commit + per-file SHA-256/size + Test-ReleaseBundle recomputation'
-    sbom_bound_locally = [bool]$hasSbomBinder
-    fallback          = 'external SBOM/license/advisory signer binds exact release hashes; record its evidence with the release, do not claim local binding'
+    reason                    = "RELEASE.json / SHA256SUMS.json / RUNTIME_ARTIFACTS.json bind source commit plus per-file SHA-256/size with signature_evidence:not-issued when unsigned. The in-repo SBOM/license/advisory generators exist and were executed here, and each binds its canonical receipt digest plus per-component integrity digests. The release half is missing: release staging never requests $($unstagedReleaseArtifacts -join ', '), so those artifacts are not covered by the manifest whose per-file SHA-256 is the release hash."
+    manifest_evidence         = 'source commit + per-file SHA-256/size + Test-ReleaseBundle recomputation'
+    generator_owner           = 'scripts/verify-dependency-policy.py build_sbom_artifact / build_license_report_artifact / build_advisory_report_artifact'
+    generator_exit            = $generatorRun.exit_code
+    unstaged_release_artifacts = $unstagedReleaseArtifacts
+    fallback                  = 'release staging must request the SBOM/license/advisory run artifacts and recompute their per-file SHA-256 into the release manifest; until then the external signer records that binding with the release'
 }
 
 # ---------------------------------------------------------------------------
