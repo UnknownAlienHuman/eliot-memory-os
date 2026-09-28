@@ -2052,18 +2052,55 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Revalidates a queued operation's claimed application session against
-    /// the live session authority before a daemon claim (issue #1746).
+    /// Revalidates a queued operation's claimed application binding against
+    /// the live session authority and the retained activation binding before
+    /// a daemon claim (issue #1746).
     ///
-    /// Admission verified the claim; this closes the logout/revocation window
-    /// between enqueue and claim. A pair whose claimed session is unknown,
-    /// terminal, epoch-mismatched, or never bound to the presenting
-    /// connection is not claimable. Pairs without a session claim carry
-    /// nothing to revalidate here.
-    fn application_session_live_for_claim(
+    /// Admission verified the claims; this closes the window between enqueue
+    /// and claim. A pair whose claimed session is unknown, terminal,
+    /// epoch-mismatched, or never bound to the presenting connection is not
+    /// claimable, and neither is a pair whose claimed task, scope, or task
+    /// revision drifted from this connection's retained `Resolved`
+    /// activation binding. Pairs without a claim carry nothing to revalidate
+    /// on that leg. An unclaimable pair keeps its original identity and is
+    /// skipped for later reconciliation, never refused or rewritten here.
+    fn application_binding_live_for_claim(
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<bool, TransportError> {
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.clone())
+        };
+        if let Some(retained) = retained.as_ref() {
+            if envelope
+                .identity
+                .task_id
+                .as_deref()
+                .is_some_and(|claimed| claimed != retained.task_id)
+                || envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != retained.work_scope_id)
+                || envelope
+                    .state_fence
+                    .task_revision
+                    .is_some_and(|claimed| claimed != retained.task_revision)
+            {
+                return Ok(false);
+            }
+        } else if envelope.identity.task_id.is_some()
+            || envelope.identity.work_scope_id.is_some()
+            || envelope.state_fence.task_revision.is_some()
+        {
+            return Ok(false);
+        }
         let Some(claimed) = envelope.identity.session_id.as_deref() else {
             return Ok(true);
         };
@@ -2130,7 +2167,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_session_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -3313,7 +3350,7 @@ impl KernelComposition {
                     position += 1;
                     continue;
                 }
-                if !self.application_session_live_for_claim(envelope)? {
+                if !self.application_binding_live_for_claim(envelope)? {
                     position += 1;
                     continue;
                 }
