@@ -384,6 +384,12 @@ fn observed_store_heads_unambiguous(
 /// promotion keeps the permitted safe raw observation cold via
 /// `cold_raw_retained`.
 ///
+/// The recorded disposition is a function of the observed value set, never of
+/// arrival order: the heads are normalized through [`normalize_heads`] and the
+/// pinned-scope denominator is sorted and deduplicated with the same
+/// discipline, so permuting `predicate_pinned_scopes` cannot change which of
+/// the dispositions is written down.
+///
 /// # Errors
 ///
 /// Returns [`FreshnessError`] when any identity, fence, predicate form, or
