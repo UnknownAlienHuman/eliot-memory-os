@@ -1030,7 +1030,7 @@ fn run_event_log_worker(state: &EventLogProducerState) {
             increment_dropped_total(state);
         }
         let tracing_result = catch_unwind(AssertUnwindSafe(|| {
-            tracing::info!(
+            crate::host_diagnostics::info!(
                 target: "eliot_host::windows_event_log",
                 event = "host.event_log_delivery",
                 operation = event.as_str(),
