@@ -43,21 +43,26 @@
 //! - `FIXTURE`: bounded compatibility fixture with expiry/removal condition.
 //! - `DELETE-PROPOSED`: removal deferred to the LEGACY-DELETE-last root turn
 //!   once the stated precondition closes. Never executed here.
+//! - `DELETED (#1143 work item 4)`: the duplicate owner itself is removed
+//!   from this crate because it had zero production call sites and its named
+//!   current owner already carries the behaviour. Removing the duplicate
+//!   makes the recorded divergence inexpressible, so the divergence is closed
+//!   rather than asserted.
 //!
 //! | # | Facade item | Current #94 owner | Bounded fixture + expiry | Disposition |
 //! |---|-------------|-------------------|--------------------------|-------------|
-//! | 1 | `CONTRACT_NAME` | contracts `CONTRACT_NAME` ("eliot.smart.dreamer.contracts") | replay/diagnostic string; expires at LEGACY-DELETE | FIXTURE |
-//! | 2 | `CONTRACT_VERSION` | contracts `CONTRACT_VERSION` ("1.0.0" str) + `DREAM_JOB_SCHEMA_VERSION` (1u32) | version-string fixture (see D-DRM-6); expires at LEGACY-DELETE | FIXTURE |
-//! | 3 | `MAX_TEXT` | contracts per-field `check_text` bounds + bundle ceilings | bound differential; expires at LEGACY-DELETE | DELETE-PROPOSED after bundle/validation own every bound |
-//! | 4 | `MAX_ITEMS` | contracts per-collection bounds (64: draft items/unknowns) | bound differential; expires at LEGACY-DELETE | DELETE-PROPOSED after validation owns every bound |
-//! | 5 | `MAX_SOURCES` | contracts lineage bounds (128) | bound differential; expires at LEGACY-DELETE | DELETE-PROPOSED after validation owns every bound |
+//! | 1 | `CONTRACT_NAME` | contracts `CONTRACT_NAME` ("eliot.smart.dreamer.contracts") | second contract-name string for the same capability; zero call sites | DELETED (#1143 work item 4) |
+//! | 2 | `CONTRACT_VERSION` | contracts `CONTRACT_VERSION` ("1.0.0" str) + `DREAM_JOB_SCHEMA_VERSION` (1u32) | second version identity; zero call sites | DELETED (#1143 work item 4) |
+//! | 3 | `MAX_TEXT` | contracts per-field `check_text` bounds + bundle ceilings | one coarse global bound cannot express per-field limits | DELETED (#1143 work item 4) |
+//! | 4 | `MAX_ITEMS` | contracts per-collection bounds (64: draft items/unknowns) | one coarse global bound cannot express per-collection limits | DELETED (#1143 work item 4) |
+//! | 5 | `MAX_SOURCES` | contracts lineage bounds (128) | one coarse global bound cannot express per-lineage limits | DELETED (#1143 work item 4) |
 //! | 6 | `DreamerError` | contracts `ContractViolation` + candidate-validation `DreamDraftValidationError` | error-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after pipeline uses owner errors |
 //! | 7 | `JobClass` (facade deleted; canonical re-export) | contracts `job::JobClass` (9 closed classes) | canonical `snake_case` wire vocabulary asserted live (see D-DRM-1..3) | RE-EXPORTED (contract-unification turn) |
-//! | 8 | `Requester` (4 variants) | contracts `job::{Requester, RequesterOrigin}` (origin + principal/session binding) | requester-mapping fixture (see D-DRM-4); expires after intake migration | DELETE-PROPOSED after bundle owns requester binding |
+//! | 8 | `Requester` (4 variants) | contracts `job::{Requester, RequesterOrigin}` (origin + principal/session binding) | second requester-binding vocabulary; zero call sites | DELETED (#1143 work item 4) |
 //! | 9 | `CandidateKind` (17 variants) | contracts `curation::CurationKind` + kind families + 13 typed handler cells (classification/relation/episode/concept/procedure/failure/structure-repair/reconsolidation/accessibility/memory-repair + rival-model/probe-plan + clarification) | kind-mapping fixture; expires after curation + handlers admit every kind | DELETE-PROPOSED after handler migration |
-//! | 10 | `PrivacyClass` | `eliot-security-contracts::PrivacyClass` via contracts re-export | privacy-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after intake uses owner class |
-//! | 11 | `DreamBudget` | contracts `budget::BudgetLimits` (11 independent dimensions) | EDGE-DRM-1143 budget-shape differential (see D-DRM-5); retained until jobs carry owner budgets | MIGRATED-1143 (`differential_1143` in this file) |
-//! | 12 | `DreamBudget::validate` | contracts `BudgetLimits::validate`/`require_exact` | EDGE-DRM-1143 zero-rejection differential; retained until jobs carry owner budgets | MIGRATED-1143 (`differential_1143` in this file) |
+//! | 10 | `PrivacyClass` | `eliot-security-contracts::PrivacyClass` via contracts re-export | a second definition of the same two-class vocabulary; zero call sites | DELETED (#1143 work item 4) |
+//! | 11 | `DreamBudget` | contracts `budget::BudgetLimits` (11 independent dimensions) | four coarse `u32` fields cannot express 11 independent limits; zero call sites | DELETED (#1143 work item 4) |
+//! | 12 | `DreamBudget::validate` | contracts `BudgetLimits::validate`/`require_exact` | strictly weaker three-field zero check, not an owner | DELETED (#1143 work item 4) |
 //! | 13 | `DreamJobInput` (facade deleted; canonical re-export) | contracts `job::DreamJobInput` (closed intake) via bundle `DreamInputBundle` assembly | canonical intake validation asserted live (see D-DRM-8) | RE-EXPORTED (contract-unification turn) |
 //! | 14 | `DreamJobInput::validate` (facade deleted with row 13) | contracts intake `validate` | owner validation asserted live with row 13 | DELETED with row 13 |
 //! | 15 | `DreamJobInput::all_handles` (facade deleted with row 13) | bundle `AssemblyMaterialSet` / material closure | handle closure belongs to bundle assembly, never to intake | DELETED with row 13 |
@@ -72,16 +77,18 @@
 //!
 //! ## EDGE-DRM-1143 (migrated this turn, candidate-only ceiling)
 //!
-//! Facade [`CandidateGenerator::generate`] with its intake vocabulary
-//! ([`JobClass`]) and budget gate ([`DreamBudget::validate`]) projects onto the
-//! owner pipeline (`eliot-dreamer-contracts` schemas, functional capabilities
+//! Facade [`CandidateGenerator::generate`] with its re-exported intake
+//! vocabulary ([`JobClass`], [`DreamJobInput`]) and the owner's own
+//! `budget_units` gate projects onto the owner pipeline
+//! (`eliot-dreamer-contracts` schemas, functional capabilities
 //! `smart.dreamer.contracts` / `smart.dreamer.bundle` /
 //! `smart.dreamer.candidate_validation` per
 //! `crates/smart/cognitive-crate-decisions.toml`). Differential fixtures in
 //! `differential_1143` prove: (a) the 9 canonical job classes serialize to the
 //! frozen owner spellings, including `architecture_self_query` and the
-//! first-class `configuration_assistance` (D-DRM-1..3); (b) degenerate budgets are
-//! rejected at validation and enforced at generation; (c) generation stays
+//! first-class `configuration_assistance` (D-DRM-1..3); (b) degenerate
+//! canonical budgets are rejected at owner validation and enforced at
+//! generation (`budget_units`); (c) generation stays
 //! candidate-only — fence carried verbatim, `authority_unchanged` held,
 //! promotion/empty inputs rejected, digests deterministic, and no
 //! `VERIFIED_COMPLETE` marker exists on the wire. Aggregate output still cannot
@@ -106,16 +113,23 @@
 //!   distinction.
 //! - D-DRM-3 (closed): `configuration_assistance` is first-class canonical
 //!   with live wire assertions. There is no facade counterpart left to diverge.
-//! - D-DRM-4: facade flat `Requester` (4 variants, no binding) vs owner
-//!   `RequesterOrigin` (3 origins) + principal/session binding that model text
-//!   can never rewrite. Only `Human`/`human` is an exact correspondence; the
-//!   remaining mapping is proposed for intake migration, never asserted here.
-//! - D-DRM-5: facade 4 coarse `u32` budget fields vs owner 11 independent
-//!   dimensions with no cross-subsidy. Facade zero-rejection is retained;
-//!   `route_cost_units` is a passthrough, never an authorization.
-//! - D-DRM-6: facade `CONTRACT_VERSION: ContractVersion(1,0,0)` vs owner
-//!   `CONTRACT_VERSION: &str "1.0.0"` + `DREAM_JOB_SCHEMA_VERSION: u32 = 1`.
-//!   Wire schema versions are never equated.
+//! - D-DRM-4 (closed, #1143 work item 4): the facade flat `Requester` (4
+//!   variants, no origin or principal/session binding that model text could
+//!   rewrite) is deleted. `eliot-dreamer-contracts::job::{RequesterOrigin,
+//!   Requester}` is the only requester-binding owner, and the divergence is no
+//!   longer expressible, so nothing can equate the two.
+//! - D-DRM-5 (closed, #1143 work item 4): the facade `DreamBudget` (4 coarse
+//!   `u32` fields) and its `validate` are deleted. The owner
+//!   `eliot_dreamer_contracts::budget::BudgetLimits` (11 independent
+//!   dimensions, each with its own class ceiling and zero rule) is the only
+//!   grant owner; generation is gated on the canonical `budget_units`. A
+//!   `route_cost_units` passthrough no longer exists here, and no coarse
+//!   zero-rejection rule can be mistaken for an authorization.
+//! - D-DRM-6 (closed, #1143 work item 4): the facade `CONTRACT_NAME` and
+//!   `CONTRACT_VERSION: ContractVersion(1,0,0)` are deleted. The owner
+//!   `eliot_dreamer_contracts::{CONTRACT_NAME, CONTRACT_VERSION}` plus
+//!   `DREAM_JOB_SCHEMA_VERSION` are the only wire schema identity, so two
+//!   identities can no longer drift apart or be equated.
 //! - D-DRM-7: facade 6-bool `PreservationReport` vs owner 7-dimension verdicts
 //!   with no averaging. Facade `authority_unchanged` is retained as the
 //!   candidate-only ceiling bit, never as a promotion claim.
@@ -131,9 +145,12 @@
 //! found no exact-titled issues, only adjacent owners: #833 (facade shaping),
 //! #835 + #706 (`eliot-types` `CueKind` alias/denominator), #804 (A-10 dreamer
 //! vocabulary owner), orientation/clarification/curation handler issues. This
-//! turn pre-deletes nothing and invents no handler semantics. Residual for the
-//! LEGACY-DELETE-last root turn: root `Cargo.toml` member line, `Cargo.lock`
-//! own-entry, generated doc indexes, `module.toml` donor anchors.
+//! turn deletes only the duplicate owners whose named current owner already
+//! carries the behaviour and whose measured production call-site set is empty;
+//! it invents no handler semantics and re-exposes no residual spelling.
+//! Residual for the LEGACY-DELETE-last root turn: root `Cargo.toml` member
+//! line, `Cargo.lock` own-entry, generated doc indexes, `module.toml` donor
+//! anchors.
 
 #![forbid(unsafe_code)]
 
@@ -146,7 +163,7 @@ pub use advice_gate::{
 use std::collections::BTreeSet;
 
 use blake3::Hasher;
-use eliot_contracts::{ArtifactId, ContractError, ContractVersion, StateFence};
+use eliot_contracts::{ArtifactId, ContractError, StateFence};
 use eliot_dreamer_contracts::ContractViolation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -157,12 +174,6 @@ use thiserror::Error;
 /// re-exports the canonical shapes so surviving items (`CandidateGenerator`,
 /// `CandidateArtifact`, `DreamPacket`) bind to owner vocabulary directly.
 pub use eliot_dreamer_contracts::{DreamJobInput, JobClass, ModelDraft};
-
-pub const CONTRACT_NAME: &str = "eliot.smart.dreamer";
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
-pub const MAX_TEXT: usize = 16_384;
-pub const MAX_ITEMS: usize = 64;
-pub const MAX_SOURCES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DreamerError {
@@ -192,17 +203,6 @@ pub enum DreamerError {
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Requester {
-    Human,
-    MainAgent,
-    Watchdog,
-    MaintenancePolicy,
-}
-
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CandidateKind {
     Interpretation,
     RivalModel,
@@ -223,40 +223,10 @@ pub enum CandidateKind {
     WorkPlan,
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PrivacyClass {
-    LocalOnly,
-    GovernedExternal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DreamBudget {
-    pub maximum_candidates: u32,
-    pub maximum_source_handles: u32,
-    pub maximum_output_bytes: u32,
-    pub route_cost_units: u32,
-}
-
-impl DreamBudget {
-    pub fn validate(&self) -> Result<(), DreamerError> {
-        if self.maximum_candidates == 0
-            || self.maximum_source_handles == 0
-            || self.maximum_output_bytes == 0
-        {
-            return Err(DreamerError::BudgetExhausted);
-        }
-        Ok(())
-    }
-}
-
 /// Maps canonical intake validation onto the candidate-only error vocabulary.
 /// A non-positive canonical budget (`budget_units`/`deadline_ms`) is a
-/// degenerate budget, mirroring the retained facade `DreamBudget`
-/// zero-rejection; every other owner violation passes through verbatim.
+/// degenerate budget and is refused at the owner's own validation; every other
+/// owner violation passes through verbatim.
 fn map_input_violation(violation: ContractViolation) -> DreamerError {
     match violation {
         ContractViolation::BindingMismatch {
@@ -427,10 +397,9 @@ impl CandidateGenerator {
             recommended_probes: dedup_text(&draft.recommended_probes),
             invalidation_conditions: dedup_text(&draft.invalidation_conditions),
             source_coverage: item_source_count,
-            // Canonical intake carries no route-cost passthrough (the old
-            // facade `DreamBudget::route_cost_units` passthrough is retained
-            // only on the facade budget shape); candidate-only packets record
-            // zero until a cost owner exists.
+            // Canonical intake carries no route-cost grant (the facade
+            // `DreamBudget` passthrough is deleted, #1143 work item 4);
+            // candidate-only packets record zero until a cost owner exists.
             route_cost_units: 0,
         };
         let bytes = serde_json::to_vec(&packet).map_err(|_| DreamerError::EmptyCandidate)?;
@@ -480,8 +449,7 @@ mod differential_1143 {
     use eliot_dreamer_contracts::{ContractViolation, parse_job_class};
 
     use super::{
-        CONTRACT_NAME, CandidateGenerator, CandidateKind, DreamBudget, DreamJobInput, DreamerError,
-        JobClass, MAX_ITEMS, MAX_SOURCES, MAX_TEXT, ModelDraft, PrivacyClass, Requester,
+        CandidateGenerator, CandidateKind, DreamJobInput, DreamerError, JobClass, ModelDraft,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -492,15 +460,6 @@ mod differential_1143 {
         let lineage = EpochLineageId::new(TEST_LINEAGE_A)?;
         let epoch = EpochId::new(lineage, NonZeroU64::MIN)?;
         Ok(StateFence::new(epoch, ResourceGeneration::genesis()))
-    }
-
-    fn generous_budget() -> DreamBudget {
-        DreamBudget {
-            maximum_candidates: 8,
-            maximum_source_handles: 8,
-            maximum_output_bytes: 16_384,
-            route_cost_units: 3,
-        }
     }
 
     fn test_input_with_budget(
@@ -555,10 +514,13 @@ mod differential_1143 {
     // this crate (D-DRM-1). `architecture_self_query` is the single
     // architecture spelling (D-DRM-2) and `configuration_assistance` is
     // first-class with live assertions (D-DRM-3). SCREAMING_SNAKE spellings
-    // are rejected, never equated.
+    // are rejected, never equated. The duplicate `CandidateKind` vocabulary
+    // is deliberately still asserted: it is a `DELETE-PROPOSED` row above, not
+    // a removed one, and its wire spellings must keep being pinned until the
+    // curation dispatch and the 14 typed handler cells admit every kind they
+    // own.
     #[test]
     fn ledger_1143_job_class_wire_matches_owner_spellings() -> TestResult {
-        assert_eq!(CONTRACT_NAME, "eliot.smart.dreamer");
         let canonical: [(JobClass, &str); 9] = [
             (JobClass::Orientation, "orientation"),
             (JobClass::Curation, "curation"),
@@ -590,26 +552,11 @@ mod differential_1143 {
         ] {
             assert!(parse_job_class(rejected).is_err());
         }
-        let requesters: [(Requester, &str); 4] = [
-            (Requester::Human, "\"HUMAN\""),
-            (Requester::MainAgent, "\"MAIN_AGENT\""),
-            (Requester::Watchdog, "\"WATCHDOG\""),
-            (Requester::MaintenancePolicy, "\"MAINTENANCE_POLICY\""),
-        ];
-        for (requester, wire_spelling) in requesters {
-            let wire = serde_json::to_string(&requester)?;
-            assert_eq!(wire, wire_spelling);
-        }
-        // D-DRM-4: only Human/human is an exact correspondence; the owner binds
-        // origin + principal/session (`job.rs`), which the facade cannot carry.
-        assert_eq!(
-            serde_json::to_string(&PrivacyClass::LocalOnly)?,
-            "\"LOCAL_ONLY\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PrivacyClass::GovernedExternal)?,
-            "\"GOVERNED_EXTERNAL\""
-        );
+        // D-DRM-4 / D-DRM-6 closed (#1143 work item 4): the facade
+        // `Requester` / `PrivacyClass` / `CONTRACT_NAME` duplicates are
+        // deleted, so the owner `job::Requester` origin + principal/session
+        // binding and the owner contract identity are the only surfaces left
+        // and there is no second vocabulary that could be equated with them.
         let kinds: [(CandidateKind, &str); 4] = [
             (CandidateKind::RivalModel, "\"RIVAL_MODEL\""),
             (CandidateKind::Clarification, "\"CLARIFICATION\""),
@@ -623,35 +570,15 @@ mod differential_1143 {
         Ok(())
     }
 
-    // EDGE-DRM-1143 budget gate: degenerate facade budgets are rejected at
-    // validation (mirroring the owner `BudgetLimits` zero-rejection in
-    // `eliot-dreamer-contracts/src/budget.rs`), and degenerate canonical
-    // budgets are rejected at generation: `budget_units == 0` fails intake
-    // validation and maps to `BudgetExhausted`, and a packet that does not fit
-    // inside `budget_units` is refused. Frozen facade bounds pinned.
+    // EDGE-DRM-1143 budget gate: the canonical owner budget is the only grant
+    // (D-DRM-5 closed, #1143 work item 4 — the coarse facade `DreamBudget` and
+    // its weaker `validate` are deleted), so the edge proves the owner's own
+    // rule: `budget_units == 0` fails intake validation and maps to
+    // `BudgetExhausted`, and a packet that does not fit inside `budget_units`
+    // is refused. A `route_cost_units` passthrough no longer exists here, so no
+    // coarse field can be read as an authorization.
     #[test]
     fn ledger_1143_budget_edge_rejects_degenerate_budgets() -> TestResult {
-        assert_eq!(MAX_TEXT, 16_384);
-        assert_eq!(MAX_ITEMS, 64);
-        assert_eq!(MAX_SOURCES, 128);
-        let base = generous_budget();
-        assert!(base.validate().is_ok());
-        for degenerate in [
-            DreamBudget {
-                maximum_candidates: 0,
-                ..base.clone()
-            },
-            DreamBudget {
-                maximum_source_handles: 0,
-                ..base.clone()
-            },
-            DreamBudget {
-                maximum_output_bytes: 0,
-                ..base.clone()
-            },
-        ] {
-            assert_eq!(degenerate.validate(), Err(DreamerError::BudgetExhausted));
-        }
         let draft = test_draft("tiny")?;
         let zero_budget = test_input_with_budget(0)?;
         assert_eq!(

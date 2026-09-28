@@ -54,7 +54,10 @@ public_items = 38
 migrate = 8
 bounded_fixture = 0
 delete = 30
+removed_in_work_item_4 = 1
 denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-cues/src/{lib.rs,legacy_adapter.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions."
+work_item_4_removed_set = ["frozen_spellings_round_trip"]
+work_item_4_removal_rule = "A `delete` row was executed only when all three held: (1) its named current owner already carries the behaviour in admitted source, or the item is pure duplication with no owner duty, (2) its measured production call-site set is empty (`git grep` over crates/bins finds no reference outside this package, and the package has zero Cargo reverse-dependents), and (3) removing it cannot drop a proof, because the only reader was a fixture assertion about the item itself. Only `frozen_spellings_round_trip` satisfied all three. The 29 remaining `delete` rows each name their blocker below; none of them is a second semantic, state, scheduling, provider, authority, canonical or Finish owner, so none of them keeps this aggregate in violation of the issue's causal property."
 bounded_fixture_zero_reason = "The issue defines a bounded fixture as retained 'only for an identified current consumer'. No current consumer was identified, so no item can honestly qualify. Recording a fixture row would be fabricated retention authority."
 
 [metadata_references_to_close_before_any_delete]
@@ -101,8 +104,8 @@ generated_doc_indexes = ["docs/code-navigation/PACKAGE_DOCS_INDEX.md", "docs/cod
 generated_serde_registry = "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
 
 [removal_precondition]
-statement = "No `delete` row may be executed in this pass. Before any future deletion, the #1143 differential proof that the migrated rows below are correct must be relocated into the owning cell's own suite, otherwise deletion would drop the only place the migrated edge is exercised."
-blocking_residue = "crates/smart/eliot-cues/tests/legacy_facade.rs:460-461 still asserts `MigrationRequired` from `require_reobservation`; this is the residue the 2026-09-23 audit recorded and the reason #1100/#11 cannot yet run with aggregate fallback disabled."
+statement = "Work item 4 removed `frozen_spellings_round_trip`, the only row with an empty caller set, no owner duty, and no proof role. The 29 remaining `delete` rows are recorded, not executed; each names its blocker below. The `migrate` rows are already-delegating one-owner-call shells and stay until a real consumer imports the owner directly."
+blocking_residue = "crates/smart/eliot-cues/tests/legacy_facade.rs:460-461 still asserts `MigrationRequired` from `require_reobservation`; this is the residue the 2026-09-23 audit recorded and the reason #1100/#11 cannot yet run with aggregate fallback disabled. `require_reobservation` can only be removed after the #706 re-observation duty is re-expressed as an owner-path migration receipt, which does not exist in `eliot-cue-normalizer` today."
 separate_issues = "work items 4 (duplicate owners), 5 (consumer-edge migration) and 6 (residue removal) of #1143; #835/#246/#706 own the eliot-types CueKind alias and spelling denominator."
 
 # ------------------------------------------------- CrateExtractionDecision ---
@@ -472,11 +475,11 @@ removal_condition = "With convert_v1_row."
 [[item_disposition]]
 item = "frozen_spellings_round_trip"
 kind = "function"
-disposition = "delete"
+disposition = "removed"
 current_owner = "none"
-owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:734"
-basis = "Self-check that the frozen spelling table and the decoder agree. Measured caller set is empty (`git grep -n frozen_spellings_round_trip -- crates bins` returns only the definition), so it is a public item with no call site."
-removal_condition = "With LEGACY_KIND_SPELLINGS and decode_legacy_kind."
+owner_evidence = "Removed from crates/smart/eliot-cues/src/legacy_adapter.rs in #1143 work item 4 (branch refactor/1143-legacy-cue-owners-W2)."
+basis = "Self-check that the frozen spelling table and the decoder agree. Measured caller set is empty (`git grep -n frozen_spellings_round_trip -- crates bins` returned only the definition before removal), so it was a public item with no call site. The agreement it asserted is already proven by the in-package fixture WORK_UNIT_CASE 833/26 (`oracle_detects_duplicate_type_algorithm_state`), which iterates LEGACY_KIND_SPELLINGS through `decode_legacy_kind` and asserts injectivity over all ten frozen spellings. The function therefore added a second, uncalled spelling-agreement path with no independent proof ceiling."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. The remaining frozen-spelling denominator is LEGACY_KIND_SPELLINGS plus `decode_legacy_kind`, exercised by tests/legacy_facade.rs case 26."
 
 [[item_disposition]]
 item = "request_legacy_delivery"
