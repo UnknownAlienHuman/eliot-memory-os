@@ -102,8 +102,11 @@ pub use backup_capture::{
 };
 pub use backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    PublicationPort, PublicationReceipt, PublishedArchive, SnapshotRelation,
-    require_capture_admitted,
+    MEMBER_DOMAIN_HOST_AUDIT, MEMBER_DOMAIN_ORDERING_HEAD, MEMBER_DOMAIN_ORS_CHECKPOINT,
+    MEMBER_DOMAIN_ORS_CUTOVER, MEMBER_DOMAIN_ORS_PENDING, MEMBER_DOMAIN_REVISION_HEAD,
+    MEMBER_DOMAIN_WATCHDOG_SIGNAL, PublicationPort, PublicationReceipt, PublishedArchive,
+    SnapshotRelation, owner_fence_dispositions, owner_residency_key_digest,
+    owner_suspended_recovery_refs, require_capture_admitted,
 };
 pub use backup_restore::{
     BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,

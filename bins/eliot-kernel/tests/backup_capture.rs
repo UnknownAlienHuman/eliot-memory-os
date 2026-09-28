@@ -26,9 +26,7 @@ use eliot_backup::{
     CanonicalRecord, EventRange, ExportFence, HostStateAuditFence, OrsSnapshotFence,
     WatchdogSpoolFence,
 };
-use eliot_contracts::{
-    EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
     CaptureBudgets, CaptureCallerAuth, CaptureEvidenceLevel, CaptureRequest, CaptureState,
     FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
@@ -551,7 +549,10 @@ impl PublicationPort for MemPublisher {
 
 /// Expected member-disposition keys in the coordinator's domain-prefixed
 /// shape (`canonical:` / `projection:` / `receipt:` / `blob:` / `purge:` /
-/// `artifact:`), sorted for bijection comparison against the report.
+/// `artifact:` for the carried content, plus the owner-declared fence
+/// domains `revision_head:` / `ordering_head:` / `ors_pending:` /
+/// `ors_checkpoint:` / `ors_cutover:` / `watchdog_signal:` / `host_audit:`),
+/// sorted for bijection comparison against the report.
 fn expected_disposition_keys(input: &BackupInput) -> Vec<String> {
     let mut keys = Vec::new();
     for event in &input.canonical_events {
@@ -566,7 +567,9 @@ fn expected_disposition_keys(input: &BackupInput) -> Vec<String> {
     for blob in &input.blobs {
         keys.push(format!(
             "blob:{}",
-            sha256_hex(&canonical_json_bytes(&blob.locator.residency).expect("residency encodes"))
+            blob.locator
+                .residency_key_digest()
+                .expect("residency key digest")
         ));
     }
     for entry in &input.purge_ledger {
@@ -574,6 +577,33 @@ fn expected_disposition_keys(input: &BackupInput) -> Vec<String> {
     }
     for artifact in &input.artifacts {
         keys.push(format!("artifact:{}", artifact.artifact_id));
+    }
+    for head in &input.export_fence.revision_heads {
+        keys.push(format!("revision_head:{}", head.key.as_str()));
+    }
+    for head in &input.export_fence.ordering_heads {
+        keys.push(format!("ordering_head:{}", head.scope.as_str()));
+    }
+    if let Some(snapshot) = &input.ors_snapshot {
+        for pending in &snapshot.pending_operation_ids {
+            keys.push(format!("ors_pending:{}", pending));
+        }
+        for checkpoint in &snapshot.job_checkpoint_ids {
+            keys.push(format!("ors_checkpoint:{}", checkpoint));
+        }
+        for cutover in &snapshot.generation_cutover_ids {
+            keys.push(format!("ors_cutover:{}", cutover));
+        }
+    }
+    if let Some(spool) = &input.watchdog_spool {
+        for signal in &spool.unresolved_signal_digests {
+            keys.push(format!("watchdog_signal:{}", signal));
+        }
+    }
+    if let Some(audit) = &input.host_audit {
+        for disposition in &audit.observed_dispositions {
+            keys.push(format!("host_audit:{}", disposition));
+        }
     }
     keys.sort();
     keys
@@ -628,13 +658,24 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
         report_disposition_keys(&report.member_dispositions),
         expected_disposition_keys(&input)
     );
-    assert_eq!(report.member_dispositions.len(), 10);
-    assert!(
-        report
-            .member_dispositions
-            .iter()
-            .all(|(_, disposition)| disposition == "captured")
-    );
+    // 10 carried-content members (2 canonical, 1 projection, 1 receipt, 1 blob,
+    // 1 purge, 4 artifacts) plus the members each OWNER declared in its own
+    // fence: 1 ORS pending operation, 1 ORS job checkpoint, 1 Watchdog
+    // unresolved signal, and 1 forensic Host audit disposition.
+    assert_eq!(report.member_dispositions.len(), 14);
+    // The carried-content domains are `captured`; an ORS pending operation and an
+    // unresolved Watchdog signal are `suspended`, and the optional Host audit
+    // disposition is `forensic` — retained, never restored as active authority.
+    for (key, disposition) in &report.member_dispositions {
+        let expected = if key.starts_with("ors_pending:") || key.starts_with("watchdog_signal:") {
+            "suspended"
+        } else if key.starts_with("host_audit:") {
+            "forensic"
+        } else {
+            "captured"
+        };
+        assert_eq!(disposition, expected, "disposition for {key}");
+    }
     for prefix in [
         "canonical:",
         "projection:",

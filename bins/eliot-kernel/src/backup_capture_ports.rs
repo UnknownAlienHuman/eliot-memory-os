@@ -14,9 +14,19 @@
 //! (`FrozenCapturePlan` with finite `CaptureBudgets`), the cross-owner
 //! snapshot relation (`SnapshotRelation`, where matching timestamps alone
 //! prove nothing), the already-accepted owner-evidence bundle (`CapturePorts`),
-//! the exactly-once publication port (`PublicationPort`), and the fail-closed
-//! `KernelCaptureError` vocabulary with lossless mapping onto the accepted
-//! `BackupError` seam (`KernelCaptureError::to_backup`).
+//! the adapters onto accepted owner-neutral APIs only
+//! (`owner_residency_key_digest`, `owner_suspended_recovery_refs`,
+//! `owner_fence_dispositions`), the exactly-once publication port
+//! (`PublicationPort`), and the fail-closed `KernelCaptureError` vocabulary
+//! with lossless mapping onto the accepted `BackupError` seam
+//! (`KernelCaptureError::to_backup`).
+//!
+//! Every adapter below is a thin projection of an API an owner already
+//! publishes. None of them derives a value the owner does not publish, keeps a
+//! second copy of an owner's own rule, or invents an owner: the residency
+//! digest, the suspended-recovery frontier and the fence member set are all
+//! read from the owner that declares them, and an owner that refuses is
+//! reported as a refusal rather than smoothed over.
 //!
 //! What this file deliberately does NOT own: any live owner channel, any
 //! global cross-store transaction, stop-the-world barrier, or distributed
@@ -34,7 +44,7 @@
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupClass, BackupError, CanonicalRecord, ExportFence,
-    HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence,
+    HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence, suspended_recovery_entries,
 };
 use eliot_contracts::StateFence;
 use eliot_security_contracts::PurgeLedgerEntry;
@@ -276,20 +286,47 @@ pub struct SnapshotRelation {
     pub event_cursor: u64,
     /// Highest canonical outbox cursor covered by the relation.
     pub outbox_cursor: u64,
-    /// Pending operation identities at the ORS frontier.
+    /// Pending operation identities at the ORS frontier, read through the
+    /// archive owner's own suspended derivation
+    /// ([`owner_suspended_recovery_refs`]).
     pub pending_operation_ids: Vec<String>,
     /// Pending operation hashes at the ORS frontier.
+    ///
+    /// EMPTY IS NOT A CLAIM. No accepted owner-neutral ORS type reports a
+    /// per-operation hash: `OrsSnapshotFence` records identities, checkpoints
+    /// and cutovers only. This vector therefore stays empty because the
+    /// dimension is unreportable, and a reader must not read it as "the ORS
+    /// owner reported no pending hashes" — the honest reading of I5.13's
+    /// "identities and hashes" is that only the identities exist, and this
+    /// owner records exactly what the owner gives rather than inventing the
+    /// other half.
     pub pending_operation_hashes: Vec<String>,
     /// Job checkpoint identities covered by the relation.
     pub checkpoint_ids: Vec<String>,
     /// Generation cutover identities covered by the relation.
     pub cutover_ids: Vec<String>,
-    /// Unresolved Watchdog spool signal digests covered by the relation.
+    /// Unresolved Watchdog spool signal digests covered by the relation, read
+    /// from the Watchdog owner's own `unresolved_signal_digests`.
     pub spool_signal_digests: Vec<String>,
     /// Explained Watchdog spool gaps covered by the relation.
+    ///
+    /// EMPTY IS NOT A CLAIM, for the same reason as
+    /// [`Self::pending_operation_hashes`]: no accepted owner-neutral Watchdog
+    /// type reports a gap. `WatchdogSpoolFence` publishes a bounded set of
+    /// unresolved signal digests and nothing else, and no document defines a
+    /// gap vocabulary this owner could fill, so the dimension is recorded as
+    /// unreportable rather than reported as "no gaps".
     pub spool_gaps: Vec<String>,
     /// Per-owner capture times in milliseconds (observed only; never
     /// sufficient on their own).
+    ///
+    /// EMPTY IS NOT A CLAIM. Every accepted owner-neutral type hands this owner
+    /// already-acquired evidence and none of them reports the instant it was
+    /// acquired, so there is one admitted operation rather than six per-owner
+    /// clocks to record. Repeating this operation's own elapsed time once per
+    /// owner would be an invented per-owner observation, so the vector stays
+    /// empty and I5.13's "matching timestamps alone prove nothing" is honoured
+    /// by never presenting a timestamp as evidence at all.
     pub capture_time_ms_per_owner: Vec<(String, u64)>,
     /// Whether every carried owner fence is compatible with the export fence.
     pub fence_compatible: bool,
@@ -418,8 +455,167 @@ impl CapturePorts<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Adapters onto accepted owner-neutral APIs only.
+//
+// Every function in this section is a thin projection of an API an owner
+// already publishes. None of them derives a value the owner does not publish,
+// keeps a second copy of an owner's own rule, or invents an owner: a caller
+// that wants a residency identity, a suspended frontier, or a fence member set
+// asks the owner, and a refusal from the owner is reported as a refusal here
+// rather than smoothed over.
+// ---------------------------------------------------------------------------
+
+/// Closed obligation-domain prefixes for members an owner's own fence declares.
+///
+/// The prefixes keep the owner domains disjoint, so a key produced by one owner
+/// can never be mistaken for a key of another and a missing member of one
+/// domain can never be masked by a surplus member of a different one. The
+/// carried-content prefixes (`canonical:`, `receipt:`, `blob:`, `purge:`,
+/// `artifact:`) live beside the coordinator that emits them
+/// (`backup_capture::member_disposition_list`).
+pub const MEMBER_DOMAIN_REVISION_HEAD: &str = "revision_head:";
+/// Canonical ordering-head obligation domain (see [`MEMBER_DOMAIN_REVISION_HEAD`]).
+pub const MEMBER_DOMAIN_ORDERING_HEAD: &str = "ordering_head:";
+/// ORS pending-operation obligation domain (see [`MEMBER_DOMAIN_REVISION_HEAD`]).
+pub const MEMBER_DOMAIN_ORS_PENDING: &str = "ors_pending:";
+/// ORS job-checkpoint obligation domain (see [`MEMBER_DOMAIN_REVISION_HEAD`]).
+pub const MEMBER_DOMAIN_ORS_CHECKPOINT: &str = "ors_checkpoint:";
+/// ORS generation-cutover obligation domain (see [`MEMBER_DOMAIN_REVISION_HEAD`]).
+pub const MEMBER_DOMAIN_ORS_CUTOVER: &str = "ors_cutover:";
+/// Watchdog unresolved-spool-signal obligation domain.
+pub const MEMBER_DOMAIN_WATCHDOG_SIGNAL: &str = "watchdog_signal:";
+/// Forensic Host audit obligation domain; never active authority.
+pub const MEMBER_DOMAIN_HOST_AUDIT: &str = "host_audit:";
+
+/// The blob owner's own residency-key digest for one carried sealed envelope.
+///
+/// I5.12 derives the physical blob path from `<residency-key-digest>` and I5.13
+/// requires every export and backup entry to preserve that opaque
+/// residency-key digest, so the capture's blob member key IS the blob owner's
+/// own derivation: `BlobLocator::residency_key_digest`, the same function the
+/// owner uses for path derivation and receipt linkage. Re-deriving a look-alike
+/// digest here would be a second scheme over the same value, and
+/// `BackupBlob::locator.hash` is only the versioned CONTENT digest, which would
+/// collapse two obligation domains over equal bytes into one logical object —
+/// exactly what I5.13:42 and I5.12:13 forbid.
+pub fn owner_residency_key_digest(blob: &BackupBlob) -> Result<String, KernelCaptureError> {
+    blob.locator
+        .residency_key_digest()
+        .map_err(|error| KernelCaptureError::OwnerEvidenceInvalid(error.to_string()))
+}
+
+/// The archive owner's own suspended-recovery frontier for one ORS snapshot.
+///
+/// I5.13 requires the `OrsSnapshotFence` to record "pending-operation
+/// identities and hashes", and the identities it records ARE the frontier.
+/// This adapter reads them through the accepted owner-neutral derivation
+/// `suspended_recovery_entries`, which validates the fence first and then
+/// turns every pending identity into one validated suspended `OrsOperation`
+/// entry. Reading `pending_operation_ids` as a raw vector would skip that
+/// validation and would accept an ORS fence the archive owner itself refuses;
+/// an absent snapshot is an empty frontier, never a "none claimed" default.
+pub fn owner_suspended_recovery_refs(
+    snapshot: &OrsSnapshotFence,
+) -> Result<Vec<String>, KernelCaptureError> {
+    let entries = suspended_recovery_entries(snapshot)
+        .map_err(|error| KernelCaptureError::OwnerEvidenceInvalid(error.to_string()))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.historical_ref)
+        .collect())
+}
+
+/// One disposition for every member an OWNER declared, read from that owner's
+/// own fence and never from a carried content list.
+///
+/// This is the INDEPENDENT expected set a capture denominator is checked
+/// against. `ExportFence::revision_heads` / `ordering_heads` are the canonical
+/// owner's declared order and history; `OrsSnapshotFence` declares its own
+/// pending operations, job checkpoints, and generation cutovers;
+/// `WatchdogSpoolFence` declares its own unresolved signals; and the optional
+/// `HostStateAuditFence` declares its own forensic dispositions. Deriving the
+/// same keys from the caller's carried records instead would compare one
+/// caller-supplied list with itself: two copies of the same list agree with each
+/// other whatever the owners declared, so they cannot state "every expected
+/// source/member has one disposition" about a member no carried list mentions.
+///
+/// What this cannot do, and does not claim: it cannot detect a member an owner
+/// omitted from its OWN fence before this owner saw it. A fence is the owner's
+/// declaration; a fence that under-declares is that owner's evidence gap.
+///
+/// The ORS pending-operation dispositions are read through the owner's own
+/// suspended derivation (see [`owner_suspended_recovery_refs`]), so an ORS
+/// fence the archive owner refuses yields a refusal here rather than a
+/// silently shortened frontier. The Host audit dispositions are labelled
+/// `forensic`: I5.13:44 makes the audit optional and never restored as active
+/// authority, so it can never satisfy a class denominator.
+pub fn owner_fence_dispositions(
+    export_fence: &ExportFence,
+    ors_snapshot: Option<&OrsSnapshotFence>,
+    watchdog_spool: Option<&WatchdogSpoolFence>,
+    host_audit: Option<&HostStateAuditFence>,
+) -> Result<Vec<(String, String)>, KernelCaptureError> {
+    let mut dispositions = Vec::new();
+    for head in &export_fence.revision_heads {
+        dispositions.push((
+            format!("{}{}", MEMBER_DOMAIN_REVISION_HEAD, head.key.as_str()),
+            "captured".to_owned(),
+        ));
+    }
+    for head in &export_fence.ordering_heads {
+        dispositions.push((
+            format!("{}{}", MEMBER_DOMAIN_ORDERING_HEAD, head.scope.as_str()),
+            "captured".to_owned(),
+        ));
+    }
+    if let Some(snapshot) = ors_snapshot {
+        for pending in owner_suspended_recovery_refs(snapshot)? {
+            dispositions.push((
+                format!("{MEMBER_DOMAIN_ORS_PENDING}{pending}"),
+                "suspended".to_owned(),
+            ));
+        }
+        for checkpoint in &snapshot.job_checkpoint_ids {
+            dispositions.push((
+                format!("{MEMBER_DOMAIN_ORS_CHECKPOINT}{checkpoint}"),
+                "captured".to_owned(),
+            ));
+        }
+        for cutover in &snapshot.generation_cutover_ids {
+            dispositions.push((
+                format!("{MEMBER_DOMAIN_ORS_CUTOVER}{cutover}"),
+                "captured".to_owned(),
+            ));
+        }
+    }
+    if let Some(spool) = watchdog_spool {
+        for signal in &spool.unresolved_signal_digests {
+            dispositions.push((
+                format!("{MEMBER_DOMAIN_WATCHDOG_SIGNAL}{signal}"),
+                "suspended".to_owned(),
+            ));
+        }
+    }
+    if let Some(audit) = host_audit {
+        for disposition in &audit.observed_dispositions {
+            dispositions.push((
+                format!("{MEMBER_DOMAIN_HOST_AUDIT}{disposition}"),
+                "forensic".to_owned(),
+            ));
+        }
+    }
+    Ok(dispositions)
+}
+
 /// One immutable verified archive bound to its single publication operation:
-/// archive digest, operation identity, idempotency key, and durability note.
+/// archive digest, operation identity, and idempotency key.
+///
+/// There is deliberately no durability field here. Durability is evidence the
+/// OWNER issues — it is [`PublicationReceipt::durable`] — and a note this owner
+/// wrote about its own publication would be a self-attested flag, not proof.
+/// The coordinator compares the owner's receipt against these three identities
+/// and nothing else.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedArchive {
     /// Archive backup identity bound at build.
@@ -430,8 +626,6 @@ pub struct PublishedArchive {
     pub operation_id: String,
     /// Idempotency key binding backup identity and archive digest.
     pub idempotency_key: String,
-    /// Owner durability note accompanying the receipt.
-    pub durability_note: String,
 }
 
 /// Durable receipt for one publication operation.
