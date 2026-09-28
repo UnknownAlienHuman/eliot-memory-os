@@ -210,6 +210,7 @@
 //! | `CommitExperienceBank` | F1 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `CommitAgentFeedback` | F7 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `ApplyBlackboardItem` | F7 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `ApplyIntegrationCandidate` | F7 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `ApplyEpistemicRevision` | F3 | `Epistemic` | `Candidate` | 4 |
 //! | `UpdateTaskState` | F2 | `TaskControl` | `ReversibleMutation` | 4 |
 //! | `ApplyLifecyclePolicy` | F8 | `LifecyclePolicy` | `ReversibleMutation` | 4 |

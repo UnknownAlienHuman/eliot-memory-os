@@ -174,6 +174,11 @@ pub enum ParameterShape {
     BlackboardItemRevision,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
+    /// Exact task/candidate identity selector for issue #1818.
+    IntegrationCandidateLookup,
+    /// Closed typed integration-candidate manifest revision and predecessor
+    /// CAS for issue #1818.
+    IntegrationCandidateRevision,
 }
 
 impl ParameterShape {
@@ -192,6 +197,8 @@ impl ParameterShape {
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
+            Self::IntegrationCandidateLookup => "eliot.integration.candidate-lookup.v1",
+            Self::IntegrationCandidateRevision => "eliot.integration.candidate-revision.v1",
         }
     }
 }
@@ -1124,6 +1131,23 @@ static APPLY_BLACKBOARD_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
     shape: ParameterShape::BlackboardItemRevision,
     required: true,
 }];
+static INTEGRATION_CANDIDATE_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::IntegrationCandidateLookup,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "candidate_id",
+        shape: ParameterShape::IntegrationCandidateLookup,
+        required: true,
+    },
+];
+static APPLY_INTEGRATION_CANDIDATE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "revision",
+    shape: ParameterShape::IntegrationCandidateRevision,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -1159,6 +1183,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::ResolveWriteReceipt => "ResolveWriteReceipt",
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
+        NamedReadOperation::GetIntegrationCandidate => "GetIntegrationCandidate",
     }
 }
 
@@ -1199,6 +1224,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetCapabilityEvidenceRecordRange" => {
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
         }
+        b"GetIntegrationCandidate" => Some(NamedReadOperation::GetIntegrationCandidate),
         _ => None,
     }
 }
@@ -1228,6 +1254,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
+        NamedMutationOperation::ApplyIntegrationCandidate => "ApplyIntegrationCandidate",
     }
 }
 
@@ -1260,6 +1287,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
         }
+        b"ApplyIntegrationCandidate" => Some(NamedMutationOperation::ApplyIntegrationCandidate),
         _ => None,
     }
 }
@@ -1292,6 +1320,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetBlackboardItem` declares the exact `task_id` and `item_id` selectors
 /// (issue #1822);
+/// `GetIntegrationCandidate` declares the exact `task_id` and `candidate_id`
+/// selectors (issue #1818);
 /// `GetLearningRecordRange` declares the required decimal `max_records`
 /// bound, the optional closed `record_kind` filter, plus the optional
 /// opaque `cursor` continuation selector (issue #1868; scope arrives
@@ -1329,6 +1359,7 @@ pub const fn declared_read_parameters(
             &GET_EXPERIENCE_RANGE_PARAMETERS
         }
         NamedReadOperation::GetBlackboardItem => &BLACKBOARD_ITEM_LOOKUP_PARAMETERS,
+        NamedReadOperation::GetIntegrationCandidate => &INTEGRATION_CANDIDATE_LOOKUP_PARAMETERS,
         NamedReadOperation::GetLearningRecordRange => &GET_LEARNING_RANGE_PARAMETERS,
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             &GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS
@@ -1388,6 +1419,8 @@ pub const fn declared_read_parameters(
 /// variant, digest re-proof at the Governor read edge);
 /// `ApplyBlackboardItem` declares the required typed `revision` candidate
 /// and predecessor CAS (issue #1822);
+/// `ApplyIntegrationCandidate` declares the required typed `revision`
+/// manifest and predecessor CAS (issue #1818);
 /// `RecordLearningRecord` declares the seven required commit fields
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
@@ -1412,6 +1445,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
+        NamedMutationOperation::ApplyIntegrationCandidate => {
+            &APPLY_INTEGRATION_CANDIDATE_PARAMETERS
+        }
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1507,7 +1543,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
     let structured = match declaration.shape {
         ParameterShape::OperationId
         | ParameterShape::Subject
-        | ParameterShape::BlackboardItemLookup => false,
+        | ParameterShape::BlackboardItemLookup
+        | ParameterShape::IntegrationCandidateLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
@@ -1515,6 +1552,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
+        | ParameterShape::IntegrationCandidateRevision
         | ParameterShape::InstrumentRegistrySnapshot => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
@@ -1604,6 +1642,10 @@ pub fn validate_typed_mutation_parameters(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed shape table; one arm per parameter shape"
+)]
 fn check_declared_shape(
     declaration: &ParameterDeclaration,
     value: &Value,
@@ -1703,6 +1745,15 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             revision.validate()
         }
+        ParameterShape::IntegrationCandidateLookup => {
+            validate_integration_candidate_lookup_selector(declaration, value)
+        }
+        ParameterShape::IntegrationCandidateRevision => {
+            let revision: crate::IntegrationCandidateRevision =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            revision.validate()
+        }
     }
 }
 
@@ -1736,6 +1787,26 @@ fn validate_blackboard_lookup_selector(
         return Err(StoreError::InvalidField {
             field: "operation.parameter",
             reason: "blackboard identity selector must be non-blank text",
+        });
+    }
+    if declaration.name == "task_id" {
+        eliot_contracts::TaskId::new(text).map_err(StoreError::Foundation)?;
+    }
+    Ok(())
+}
+
+fn validate_integration_candidate_lookup_selector(
+    declaration: &ParameterDeclaration,
+    value: &Value,
+) -> Result<(), StoreError> {
+    let text = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "integration-candidate identity selector must be a string",
+    })?;
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "integration-candidate identity selector must be non-blank text",
         });
     }
     if declaration.name == "task_id" {

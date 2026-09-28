@@ -47,6 +47,7 @@ mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
+mod integration_candidate;
 pub mod learning_store;
 mod named_mutation_receipt;
 mod notification_state;
@@ -276,6 +277,13 @@ pub use experience_store::{
     experience_feedback_commit_params, experience_feedback_mutation_request,
     experience_feedback_read_request, validate_experience_mutation_params,
     validate_experience_read_params,
+};
+
+pub use integration_candidate::{
+    INTEGRATION_CANDIDATE_MUTATION_NAME, INTEGRATION_CANDIDATE_READ_NAME,
+    INTEGRATION_CANDIDATE_SCHEMA_V1, IntegrationCandidateRecord, IntegrationCandidateRevision,
+    decode_integration_candidate, integration_candidate_read_request,
+    integration_candidate_request,
 };
 
 pub use learning_store::{
@@ -3756,6 +3764,9 @@ pub enum NamedReadOperation {
     /// bounded page with a fence-bound keyset continuation cursor, so a
     /// complete hydration drains it to exhaustion.
     GetCapabilityEvidenceRecordRange,
+    /// Exact, fenced lookup of one immutable integration-candidate manifest
+    /// head (issue #1818).
+    GetIntegrationCandidate,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -3881,6 +3892,11 @@ pub enum NamedMutationOperation {
     /// Governor registry re-evaluates through its own exact-fingerprint,
     /// freshness, invalidation, and requalification predicates.
     RecordCapabilityEvidenceRecord,
+    /// Canonical integration-candidate manifest persistence (issue #1818).
+    /// Persists a Kernel-admitted manifest revision under the candidate-only
+    /// ceiling; it does not perform lifecycle transitions, decisions,
+    /// acceptance, or write-authority changes.
+    ApplyIntegrationCandidate,
 }
 
 impl NamedMutationOperation {
@@ -3893,7 +3909,8 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
-            | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
+            | Self::RecordCapabilityEvidenceRecord
+            | Self::ApplyIntegrationCandidate => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
