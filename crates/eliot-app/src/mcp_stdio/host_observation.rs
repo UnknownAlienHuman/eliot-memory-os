@@ -8,21 +8,24 @@
 //! identity/sequence/cursor, observed time, and the applicable deadline.
 //!
 //! The adapter verifies everything verifiable in the envelope (validity,
-//! terminal kind, route digest) and requires the observed generation to equal
-//! the owner's current generation, so a stale, foreign, duplicated, or
-//! reordered host event can never close a current correlation. Correlation
-//! attribution rides the owner's journal session binding: the owner nominates
-//! the candidate event from its live journal and the join verifies it there
+//! terminal kind, route digest) and joins the *event's own* observed session
+//! against the *owner's live* current session, so a stale or foreign
+//! generation, a duplicated or reordered event, and an unattributable lineage
+//! each close nothing current. The observed side is never taken from the
+//! joining caller's keys: comparing two caller-supplied generation fields
+//! proves only that the caller agrees with itself. Correlation attribution
+//! rides the owner's journal session binding: the owner nominates the
+//! candidate event from its live journal and the join verifies it there
 //! verbatim (see `super::bridge_join`). UI-only screenshots and free text are
 //! not machine authority and never enter the observation.
 
-use eliot_agent_bridge_core::{HostEventEnvelope, HostEventKind};
+use eliot_agent_bridge_core::{HostEventEnvelope, HostEventKind, ProviderObservationLineage};
 
 use super::correlation::{
     HostObservationEvidence, HostTerminalObservation, HostTerminalState, sha256_hex,
 };
 
-/// Generation triple a host observation is bound to.
+/// Generation triple the live event owner states for the joined route.
 #[allow(
     dead_code,
     reason = "owner seam: carried only by the bridge join's host-event keys (#2899)"
@@ -38,6 +41,13 @@ pub(crate) struct HostGeneration {
 }
 
 /// Exact join keys the event owner attests for one candidate host event.
+///
+/// The keys carry only the *expected* side of the join. There is deliberately
+/// no observed-generation field: a pair of caller-supplied generations can only
+/// prove that the caller agrees with itself. The observed side is derived from
+/// the candidate's own owner-validated lineage and compared against the live
+/// attach binding the join reads from the owner itself
+/// ([`normalize_terminal_observation`]).
 #[allow(
     dead_code,
     reason = "owner seam: attested only by the bridge-owning join caller (#2899)"
@@ -46,9 +56,7 @@ pub(crate) struct HostGeneration {
 pub(crate) struct HostEventJoinKeys {
     /// Host integration identity that produced the observation.
     pub(crate) integration_id: String,
-    /// Generation the owner attributes to the candidate event.
-    pub(crate) observed_generation: HostGeneration,
-    /// Owner's current generation; must equal the observed generation.
+    /// Generation the live owner states for the joined route.
     pub(crate) current_generation: HostGeneration,
     /// Owner-attested correlation digest the event is joined to.
     pub(crate) correlation_digest: String,
@@ -76,8 +84,17 @@ pub(crate) enum HostObservationReject {
         /// Observed route digest from the event.
         observed: String,
     },
-    /// The event belongs to a stale generation; it closes nothing current.
-    StaleGeneration,
+    /// The event's own owner-validated lineage attributes no session, so no
+    /// generation can be compared for it. Unattributable, not a host fault.
+    SessionLineageUnattributable,
+    /// The event's own session is not the owner's current session; a rotated or
+    /// restarted session must not relabel an old observation as current.
+    StaleGeneration {
+        /// Session the event's own lineage names.
+        observed: String,
+        /// Session the owner's live attach binding names.
+        current: String,
+    },
 }
 
 impl std::fmt::Display for HostObservationReject {
@@ -96,8 +113,13 @@ impl std::fmt::Display for HostObservationReject {
                 formatter,
                 "host event route mismatch: expected {expected}, observed {observed}"
             ),
-            Self::StaleGeneration => formatter.write_str(
-                "host event belongs to a stale generation and closes no current correlation",
+            Self::SessionLineageUnattributable => formatter.write_str(
+                "host event lineage attributes no session; it closes no current correlation",
+            ),
+            Self::StaleGeneration { observed, current } => write!(
+                formatter,
+                "host event session {observed} is not the owner current session {current}; \
+                 it closes no current correlation"
             ),
         }
     }
@@ -107,10 +129,14 @@ impl std::error::Error for HostObservationReject {}
 
 /// Normalizes one owner-nominated host event into a terminal observation.
 ///
-/// Verifies envelope validity, terminal kind, exact route digest, and exact
-/// generation currency. Non-terminal kinds, foreign routes, and stale
-/// generations are rejected: missing or mismatched telemetry is never
-/// relabeled as a host fault.
+/// Verifies envelope validity, terminal kind, and the exact route digest, then
+/// joins the event's *own* observed generation against the owner's live
+/// current session: the observed side is read from the closed, versioned
+/// normalized observation the envelope carries (never from caller input and
+/// never from the wire's generic JSON), the expected side is supplied by the
+/// owner itself. Non-terminal kinds, foreign routes, unattributable lineage,
+/// and stale generations are rejected: missing or mismatched telemetry is
+/// never relabeled as a host fault.
 #[allow(
     dead_code,
     reason = "owner seam: invoked by the bridge-owning process with live journal events; the facade observes no host events itself (#2899)"
@@ -118,6 +144,7 @@ impl std::error::Error for HostObservationReject {}
 pub(crate) fn normalize_terminal_observation(
     event: &HostEventEnvelope,
     keys: &HostEventJoinKeys,
+    current_session: &str,
 ) -> Result<HostTerminalObservation, HostObservationReject> {
     event
         .validate()
@@ -140,8 +167,31 @@ pub(crate) fn normalize_terminal_observation(
             observed: route_digest,
         });
     }
-    if keys.observed_generation != keys.current_generation {
-        return Err(HostObservationReject::StaleGeneration);
+    // The observed generation side comes from the closed normalized observation
+    // the envelope carries — never from the joining caller's keys and never
+    // from the wire's generic JSON. A lineage that attributes no session is
+    // *unattributable*, which is a different outcome from a *stale* generation
+    // and is never relabeled as a host fault.
+    let observed_session =
+        event
+            .normalized()
+            .ok()
+            .and_then(|normalized| match &normalized.lineage {
+                ProviderObservationLineage::SessionObservation(observation) => {
+                    observation.session_id.as_ref()
+                }
+                ProviderObservationLineage::ExecutionUnitObservation(observation) => {
+                    observation.binding.session_id.as_ref()
+                }
+            });
+    let Some(observed_session) = observed_session else {
+        return Err(HostObservationReject::SessionLineageUnattributable);
+    };
+    if observed_session.as_str() != current_session {
+        return Err(HostObservationReject::StaleGeneration {
+            observed: observed_session.as_str().to_owned(),
+            current: current_session.to_owned(),
+        });
     }
     let event_json = serde_json::to_string(event)
         .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
