@@ -2899,12 +2899,30 @@ impl DaemonComposition {
                 )))
             })?;
         if staled.newly_staled > 0 {
+            // LOUD, and deliberately not phrased as if the restriction were
+            // recorded durably. `staled.records` are the durable half — each
+            // carries this change reference in its own persisted
+            // `limitations_and_negative_evidence`, which the canonical store
+            // serves verbatim — and this call site DOES NOT COMMIT THEM.
+            //
+            // The restriction therefore holds in this process only and a restart
+            // erases it. That is the W2 gap, and it is `STITCH` because
+            // `commit_capability_evidence_record` has no production caller: no
+            // capability-probe producer exists in the repository, so there is no
+            // observation to commit from. Committing here anyway would require
+            // inventing a request identity and would turn a working route refusal
+            // into a possible error, which is not an improvement.
+            //
+            // The log therefore states the limitation's scope rather than
+            // implying durability the code does not achieve.
             tracing::warn!(
                 target: "eliotd::capability_evidence",
                 event = "eliotd.capability_evidence_staled",
                 staled_records = staled.newly_staled,
+                uncommitted_records = staled.records.len(),
                 change_reference = %staled.blocking_evidence_ref,
-                "an observed runtime/adapter/provider/serializer change limited dependent capability evidence; the exact route must requalify, naming this change reference, before production work"
+                durable = false,
+                "an observed runtime/adapter/provider/serializer change limited dependent capability evidence IN THIS PROCESS ONLY; the mutated records carrying this change reference are NOT committed, so a restart will forget the restriction. The exact route must requalify, naming this change reference, before production work"
             );
         }
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)

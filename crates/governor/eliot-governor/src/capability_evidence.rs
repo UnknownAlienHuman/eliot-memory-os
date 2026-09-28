@@ -63,19 +63,30 @@
 //! capability's invalidation on the same fingerprint: the key is the record
 //! identity, not the bare scope.
 //!
-//! **Invalidation is durable, not remembered.** An applied dependency change is
-//! written into the affected record's
+//! **Invalidation is durable once committed — and is a known restriction until
+//! then.** An applied dependency change is written into the affected record's
 //! [`CapabilityEvidenceRecord::limitations_and_negative_evidence`] — an
-//! already-declared I3.4 field, not a parallel structure — and the canonical
-//! store holds those bytes verbatim. [`ScopeInvalidationSet`] is therefore a
-//! *derived index*, recomputed by
-//! [`CapabilityRegistry::rebuild_invalidation_index`] from the retained
-//! records. A fresh process that hydrates the records the store served
-//! re-derives every restriction that was ever committed, so a restart cannot
-//! re-admit stale evidence; a restriction that was never committed was never an
-//! owner-issued durable fact in the first place. The two admission predicates
-//! additionally read [`CapabilityEvidenceRecord::is_limited`] directly, so the
-//! durable claim does not depend on the index being rebuilt.
+//! already-declared I3.4 field, not a parallel structure — and
+//! [`ScopeInvalidationSet`] is a *derived index*, recomputed by
+//! [`CapabilityRegistry::rebuild_invalidation_index`] from the retained records
+//! rather than remembered separately. A fresh process that hydrates the records
+//! the store served therefore re-derives every restriction that was **committed**.
+//!
+//! But the mutated record is only durable once the caller commits it through the
+//! named `RecordCapabilityEvidenceRecord` leg, and the call that applies a change
+//! does not yet commit it. An uncommitted restriction is therefore a *known*
+//! restriction in this process — it refuses production work, which is the
+//! fail-closed direction — and it **is** erased by a restart. That is a real gap,
+//! not a property: a restriction the running process applied and never committed
+//! is forgotten, and the affected evidence can be re-admitted after a restart.
+//! It is not repaired here, because the commit path has no production caller
+//! (`STITCH`: no capability-probe producer exists in the repository). Do not read
+//! the durability above as covering the uncommitted case.
+//!
+//! The two admission predicates additionally read
+//! [`CapabilityEvidenceRecord::is_limited`] directly, so once a limitation IS
+//! committed, the restriction holds from the record's own served bytes and does
+//! not depend on the index having been rebuilt.
 //!
 //! The registry never evicts a key's latest frontier: after the bound is
 //! reached, new keys are refused, and an unretained restriction fails

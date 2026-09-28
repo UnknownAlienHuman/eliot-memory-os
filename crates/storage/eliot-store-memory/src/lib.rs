@@ -1658,9 +1658,13 @@ fn capability_evidence_record_range_payload(
         // Surreal (`String::from_utf8` of the `TYPE bytes` column), so the
         // consumer's decode is provider-independent.
         //
-        // The digest re-proof validates the ORIGINAL recorded bytes, not a
-        // derived substitute, so a row can never be served under an
-        // owner-issued reference the store never issued for those bytes.
+        // Row-address re-proof, like for like: the map key is a
+        // `RecoveryRecordKey` (the in-memory form of the `namespace` + `key`
+        // columns), so it is compared against the same
+        // `capability_evidence_row_key` the Surreal provider compares the `key`
+        // column against. The digest re-proof below validates the ORIGINAL
+        // recorded bytes, not a derived substitute, so a row can never be served
+        // under an owner-issued reference the store never issued for those bytes.
         if eliot_store_api::capability_evidence_row_key(&row.skill_id, &row.scope_key) != *key {
             return Err(StoreError::InvalidField {
                 field: "capability_evidence.key",

@@ -50,11 +50,36 @@
 //!                         the request fence
 //! ```
 //!
-//! Owner-issued revision: the store arbitrates the evidence row's fenced
-//! revision and issues `expected + 1`. This module never mints that value from a
-//! local clock; it reads the issued revision back through
-//! [`issued_owner_revision`] after the commit, so the value the registry orders
-//! by is the one the canonical store assigned.
+//! Owner-issued revision — and exactly where the value comes from.
+//!
+//! The canonical store arbitrates the evidence row's fenced revision under a
+//! compare-and-set and issues `expected + 1`. **This module does not read that
+//! value back from the store.** It re-derives the same arithmetic from the
+//! predecessor the owner itself asserted, so the value the registry orders by is
+//! correct only because it is a **store contract**, not because this module
+//! observed the store.
+//!
+//! The two endpoints of that contract, both of which must issue exactly
+//! `expected + 1`:
+//!
+//! * memory — `crates/storage/eliot-store-memory/src/lib.rs`
+//!   `dispatch_apply_capability_evidence`, which refuses a stale predecessor with
+//!   `StoreError::RevisionConflict` and then writes
+//!   `expected_canonical_revision.checked_add(1)`;
+//! * Surreal — `crates/storage/eliot-store-surreal-adapter/src/schema.rs`
+//!   `TX_CAPABILITY_EVIDENCE_OWNER`, driven by
+//!   `append_capability_evidence_owner_statements` in that crate's
+//!   `apply/atomic_write.rs`, which throws `capability_evidence_cas_conflict` on a
+//!   stale predecessor and binds `revision` to the same `expected + 1`.
+//!
+//! A provider that issued anything other than `expected + 1` would therefore
+//! break the registry's ordering, and this code would not detect it: the
+//! derivation and the store would disagree silently. That coupling is the price
+//! of not adding a readback round trip on a path that has no production caller
+//! yet; it is stated here rather than papered over. The readback half of the
+//! leg does exist and does not share this weakness — the paged range read
+//! projects the store's own `revision` column, so a hydrated record is ordered
+//! by the revision the store actually holds.
 //!
 //! Fail-closed checks before any commit: the named-operation guard, closed
 //! parameter decode, request-identity validity, and idempotency agreement
@@ -275,9 +300,11 @@ pub async fn commit_capability_evidence_record<P: KernelGenerationPort + ?Sized>
         &decoded.idempotency_key,
         &envelope_fence,
     )?;
-    // The store issued `expected + 1`; the owner-issued revision the registry
-    // orders by is exactly that value, paired with the presented digest the
-    // store echoed.
+    // Re-derived, not read back. This is the same `expected + 1` the store
+    // issues under its fenced compare-and-set (see this module's docs for both
+    // provider endpoints); it is a store contract this function depends on, not
+    // an observation of the store. The presented digest is the owner-issued
+    // evidence reference the store echoes verbatim on readback.
     let issued =
         decoded
             .expected_canonical_revision

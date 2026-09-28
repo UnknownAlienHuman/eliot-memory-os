@@ -24,9 +24,7 @@
 //! only when the eligible set was traversed to its end — so a complete hydration
 //! terminates instead of re-reading the first page forever.
 
-use eliot_store_api::{
-    CAPABILITY_EVIDENCE_RECORD_NAMESPACE, StateFence, StoreError, canonical_json_bytes, sha256_hex,
-};
+use eliot_store_api::{CAPABILITY_EVIDENCE_RECORD_NAMESPACE, StateFence, StoreError, sha256_hex};
 use serde_json::{Map, Value, json};
 
 use crate::SurrealAdapterConfig;
@@ -60,13 +58,27 @@ pub(crate) struct CapabilityEvidenceReadPage {
     pub more: bool,
 }
 
-/// Returns the physical row-id digest of one evidence key, exactly as the write
-/// path derives it.
-fn row_id(skill_id: &str, scope_key: &str) -> Result<String, AdapterError> {
-    let key = eliot_store_api::capability_evidence_row_key(skill_id, scope_key);
-    let bytes = canonical_json_bytes(&key)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    Ok(sha256_hex(&bytes))
+/// Returns the `key` **column** value the write path produced for one evidence
+/// key.
+///
+/// Two addresses are in play and they are not interchangeable:
+///
+/// * the `key` **column** — `"evidence_<sha256>"`, produced by
+///   [`eliot_store_api::capability_evidence_row_key`] and written by
+///   `record.insert("key", json!(row_key.key))` in
+///   `super::append_capability_evidence_owner_statements`. This is the anchor
+///   the rest of the adapter addresses rows by:
+///   [`crate::schema::READ_RECOVERY_OWNER_BY_KEY`] selects
+///   `WHERE namespace = $ns AND key = $key`, and the blackboard leg binds
+///   `blackboard_key` the same way.
+/// * the **physical record id** — `sha256_hex(canonical_json_bytes(RecoveryRecordKey))`
+///   over that key, produced by `recovery_owner_id` in [`super::atomic_write`] and
+///   consumed only as `type::record($table, $id)`. It is never projected as a
+///   column and is never compared against `key`.
+///
+/// The re-proof therefore compares column to column.
+fn row_key_column(skill_id: &str, scope_key: &str) -> String {
+    eliot_store_api::capability_evidence_row_key(skill_id, scope_key).key
 }
 
 /// Reads the eligible capability-evidence rows for the current query in key
@@ -251,13 +263,16 @@ struct CapabilityEvidenceRow {
 /// * the row must name the exact `capability-evidence-v1` namespace;
 /// * the row's own `scope_id` must equal the scope the read was planned for, so
 ///   a row cannot be served into another scope's answer;
-/// * the row address must be reproducible from the row's own
-///   `(skill_id, scope_key)` identity, so a row cannot be projected under a key
-///   the write path could not have produced; and
+/// * the `key` column must equal the `"evidence_<sha256>"` address recomputed
+///   from the row's own `(skill_id, scope_key)` identity — column to column, with
+///   both write-side producers named at the check — so a row cannot be projected
+///   under an address the write path could not have produced; and
 /// * `sha256_hex(payload) == record_digest`, the **owner-issued reference of the
-///   original committed bytes**. This re-proof validates the value the store
-///   committed, not a freshly derived substitute, so a hydration can never mint a
-///   record under an evidence reference the store never issued for those bytes.
+///   original committed bytes**, checked over the `TYPE bytes` column as
+///   committed and with both producer symbols named at the check. This validates
+///   the value the store committed, not a freshly derived substitute, so a
+///   hydration can never mint a record under an evidence reference the store
+///   never issued for those bytes.
 ///
 /// The revision must be at least `1`, because the store's fenced compare-and-set
 /// only ever issues `expected + 1` from a `0` floor.
@@ -278,14 +293,41 @@ fn decode_capability_evidence_row(
             reason: "capability evidence row is in a foreign scope",
         }));
     }
-    if row_id(&row.skill_id, &row.scope_key)? != key {
+    // Row-address re-proof, column to column.
+    //
+    // LEFT:  the `key` column read off the projected row, which the write path
+    //        filled from `row_key.key` in
+    //        `super::append_capability_evidence_owner_statements`.
+    // RIGHT: `eliot_store_api::capability_evidence_row_key(skill_id,
+    //        scope_key).key` — the same `"evidence_<sha256>"` string recomputed
+    //        from the row's OWN `(skill_id, scope_key)` identity fields, which the
+    //        same write statement filled in.
+    //
+    // These are the same kind of value, so the comparison can succeed; the
+    // physical record id (`recovery_owner_id`, a bare digest used only inside
+    // `type::record($table, $id)`) is deliberately NOT what is compared here.
+    if row_key_column(&row.skill_id, &row.scope_key) != key {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.key",
             reason: "capability evidence row address does not match its identity",
         }));
     }
     // The owner-issued reference is re-proved against the ORIGINAL recorded
-    // bytes, taken from the `TYPE bytes` column exactly as committed.
+    // bytes, not a derived substitute.
+    //
+    // LEFT:  `sha256_hex(record_json.as_bytes())` where `record_json` is
+    //        `String::from_utf8(row.payload)` and `row.payload` is the `TYPE bytes`
+    //        column read back exactly as committed.
+    // RIGHT: the `record_digest` column, which
+    //        `super::append_capability_evidence_owner_statements` filled from the
+    //        presented `record_digest`, and which the Governor produced as
+    //        `sha256_hex(record_json.as_bytes())` in
+    //        `crate::capability_evidence_mutation_request_for_record` over the very
+    //        bytes it put in `record_json`.
+    //
+    // Same producer on both sides, over the committed value, so a row can never
+    // be served under an evidence reference the store never issued for those
+    // bytes.
     let record_json = String::from_utf8(row.payload).map_err(|_| {
         AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.payload",

@@ -483,7 +483,6 @@ impl GovernorCapabilityAdmission {
             }
         }
         Ok(EvidenceRecordPage {
-            records_in_page: rows.len(),
             minted,
             truncated,
             next_cursor,
@@ -685,8 +684,13 @@ fn decode_evidence_record_row(
 ///
 /// * a page that reports truncation without a usable cursor is refused, so a
 ///   bounded prefix is never reported as complete coverage;
-/// * a store that returns a cursor it already issued is refused, so the loop
-///   cannot spin forever re-reading the same page.
+/// * a page that reports truncation must carry a continuation, and that
+///   continuation must **strictly advance** past the previous one. This is the
+///   house paging rule in `notification_board_attach.rs`: a short truncated page
+///   would mean the store knows of more eligible rows but cannot say where they
+///   resume, and continuing from a non-advancing cursor would either spin or
+///   silently under-read. Both are refused rather than accepted and hoped over,
+///   so a future provider cannot quietly break the coverage claim.
 ///
 /// **Atomicity.** Pages are applied to a *staging* view and the held view is
 /// replaced only after the last page. A drain that stops early — a capacity
@@ -711,7 +715,6 @@ pub fn drain_capability_evidence_records(
     let mut cursor: Option<String> = None;
     let mut pages = 0_u32;
     let mut minted = 0_usize;
-    let mut observed = 0_u64;
     let mut issued: Vec<String> = Vec::new();
     let drained = loop {
         let request = GovernorCapabilityAdmission::plan_evidence_record_read(
@@ -726,15 +729,41 @@ pub fn drain_capability_evidence_records(
             .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
         let page = staging.hydrate_from_evidence_record_page(&request, &response)?;
         pages = pages.saturating_add(1);
-        observed = observed.saturating_add(u64::try_from(page.records_in_page).unwrap_or(u64::MAX));
         minted = minted.saturating_add(page.minted);
         if !page.truncated {
-            break (pages, observed, minted, staging.len());
+            // Coverage is the staging view's own retained key count, read AFTER
+            // the final page is applied. Both endpoints of that number are named
+            // here so it does not have to be re-derived:
+            //
+            // WRITE SIDE  `CapabilityRegistry::insert`
+            //             (eliot-governor/capability_evidence.rs) locates an
+            //             existing key by `skill_id` + `scope_fingerprint`, and
+            //             `CapabilityRegistry::len` is that key vector's length.
+            // READ SIDE   `staging.len()` -> `GovernorCapabilityAdmission::len`
+            //             -> `self.registry.len()`, where `self.registry` is the
+            //             registry `hydrate_from_evidence_record_page` inserts
+            //             into above.
+            //
+            // It therefore counts DISTINCT keys, so a store that re-serves a
+            // page under a fresh cursor cannot inflate it. The `minted` sum is
+            // reported separately and is likewise duplicate-safe, because a
+            // replayed key contributes nothing to `minted`.
+            break (pages, staging.len(), minted);
         }
+        // House paging rule (see `notification_board_attach.rs`): a page that
+        // reports truncation MUST carry a usable continuation, and that
+        // continuation must strictly advance. Both providers currently set
+        // `truncated` only after observing a further eligible row, so a short
+        // truncated page is not reachable today — but accepting one would let a
+        // future provider silently under-read the eligible set, which is the
+        // wrong direction for a coverage claim. Refuse instead.
         let Some(next) = page.next_cursor else {
             return Err(EvidenceBridgeError::Payload("next_cursor"));
         };
-        if issued.iter().any(|seen| seen == &next) {
+        if issued
+            .last()
+            .is_some_and(|previous| next.as_str() <= previous.as_str())
+        {
             return Err(EvidenceBridgeError::Request(
                 "capability evidence hydration cursor did not advance".to_owned(),
             ));
@@ -743,21 +772,27 @@ pub fn drain_capability_evidence_records(
         cursor = Some(next);
     };
     admission.replace_drained_registry(staging);
-    let (pages, observed_records, minted_records, retained) = drained;
+    let (pages, observed_records, minted_records) = drained;
+    let observed_records = u64::try_from(observed_records).unwrap_or(u64::MAX);
     Ok(CapabilityHydrationReport {
         pages,
         observed_records,
         minted_records,
-        retained,
+        retained: usize::try_from(observed_records).unwrap_or(usize::MAX),
     })
 }
 
 /// One applied page of the capability-evidence record read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceRecordPage {
-    /// Rows the served page carried.
-    pub records_in_page: usize,
     /// Records this page newly retained (replays converge and are not counted).
+    ///
+    /// This is the count a coverage claim may use, because it counts DISTINCT
+    /// keys: a page that re-serves an already-retained key adds nothing. There is
+    /// deliberately no per-page row count alongside it. A served-row count
+    /// double-counts whenever a provider re-serves a page under a fresh cursor,
+    /// which would make a drain report more coverage than it actually read, and
+    /// that is the specific failure a coverage figure exists to exclude.
     pub minted: usize,
     /// Whether the store observed a further eligible row beyond this page.
     pub truncated: bool,
@@ -773,6 +808,10 @@ pub struct CapabilityHydrationReport {
     /// Pages drained to exhaustion.
     pub pages: u32,
     /// Durable evidence rows observed across every page.
+    /// Distinct `(skill_id, scope_fingerprint)` evidence keys the drained view
+    /// holds. This is the honest coverage figure: it is the registry's own
+    /// retained count, so a store that re-served a page under a fresh cursor
+    /// cannot inflate it. Never a sum of per-page row counts.
     pub observed_records: u64,
     /// Records the drain newly retained; a replayed record is not re-counted.
     pub minted_records: usize,
