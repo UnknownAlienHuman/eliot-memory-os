@@ -46,6 +46,7 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 mod derived_cache;
 mod finish_disposition;
 mod plan_consumer;
+mod work_envelope;
 
 pub use derived_cache::{
     ADMITTED_SCHEMA_REVISIONS, ArtifactLineage, CacheCounters, CacheLimits, CacheLookup,
@@ -60,6 +61,10 @@ pub use finish_disposition::{
     ProvenRequiredProof, RequiredProofCompletion, TaskOutcome, apply_finish_boundary,
 };
 pub use plan_consumer::{ApplicableInputs, ResolverPlanConsumer};
+pub use work_envelope::{
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity, GovernedWorkEnvelope,
+    LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
+};
 
 pub(crate) fn validate_text_shape(value: &str, field: &'static str) -> Result<(), GraphError> {
     text(value, field)

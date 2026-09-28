@@ -873,6 +873,16 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
 /// profiles run the owner-resolved cargo-nextest toolchain. The libtest
 /// reporter gate rides along unused for discovery; requiring the one
 /// toolchain identity set keeps a single owner-observed tool path.
+///
+/// Governed boundary (issue #1897 W3): every testd-launched Cargo and
+/// test invocation binds `CARGO_TARGET_DIR` to the durable allocated
+/// root above, never to the repository `target/` directory, which the
+/// source-disjointness gate already refuses as an admitted root. The
+/// explicitly non-governed local workflows are the Justfile cargo
+/// recipes and the verify cargo/dotnet gates, which execute directly
+/// with no governed profile receipt as the quarantined legacy lane
+/// (issue #1813 W6; `Justfile` quick-lane note,
+/// `scripts/verify.ps1` `VERIFY_QUARANTINE`).
 fn derive_testd_intent_environment(
     params: &TestdDerivedIntentParams,
 ) -> Result<EnvironmentProjection, TestdError> {
