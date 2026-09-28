@@ -280,33 +280,33 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
+          import importlib.util
           import pathlib
           import re
+          import sys
 
           failures = []
 
           def fail(area, detail):
               failures.append(f'POLICY_{area}_FAILURE: {detail}')
 
+          # One owner for trigger and action-reference reading: this gate reads
+          # the same module the common verifier does, so the two cannot disagree
+          # about which events a workflow declares or which `uses:` values a
+          # workflow references. The module is registered in sys.modules before
+          # execution because its frozen dataclass resolves its module there.
+          _owner_name = 'verify_github_workflows'
+          _owner_spec = importlib.util.spec_from_file_location(
+              _owner_name,
+              pathlib.Path('scripts/verify-github-workflows.py'),
+          )
+          _owner = importlib.util.module_from_spec(_owner_spec)
+          sys.modules[_owner_name] = _owner
+          _owner_spec.loader.exec_module(_owner)
+
           def on_children(text):
-              # Top-level `on:` mapping children by indentation (stdlib only).
-              lines = text.splitlines()
-              for i, line in enumerate(lines):
-                  if re.fullmatch(r'on:\s*(#.*)?', line):
-                      base = len(line) - len(line.lstrip(' '))
-                      children = []
-                      for follow in lines[i + 1:]:
-                          if not follow.strip() or follow.strip().startswith('#'):
-                              continue
-                          indent = len(follow) - len(follow.lstrip(' '))
-                          if indent <= base:
-                              break
-                          if indent == base + 2:
-                              key = follow.strip().split(':')[0].strip()
-                              if key:
-                                  children.append(key)
-                      return children
-              return []
+              # The top-level `on:` event set, read by the common verifier.
+              return set(_owner.parse_workflow_events(text))
 
           harness_execution_re = re.compile(r'dotnet\s+(run|exec)\b[^\n]*Eliot\.Operator\.Tests')
           non_execution_command_re = re.compile(r'(?<![\w.-])(echo|write-host|write-output|printf)(?![\w-])', re.IGNORECASE)
@@ -413,12 +413,13 @@ jobs:
           def _enclosing_job_block(lines, index, indent):
               # Line indexes of the job body that owns a step at `indent`.
               # `steps:` sits between the job header and its steps, so the owning
-              # job's body is every shallower mapping line from the job header up
-              # to (and including) the `steps:` container. Every governing
-              # `if:`/soft-failure/timeout key in that body is returned, so a
-              # skipped or soft-failure job is seen no matter which key carries
-              # it.
+              # job's body is every mapping line at the job-body indentation, from
+              # the `steps:` container up to (but not including) the shallower job
+              # header. Every governing `if:`/soft-failure/timeout key in that
+              # body is returned, so a skipped or soft-failure job is seen no
+              # matter which key carries it.
               governing = []
+              body_indent = None
               for previous in range(index, -1, -1):
                   line = lines[previous]
                   if _is_yaml_comment(line):
@@ -429,9 +430,13 @@ jobs:
                   leading = len(line) - len(line.lstrip(' '))
                   if leading >= indent:
                       continue
+                  if body_indent is not None and leading < body_indent:
+                      # Shallower than a job-body key: this is the job header, so
+                      # the job body ends and nothing above it governs the step.
+                      break
                   governing.append(previous)
                   if key == 'steps':
-                      break
+                      body_indent = leading
               return governing
 
           def _nearest_list_item(lines, index):
@@ -582,14 +587,14 @@ jobs:
           # workflow_dispatch-only default; ci.yml is the sole automatic
           # exception with main-scoped pull_request/push.
           trigger_policy = {
-              'ci.yml': ['workflow_dispatch', 'pull_request', 'push'],
+              'ci.yml': {'workflow_dispatch', 'pull_request', 'push'},
           }
           for path in workflows:
               text = path.read_text(encoding='utf-8')
               children = on_children(text)
-              expected = trigger_policy.get(path.name, ['workflow_dispatch'])
+              expected = trigger_policy.get(path.name, {'workflow_dispatch'})
               if children != expected:
-                  fail('TRIGGER', f'{path.as_posix()} on-children={children} expected={expected}')
+                  fail('TRIGGER', f'{path.as_posix()} on-children={sorted(children)} expected={sorted(expected)}')
 
           ci = pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
           policy_text = pathlib.Path('.github/workflows/repository-policy.yml').read_text(encoding='utf-8')
@@ -743,14 +748,17 @@ jobs:
           # source-only proof ceiling without freezing its exact bytes, so a
           # reviewed lock or binding edit does not read as an identity break.
           # No fixed hash and no fixed issue set carries authority here.
-          if on_children(sc_text) != ['workflow_dispatch']:
+          if on_children(sc_text) != {'workflow_dispatch'}:
               fail('CANDIDATE', 'source-candidate.yml trigger identity changed')
+          # Action identity is read by the common verifier, so every `uses:`
+          # spelling it judges is judged here too (same-line value, block
+          # mapping, flow mapping) instead of only the same-line form.
+          for line_no, ref in _owner.iter_action_references_in_text(sc_text):
+              if ref.startswith('./'):
+                  continue
+              if '@' not in ref or not re.fullmatch(r'[0-9a-fA-F]{40}', ref.split('@', 1)[1]):
+                  fail('CANDIDATE', f'source-candidate.yml line {line_no} action is not full-SHA pinned: {ref}')
           for line_no, line in enumerate(sc_text.splitlines(), start=1):
-              uses_match = re.match(r'^\s*-\s*uses:\s*([^\s#]+)', line)
-              if uses_match:
-                  ref = uses_match.group(1)
-                  if not ref.startswith('./') and ('@' not in ref or not re.fullmatch(r'[0-9a-fA-F]{40}', ref.split('@', 1)[1])):
-                      fail('CANDIDATE', f'source-candidate.yml line {line_no} action is not full-SHA pinned: {ref}')
               # Quoted prose (e.g. failure-message literals) is not a gate
               # invocation; only unquoted cargo check/clippy/test/build/metadata
               # commands must carry --locked.
