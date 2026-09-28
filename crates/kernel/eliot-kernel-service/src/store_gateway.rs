@@ -10,6 +10,8 @@
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
 
+#[cfg(windows)]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -52,10 +54,12 @@ use eliot_ors::{
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 #[cfg(windows)]
 use eliot_protocol::{
-    MAINTENANCE_TRIGGER_PAGE_WIRE_ID, MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION, MaintenanceTriggerAck,
-    MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDisposition,
-    MaintenanceTriggerGap, MaintenanceTriggerPage, MaintenanceTriggerPendingSummary,
-    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MAINTENANCE_TRIGGER_PAGE_WIRE_ID,
+    MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION, MaintenanceTriggerAck, MaintenanceTriggerClaim,
+    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDisposition, MaintenanceTriggerGap,
+    MaintenanceTriggerPage, MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord,
+    MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
     MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind, ProtocolError,
 };
 use eliot_store_api::{
@@ -67,6 +71,8 @@ use eliot_store_api::{
     WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
     dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
 };
+#[cfg(windows)]
+use eliot_store_api::{NamedReadOperation, ReadConsistency, TransitionClass};
 use serde::{Deserialize, Serialize};
 
 use crate::commit_recovery::{
@@ -819,7 +825,7 @@ fn maintenance_trigger_downstream_intent_origin_claim(
 }
 
 #[cfg(windows)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MaintenanceTriggerDecisionOwnerPayload {
     operation_id: String,
@@ -3121,6 +3127,66 @@ impl KernelStoreGateway {
             OperationId::new(decision.canonical_receipt_ref.clone()).map_err(|error| {
                 MaintenanceTriggerLifecycleFailure::from_protocol_error(error.into())
             })?;
+        let (receipt, receipt_digest) = self
+            .read_maintenance_trigger_store_receipt(active_state_fence, &operation_id)
+            .await?;
+        if receipt_digest != decision.receipt_digest {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        if !receipt
+            .ordering_sequences
+            .iter()
+            .any(|head| head.scope.as_str() == decision.scope_ref)
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        if !maintenance_trigger_receipt_contains_intents(&receipt, decision) {
+            return Err(MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound);
+        }
+        let owner_row = self
+            .read_maintenance_trigger_store_decision_owner(
+                active_state_fence,
+                &decision.trigger_id,
+                decision.revision,
+            )
+            .await?
+            .ok_or(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch)?;
+        Self::validate_maintenance_trigger_store_decision_owner(
+            &owner_row.0,
+            &owner_row.1,
+            decision,
+            &receipt,
+        )?;
+
+        let expected_record = maintenance_trigger_decision_record(decision)?;
+        if lifecycle.recovered_from_store {
+            if lifecycle.decision_record.as_ref() != Some(&expected_record)
+                || lifecycle.downstream_intent_record.as_ref() != Some(&expected_record)
+            {
+                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+            }
+        } else {
+            // Ordinary retained decisions remain bound to the claim that
+            // first retained their intent. Only an explicit ORS recovery
+            // marker permits the canonical Store fence to predate this claim.
+            let origin_fence = if lifecycle.downstream_intent_record.is_some() {
+                maintenance_trigger_downstream_intent_origin_claim(lifecycle)?.daemon_fence
+            } else {
+                maintenance_trigger_retained_claim(lifecycle)?.daemon_fence
+            };
+            if receipt.state_fence != origin_fence {
+                return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+            }
+        }
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    async fn read_maintenance_trigger_store_receipt(
+        &self,
+        active_state_fence: &StateFence,
+        operation_id: &OperationId,
+    ) -> Result<(WriteReceipt, String), MaintenanceTriggerLifecycleFailure> {
         let result = self.store.receipt(operation_id.clone()).await;
         if self.is_fenced() {
             return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
@@ -3139,77 +3205,55 @@ impl KernelStoreGateway {
                 error,
                 commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
             })?;
-        let canonical_bytes = canonical_json_bytes(&receipt)
-            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
-        if receipt.operation_id != operation_id
-            || sha256_hex(&canonical_bytes) != decision.receipt_digest
-        {
+        if &receipt.operation_id != operation_id {
             return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
         }
         if receipt.status != WriteReceiptStatus::Committed {
             return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptNotCommitted);
         }
-        if !receipt
-            .ordering_sequences
-            .iter()
-            .any(|head| head.scope.as_str() == decision.scope_ref)
-        {
+        if receipt.transition_class != TransitionClass::RecoverySchema {
             return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
         }
-        if !maintenance_trigger_receipt_contains_intents(&receipt, decision) {
-            return Err(MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound);
-        }
-        self.validate_maintenance_trigger_store_decision_owner(
-            active_state_fence,
-            decision,
-            &receipt,
-        )
-        .await?;
-
-        // A replacement claim may recover an older committed effect. Bind
-        // receipt recovery to the immutable claim captured with first intent
-        // persistence; the latest revocation can describe a later claim.
-        let origin_fence = if lifecycle.downstream_intent_record.is_some() {
-            maintenance_trigger_downstream_intent_origin_claim(lifecycle)?.daemon_fence
-        } else {
-            maintenance_trigger_retained_claim(lifecycle)?.daemon_fence
-        };
-        if receipt.state_fence != origin_fence {
-            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
-        }
-        Ok(receipt)
+        // `validate` checks the canonical request digest's shape; this digest
+        // binds that request identity, operation, historical fence, and all
+        // receipt outputs into the decision receipt returned to the caller.
+        let canonical_bytes = canonical_json_bytes(&receipt)
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
+        Ok((receipt, sha256_hex(&canonical_bytes)))
     }
 
-    /// Proves that the canonical receipt was emitted by the named maintenance
-    /// decision mutation with the exact trigger, policy, scope, and intent
-    /// fields presented for acknowledgement. The Store owner row is written in
-    /// the same canonical transaction as its receipt; this same-fence recovery
-    /// read is the binding between that receipt and the trigger revision.
     #[cfg(windows)]
-    async fn validate_maintenance_trigger_store_decision_owner(
+    async fn read_maintenance_trigger_store_decision_owner(
         &self,
         active_state_fence: &StateFence,
-        decision: &MaintenanceTriggerDecisionReceipt,
-        receipt: &WriteReceipt,
-    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
-        let key_bytes = canonical_json_bytes(&(&decision.trigger_id, decision.revision))
-            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
-        let key = String::from_utf8(key_bytes)
-            .map_err(|_| MaintenanceTriggerLifecycleFailure::RecordBindingMismatch)?;
-        let record_key = RecoveryRecordKey::new(
-            eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE,
-            key,
-        )
-        .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
-            error,
-            commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
-        })?;
-        let request = StoreRecoveryRequest {
-            contract_version: eliot_store_api::CONTRACT_VERSION,
-            state_fence: receipt.state_fence.clone(),
-            records: vec![record_key.clone()],
-            include_receipts: false,
-            include_jobs: false,
+        trigger_id: &str,
+        revision: u64,
+    ) -> Result<
+        Option<(RecoveryRecord, MaintenanceTriggerDecisionOwnerPayload)>,
+        MaintenanceTriggerLifecycleFailure,
+    > {
+        let revision_text = revision.to_string();
+        let record_key =
+            eliot_store_api::maintenance_trigger_decision_owner_key(trigger_id, &revision_text)
+                .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+                })?;
+        let request = NamedReadRequest {
+            operation: NamedReadOperation::GetMaintenanceTriggerDecisionOwner,
+            scope_id: None,
+            consistency: ReadConsistency::ExactFence,
+            state_fence: active_state_fence.clone(),
+            parameters: BTreeMap::from([
+                (
+                    "trigger_id".to_owned(),
+                    serde_json::Value::String(trigger_id.to_owned()),
+                ),
+                (
+                    "trigger_revision".to_owned(),
+                    serde_json::Value::String(revision_text),
+                ),
+            ]),
         };
         request
             .validate()
@@ -3217,29 +3261,39 @@ impl KernelStoreGateway {
                 error,
                 commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
             })?;
-        let snapshot = self.store.recovery(request).await.map_err(|error| {
-            MaintenanceTriggerLifecycleFailure::Store {
-                error,
-                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
-            }
-        })?;
+        let result = self.store.execute_named(request).await;
         if self.is_fenced() {
             return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
         }
         self.validate_active_route(active_state_fence)
             .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
-        snapshot
+        let response = result.map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+        })?;
+        response
             .validate()
             .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
                 error,
                 commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
             })?;
-        if snapshot.state_fence != receipt.state_fence || snapshot.owner_records.len() != 1 {
+        if response.operation != NamedReadOperation::GetMaintenanceTriggerDecisionOwner
+            || response.state_fence != *active_state_fence
+        {
             return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
         }
-        let record = &snapshot.owner_records[0];
+        if response.payload.is_null() {
+            return Ok(None);
+        }
+        let record: RecoveryRecord = serde_json::from_value(response.payload)
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalDeserialization)?;
+        record
+            .validate()
+            .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+            })?;
         if record.record_key() != record_key
-            || record.state_fence != receipt.state_fence
             || record.revision != 1
             || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
         {
@@ -3250,6 +3304,30 @@ impl KernelStoreGateway {
         let canonical_payload = canonical_json_bytes(&owner)
             .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
         if canonical_payload != record.payload
+            || owner.trigger_id != trigger_id
+            || owner.trigger_revision != revision
+            || owner.operation_id.trim().is_empty()
+            || owner.decision_json.trim().is_empty()
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        Ok(Some((record, owner)))
+    }
+
+    /// Proves that the canonical receipt was emitted by the named maintenance
+    /// decision mutation with the exact trigger, policy, scope, and intent
+    /// fields presented for acknowledgement. The Store owner row is written in
+    /// the same canonical transaction as its receipt; its own fence remains
+    /// historical lineage and must match the receipt, while the named read's
+    /// response is separately bound to the active request fence.
+    #[cfg(windows)]
+    fn validate_maintenance_trigger_store_decision_owner(
+        record: &RecoveryRecord,
+        owner: &MaintenanceTriggerDecisionOwnerPayload,
+        decision: &MaintenanceTriggerDecisionReceipt,
+        receipt: &WriteReceipt,
+    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
+        if record.state_fence != receipt.state_fence
             || owner.operation_id != receipt.operation_id.to_string()
             || owner.trigger_id != decision.trigger_id
             || owner.operation_hash != decision.operation_hash
@@ -3265,6 +3343,144 @@ impl KernelStoreGateway {
             return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn recover_maintenance_trigger_decision_from_store(
+        &self,
+        active_state_fence: &StateFence,
+        authenticated_session: &str,
+        trigger: &MaintenanceTriggerRecord,
+        lifecycle: &MaintenanceTriggerLifecycleRecord,
+        binding: &MaintenanceTriggerClaimBinding,
+        ors: &dyn OperationalRecoveryStore,
+    ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceTriggerLifecycleFailure> {
+        if lifecycle.phase != MaintenanceTriggerLifecyclePhase::Claimed
+            || lifecycle.recovered_from_store
+            || lifecycle.decision_record.is_some()
+            || lifecycle.downstream_intent_record.is_some()
+            || lifecycle.claim.as_ref() != Some(binding)
+            || authenticated_session.trim().is_empty()
+            || binding.daemon_session != authenticated_session
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+
+        let Some((owner_record, owner)) = self
+            .read_maintenance_trigger_store_decision_owner(
+                active_state_fence,
+                &trigger.trigger_id,
+                lifecycle.retained_revision,
+            )
+            .await?
+        else {
+            // This is the only absence that proves no decision owner exists:
+            // the exact named operation returned null under the active fence.
+            return Ok(None);
+        };
+        let operation_id = OperationId::new(owner.operation_id.clone())
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch)?;
+        let (receipt, receipt_digest) = self
+            .read_maintenance_trigger_store_receipt(active_state_fence, &operation_id)
+            .await?;
+        let decision = MaintenanceTriggerDecisionReceipt {
+            wire_id: MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION,
+            trigger_id: owner.trigger_id.clone(),
+            operation_hash: owner.operation_hash.clone(),
+            revision: owner.trigger_revision,
+            evaluation_revision: owner.evaluation_revision.clone(),
+            policy_revision: owner.policy_revision.clone(),
+            scope_ref: owner.scope_ref.clone(),
+            job_ref: owner.job_ref.clone(),
+            recommendation_ref: owner.recommendation_ref.clone(),
+            wake_ref: owner.wake_ref.clone(),
+            canonical_receipt_ref: receipt.operation_id.to_string(),
+            receipt_digest,
+        };
+        decision
+            .validate()
+            .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+        decision
+            .matches_trigger(trigger)
+            .map_err(MaintenanceTriggerLifecycleFailure::from_protocol_error)?;
+        if decision.revision != lifecycle.retained_revision {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        if !receipt
+            .ordering_sequences
+            .iter()
+            .any(|head| head.scope.as_str() == decision.scope_ref)
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        if !maintenance_trigger_receipt_contains_intents(&receipt, &decision) {
+            return Err(MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound);
+        }
+        Self::validate_maintenance_trigger_store_decision_owner(
+            &owner_record,
+            &owner,
+            &decision,
+            &receipt,
+        )?;
+
+        let decision_record = maintenance_trigger_decision_record(&decision)?;
+        if self.is_fenced() {
+            return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
+        }
+        self.refuse_shadow_mutation()
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ShadowMutationRefused)?;
+        self.validate_active_route(active_state_fence)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        let now_ms = maintenance_trigger_now_ms()?;
+        let persisted = ors
+            .record_recovered_maintenance_trigger_decision(
+                &trigger.trigger_id,
+                lifecycle.state_revision,
+                binding,
+                decision_record.clone(),
+                decision_record.clone(),
+                now_ms,
+            )
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+        persisted
+            .validate()
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
+        if self.is_fenced() {
+            return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
+        }
+        self.validate_active_route(active_state_fence)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+
+        // Re-open ORS after the write. A returned mutation value alone is not
+        // the readback required before exposing a recovered receipt for ack.
+        let (_, readback_trigger, readback) =
+            load_maintenance_trigger_context(ors, &trigger.trigger_id)?;
+        if readback_trigger.trigger_id != trigger.trigger_id
+            || readback_trigger.operation_hash != trigger.operation_hash
+            || readback != persisted
+            || !readback.recovered_from_store
+            || readback.retained_revision != lifecycle.retained_revision
+            || !matches!(
+                &readback.phase,
+                MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                    | MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Reconciling
+            )
+            || readback.claim.as_ref() != Some(binding)
+            || readback.decision_record.as_ref() != Some(&decision_record)
+            || readback.downstream_intent_record.as_ref() != Some(&decision_record)
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        self.read_maintenance_trigger_canonical_receipt(
+            active_state_fence,
+            &readback_trigger,
+            &readback,
+            &decision,
+        )
+        .await?;
+        Ok(Some(decision))
     }
 
     /// Looks up the exact committed Store receipt retained for one active
@@ -3319,12 +3535,32 @@ impl KernelStoreGateway {
             .as_ref()
             .or(lifecycle.downstream_intent_record.as_ref());
         let Some(record) = record else {
-            return Ok(None);
+            if lifecycle.recovered_from_store
+                || lifecycle.phase != MaintenanceTriggerLifecyclePhase::Claimed
+            {
+                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+            }
+            return self
+                .recover_maintenance_trigger_decision_from_store(
+                    active_state_fence,
+                    authenticated_session,
+                    &trigger,
+                    &lifecycle,
+                    &binding,
+                    ors,
+                )
+                .await;
         };
         let decision: MaintenanceTriggerDecisionReceipt =
             maintenance_trigger_parse_canonical(record)?;
         let expected = maintenance_trigger_decision_record(&decision)?;
         if record != &expected {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        if lifecycle.recovered_from_store
+            && (lifecycle.decision_record.as_ref() != Some(&expected)
+                || lifecycle.downstream_intent_record.as_ref() != Some(&expected))
+        {
             return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
         }
         self.read_maintenance_trigger_canonical_receipt(
