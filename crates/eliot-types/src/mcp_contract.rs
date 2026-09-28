@@ -292,6 +292,35 @@ pub fn agent_candidate_input_schema() -> Value {
 
 /// Capture-first observation input. The server supplies the trusted session,
 /// project and task context; callers cannot select an arbitrary project.
+///
+/// `hint` and `schema_version` keep their existing decoder state in this
+/// increment, and that is a recorded decision, not a default:
+///
+/// - `schema_version` is contract-required and `dispatch_observe` already pins
+///   `OBSERVE_INPUT_SCHEMA_VERSION`, rejecting anything else. Removing the
+///   default would move that check earlier (absent key = typed missing-field
+///   failure rather than a silent promotion to current) and invents no version
+///   field — `schema_version` and its constant already exist on this wire.
+///   BLOCKED-BY: the *contract* is generated from this type, and
+///   `eliot.observe` is published in the MCP tool catalogue whose
+///   `schema_sha256` and required-key set are the agent-visible wire. Making a
+///   previously omittable key required changes `tools/list` output bytes for
+///   every connected agent, which is a major incompatibility under APPENDIX-P
+///   and needs the catalogue owner, not this crate's file scope.
+/// - `hint`'s `alias = "kind"` is a genuine W4 defect: the current decoder
+///   trial-accepts the same classification hint under two names, and APPENDIX-P
+///   requires the current decoder to fail closed on a closed control variant.
+///   But removing it breaks any producer still sending `kind`, and #708 forbids
+///   compensating with an alias, `untagged` or a default. BLOCKED-BY: renaming
+///   owner is `eliot-mcp`'s request-validation surface
+///   (`crates/surfaces/eliot-mcp/src/core.rs::decode_protected_request_bytes`),
+///   outside this issue's exclusive mutable scope, and it needs an integration
+///   turn with a named compatibility boundary.
+///
+/// The remaining `#[serde(default)]` fields stay: `task_id`,
+/// `expected_reuse_note` and `write_id` are genuinely optional agent choices,
+/// and `affected_resources` / `source_handles` are explicit no-authority sets
+/// whose empty value is a real answer, not an inferred one.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveInput {

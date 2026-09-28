@@ -406,9 +406,45 @@ impl ReplayEvaluationIntegrityReceipt {
     }
 }
 
-/// Decoder: derived and closed. The `#[serde(default)]` meta fields keep
-/// pre-meta harness records readable and decode as absent or explicitly
-/// uncertain (`InsufficientEvidence`); none of them can promote a candidate.
+/// Decoder: derived and closed. The experiment meta fields below are
+/// contract-required once a `HarnessExperimentRecord` exists at all: they carry
+/// the candidate identity, the baseline/candidate policy pair, the fixed
+/// replay and holdout sets, the reproducibility digest, the declared
+/// uncertainty and the resulting decision. `#[serde(default)]` let an omitted
+/// key decode into `""` / `[]` / `InsufficientEvidence`, so a truncated or
+/// partial record could present itself as a decision-bearing experiment record
+/// with no reproducible basis. Each is now required on the wire; omission fails
+/// with the derived typed missing-field error (the existing owner, same pattern
+/// as the merged #722/#3155 and #708/#3437 increments).
+///
+/// Compatibility: this record is persisted through
+/// `eliot-store`'s canonical projection (`canonical_projection.rs`,
+/// `harness_experiments: Vec<CanonicalRecord<HarnessExperimentRecord>>`) and
+/// read back by `replay_view.rs`. Every current producer sets all of these
+/// explicitly — `harness_experiment_record`, the meta gate record at
+/// `eliot-engine/src/eval.rs:3098` and the fixture at `:3562` all construct the
+/// full literal, including `""` and empty vectors. `Serialize` is untouched, so
+/// accepted and emitted bytes are unchanged and this is a compatible requiredness
+/// correction, not a new version. The previously documented "pre-meta" tolerance
+/// is withdrawn here: no named/versioned legacy decoder exists for this record
+/// (there is no `schema_version` on it and none may be invented, W4), so a
+/// truncated record now fails loudly instead of decoding as a decision-bearing
+/// experiment with an empty basis. Previously buggy permissiveness is not a
+/// promised compatibility (issue body, "Field inventory and required
+/// treatment").
+///
+/// `authorized_command_ref`, `authoritative_isolation_rejection` and
+/// `authoritative_policy_candidate` are `Option` with no `default`: these are
+/// three genuinely optional fields, and `Option` alone already separates absent
+/// from `null` from a value without manufacturing one — an authorized command,
+/// an isolation rejection and a policy candidate each either exist or do not.
+/// `disposition_receipt` is different and deliberately keeps
+/// `#[serde(default, skip_serializing_if)]`: the receipt is stamped back onto
+/// the stored body *after* serialization, so the canonical bytes on disk omit
+/// the key whenever it is `None`. Dropping `default` there would make a
+/// store-written record unreadable by its own type (the round-trip trap).
+/// `InsufficientEvidence` is now reachable only by a writer that says so
+/// explicitly, never by omission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessExperimentRecord {
@@ -418,49 +454,27 @@ pub struct HarnessExperimentRecord {
     pub verdict_id: Option<EvalVerdictId>,
     pub notes: Vec<String>,
     pub no_mutation_confirmed: bool,
-    #[serde(default)]
     pub project_id: Option<ProjectId>,
-    #[serde(default)]
     pub candidate_ref: String,
-    #[serde(default)]
     pub change_class: MetaCandidateChangeClass,
-    #[serde(default)]
     pub changed_variables: Vec<String>,
-    #[serde(default)]
     pub evaluator_snapshot_ref: String,
-    #[serde(default)]
     pub baseline_policy_hash: String,
-    #[serde(default)]
     pub candidate_policy_hash: String,
-    #[serde(default)]
     pub fixed_replay_set_ref: String,
-    #[serde(default)]
     pub holdout_set_ref: String,
-    #[serde(default)]
     pub replay_run_refs: Vec<String>,
-    #[serde(default)]
     pub holdout_run_refs: Vec<String>,
-    #[serde(default)]
     pub primary_metric_refs: Vec<String>,
-    #[serde(default)]
     pub counter_metric_refs: Vec<String>,
-    #[serde(default)]
     pub reproducibility_hash: String,
-    #[serde(default)]
     pub uncertainty: String,
-    #[serde(default)]
     pub decision: MetaExperimentDecision,
-    #[serde(default)]
     pub authorized_command_ref: Option<String>,
-    #[serde(default)]
     pub rollback_target_ref: String,
-    #[serde(default)]
     pub rollback_command_ref: String,
-    #[serde(default)]
     pub authoritative_metric_evidence: Vec<CanonicalMetaMetricEvidence>,
-    #[serde(default)]
     pub authoritative_isolation_rejection: Option<MetaIsolationRejectionRecord>,
-    #[serde(default)]
     pub authoritative_policy_candidate: Option<ExperimentalMetaPolicyCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition_receipt: Option<WriteReceiptRef>,
@@ -568,12 +582,16 @@ pub struct CanonicalMetaMetricEvidence {
     pub evidence_hash: String,
 }
 
+/// Decoder: derived and closed. `source_experiment_ref` names the experiment
+/// whose isolation was breached; an omitted key would decode it as `""`, which
+/// is not an experiment identity and can never match a real one. It is now
+/// required on the wire and omission fails with the derived typed missing-field
+/// error (the existing owner).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetaIsolationRejectionRecord {
     pub rejection_id: String,
     pub project_id: ProjectId,
-    #[serde(default)]
     pub source_experiment_ref: String,
     pub candidate_ref: String,
     pub derived_fence: MetaIsolationFence,
@@ -607,12 +625,19 @@ pub struct MetaPolicyAuthorization {
     pub exact_action_hash: String,
 }
 
+/// Decoder: derived and closed. `operator_command_ref` is the authorized
+/// operator command that authorized this promotion or rollback; an omitted key
+/// would decode it as `""`, which is not an operator command and can never
+/// match a real one. It is now required on the wire and omission fails with the
+/// derived typed missing-field error (the existing owner). `resulting_candidate`
+/// keeps explicit `Option` presence: a promote produces a candidate and a
+/// rollback does not, and that difference must stay observable rather than
+/// being defaulted either way.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetaPolicyExecutionReceipt {
     pub execution_id: String,
     pub candidate_id: String,
-    #[serde(default)]
     pub operator_command_ref: String,
     pub action: MetaPolicyExecutionAction,
     pub before_hash: String,
@@ -620,7 +645,6 @@ pub struct MetaPolicyExecutionReceipt {
     pub rollback_target_hash: String,
     pub exact_action_hash: String,
     pub active_policy: ExperimentalMetaPolicyPayload,
-    #[serde(default)]
     pub resulting_candidate: Option<ExperimentalMetaPolicyCandidate>,
     #[serde(with = "time::serde::rfc3339")]
     pub executed_at: OffsetDateTime,
