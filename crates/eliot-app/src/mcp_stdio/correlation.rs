@@ -1148,9 +1148,9 @@ impl CommitEvidence {
 
 /// Explicit assessment state of one correlated invocation (issue #2899, item 6).
 ///
-/// Pending, unavailable, gapped, and unknown states are not degradation:
-/// they prescribe no fault recovery. Fault states arise only from competent
-/// host evidence or a directly observed local emission failure.
+/// Pending, unavailable, gapped, unknown, and local-emission-failed states
+/// are not degradation: they prescribe no fault recovery. Route-fault states
+/// arise only from competent host evidence or an owner-recorded disconnect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CorrelationAssessmentState {
@@ -1344,12 +1344,16 @@ pub(crate) struct Assessment {
 
 /// Derives the route assessment from observed cause plus operation disposition.
 ///
-/// Decision order is strongest-evidence-first: a directly observed local
-/// emission failure, then an explicit host terminal, then an owner-recorded
-/// disconnect, then a complete interval past deadline, then coverage-only
-/// pending states. Misclassification requires a proven success envelope: a
-/// host error against an error envelope (or an unobserved relayed envelope)
-/// is consistent surfacing, not a route fault.
+/// A provably flushed frame is a precondition, not a verdict: emission alone
+/// never yields a degradation code or a recovery directive (issue #2899). A
+/// record that never reached the pipe is a local fact and stays local — it
+/// prescribes no host-facing route recovery. Among emissions that provably
+/// reached the pipe, decision order is strongest-evidence-first: an explicit
+/// host terminal, then an owner-recorded disconnect, then a complete interval
+/// past deadline, then coverage-only pending states. Only those evidenced
+/// states derive recovery. Misclassification requires a proven success
+/// envelope: a host error against an error envelope (or an unobserved relayed
+/// envelope) is consistent surfacing, not a route fault.
 pub(crate) fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
     let emission = inputs.emission;
     let mut evidence = AssessmentEvidence {
@@ -1358,18 +1362,10 @@ pub(crate) fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
         transport_edge: inputs.transport_edge,
     };
     if !emission.emitted_exactly_once() {
-        let state = CorrelationAssessmentState::EliotEmissionFailed;
-        let recovery = derive_recovery(
-            &emission.identity.identity_digest,
-            state,
-            inputs.operation_binding,
-            inputs.canonical,
-            inputs.ui_confirmed_stale,
-        );
         return Assessment {
-            state,
+            state: CorrelationAssessmentState::EliotEmissionFailed,
             degradation: None,
-            recovery,
+            recovery: None,
             evidence,
         };
     }
@@ -1509,11 +1505,13 @@ fn degradation_for(
 /// Derives typed, bounded recovery from state plus dispositions.
 ///
 /// Recovery order is per-cause, never a common list: healthy completion
-/// recovers nothing; pending states recover nothing; possible or unknown
-/// canonical outcomes reconcile read-only first; same-operation replay
-/// appears only from an owner-validated binding whose approved options
-/// include resubmission in a lawful retry state. Every fault recovery
-/// terminates in bounded escalation with the correlation record attached.
+/// recovers nothing; pending states recover nothing; a directly observed local
+/// emission failure is a local fact and recovers nothing host-facing; possible
+/// or unknown canonical outcomes reconcile read-only first; same-operation
+/// replay appears only from an owner-validated binding whose approved options
+/// include resubmission in a lawful retry state. Every evidenced route-fault
+/// recovery terminates in bounded escalation with the correlation record
+/// attached.
 pub(crate) fn derive_recovery(
     identity_digest: &str,
     state: CorrelationAssessmentState,
@@ -1534,7 +1532,8 @@ pub(crate) fn derive_recovery(
         CorrelationAssessmentState::HostReportedInvocationError
         | CorrelationAssessmentState::EmissionSucceededAwaitingHostObservation
         | CorrelationAssessmentState::HostObservationUnavailableOrGapped
-        | CorrelationAssessmentState::TransportOutcomeUnknown => return None,
+        | CorrelationAssessmentState::TransportOutcomeUnknown
+        | CorrelationAssessmentState::EliotEmissionFailed => return None,
         CorrelationAssessmentState::ResponseMisclassifiedByHost => {
             misclassified_recovery(canonical, resubmit_allowed)
         }
@@ -1555,12 +1554,11 @@ pub(crate) fn derive_recovery(
             actions.push(RecoveryAction::RefreshDesktopView);
             actions
         }
-        CorrelationAssessmentState::EliotEmissionFailed => {
-            emission_failed_recovery(canonical, resubmit_allowed)
-        }
     };
-    // Every arm above is a fault state or a stale completion: each terminates
-    // in bounded escalation, so a proven fault never prescribes nothing.
+    // Every arm above is an evidenced fault state or a stale completion: each
+    // terminates in bounded escalation, so a proven fault never prescribes
+    // nothing. A pending state and a local emission failure reach no arm and
+    // recover nothing.
     actions.push(RecoveryAction::EscalateWithCorrelationEvidence);
     Some(RecoveryDirective {
         actions,
@@ -1580,24 +1578,6 @@ fn misclassified_recovery(
     } else {
         Vec::new()
     }
-}
-
-/// Recovery for a directly observed local emission failure.
-fn emission_failed_recovery(
-    canonical: &CanonicalDisposition,
-    resubmit_allowed: bool,
-) -> Vec<RecoveryAction> {
-    let mut actions = vec![RecoveryAction::ReconnectStdioRoute];
-    if matches!(
-        canonical,
-        CanonicalDisposition::RolledBack | CanonicalDisposition::FailedBeforeStage
-    ) && resubmit_allowed
-    {
-        actions.push(RecoveryAction::ResubmitSameOperationIdentity);
-    } else if canonical.needs_reconciliation_first() {
-        actions.push(RecoveryAction::QueryStatusTool);
-    }
-    actions
 }
 
 /// One append-only assessment revision under a logical correlation.
