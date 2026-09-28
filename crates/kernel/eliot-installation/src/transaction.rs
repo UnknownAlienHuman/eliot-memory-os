@@ -14,11 +14,13 @@ use super::{
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
-    RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
+    ProfileGovernedRoots, ProfileSelectionResolution, RuntimeStateRoots,
+    SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
     StoreCredentialProgress, candidate_manifest_digest, handle, handles,
-    ownership_secret_absence_evidence, phase_b_scm_digest, sha256_handle, sha256_hex,
-    validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
-    validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
+    ownership_secret_absence_evidence, phase_b_scm_digest, prove_unprivileged_selection,
+    sha256_handle, sha256_hex, validate_installer_effects, validate_package_binding,
+    validate_phase_b_effect_bindings, validate_staging_receipt_for_observation,
+    validate_staging_receipt_for_plan,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -506,6 +508,58 @@ impl PartialEq for PlannerConstructionProof {
 impl Eq for PlannerConstructionProof {}
 
 impl InstallationTransaction {
+    /// Returns the recorded I3.1 root binding this installation was planned
+    /// with, revalidated against the transaction's own recorded profile and
+    /// recorded runtime roots.
+    ///
+    /// This is the restart rehydration seam. It returns the value the
+    /// durable wire actually carries — the ORIGINAL recorded binding — and
+    /// never re-derives a layout from today's environment. A transaction
+    /// carrying no profile-governed binding, or one whose recorded binding
+    /// disagrees with its recorded profile or candidate runtime roots, is a
+    /// typed refusal rather than a fresh resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::MigrationRequired`] when the transaction
+    /// predates profile-governed planning, and
+    /// [`InstallationError::ProfileViolation`] when the recorded binding
+    /// disagrees with the recorded profile or retained roots.
+    pub fn rehydrate_profile_binding(
+        &self,
+    ) -> Result<ProfileSelectionResolution, InstallationError> {
+        let binding = self.profile_governed_roots.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
+                reason: format!(
+                    "transaction {} carries no profile-governed root binding; its installation layout requires an explicit migration/import disposition",
+                    self.transaction_id
+                ),
+            }
+        })?;
+        binding.validate(self.profile)?;
+        if binding.runtime_state_roots != self.candidate_manifest.runtime_launch.runtime_state_roots
+        {
+            return Err(InstallationError::ProfileViolation(
+                "recorded profile-governed roots disagree with the recorded candidate runtime roots"
+                    .to_owned(),
+            ));
+        }
+        let governed = ProfileGovernedRoots {
+            profile: self.profile,
+            immutable_binaries: binding.immutable_binaries.clone(),
+            durable_data: binding.durable_data.clone(),
+            user_config: binding.user_config.clone(),
+            user_cache: binding.user_cache.clone(),
+        };
+        let unprivileged_proof =
+            prove_unprivileged_selection(&governed, &binding.runtime_state_roots)?;
+        Ok(ProfileSelectionResolution {
+            roots: binding.clone(),
+            governance: governed.governance_report(),
+            unprivileged_proof,
+        })
+    }
+
     /// Creates a validated immutable plan at `PLANNED`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
