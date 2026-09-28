@@ -460,7 +460,9 @@ pub use eliot_runtime_contracts::{
     SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use eliot_runtime_contracts::{
-    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, SupervisionGenerationBinding,
+    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
+    ResumeIdentitySnapshot, ResumeProcessIdentity, SupervisionGenerationBinding,
+    revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
 #[cfg(test)]
