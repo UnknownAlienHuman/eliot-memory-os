@@ -27,9 +27,10 @@
 //! not emit one alert per occurrence; a material revision, verified recovery or
 //! Human disposition reopens that notification key." [`AutomationFailureKey`] is
 //! therefore the decision's *own* stable identity — `family`, `scope_ref`,
-//! `reason`, `decision`, `trigger_id` — and nothing else. No clock, counter, or
-//! per-observation value enters the key, so a repeat of the same failure under
-//! the same admitted fence yields the same `dedup_key`.
+//! `reason`, `decision`, `trigger_id` — together with the bound policy episode,
+//! requested catalog route and actual route evidence. No clock, counter, or
+//! per-observation value enters the key, so a repeat under unchanged evidence
+//! yields the same `dedup_key`.
 //!
 //! Read that sentence against the store's own upsert, because it decides what
 //! this emitter may do. `NotificationStore::upsert` refuses a draft that does
@@ -145,7 +146,10 @@ use eliot_governor::{
 use eliot_kernel_core::{
     DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity,
 };
-use eliot_maintenance::AutomationTriggerDecision;
+use eliot_maintenance::{
+    AutomationTriggerDecision, MaintenanceAutomationMode, MaintenancePolicyEvidence,
+    MaintenanceRouteEvidence,
+};
 use eliot_platform::PlatformHandle;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
@@ -241,10 +245,50 @@ pub enum NotificationStateEmit {
     },
 }
 
+/// Policy and actual-route evidence observed for the decision being recorded.
+///
+/// The policy is bound to the decision's family and scope before it can affect
+/// the fingerprint or canonical record. Optional publisher fields remain
+/// absent until their owners publish them; this type does not synthesize policy
+/// revisions or route identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceNotificationEvidence {
+    /// Human-owned policy evidence selected for this family and scope.
+    pub policy: MaintenancePolicyEvidence,
+    /// Actual admitted route evidence, when an owner has published it.
+    pub route: MaintenanceRouteEvidence,
+}
+
+impl MaintenanceNotificationEvidence {
+    /// Refuses policy evidence issued for a different family, scope, or mode.
+    pub fn validate_for(&self, decision: &AutomationTriggerDecision) -> Result<(), StoreError> {
+        if self.policy.family != decision.family {
+            return Err(StoreError::InvalidField {
+                field: "maintenance_policy.family",
+                reason: "policy evidence family must match the trigger decision",
+            });
+        }
+        if self.policy.scope_ref != decision.scope_ref {
+            return Err(StoreError::InvalidField {
+                field: "maintenance_policy.scope_ref",
+                reason: "policy evidence scope must match the trigger decision",
+            });
+        }
+        if self.policy.mode != super::maintenance_family_catalog::entry_for(decision.family).mode {
+            return Err(StoreError::InvalidField {
+                field: "maintenance_policy.mode",
+                reason: "policy evidence mode must match the registered family mode",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The stable failure fingerprint of one admitted automation decision.
 ///
-/// This is I11.12's "automation revision and failure fingerprint" and nothing
-/// else: the decision's own identity, never a fresh value per observation.
+/// This is I11.12's "automation revision and failure fingerprint": the
+/// decision's own identity plus its bound policy and route evidence, never a
+/// fresh value per observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationFailureKey {
     /// The store's record id and coalescing index: exactly one record.
@@ -269,38 +313,55 @@ pub struct AutomationFailureKey {
 /// Derives the one stable failure fingerprint of an admitted automation
 /// decision.
 ///
-/// The key is the canonical-JSON digest of exactly `(family, scope_ref,
-/// reason, decision, trigger_id)`. Every component is the decision's own stable
-/// identity as produced by the Governor-owned evaluator, so two evaluations of
-/// the same failure under the same admitted fence yield the same key and
-/// therefore update one record.
+/// The key is the canonical-JSON digest of the decision identity, policy
+/// episode, requested catalog route and actual admitted route evidence. Missing
+/// publisher fields remain `None` in that identity. Replaying the same decision
+/// under unchanged evidence yields the same key; a material policy or route
+/// change yields a distinct canonical record.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] when a closed maintenance discriminator does not
-/// render its declared wire form or the identity cannot be serialized
-/// canonically.
+/// Returns [`StoreError`] when evidence is bound to a different family/scope,
+/// a closed discriminator does not render its declared wire form, or the
+/// identity cannot be serialized canonically.
 pub fn automation_failure_key(
     decision: &AutomationTriggerDecision,
+    evidence: &MaintenanceNotificationEvidence,
 ) -> Result<AutomationFailureKey, StoreError> {
+    evidence.validate_for(decision)?;
     let family_decision =
         super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
-    automation_failure_key_with_family_decision(decision, &family_decision)
+    automation_failure_key_with_family_decision(decision, &family_decision, evidence)
 }
 
 fn automation_failure_key_with_family_decision(
     decision: &AutomationTriggerDecision,
     family_decision: &super::maintenance_family_catalog::MaintenanceFamilyDecision,
+    evidence: &MaintenanceNotificationEvidence,
 ) -> Result<AutomationFailureKey, StoreError> {
     let family = closed_wire_name(decision.family)?;
     let reason = closed_wire_name(decision.reason)?;
     let outcome = closed_wire_name(decision.decision)?;
+    let mode = closed_wire_name(evidence.policy.mode)?;
+    let requested_route = (
+        family_decision.route.target(),
+        family_decision.route.missing(),
+    );
     let identity = (
         family.as_str(),
         decision.scope_ref.as_str(),
         reason.as_str(),
         outcome.as_str(),
         decision.trigger_id.as_str(),
+        mode.as_str(),
+        evidence.policy.revision,
+        evidence.policy.digest.as_deref(),
+        evidence.policy.override_provenance.as_deref(),
+        requested_route,
+        evidence.route.capability_fingerprint.as_deref(),
+        evidence.route.generation,
+        evidence.route.credential_ref.as_deref(),
+        evidence.route.unattended_suitable,
     );
     let fingerprint = sha256_hex(
         &canonical_json_bytes(&identity)
@@ -312,11 +373,16 @@ fn automation_failure_key_with_family_decision(
         subject: format!("blocked maintenance automation {family}"),
         summary: format!(
             "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
-             Governor admits job: {}; catalog route admits start: {}; trigger identity {}",
+             Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
+             policy episode {}; requested route {} (missing {}); actual route {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
-            decision.trigger_id
+            decision.trigger_id,
+            policy_episode_summary(&mode, evidence),
+            requested_route.0,
+            requested_route.1,
+            actual_route_summary(evidence),
         ),
         // Preserve the Governor's closed reason above and carry the catalog's
         // exact one actionable recommendation, including its reason, evidence,
@@ -461,13 +527,10 @@ pub async fn notification_already_recorded(
 /// decision whose record is already stored is I11.12's repeat rather than a
 /// new occurrence; both return `Ok(None)` without touching the store.
 ///
-/// The `off`-mode guard refuses a *proactive* decision only. A `Block` or
-/// `Defer` decision is the durable record of a refusal, and I14.22:94 requires
-/// exactly that to be preserved: "If automation is disabled, the required route
-/// is unavailable or budget is exhausted, ELIOT preserves one actionable
-/// recommendation with reason, evidence, expected benefit, cost, expiry and safe
-/// deferral consequence. It does not repeatedly notify or pretend maintenance
-/// occurred." See [`records_a_refusal`] for the exact split.
+/// `Off` returns before any canonical read/write. This prevents a missing route
+/// from becoming a proactive recommendation when automation is disabled. The
+/// verified mandatory safety/recovery evidence needed for I14.22's exception is
+/// not published to this path, so it does not bypass this guard.
 ///
 /// Stated rather than implied: the second guard below,
 /// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
@@ -489,40 +552,21 @@ pub async fn emit_blocked_automation_notification(
     kernel: &Arc<DaemonKernelClient>,
     state_fence: StateFence,
     decision: &AutomationTriggerDecision,
+    evidence: &MaintenanceNotificationEvidence,
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
     let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
-    // #1692 kept, #1693 narrowed. #1692 (#3641) added this guard so that an
-    // unresolved Human policy cannot publish a proactive maintenance
-    // recommendation, and that intent is preserved exactly: I14.22:37 defines
-    // `off` as "no automatic job or proactive recommendation, except mandatory
-    // safety/recovery obligations", so a `Start` or a `Suggest` is still
-    // refused while the selected mode is `Off`.
-    //
-    // What is NOT preserved is the unconditional early return the same commit
-    // added for every decision. `eliot_maintenance::MaintenanceController::evaluate_trigger`
-    // itself answers mode `Off` with `(Block, AutomationOff)`, so the
-    // unconditional form returned `Ok(None)` for all fifteen families before any
-    // durable I/O, and the caller in `daemon_runtime.rs` discarded it: a
-    // triggered family was silently ignored, which is the one outcome A1
-    // forbids. A `Block`/`Defer` decision states that work was NOT started, so
-    // recording it cannot be a proactive recommendation and `off` does not
-    // forbid it.
-    //
-    // Ownership is not part of the predicate, and deliberately so: a family
-    // with a real execution owner and a family with none at all both owe the
-    // operator the same refusal record. What `MaintenanceExecutionOwner::is_owned`
-    // selects is only WHICH exact absence that record names, through
-    // `MaintenanceFamilyEntry::recommendation`.
-    if family_entry.mode == eliot_maintenance::MaintenanceAutomationMode::Off
-        && !records_a_refusal(decision.decision)
-    {
+    evidence.validate_for(decision)?;
+    // Off must not turn a missing route into a proactive board recommendation.
+    // The verified mandatory safety/recovery publisher is not connected here,
+    // so this path has no safety bypass. Return before any canonical read/write.
+    if evidence.policy.mode == MaintenanceAutomationMode::Off {
         return Ok(None);
     }
     let family_decision = family_entry.decide(decision);
     if decision.admits_job && family_decision.admits_start {
         return Ok(None);
     }
-    let key = automation_failure_key_with_family_decision(decision, &family_decision)?;
+    let key = automation_failure_key_with_family_decision(decision, &family_decision, evidence)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     if notification_already_recorded(&reads, &key, &state_fence).await? {
         return Ok(None);
@@ -596,35 +640,35 @@ pub async fn emit_blocked_automation_notification(
     }))
 }
 
-/// Whether one Governor decision is the durable record of a REFUSAL rather
-/// than a proactive act.
-///
-/// I14.22:56 fixes the closed decision vocabulary this emitter receives, and
-/// only two of its six members are refusals:
-///
-/// * [`eliot_maintenance::AutomationDecision::Block`] — "Policy, route,
-///   budget or session requirements deny execution";
-/// * [`eliot_maintenance::AutomationDecision::Defer`] — "Preserve the trigger
-///   for a later eligible window".
-///
-/// Both state that the family did NOT run, so writing them is not "a
-/// proactive recommendation" and I14.22:37's `off` does not forbid it. The
-/// other members are refused while `off` holds: `Start` and `Suggest` are the
-/// two proactive acts `off` names outright; `Escalate` hands work to a Human
-/// or recovery owner rather than stating this family's disposition;
-/// `SuppressDuplicate` is I11.12's repeat, already coalesced onto the one
-/// stored record by the identical key.
-///
-/// Stated rather than implied: `eliot_maintenance::MaintenanceController::evaluate_trigger`
-/// has no `Escalate` arm and this daemon holds `active_job_id` at `None`
-/// (`crate::maintenance_trigger_evaluator::UNRESOLVED_AUTHORITIES`), so the
-/// two arms this predicate excludes beyond `Start`/`Suggest` cannot currently
-/// reach it. The exclusion is written from I14.22's own definitions, not from
-/// today's reachability.
-fn records_a_refusal(decision: eliot_maintenance::AutomationDecision) -> bool {
-    matches!(
-        decision,
-        eliot_maintenance::AutomationDecision::Block | eliot_maintenance::AutomationDecision::Defer
+fn policy_episode_summary(mode: &str, evidence: &MaintenanceNotificationEvidence) -> String {
+    if evidence.policy.revision.is_none()
+        && evidence.policy.digest.is_none()
+        && evidence.policy.override_provenance.is_none()
+    {
+        return "unpublished".to_owned();
+    }
+    format!(
+        "mode={mode}, revision={:?}, digest={}, override_provenance={}",
+        evidence.policy.revision,
+        evidence.policy.digest.as_deref().unwrap_or("unpublished"),
+        if evidence.policy.override_provenance.is_some() {
+            "present"
+        } else {
+            "unpublished"
+        },
+    )
+}
+
+fn actual_route_summary(evidence: &MaintenanceNotificationEvidence) -> String {
+    format!(
+        "fingerprint={}, generation={:?}, unattended_suitable={}",
+        evidence
+            .route
+            .capability_fingerprint
+            .as_deref()
+            .unwrap_or("unpublished"),
+        evidence.route.generation,
+        evidence.route.unattended_suitable,
     )
 }
 

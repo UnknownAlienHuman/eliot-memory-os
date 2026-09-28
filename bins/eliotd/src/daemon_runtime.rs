@@ -1803,21 +1803,23 @@ fn maintenance_notification_candidate(
 ) -> Option<(
     eliot_contracts::StateFence,
     eliot_maintenance::AutomationTriggerDecision,
+    eliotd::notification_state_emit::MaintenanceNotificationEvidence,
 )> {
-    let decision = match composition.evaluate_maintenance_trigger(observation) {
-        Ok(decision) => decision,
-        Err(error) => {
-            // #740 A14: the cadence re-evaluates every tick, so a standing
-            // refusal gates its record on this stream's guard instead of
-            // emitting unbounded repeats.
-            if failure_guard.should_emit() {
-                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+    let (decision, evidence) =
+        match composition.evaluate_maintenance_trigger_with_evidence(observation) {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                // #740 A14: the cadence re-evaluates every tick, so a standing
+                // refusal gates its record on this stream's guard instead of
+                // emitting unbounded repeats.
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
     match composition.notification_state_admission_fence() {
-        Ok(fence) => Some((fence, decision)),
+        Ok(fence) => Some((fence, decision, evidence)),
         Err(error) => {
             // No exchange is attempted until the composition exposes an
             // admitted Kernel fence. This remains a diagnostic gap, never a
@@ -1843,8 +1845,9 @@ async fn evaluate_and_emit_maintenance_notification(
         let guard = composition.lock().await;
         maintenance_notification_candidate(&guard, observation, failure_guard)
     };
-    if let Some((fence, decision)) = candidate {
-        note_blocked_automation_notification(kernel, fence, &decision, failure_guard).await;
+    if let Some((fence, decision, evidence)) = candidate {
+        note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
+            .await;
     }
 }
 
@@ -1967,10 +1970,11 @@ async fn note_blocked_automation_notification(
     kernel: &Arc<DaemonKernelClient>,
     fence: eliot_contracts::StateFence,
     decision: &eliot_maintenance::AutomationTriggerDecision,
+    evidence: &eliotd::notification_state_emit::MaintenanceNotificationEvidence,
     failure_guard: &mut RepeatedFailureGuard,
 ) {
     match eliotd::notification_state_emit::emit_blocked_automation_notification(
-        kernel, fence, decision,
+        kernel, fence, decision, evidence,
     )
     .await
     {
@@ -2159,16 +2163,18 @@ async fn run_health_heartbeat_tick(
         // Same tolerance as `DaemonComposition::note_maintenance_trigger`: a
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
-        let blocked_automation = match guard.evaluate_maintenance_trigger(maintenance_observation(
-            MaintenanceTriggerOrigin::AdmittedObservation,
-            &[
-                format!("store_health={:?}", health.status),
-                health.manifest_digest.as_str().to_owned(),
-            ],
-            activation_in_flight,
-        )) {
-            Ok(decision) => match guard.notification_state_admission_fence() {
-                Ok(fence) => Some((fence, decision)),
+        let blocked_automation = match guard.evaluate_maintenance_trigger_with_evidence(
+            maintenance_observation(
+                MaintenanceTriggerOrigin::AdmittedObservation,
+                &[
+                    format!("store_health={:?}", health.status),
+                    health.manifest_digest.as_str().to_owned(),
+                ],
+                activation_in_flight,
+            ),
+        ) {
+            Ok((decision, evidence)) => match guard.notification_state_admission_fence() {
+                Ok(fence) => Some((fence, decision, evidence)),
                 // A not-ready composition is a typed refusal, not a reason to
                 // pretend there is no blocked automation: it is recorded with
                 // the same minimal diagnostics the evaluation refusal uses.
@@ -2191,8 +2197,9 @@ async fn run_health_heartbeat_tick(
         };
         (readiness_verdict, readiness_report, blocked_automation)
     };
-    if let Some((fence, decision)) = blocked_automation {
-        note_blocked_automation_notification(kernel, fence, &decision, failure_guard).await;
+    if let Some((fence, decision, evidence)) = blocked_automation {
+        note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
+            .await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core
