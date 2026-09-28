@@ -155,8 +155,265 @@ pub struct ImprovementEvidenceView {
     pub retained_prior_proposal: Option<RetainedImprovementProposal>,
 }
 
+/// Closed target-surface vocabulary this maintenance owner bounds.
+///
+/// I12.24:297 bounds the active candidate backlog "by target surface and
+/// value", so the surface is the first key of the bound. These names are the
+/// `snake_case` wire spellings of the `meta.improvement` `ImprovementSurface`
+/// values; this crate deliberately declares its OWN closed copy rather than
+/// importing the candidate crate, exactly as it declares
+/// `ImprovementCandidateView` over that crate's cells without importing it.
+/// `from_name` refuses any other name, so a bound can never be attached to a
+/// surface vocabulary this owner does not define.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementTargetSurface {
+    /// Context/memory transformation surface.
+    Memory,
+    /// Skill surface.
+    Skill,
+    /// Tool profile surface.
+    ToolProfile,
+    /// Rule surface.
+    Rule,
+    /// Context packet compiler surface.
+    PacketCompiler,
+    /// Verifier surface.
+    Verifier,
+    /// Scheduler surface.
+    Scheduler,
+}
+
+impl ImprovementTargetSurface {
+    /// The closed wire spelling of this surface.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Skill => "skill",
+            Self::ToolProfile => "tool_profile",
+            Self::Rule => "rule",
+            Self::PacketCompiler => "packet_compiler",
+            Self::Verifier => "verifier",
+            Self::Scheduler => "scheduler",
+        }
+    }
+
+    /// Parses the closed wire spelling back into its surface.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.as_bytes() {
+            b"memory" => Some(Self::Memory),
+            b"skill" => Some(Self::Skill),
+            b"tool_profile" => Some(Self::ToolProfile),
+            b"rule" => Some(Self::Rule),
+            b"packet_compiler" => Some(Self::PacketCompiler),
+            b"verifier" => Some(Self::Verifier),
+            b"scheduler" => Some(Self::Scheduler),
+            _ => None,
+        }
+    }
+}
+
+/// One target surface's active-candidate bound, as decided by maintenance
+/// (`G-19`) and recorded in the same policy record that owns candidate
+/// admission (I12.24:297).
+///
+/// These are the only two bound dimensions I12.24:297 names — target surface
+/// (the key) and value (the ordering, here the `min_value` floor). The
+/// admitting surface does not restate them or re-derive them: it reads this
+/// record and builds its bound from it, so a `CandidateBoundPolicy` whose
+/// numbers disagree with this record is refused
+/// ([`ImprovementBoundError::BoundContentMismatch`]) rather than enforced.
+///
+/// No separate table, root record, scheduler, task graph or promotion
+/// authority is introduced. This is a field group on the EXISTING admission
+/// policy record, read through the EXISTING maintenance admission path
+/// (I12.24:314).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementSurfaceBound {
+    /// Target surface this bound applies to.
+    pub target_surface: ImprovementTargetSurface,
+    /// Maximum simultaneously active candidates on this surface.
+    ///
+    /// Must be non-zero: a zero bound admits nothing, which is a
+    /// contradiction rather than a bound.
+    pub max_active: u32,
+    /// Minimum owner-assessed value a candidate must reach to be active.
+    ///
+    /// Must be finite and non-negative. An archive claim derives from this
+    /// floor, so a negative or non-finite floor would make "below the floor"
+    /// undecidable.
+    pub min_value: f64,
+}
+
+/// Why a bound read from the maintenance admission policy was refused.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ImprovementBoundError {
+    /// The policy record carries no bound for the requested surface.
+    ///
+    /// An absent bound is never a default: I12.24:297 requires the backlog to
+    /// BE bounded, and a default would be this module inventing the number the
+    /// owner did not decide.
+    #[error("maintenance admission policy has no bound for surface {0:?}")]
+    NoBoundForSurface(ImprovementTargetSurface),
+    /// The bound itself is not a usable bound.
+    #[error("maintenance candidate bound is invalid: {0}")]
+    InvalidBound(&'static str),
+    /// The bound that was read is not the one the admitted operation uses.
+    #[error(
+        "candidate bound content does not match the maintenance admission policy: field {field}"
+    )]
+    BoundContentMismatch {
+        /// Which field of the bound disagrees.
+        field: &'static str,
+    },
+}
+
+/// Resolve the per-surface active-candidate bound this maintenance policy
+/// record decides, and check it against the bound an admitting surface built.
+///
+/// This is the whole of W1's owner half, and it is a pure function of the two
+/// records: no clock, I/O, or live query.
+///
+/// The second half is the check that makes the guarantee a CONTENT comparison
+/// rather than a shape check. `admitted` is the bound the admitting surface
+/// will actually enforce; each dimension is compared against the owner's own
+/// recorded value, so a caller cannot supply a well-formed bound with a
+/// different `max_active`, `min_value`, target surface, bound revision, or
+/// owning authority and have it accepted. A mismatch names the disagreeing
+/// field and never repairs it.
+///
+/// The policy's own text gates run first (its owner, operation and idempotency
+/// key are non-blank), so an unissued or half-filled policy record cannot
+/// authorize a bound.
+pub fn resolve_candidate_surface_bound(
+    policy: &ImprovementAdmissionPolicy,
+    surface: ImprovementTargetSurface,
+    admitted: &ImprovementSurfaceBound,
+) -> Result<ImprovementSurfaceBound, ImprovementBoundError> {
+    if policy.external_owner_id.trim().is_empty()
+        || policy.operation_ref.trim().is_empty()
+        || policy.idempotency_key.trim().is_empty()
+    {
+        return Err(ImprovementBoundError::InvalidBound(
+            "maintenance admission policy owner, operation and idempotency key are required",
+        ));
+    }
+    if admitted.target_surface != surface {
+        return Err(ImprovementBoundError::BoundContentMismatch {
+            field: "target_surface",
+        });
+    }
+    let decided = policy
+        .candidate_bounds
+        .iter()
+        .find(|bound| bound.target_surface == surface)
+        .ok_or(ImprovementBoundError::NoBoundForSurface(surface))?;
+    check_bound_shape(*decided)?;
+    check_bound_shape(*admitted)?;
+    if admitted.max_active != decided.max_active {
+        return Err(ImprovementBoundError::BoundContentMismatch {
+            field: "max_active",
+        });
+    }
+    if admitted.min_value.to_bits() != decided.min_value.to_bits() {
+        return Err(ImprovementBoundError::BoundContentMismatch { field: "min_value" });
+    }
+    Ok(*decided)
+}
+
+/// The shape rules both the decided and the admitted bound must satisfy, so
+/// `min_value.to_bits()` above is only ever comparing two usable bounds.
+fn check_bound_shape(bound: ImprovementSurfaceBound) -> Result<(), ImprovementBoundError> {
+    if bound.max_active == 0 {
+        return Err(ImprovementBoundError::InvalidBound(
+            "max_active must be non-zero",
+        ));
+    }
+    if bound.min_value < 0.0 || !bound.min_value.is_finite() {
+        return Err(ImprovementBoundError::InvalidBound(
+            "min_value must be a finite non-negative value",
+        ));
+    }
+    Ok(())
+}
+
+/// Owner identity of the maintenance (`G-19`) improvement admission decision.
+///
+/// This is the value a learning admission permit must carry as its
+/// `authority_ref` for a governed improvement-bound admission to be accepted:
+/// `eliot_improvement::candidate_bounds::CandidateBoundPolicy::validate_governed`
+/// compares the bound policy's owning authority against the authority bound in
+/// the owner-verified permit and refuses a disagreement. A caller that spells
+/// its own owner label instead of reading this constant therefore cannot be
+/// admitted, which is the point — the bound is owned by `G-19`, not by the
+/// daemon that happens to run the intake.
+pub const IMPROVEMENT_ADMISSION_AUTHORITY: &str = "governor.maintenance.G-19";
+
+/// The per-surface active-candidate bounds this maintenance owner decides
+/// (I12.24:297).
+///
+/// Owner-owned, closed, and deliberately minimal: one entry, for the single
+/// surface the maintenance improvement cells (`meta.learning.closure`,
+/// `meta.improvement.promotion_input`) actually admit candidates against. A
+/// second surface needs a second decision here, not a caller-supplied number.
+///
+/// The values are the owner's current decision, not a default derived from the
+/// code: `max_active = 8` is the simultaneous-active-candidate ceiling for the
+/// `Memory` surface and `min_value = 0.0` is its value floor (a candidate with
+/// no assessed expected value is not admitted to the active set). An
+/// unconfigured surface has no entry, and
+/// [`ImprovementBoundError::NoBoundForSurface`] is how that absence surfaces at
+/// the reading end.
+pub const IMPROVEMENT_CANDIDATE_BOUNDS: &[ImprovementSurfaceBound] = &[ImprovementSurfaceBound {
+    target_surface: ImprovementTargetSurface::Memory,
+    max_active: 8,
+    min_value: 0.0,
+}];
+
+/// Wire revision of the bound set [`IMPROVEMENT_CANDIDATE_BOUNDS`] represents.
+///
+/// Recorded on the bound so an admitting surface's policy revision is checked
+/// against the owner's current decision rather than a caller's own counter.
+pub const IMPROVEMENT_CANDIDATE_BOUNDS_REVISION: u64 = 1;
+
+/// Build the maintenance (`G-19`) improvement admission policy record for one
+/// exact operation.
+///
+/// This is the EXISTING admission policy record (I12.24's G-19 admission owner,
+/// `crates/meta/eliot-improvement/module.toml:35` "admission is owned outside
+/// this package by governor maintenance G-19"), carrying the per-surface bound
+/// fields I12.24:297 requires. It is a pure function of the operation identity
+/// the caller is admitting under: no clock, I/O, store read, or live query, and
+/// no second policy source.
+///
+/// `rollback_owner_id`, `require_independent_verifier` and the operation
+/// identity remain the caller's real values, exactly as they were before the
+/// bound fields existed. The BOUND is not the caller's: it is
+/// [`IMPROVEMENT_CANDIDATE_BOUNDS`], and a caller that wants a different bound
+/// must change this owner's decision, not this call.
+#[must_use]
+pub fn improvement_admission_policy(
+    operation_ref: &str,
+    idempotency_key: &str,
+    rollback_owner_id: &str,
+) -> ImprovementAdmissionPolicy {
+    ImprovementAdmissionPolicy {
+        external_owner_id: IMPROVEMENT_ADMISSION_AUTHORITY.to_owned(),
+        rollback_owner_id: rollback_owner_id.to_owned(),
+        operation_ref: operation_ref.to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        require_independent_verifier: true,
+        candidate_bounds: IMPROVEMENT_CANDIDATE_BOUNDS.to_vec(),
+    }
+}
+
 /// Policy governing improvement admission. No clock, I/O, or live query.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImprovementAdmissionPolicy {
     /// Governor admission owner deciding here.
@@ -169,6 +426,16 @@ pub struct ImprovementAdmissionPolicy {
     pub idempotency_key: String,
     /// Whether independent verification is required (always true in practice).
     pub require_independent_verifier: bool,
+    /// Per-surface active-candidate bounds this owner decides
+    /// (I12.24:297), read through
+    /// [`resolve_candidate_surface_bound`].
+    ///
+    /// Recorded on the EXISTING admission policy record rather than in a new
+    /// table, root record, or scheduler (I12.24:314). A surface absent from
+    /// this list is an unbound surface, and
+    /// [`ImprovementBoundError::NoBoundForSurface`] is how the absence
+    /// surfaces — never a default.
+    pub candidate_bounds: Vec<ImprovementSurfaceBound>,
 }
 
 /// Owner-defined cause of a rejected improvement candidate.
@@ -847,6 +1114,11 @@ mod tests {
             operation_ref: "op-1145-a".to_string(),
             idempotency_key: "idem-1145-a".to_string(),
             require_independent_verifier: true,
+            candidate_bounds: vec![ImprovementSurfaceBound {
+                target_surface: ImprovementTargetSurface::Memory,
+                max_active: 8,
+                min_value: 0.0,
+            }],
         }
     }
 

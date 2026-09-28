@@ -39,11 +39,14 @@ pub use end_of_activity::{
 };
 
 pub use improvement_admission::{
-    IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
-    IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT, ImprovementAdmissionDecision,
-    ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementBlockCause,
-    ImprovementBlockRemedy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementPulseOutcome, ImprovementRejectCause, admit_improvement_candidate,
+    IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS,
+    IMPROVEMENT_CANDIDATE_BOUNDS_REVISION, IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE,
+    IMPROVEMENT_PROMOTION_MODULE, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
+    ImprovementAdmissionDecision, ImprovementAdmissionError, ImprovementAdmissionPolicy,
+    ImprovementBlockCause, ImprovementBlockRemedy, ImprovementBoundError, ImprovementCandidateView,
+    ImprovementEvidenceView, ImprovementPulseOutcome, ImprovementRejectCause,
+    ImprovementSurfaceBound, ImprovementTargetSurface, admit_improvement_candidate,
+    improvement_admission_policy, resolve_candidate_surface_bound,
 };
 pub use improvement_pipeline::{
     ActivationEvidence, AdmittedResourceCeiling, AdmittedScopeRefinement, ExperimentPlan,
@@ -552,6 +555,26 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     /// Creates a controller over the caller-owned durable maintenance store.
     pub const fn new(store: S) -> Self {
         Self { store }
+    }
+
+    /// The maintenance (`G-19`) improvement admission policy record for one
+    /// exact operation, including the per-surface active-candidate bounds
+    /// I12.24:297 requires.
+    ///
+    /// This is the existing maintenance admission path, not a second one: the
+    /// same `G-19` owner that decides improvement candidate admission publishes
+    /// the bound it decides, so a caller enforcing a backlog bound reads the
+    /// owner's own record rather than choosing a number. Pure — no clock, I/O,
+    /// store read, or live query — and it adds no scheduler, root record, or
+    /// second policy source (I12.24:314).
+    #[must_use]
+    pub fn improvement_admission_policy(
+        &self,
+        operation_ref: &str,
+        idempotency_key: &str,
+        rollback_owner_id: &str,
+    ) -> ImprovementAdmissionPolicy {
+        improvement_admission_policy(operation_ref, idempotency_key, rollback_owner_id)
     }
 
     /// Evaluates one trigger without scheduling or executing a job.

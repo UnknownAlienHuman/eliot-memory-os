@@ -11,15 +11,21 @@
 //!   merged provenance (`merged_from`, unioned evidence/source refs).
 //! - Stale, ownerless, or low-value candidates leave the active set only
 //!   through an explicit [`ArchivedCandidate`] transition with a summary;
-//!   they are never silently dropped or silently retained. The governed
-//!   production entry [`BoundedBacklog::admit_reporting_pressure`] drives
-//!   that transition through [`BoundedBacklog::archive`] itself when the
-//!   surface bound is already full, and returns the [`ArchivedCandidate`]
-//!   receipts, so the bound-failure path is wired and auditable instead of
-//!   an unwired obligation on every caller. All three
-//!   [`ArchiveCause`] values have a live producer on that path: ownerless
-//!   and low value from live entry state, stale from the derived rule in
-//!   `archive_cause_for`.
+//!   they are never silently dropped or silently retained. That transition
+//!   now also drives the OWNER-decision lifecycle: the archive receipt carries
+//!   the [`ImprovementLifecycle`] the transition actually reached
+//!   ([`archive_cause_lifecycles`]), and every cause ends at
+//!   `ImprovementLifecycle::Archived` — a stale entry is recorded `Stale`
+//!   first, so both terminal dispositions have a live producer and no
+//!   candidate can be archived without its disposition being recorded.
+//!   The governed production entry
+//!   [`BoundedBacklog::admit_reporting_pressure`] drives that transition
+//!   through [`BoundedBacklog::archive`] itself when the surface bound is
+//!   already full, and returns the [`ArchivedCandidate`] receipts, so the
+//!   bound-failure path is wired and auditable instead of an unwired
+//!   obligation on every caller. All three [`ArchiveCause`] values have a
+//!   live producer on that path: ownerless and low value from live entry
+//!   state, stale from the derived rule in `archive_cause_for`.
 //! - Retrieval refuses expired local overlays and unclosed reusable
 //!   candidates. Before closure, only the exact non-expired `LOCAL_ADMITTED`
 //!   overlay of the active campaign may influence a compatible attempt.
@@ -86,7 +92,7 @@ use crate::learning_closure::{
     assemble_campaign_learning_closure, assemble_campaign_learning_closure_with_evidence,
     supported_episode_disposition, trigger_closure_due,
 };
-use crate::{CandidateState, ImprovementCandidate, ImprovementSurface};
+use crate::{CandidateState, ImprovementCandidate, ImprovementLifecycle, ImprovementSurface};
 
 /// Per-surface active-backlog bound, owned by the Governor decision authority.
 ///
@@ -198,6 +204,12 @@ pub enum AdmitOutcome {
 /// Explicit archive record: the only way out of the active set for
 /// stale/ownerless/low-value candidates. Carries the summary so the
 /// archival is reviewable, never silent.
+///
+/// `archived_lifecycle` is the owner-decision disposition the archive
+/// transition actually reached, read back from the entry rather than assumed
+/// from the requested cause (W3: an archived candidate must be an explicit,
+/// recorded disposition, not a silent removal). A caller that persists this
+/// record therefore persists the lifecycle its candidate now holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedCandidate {
     pub candidate_id: String,
@@ -207,6 +219,8 @@ pub struct ArchivedCandidate {
     pub merged_from: Vec<String>,
     pub evidence_lineage: Vec<String>,
     pub archived_revision: u64,
+    /// The recorded owner-decision lifecycle the archive transition reached.
+    pub archived_lifecycle: ImprovementLifecycle,
 }
 
 /// The reviewable reason a candidate was archived.
@@ -911,7 +925,25 @@ impl BoundedBacklog {
 
     /// Explicitly summarize and archive a stale, ownerless, or low-value
     /// active candidate. Drives the advisory lifecycle to `Retired` through
-    /// the legal transitions and returns the reviewable archive record.
+    /// the legal transitions AND the named owner-decision lifecycle to its
+    /// terminal archived disposition, then returns the reviewable archive
+    /// record.
+    ///
+    /// The owner-decision transition is the point W3 names: a candidate leaves
+    /// the active set only through an explicit lifecycle disposition, never by
+    /// being silently dropped or silently retained. `archive_cause_lifecycles`
+    /// states the exact chain per cause and why each edge is legal, and every
+    /// edge is validated by `transition_lifecycle`, so an illegal move is a
+    /// refusal with the entry untouched up to the advisory chain — the same
+    /// validate-then-commit discipline the lineage merge uses.
+    ///
+    /// Both terminal lifecycles are produced. A stale candidate's recorded
+    /// disposition is `Stale` FIRST — the contract's own vocabulary for
+    /// "superseded by a newer admission epoch" — and is then closed as
+    /// `Archived`, which is the only disposition that ends the active-set
+    /// membership. An ownerless or low-value candidate is never described as
+    /// stale (that would be a false statement about its epoch): it is rejected
+    /// as an owner decision and then archived.
     pub fn archive(
         &mut self,
         candidate_id: &str,
@@ -948,6 +980,18 @@ impl BoundedBacklog {
         }
         let entry = &mut self.entries[index];
         retire_candidate(&mut entry.candidate).map_err(BoundsError::Candidate)?;
+        // The owner-decision disposition. `retire_candidate` above already
+        // moved the ADVISORY state; this moves the OWNER lifecycle, and it is
+        // validate-then-commit through `transition_lifecycle` itself, so a
+        // refused edge leaves the lifecycle at its previous value rather than
+        // half-advanced.
+        let chain = archive_cause_lifecycles(cause, entry.candidate.lifecycle);
+        for next in chain {
+            entry
+                .candidate
+                .transition_lifecycle(next)
+                .map_err(BoundsError::Candidate)?;
+        }
         Ok(ArchivedCandidate {
             candidate_id: entry.candidate.candidate_id.clone(),
             target_surface: entry.candidate.target_surface,
@@ -956,6 +1000,11 @@ impl BoundedBacklog {
             merged_from: entry.merged_from.clone(),
             evidence_lineage: canonical_evidence_lineage(&entry.candidate.evidence_refs),
             archived_revision: entry.candidate.revision,
+            // The recorded owner-decision disposition the transition actually
+            // reached, read back from the entry rather than assumed from the
+            // requested chain. This is what a durable archive receipt commits,
+            // so a persisted record names the lifecycle its candidate holds.
+            archived_lifecycle: entry.candidate.lifecycle,
         })
     }
 
@@ -1254,6 +1303,65 @@ impl BoundedBacklog {
         self.entry_for(candidate_id.trim())
             .ok_or(BoundsError::NotBacklogAdmitted)?;
         Ok(&binding.reusable)
+    }
+}
+
+/// The owner-decision lifecycle chain one archive cause drives, in order,
+/// given the lifecycle the entry is in right now.
+///
+/// The two terminal lifecycles W3 names each have a real producer here, and
+/// neither is a synonym for the other:
+///
+/// - `Stale` — only for [`ArchiveCause::Stale`]. The cause is *derived*: the
+///   entry's retained admission epoch no longer equals the epoch this surface's
+///   bound names, so the record was superseded rather than judged worthless.
+///   `Stale` is the contract's own word for that, and it is the disposition
+///   that supersedes an entry still being triaged.
+/// - `Rejected` — for [`ArchiveCause::Ownerless`] and [`ArchiveCause::LowValue`],
+///   and only for an entry whose lifecycle is still open. Neither cause is a
+///   staleness claim, and calling them stale would be a false claim about the
+///   admission epoch. An ownerless candidate has no decision owner and a
+///   low-value one is below the surface floor; both are owner decisions to stop
+///   pursuing, which is `Rejected`. A candidate already at a terminal
+///   lifecycle has already been decided, so no `Rejected` hop is inserted and
+///   the terminal lifecycle is preserved rather than rewritten.
+/// - `Archived` — for every cause, always last. It is the disposition that ends
+///   active-set membership, and the only one of the two terminal values that
+///   can be reached from every terminal lifecycle the chain above can leave
+///   behind (`Stale` → `Archived`, `Rejected` → `Archived`,
+///   `Narrowed`/`Supported`/`RolledBack` → `Archived` are all legal edges).
+///   An entry already `Archived` is out of the active set, so the chain is
+///   empty and the caller keeps the disposition it already has.
+///
+/// Every hop is validated by `ImprovementCandidate::transition_lifecycle`, so a
+/// state this function does not anticipate is a typed refusal rather than a
+/// silent skip, and no candidate can leave the active set without its
+/// archival being a recorded `ImprovementLifecycle::Archived`.
+fn archive_cause_lifecycles(
+    cause: ArchiveCause,
+    current: ImprovementLifecycle,
+) -> Vec<ImprovementLifecycle> {
+    if current.is_terminal() {
+        // Already decided. Preserve the recorded disposition and only close the
+        // archival when it is not already closed: re-deciding a terminal
+        // candidate would rewrite its history, and an entry whose terminal value
+        // is not `Archived` has nothing further to give.
+        return if current == ImprovementLifecycle::Archived {
+            Vec::new()
+        } else {
+            vec![ImprovementLifecycle::Archived]
+        };
+    }
+    match cause {
+        ArchiveCause::Stale => {
+            vec![ImprovementLifecycle::Stale, ImprovementLifecycle::Archived]
+        }
+        ArchiveCause::Ownerless | ArchiveCause::LowValue => {
+            vec![
+                ImprovementLifecycle::Rejected,
+                ImprovementLifecycle::Archived,
+            ]
+        }
     }
 }
 
