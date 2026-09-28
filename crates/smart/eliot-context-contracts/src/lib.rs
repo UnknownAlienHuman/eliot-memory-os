@@ -80,8 +80,10 @@ pub use measurement::{
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
-    QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult, QualityDimensionState,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QUALITY_APPLICABILITY_INPUTS, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION,
+    QualityApplicability, QualityApplicabilityInput, QualityDimension, QualityDimensionResult,
+    QualityDimensionState, QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QualitySuitability,
 };
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
