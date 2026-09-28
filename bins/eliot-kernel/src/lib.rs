@@ -181,6 +181,10 @@ fn observe_supervision_lease_expiry() {
 
 mod idle_lease_census;
 pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
+// The availability value every I1.13 admission guard reads. The guard
+// functions themselves stay owned by `kernel_unavailability`; only the type is
+// named here, by the composition that observes it.
+use crate::kernel_unavailability::KernelAvailability;
 pub(crate) use startup_coordinator::StartupCoordinator;
 pub use startup_coordinator::{
     AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
@@ -2569,6 +2573,51 @@ impl KernelComposition {
             })
     }
 
+    /// Observes whether this Kernel composition can still issue new authority
+    /// (I1.13, issue #1972).
+    ///
+    /// This is the one producer of [`KernelAvailability`] for the four
+    /// authorities the shared guard covers, and every value it returns comes
+    /// from a live fact this composition already owns and already consults at
+    /// its own admission boundaries. It is never a configured default, a
+    /// constant, or a health channel nothing observes:
+    ///
+    /// - `KernelService::admit_shadow_effect` is the existing I14.16 step-4
+    ///   owner that refuses Session, lease, epoch and Store issuance while a
+    ///   candidate holds no authority;
+    /// - `KernelService::generation_fenced` is the existing post-publication
+    ///   fence that closes this instance until forward recovery, the same fact
+    ///   `validate_material_target_fence` requires to be clear;
+    /// - the generation-gateway poison latch is the existing fence a failed
+    ///   generation publish sets and that `bind_session`,
+    ///   `generation_route_snapshot` and `apply_control` already honour.
+    ///
+    /// A lock this composition cannot read fails closed: an availability it
+    /// cannot prove is not an availability it may report.
+    #[must_use]
+    pub(crate) fn observed_kernel_availability(&self) -> KernelAvailability {
+        let Ok(poison) = self.generation_poison.lock() else {
+            return KernelAvailability::Unavailable;
+        };
+        if poison.is_some() {
+            return KernelAvailability::Unavailable;
+        }
+        drop(poison);
+        let Ok(service) = self.service.lock() else {
+            return KernelAvailability::Unavailable;
+        };
+        let generation_fenced = service.generation_fenced();
+        // The service's own I14.16 step-4 refusal, read through its owner
+        // method rather than a second copy of the state list.
+        let no_authority = service.admit_shadow_effect().is_err();
+        drop(service);
+        if generation_fenced || no_authority {
+            KernelAvailability::Unavailable
+        } else {
+            KernelAvailability::Available
+        }
+    }
+
     /// Material/Critical authority admission for one Governance Profile.
     /// Startup completeness is checked first with its named prerequisite;
     /// the profile ceiling alone decides once startup is complete.
@@ -2586,12 +2635,17 @@ impl KernelComposition {
     ///
     /// # Errors
     ///
-    /// Returns the blocking [`StartupRejection`] or the profile-ceiling
-    /// rejection as a platform error carrying the named prerequisite.
+    /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
+    /// as a platform error when the Kernel is unavailable, otherwise the
+    /// blocking [`StartupRejection`] or the profile-ceiling rejection.
     pub fn admit_material_authority(
         &self,
         profile: GovernanceProfile,
     ) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_external_material_authority(
+            self.observed_kernel_availability(),
+        )
+        .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let coordinator = self
             .startup_coordinator
             .lock()
@@ -2605,11 +2659,20 @@ impl KernelComposition {
     /// Inspection remains allowed; a blocked write fails with the named
     /// unmet startup prerequisite.
     ///
+    /// This is the one live admission point every normal canonical write
+    /// passes through, so the shared Kernel-unavailability guard runs here
+    /// first: while the Kernel is unavailable no canonical write is issued at
+    /// all, whatever the startup cursor still reports.
+    ///
     /// # Errors
     ///
-    /// Returns the blocking [`StartupRejection`] naming the unmet
-    /// prerequisite, or a lock-poison platform error.
+    /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
+    /// as a platform error when the Kernel is unavailable, the blocking
+    /// [`StartupRejection`] naming the unmet prerequisite, or a lock-poison
+    /// platform error.
     pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_canonical_write(self.observed_kernel_availability())
+            .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let coordinator = self
             .startup_coordinator
             .lock()
@@ -2716,11 +2779,20 @@ impl KernelComposition {
     /// Human-risk path requirement. The supervision half reads the revocable
     /// I1.11 supervision step, never a latched cursor and never lease
     /// continuity alone.
+    ///
+    /// The shared Kernel-unavailability guard runs before both halves, so an
+    /// unavailable Kernel issues no external Material authority at all; the
+    /// Governor-issued wrapper reaches this same gate, so there is one
+    /// Material denial, not one per caller.
     pub(crate) fn admit_material_authority_for_fence(
         &self,
         profile: GovernanceProfile,
         target: &StateFence,
     ) -> Result<(), KernelServiceError> {
+        crate::kernel_unavailability::admit_external_material_authority(
+            self.observed_kernel_availability(),
+        )
+        .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let candidate = self.validate_material_target_fence(target)?;
         if !matches!(
             profile.ceiling(),
@@ -3641,6 +3713,11 @@ impl KernelComposition {
         session: &Session,
         process: &ProcessStartReceipt,
     ) -> Result<(DaemonSupervisionContour, SupervisionLeaseSnapshot), KernelServiceError> {
+        // The one live point where this composition issues a supervision lease.
+        // The shared Kernel-unavailability guard runs first, so an unavailable
+        // Kernel issues no new lease rather than failing later inside ORS.
+        crate::kernel_unavailability::admit_lease(self.observed_kernel_availability())
+            .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
         let contour = self.daemon_supervision_contour(session, process)?;
         let authority = self
             .supervision_lease_authority

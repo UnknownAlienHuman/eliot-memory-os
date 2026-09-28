@@ -628,6 +628,14 @@ impl KernelComposition {
         client: &eliot_protocol::ClientHello,
         audit_evidence: &mut DaemonSessionBindingAuditEvidence,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        // I1.13 / #1972: the shared Kernel-unavailability guard runs before
+        // any Session is established, so an unavailable Kernel issues no new
+        // Session on this front door. The availability value is this
+        // composition's own live observation (see
+        // `KernelComposition::observed_kernel_availability`), and the refusal
+        // reuses this path's existing terminal rather than a second code.
+        crate::kernel_unavailability::admit_new_session(self.observed_kernel_availability())
+            .map_err(|_denial| TransportError::SessionFenced)?;
         let Ok(generation_poison) = self.generation_poison.lock() else {
             audit_evidence.refuse(client, "kernel.generation_poison_state_unavailable");
             return Err(TransportError::SessionFenced);
