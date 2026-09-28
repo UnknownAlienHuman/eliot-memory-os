@@ -216,6 +216,18 @@ const OPERATION_ID_DECLARATION: ParameterDeclaration = ParameterDeclaration {
 };
 
 static RESOLVE_WRITE_RECEIPT_PARAMETERS: [ParameterDeclaration; 1] = [OPERATION_ID_DECLARATION];
+static GET_MAINTENANCE_TRIGGER_DECISION_OWNER_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "trigger_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "trigger_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static GET_EVIDENCE_PACK_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "subject",
@@ -1215,6 +1227,9 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetMailbox => "GetMailbox",
         NamedReadOperation::GetAuditRange => "GetAuditRange",
         NamedReadOperation::ResolveWriteReceipt => "ResolveWriteReceipt",
+        NamedReadOperation::GetMaintenanceTriggerDecisionOwner => {
+            "GetMaintenanceTriggerDecisionOwner"
+        }
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
     }
@@ -1244,6 +1259,9 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetMailbox" => Some(NamedReadOperation::GetMailbox),
         b"GetAuditRange" => Some(NamedReadOperation::GetAuditRange),
         b"ResolveWriteReceipt" => Some(NamedReadOperation::ResolveWriteReceipt),
+        b"GetMaintenanceTriggerDecisionOwner" => {
+            Some(NamedReadOperation::GetMaintenanceTriggerDecisionOwner)
+        }
         b"GetAuthorityRevocationHistory" => Some(NamedReadOperation::GetAuthorityRevocationHistory),
         b"GetNotificationState" => Some(NamedReadOperation::GetNotificationState),
         b"GetReactiveInjectionState" => Some(NamedReadOperation::GetReactiveInjectionState),
@@ -1370,6 +1388,9 @@ pub const fn declared_read_parameters(
 ) -> &'static [ParameterDeclaration] {
     match operation {
         NamedReadOperation::ResolveWriteReceipt => &RESOLVE_WRITE_RECEIPT_PARAMETERS,
+        NamedReadOperation::GetMaintenanceTriggerDecisionOwner => {
+            &GET_MAINTENANCE_TRIGGER_DECISION_OWNER_PARAMETERS
+        }
         NamedReadOperation::GetEvidencePack => &GET_EVIDENCE_PACK_PARAMETERS,
         NamedReadOperation::GetAuthorityRevocationHistory => {
             &GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS

@@ -405,6 +405,35 @@ impl RecoveryRecordKey {
     }
 }
 
+/// Builds the exact immutable recovery-owner key for one maintenance-trigger
+/// decision. The revision is parsed as the same positive decimal u64 used
+/// when the decision transaction writes the row.
+pub fn maintenance_trigger_decision_owner_key(
+    trigger_id: &str,
+    trigger_revision: &str,
+) -> Result<RecoveryRecordKey, StoreError> {
+    validate_text(trigger_id, "maintenance_trigger_decision.trigger_id")?;
+    let revision = trigger_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a canonical positive decimal revision",
+        })?;
+    if revision.to_string() != trigger_revision {
+        return Err(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a canonical positive decimal revision",
+        });
+    }
+    let key_bytes = canonical_json_bytes(&(trigger_id, revision))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let key = String::from_utf8(key_bytes)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    RecoveryRecordKey::new(MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE, key)
+}
+
 /// One opaque, fenced, content-addressed recovery record.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3709,6 +3738,11 @@ pub enum NamedReadOperation {
     GetMailbox,
     GetAuditRange,
     ResolveWriteReceipt,
+    /// Exact lookup of an immutable maintenance-trigger decision owner row.
+    ///
+    /// The request is authorized under its current Store fence; the returned
+    /// recovery record retains its original commit fence as data.
+    GetMaintenanceTriggerDecisionOwner,
     /// CURRENT authority revocation history (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
     /// with proven handlers; the typed parameters and payload contract
