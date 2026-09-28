@@ -24,9 +24,9 @@ use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::UserAutomationOperation;
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationWorkClass, ConfigPolicySnapshot, ProviderFingerprintPolicy,
-    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
-    UserAutomationInvocation, UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    ConfigPolicySnapshot, DeliveryChannel, UserAutomationConfigurationState,
+    UserAutomationDeferReason, UserAutomationExecutionMode, UserAutomationInvocation,
+    UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
@@ -2396,14 +2396,14 @@ impl KernelStoreGateway {
     /// Joins the canonical owner revision and live state, the B-owned policy
     /// snapshot, the committed Store receipt envelope, the complete owner
     /// execution view, and — when the owner reports `blocked_config` — the last
-    /// owner-issued failure. Live evidence the Governor owners attest in their
-    /// own records (exact Tool Definitions, delivery capability, agent provider
-    /// observation) has no Kernel-side decoder: the Kernel keeps those payloads
-    /// opaque, so their absence is reported as the named missing owner rather
-    /// than synthesized. A paused or retired revision defers without consulting
-    /// that evidence; an active revision stays unadmitted until an owner issues
-    /// it. No model, provider, scheduler, or notification call is reachable
-    /// from this join.
+    /// owner-issued failure. The declared Skill/Tool closure and the delivery
+    /// capability of the declared channels are readable from owners this
+    /// boundary already holds, so an active deterministic revision assembles the
+    /// complete projection. The one member with no Kernel-side owner — the
+    /// observed provider/model/adapter fingerprint an agent revision needs —
+    /// stays absent and is reported as the named missing owner rather than
+    /// synthesized. No model, provider, scheduler, or notification call is
+    /// reachable from this join.
     async fn assemble_run_now_preflight_projection(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -2452,19 +2452,23 @@ impl KernelStoreGateway {
         };
         // Live evidence below the Kernel decoding boundary. The run-now path
         // issues no provider call before preflight, so the only honest provider
-        // observation here is none; the exact Tool Definitions and the delivery
-        // capability live in Governor-owned records the Kernel keeps opaque, so
-        // they arrive unattested. Assembly refuses an active revision on exactly
-        // those grounds; paused, retired and owner-failed revisions decide
-        // without consulting them.
+        // observation here is none — which is exactly what deterministic mode
+        // requires (I11.12:49) and what an agent revision still cannot obtain
+        // at this boundary. The exact Tool Definitions are the Tool-Definition
+        // half of the closure the canonical owner revision already declares, so
+        // they are read from that same owner instead of being left unattested.
+        // Delivery capability is a named observation of the declared channels,
+        // not an inference from an adapter result.
         let evidence = UserAutomationPreflightEvidence {
             observed_provider_fingerprint: None,
-            trusted_tool_definition_refs: Vec::new(),
-            delivery_available: false,
+            trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
+            delivery_available: Self::read_run_now_delivery_capability(&owner.revision),
             failure,
         };
-        if owner.current_configuration_state == UserAutomationConfigurationState::Active {
-            Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
+        if owner.current_configuration_state == UserAutomationConfigurationState::Active
+            && owner.revision.mode == UserAutomationExecutionMode::Agent
+        {
+            Self::require_run_now_agent_evidence(owner, &execution, &evidence)?;
         }
         UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
             revision: &owner.revision,
@@ -2479,22 +2483,27 @@ impl KernelStoreGateway {
         .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))
     }
 
-    /// Requires the complete live evidence set an active revision admits.
+    /// Requires the live evidence an active **agent** revision still lacks.
     ///
-    /// Each refusal names the owner that must issue the missing member: the
-    /// exact Tool Definitions and the delivery capability live in
-    /// Governor-owned records the Kernel keeps opaque, the agent provider
-    /// observation needs a provider-route observer this boundary does not have,
-    /// and unresolved prior effects belong to I14.21 reconciliation. The
-    /// deterministic closed world is enforced from the revision itself: no
-    /// provider observation, a deterministic-only policy, a clean capability
-    /// profile, and a non-model work class.
-    fn require_run_now_active_evidence(
+    /// Deterministic mode reaches the Durable Job owner from the revision and
+    /// the named delivery observation alone, so this arm exists only for the
+    /// one member no Kernel-side route can produce: the observed
+    /// provider/model/adapter fingerprint. The observed set lives in the
+    /// Governor route registry (`ObservedRoute` /
+    /// `RouteBehaviorFingerprint`), which is outside this crate's dependency
+    /// graph, and `provider_and_model_request` there is a request rather than an
+    /// observation, so the Kernel cannot derive it. That absence is reported
+    /// with its exact owner instead of being filled with the policy's own
+    /// expectation, which would make drift undetectable (I11.12:47).
+    ///
+    /// The unresolved-prior-effect refusal stays here because it is an
+    /// execution fact, not an evidence fact: I14.21 reconciliation owns that
+    /// disposition for every mode.
+    fn require_run_now_agent_evidence(
         owner: &UserAutomationOwnerSnapshot,
         execution: &eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
         evidence: &UserAutomationPreflightEvidence,
     ) -> Result<(), RunNowPreflightAssembly> {
-        let revision = &owner.revision;
         if execution.requires_reconciliation() {
             return Err(RunNowPreflightAssembly::Unavailable(
                 "the committed occurrence has unresolved prior effects: their I14.21 \
@@ -2505,55 +2514,64 @@ impl KernelStoreGateway {
         }
         if evidence.trusted_tool_definition_refs.is_empty() {
             return Err(RunNowPreflightAssembly::Unavailable(
-                "no owner-issued Tool Definition attestation is readable at the Kernel \
-                 preflight boundary: the exact trusted Tool Definitions live in the \
-                 Governor-owned skill/module records, which the Kernel keeps opaque, so \
-                 the committed occurrence stays unadmitted for a later owner-issued \
-                 submission to admit"
+                "the current owner revision declares no trusted Tool Definition revisions, \
+                 so the declared dependency closure is empty and the committed occurrence \
+                 stays unadmitted"
                     .to_owned(),
             ));
         }
         if !evidence.delivery_available {
             return Err(RunNowPreflightAssembly::Unavailable(
-                "no delivery-capability observation is readable at the Kernel preflight \
-                 boundary: whether the declared delivery target is currently capable is \
-                 attested by the notification owner, so the committed occurrence stays \
+                "the declared delivery target is not currently capable: no interactive user \
+                 session backs its native-toast channel, so the committed occurrence stays \
                  unadmitted"
                     .to_owned(),
             ));
         }
-        if revision.mode == UserAutomationExecutionMode::DeterministicProcess {
-            if evidence.observed_provider_fingerprint.is_some()
-                || !matches!(
-                    revision.provider_policy,
-                    ProviderFingerprintPolicy::DeterministicOnly
-                )
-                || revision.task.capability_profile.model_access
-                || revision.task.capability_profile.provider_access
-                || revision.task.capability_profile.automation_scheduling
-                || revision.work_class == AutomationWorkClass::ModelJobs
-            {
-                return Err(RunNowPreflightAssembly::Unavailable(
-                    "the revision violates the deterministic closed world: deterministic \
-                     mode admits no provider observation, a deterministic-only policy, a \
-                     capability profile without model, provider or scheduling access, and \
-                     a non-model work class"
-                        .to_owned(),
-                ));
-            }
-        } else if !revision
+        if !owner
+            .revision
             .provider_policy
             .admits(evidence.observed_provider_fingerprint.as_ref())
         {
             return Err(RunNowPreflightAssembly::Unavailable(
                 "no provider-route observer issues an observed fingerprint at the Kernel \
                  preflight boundary: the run-now path makes no provider call before \
-                 preflight, so an agent revision whose policy admits only an observed \
-                 compatible set stays unadmitted"
+                 preflight, and the observed route set lives in the Governor route \
+                 registry outside this crate, so an agent revision whose policy admits only \
+                 an observed compatible set stays unadmitted"
                     .to_owned(),
             ));
         }
         Ok(())
+    }
+
+    /// Observes whether the declared delivery target is currently capable.
+    ///
+    /// I11.12:43 makes delivery capability a preflight input, and
+    /// I11.12:61 routes delivery through the declared target and the canonical
+    /// outbox. Of the four canonical channels only
+    /// [`DeliveryChannel::NativeToast`] is gated on a live interactive user
+    /// session: the Control Board is a persistent in-process inbox projection,
+    /// and the Windows Event Log and recovery-fallback routes are owned by
+    /// services that run without one. `eliot_platform_windows::
+    /// interactive_user_session_available` is exactly that named observation —
+    /// it "exposes" the condition "so a delivery caller can name the no-session
+    /// condition honestly instead of inferring it from a generic adapter
+    /// failure" — and `eliot-platform-windows` is already a production
+    /// dependency of this crate, so no new edge is introduced.
+    ///
+    /// The result is never defaulted to `true`: a declared `NativeToast` target
+    /// read from a session with no interactive user reports the capability it
+    /// actually observed. `ASSUMPTION:` a Kernel daemon running as a service in
+    /// session 0 observes `false` there, which is honest for that process even
+    /// when a user is logged on elsewhere; the `ControlBoard` channel is
+    /// unaffected and is the channel a headless daemon can still deliver to.
+    fn read_run_now_delivery_capability(revision: &UserAutomationRevision) -> bool {
+        !revision
+            .delivery_target
+            .channels
+            .contains(&DeliveryChannel::NativeToast)
+            || eliot_platform_windows::interactive_user_session_available()
     }
 
     /// Reads the committed `RunNow` Store receipt envelope that sources one

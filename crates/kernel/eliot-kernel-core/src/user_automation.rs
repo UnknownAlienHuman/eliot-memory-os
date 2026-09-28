@@ -1525,6 +1525,20 @@ pub struct UserAutomationRevision {
     pub task: AutomationTaskBinding,
     /// Exact trusted Skill package revision references.
     pub portable_skill_package_revision_refs: Vec<String>,
+    /// Exact trusted Tool Definition revision references this revision admits.
+    ///
+    /// I11.12:41 lists the Skill package revisions and the Tool Definitions as
+    /// one attested closure: "exact trusted/current Skill package revisions and
+    /// Tool Definitions". This is the Tool-Definition half of the same Kernel
+    /// owner that already declares the Skill half above, so the preflight
+    /// equality check keeps comparing the revision against itself instead of
+    /// against a set some other layer supplies. It defaults to empty so a
+    /// revision written before this member existed still decodes; an active
+    /// revision with an empty set is refused exactly as before, because
+    /// `preflight` blocks `ToolDefinitionMismatch` and assembly refuses an
+    /// empty set before that.
+    #[serde(default)]
+    pub trusted_tool_definition_refs: Vec<String>,
     /// Workdir binding repeated for explicit preflight inspection.
     pub workdir_ref: String,
     /// Route and cost ceiling.
@@ -1567,6 +1581,10 @@ impl UserAutomationRevision {
         list_text(
             &self.portable_skill_package_revision_refs,
             "portable_skill_package_revision_refs",
+        )?;
+        list_text(
+            &self.trusted_tool_definition_refs,
+            "trusted_tool_definition_refs",
         )?;
         text(&self.workdir_ref, "workdir_ref")?;
         if self.workdir_ref != self.work_scope.workdir_ref {
@@ -2458,7 +2476,12 @@ pub struct UserAutomationPreflightContext {
 pub struct UserAutomationPreflightEvidence {
     /// Provider identity observed by the owner route, if model access applies.
     pub observed_provider_fingerprint: Option<ProviderFingerprint>,
-    /// Exact trusted Tool Definition revisions observed by the owner route.
+    /// Exact trusted Tool Definition revisions read by the joining owner.
+    ///
+    /// The joining owner reports the set the revision declares, so assembly can
+    /// compare the two and refuse a substituted closure instead of trusting
+    /// this member. The projection itself always carries the revision's own
+    /// set.
     pub trusted_tool_definition_refs: Vec<String>,
     /// Whether the declared delivery target is currently capable.
     pub delivery_available: bool,
@@ -2562,8 +2585,9 @@ impl UserAutomationPreflightProjection {
     /// Durable Job/history owner over the complete denominator, and the live
     /// evidence from the provider/tool/delivery/failure owner routes. Nothing
     /// is defaulted and nothing is re-derived by spelling: the trusted skill
-    /// revisions are repeated verbatim from the revision that attests them, so
-    /// the deterministic preflight keeps the exact equality check.
+    /// and Tool Definition revisions are repeated verbatim from the revision
+    /// that attests them, so the deterministic preflight keeps the exact
+    /// equality check and no caller can substitute a closure.
     ///
     /// Evidence completeness follows the configuration state the owner reports.
     /// A paused or retired revision defers without consulting provider, tool or
@@ -2596,7 +2620,11 @@ impl UserAutomationPreflightProjection {
                 .revision
                 .portable_skill_package_revision_refs
                 .clone(),
-            trusted_tool_definition_refs: assembly.evidence.trusted_tool_definition_refs.clone(),
+            // The Tool Definition half of the same declared closure is repeated
+            // verbatim from the revision that attests it, exactly like the Skill
+            // half above, so the projection can never carry a tool set the
+            // revision did not declare.
+            trusted_tool_definition_refs: assembly.revision.trusted_tool_definition_refs.clone(),
             delivery_available: assembly.evidence.delivery_available,
             trigger_origin: assembly.invocation.trigger_origin,
             child_depth: assembly.invocation.child_depth,
@@ -2702,8 +2730,15 @@ impl UserAutomationPreflightProjection {
                         "execution.unresolved_reconciliation_refs",
                     ));
                 }
-                if assembly.evidence.trusted_tool_definition_refs.is_empty() {
+                if assembly.revision.trusted_tool_definition_refs.is_empty() {
                     return Err(UserAutomationError::Invalid("trusted_tool_definition_refs"));
+                }
+                if assembly.evidence.trusted_tool_definition_refs
+                    != assembly.revision.trusted_tool_definition_refs
+                {
+                    return Err(UserAutomationError::Invalid(
+                        "trusted_tool_definition_refs.substituted",
+                    ));
                 }
                 if !assembly.evidence.delivery_available {
                     return Err(UserAutomationError::Invalid("delivery_available"));
@@ -3296,6 +3331,7 @@ mod tests {
                 },
             },
             portable_skill_package_revision_refs: vec!["skill-package@1".to_owned()],
+            trusted_tool_definition_refs: vec!["skill-package@1".to_owned()],
             workdir_ref: "workdir-1".to_owned(),
             route_cost_policy: RouteCostPolicy {
                 route_ref: "deterministic-local".to_owned(),
