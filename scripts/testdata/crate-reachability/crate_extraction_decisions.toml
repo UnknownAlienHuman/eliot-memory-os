@@ -73,6 +73,12 @@
 # `exclude`. The five other waves the issue names admit different packages:
 # #829 -> 6 contract crates, #836 -> 5, #965 -> 6, #969 -> 5, #830 -> none.
 schema = "eliot.crate-extraction-decision.v1"
+# `revision` is `<owner evaluation date>.<bump>`, and that date is the clock every
+# `expires` in this file is compared against by
+# `scripts/crate_reachability_inventory.py::revision_date`. It is the owner's own
+# reviewed record, not the wall clock, so "unexpired" is a decision somebody made
+# and re-bumped at a known commit rather than a function of when the tool ran. A
+# revision with no ISO-8601 date is malformed data and fails closed.
 revision = "2026-09-28.1"
 
 # Honest residual, recorded rather than hidden: `decision` is STILL EMPTY. No
