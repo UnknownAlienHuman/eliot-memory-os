@@ -31,21 +31,24 @@ pub use peer_communication::{
     BoardAnchor, BoardCompactionPolicy, BoardCompactionReceipt, BoardEntry, BoardEntryReceipt,
     BoardEntrySummary, BoardOmission, BoardPage, BoardTombstone, ConflictCandidate,
     ConflictCandidateDraft, EmbeddedMarker, EmbeddedMarkerDraft, EmbeddedMarkerKind,
-    EnqueuePeerMessage, ExternalResolutionReceipt, LiveDeltaKind, MAX_BOARD_ENTRIES_PER_SCOPE,
-    MAX_BOARD_PAGE_SIZE, MAX_BOARD_REVISIONS_PER_ENTRY, MAX_PEER_ATTEMPT_HISTORY,
-    MAX_PEER_INLINE_TEXT, MAX_PEER_MESSAGE_BYTES, MAX_PEER_OUTSTANDING_PER_RECIPIENT,
-    MAX_PEER_OUTSTANDING_PER_SENDER, MAX_PEER_REFERENCES, MAX_PEER_STREAM_DEPTH, MarkerDisposition,
-    OPTIONAL_PEER_ENVELOPE_FIELDS, PEER_CHANNEL_REVISION, PEER_MESSAGE_SCHEMA, PeerAckReceipt,
-    PeerArtifactHead, PeerAttemptRecord, PeerClockPort, PeerConflict, PeerConflictDimension,
-    PeerConflictReceipt, PeerConflictState, PeerConflictType, PeerConsumeReceipt, PeerCursor,
-    PeerCursorKey, PeerDeliveryAttempt, PeerDeliveryPort, PeerDeliveryReceipt, PeerDeliveryTarget,
-    PeerDurability, PeerDurabilityAttestation, PeerDurabilityPort, PeerEndpointLossReport,
-    PeerEnqueueReceipt, PeerEnvelopeHeader, PeerMessage, PeerMessageDiagnostic, PeerMessageKind,
-    PeerMessageState, PeerReconnectReport, PeerReviewAckReceipt, PeerReviewAdvance,
-    PeerReviewDenominator, PeerReviewLifecycle, PeerReviewReceipt, PeerReviewStanding,
-    PeerStreamHead, PeerStreamId, PostBoardEntry, PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS,
-    RawField, RecordPeerConflict, ReviewCompleteness, ReviewKind, ReviewRecommendation,
-    ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
+    EnqueuePeerMessage, ExternalResolutionReceipt, LIVE_PEER_REJECTION_PLAN_MISMATCH,
+    LiveDeltaKind, LivePeerHelpfulnessObservation, LivePeerHelpfulnessReceipt, LivePeerObligation,
+    LivePeerObligationKind, LivePeerRejection, LivePeerUseObservation, LivePeerUseReceipt,
+    MAX_BOARD_ENTRIES_PER_SCOPE, MAX_BOARD_PAGE_SIZE, MAX_BOARD_REVISIONS_PER_ENTRY,
+    MAX_PEER_ATTEMPT_HISTORY, MAX_PEER_INLINE_TEXT, MAX_PEER_MESSAGE_BYTES,
+    MAX_PEER_OUTSTANDING_PER_RECIPIENT, MAX_PEER_OUTSTANDING_PER_SENDER, MAX_PEER_REFERENCES,
+    MAX_PEER_STREAM_DEPTH, MarkerDisposition, OPTIONAL_PEER_ENVELOPE_FIELDS, PEER_CHANNEL_REVISION,
+    PEER_MESSAGE_SCHEMA, PeerAckReceipt, PeerArtifactHead, PeerAttemptRecord, PeerClockPort,
+    PeerConflict, PeerConflictDimension, PeerConflictReceipt, PeerConflictState, PeerConflictType,
+    PeerConsumeReceipt, PeerCursor, PeerCursorKey, PeerDeliveryAttempt, PeerDeliveryPort,
+    PeerDeliveryReceipt, PeerDeliveryTarget, PeerDurability, PeerDurabilityAttestation,
+    PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt, PeerEnvelopeHeader,
+    PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState, PeerReconnectReport,
+    PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewDenominator, PeerReviewLifecycle,
+    PeerReviewReceipt, PeerReviewStanding, PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId,
+    PostBoardEntry, PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
+    ReviewCompleteness, ReviewKind, ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry,
+    SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
 };
 
 pub use eliot_contracts::{BoardEntryState, PeerBoardKind};
@@ -598,6 +601,14 @@ pub struct CoordinationOwner {
     peer_artifact_heads: BTreeMap<String, peer_communication::PeerArtifactHead>,
     #[serde(default)]
     peer_artifact_revisions: BTreeMap<(String, u64), String>,
+    #[serde(default)]
+    live_peer_obligations: BTreeMap<String, peer_communication::LivePeerObligation>,
+    #[serde(default)]
+    live_peer_rejections: BTreeMap<String, peer_communication::LivePeerRejection>,
+    #[serde(default)]
+    live_peer_uses: BTreeMap<String, Vec<peer_communication::LivePeerUseObservation>>,
+    #[serde(default)]
+    live_peer_helpfulness: BTreeMap<String, peer_communication::LivePeerHelpfulnessObservation>,
 }
 
 impl CoordinationOwner {
