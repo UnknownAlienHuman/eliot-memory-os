@@ -1782,14 +1782,159 @@ impl RecoveryAccessClass {
     }
 }
 
+/// Admitted write identity retained beside its opaque recovery payload.
+///
+/// This binds the versioned write submission to the prepared transition and
+/// the reservation without making ORS an interpreter of either value. The
+/// operation identity is repeated deliberately: it is checked against the
+/// envelope key and survives as part of the token and poll identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryWriteBinding {
+    /// Version of the admitted `VersionedWriteSubmission` protocol.
+    pub write_envelope_protocol_version: u32,
+    /// Contract version of the exact staged recovery envelope.
+    pub recovery_envelope_contract_version: u16,
+    /// Privacy, visibility, and instruction-taint aggregate of that envelope.
+    pub recovery_access_class: RecoveryAccessClass,
+    /// Exact recovery-envelope retention timestamps retained after payload cleanup.
+    pub payload_created_at_ms: i64,
+    pub payload_known_at_ms: i64,
+    pub payload_expires_at_ms: Option<i64>,
+    /// Globally unique operation identity of this submitted transition.
+    pub operation_id: OperationIdentity,
+    /// Stable logical intent carried across correction/retry submissions.
+    pub write_intent_id: OpaqueLabel,
+    /// Retry identity from the admitted canonical write envelope.
+    pub idempotency_key: OpaqueLabel,
+    /// Canonical request digest computed by the canonical write-envelope owner.
+    pub canonical_request_sha256: String,
+    /// Digest of the exact admitted prepared transition.
+    pub prepared_transition_sha256: String,
+    /// Complete ordering-scope set declared by the prepared transition.
+    pub ordering_scopes: Vec<OrderingScope>,
+    /// Admitted contract-set digest.
+    pub admission_contract_set_digest: String,
+    /// Exact operation-manifest identity admitted for the transition.
+    pub operation_manifest_digest: OpaqueLabel,
+    /// Exact authority epoch admitted for the transition.
+    pub authority_epoch: EpochLineage,
+    /// Exact state fence admitted for the transition.
+    pub state_fence: StateFenceSnapshot,
+    /// Digest of the exact protected payload bytes staged in the envelope.
+    pub protected_payload_sha256: String,
+    /// Length of the exact protected payload bytes staged in the envelope.
+    pub protected_payload_length: u64,
+    /// Provider-owned key reference used to protect those exact bytes.
+    pub payload_key_reference: SecretReference,
+}
+
+impl RecoveryWriteBinding {
+    /// Validates the retained, provider-neutral write identity.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.write_envelope_protocol_version == 0 {
+            return Err(OrsError::InvalidField {
+                field: "write_envelope_protocol_version",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.recovery_envelope_contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(
+                self.recovery_envelope_contract_version,
+            ));
+        }
+        self.recovery_access_class.validate()?;
+        if self.payload_known_at_ms < self.payload_created_at_ms
+            || self
+                .payload_expires_at_ms
+                .is_some_and(|expires| expires <= self.payload_created_at_ms)
+        {
+            return Err(OrsError::InvalidExpiry);
+        }
+        validate_digest(&self.canonical_request_sha256, "canonical_request_sha256")?;
+        validate_digest(
+            &self.prepared_transition_sha256,
+            "prepared_transition_sha256",
+        )?;
+        validate_digest(
+            &self.admission_contract_set_digest,
+            "admission_contract_set_digest",
+        )?;
+        validate_text(
+            self.operation_manifest_digest.as_str(),
+            "operation_manifest_digest",
+        )?;
+        self.authority_epoch.validate()?;
+        self.state_fence.validate()?;
+        if self.state_fence.observed_authority_epoch != self.authority_epoch.current.epoch {
+            return Err(OrsError::FenceMismatch);
+        }
+        validate_digest(&self.protected_payload_sha256, "protected_payload_sha256")?;
+        if self.protected_payload_length == 0
+            || self.protected_payload_length > MAX_INLINE_RECOVERY_BYTES
+        {
+            return Err(OrsError::InvalidField {
+                field: "protected_payload_length",
+                reason: "must be greater than zero and within the inline recovery bound",
+            });
+        }
+        validate_text(
+            self.payload_key_reference.provider.as_str(),
+            "payload_key_reference.provider",
+        )?;
+        validate_text(
+            self.payload_key_reference.key.as_str(),
+            "payload_key_reference.key",
+        )?;
+        if self.ordering_scopes.is_empty() {
+            return Err(OrsError::EmptyScopeSet);
+        }
+        let mut seen = BTreeSet::new();
+        if self
+            .ordering_scopes
+            .iter()
+            .any(|scope| !seen.insert(scope.as_str()))
+        {
+            return Err(OrsError::DuplicateScope);
+        }
+        Ok(())
+    }
+
+    /// Compares a retried submission to this retained canonical identity.
+    pub(crate) fn same_retry_identity(&self, other: &Self) -> bool {
+        self.write_envelope_protocol_version == other.write_envelope_protocol_version
+            && self.recovery_envelope_contract_version == other.recovery_envelope_contract_version
+            && self.recovery_access_class == other.recovery_access_class
+            && self.payload_created_at_ms == other.payload_created_at_ms
+            && self.payload_known_at_ms == other.payload_known_at_ms
+            && self.payload_expires_at_ms == other.payload_expires_at_ms
+            && self.operation_id == other.operation_id
+            && self.write_intent_id == other.write_intent_id
+            && self.idempotency_key == other.idempotency_key
+            && self.canonical_request_sha256 == other.canonical_request_sha256
+            && self.prepared_transition_sha256 == other.prepared_transition_sha256
+            && self.ordering_scopes == other.ordering_scopes
+            && self.admission_contract_set_digest == other.admission_contract_set_digest
+            && self.operation_manifest_digest == other.operation_manifest_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.state_fence == other.state_fence
+            && self.protected_payload_sha256 == other.protected_payload_sha256
+            && self.protected_payload_length == other.protected_payload_length
+            && self.payload_key_reference == other.payload_key_reference
+    }
+}
+
 /// Versioned opaque recovery envelope required at the ORS boundary (I5.2).
 ///
-/// The field list is exactly the one I5.2 mandates: contract version,
-/// operation/checkpoint identity, privacy and visibility class, the encrypted
-/// payload or immutable locator, payload hash and length, authority epoch and
-/// state fence, and the created/expiry times. Authority epoch and state fence
-/// are bound to each other by [`Self::validate`], so a staged envelope is
-/// never replayable under a foreign epoch or fence.
+/// The I5.2 envelope fields retain contract version, operation/checkpoint
+/// identity, privacy and visibility class, encrypted payload or immutable
+/// locator, payload hash and length, authority epoch and state fence, and the
+/// created/expiry times. Canonical write reservations additionally carry the
+/// optional [`RecoveryWriteBinding`] that joins the versioned submission and
+/// prepared transition to this payload. Other recovery envelopes leave it
+/// absent. Authority epoch and state fence are bound to each other by
+/// [`Self::validate`], so a staged envelope is never replayable under a foreign
+/// epoch or fence.
 ///
 /// Retention is carried by `expires_at_ms` alone. I5.2 requires that original
 /// retention travel with the pending payload, and it names no distinct
@@ -1803,6 +1948,10 @@ pub struct RecoveryPayloadEnvelope {
     pub operation_or_checkpoint_id: OperationIdentity,
     pub privacy_and_visibility_class: RecoveryAccessClass,
     pub payload: RecoveryPayload,
+    /// Admitted write identity when this envelope stages a canonical write.
+    /// Missing on older retained records and non-write recovery envelopes.
+    #[serde(default)]
+    pub write_binding: Option<RecoveryWriteBinding>,
     pub payload_sha256: String,
     pub payload_length: u64,
     pub authority_epoch: EpochLineage,
@@ -1844,6 +1993,7 @@ impl RecoveryPayloadEnvelope {
             operation_or_checkpoint_id: context.operation_or_checkpoint_id,
             privacy_and_visibility_class: context.privacy_and_visibility_class,
             payload: RecoveryPayload::Encrypted { key, ciphertext },
+            write_binding: None,
             payload_sha256,
             payload_length,
             authority_epoch: context.authority_epoch,
@@ -1868,6 +2018,7 @@ impl RecoveryPayloadEnvelope {
             operation_or_checkpoint_id: context.operation_or_checkpoint_id,
             privacy_and_visibility_class: context.privacy_and_visibility_class,
             payload: RecoveryPayload::ImmutableLocator { locator },
+            write_binding: None,
             payload_sha256,
             payload_length,
             authority_epoch: context.authority_epoch,
@@ -1878,6 +2029,16 @@ impl RecoveryPayloadEnvelope {
         };
         envelope.validate()?;
         Ok(envelope)
+    }
+
+    /// Binds a canonical write identity to this exact recovery envelope.
+    pub fn with_write_binding(
+        mut self,
+        write_binding: RecoveryWriteBinding,
+    ) -> Result<Self, OrsError> {
+        self.write_binding = Some(write_binding);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Validates version, integrity bindings, carried access class, fence,
@@ -1894,6 +2055,30 @@ impl RecoveryPayloadEnvelope {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
         self.privacy_and_visibility_class.validate()?;
+        if let Some(write_binding) = &self.write_binding {
+            write_binding.validate()?;
+            if write_binding.operation_id != self.operation_or_checkpoint_id
+                || write_binding.recovery_envelope_contract_version != self.contract_version
+                || write_binding.recovery_access_class != self.privacy_and_visibility_class
+                || write_binding.payload_created_at_ms != self.created_at_ms
+                || write_binding.payload_known_at_ms != self.known_at_ms
+                || write_binding.payload_expires_at_ms != self.expires_at_ms
+                || write_binding.authority_epoch != self.authority_epoch
+                || write_binding.state_fence != self.state_fence
+                || write_binding.protected_payload_sha256 != self.payload_sha256
+                || write_binding.protected_payload_length != self.payload_length
+                || !matches!(
+                    &self.payload,
+                    RecoveryPayload::Encrypted { key, .. }
+                        if key == &write_binding.payload_key_reference
+                )
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "recovery_envelope",
+                    reason: "write binding operation, epoch, fence, or protected payload differs from the envelope".to_owned(),
+                });
+            }
+        }
         validate_digest(&self.payload_sha256, "payload_sha256")?;
         if self.payload_length == 0 {
             return Err(OrsError::InvalidField {
@@ -1987,6 +2172,332 @@ pub struct RecoveryPage {
     pub records: Vec<ReservationRecord>,
     pub next_after_order: Option<u64>,
 }
+
+/// Independently revisioned sources in the Kernel startup recovery inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryInventorySource {
+    Reservations,
+    OperationalCurrent,
+    RecoveryInbox,
+    RecoveryProblems,
+    WriteIdempotency,
+}
+
+/// Cross-source revision captured atomically before a bounded startup scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryInventorySnapshot {
+    pub reservation_revision: u64,
+    pub operational_current_revision: u64,
+    pub recovery_inbox_revision: u64,
+    pub recovery_problem_revision: u64,
+    pub write_idempotency_revision: u64,
+    pub snapshot_sha256: String,
+}
+
+impl RecoveryInventorySnapshot {
+    pub(crate) fn from_revisions(
+        reservation_revision: u64,
+        operational_current_revision: u64,
+        recovery_inbox_revision: u64,
+        recovery_problem_revision: u64,
+        write_idempotency_revision: u64,
+    ) -> Self {
+        let mut snapshot = Self {
+            reservation_revision,
+            operational_current_revision,
+            recovery_inbox_revision,
+            recovery_problem_revision,
+            write_idempotency_revision,
+            snapshot_sha256: String::new(),
+        };
+        snapshot.snapshot_sha256 = snapshot.calculate_sha256();
+        snapshot
+    }
+
+    /// Validates that the stable snapshot digest covers every source revision.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.snapshot_sha256, "recovery_inventory_snapshot_sha256")?;
+        if self.snapshot_sha256 != self.calculate_sha256() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_inventory_snapshot",
+                reason: "snapshot digest does not bind the declared source revisions".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub const fn revision_for(&self, source: RecoveryInventorySource) -> u64 {
+        match source {
+            RecoveryInventorySource::Reservations => self.reservation_revision,
+            RecoveryInventorySource::OperationalCurrent => self.operational_current_revision,
+            RecoveryInventorySource::RecoveryInbox => self.recovery_inbox_revision,
+            RecoveryInventorySource::RecoveryProblems => self.recovery_problem_revision,
+            RecoveryInventorySource::WriteIdempotency => self.write_idempotency_revision,
+        }
+    }
+
+    fn calculate_sha256(&self) -> String {
+        sha256_hex(
+            format!(
+                "eliot.ors.recovery-inventory.v1\nreservations={}\noperational_current={}\nrecovery_inbox={}\nrecovery_problems={}\nwrite_idempotency={}",
+                self.reservation_revision,
+                self.operational_current_revision,
+                self.recovery_inbox_revision,
+                self.recovery_problem_revision,
+                self.write_idempotency_revision,
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+macro_rules! define_key_scan_cursor {
+    ($name:ident, $source:expr, $after:ty, $revision_field:ident) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+        pub struct $name {
+            pub(crate) source: RecoveryInventorySource,
+            pub(crate) after: Option<$after>,
+            pub(crate) source_revision: u64,
+            pub(crate) snapshot: RecoveryInventorySnapshot,
+            pub(crate) limit: u16,
+        }
+
+        impl $name {
+            pub fn start(
+                snapshot: RecoveryInventorySnapshot,
+                limit: u16,
+            ) -> Result<Self, OrsError> {
+                let value = Self {
+                    source: $source,
+                    after: None,
+                    source_revision: snapshot.$revision_field,
+                    snapshot,
+                    limit,
+                };
+                value.validate()?;
+                Ok(value)
+            }
+
+            pub(crate) fn continue_after(&self, after: $after) -> Self {
+                Self {
+                    source: $source,
+                    after: Some(after),
+                    source_revision: self.source_revision,
+                    snapshot: self.snapshot.clone(),
+                    limit: self.limit,
+                }
+            }
+
+            pub(crate) fn validate(&self) -> Result<(), OrsError> {
+                self.snapshot.validate()?;
+                if self.source != $source || self.source_revision != self.snapshot.$revision_field {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "recovery_inventory_cursor",
+                        reason: "typed source or source revision differs from its snapshot"
+                            .to_owned(),
+                    });
+                }
+                if self.limit == 0 || self.limit > MAX_RECOVERY_PAGE {
+                    return Err(OrsError::InvalidCursorLimit);
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+define_key_scan_cursor!(
+    OperationalCurrentRecoveryCursor,
+    RecoveryInventorySource::OperationalCurrent,
+    OpaqueLabel,
+    operational_current_revision
+);
+define_key_scan_cursor!(
+    RecoveryInboxRecoveryCursor,
+    RecoveryInventorySource::RecoveryInbox,
+    OpaqueLabel,
+    recovery_inbox_revision
+);
+define_key_scan_cursor!(
+    RecoveryProblemRecoveryCursor,
+    RecoveryInventorySource::RecoveryProblems,
+    OpaqueLabel,
+    recovery_problem_revision
+);
+define_key_scan_cursor!(
+    WriteIdempotencyRecoveryCursor,
+    RecoveryInventorySource::WriteIdempotency,
+    OpaqueLabel,
+    write_idempotency_revision
+);
+
+/// Bounded phases that cover the primary reservation table and every
+/// reservation identity index without treating an index as the denominator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WriteReservationRecoveryPhase {
+    Reservations,
+    ReservationOrders,
+    Operations,
+}
+
+/// Typed continuation across the primary reservation rows and their durable
+/// order/operation indexes. `after` is exclusive within the selected phase.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WriteReservationRecoveryCursor {
+    pub(crate) source: RecoveryInventorySource,
+    pub(crate) phase: WriteReservationRecoveryPhase,
+    pub(crate) after: Option<OpaqueLabel>,
+    pub(crate) source_revision: u64,
+    pub(crate) snapshot: RecoveryInventorySnapshot,
+    pub(crate) limit: u16,
+}
+
+impl WriteReservationRecoveryCursor {
+    pub fn start(snapshot: RecoveryInventorySnapshot, limit: u16) -> Result<Self, OrsError> {
+        let value = Self {
+            source: RecoveryInventorySource::Reservations,
+            phase: WriteReservationRecoveryPhase::Reservations,
+            after: None,
+            source_revision: snapshot.reservation_revision,
+            snapshot,
+            limit,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn continue_after(&self, after: OpaqueLabel) -> Self {
+        Self {
+            source: self.source,
+            phase: self.phase,
+            after: Some(after),
+            source_revision: self.source_revision,
+            snapshot: self.snapshot.clone(),
+            limit: self.limit,
+        }
+    }
+
+    pub(crate) fn continue_in_phase(&self, phase: WriteReservationRecoveryPhase) -> Self {
+        Self {
+            source: self.source,
+            phase,
+            after: None,
+            source_revision: self.source_revision,
+            snapshot: self.snapshot.clone(),
+            limit: self.limit,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        self.snapshot.validate()?;
+        if self.source != RecoveryInventorySource::Reservations
+            || self.source_revision != self.snapshot.reservation_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_inventory_cursor",
+                reason: "typed reservation source or revision differs from its snapshot".to_owned(),
+            });
+        }
+        if self.limit == 0 || self.limit > MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        Ok(())
+    }
+}
+
+/// Safe, payload-free summary of one operational-current obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalCurrentRecoveryEntry {
+    pub storage_key: OpaqueLabel,
+    pub kind: OpaqueLabel,
+    pub record_id: OperationIdentity,
+    pub subject_id: OperationIdentity,
+    pub phase: OperationalPhase,
+    pub operation_order: u64,
+    pub authority_epoch: EpochLineage,
+    pub state_fence: StateFenceSnapshot,
+    pub payload_sha256: String,
+    pub payload_length: u64,
+    pub created_at_ms: i64,
+    pub cleanup_after_ms: Option<i64>,
+    pub record_sha256: String,
+}
+
+/// Safe, payload-free summary of one imported recovery-inbox obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryInboxRecoveryEntry {
+    pub item_id: OperationIdentity,
+    pub operation_id: OperationIdentity,
+    pub signer_id: OpaqueLabel,
+    pub disposition: RecoveryInboxDisposition,
+    pub operation_order: u64,
+    pub contract_version: u16,
+    pub privacy_and_visibility_class: RecoveryAccessClass,
+    pub payload_sha256: String,
+    pub payload_length: u64,
+    pub authority_epoch: EpochLineage,
+    pub state_fence: StateFenceSnapshot,
+    pub created_at_ms: i64,
+    pub known_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub envelope_sha256: String,
+    pub signature_sha256: String,
+    pub record_sha256: String,
+}
+
+/// Verified durable idempotency index entry, including terminal operations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteIdempotencyRecoveryEntry {
+    pub idempotency_key_sha256: String,
+    pub operation_id: OperationIdentity,
+    pub reservation_id: OperationIdentity,
+    pub write_binding: RecoveryWriteBinding,
+}
+
+macro_rules! define_recovery_inventory_page {
+    ($name:ident, $cursor:ident, $record:ty) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+        pub struct $name {
+            pub source_revision: u64,
+            pub snapshot_sha256: String,
+            pub records: Vec<$record>,
+            pub next_cursor: Option<$cursor>,
+            pub complete: bool,
+        }
+    };
+}
+
+define_recovery_inventory_page!(
+    WriteReservationRecoveryPage,
+    WriteReservationRecoveryCursor,
+    ReservationRecord
+);
+define_recovery_inventory_page!(
+    OperationalCurrentRecoveryPage,
+    OperationalCurrentRecoveryCursor,
+    OperationalCurrentRecoveryEntry
+);
+define_recovery_inventory_page!(
+    RecoveryInboxRecoveryPage,
+    RecoveryInboxRecoveryCursor,
+    RecoveryInboxRecoveryEntry
+);
+define_recovery_inventory_page!(
+    RecoveryProblemRecoveryPage,
+    RecoveryProblemRecoveryCursor,
+    RecoveryProblem
+);
+define_recovery_inventory_page!(
+    WriteIdempotencyRecoveryPage,
+    WriteIdempotencyRecoveryCursor,
+    WriteIdempotencyRecoveryEntry
+);
 
 /// Canonical head observation supplied alongside a receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3222,14 +3733,51 @@ impl RecoveryProblem {
 /// durably staged under the same operation identity: the envelope was
 /// committed atomically with the Ordering Scope reservations, read back,
 /// hash-validated, and enumerated by identity. It never implies canonical
-/// commit or exactly-once external effect; the caller must poll/subscribe
-/// and must not retry under a duplicate identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// commit or exactly-once external effect; the caller should poll/subscribe.
+/// An exact duplicate is resolved to the original identity and never creates
+/// another reservation or replaces the retained payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptedPending {
     pub operation_id: OperationIdentity,
     pub reservation_id: OperationIdentity,
     pub reservation_order: u64,
     pub prepared_transition_sha256: String,
+    /// Original admitted write identity used to poll and reconcile this stage.
+    pub write_binding: RecoveryWriteBinding,
+}
+
+impl AcceptedPending {
+    /// Validates the complete poll/reconciliation identity carried over the
+    /// daemon wire. Call after deserialization before treating it as a handle.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.write_binding.validate()?;
+        if self.reservation_order == 0
+            || self.operation_id != self.write_binding.operation_id
+            || self.prepared_transition_sha256 != self.write_binding.prepared_transition_sha256
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "accepted_pending",
+                reason: "poll handle differs from its admitted write binding".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Original write identity returned when an idempotent retry finds terminal
+/// ORS state. The Kernel uses this identity to query and authenticate the
+/// original canonical receipt; it must not be surfaced as pending work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlreadyTerminalWrite {
+    /// Original operation identity used for receipt lookup.
+    pub operation_id: OperationIdentity,
+    /// Original durable ORS reservation identity.
+    pub reservation_id: OperationIdentity,
+    /// Receipt identity when retained terminal evidence names one. `None`
+    /// represents terminal ORS state with unresolved receipt disposition.
+    pub terminal_receipt_id: Option<OpaqueLabel>,
 }
 
 impl AcceptedPending {
@@ -3669,8 +4217,18 @@ pub enum OrsError {
     DuplicateScope,
     #[error("recovery cursor limit must be between 1 and {MAX_RECOVERY_PAGE}")]
     InvalidCursorLimit,
+    #[error(
+        "recovery inventory source {inventory_source:?} moved from revision {expected_revision} to {observed_revision}"
+    )]
+    RecoverySnapshotMoved {
+        inventory_source: RecoveryInventorySource,
+        expected_revision: u64,
+        observed_revision: u64,
+    },
     #[error("duplicate identity conflicts with durable ORS state")]
     DuplicateConflict,
+    #[error("idempotent write already has terminal ORS state")]
+    AlreadyTerminalWrite(AlreadyTerminalWrite),
     #[error("reservation was not found")]
     ReservationNotFound,
     #[error("reservation lifecycle transition is invalid")]
@@ -3841,6 +4399,24 @@ pub enum OrsError {
     Encoding(String),
     #[error("opaque operation could not be durably staged, ACCEPTED_PENDING is forbidden: {0}")]
     StagingNotDurable(String),
+    #[error(
+        "redb commit outcome is unresolved for operation {operation_id:?} and reservation {reservation_id:?}; commit error: {commit_error}; readback error: {readback_error:?}"
+    )]
+    StagingCommitOutcomeUnknown {
+        operation_id: OperationIdentity,
+        reservation_id: OperationIdentity,
+        commit_error: Box<OrsError>,
+        readback_error: Option<Box<OrsError>>,
+    },
+    #[error(
+        "Recovery Problem could not be persisted for operation {operation_id:?} and reservation {reservation_id:?}; original cause: {original}; recorder failure: {recorder}"
+    )]
+    RecoveryProblemRecordFailed {
+        operation_id: OperationIdentity,
+        reservation_id: OperationIdentity,
+        original: Box<OrsError>,
+        recorder: Box<OrsError>,
+    },
     #[error(
         "staged opaque payload for operation {operation_id} failed validation; a durable Recovery Problem is retained for disposition, plaintext fallback and silent deletion are forbidden"
     )]

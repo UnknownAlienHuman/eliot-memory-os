@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::validate_digest;
 use crate::{
-    EpochLineage, ExpectedOrderingHead, MAX_RECOVERY_PAGE, OpaqueLabel, OperationIdentity,
-    OrderingScope, OrsError, RecoveryOwner, RecoveryPayloadEnvelope, StateFenceSnapshot,
+    EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity, OrderingScope, OrsError,
+    RecoveryOwner, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
+    StateFenceSnapshot,
 };
 
 /// One requested scope and the canonical head it must extend.
@@ -34,7 +35,10 @@ pub struct ScopeReservationRequest {
     pub expected_head: ExpectedOrderingHead,
 }
 
-/// Atomic reservation request. All scopes are reserved or none are.
+/// Atomic reservation request for one canonical write. Its complete admitted
+/// write identity and encrypted recovery payload are required; all scopes are
+/// reserved or none are. Older retained non-write envelopes remain readable
+/// without this binding but cannot enter the canonical write reservation path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReservationRequest {
@@ -50,19 +54,50 @@ pub struct ReservationRequest {
 impl ReservationRequest {
     pub(crate) fn validate(&self) -> Result<(), OrsError> {
         self.envelope.validate()?;
+        let write_binding = self
+            .envelope
+            .write_binding
+            .as_ref()
+            .ok_or(OrsError::InvalidField {
+                field: "recovery_write_binding",
+                reason: "required for a canonical write reservation",
+            })?;
+        write_binding.validate()?;
+        if write_binding.prepared_transition_sha256 != self.prepared_transition_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if !matches!(&self.envelope.payload, RecoveryPayload::Encrypted { .. }) {
+            return Err(OrsError::InvalidField {
+                field: "recovery_payload",
+                reason: "canonical write reservations require an encrypted payload",
+            });
+        }
         self.writer_epoch.validate()?;
         validate_digest(
             &self.prepared_transition_sha256,
             "prepared_transition_sha256",
         )?;
-        if self.writer_epoch.current != self.envelope.authority_epoch.current {
+        if self.writer_epoch != self.envelope.authority_epoch {
             return Err(OrsError::EpochMismatch);
+        }
+        if write_binding.authority_epoch != self.writer_epoch {
+            return Err(OrsError::EpochMismatch);
+        }
+        if write_binding.state_fence != self.envelope.state_fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        if write_binding.protected_payload_sha256 != self.envelope.payload_sha256
+            || write_binding.protected_payload_length != self.envelope.payload_length
+            || !matches!(
+                &self.envelope.payload,
+                RecoveryPayload::Encrypted { key, .. }
+                    if key == &write_binding.payload_key_reference
+            )
+        {
+            return Err(OrsError::PayloadIntegrityMismatch);
         }
         if self.scopes.is_empty() {
             return Err(OrsError::EmptyScopeSet);
-        }
-        if self.scopes.len() > usize::from(MAX_RECOVERY_PAGE) {
-            return Err(OrsError::InvalidCursorLimit);
         }
         let mut seen = BTreeSet::new();
         for scope in &self.scopes {
@@ -70,6 +105,17 @@ impl ReservationRequest {
             if !seen.insert(scope.scope.clone()) {
                 return Err(OrsError::DuplicateScope);
             }
+        }
+        let bound_scopes = write_binding
+            .ordering_scopes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if seen != bound_scopes {
+            return Err(OrsError::InvalidField {
+                field: "ordering_scopes",
+                reason: "reservation scopes must equal the complete admitted scope set",
+            });
         }
         if self.expires_at_ms <= self.envelope.created_at_ms {
             return Err(OrsError::InvalidExpiry);
@@ -98,6 +144,9 @@ pub struct WriterReservationToken {
     pub reservation_order: u64,
     pub scopes: Vec<ReservedScope>,
     pub prepared_transition_sha256: String,
+    /// Original submitted write identity, absent only on legacy retained rows.
+    #[serde(default)]
+    pub write_binding: Option<RecoveryWriteBinding>,
     pub expires_at_ms: i64,
     pub recovery_owner: RecoveryOwner,
 }

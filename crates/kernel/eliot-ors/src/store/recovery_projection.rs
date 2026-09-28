@@ -414,6 +414,10 @@ pub(super) fn import_recovery_inbox(
         .insert(history_key.as_str(), encoded.as_str())
         .map_err(storage)?;
     drop(history);
+    RedbRecoveryStore::bump_recovery_inventory_revision(
+        &write,
+        super::RecoveryInventorySource::RecoveryInbox,
+    )?;
     write.commit().map_err(storage)?;
     Ok(RecoveryInboxReceipt::from_receipt(receipt))
 }

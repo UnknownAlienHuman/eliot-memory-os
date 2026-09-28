@@ -1417,9 +1417,9 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         | OrsError::RecoveryOwnerMismatch => BackupError::FenceMismatch {
             subject: "restore journal writer authority".to_owned(),
         },
-        OrsError::AuthoritySnapshotUnavailable | OrsError::RecoveryProblemRetained { .. } => {
-            BackupError::RestoreEvidenceIncomplete
-        }
+        OrsError::AuthoritySnapshotUnavailable
+        | OrsError::RecoveryProblemRetained { .. }
+        | OrsError::RecoveryProblemRecordFailed { .. } => BackupError::RestoreEvidenceIncomplete,
         OrsError::OrderingHeadMismatch | OrsError::ReconciliationMismatch => {
             BackupError::ReceiptChainGap {
                 event_id: "restore journal ordering head".to_owned(),
@@ -1431,7 +1431,8 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::UnknownReceiptCannotResolve
         | OrsError::ReservationNotFound
         | OrsError::PredecessorPending
-        | OrsError::StagingNotDurable(_) => BackupError::RestoreRollbackRequired,
+        | OrsError::StagingNotDurable(_)
+        | OrsError::StagingCommitOutcomeUnknown { .. } => BackupError::RestoreRollbackRequired,
         OrsError::EmptyScopeSet | OrsError::DuplicateScope => {
             BackupError::MissingRecoveryComponent("restore journal ordering scope set")
         }
@@ -1441,21 +1442,25 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 reason: "must be a supported bounded page",
             }
         }
-        OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
-            BackupError::RestorePhaseMismatch
-        }
+        OrsError::RecoverySnapshotMoved { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal recovery inventory snapshot".to_owned(),
+        },
+        OrsError::InvalidTransition
+        | OrsError::ScopeRecoveryRequired
+        | OrsError::UnsafeExpiry
+        | OrsError::AlreadyTerminalWrite(_)
+        | OrsError::ActivationLifecycleStateConflict { .. } => BackupError::RestorePhaseMismatch,
         // The activation lifecycle vocabulary (#1115) keeps the same per-class
         // discipline as the supervision-ticket group above: a ticket whose
         // deadline closed before result admission is a named lifecycle record
         // that cannot satisfy the request, never a generic target failure, and
         // a ticket found in the wrong durable state is the same invalid
         // phase/state transition `InvalidTransition` already reports. They are
-        // deliberately two arms rather than one so an expiry never reads as a
-        // state conflict on this seam.
+        // kept distinct from the invalid-phase group above so an expiry never
+        // reads as a state conflict on this seam.
         OrsError::ActivationLifecycleExpired { .. } => BackupError::IntegrityMismatch {
             subject: "restore journal activation ticket expiry".to_owned(),
         },
-        OrsError::ActivationLifecycleStateConflict { .. } => BackupError::RestorePhaseMismatch,
         OrsError::ActiveExecutableReplacement
         | OrsError::IncompatibleArtifact
         | OrsError::VersionedArtifactConflict

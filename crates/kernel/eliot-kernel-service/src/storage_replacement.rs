@@ -1162,6 +1162,7 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         }
         OrsError::WorkerReplayStaleStream { .. } => mismatch("worker_replay_stream"),
         OrsError::WorkerReplayAckMismatch { .. } => mismatch("worker_replay_ack"),
+        OrsError::RecoverySnapshotMoved { .. } => mismatch("recovery_inventory_revision"),
         // An ORS field rejection already has this crate's exact refusal shape.
         OrsError::InvalidField { field, reason } => {
             KernelServiceError::InvalidField { field, reason }
@@ -1190,6 +1191,7 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::DuplicateScope => invalid_field("ordering_scopes_duplicate"),
         OrsError::InvalidCursorLimit => invalid_field("recovery_cursor_limit"),
         OrsError::DuplicateConflict => invalid_field("durable_state_duplicate"),
+        OrsError::AlreadyTerminalWrite(_) => invalid_field("reservation_already_terminal"),
         OrsError::ReservationNotFound => invalid_field("reservation_missing"),
         OrsError::InvalidTransition => invalid_field("reservation_lifecycle"),
         OrsError::PredecessorPending => invalid_field("ordering_scope_predecessor"),
@@ -1240,6 +1242,11 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::VersionedArtifactNotFound => invalid_field("versioned_artifact_missing"),
         OrsError::VersionedArtifactNotDrained => invalid_field("versioned_artifact_draining"),
         OrsError::RecoveryProblemRetained { .. } => invalid_field("staged_payload_recovery"),
+        // Neither write-staging failure is an admitted storage-replacement
+        // outcome. If an ORS provider surfaces one here, close generation
+        // authority until the original operation is reconciled by its owner.
+        OrsError::StagingCommitOutcomeUnknown { .. }
+        | OrsError::RecoveryProblemRecordFailed { .. } => KernelServiceError::GenerationFenced,
     }
 }
 
