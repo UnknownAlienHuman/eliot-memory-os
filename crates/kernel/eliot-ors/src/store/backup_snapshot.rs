@@ -305,6 +305,27 @@ impl super::RedbRecoveryStore {
     ///   [`stream_recovery_entry`] the export uses, and its `payload_digest` is
     ///   the digest of the row re-encoded through the same ORS codec. Any
     ///   disagreement refuses the whole driver with zero writes.
+    /// - every row is then pre-flighted against the destination's CURRENT
+    ///   durable row for the same `(operation, stream)` key, still before the
+    ///   first write, through [`restore_row_refusal`], which mirrors the
+    ///   refusals the family's write body applies to a restored row: differing
+    ///   evidence axes, an activation the destination may not become, an
+    ///   archived `Retired` row landing on a destination row that is not already
+    ///   `Retired` (a restore must not terminate a live row), and an archived
+    ///   `Retired` row landing on a `Retired` destination row whose retained
+    ///   reconciliation differs. Any of these refuses the whole driver with
+    ///   zero writes, so a page is never left half-restored by a refusal the
+    ///   driver could have seen in advance. The pre-pass is strictly stronger
+    ///   than the write body for the terminal-over-live case: it refuses that
+    ///   page even when the archived row is byte-identical to the destination
+    ///   row apart from the activation.
+    ///
+    /// The pre-pass reads destination state in one read transaction that is
+    /// dropped before the first write, so the zero-write property is exact for
+    /// a destination that does not move during the driver's pre-pass. A
+    /// destination that does move is still stopped row by row by the write body
+    /// itself, fail closed; the only difference is that such a move can abort
+    /// the page after an earlier row was already written.
     ///
     /// The same source/destination and page bindings
     /// [`import_page_quarantined`](super::RedbRecoveryStore::import_backup_page_quarantined)
@@ -325,36 +346,59 @@ impl super::RedbRecoveryStore {
             return Err(OrsError::InvalidExpiry);
         }
         let mut bound = Vec::with_capacity(rows.len());
-        for projection in rows {
-            let record_id = projection.record_key()?;
-            let entry = page
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.family == RowFamilyKind::ProcessStreamRecovery
-                        && entry.record_id == record_id
-                })
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: format!(
-                        "restored row {record_id:?} is not an entry of the presented backup page"
-                    ),
-                })?;
-            let (order, effect_class) = stream_recovery_entry(projection)?;
-            if entry.order != order || entry.effect_class != effect_class {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: format!(
-                        "restored row {record_id:?} does not match the exported entry's order and \
-                         effect class"
-                    ),
-                });
+        {
+            // One read transaction for the whole pre-pass, dropped before the
+            // first write so no reader overlaps the write loop below.
+            let read = self.database.begin_read().map_err(storage)?;
+            let destination_rows = read
+                .open_table(super::PROCESS_STREAM_RECOVERY)
+                .map_err(storage)?;
+            for projection in rows {
+                let record_id = projection.record_key()?;
+                let entry = page
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.family == RowFamilyKind::ProcessStreamRecovery
+                            && entry.record_id == record_id
+                    })
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} is not an entry of the presented backup page"
+                        ),
+                    })?;
+                let (order, effect_class) = stream_recovery_entry(projection)?;
+                if entry.order != order || entry.effect_class != effect_class {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_stream_recovery",
+                        reason: format!(
+                            "restored row {record_id:?} does not match the exported entry's order \
+                             and effect class"
+                        ),
+                    });
+                }
+                let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
+                if entry.payload_digest != digest {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+                // The pre-flight, in the same pass and still before any write:
+                // a refusal the write body would raise on this row is raised
+                // here, once for the whole page, instead of after an earlier row
+                // of the same page was already written.
+                let destination = destination_rows
+                    .get(record_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                    .transpose()?;
+                if let Some(destination) = destination
+                    && let Some(refusal) =
+                        restore_row_refusal(&record_id, projection, &destination)?
+                {
+                    return Err(refusal);
+                }
+                bound.push(projection);
             }
-            let digest = crate::model::sha256_hex(encode(projection)?.as_bytes());
-            if entry.payload_digest != digest {
-                return Err(OrsError::PayloadIntegrityMismatch);
-            }
-            bound.push(projection);
         }
         let mut outcomes = Vec::with_capacity(bound.len());
         for projection in bound {
@@ -362,6 +406,64 @@ impl super::RedbRecoveryStore {
         }
         Ok(outcomes)
     }
+}
+
+/// Whether one archived row must be refused against the destination's current
+/// durable row for the same `(operation, stream)` key.
+///
+/// The activation an archived row imports as is restated here exactly as
+/// [`RedbRecoveryStore::import_process_stream_recovery_suspended`] maps it,
+/// which is the single owner of that rule: an already `Retired` row stays
+/// `Retired` and every other row becomes `Suspended`.
+///
+/// `Ok(None)` means the write body accepts the pair. Each refusal below is one
+/// the write body raises too, except the terminal-over-live case, where this
+/// pre-flight is deliberately stricter: a restore proves no terminal
+/// disposition, so it may re-preserve a terminal row into an empty key or over
+/// an already terminal row, and never turns a live destination row terminal.
+fn restore_row_refusal(
+    record_id: &str,
+    archived: &ProcessStreamRecoveryProjection,
+    destination: &ProcessStreamRecoveryProjection,
+) -> Result<Option<OrsError>, OrsError> {
+    let refusal = |reason: String| OrsError::IntegrityProblem {
+        record_type: "process_stream_recovery",
+        reason: format!(
+            "restored row {record_id:?} conflicts with the destination's durable row: {reason}"
+        ),
+    };
+    if destination.evidence_axes_sha256()? != archived.evidence_axes_sha256()? {
+        return Ok(Some(refusal(
+            "the durable evidence axes are immutable and differ".to_owned(),
+        )));
+    }
+    let imported = if archived.activation == StreamRecoveryActivation::Retired {
+        StreamRecoveryActivation::Retired
+    } else {
+        StreamRecoveryActivation::Suspended
+    };
+    let terminal_restore = imported == StreamRecoveryActivation::Retired;
+    if destination.activation == imported {
+        // Observation-advance arm of the write body, which cannot move
+        // activation: only a reconciliation rewrite is refused there, and only
+        // for a row that is already terminal.
+        if terminal_restore && destination.reconciliation != archived.reconciliation {
+            return Ok(Some(refusal(
+                "the retained reconciliation of an already retired destination row must not be \
+                 rewritten by a restore"
+                    .to_owned(),
+            )));
+        }
+        return Ok(None);
+    }
+    if terminal_restore || !destination.activation.permits_transition_to(imported) {
+        return Ok(Some(refusal(format!(
+            "the destination row is {:?} and the restored row imports as {:?}, which that durable \
+             row may not become",
+            destination.activation, imported
+        ))));
+    }
+    Ok(None)
 }
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
