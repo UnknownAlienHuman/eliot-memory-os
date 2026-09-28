@@ -19,6 +19,10 @@ proof_entrypoint = "cargo test -p eliot-kernel-service"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
+# Issue #2966 step 2: the history projector declares the traversal bounds
+# the committed closures were proven under. Narrow use of one type plus
+# `default_bounds`; same layer-family edge `eliot-kernel-core` already holds.
+eliot-influence.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true

@@ -69,8 +69,12 @@
 //! The bound coordinates and where each one is decided:
 //!
 //! * closure identity and canonical request hash — declared by the producer,
-//!   recomputed here over the exact presented bytes; disagreement is
-//!   [`RevocationHistoryError::IdentityConflict`] under I5.27;
+//!   recomputed here over the exact presented bytes through the one shared
+//!   canonical codec (`eliot_security_contracts`), which covers the evidence
+//!   version, identity, owner namespace, origin, dependents, reason, state,
+//!   fence, revision, bounds, disposition, omissions and the affected-member
+//!   coordinates; disagreement is [`RevocationHistoryError::IdentityConflict`]
+//!   under I5.27;
 //! * owner namespace — declared per closure, resolved to the typed
 //!   [`AuthorityRootRef`] and checked against the bound graph by
 //!   `GrantGraph::admit_origin_bound_closure`, so a closure served under a
@@ -96,9 +100,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::StateFence;
 use eliot_influence::RevocationBounds;
-use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState, RevocationReason};
+use eliot_security_contracts::{
+    InfluenceDependencyClosure, InfluenceState, REVOCATION_DISPOSITION_COMPLETE,
+    REVOCATION_DISPOSITION_PARTIAL, REVOCATION_DISPOSITION_UNKNOWN, RevocationClosureDigestBounds,
+    RevocationClosureDigestInput, RevocationReason, revocation_affected_members,
+    revocation_affected_members_digest, revocation_closure_canonical_digest,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -106,23 +115,11 @@ use crate::grants::RevocationDenominator;
 use crate::{AuthorityError, CapabilityGrant, GrantGraph, GrantId, validate_text};
 
 /// Closed evidence version of the authority revocation-history closure
-/// record (issue #2966, step 2).
+/// record, shared with the durable producer (issue #2966, step 2).
 ///
-/// Every [`AuthorityRevocationClosureEvidence`] declares this version and
-/// every [`ValidatedRevocationClosure`] is stamped with it by
-/// [`RevocationHistoryEvidence::require_current`](RevocationHistoryEvidence::require_current),
-/// which refuses any other declared version as an unsupported schema before
-/// reading a protected field. Every [`AdmittedRevocationClosure`] then carries
-/// it through admission, which refuses any other version again: a closure
-/// validated under an older (or newer) evidence version is never silently
-/// reinterpreted as the current stronger form.
-///
-/// Version 1 was the observation DTO, which carried no owner namespace,
-/// declared bounds, declared disposition, committed affected-member digest or
-/// count, and no declared omissions. Those bytes are not migrated: the durable
-/// history owner pre-partitions its evidence under this version, and a v1
-/// presentation is refused rather than read with defaults.
-pub const REVOCATION_HISTORY_EVIDENCE_VERSION: u16 = 2;
+/// Re-exported so evidence paths keep one name for the contract both sides
+/// declare; see the canonical definition for the version history.
+pub use eliot_security_contracts::REVOCATION_HISTORY_EVIDENCE_VERSION;
 
 /// Declared completeness of one committed closure's own affected evidence.
 ///
@@ -159,7 +156,10 @@ pub enum RevocationEvidenceDisposition {
 /// content-addressed coordinates are produced by the declaring owner through
 /// [`declared_canonical_request_digest`](Self::declared_canonical_request_digest)
 /// and [`affected_members_digest`](Self::affected_members_digest), and are
-/// recomputed and compared on the restore path.
+/// recomputed and compared on the restore path. Both delegate to the one
+/// shared canonical codec in `eliot_security_contracts`, which the durable
+/// producer uses for the identical bytes, so the comparison binds the
+/// restore to what the producer served instead of re-blessing it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityRevocationClosureEvidence {
@@ -237,13 +237,10 @@ impl AuthorityRevocationClosureEvidence {
     /// The one definition of a committed affected membership: the declared
     /// origin reference plus every declared dependent, deduplicated. A
     /// durable owner computes the digest/count coordinate over this set, and
-    /// recovery recomputes it over the presented set with the same function,
-    /// so the two can never describe different memberships.
+    /// recovery recomputes it over the presented set with the same shared
+    /// function, so the two can never describe different memberships.
     pub fn members_of(origin_ref: &str, dependent_refs: &[String]) -> BTreeSet<String> {
-        let mut affected = BTreeSet::new();
-        affected.insert(origin_ref.to_owned());
-        affected.extend(dependent_refs.iter().cloned());
-        affected
+        revocation_affected_members(origin_ref, dependent_refs)
     }
 
     /// Canonical digest of one exact committed affected membership, for the
@@ -258,52 +255,71 @@ impl AuthorityRevocationClosureEvidence {
     /// never given a defaulted one.
     #[must_use]
     pub fn affected_members_digest(affected: &BTreeSet<String>) -> Option<String> {
-        let members: Vec<&str> = affected.iter().map(String::as_str).collect();
-        let bytes = canonical_json_bytes(&RevocationAffectedMembersPreimage {
-            affected_members: &members,
-        })
-        .ok()?;
-        Some(sha256_hex(&bytes))
+        revocation_affected_members_digest(affected)
     }
 
     /// Canonical request hash of one exact closure presentation, for the
     /// durable owner that must DECLARE
-    /// [`canonical_request_digest`](Self::canonical_request_digest): closure
-    /// identity, origin, sorted dependents, reason, terminal state, fence and
-    /// revision. I5.27 defines idempotency over canonical bytes, so a
-    /// presentation whose declared hash disagrees with its own bytes is an
-    /// identity conflict rather than a new operation.
+    /// [`canonical_request_digest`](Self::canonical_request_digest). The
+    /// input covers every presented coordinate — evidence version, closure
+    /// identity, owner namespace, origin, sorted dependents, reason,
+    /// terminal state, fence, revision, bounds, disposition, sorted
+    /// omissions, and the affected-member count and digest — through the one
+    /// shared canonical codec, so both sides hash identical bytes. I5.27
+    /// defines idempotency over canonical bytes, so a presentation whose
+    /// declared hash disagrees with its own bytes is an identity conflict
+    /// rather than a new operation.
     #[must_use]
     pub fn declared_canonical_request_digest(
-        closure_id: &str,
-        root_ref: &str,
-        dependent_refs: &[String],
-        invalidation_reason: Option<RevocationReason>,
-        current_influence: InfluenceState,
-        state_fence: &StateFence,
-        revision: u64,
+        input: &RevocationClosureDigestInput<'_>,
     ) -> Option<String> {
-        let mut dependents: Vec<&str> = dependent_refs.iter().map(String::as_str).collect();
-        dependents.sort_unstable();
-        let bytes = canonical_json_bytes(&RevocationClosureCanonicalPreimage {
-            closure_id,
-            root_ref,
-            dependent_refs: dependents,
-            invalidation_reason,
-            current_influence,
-            state_fence,
-            revision,
-        })
-        .ok()?;
-        Some(sha256_hex(&bytes))
+        revocation_closure_canonical_digest(input)
+    }
+
+    /// This presentation as shared canonical digest input.
+    fn digest_input(&self) -> RevocationClosureDigestInput<'_> {
+        RevocationClosureDigestInput {
+            evidence_version: self.evidence_version,
+            closure_id: &self.closure_id,
+            owner_namespace: &self.owner_namespace,
+            root_ref: &self.root_ref,
+            dependent_refs: &self.dependent_refs,
+            invalidation_reason: self.invalidation_reason,
+            current_influence: self.current_influence,
+            state_fence: &self.state_fence,
+            revision: self.revision,
+            bounds: digest_bounds(&self.bounds),
+            disposition: disposition_spelling(self.disposition),
+            omissions: &self.omissions,
+            affected_member_count: self.affected_member_count,
+            affected_member_digest: &self.affected_member_digest,
+        }
     }
 }
 
-/// Canonical preimage of one committed affected membership.
-/// Private on purpose: it is the digest input, not a wire contract.
-#[derive(Serialize)]
-struct RevocationAffectedMembersPreimage<'a> {
-    affected_members: &'a [&'a str],
+/// Engine bounds as shared digest input. The served row maps its own wire
+/// bounds the same way; the digest proves the two mappings agree.
+fn digest_bounds(bounds: &RevocationBounds) -> RevocationClosureDigestBounds {
+    RevocationClosureDigestBounds {
+        max_nodes: bounds.max_nodes,
+        max_edges: bounds.max_edges,
+        max_depth: bounds.max_depth,
+        max_result: bounds.max_result,
+        max_work: bounds.max_work,
+        max_frontier: bounds.max_frontier,
+        max_time: bounds.max_time,
+    }
+}
+
+/// Evidence disposition as its canonical digest spelling. The served row
+/// maps its own wire disposition to the same spellings; the digest proves
+/// the two mappings agree.
+fn disposition_spelling(disposition: RevocationEvidenceDisposition) -> &'static str {
+    match disposition {
+        RevocationEvidenceDisposition::Complete => REVOCATION_DISPOSITION_COMPLETE,
+        RevocationEvidenceDisposition::Partial => REVOCATION_DISPOSITION_PARTIAL,
+        RevocationEvidenceDisposition::Unknown => REVOCATION_DISPOSITION_UNKNOWN,
+    }
 }
 
 /// Explicit CURRENT revocation-history evidence observed at one durable
@@ -344,9 +360,13 @@ impl RevocationHistoryEvidence {
     ///
     /// One closure identity presented twice with changed content is
     /// [`RevocationHistoryError::IdentityConflict`]: the committed result
-    /// is authoritative and nothing is applied. An identical repeat still
-    /// violates the strictly-increasing shape and refuses as unknown, and
-    /// an out-of-order identity refuses as unknown; the refusal set is
+    /// is authoritative and nothing is applied. The comparison covers every
+    /// presented coordinate, so a repeat that changes the origin kind,
+    /// owner, bounds, disposition, omissions, revision, fence, transition
+    /// evidence, affected set or any declared digest conflicts under its
+    /// exact field, never as unknown. An identical repeat still violates
+    /// the strictly-increasing shape and refuses as unknown, and an
+    /// out-of-order identity refuses as unknown; the refusal set is
     /// unchanged, only the conflict cause is named.
     ///
     /// Missing evidence is expressed by passing `None` at the restore
@@ -366,18 +386,15 @@ impl RevocationHistoryEvidence {
             if let Some(previous) = previous
                 && previous.closure_id.as_str() >= closure.closure_id.as_str()
             {
-                if previous.closure_id == closure.closure_id {
-                    let previous_digest = closure_canonical_digest(previous)?;
-                    let digest = closure_canonical_digest(closure)?;
-                    if previous_digest != digest {
-                        return Err(RevocationHistoryError::IdentityConflict(
-                            ClosureIdentityConflict {
-                                closure_id: closure.closure_id.clone(),
-                                field: conflicted_closure_field(previous, closure)
-                                    .unwrap_or("closure.canonical_content"),
-                            },
-                        ));
-                    }
+                if previous.closure_id == closure.closure_id
+                    && let Some(field) = conflicted_closure_field(previous, closure)
+                {
+                    return Err(RevocationHistoryError::IdentityConflict(
+                        ClosureIdentityConflict {
+                            closure_id: closure.closure_id.clone(),
+                            field,
+                        },
+                    ));
                 }
                 return Err(RevocationHistoryError::UnknownHistory);
             }
@@ -393,16 +410,23 @@ impl RevocationHistoryEvidence {
 /// First canonical field on which two closures sharing one `closure_id`
 /// disagree, if any.
 ///
-/// Dependent order is spelling, not content: validation absorbs the
-/// dependents into a set and every downstream decision is
-/// order-insensitive, so only the sorted membership is compared.
-/// Anything else — origin, reason, state, fence, or revision — is
-/// committed content under I5.27, and a difference is an identity
-/// conflict, never a merge.
+/// The comparison covers every presented coordinate, so no changed content
+/// can pass as an unknown ordering violation: version first (a legacy
+/// presentation is never read under the current stronger form), then
+/// origin, owner, bounds, disposition, dependents, reason, state, fence,
+/// revision, omissions, and the three declared content addresses.
+/// Dependent and omission order is spelling, not content: validation
+/// absorbs both into sets and every downstream decision is
+/// order-insensitive, so only the sorted memberships are compared.
+/// Anything else is committed content under I5.27, and a difference is an
+/// identity conflict, never a merge.
 fn conflicted_closure_field(
     previous: &AuthorityRevocationClosureEvidence,
     closure: &AuthorityRevocationClosureEvidence,
 ) -> Option<&'static str> {
+    if previous.evidence_version != closure.evidence_version {
+        return Some("closure.evidence_version");
+    }
     if previous.root_ref != closure.root_ref {
         return Some("closure.root_ref");
     }
@@ -448,44 +472,23 @@ fn conflicted_closure_field(
     if previous.affected_member_digest != closure.affected_member_digest {
         return Some("closure.affected_member_digest");
     }
+    if previous.canonical_request_digest != closure.canonical_request_digest {
+        return Some("closure.canonical_request_digest");
+    }
     None
 }
 
-/// Canonical preimage of one exact revocation-closure presentation.
-/// Private on purpose: it is the digest input, not a wire contract.
-///
-/// Dependent order is spelling, not content (see
-/// [`conflicted_closure_field`]), so the preimage carries the sorted
-/// membership; the committed affected set is exactly this origin plus
-/// these dependents. Every other presented field is committed content.
-#[derive(Serialize)]
-struct RevocationClosureCanonicalPreimage<'a> {
-    closure_id: &'a str,
-    root_ref: &'a str,
-    dependent_refs: Vec<&'a str>,
-    invalidation_reason: Option<RevocationReason>,
-    current_influence: InfluenceState,
-    state_fence: &'a StateFence,
-    revision: u64,
-}
-
-/// Canonical request digest of one exact revocation-closure presentation:
-/// the identity, origin, sorted dependents, reason, state, fence, and
-/// revision the wire record presented. An unserializable presentation is
+/// Canonical request digest of one exact revocation-closure presentation,
+/// recomputed through the one shared canonical codec over every presented
+/// coordinate: version, identity, owner, origin, sorted dependents, reason,
+/// state, fence, revision, bounds, disposition, sorted omissions, and the
+/// affected-member count and digest. An unserializable presentation is
 /// unknown evidence, never a defaulted hash.
 fn closure_canonical_digest(
     closure: &AuthorityRevocationClosureEvidence,
 ) -> Result<String, RevocationHistoryError> {
-    AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
-        &closure.closure_id,
-        &closure.root_ref,
-        &closure.dependent_refs,
-        closure.invalidation_reason,
-        closure.current_influence,
-        &closure.state_fence,
-        closure.revision,
-    )
-    .ok_or(RevocationHistoryError::UnknownHistory)
+    AuthorityRevocationClosureEvidence::declared_canonical_request_digest(&closure.digest_input())
+        .ok_or(RevocationHistoryError::UnknownHistory)
 }
 
 /// One CURRENT revocation closure with its exact declared reference set.
@@ -535,9 +538,11 @@ pub struct ValidatedRevocationClosure {
     /// compared against the exact recomputed membership.
     pub affected_member_digest: String,
     /// Declared canonical request hash of the exact presented bytes:
-    /// identity, origin, sorted dependents, reason, state, fence, and
-    /// revision. It was recomputed over those bytes and compared before this
-    /// value was accepted, so it identifies this presentation.
+    /// version, identity, owner, origin, sorted dependents, reason, state,
+    /// fence, revision, bounds, disposition, sorted omissions, and the
+    /// affected-member count and digest. It was recomputed over those bytes
+    /// and compared before this value was accepted, so it identifies this
+    /// presentation.
     pub canonical_request_digest: String,
     /// Evidence version this validation was proven under. Admission
     /// requires [`REVOCATION_HISTORY_EVIDENCE_VERSION`], so a value
@@ -850,8 +855,9 @@ pub struct AdmittedRevocationClosure {
     /// The closure's own committed revision at that source revision.
     pub closure_revision: u64,
     /// Canonical request digest of the exact presented bytes this admission
-    /// was proven from: identity, origin, sorted dependents, reason,
-    /// state, fence, and revision.
+    /// was proven from: version, identity, owner, origin, sorted dependents,
+    /// reason, state, fence, revision, bounds, disposition, sorted omissions,
+    /// and the affected-member count and digest.
     pub canonical_request_digest: String,
     /// Evidence version the admission was proven under, carried from the
     /// validated closure so the admitted value identifies the evidence
@@ -969,8 +975,9 @@ pub enum RevocationHistoryError {
     /// reports a reachable target the closure omitted.
     OriginTargetMismatch(OriginTargetMismatch),
     /// One closure identity was presented twice in a single evidence input
-    /// with different committed content: changed origin, affected set,
-    /// reason, state, fence, or revision. The committed result is
+    /// with different committed content: changed version, origin, owner,
+    /// bounds, disposition, affected set, reason, state, fence, revision,
+    /// omissions, or any declared digest. The committed result is
     /// authoritative and nothing is applied. Exact replay across restores
     /// returns the same suppression result by construction; comparing one
     /// restore against a previous one needs the durable history owner,
@@ -1097,9 +1104,11 @@ fn inherited_suppression(
     grant: &CapabilityGrant,
 ) -> Option<SuppressedGrant> {
     // The admission comparison has already proven that every denominator
-    // member is either named by the committed closure, owned by the declared
-    // authority root, or inherits from one of those, so a member that
-    // reaches this arm always finds a suppressed ancestor.
+    // member is either named by the committed closure or owned by the
+    // declared authority root, so for admitted closures this arm finds no
+    // one: a suppressed ancestor never stands in for an omitted descendant.
+    // The walk stays as the termination-guarded inheritance fallback rather
+    // than a second admission rule.
     let mut cursor = grant.parent_grant_id.as_ref().map(GrantId::as_str);
     while let Some(parent_id) = cursor {
         if let Some(parent) = suppression_of(graph, admitted, memoized, parent_id) {
