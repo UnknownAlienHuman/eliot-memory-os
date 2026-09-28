@@ -10,6 +10,7 @@
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,9 +25,9 @@ use eliot_kernel_core::user_automation::{
     UserAutomationConfigurationState, UserAutomationInvocation, UserAutomationRevision,
 };
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind, HostRequestRecord, HostRequestState,
-    OpaqueLabel, RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
-    WriterReservationToken,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
+    HostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel, RedbRecoveryStore,
+    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord, WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_store_api::{
@@ -78,6 +79,16 @@ use crate::{
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+
+/// Monotonic per-process counter behind one UserAutomation send claim.
+///
+/// The durable claim is first-writer-wins, so a second acquisition of the same
+/// obligation must never be able to replay as the first caller's attempt. Every
+/// claim therefore mints a distinct launch nonce from this counter, so the ORS
+/// `HostRequestAttempt` two competing callers present can only be byte-equal
+/// when they are the same attempt. It is process-local identity for a durable
+/// record; it grants no authority and carries no decision of its own.
+static USER_AUTOMATION_SEND_CLAIM_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomationExecutionError {
     UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
@@ -1578,15 +1589,15 @@ impl KernelStoreGateway {
     /// skip: the caller reports it as an explicit unavailability and issues no
     /// owner effect at all.
     ///
-    /// The one window this durable outbox does not close is a process death
-    /// strictly between handing the request to the owner and recording its
-    /// answer: the record is left `Admitted`, which still proves the owner was
-    /// never handed it, so a later attempt of the same parent operation issues it
-    /// again under the same original owner operation identity. Closing that
-    /// window would need an outbox edge from a routed record back to a
-    /// not-issued state, which `eliot_ors::HostRequestState::transition_to` has
-    /// none of; every *reported* response loss is armed by
-    /// [`Self::mark_user_automation_obligation_unknown`] instead.
+    /// The window between handing the request to the owner and recording its
+    /// answer is closed by [`Self::claim_user_automation_send`], which acquires
+    /// one exclusive durable send claim and persists the monotonic `Routed`
+    /// state before the first transport await (issue #2970). A process death
+    /// after that claim therefore reloads as a reconciling record, never as
+    /// re-issuable `Admitted` work, and a competing caller that loses the claim
+    /// issues nothing. Every *reported* response loss is still armed by
+    /// [`Self::mark_user_automation_obligation_unknown`], and no state is ever
+    /// moved backward out of a possible-effect contour to enable a retry.
     fn retain_user_automation_obligation(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -1672,12 +1683,14 @@ impl KernelStoreGateway {
     ///
     /// `Admitted` is the last state that still proves the owner was never handed
     /// the request, and it is the state the outbox's own answer path continues
-    /// from: persisting a result walks `Admitted -> Routed -> Submitted ->
-    /// ResultReceived` inside one transaction, and an owner that is not available
-    /// leaves the record admitted so a later attempt of the same parent operation
-    /// may still issue it. The outbox has no edge back out of `Routed`, so the
-    /// record is never walked past the point where the effect would become
-    /// irreversible; a lost answer is armed by
+    /// from. This advance is a mechanical, idempotent state projection and
+    /// deliberately grants no ownership: [`Self::claim_user_automation_send`]
+    /// then acquires the exclusive send claim that actually permits the owner
+    /// handoff, and that claim is what persists the monotonic `Routed` state
+    /// before the first transport await. An owner that is not available leaves
+    /// the record admitted, so a later attempt of the same parent operation may
+    /// still claim and issue it; nothing here is ever moved backward out of a
+    /// possible-effect contour, and a lost answer is armed by
     /// [`Self::mark_user_automation_obligation_unknown`] instead.
     fn mark_user_automation_obligation_admitted(
         &self,
@@ -1712,6 +1725,182 @@ impl KernelStoreGateway {
                     .to_owned(),
             )),
         }
+    }
+
+    /// Prepares one retained wake cancellation for its single owner handoff,
+    /// and reports the unresolved phases to return when it cannot.
+    ///
+    /// The durable advance to `Admitted` and the exclusive send claim are two
+    /// separate steps on purpose. The advance is a mechanical, idempotent
+    /// projection that still proves the owner was never handed the request;
+    /// the claim is what actually grants ownership, and it persists the
+    /// monotonic `Routed` state in the same ORS transaction. Issuing the
+    /// request requires both, and neither failure may issue an owner effect,
+    /// so both are reported as an unresolved handoff of the already committed
+    /// retirement under the original owner operation identity.
+    ///
+    /// Returns the phases the caller must return instead, or `None` when the
+    /// cancellation now holds its claim and may reach the owner.
+    fn claim_wake_cancellation_send(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        settled: &mut UserAutomationRuntimeObligation,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+        execution: &UserAutomationExecutionPhase,
+    ) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
+        // The retained record is admitted durably before the request leaves this
+        // boundary. The retirement replayed inside the join is a read of an
+        // already committed fact, so the only effect that request can carry is
+        // the cancellation, and it is the one the record now tracks.
+        if let Err(reason) = self.mark_user_automation_obligation_admitted(settled) {
+            return Some(unresolved_wake_cancellation(
+                settled,
+                obligations,
+                execution,
+                reason,
+            ));
+        }
+        // Exactly one caller may hand this cancellation to the owner. The claim
+        // is acquired before the first transport await and, in the same durable
+        // write, persists the monotonic `Routed` state, so a process death
+        // inside the await window cannot reload as re-issuable `Retained` work
+        // and a competing caller issues nothing at all.
+        self.claim_user_automation_send(sealed, settled)
+            .err()
+            .map(|reason| unresolved_wake_cancellation(settled, obligations, execution, reason))
+    }
+
+    /// Acquires the one exclusive, durable send claim of one retained
+    /// obligation before its owner effect is handed to the transport
+    /// (issue #2970).
+    ///
+    /// This is the existing ORS HostRequest claim seam, not a new outbox: the
+    /// claim is a `HostRequestAttempt` on the same row the obligation already
+    /// owns, and [`RedbRecoveryStore::claim_host_request_attempt`] performs the
+    /// whole acquisition in one ORS write transaction. Two guarantees come
+    /// from that single transaction rather than from this caller:
+    ///
+    /// - Acquisition is first-writer-wins. `Admitted` is the last state that
+    ///   still proves the owner was never handed the request, and exactly one
+    ///   caller can move the row out of it with a claimed attempt. A second
+    ///   caller's presented attempt never matches the durable one, so ORS
+    ///   retains the first attempt and fences the operation as `Unknown`
+    ///   instead of reissuing.
+    /// - The monotonic non-reissuable `Routed` state is persisted in that same
+    ///   transaction, before this function returns and therefore before the
+    ///   first transport await. A process death after this point reloads as a
+    ///   reconciling record, never as ordinary `Retained` work, and nothing is
+    ///   ever written between the claim and the routed state because they are
+    ///   one write.
+    ///
+    /// Ownership is then confirmed by CONTENT, not by the mere existence of a
+    /// claimed attempt or by a same-target `Routed` replay: the durable attempt
+    /// is compared against the exact attempt this caller presented, so only
+    /// the claim that actually won proceeds to the transport. A caller that
+    /// loses returns a closed reason and makes zero Host calls, and the
+    /// obligation is left for reconciliation under its original owner operation
+    /// identity instead.
+    fn claim_user_automation_send(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so no \
+                 exclusive send claim can be acquired"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let attempt = self.user_automation_send_claim_attempt(sealed, obligation)?;
+        let claimed = ors
+            .claim_host_request_attempt(&operation_id, &obligation.request_digest, &attempt)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the exclusive send claim could not be acquired: {error}"),
+                )
+            })?;
+        let Some(claimed) = claimed else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the retained obligation record disappeared before its exclusive send claim could \
+                 be acquired"
+                    .to_owned(),
+            ));
+        };
+        // The routed state and this caller's own claim are one durable write;
+        // anything else is a competing attempt, not ownership.
+        if claimed.state != HostRequestState::Routed || claimed.attempt.as_ref() != Some(&attempt) {
+            return Err(format!(
+                "the {} runtime obligation under owner operation identity {} was already claimed by \
+                 another caller, which is durably recorded as {:?} with a different attempt; no \
+                 owner effect was issued from this caller and the claim stays owned by its winner \
+                 for reconciliation",
+                obligation.kind.as_str(),
+                obligation.owner_operation_id,
+                claimed.state
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the exact ORS `HostRequestAttempt` one UserAutomation send claim
+    /// presents, bound by content to this obligation and to the live Kernel
+    /// route.
+    ///
+    /// `attempt.fence_digest` is the parent's own State Fence digest, the same
+    /// digest the staged row carries, so ORS's own `attempt.validate` refuses
+    /// a claim that does not belong to the record it is claiming. The owner
+    /// fields name the claiming Kernel generation, its authority session, and
+    /// this claim's unique launch identity, which is what makes two competing
+    /// claims distinguishable instead of interchangeable.
+    fn user_automation_send_claim_attempt(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<HostRequestAttempt, String> {
+        let fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
+        let claim_nonce = USER_AUTOMATION_SEND_CLAIM_NONCE
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .checked_add(1)
+            .ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "this process exhausted its send claim identity space, so a new claim identity \
+                     could not be minted",
+                )
+            })?;
+        let owner_connection_ref = obligation_label(
+            obligation,
+            format!(
+                "{}:{}:{}",
+                self.route.route_scope().as_str(),
+                self.route.active_generation().value(),
+                std::process::id()
+            ),
+        )?;
+        let owner_launch_nonce = obligation_label(
+            obligation,
+            format!("{USER_AUTOMATION_RUNTIME_CHANNEL}:{claim_nonce:016x}"),
+        )?;
+        Ok(HostRequestAttempt {
+            attempt_id: obligation_label(
+                obligation,
+                format!(
+                    "ua-obligation-send-claim:{}:{}:{claim_nonce:016x}",
+                    obligation.owner_operation_id, obligation.request_digest
+                ),
+            )?,
+            generation: sealed.context.state_fence.resource_generation.value(),
+            fence_digest,
+            owner_connection_ref,
+            owner_launch_nonce,
+            owner_session_epoch: self.route.authority_epoch().sequence.get(),
+            phase: HostRequestAttemptPhase::Claimed,
+        })
     }
 
     /// Arms the anti-blind-retry fence of one retained obligation after its owner
@@ -1780,14 +1969,7 @@ impl KernelStoreGateway {
                  non-negative duration",
                 )
             })?;
-        let fence_digest = canonical_json_bytes(&sealed.context.state_fence)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|error| {
-                unretained_obligation_reason(
-                    obligation,
-                    format!("the State Fence of the obligation could not be digested: {error}"),
-                )
-            })?;
+        let fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
         let payload_digest =
             runtime_obligation_payload_digest(&obligation.subject_ids).map_err(|error| {
                 unretained_obligation_reason(
@@ -2634,9 +2816,9 @@ impl KernelStoreGateway {
         .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
     }
 
-    /// Retains, routes and issues the wake cancellation of one committed
-    /// retirement under its durable owner operation identity, and returns the
-    /// wake phase the owner produced.
+    /// Retains, claims, routes and issues the wake cancellation of one
+    /// committed retirement under its durable owner operation identity, and
+    /// returns the wake phase the owner produced.
     ///
     /// The intent is staged under the ORIGINAL owner operation identity before
     /// the request leaves this boundary, so a response loss at the wake owner or
@@ -2645,6 +2827,17 @@ impl KernelStoreGateway {
     /// the earlier read and this staging is the concurrent attempt of the same
     /// parent operation: its retained disposition is honoured and nothing is
     /// issued.
+    ///
+    /// The cancellation is then handed to the owner under ONE exclusive durable
+    /// send claim acquired before the first transport await (issue #2970). That
+    /// claim is what makes the handoff single-owner rather than merely
+    /// single-request: two concurrent attempts of the same parent operation
+    /// yield at most one owner handoff, because the second one fails to acquire
+    /// the claim and issues nothing. The claim also persists the monotonic
+    /// `Routed` state in the same transaction, so a crash anywhere inside the
+    /// await window leaves a non-reissuable reconciling record under the
+    /// ORIGINAL owner operation identity rather than ordinary `Retained` work
+    /// that a later attempt would blindly reissue.
     async fn issue_retirement_cancellation<R>(
         &self,
         handoff: OwnerWakeHandoffKind,
@@ -2674,16 +2867,10 @@ impl KernelStoreGateway {
             obligations.push(settled);
             return Ok(phases);
         }
-        // The retained record is admitted durably before the request leaves this
-        // boundary. The retirement replayed inside the join below is a read of an
-        // already committed fact, so the only effect that request can carry is
-        // the cancellation, and it is the one the record now tracks.
-        if let Err(reason) = self.mark_user_automation_obligation_admitted(&settled) {
-            settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
-                reason: reason.clone(),
-            };
-            obligations.push(settled);
-            return Ok(unresolved_retirement_phases(reason, execution));
+        if let Some(phases) =
+            self.claim_wake_cancellation_send(sealed, &mut settled, obligations, &execution)
+        {
+            return Ok(phases);
         }
         let removal = match self
             .cancel_retirement_wakes(
@@ -2697,44 +2884,14 @@ impl KernelStoreGateway {
             .await
         {
             Ok(removal) => removal,
-            // The retirement is committed and durable, so a refusal at this leg
-            // is an unresolved handoff of a committed fact. It is reported as
-            // such, with the exact refusal, instead of being reported as a failed
-            // retirement or as a cancellation that did not happen. Only a lost
-            // owner answer leaves a possibly issued effect: every other refusal
-            // happened before the cancellation left this boundary, so the
-            // obligation stays re-issuable under its retained identity.
-            Err((error, owner_answered_unknown)) => {
-                if owner_answered_unknown
-                    && let Err(arm) = self.mark_user_automation_obligation_unknown(&settled)
-                {
-                    settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
-                        reason: arm.clone(),
-                    };
-                    obligations.push(settled);
-                    return Ok(unresolved_retirement_phases(arm, execution));
-                }
-                settled.disposition = if owner_answered_unknown {
-                    UserAutomationRuntimeObligationDisposition::Reconciling {
-                        reason: unretained_cancellation_outcome_reason(
-                            &revision.revision,
-                            &settled.owner_operation_id,
-                            &error.to_string(),
-                        ),
-                    }
-                } else {
-                    UserAutomationRuntimeObligationDisposition::Retained
-                };
-                obligations.push(settled);
-                return Ok(unresolved_retirement_phases(
-                    format!(
-                        "revision {} of {} is {}, but its unadmitted wakes were not cancelled from \
-                         the complete owner view: {}; the not-yet-admitted wakes and the exact \
-                         unresolved reconciliation references of this revision are preserved and \
-                         stay open",
-                        revision.revision, revision.automation_id, noun, error
-                    ),
-                    execution,
+            Err(refusal) => {
+                return Ok(self.refused_claimed_cancellation(
+                    refusal,
+                    &revision,
+                    noun,
+                    &mut settled,
+                    obligations,
+                    &execution,
                 ));
             }
         };
@@ -2782,6 +2939,61 @@ impl KernelStoreGateway {
             UserAutomationWakePhase::Cancelled { cancelled_wake_ids },
             execution,
         ))
+    }
+
+    /// Reports one refused wake cancellation that already held the exclusive
+    /// send claim, and returns the phases its caller must return.
+    ///
+    /// The retirement is committed and durable, so a refusal at this leg is an
+    /// unresolved handoff of a committed fact. It is reported as such, with the
+    /// exact refusal, instead of being reported as a failed retirement or as a
+    /// cancellation that did not happen. The exclusive send claim is already
+    /// durable, so no arm here may report the obligation as still re-issuable:
+    /// a claim that survived the attempt to hand the request over can only be
+    /// settled by exact owner reconciliation under the original owner
+    /// operation identity.
+    #[allow(clippy::too_many_arguments)]
+    fn refused_claimed_cancellation(
+        &self,
+        refusal: (UserAutomationExecutionError, bool),
+        revision: &UserAutomationRevision,
+        noun: &str,
+        settled: &mut UserAutomationRuntimeObligation,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+        execution: &UserAutomationExecutionPhase,
+    ) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+        let (error, owner_answered_unknown) = refusal;
+        if owner_answered_unknown
+            && let Err(arm) = self.mark_user_automation_obligation_unknown(settled)
+        {
+            return unresolved_wake_cancellation(settled, obligations, execution, arm);
+        }
+        let reason = if owner_answered_unknown {
+            unretained_cancellation_outcome_reason(
+                &revision.revision,
+                &settled.owner_operation_id,
+                &error.to_string(),
+            )
+        } else {
+            claimed_cancellation_outcome_reason(
+                &revision.revision,
+                &settled.owner_operation_id,
+                &error.to_string(),
+            )
+        };
+        settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+            reason: reason.clone(),
+        };
+        obligations.push(settled.clone());
+        unresolved_retirement_phases(
+            format!(
+                "revision {} of {} is {}, but its unadmitted wakes were not cancelled from the \
+                 complete owner view: {}; the not-yet-admitted wakes and the exact unresolved \
+                 reconciliation references of this revision are preserved and stay open",
+                revision.revision, revision.automation_id, noun, error
+            ),
+            execution.clone(),
+        )
     }
 
     /// Issues the wake cancellation of one committed retirement-like transition
@@ -4239,6 +4451,28 @@ fn unresolved_retirement_phases(
     )
 }
 
+/// Records one retained wake cancellation as an unresolved handoff of an
+/// already committed retirement, and reports the phases its caller must return.
+///
+/// Both the durable admit and the exclusive send claim refuse without ever
+/// issuing an owner effect, so a caller that cannot take one of them reports
+/// the committed fact exactly like a refusal that reached no owner. The
+/// disposition is `Reconciling` rather than retained work in both cases: a
+/// committed retirement can only be settled by exact owner reconciliation
+/// under its original owner operation identity.
+fn unresolved_wake_cancellation(
+    settled: &mut UserAutomationRuntimeObligation,
+    obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    execution: &UserAutomationExecutionPhase,
+    reason: String,
+) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+    settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+        reason: reason.clone(),
+    };
+    obligations.push(settled.clone());
+    unresolved_retirement_phases(reason, execution.clone())
+}
+
 /// What the composition-bound durable outbox already holds for one runtime
 /// obligation of the current parent operator operation.
 ///
@@ -4590,6 +4824,27 @@ fn user_automation_obligation_operation_id(
             format!("the derived owner operation identity is not a well-formed label: {error}"),
         )
     })
+}
+
+/// Digests the State Fence one admitted parent request carries.
+///
+/// The staged durable row and the exclusive send claim that later competes for
+/// that same row both bind the fence through this one derivation, so a claim
+/// can only be recognized as belonging to the record it claims: ORS compares
+/// the claim's fence against the staged row's fence by content and refuses any
+/// other pairing.
+fn user_automation_obligation_fence_digest(
+    sealed: &UserAutomationServiceRequest,
+    obligation: &UserAutomationRuntimeObligation,
+) -> Result<String, String> {
+    canonical_json_bytes(&sealed.context.state_fence)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| {
+            unretained_obligation_reason(
+                obligation,
+                format!("the State Fence of the obligation could not be digested: {error}"),
+            )
+        })
 }
 
 /// Builds one durable outbox label, naming the obligation when the value is not
@@ -5084,6 +5339,28 @@ fn unretained_cancellation_outcome_reason(
          {automation_revision} and its answer was lost: {detail}; that possible effect is recorded \
          under owner operation identity {owner_operation_id}, whose cancelled wake identities are \
          absent from every later read, so reconcile that identity instead of cancelling again"
+    )
+}
+
+/// Reason used when a wake cancellation held the exclusive send claim and the
+/// owner then refused it, so the request is known to have been handed over but
+/// its answer was not retained as such (issue #2970).
+///
+/// Because the claim is durable before the first transport await, this is never
+/// reported as a re-issuable obligation: the exact owner operation identity has
+/// to be reconciled, and only owner or transport evidence that the request was
+/// never issued may release it.
+fn claimed_cancellation_outcome_reason(
+    automation_revision: &str,
+    owner_operation_id: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "the wake cancellation of retired revision {automation_revision} held the exclusive durable \
+         send claim of owner operation identity {owner_operation_id} before the owner was handed \
+         the request, and the owner refused it without a retained answer: {detail}; that claim \
+         stays owned by its holder and can only be settled by reconciling the exact owner \
+         operation identity, so the cancellation is not reissued from here"
     )
 }
 
