@@ -739,11 +739,22 @@ fn commit_activation_candidate(
 /// canonical reads the accepted-intake plan carried (issue #1957, I3.4, A2/A3).
 ///
 /// **This is a refresh, never a decision.** It runs after the caller has
-/// rechecked the admitted fence and before the intake is published, it never
-/// refuses or rewrites the intake, and either leg failing leaves the held view
-/// exactly as it was. That is the fail-closed direction: a production route the
-/// view cannot evidence stays refused rather than being read as "nothing to
-/// check".
+/// rechecked the admitted fence and before the intake is published, and it never
+/// refuses or rewrites the intake. That is the fail-closed direction: a
+/// production route the view cannot evidence stays refused rather than being
+/// read as "nothing to check".
+///
+/// Note the difference between the two legs on failure, because they are not
+/// symmetric. The lifecycle leg replaces the view through the registry's own
+/// import and leaves the held contents as they were when it refuses. The DURABLE
+/// leg applies the served page ROW BY ROW into the live registry, so a refusal
+/// part-way through a page leaves the rows before it applied. That is the
+/// registry's own bounded-retain behaviour (a new key refused because the
+/// registry is full means the requested coverage was NOT retained, which is
+/// exactly what must be reported), and it is not a silent pass: the intake is
+/// unaffected either way, and any route the partial page did not cover simply
+/// stays refused. The startup drain is the leg that is atomic — it stages pages
+/// and replaces the registry only after a complete drain.
 ///
 /// The two legs carry different things and are reported separately:
 ///

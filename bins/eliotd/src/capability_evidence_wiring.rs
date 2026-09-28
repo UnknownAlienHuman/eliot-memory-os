@@ -53,10 +53,14 @@
 //! other account's and route's still-valid record into the growing invalidation
 //! set, on every call, and permanently. I3.4 requires capability to be
 //! route/account-specific, so that call erases exactly the dimension the
-//! document protects. Staleness is instead DERIVED at the gate (below), and
-//! [`apply_scope_change`](Self::apply_scope_change) is deliberately left with no
-//! production caller: it is pre-existing public surface whose correct direction
-//! is a narrower selector than any current observation site can supply.
+//! document protects. The over-broad call has been REMOVED from
+//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route),
+//! so no production path invokes it any more; staleness is instead DERIVED at the
+//! gate (below). [`apply_scope_change`](Self::apply_scope_change) is left in
+//! place, unreferenced from production: it is pre-existing public surface whose
+//! correct direction is a narrower selector than any current observation site
+//! can supply, and an existing test exercises it, so removing the method itself
+//! would exceed this issue.
 //!
 //! Evidence bridges, and why there are two. Both are canonical reads, and they
 //! carry different things — measured on current store source:
@@ -644,29 +648,20 @@ pub struct ObservedLifecycleSummary {
 ///
 /// Re-proves the row at the Governor read edge, which is where the owner
 /// authority is established: the presented `record_digest` must equal the digest
-/// over the exact record bytes, the record's own `(skill_id,
-/// scope_fingerprint)` must reproduce the row's `scope_key` address, and the
-/// record document must carry every route-scope fingerprint field. A row that
-/// fails any check is refused whole, so no substituted document can become
+/// over the exact record bytes, and the record's own `(skill_id,
+/// scope_fingerprint)` must reproduce the row's `scope_key` address. A row that
+/// fails either check is refused whole, so no substituted document can become
 /// registry state under a reference the canonical store never issued for it.
 ///
-/// **Why the field-completeness check exists (I3.4, W2).**
-/// [`RouteScopeFingerprint`] declares `deny_unknown_fields`, which rejects an
-/// EXTRA field but says nothing about a MISSING one: serde fills an absent
-/// `Option` with `None`. An absent `adapter_hash` therefore deserializes
-/// identically to an explicit `"adapter_hash": null`, and both produce the same
-/// [`RouteScopeFingerprint::reference_digest`] and therefore the same `scope_key`.
-/// I3.4 requires a field the source cannot provide to be marked **unknown
-/// rather than inferred** — a present-but-null field is that marker, and an
-/// absent field is not a marker at all. Without this check the read edge cannot
-/// tell the two apart, so a document that silently DROPS a fingerprint dimension
-/// would hydrate as if that dimension were deliberately reported unknown, and
-/// would then match a route whose real value differs.
-///
-/// The expected key set is taken from a fully-unknown
-/// [`RouteScopeFingerprint`]'s own serialization rather than a hand-written
-/// list, so it cannot drift from the adopted contract shape: a field added to
-/// the type is required here automatically.
+/// Those two checks together already bind the whole record, so no third
+/// field-completeness check is added here. Measured: the only producer of a
+/// record document is `canonical_json_bytes(record)` in the Governor's commit
+/// owner, and [`RouteScopeFingerprint`] has no `skip_serializing_if`, so every
+/// field is always present as an explicit key or an explicit `null` — I3.4's
+/// "unknown rather than inferred" marker. A document that dropped a field would
+/// change its `reference_digest()` and therefore fail the `scope_key`
+/// re-proof, and any substituted bytes change the `record_digest`. A check that
+/// cannot fire is not a check.
 fn decode_evidence_record_row(
     row: &serde_json::Value,
 ) -> Result<(CapabilityEvidenceRecord, OwnerEvidenceRevision), EvidenceBridgeError> {
@@ -688,13 +683,10 @@ fn decode_evidence_record_row(
         .and_then(serde_json::Value::as_u64)
         .ok_or(EvidenceBridgeError::Payload("revision"))?;
     // Read the ORIGINAL recorded bytes, not a re-derivation over what we hold:
-    // both the record and the completeness check are taken from the document
-    // the store committed under the digest it echoed.
-    let document: serde_json::Value =
-        serde_json::from_str(&record_json).map_err(|_| EvidenceBridgeError::Payload("record"))?;
-    require_complete_scope_fingerprint(&document)?;
+    // the record is taken from the document the store committed under the digest
+    // it echoed, and the two re-proofs below bind those exact bytes.
     let record: CapabilityEvidenceRecord =
-        serde_json::from_value(document).map_err(|_| EvidenceBridgeError::Payload("record"))?;
+        serde_json::from_str(&record_json).map_err(|_| EvidenceBridgeError::Payload("record"))?;
     if record.skill_id != row_skill_id {
         return Err(EvidenceBridgeError::Payload("skill_id"));
     }
@@ -704,41 +696,6 @@ fn decode_evidence_record_row(
     let revision = OwnerEvidenceRevision::issued(owner_revision, &record_digest)
         .map_err(|_| EvidenceBridgeError::Payload("revision"))?;
     Ok((record, revision))
-}
-
-/// Refuses a record document that does not state every route-scope fingerprint
-/// field explicitly.
-///
-/// Each field must be PRESENT, and its value must be either `null` (the
-/// source cannot provide it — I3.4's "unknown, never inferred") or a string.
-/// An absent field is refused rather than read as unknown, because serde would
-/// otherwise fill it with `None` indistinguishably from a stated unknown, and
-/// the two produce the same `scope_key` (see
-/// [`decode_evidence_record_row`]).
-fn require_complete_scope_fingerprint(
-    document: &serde_json::Value,
-) -> Result<(), EvidenceBridgeError> {
-    let expected = eliot_store_api::canonical_json_bytes(&RouteScopeFingerprint::default())
-        .map_err(|_| EvidenceBridgeError::Payload("scope_fingerprint"))?;
-    let expected: serde_json::Value = serde_json::from_slice(&expected)
-        .map_err(|_| EvidenceBridgeError::Payload("scope_fingerprint"))?;
-    let expected = expected
-        .as_object()
-        .ok_or(EvidenceBridgeError::Payload("scope_fingerprint"))?;
-    let stated = document
-        .get("scope_fingerprint")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(EvidenceBridgeError::Payload("scope_fingerprint"))?;
-    for field in expected.keys() {
-        // `None` (absent) falls through to the refusal arm together with any
-        // non-string, non-null value; only a stated `null` or a stated string
-        // is accepted.
-        match stated.get(field) {
-            Some(serde_json::Value::Null | serde_json::Value::String(_)) => {}
-            _ => return Err(EvidenceBridgeError::Payload("scope_fingerprint")),
-        }
-    }
-    Ok(())
 }
 
 /// Drains the complete capability-evidence record read into the held view.
