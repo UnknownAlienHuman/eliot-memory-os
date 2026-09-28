@@ -855,6 +855,23 @@ fn maintenance_trigger_decision_record(
 }
 
 #[cfg(windows)]
+fn maintenance_trigger_acknowledgement_record(
+    acknowledgement: &MaintenanceTriggerAck,
+) -> Result<MaintenanceTriggerCanonicalRecord, MaintenanceTriggerLifecycleFailure> {
+    let digest = sha256_hex(
+        &canonical_json_bytes(acknowledgement)
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?,
+    );
+    maintenance_trigger_canonical_record(
+        format!(
+            "maintenance-trigger-ack:{}:{}:{digest}",
+            acknowledgement.trigger_id, acknowledgement.delivery_id
+        ),
+        acknowledgement,
+    )
+}
+
+#[cfg(windows)]
 fn mark_maintenance_trigger_reconciling_checked(
     ors: &dyn OperationalRecoveryStore,
     trigger_id: &str,
@@ -3424,7 +3441,29 @@ impl KernelStoreGateway {
             &receipt,
         )?;
 
-        let decision_record = maintenance_trigger_decision_record(&decision)?;
+        self.persist_recovered_maintenance_trigger_decision(
+            active_state_fence,
+            trigger,
+            lifecycle,
+            binding,
+            ors,
+            &decision,
+        )
+        .await?;
+        Ok(Some(decision))
+    }
+
+    #[cfg(windows)]
+    async fn persist_recovered_maintenance_trigger_decision(
+        &self,
+        active_state_fence: &StateFence,
+        trigger: &MaintenanceTriggerRecord,
+        lifecycle: &MaintenanceTriggerLifecycleRecord,
+        binding: &MaintenanceTriggerClaimBinding,
+        ors: &dyn OperationalRecoveryStore,
+        decision: &MaintenanceTriggerDecisionReceipt,
+    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
+        let decision_record = maintenance_trigger_decision_record(decision)?;
         if self.is_fenced() {
             return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
         }
@@ -3477,10 +3516,10 @@ impl KernelStoreGateway {
             active_state_fence,
             &readback_trigger,
             &readback,
-            &decision,
+            decision,
         )
         .await?;
-        Ok(Some(decision))
+        Ok(())
     }
 
     /// Looks up the exact committed Store receipt retained for one active
@@ -3610,6 +3649,24 @@ impl KernelStoreGateway {
             authenticated_session,
             decision,
         )?;
+        self.persist_maintenance_trigger_decision_after_receipt(
+            active_state_fence,
+            ors,
+            decision,
+            &context,
+        )
+        .await?;
+        Ok(decision.clone())
+    }
+
+    #[cfg(windows)]
+    async fn persist_maintenance_trigger_decision_after_receipt(
+        &self,
+        active_state_fence: &StateFence,
+        ors: &dyn OperationalRecoveryStore,
+        decision: &MaintenanceTriggerDecisionReceipt,
+        context: &MaintenanceTriggerDecisionContext,
+    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
         let intent = context.record.clone();
         let receipt_result = self
             .read_maintenance_trigger_canonical_receipt(
@@ -3701,7 +3758,7 @@ impl KernelStoreGateway {
                 return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
             }
         }
-        Ok(decision.clone())
+        Ok(())
     }
 
     /// Acknowledges only a previously retained, fully validated decision
@@ -3759,18 +3816,7 @@ impl KernelStoreGateway {
             return Err(MaintenanceTriggerLifecycleFailure::ClaimNotCurrent);
         }
 
-        let ack_record = maintenance_trigger_canonical_record(
-            format!(
-                "maintenance-trigger-ack:{}:{}:{}",
-                acknowledgement.trigger_id,
-                acknowledgement.delivery_id,
-                sha256_hex(
-                    &canonical_json_bytes(acknowledgement)
-                        .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization,)?
-                )
-            ),
-            acknowledgement,
-        )?;
+        let ack_record = maintenance_trigger_acknowledgement_record(acknowledgement)?;
         if let Some(replayed_acknowledgement) = self
             .replay_maintenance_trigger_acknowledgement(
                 active_state_fence,
