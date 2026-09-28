@@ -127,6 +127,7 @@ mod package_planner;
 mod plan;
 mod profile_governed_roots;
 mod profile_roots;
+mod profile_supervision;
 mod redb_state;
 mod registry_wire;
 mod runtime_root_contract;
@@ -227,6 +228,7 @@ use package::{
 use package::{package_absent_with_snapshot, package_manifest_matches, package_staging_reference};
 pub use package_planner::{
     GenerationPackagePlanInput, GenerationPackagePlanner, ProfileRootSelectionInput,
+    ProfileSelectionInput, ProfileSelectionResolution,
 };
 pub use plan::{
     InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole,
@@ -235,6 +237,10 @@ pub use plan::{
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
+pub use profile_supervision::{
+    ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision, UnprivilegedSelectionProof,
+    prove_unprivileged_selection,
+};
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,

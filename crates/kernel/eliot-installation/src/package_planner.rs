@@ -16,12 +16,14 @@ use crate::{
     InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
     InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
     ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
-    PackageArtifactDigest, PlannedChange, ProfileRootAnchors, ResourceGeneration,
-    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
-    StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
+    PackageArtifactDigest, PlannedChange, ProfileGovernanceReport, ProfileRootAnchors,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
+    SupervisionAuthorityProvisionPlan, UnprivilegedSelectionProof,
     candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate, provider_bootstrap_credential_target_for_store_target,
-    select_profile_roots, supervision_key_slot_for_scope_id,
+    phase_b_static_template_for_candidate, prove_unprivileged_selection,
+    provider_bootstrap_credential_target_for_store_target, select_profile_roots,
+    supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -1079,6 +1081,57 @@ pub struct ProfileRootSelectionInput {
     pub generation: Option<String>,
 }
 
+/// The complete explicit input set for one I3.1 profile resolution.
+///
+/// Every value is caller-supplied: the profile, the OS-proved anchors, the
+/// versioned component identity, the retained runtime anchor, and the two
+/// planned write destinations that must be checked against the profile's
+/// immutable binaries root. Nothing is defaulted from a process environment
+/// variable, the current directory, or today's ambient state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileSelectionInput {
+    /// Explicitly selected supervision/path profile.
+    pub profile: InstallationProfile,
+    /// OS-proved profile anchors for the selected profile.
+    pub anchors: ProfileRootAnchors,
+    /// OS-validated profile anchor the retained runtime roots are derived from.
+    pub profile_anchor_root: PlatformHandle,
+    /// Lowercase installation key for the profiled Windows profiles. Must be
+    /// absent for `portable_dev`.
+    pub installation_key: Option<PlatformHandle>,
+    /// Component name for the versioned immutable root of the Windows profiles.
+    pub component: String,
+    /// Component version for the versioned immutable root of the Windows profiles.
+    pub version: String,
+    /// Immutable-root generation for `portable_dev`, which versions its
+    /// immutable root by generation rather than by release version. Required
+    /// when the profile is `PortableDev`, ignored otherwise.
+    pub generation: Option<String>,
+    /// Absolute immutable source-bundle directory the plan would consume.
+    pub source_root: PlatformHandle,
+    /// Absolute immutable staging destination the plan would use.
+    pub staging_root: PlatformHandle,
+}
+
+/// What one explicitly selected profile governs, resolved once before effects.
+///
+/// The value is the whole answer to "which profile is this, what does it
+/// write, how is it supervised, and what does it honestly not guarantee".
+/// It is resolved read-only, so a caller can present or refuse it without
+/// creating a root or reserving a service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileSelectionResolution {
+    /// The versioned four-root binding for the selected profile.
+    pub roots: InstallationRoots,
+    /// Selected profile, intended supervision and enforced/unsupported
+    /// guarantees. Contains no key, secret or credential value.
+    pub governance: ProfileGovernanceReport,
+    /// Evidence that a non-service selection depends on no service-only
+    /// authority. Always present, and always the proved fact rather than a
+    /// claim.
+    pub unprivileged_proof: UnprivilegedSelectionProof,
+}
+
 /// The sole production package/transaction composition seam.
 pub struct GenerationPackagePlanner;
 
@@ -1162,26 +1215,94 @@ impl GenerationPackagePlanner {
         files: Vec<PackageArtifactDigest>,
         evidence_digest: PlatformHandle,
     ) -> Result<(InstallationTransaction, InstallationRoots), InstallationError> {
-        let governed = select_profile_roots(
-            input.profile,
-            selection.component.as_str(),
-            selection.version.as_str(),
-            selection.generation.as_deref(),
-            &selection.anchors,
-        )?;
-        governed.admits_write_target(input.source_root.as_str())?;
-        governed.admits_write_target(input.staging_root.as_str())?;
-        let roots = Self::planner_runtime_roots(&input)?;
-        let binding = governed.into_installation_roots(roots)?;
+        // Resolve once, before any effect: the I3.1 root row, the write
+        // guards, and — for a non-service profile — the structural proof that
+        // the selection carries no SCM, administrative or `ProgramData`
+        // dependency.
+        let resolution = Self::resolve_profile_selection(&ProfileSelectionInput {
+            profile: input.profile,
+            anchors: selection.anchors.clone(),
+            profile_anchor_root: input.profile_anchor_root.clone(),
+            installation_key: input.installation_key.clone(),
+            component: selection.component.clone(),
+            version: selection.version.clone(),
+            generation: selection.generation.clone(),
+            source_root: input.source_root.clone(),
+            staging_root: input.staging_root.clone(),
+        })?;
         let mut transaction = Self::plan_with_source_publication_binding(
             input,
             source_identity,
             files,
             evidence_digest,
         )?;
-        transaction.profile_governed_roots = Some(binding.clone());
+        transaction.profile_governed_roots = Some(resolution.roots.clone());
         transaction.validate()?;
-        Ok((transaction, binding))
+        Ok((transaction, resolution.roots))
+    }
+
+    /// Resolves the I3.1 selection for one explicit profile, read-only.
+    ///
+    /// This is the single place the selected profile's roots, supervision
+    /// path, honest guarantee report and unprivileged-dependency proof are
+    /// produced, and it is the same resolution
+    /// [`Self::plan_with_profile_governed_roots`] performs before it derives
+    /// any effect. It is exposed so a caller can inspect exactly what a
+    /// profile governs before asking for a plan. Nothing here creates a root,
+    /// reserves a service, or mutates durable state: an invalid profile, a
+    /// missing or ambiguous anchor, a write into the versioned immutable
+    /// binaries root, or an unprovable service dependency is a typed refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::ProfileViolation`] for an invalid or
+    /// unsupported profile, a missing anchor, a write into the immutable
+    /// binaries root, or a selection that cannot prove it depends on no
+    /// service-only authority.
+    pub fn resolve_profile_selection(
+        selection: &ProfileSelectionInput,
+    ) -> Result<ProfileSelectionResolution, InstallationError> {
+        let governed = select_profile_roots(
+            selection.profile,
+            selection.component.as_str(),
+            selection.version.as_str(),
+            selection.generation.as_deref(),
+            &selection.anchors,
+        )?;
+        governed.admits_write_target(selection.source_root.as_str())?;
+        governed.admits_write_target(selection.staging_root.as_str())?;
+        let runtime_state_roots = match selection.profile {
+            InstallationProfile::PortableDev => {
+                if selection.installation_key.is_some() {
+                    return Err(InstallationError::ProfileViolation(
+                        "portable_dev does not accept a profiled installation key".to_owned(),
+                    ));
+                }
+                RuntimeStateRoots::derive_portable(selection.profile_anchor_root.clone())
+            }
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                let key = selection.installation_key.as_ref().ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "profile_selection.installation_key".to_owned(),
+                        reason: "profiled installations require an explicit key".to_owned(),
+                    }
+                })?;
+                RuntimeStateRoots::derive_profiled(
+                    selection.profile,
+                    selection.profile_anchor_root.clone(),
+                    key.as_str(),
+                )
+            }
+        };
+        let runtime_state_roots = runtime_state_roots?;
+        let unprivileged_proof = prove_unprivileged_selection(&governed, &runtime_state_roots)?;
+        let governance = governed.governance_report();
+        let roots = governed.into_installation_roots(runtime_state_roots)?;
+        Ok(ProfileSelectionResolution {
+            roots,
+            governance,
+            unprivileged_proof,
+        })
     }
 
     /// Derives the digest-bound runtime topology for one planner input.
