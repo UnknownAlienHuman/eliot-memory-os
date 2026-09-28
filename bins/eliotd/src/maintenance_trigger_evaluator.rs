@@ -41,6 +41,7 @@ use eliot_maintenance::{
 
 use super::DaemonComposition;
 use super::DaemonError;
+use super::notification_state_emit::MaintenanceNotificationEvidence;
 
 /// The maintenance families whose policy owner this daemon cannot yet resolve,
 /// as one constant a reader can inspect instead of a scattered `false`.
@@ -171,6 +172,21 @@ impl DaemonComposition {
         &self,
         observation: MaintenanceObservation,
     ) -> Result<AutomationTriggerDecision, DaemonError> {
+        self.evaluate_maintenance_trigger_with_evidence(observation)
+            .map(|(decision, _)| decision)
+    }
+
+    /// Evaluates one trigger and retains the exact policy and route evidence
+    /// that the canonical notification owner needs for its failure identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same readiness or maintenance error as
+    /// [`Self::evaluate_maintenance_trigger`].
+    pub fn evaluate_maintenance_trigger_with_evidence(
+        &self,
+        observation: MaintenanceObservation,
+    ) -> Result<(AutomationTriggerDecision, MaintenanceNotificationEvidence), DaemonError> {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
@@ -193,7 +209,7 @@ impl DaemonComposition {
             observation.origin.as_str(),
             observation.family
         );
-        let input = {
+        let (input, notification_evidence) = {
             // Owner evidence for every gate (I14.22/I14.24, issue #1692). Each
             // value is derived from a Governor-owned evidence owner or held at
             // its fail-closed value because the owning authority does not
@@ -220,7 +236,7 @@ impl DaemonComposition {
             let schedule = MaintenanceScheduleEvidence::unpublished();
             let broker = MaintenanceBrokerEvidence::transport_only(self.owner_session.is_some());
             let safety = MaintenanceSafetyEvidence::unpublished();
-            MaintenanceTriggerInput {
+            let input = MaintenanceTriggerInput {
                 trigger_id,
                 evidence_refs: observation.evidence_refs,
                 family: observation.family,
@@ -243,7 +259,8 @@ impl DaemonComposition {
                 now_ms: crate::unix_ms_i64(),
                 expires_at_ms: None,
                 active_job_id: None,
-            }
+            };
+            (input, MaintenanceNotificationEvidence { policy, route })
         };
         let decision = self
             .governor
@@ -257,7 +274,7 @@ impl DaemonComposition {
         // triggered family is therefore never silently ignored, and no family
         // is ever reported as having run.
         entry.record_start_route(&decision);
-        Ok(decision)
+        Ok((decision, notification_evidence))
     }
 
     /// Evaluates one durable maintenance trigger and never fails the caller.
