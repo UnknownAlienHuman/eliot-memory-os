@@ -1163,47 +1163,19 @@ where
                 retryable: false,
             }));
         }
-        let issued = match self.issuer.lock() {
-            Ok(mut issuer) => match operation {
-                operation_identity::NotifyOperation::G08Verify => {
-                    issuer.issue_g08(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::A08Admit => {
-                    issuer.issue_a08(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::WatchdogVerify => {
-                    issuer.issue_watchdog(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::DeliveryVerify => {
-                    issuer.issue_delivery(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::LedgerReserve => {
-                    issuer.issue_reserve(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::LedgerCommit => {
-                    issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::NotificationState => {
-                    issuer.issue_notification_state(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::NotificationStateRead => {
-                    issuer.issue_notification_state_read(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::QuietHoursProjectionRead => {
-                    issuer.issue_quiet_hours_projection_read(parent, &payload, now)
-                }
-                operation_identity::NotifyOperation::UserAutomationPreflightRead => {
-                    issuer.issue_user_automation_preflight_read(parent, &payload, now)
-                }
-            },
-            Err(_) => {
-                return PortOutcome::Error(PortError::Provider(ProviderError {
-                    code: ProviderErrorCode::Failed,
-                    retryable: false,
-                }));
-            }
-        };
-        let issued = match issued {
+        // A reconstruction replays a RETAINED ORIGINAL identity; it never
+        // re-derives one. This composition root holds no retained per-step
+        // record — see the #78 STITCH note on `issue_step` — so the recovery
+        // material is explicitly absent and this step is a FIRST issuance.
+        let issued = match issue_step(
+            &self.issuer,
+            parent,
+            operation,
+            &payload,
+            prior_receipt_digest,
+            None,
+            now,
+        ) {
             Ok(issued) => issued,
             Err(operation_identity::OperationIdentityError::IdentityConflict(detail)) => {
                 return identity_conflict_outcome(detail.as_str());
@@ -1271,6 +1243,84 @@ where
                 "Kernel verification exchange mutex is poisoned".to_owned(),
             )),
         }
+    }
+}
+
+/// Resolves the exact child identity for one Kernel step.
+///
+/// A reconstruction is only ever a replay of a RETAINED ORIGINAL identity:
+/// [`operation_identity::NotifyIdentityIssuer::restore_issued`] reinstalls the
+/// complete `RequestIdentity` a step was first issued with and compares it
+/// field by field against the live parent, operation, canonical payload, prior
+/// receipt and the other retained fields. The recovery clock may validate
+/// freshness and report expiry; it never re-anchors that identity. A step
+/// without such retained material is a FIRST issuance and the issuer mints its
+/// own anchored identity under the derived transport strings.
+///
+/// #78 STITCH: the `retained` seam is the only place reconstruction can enter,
+/// and the durable owner of that per-step record does not exist yet. Every
+/// in-scope caller (the stdin request schema, the one-shot composition root,
+/// the protected fallback ledger and its schema-compatible snapshot, and the
+/// Kernel/state owners) carries no retained child identity, so this root never
+/// supplies one and the branch below is not yet taken in production. Until that
+/// owner exists this stays an honest STITCH: a freshly started issuer re-mints
+/// a new anchor under the same transport strings, and that is a first issuance,
+/// never a replay of a lost step. Nothing is fabricated to close the gap.
+fn issue_step(
+    issuer: &operation_identity::IssuerHandle,
+    parent: &NotificationRequest,
+    operation: operation_identity::NotifyOperation,
+    payload: &Value,
+    prior_receipt_digest: Option<&str>,
+    retained: Option<&operation_identity::ChildLineageEntry>,
+    now: u64,
+) -> Result<operation_identity::IssuedIdentity, operation_identity::OperationIdentityError> {
+    let mut issuer = issuer.lock().map_err(|_| {
+        operation_identity::OperationIdentityError::InvalidIdentity(
+            "operation identity issuer mutex is poisoned".to_owned(),
+        )
+    })?;
+    match retained {
+        Some(retained) => issuer.restore_issued(
+            parent,
+            operation,
+            payload,
+            prior_receipt_digest,
+            retained,
+            now,
+        ),
+        None => match operation {
+            operation_identity::NotifyOperation::G08Verify => {
+                issuer.issue_g08(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::A08Admit => {
+                issuer.issue_a08(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::WatchdogVerify => {
+                issuer.issue_watchdog(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::DeliveryVerify => {
+                issuer.issue_delivery(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::LedgerReserve => {
+                issuer.issue_reserve(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::LedgerCommit => {
+                issuer.issue_commit(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::NotificationState => {
+                issuer.issue_notification_state(parent, payload, prior_receipt_digest, now)
+            }
+            operation_identity::NotifyOperation::NotificationStateRead => {
+                issuer.issue_notification_state_read(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::QuietHoursProjectionRead => {
+                issuer.issue_quiet_hours_projection_read(parent, payload, now)
+            }
+            operation_identity::NotifyOperation::UserAutomationPreflightRead => {
+                issuer.issue_user_automation_preflight_read(parent, payload, now)
+            }
+        },
     }
 }
 
