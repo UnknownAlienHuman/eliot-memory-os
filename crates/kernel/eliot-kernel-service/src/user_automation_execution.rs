@@ -62,6 +62,17 @@ pub enum UserAutomationRuntimeError {
     /// The existing owner cannot determine whether the effect was applied.
     #[error("UserAutomation runtime owner returned an unknown outcome: {0}")]
     UnknownOutcome(String),
+    /// The mutation's disposition is proven by exact receipt evidence, but the
+    /// ledger answer for it is still unread.
+    ///
+    /// Issue #2764 item 6: this is a complete answer about the mutation and an
+    /// incomplete one about the ledger, and the two are different facts. The
+    /// distinction is load-bearing for the same reason `NotRetained` is
+    /// separated from `UnknownOutcome`: a caller that can see "the commit
+    /// provably happened" must not have to re-derive it from prose, and a caller
+    /// that sees this must not treat the operation as possibly-unapplied.
+    #[error("UserAutomation runtime owner mutation disposition is settled: {0}")]
+    OutcomeSettled(String),
     /// The existing owner rejected the typed request.
     #[error("UserAutomation runtime owner rejected the request: {0}")]
     Rejected(String),

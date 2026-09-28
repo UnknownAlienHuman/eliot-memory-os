@@ -51,6 +51,34 @@
 //! for a dependent mutation. I14.24 requires exactly this, and I14.21's
 //! "pause the Ordering Scope until an evidence-backed disposition" is only
 //! meaningful while the pause set itself is honest about its coverage.
+//!
+//! ## Retained binding and the contract-version clause (issue #2764 item 1)
+//!
+//! [`verify_retained_binding`] compares the four fields the persisted
+//! `UnknownCommitRecord` actually carries — operation id, idempotency key,
+//! canonical request hash, and the original scope/owner binding
+//! (`ordering_scopes`) — and names every disagreeing field in one
+//! [`CommitRecoveryError::RetainedRecordConflict`]. The fifth field the item
+//! names, "applicable contract version", is NOT compared, and this module
+//! does not pretend otherwise: `UnknownCommitRecord` is a
+//! `#[serde(deny_unknown_fields)]` persisted row with no version field, so
+//! there is no stored version to compare and inventing one would fabricate a
+//! value the durable state never held. I5.22 requires "core schema is
+//! explicit and versioned" and "migration IDs/checksums are immutable after
+//! release" — adding the field is a real schema change, and a comparable
+//! contract version is only truthful once rows written by a *different*
+//! contract can be told apart from rows written by this one. This issue owns
+//! no migration, so the clause is void here, not silently satisfied. The
+//! record type's own schema evolution is the owning question, recorded here
+//! rather than papered over in code.
+//!
+//! I5.27 does require that idempotency be defined over canonical bytes rather
+//! than caller spelling, and on the Dreamer recovery leg the admitted request
+//! hash is presented by the caller. That is why
+//! [`verify_dreamer_canonical_request_hash`] exists here: it recomputes the
+//! hash through the owning Dreamer protocol contract
+//! ([`DurableRequestIdentity::digest_for`]) so the retained-state comparison
+//! runs on a contract-derived binding, not on a spelled string.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -58,6 +86,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use eliot_ors::{RedbRecoveryStore, UnknownCommitOutcome, UnknownCommitRecord};
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableRequestIdentity};
 use eliot_store_api::{
     OperationIdentity, Resubmission, StoreError, WriteReceipt, WriteReceiptStatus,
 };
@@ -1273,15 +1302,32 @@ pub(crate) enum RetainedCommitState {
 /// (issue #2764 items 1 and 3).
 ///
 /// The comparison covers operation id, idempotency key, canonical request
-/// hash, and the original scope/owner binding. The canonical request hash is
-/// the value the existing contract computed and bound, not caller spelling:
-/// a resubmission that reuses a key with a changed operation or a changed
-/// hash is rejected even when the retained record is already terminal, and
-/// historical operation/fence data in the record is never rewritten to
-/// today's epoch.
+/// hash, and the original scope/owner binding. The scope/owner binding is
+/// compared as CONTENT, never merely as proof that a record exists: two
+/// records differing only in their `ordering_scopes` are a conflict and not
+/// the same admitted operation. `presented_ordering_scopes` is the scope set
+/// the caller already proved for this operation from its owning contract (the
+/// same set that opened the record), so nothing about scope is inferred here.
+///
+/// Every disagreement is collected by field name into ONE
+/// [`CommitRecoveryError::RetainedRecordConflict`], which preserves the
+/// retained history and rejects the adoption. A scope-only divergence is
+/// named as `ordering_scopes` in that same detail, so it stays
+/// distinguishable without a second error type.
+///
+/// The canonical request hash compared here is the value the admitted
+/// identity carries. Recomputing that hash through its owning contract is
+/// [`verify_dreamer_canonical_request_hash`], deliberately a separate step: a
+/// caller-spelled hash is not a contract-verified one, and the two are never
+/// conflated into a single claim.
+///
+/// Historical operation/fence data in the record is never rewritten to
+/// today's epoch: a mismatch rejects the presentation and leaves the record
+/// exactly as retained.
 pub(crate) fn verify_retained_binding(
     record: &UnknownCommitRecord,
     identity: &OperationIdentity,
+    presented_ordering_scopes: &[String],
 ) -> Result<(), CommitRecoveryError> {
     let mut mismatches: Vec<&str> = Vec::new();
     if record.idempotency_key != identity.idempotency_key {
@@ -1292,6 +1338,9 @@ pub(crate) fn verify_retained_binding(
     }
     if record.canonical_request_hash != identity.canonical_request_hash {
         mismatches.push("canonical_request_hash");
+    }
+    if !same_ordering_scopes(&record.ordering_scopes, presented_ordering_scopes) {
+        mismatches.push("ordering_scopes");
     }
     if mismatches.is_empty() {
         return Ok(());
@@ -1307,6 +1356,82 @@ pub(crate) fn verify_retained_binding(
     })
 }
 
+/// Compares the retained Ordering Scope set with the presented one as sets.
+///
+/// The retained set was declared once by the owner that opened the record;
+/// the presented set is this same operation's proven set. Reordering the same
+/// scopes is the same binding, so the comparison is set equality after
+/// canonical ordering, and a repeated entry names one scope rather than two.
+/// An empty set equals only an empty set: a scoped operation and a scopeless
+/// genesis commit are different bindings, exactly as `ordering_scopes`' own
+/// field contract says.
+fn same_ordering_scopes(retained: &[String], presented: &[String]) -> bool {
+    let mut left = retained.to_vec();
+    left.sort();
+    left.dedup();
+    let mut right = presented.to_vec();
+    right.sort();
+    right.dedup();
+    left == right
+}
+
+/// Recomputes one Dreamer request's canonical request hash through the owning
+/// protocol contract and rejects a caller-spelled divergence (issue #2764
+/// item 1, I5.27).
+///
+/// This is the seam that lets "recompute/verify canonical request binding
+/// through the existing contract, not caller spelling" be satisfied on the
+/// retained-recovery leg. I5.27 defines idempotency over canonical bytes, not
+/// over an unversioned hash, so a `DurableJobRequest` whose
+/// `request_identity.canonical_request_hash` was spelled rather than derived
+/// must be refused before that identity loads retained state, queries a
+/// receipt, or authorizes a send. The recomputation is the owner's own
+/// versioned derivation, [`DurableRequestIdentity::digest_for`], over the same
+/// stable fields the contract hashes, so this introduces no second hash owner
+/// and keeps the fresh transport correlation excluded exactly as the contract
+/// excludes it.
+///
+/// The refusal is [`CommitRecoveryError::CommitRefused`] and nothing is
+/// staged, queried or sent: a determinate pre-effect refusal belongs before
+/// the recovery classification. The retained record keeps its own history
+/// either way; this check rewrites no operation or fence data to today's
+/// epoch.
+///
+/// # Errors
+///
+/// Returns [`CommitRecoveryError::CommitRefused`] when the request's own
+/// contract recomputation fails, or when the recomputed digest differs from
+/// the digest the caller spelled.
+pub(crate) fn verify_dreamer_canonical_request_hash(
+    request: &DurableJobRequest,
+) -> Result<String, CommitRecoveryError> {
+    let identity = &request.request_identity;
+    let recomputed = DurableRequestIdentity::digest_for(
+        &identity.operation,
+        &identity.request,
+        &request.operation,
+        request.role,
+    )
+    .map_err(|error| CommitRecoveryError::CommitRefused {
+        detail: format!(
+            "the canonical request hash of Dreamer operation {} cannot be recomputed through the \
+             owning protocol contract: {error}",
+            identity.operation.operation_id
+        ),
+    })?;
+    if recomputed != identity.canonical_request_hash {
+        return Err(CommitRecoveryError::CommitRefused {
+            detail: format!(
+                "Dreamer operation {} spells a canonical request hash its own admitted bytes do \
+                 not produce; that identity is not this contract's binding, so no retained state \
+                 is classified, no receipt is queried and no send is authorized under it",
+                identity.operation.operation_id
+            ),
+        });
+    }
+    Ok(recomputed)
+}
+
 /// Loads and classifies the retained unknown-commit state for one exact key.
 ///
 /// An absent ORS owner and an unreadable record are both errors, never
@@ -1314,9 +1439,16 @@ pub(crate) fn verify_retained_binding(
 /// be read, and I14.21's "keep the scope paused until an exact
 /// evidence-backed disposition" is only meaningful while the record is
 /// honestly classified.
+///
+/// `ordering_scopes` is this operation's proven scope set and is compared as
+/// binding content against the loaded record before the state is reported as
+/// `Open` or `Terminal`, so a record that paused a different scope set is a
+/// conflict at classification time rather than a mismatch discovered later.
+/// It is the same set the record itself was staged with.
 pub(crate) fn classify_retained_commit(
     ors: Option<&RedbRecoveryStore>,
     identity: &OperationIdentity,
+    ordering_scopes: &[String],
 ) -> Result<RetainedCommitState, CommitRecoveryError> {
     let Some(ors) = ors else {
         return Err(CommitRecoveryError::OrsUnavailable {
@@ -1333,7 +1465,7 @@ pub(crate) fn classify_retained_commit(
     else {
         return Ok(RetainedCommitState::Absent);
     };
-    verify_retained_binding(&record, identity)?;
+    verify_retained_binding(&record, identity, ordering_scopes)?;
     match record.outcome {
         None => Ok(RetainedCommitState::Open { record }),
         Some(_) => Ok(RetainedCommitState::Terminal { record }),

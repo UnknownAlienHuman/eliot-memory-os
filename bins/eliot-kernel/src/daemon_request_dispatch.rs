@@ -5694,6 +5694,26 @@ impl KernelComposition {
                 "value": { "outcome": "unknown_outcome" },
                 "recovery": { "kind": "unknown_outcome", "reason": reason },
             }),
+            // The mutation's disposition is proven by exact receipt evidence
+            // and only the ledger answer is unread (issue #2764 item 6). This is
+            // a `known` status for the same reason `NotRetained` is: the
+            // disposition is settled, so a client must not keep treating the
+            // operation as possibly-unapplied. It is deliberately NOT folded
+            // into `unknown_outcome`, which means the owner cannot tell whether
+            // the mutation committed at all — reporting a proven commit under
+            // that value would make the two indistinguishable to the client, and
+            // would keep an already-settled operation reconciling forever.
+            // The remaining ledger read is still owed, so the exact recorded
+            // disposition travels in `reason` rather than being dropped.
+            UserAutomationRuntimeError::OutcomeSettled(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "outcome_settled",
+                    "reason": reason,
+                },
+                "recovery": null,
+            }),
             UserAutomationRuntimeError::Rejected(reason) => serde_json::json!({
                 "status": "known",
                 "value": {

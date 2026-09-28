@@ -404,6 +404,24 @@ pub enum UserAutomationHostExecutionFailure {
         /// Closed reason supplied by the Host owner.
         reason: String,
     },
+    /// The mutation's disposition is proven by exact receipt evidence, but the
+    /// ledger answer for it is still unread.
+    ///
+    /// This crosses the process boundary as its own closed variant for the same
+    /// reason `NotRetained` does, and by the same additive rule (issue #2764
+    /// item 6): `UnknownOutcome` means the owner *cannot tell* whether the
+    /// mutation committed, while this means it *can* and the commit is settled.
+    /// Folding the two into one wire value would erase, in transit, the
+    /// distinction the typed carrier was introduced to preserve, and would make
+    /// a provably-committed mutation indistinguishable on the Kernel side from
+    /// a possibly-unapplied one. It is an additive variant of an externally
+    /// tagged, `deny_unknown_fields` enum: no existing variant, member name or
+    /// digest input changed, and an older peer that cannot decode it fails
+    /// closed rather than answering `UnknownOutcome`.
+    OutcomeSettled {
+        /// Closed reason supplied by the Host owner.
+        reason: String,
+    },
     /// The typed request was rejected before an owner effect.
     Rejected {
         /// Closed reason supplied by the Host owner.
@@ -419,6 +437,7 @@ impl UserAutomationHostExecutionFailure {
             UserAutomationRuntimeError::Unavailable(reason) => Self::Unavailable { reason },
             UserAutomationRuntimeError::NotRetained(reason) => Self::NotRetained { reason },
             UserAutomationRuntimeError::UnknownOutcome(reason) => Self::UnknownOutcome { reason },
+            UserAutomationRuntimeError::OutcomeSettled(reason) => Self::OutcomeSettled { reason },
             UserAutomationRuntimeError::Rejected(reason) => Self::Rejected { reason },
             UserAutomationRuntimeError::IdentityConflict => Self::IdentityConflict,
         }
@@ -429,6 +448,7 @@ impl UserAutomationHostExecutionFailure {
             Self::Unavailable { reason } => UserAutomationRuntimeError::Unavailable(reason),
             Self::NotRetained { reason } => UserAutomationRuntimeError::NotRetained(reason),
             Self::UnknownOutcome { reason } => UserAutomationRuntimeError::UnknownOutcome(reason),
+            Self::OutcomeSettled { reason } => UserAutomationRuntimeError::OutcomeSettled(reason),
             Self::Rejected { reason } => UserAutomationRuntimeError::Rejected(reason),
             Self::IdentityConflict => UserAutomationRuntimeError::IdentityConflict,
         }
@@ -440,6 +460,7 @@ impl UserAutomationHostExecutionFailure {
             Self::Unavailable { reason }
             | Self::NotRetained { reason }
             | Self::UnknownOutcome { reason }
+            | Self::OutcomeSettled { reason }
             | Self::Rejected { reason } => validate_text(reason, "failure.reason"),
             Self::IdentityConflict => Ok(()),
         }

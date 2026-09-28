@@ -44,7 +44,8 @@ use crate::commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PauseReleaseOutcome,
     PauseScopeView, PausedScopeMirror, RetainedCommitState, classify_commit_receipt,
     classify_retained_commit, open_record_for, receipt_evidence_digest, recover_commit,
-    resolve_open_record, verify_receipt_binding, verify_retained_binding, verify_terminal_evidence,
+    resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
+    verify_retained_binding, verify_terminal_evidence,
 };
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
@@ -107,8 +108,14 @@ mod store_receipt_gateway;
 /// `WriteReceipt`; a Dreamer commit answers with a ledger projection instead,
 /// so this leg states the same three mandated branches over its own typed
 /// answer and never collapses them into a success or a retry permission.
+///
+/// It is public because it is the recovered outcome its real caller must
+/// distinguish: it travels inside [`DreamerJobGatewayError`], so a
+/// caller-reachable field may not be crate-private. Every arm names the
+/// admitted idempotency key, the exact terminal `UnknownCommitOutcome`, the
+/// receipt evidence digest that proves it, and the obligation that remains.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum DreamerCommitUncertain {
+pub enum DreamerCommitUncertain {
     /// The commit outcome is proven by an exact receipt and this leg
     /// reconciled the durable record with that receipt digest bound as its
     /// terminal evidence. Exactly one canonical operation exists under the
@@ -218,48 +225,48 @@ fn dreamer_pause_refusal(
     identity: &OperationIdentity,
     proof: &DreamerOrderingScopeProof,
     effect: DreamerOperationEffect,
-) -> Option<String> {
+) -> Option<CommitRecoveryError> {
     if effect != DreamerOperationEffect::Mutation {
         return None;
     }
     let key = identity.idempotency_key.as_str();
     let paused = proof.scopes.iter().find_map(|scope| {
-        observed.pausing_key_for(scope, key).map(|pausing_key| {
-            CommitRecoveryError::ScopePaused {
+        observed
+            .pausing_key_for(scope, key)
+            .map(|pausing_key| CommitRecoveryError::ScopePaused {
                 scope: scope.clone(),
                 paused_by_key: pausing_key.to_owned(),
-            }
-            .to_string()
-        })
+            })
     });
     if paused.is_some() {
         return paused;
     }
     if !proof.work_scope_proven && observed.any_open_except(key) {
-        return Some(
-            CommitRecoveryError::OrderingScopeUnresolved {
-                operation: "dreamer-job".to_owned(),
-                detail: format!(
-                    "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
-                     its ledger record is ordered inside, so its coverage by the open \
-                     unknown-commit record set observed at revision {} cannot be proven and \
-                     dependent durable admission stays closed",
-                    proof.rendered(),
-                    observed.binding().revision
-                ),
-            }
-            .to_string(),
-        );
+        return Some(CommitRecoveryError::OrderingScopeUnresolved {
+            operation: "dreamer-job".to_owned(),
+            detail: format!(
+                "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
+                 its ledger record is ordered inside, so its coverage by the open \
+                 unknown-commit record set observed at revision {} cannot be proven and \
+                 dependent durable admission stays closed",
+                proof.rendered(),
+                observed.binding().revision
+            ),
+        });
     }
     None
 }
 
 /// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
-fn ors_unavailable(error: impl std::fmt::Display) -> String {
+///
+/// The value stays typed: the fail-closed refusal is a
+/// [`CommitRecoveryError::OrsUnavailable`], and every caller of this helper
+/// composes it into an error that already carries that type, so no gateway
+/// refusal has to be flattened to text to travel anywhere.
+fn ors_unavailable(error: impl std::fmt::Display) -> CommitRecoveryError {
     CommitRecoveryError::OrsUnavailable {
         detail: error.to_string(),
     }
-    .to_string()
 }
 
 /// Reads back the recorded terminal outcome and evidence digest of one
@@ -284,12 +291,16 @@ fn retained_terminal_evidence(
 
 /// Projects one already-resolved durable record into its typed answer,
 /// preserving the outcome it actually recorded.
+///
+/// The recorded outcome and its evidence digest are returned as the values the
+/// record holds, never as a synthesized success: a `RolledBack` key and a
+/// `Committed` key are different proven facts and the caller is given the one
+/// that actually happened.
 fn dreamer_dispositioned(
     idempotency_key: &str,
     record: &UnknownCommitRecord,
-) -> Result<DreamerCommitUncertain, String> {
-    let (outcome, evidence_receipt_digest) =
-        retained_terminal_evidence(idempotency_key, record).map_err(|error| error.to_string())?;
+) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
+    let (outcome, evidence_receipt_digest) = retained_terminal_evidence(idempotency_key, record)?;
     Ok(DreamerCommitUncertain::AlreadyDispositioned {
         idempotency_key: idempotency_key.to_owned(),
         outcome,
@@ -3712,14 +3723,34 @@ impl KernelStoreGateway {
     /// mutation send. The retained record keeps its original operation and
     /// fence data; only the new recovery request is authenticated under
     /// current authority.
+    ///
+    /// ## The typed answer reaches the caller (issue #2764 item 6)
+    ///
+    /// The error type is [`DreamerJobGatewayError`], not `String`. A settled
+    /// recovery leg returns [`DreamerJobGatewayError::Uncertain`] carrying the
+    /// [`DreamerCommitUncertain`] value itself, so the caller receives the
+    /// original operation/key, the exact recorded outcome, the receipt evidence
+    /// digest, and the remaining `Status`/`Reconcile` ledger-read obligation as
+    /// values it can branch on. A `WriteReceipt` proves a mutation disposition,
+    /// never the missing `DurableJobResponse`, so no terminal state is reduced
+    /// to an ambiguous success. Every non-recovery refusal keeps its own variant
+    /// too: [`DreamerJobGatewayError::Commit`] holds the whole
+    /// [`CommitRecoveryError`] set and [`DreamerJobGatewayError::GatewayRefusal`]
+    /// holds this route's pre-existing gate text unchanged, so the only string
+    /// conversion left is the caller's own frame projection.
     pub async fn dreamer_job(
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String> {
-        let _flight = self.flight.enter()?;
+    ) -> Result<DurableJobResponse, DreamerJobGatewayError> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(DreamerJobGatewayError::GatewayRefusal)?;
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
         // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
         // write. The gate reuses this module's own
@@ -3729,86 +3760,28 @@ impl KernelStoreGateway {
         // recovery state is read and before the retained-commit
         // classification, so a shadow candidate cannot stage, classify or
         // reconcile a mutation.
-        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
-            self.refuse_shadow_mutation()?;
-        }
-        context.validate().map_err(|error| error.to_string())?;
-        request.validate().map_err(|error| error.to_string())?;
-        if !request.role.permits(request.operation.kind()) {
-            return Err("dreamer job caller role does not permit the operation".to_owned());
-        }
-        self.validate_active_route(&context.state_fence)?;
-        if request.request_identity.operation.state_fence != context.state_fence {
-            return Err("dreamer job request fence does not match request metadata".to_owned());
-        }
-        // I14.21 (#1690) write-attempt identity: the admitted Dreamer mutation
-        // identity, taken from the stable operation binding only. Fresh
-        // transport correlation never enters it, so a retry under the same
-        // identity always reuses this record.
-        let identity = OperationIdentity {
-            operation_id: request.request_identity.operation.operation_id.clone(),
-            idempotency_key: request.request_identity.operation.idempotency_key.clone(),
-            canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
-        };
-        let scope_proof = dreamer_ordering_scope_proof(&request);
-        let effect = dreamer_operation_effect(&request.operation);
-
-        // Durable recovery state must be available for mutating work even
-        // when the local scope vector is empty (#2763). A permitted read and
-        // the exact receipt lookup stay available: I14.24 keeps read-only
-        // inspection and independent noncanonical work alive.
-        if effect == DreamerOperationEffect::Mutation
-            && let Some(limitation) = self.pause_observation_limitation()
-        {
-            return Err(limitation);
-        }
-
-        // Retained state is classified before new-send admission (#2764).
-        // An unreadable record is not absent: `classify_retained_commit`
-        // returns the typed ORS failure instead.
-        let retained = classify_retained_commit(self.commit_ors.as_deref(), &identity)
-            .map_err(|error| error.to_string())?;
-        let mut retried_under_retained_record = false;
-        if let Some(record) = match &retained {
-            RetainedCommitState::Absent => None,
-            RetainedCommitState::Open { record } | RetainedCommitState::Terminal { record } => {
-                Some(record)
-            }
-        } {
-            match self
-                .reconcile_retained_dreamer_operation(&identity, &scope_proof.scopes, record)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                DreamerRetainedOutcome::Settled(answer) => return Err(answer.to_string()),
-                DreamerRetainedOutcome::SameIdentityRetryPermitted => {
-                    // A proven noncommit whose resubmission policy allows the
-                    // same identity again, observed while the record is still
-                    // open. The record therefore keeps owning this retry: it
-                    // is not resolved first, so the terminal-state invariant
-                    // is not bypassed. Falling through re-enters current
-                    // normal admission and the other-key pause check below
-                    // before exactly one bounded same-identity send, keeping
-                    // the original operation, content, authorized effect and
-                    // retry budget. This leg issued zero mutation sends: the
-                    // receipt query above is a pure read and is not counted
-                    // as another attempt.
-                    retried_under_retained_record = true;
-                }
-            }
-        }
+        let (identity, scope_proof, effect) = self.admit_dreamer_operation(context, &request)?;
+        // `true` means this operation is making its ONE bounded same-identity
+        // retry under a still-open retained record; `false` means no retained
+        // state existed. A retained state that has already been reached and
+        // settled never returns here — that answer leaves as the typed
+        // `DreamerJobGatewayError::Uncertain` instead.
+        let retried_under_retained_record = self
+            .reach_retained_dreamer_recovery(&identity, &scope_proof, effect)
+            .await?;
 
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            let service = self.service.lock().map_err(|_| {
+                DreamerJobGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
-                return Err("Kernel generation is fenced".to_owned());
+                return Err(DreamerJobGatewayError::GatewayRefusal(
+                    "Kernel generation is fenced".to_owned(),
+                ));
             }
             let lease = service
                 .acquire_admission()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
             // Slices A+B (#65): Dreamer-job Store admission rides the typed
             // `NORMAL_WORKLOAD` normal lease; protected work stays on
             // `acquire_protected_control`. See
@@ -3816,12 +3789,16 @@ impl KernelStoreGateway {
             // NOT ride this normal lease, so exhausted normal capacity cannot
             // make an admitted operation's own recovery unreachable.
             if lease.authority_epoch() != context.state_fence.authority_epoch {
-                return Err("dreamer job route authority epoch is stale".to_owned());
+                return Err(DreamerJobGatewayError::GatewayRefusal(
+                    "dreamer job route authority epoch is stale".to_owned(),
+                ));
             }
             lease
         };
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
         }
         // Checked pause gate (#2763). The owner is observed here, after
         // admission and immediately before the send, so a pause published
@@ -3833,11 +3810,11 @@ impl KernelStoreGateway {
         if effect == DreamerOperationEffect::Mutation {
             let observed = self.paused_scopes.observe(self.commit_ors.as_deref());
             if let Some(error) = observed.unavailable_error() {
-                return Err(error.to_string());
+                return Err(error.into());
             }
             if let Some(refusal) = dreamer_pause_refusal(&observed, &identity, &scope_proof, effect)
             {
-                return Err(refusal);
+                return Err(refusal.into());
             }
         }
         let result = match self.store.dreamer_job_recovery(context, request).await {
@@ -3848,18 +3825,25 @@ impl KernelStoreGateway {
                 // A ledger `Status` alone could never settle it.
                 if retried_under_retained_record {
                     self.settle_after_same_identity_retry(&identity, &scope_proof.scopes)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await?;
                 }
                 Ok(response)
             }
-            Err(DreamerCommitEvidence::Refused(error)) => Err(error.to_string()),
-            Err(DreamerCommitEvidence::Reconciled(receipt)) => Err(self
-                .reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?
-                .to_string()),
-            Err(DreamerCommitEvidence::Unknown) => Err(self
-                .preserve_dreamer_operation(&identity, &scope_proof.scopes)?
-                .to_string()),
+            Err(DreamerCommitEvidence::Refused(error)) => {
+                Err(DreamerJobGatewayError::GatewayRefusal(error.to_string()))
+            }
+            // Both arms below answer with the *typed* recovered outcome when the
+            // commit is settled, and `?` carries the typed recovery error when it
+            // is not. Neither the exact disposition nor the failure that kept
+            // it unsettled is rendered to text here.
+            Err(DreamerCommitEvidence::Reconciled(receipt)) => {
+                Err(DreamerJobGatewayError::Uncertain(
+                    self.reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?,
+                ))
+            }
+            Err(DreamerCommitEvidence::Unknown) => Err(DreamerJobGatewayError::Uncertain(
+                self.preserve_dreamer_operation(&identity, &scope_proof.scopes)?,
+            )),
         };
         drop(lease);
         result
@@ -3867,11 +3851,139 @@ impl KernelStoreGateway {
 
     /// Returns the typed refusal when durable recovery state is unavailable,
     /// or `None` when a complete observation is available.
-    fn pause_observation_limitation(&self) -> Option<String> {
+    fn pause_observation_limitation(&self) -> Option<CommitRecoveryError> {
         self.paused_scopes
             .observe(self.commit_ors.as_deref())
             .unavailable_error()
-            .map(|error| error.to_string())
+    }
+
+    /// Runs every Dreamer gate that precedes any retained-state work and
+    /// returns the admitted identity, its proven Ordering Scope set, and its
+    /// owner effect class (issue #2764 items 1 and 6).
+    ///
+    /// The order here is load-bearing. The `shadow_no_authority` refusal, the
+    /// two contract validations, the presented-role projection, the active-route
+    /// check and the fence-equality join all run before anything is read from
+    /// durable state, and the contract-recomputed canonical request hash
+    /// (`verify_dreamer_canonical_request_hash`, I5.27) runs last among them:
+    /// a spelled hash is refused before the retained state is classified,
+    /// before a receipt is queried, and before any send is authorized, so a
+    /// caller-spelled identity can never reach recovery. The digest that leaves
+    /// this function is the contract-derived one, and it is what the identity
+    /// carries into retained-state comparison — not the string the caller
+    /// presented.
+    fn admit_dreamer_operation(
+        &self,
+        context: &RequestMeta,
+        request: &DurableJobRequest,
+    ) -> Result<
+        (
+            OperationIdentity,
+            DreamerOrderingScopeProof,
+            DreamerOperationEffect,
+        ),
+        DreamerJobGatewayError,
+    > {
+        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
+            self.refuse_shadow_mutation()
+                .map_err(DreamerJobGatewayError::GatewayRefusal)?;
+        }
+        context
+            .validate()
+            .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
+        if !request.role.permits(request.operation.kind()) {
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "dreamer job caller role does not permit the operation".to_owned(),
+            ));
+        }
+        self.validate_active_route(&context.state_fence)
+            .map_err(DreamerJobGatewayError::GatewayRefusal)?;
+        if request.request_identity.operation.state_fence != context.state_fence {
+            return Err(DreamerJobGatewayError::GatewayRefusal(
+                "dreamer job request fence does not match request metadata".to_owned(),
+            ));
+        }
+        // Durable recovery state must be available for mutating work even when
+        // the local scope vector is empty (#2763). A permitted read and the
+        // exact receipt lookup stay available: I14.24 keeps read-only
+        // inspection and independent noncanonical work alive.
+        let effect = dreamer_operation_effect(&request.operation);
+        if effect == DreamerOperationEffect::Mutation
+            && let Some(error) = self.pause_observation_limitation()
+        {
+            return Err(error.into());
+        }
+        // I14.21 (#1690) write-attempt identity: the admitted Dreamer mutation
+        // identity, taken from the stable operation binding only. Fresh
+        // transport correlation never enters it, so a retry under the same
+        // identity always reuses this record. Its canonical request hash is the
+        // contract-recomputed one, not caller spelling (I5.27, #2764 item 1).
+        let identity = OperationIdentity {
+            operation_id: request.request_identity.operation.operation_id.clone(),
+            idempotency_key: request.request_identity.operation.idempotency_key.clone(),
+            canonical_request_hash: verify_dreamer_canonical_request_hash(request)?,
+        };
+        Ok((identity, dreamer_ordering_scope_proof(request), effect))
+    }
+
+    /// Reaches this operation's own retained commit evidence before the
+    /// normal scope-pause gate (issue #2764).
+    ///
+    /// Returns `Ok(true)` when the caller may make its one bounded
+    /// same-identity retry under the still-open retained record, and `Ok(false)`
+    /// when no retained state exists and the new-send path applies. A retained
+    /// state that has been *reached* leaves as the typed
+    /// [`DreamerJobGatewayError::Uncertain`] answer instead, so the caller
+    /// receives the recorded outcome and evidence as values.
+    ///
+    /// An unreadable record is never absent: [`classify_retained_commit`]
+    /// returns the typed ORS failure rather than an empty answer, and the
+    /// comparison runs against the operation's own proven scope set — the exact
+    /// set the record was staged with — so a record that paused a different
+    /// scope set is a conflict at classification time.
+    async fn reach_retained_dreamer_recovery(
+        &self,
+        identity: &OperationIdentity,
+        scope_proof: &DreamerOrderingScopeProof,
+        effect: DreamerOperationEffect,
+    ) -> Result<bool, DreamerJobGatewayError> {
+        let retained =
+            classify_retained_commit(self.commit_ors.as_deref(), identity, &scope_proof.scopes)?;
+        let record = match &retained {
+            RetainedCommitState::Absent => return Ok(false),
+            RetainedCommitState::Open { record } | RetainedCommitState::Terminal { record } => {
+                record
+            }
+        };
+        // The typed answer is the caller-facing report. It travels as itself so
+        // the caller can act on the distinction between a reconciled commit, a
+        // preserved earlier disposition, a disposition whose pause release is
+        // incomplete, and a still-open Problem State. The obligation it names —
+        // a ledger `Status`/`Reconcile` read — is why this can never be
+        // reported as a completed operation.
+        match self
+            .reconcile_retained_dreamer_operation(identity, &scope_proof.scopes, record)
+            .await?
+        {
+            DreamerRetainedOutcome::Settled(answer) => {
+                Err(DreamerJobGatewayError::Uncertain(answer))
+            }
+            // A proven noncommit whose resubmission policy allows the same
+            // identity again, observed while the record is still open. The
+            // record keeps owning this retry: it is not resolved first, so the
+            // terminal-state invariant is not bypassed. Falling through re-enters
+            // current normal admission and the other-key pause check for exactly
+            // one bounded same-identity send, keeping the original operation,
+            // content, authorized effect and retry budget. This leg issued zero
+            // mutation sends: the receipt query is a pure read and is not
+            // counted as another attempt.
+            DreamerRetainedOutcome::SameIdentityRetryPermitted => {
+                Ok(effect == DreamerOperationEffect::Mutation)
+            }
+        }
     }
 
     /// Resolves the still-open record a same-identity retry was made under.
@@ -4155,10 +4267,12 @@ impl KernelStoreGateway {
     /// Commits the durable disposition for a retained operation that has now
     /// reached receipt evidence, and reports the reconciled result.
     ///
-    /// The disposition path renders its own typed variant to text, so the
-    /// conversion at this typed seam is made here, visibly, with that exact
-    /// rendering becoming the cause, rather than through a blanket
-    /// string-to-typed collapse.
+    /// The disposition path reports its own typed variant, so a durable commit
+    /// that cannot be recorded is composed here into the same
+    /// [`CommitRecoveryError::OrsUnavailable`] the other disposition sites use,
+    /// naming the retained key. No blanket `From<String>` conversion is
+    /// introduced for this seam: the reported variant still leaves here as the
+    /// [`DreamerCommitUncertain`] value, not as rendered text.
     fn commit_retained_disposition(
         &self,
         identity: &OperationIdentity,
@@ -4211,14 +4325,14 @@ impl KernelStoreGateway {
         identity: &OperationIdentity,
         ordering_scopes: &[String],
         receipt: &WriteReceipt,
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         // The one full operation/key/hash verifier runs at this adoption. The
         // previous entry compared only the receipt's idempotency key, which let
         // a receipt for a different operation sharing that key reach the
         // durable record; operation id and canonical request hash are compared
         // here too, so another attempt's receipt is never adopted as this
         // operation's evidence however it was observed.
-        verify_receipt_binding(receipt, identity).map_err(|error| error.to_string())?;
+        verify_receipt_binding(receipt, identity)?;
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -4226,15 +4340,17 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
         let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
         if let Some(record) = staged {
             // A retained record is binding-verified before anything else, so a
             // terminal record for a different operation under this key is a
-            // conflict rather than a shortcut to "already dispositioned".
-            verify_retained_binding(&record, identity).map_err(|error| error.to_string())?;
+            // conflict rather than a shortcut to "already dispositioned". The
+            // presented set is this operation's own proven scope set, which is
+            // the set the record was staged with, so a record that paused a
+            // different scope set is a conflict here too.
+            verify_retained_binding(&record, identity, ordering_scopes)?;
             if record.outcome.is_some() {
                 let outcome = match classify_commit_receipt(receipt) {
                     CommitRecoveryClass::Committed => UnknownCommitOutcome::Committed,
@@ -4244,16 +4360,14 @@ impl KernelStoreGateway {
                 let evidence_receipt_digest = receipt_evidence_digest(receipt);
                 // A wrong receipt or a changed terminal digest cannot resolve
                 // the record: it is rejected and the recorded history stands.
-                verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)
-                    .map_err(|error| error.to_string())?;
+                verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)?;
                 return match self.release_dreamer_scopes(&record) {
                     // The terminal disposition stands and the recorded
                     // outcome is preserved; only the pause release is
                     // incomplete, and that is stated rather than hidden.
                     PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
                         let (recorded_outcome, recorded_digest) =
-                            retained_terminal_evidence(key, &record)
-                                .map_err(|error| error.to_string())?;
+                            retained_terminal_evidence(key, &record)?;
                         Ok(DreamerCommitUncertain::ReconciledWithRefreshLimitation {
                             idempotency_key: key.to_owned(),
                             outcome: recorded_outcome,
@@ -4297,7 +4411,7 @@ impl KernelStoreGateway {
         ordering_scopes: &[String],
         outcome: UnknownCommitOutcome,
         evidence_receipt_digest: &str,
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -4305,14 +4419,11 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
-        let record =
-            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        let record = open_record_for(identity, ordering_scopes)?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
-        let resolution = resolve_open_record(ors, key, outcome, evidence_receipt_digest)
-            .map_err(|error| error.to_string())?;
+        let resolution = resolve_open_record(ors, key, outcome, evidence_receipt_digest)?;
         // The durable record is read back through the resolution so the report
         // below is backed by what ORS actually holds, not by what this leg
         // intended to write.
@@ -4373,7 +4484,7 @@ impl KernelStoreGateway {
         &self,
         identity: &OperationIdentity,
         ordering_scopes: &[String],
-    ) -> Result<DreamerCommitUncertain, String> {
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             CommitRecoveryError::OrsUnavailable {
                 detail: format!(
@@ -4381,21 +4492,25 @@ impl KernelStoreGateway {
                     identity.idempotency_key
                 ),
             }
-            .to_string()
         })?;
         let key = identity.idempotency_key.as_str();
         let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
         if let Some(record) = staged {
-            verify_retained_binding(&record, identity).map_err(|error| error.to_string())?;
+            // The presented set is this operation's own proven scope set — the
+            // same set the record was staged with — so a record that paused a
+            // different scope set is a conflict, not a shortcut to "already
+            // dispositioned".
+            verify_retained_binding(&record, identity, ordering_scopes)?;
             if record.outcome.is_some() {
                 // A resolved record never reopens: the earlier evidence-backed
                 // disposition stands, so this leg neither restages the record nor
-                // pauses an Ordering Scope for a key that is already closed.
+                // pauses an Ordering Scope for a key that is already closed. The
+                // recorded outcome and its evidence digest are returned as they
+                // were recorded.
                 return dreamer_dispositioned(key, &record);
             }
         }
-        let record =
-            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        let record = open_record_for(identity, ordering_scopes)?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
         // Only a durably staged record marks a scope paused, and the mirror
         // keeps the pausing key with the entry.
@@ -5770,6 +5885,60 @@ pub enum NamedReadGatewayError {
     /// Gateway validation, fencing, or route checks refused the read.
     #[error("{0}")]
     GatewayRefusal(String),
+}
+
+/// Closed failure set for one Dreamer ledger operation through the Kernel
+/// gateway (issue #2764 item 6).
+///
+/// This is the minimal carrier the real caller needs, and it exists because the
+/// recovery leg answers with facts a `String` cannot hold. The issue spends
+/// W1-W5 building a typed recovered-outcome: an exact terminal outcome, its
+/// receipt evidence, and the remaining ledger-read obligation. Flattening that
+/// answer to text at the function boundary discarded the distinction the slice
+/// exists to make, and left the caller unable to tell "already committed" from
+/// "reconciled, but the pause release is incomplete" from "outcome still
+/// unknown and the scopes are still paused". The enum arms here keep all of it
+/// addressable, and only the *final* transport edge renders it.
+///
+/// The `Display` of every arm is the operator-visible refusal line the caller
+/// projects, so a consumer that renders the value sees the same sentence it saw
+/// when this route returned a bare `String`. Nothing downstream has to parse it
+/// back apart.
+#[derive(Debug, thiserror::Error)]
+pub enum DreamerJobGatewayError {
+    /// Unknown-commit recovery refused, failed closed, or reported a conflict
+    /// (I14.21, I14.24). The typed [`CommitRecoveryError`] travels whole:
+    /// fence/route/role/validation refusals, an unavailable ORS owner, a paused
+    /// scope, an identity or terminal-evidence conflict, and a determinate
+    /// commit refusal keep their own variants instead of sharing one string.
+    #[error(transparent)]
+    Commit(#[from] CommitRecoveryError),
+    /// The mutation's disposition is proven but the ledger answer is not (or not
+    /// entirely). The typed [`DreamerCommitUncertain`] travels whole, so the
+    /// caller receives the original operation/key, the exact recorded outcome,
+    /// the receipt evidence digest, and the remaining `Status`/`Reconcile`
+    /// ledger-read obligation as addressable values.
+    #[error(transparent)]
+    Uncertain(#[from] DreamerCommitUncertain),
+    /// A pre-existing gateway refusal (flight fence, shadow mutation,
+    /// role/route/epoch staleness, request validation, protected-lane
+    /// unavailability). Its text is preserved exactly; no message is rewritten,
+    /// reworded, or reinterpreted on the way out.
+    #[error("{0}")]
+    GatewayRefusal(String),
+}
+
+impl DreamerJobGatewayError {
+    /// Returns the typed recovered outcome when this refusal carries one.
+    ///
+    /// `None` is a refusal that proves nothing about the mutation's
+    /// disposition, and a caller must not infer one from the prose.
+    pub fn uncertain(&self) -> Option<&DreamerCommitUncertain> {
+        match self {
+            Self::Uncertain(uncertain) => Some(uncertain),
+            Self::Commit(_) | Self::GatewayRefusal(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
