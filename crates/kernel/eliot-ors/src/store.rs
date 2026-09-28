@@ -20772,13 +20772,24 @@ impl RedbRecoveryStore {
     /// `catalog_revision` and `policy_revision` are the **loaded manifest's**
     /// admitting revisions — the exact revisions the lease was issued against.
     ///
-    /// `current.catalog_view` is reported as
-    /// [`crate::CatalogPolicyView::Unavailable`]: the Kernel holds no
-    /// independent live Module Catalog/Policy owner at this seam, so it can
-    /// never prove a current view here. I1.9 lines 48-49 then require denial
-    /// rather than an unproven admission, and the verifier produces
-    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`]. No view
-    /// is ever upgraded to `Current` here. `current.revocation` is
+    /// `current.catalog_view` is `Current` exactly when the recorded manifest
+    /// carries an intact Governor admission whose admitting Catalog/Policy
+    /// revisions equal the lease's own, and whose recorded class is
+    /// `effect_exact_lease` — the class I1.9 defines as effect capable
+    /// "without needing a fresh Catalog view for the restart itself". The
+    /// recorded admission is the newest Governor truth this seam holds, so
+    /// agreement means no recorded supersession. Anything else (an absent or
+    /// receipt-less manifest, revision drift, or a `current_catalog_required`
+    /// class, which by definition refuses without a live current view) stays
+    /// [`crate::CatalogPolicyView::Unavailable`], and I1.9 lines 48-49 then
+    /// require denial rather than an unproven admission: the verifier produces
+    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`].
+    /// ASSUMPTION (issue #1885 A1): a Governor supersession that never
+    /// re-admits this generation, and a revocation event arriving after lease
+    /// issuance, are unobservable at this seam — there is no live Module
+    /// Catalog/Policy owner and no revocation-event table here. That residual
+    /// is bounded by the lease expiry and the live Authority Epoch check, both
+    /// still enforced below. `current.revocation` is
     /// [`crate::RevocationAcknowledgement::None`] because no revocation event is
     /// observed at this seam, and `current.delivery` is the lease's own recorded
     /// delivery acknowledgement, so a lease whose delivery gap is open still
@@ -20816,6 +20827,28 @@ impl RedbRecoveryStore {
             );
         };
         let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        // I1.9 currency is read from the durable Governor-issued rows, never
+        // assumed. The recorded manifest's admitting revisions are the newest
+        // Governor truth this seam holds, so the reported view is `Current`
+        // exactly when the intact recorded admission agrees with the lease's
+        // own admitting revisions and the recorded class waives a fresh view
+        // (`EffectExactLease` needs "no fresh Catalog view for the restart
+        // itself", I1.9). A receipt-less or changed admission, any revision
+        // drift, or a `CurrentCatalogRequired` class stays `Unavailable`, and
+        // the verifier then denies as `EffectCatalogPolicyStale`.
+        let catalog_view = match manifest.as_ref() {
+            Some(recorded)
+                if recorded.has_governor_admission()
+                    && recorded.validate().is_ok()
+                    && recorded.restart_authorization_class()
+                        == crate::RestartAuthorizationClass::EffectExactLease
+                    && recorded.admission.catalog_revision == lease.catalog_revision
+                    && recorded.admission.policy_revision == lease.policy_revision =>
+            {
+                crate::CatalogPolicyView::Current
+            }
+            _ => crate::CatalogPolicyView::Unavailable,
+        };
         let request = crate::EffectReplayRequest {
             operation_id: lease.operation_id.clone(),
             manifest_module_id: lease.manifest_module_id.clone(),
@@ -20835,7 +20868,7 @@ impl RedbRecoveryStore {
                 policy_revision: manifest
                     .as_ref()
                     .map_or(0, |recorded| recorded.admission.policy_revision),
-                catalog_view: crate::CatalogPolicyView::Unavailable,
+                catalog_view,
                 revocation: crate::RevocationAcknowledgement::None,
                 delivery: lease.delivery,
             },
