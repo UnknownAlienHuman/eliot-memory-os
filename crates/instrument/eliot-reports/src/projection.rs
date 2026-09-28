@@ -328,6 +328,19 @@ impl ProductProgressProjection {
             .collect()
     }
 
+    /// Rolls up one product-proof record by acceptance identity.
+    ///
+    /// This is the machine-readable terminal status of a single item such as
+    /// #11: either `Pass` or a refusal carrying the exact I18.24 outcome,
+    /// the reason, the stop-imposing authority, and the required missing
+    /// evidence. Returns `None` when no record carries `proof_id`.
+    pub fn product_proof_rollup(&self, proof_id: &str) -> Option<ProductProofRollup> {
+        self.product_proofs
+            .iter()
+            .find(|proof| proof.proof_id == proof_id)
+            .map(ProductProofStatus::rollup)
+    }
+
     /// Renders the projection; the text repeats structured fields and adds no
     /// claim of its own.
     pub fn markdown(&self) -> Result<String, ReportError> {
