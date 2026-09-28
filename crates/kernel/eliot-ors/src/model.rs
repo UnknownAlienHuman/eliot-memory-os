@@ -4190,6 +4190,8 @@ pub enum OrsError {
     BridgeEventCapacityExceeded(BridgeEventCapacityPressure),
     #[error("bridge recovery window capacity exhausted")]
     BridgeRecoveryWindowCapacityExceeded,
+    #[error("bridge recovery cut capacity exhausted")]
+    BridgeRecoveryCutCapacityExceeded,
     #[error("{field} is invalid: {reason}")]
     InvalidField {
         field: &'static str,
