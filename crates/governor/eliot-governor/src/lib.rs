@@ -44,6 +44,7 @@ mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
 mod finish_attempt;
+mod governor_authority_projection;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -59,6 +60,7 @@ pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
     PreparedKernelExchange,
 };
+pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
