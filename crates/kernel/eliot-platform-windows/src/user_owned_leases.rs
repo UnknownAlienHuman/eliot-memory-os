@@ -365,6 +365,75 @@ impl UserOwnedPathLease {
         }
     }
 
+    /// Opens one existing file below `root`, or creates that exact file with
+    /// create-new semantics when it is absent. The returned handle is
+    /// no-follow, single-link, current-user protected, and retained together
+    /// with the root and every directory in its parent contour.
+    ///
+    /// Parent directories are never synthesized here. A concurrent creator
+    /// wins only by creating the same ordinary file first; the winner is then
+    /// reopened and proved through the same current-user handle checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is outside the retained root, a parent
+    /// is absent or substituted, the final object is not a regular file, or
+    /// its current-user ACL and file identity cannot be proved.
+    pub fn open_or_create(
+        root: &UserOwnedRootLease,
+        path: &Path,
+    ) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            if !path.is_absolute() {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            root.verify_stable_identity()?;
+            ensure_user_owned_containment(&root.path, path)?;
+            let parent = path.parent().ok_or(ProtectedPathError::InvalidPath)?;
+            let relative_parent = parent
+                .strip_prefix(&root.path)
+                .map_err(|_| ProtectedPathError::InvalidPath)?;
+            let directories =
+                open_user_owned_directory_contour(&root.path, relative_parent, &root.sid)?;
+            let file = match std::fs::symlink_metadata(path) {
+                Ok(_) => open_user_owned_file(path, &root.sid)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match create_user_owned_file(path, &root.sid) {
+                        Ok(file) => file,
+                        Err(ProtectedPathError::Io) if std::fs::symlink_metadata(path).is_ok() => {
+                            open_user_owned_file(path, &root.sid)?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(_) => return Err(ProtectedPathError::Io),
+            };
+            let identity = crate::process_identity::file_identity_from_handle(&file)
+                .map_err(|_| ProtectedPathError::Io)?;
+            let root_handle = root
+                .handle
+                .try_clone()
+                .map_err(|_| ProtectedPathError::Io)?;
+            let lease = Self {
+                path: path.to_path_buf(),
+                identity,
+                sid: root.sid.clone(),
+                _root: root_handle,
+                _directories: directories,
+                file,
+            };
+            lease.verify_path_identity()?;
+            root.verify_stable_identity()?;
+            Ok(lease)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, path);
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Returns the explicit file path retained by this lease.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -613,6 +682,35 @@ fn open_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, Protect
     if !metadata.is_file() {
         return Err(ProtectedPathError::InvalidPath);
     }
+    ensure_single_user_file_link(&file)?;
+    protect_user_owned_opened_handle(&file, false, sid)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .access_mode(FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    ensure_single_user_file_link(&file)?;
     protect_user_owned_opened_handle(&file, false, sid)?;
     Ok(file)
 }
