@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::{ContextBinding, ContextError, SourceSnapshot, validate_digest, validate_text};
 
 /// Only this schema revision is interpreted by this validator.
-pub const BOUNDARY_METADATA_SCHEMA_REVISION: ContractVersion = ContractVersion::new(1, 0, 0);
+///
+/// `1.1.0` adds the required `BoundaryMetadataSet::transforms` member relation. A
+/// `1.0.0` payload is rejected by name in `validate()` instead of being read as a
+/// set that declares no transform.
+pub const BOUNDARY_METADATA_SCHEMA_REVISION: ContractVersion = ContractVersion::new(1, 1, 0);
 
 /// Semantic form of a logical unit represented by one boundary envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -666,7 +670,10 @@ impl BoundaryMetadataEnvelope {
                 }
             }
             BoundaryCompleteness::Incomplete => {
-                if gap_count == 0 && self.precision == BoundaryPrecision::Exact {
+                // `Incomplete` promises that one or more declared members are gaps. That
+                // promise is enforced for every precision: a degraded record may still
+                // carry its denominator, so zero gaps is never a checkable incompleteness.
+                if gap_count == 0 {
                     return Err(ContextError::InvalidField(
                         "boundary.incomplete_without_gap",
                     ));
@@ -783,6 +790,57 @@ impl BoundaryMetadataEnvelope {
             Err(ContextError::InvalidField("boundary.member_role_reference"))
         }
     }
+
+    /// Retained member identities, or `None` when no denominator is declared.
+    fn retained_member_ids(&self) -> Option<BTreeSet<ArtifactId>> {
+        if matches!(
+            self.coverage.denominator,
+            BoundaryDenominator::UnknownLegacy
+        ) {
+            return None;
+        }
+        Some(self.coverage.retained_members.iter().cloned().collect())
+    }
+}
+
+/// How one output member of a transform was produced from one input member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BoundaryMemberOrigin {
+    /// The single contributing input member is carried into the output unchanged.
+    Retained,
+    /// The output member was produced from this input member.
+    Derived,
+}
+
+/// One exact input-to-output member relation emitted by one transform.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryMemberRelation {
+    /// Unit that supplied the input member.
+    pub input_unit_id: ArtifactId,
+    /// Declared and retained member of the input unit.
+    pub input_member_id: ArtifactId,
+    /// Declared and retained member of the output unit.
+    pub output_member_id: ArtifactId,
+    /// Whether the input member is carried through or synthesized.
+    pub origin: BoundaryMemberOrigin,
+}
+
+/// One membership-changing transform and the member relation it emitted.
+///
+/// The transformer revision repeats the exact configuration of the transform that
+/// produced the output unit, so a relation cannot bind an output to a configuration
+/// other than the one its own envelope declares.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryTransformRelation {
+    /// Transformer revision and configuration that produced the output unit.
+    pub transformer: BoundaryTransformerRevision,
+    /// Unit this transform produced; one transform application per output unit.
+    pub output_unit_id: ArtifactId,
+    /// Every contributing input member for every retained output member.
+    pub member_relations: Vec<BoundaryMemberRelation>,
 }
 
 /// A finite collection of per-unit envelopes, including referenced children.
@@ -791,6 +849,8 @@ impl BoundaryMetadataEnvelope {
 pub struct BoundaryMetadataSet {
     /// Envelopes indexed by their stable unit identities.
     pub units: Vec<BoundaryMetadataEnvelope>,
+    /// Exact input-to-output member relation for every declared transform.
+    pub transforms: Vec<BoundaryTransformRelation>,
 }
 
 impl BoundaryMetadataSet {
@@ -828,6 +888,16 @@ impl BoundaryMetadataSet {
             }
         }
 
+        self.validate_transforms(&indices, limits, &mut total_members, &mut total_metadata)?;
+        self.validate_child_graph(&indices, limits)
+    }
+
+    /// Validate the bounded, acyclic child-reference graph over the whole set.
+    fn validate_child_graph(
+        &self,
+        indices: &BTreeMap<ArtifactId, usize>,
+        limits: &BoundaryValidationLimits,
+    ) -> Result<(), ContextError> {
         let mut edges = vec![Vec::new(); self.units.len()];
         let mut indegree = vec![0usize; self.units.len()];
         for (parent, unit) in self.units.iter().enumerate() {
@@ -892,6 +962,146 @@ impl BoundaryMetadataSet {
                     field: "boundary.child_depth",
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the exact input-to-output member relation of every declared transform.
+    ///
+    /// The relation is checked against the units themselves, not against a second
+    /// caller-supplied list: every contributing member must be a declared, retained
+    /// member of a retained input envelope, and every retained output member must
+    /// name its inputs. One input member may be claimed as `Retained` by at most one
+    /// output member, so equal content from two sources keeps two provenance
+    /// relations instead of collapsing into one.
+    fn validate_transforms(
+        &self,
+        indices: &BTreeMap<ArtifactId, usize>,
+        limits: &BoundaryValidationLimits,
+        total_members: &mut usize,
+        metadata_bytes: &mut usize,
+    ) -> Result<(), ContextError> {
+        if self.transforms.len() > limits.max_units {
+            return Err(ContextError::Bounds {
+                field: "boundary.transforms",
+            });
+        }
+        let mut outputs = BTreeSet::new();
+        for transform in &self.transforms {
+            if !outputs.insert(transform.output_unit_id.clone()) {
+                return Err(ContextError::Duplicate("boundary.transform_outputs"));
+            }
+            let output = &self.units[*indices.get(&transform.output_unit_id).ok_or(
+                ContextError::MissingField("boundary.transform_output_envelope"),
+            )?];
+            if output.transformer.as_ref() != Some(&transform.transformer) {
+                return Err(ContextError::IdentityConflict);
+            }
+            let output_members = output
+                .retained_member_ids()
+                .ok_or(ContextError::InvalidField(
+                    "boundary.transform_output_coverage",
+                ))?;
+            if transform.member_relations.len() > limits.max_members_per_unit {
+                return Err(ContextError::Bounds {
+                    field: "boundary.transform_members",
+                });
+            }
+            *total_members = total_members
+                .checked_add(transform.member_relations.len())
+                .ok_or(ContextError::Overflow)?;
+            if *total_members > limits.max_total_members {
+                return Err(ContextError::Bounds {
+                    field: "boundary.total_members",
+                });
+            }
+            account_text(
+                metadata_bytes,
+                limits,
+                &transform.transformer.transformer_id,
+                "boundary.transformer_id",
+            )?;
+            account_text(
+                metadata_bytes,
+                limits,
+                &transform.transformer.configuration_sha256,
+                "boundary.transformer.configuration_sha256",
+            )?;
+            self.validate_member_relations(
+                transform,
+                indices,
+                limits,
+                &output_members,
+                metadata_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Validate one transform's member relation against the units it names.
+    fn validate_member_relations(
+        &self,
+        transform: &BoundaryTransformRelation,
+        indices: &BTreeMap<ArtifactId, usize>,
+        limits: &BoundaryValidationLimits,
+        output_members: &BTreeSet<ArtifactId>,
+        metadata_bytes: &mut usize,
+    ) -> Result<(), ContextError> {
+        let mut related = BTreeSet::new();
+        let mut retained_origins: BTreeMap<&ArtifactId, usize> = BTreeMap::new();
+        let mut claimed = BTreeSet::new();
+        for relation in &transform.member_relations {
+            if !output_members.contains(&relation.output_member_id) {
+                return Err(ContextError::DenominatorMismatch);
+            }
+            let input = &self.units[*indices.get(&relation.input_unit_id).ok_or(
+                ContextError::MissingField("boundary.transform_input_envelope"),
+            )?];
+            if !input
+                .retained_member_ids()
+                .ok_or(ContextError::InvalidField(
+                    "boundary.transform_input_coverage",
+                ))?
+                .contains(&relation.input_member_id)
+            {
+                return Err(ContextError::DenominatorMismatch);
+            }
+            if !claimed.insert((
+                relation.input_unit_id.clone(),
+                relation.input_member_id.clone(),
+                relation.output_member_id.clone(),
+            )) {
+                return Err(ContextError::Duplicate("boundary.transform_relations"));
+            }
+            if relation.origin == BoundaryMemberOrigin::Retained {
+                *retained_origins
+                    .entry(&relation.output_member_id)
+                    .or_insert(0) += 1;
+            }
+            related.insert(relation.output_member_id.clone());
+            account_text(
+                metadata_bytes,
+                limits,
+                relation.input_unit_id.as_str(),
+                "boundary.transform_input_unit",
+            )?;
+            account_text(
+                metadata_bytes,
+                limits,
+                relation.input_member_id.as_str(),
+                "boundary.transform_input_member",
+            )?;
+            account_text(
+                metadata_bytes,
+                limits,
+                relation.output_member_id.as_str(),
+                "boundary.transform_output_member",
+            )?;
+        }
+        if related.len() != output_members.len()
+            || retained_origins.values().any(|count| *count != 1)
+        {
+            return Err(ContextError::DenominatorMismatch);
         }
         Ok(())
     }
