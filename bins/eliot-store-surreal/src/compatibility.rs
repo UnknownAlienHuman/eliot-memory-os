@@ -72,13 +72,20 @@
 //! order (gate → connect → re-verify → serve) plus the backend handoff carry
 //! that proof to the writer decision.
 //!
-//! PRODUCER CONTRACT (issue #1932, audit 5856162900 defect 1). This cell is
-//! the READER and the pure decision; it deliberately does not write the
-//! installation-visible documents, because the party that qualifies a
-//! generation must not be the party that consumes the qualification (I0.5:
-//! "report wording, test count, trait presence or manual status edit cannot
-//! promote support"). The producer belongs to the existing installation /
-//! release owner, and the seam it must use is exactly:
+//! PRODUCER (issue #1932, audit 5856162900 defect 1).
+//! [`install_compatibility_decision`] is the production producer of both
+//! installation-visible documents: it renders the record, verifies it and the
+//! I0.5 evidence snapshot BEFORE either is installed, and installs the pair
+//! atomically beside the selected Store config, the evidence snapshot FIRST,
+//! so an interruption leaves the pair refusing rather than admitting.
+//!
+//! What this cell deliberately does NOT do is DECIDE the record or QUALIFY a
+//! generation. The party that qualifies a generation must not be the party that
+//! consumes the qualification (I0.5: "report wording, test count, trait
+//! presence or manual status edit cannot promote support"), so the record and
+//! the I0.5 `CurrentSystemEvidenceSnapshot` bytes are supplied by the
+//! installation / release owner and this producer only refuses a pair that does
+//! not qualify. The owner's remaining steps are:
 //!
 //! ```text
 //! 1. decide the record      — owner-approved; `active_version` is the exact
@@ -90,27 +97,13 @@
 //!                             from `eliot-bootstrap`
 //!                             (`CurrentSystemEvidenceCompiler::compile`), and
 //!                             its `snapshot_sha256` verbatim;
-//! 3. render                 — `toml::to_string_pretty(&CompatibilityFile { .. })`;
-//!                             `Serialize` is derived from the same struct the
-//!                             parser reads, so the emitted shape cannot drift;
-//! 4. verify before install  — re-parse the rendered bytes with
-//!                             `parse_compatibility_bytes` and require
-//!                             `PartialEq` equality, and require the snapshot
-//!                             bytes to state exactly the record's
-//!                             `evidence_snapshot_sha256`;
-//! 5. install atomically     — write each document to a same-directory
-//!                             temporary file and rename it into place beside
-//!                             the selected Store config, the evidence snapshot
-//!                             FIRST, so an interruption leaves the pair
-//!                             refusing rather than admitting.
+//! 3. install the pair       — `install_compatibility_decision(config_path,
+//!                             &record, &evidence_snapshot_bytes)`.
 //! ```
 //!
-//! Steps 3-5 have no production caller in this crate today: `mod
-//! compatibility` is private and the re-export seam is `lib.rs`, so an
-//! uncalled producer here would be dead code. The record is consequently
-//! never written, and a normally installed Store resolves to
-//! [`CompatibilityVerdict::Maintenance`] — visible, queryable, and refusing
-//! every mutation, which is the fail-closed outcome, but not a writer.
+//! Until the release owner calls that entry point, a normally installed Store
+//! resolves to [`CompatibilityVerdict::Maintenance`] — visible, queryable, and
+//! refusing every mutation, which is the fail-closed outcome, but not a writer.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -376,11 +369,11 @@ struct EvidenceSnapshotIdentity {
 /// Verifies the recorded evidence-snapshot identity against the document
 /// installed beside the decision record.
 ///
-/// Requires the document to parse as JSON, to state exactly the recorded
-/// `snapshot_sha256`, and to name a non-blank `selected_source_head`. Every
-/// other outcome — unresolved path, missing, unreadable, oversized, malformed,
-/// different content address, blank source head — is an explicit
-/// [`EvidenceSnapshotVerification::Refused`] naming the reason.
+/// A missing, unreadable or oversized document is an explicit
+/// [`EvidenceSnapshotVerification::Refused`] naming the reason; the bytes of an
+/// installed document are then qualified by
+/// [`verify_evidence_snapshot_bytes`], which is the single validator both this
+/// reader and [`install_compatibility_decision`] use.
 fn verify_recorded_evidence_snapshot(
     config_path: &Path,
     recorded_digest: &str,
@@ -405,7 +398,30 @@ fn verify_recorded_evidence_snapshot(
             "{EVIDENCE_SNAPSHOT_FILE_NAME} is not readable"
         ));
     };
-    let Ok(identity) = serde_json::from_slice::<EvidenceSnapshotIdentity>(&bytes) else {
+    verify_evidence_snapshot_bytes(&bytes, recorded_digest)
+}
+
+/// Qualifies one I0.5 evidence-snapshot DOCUMENT against the record's recorded
+/// content address.
+///
+/// This is the independent source the recorded `evidence_snapshot_sha256` is
+/// checked against: the snapshot must parse as JSON, must state EXACTLY the
+/// recorded `snapshot_sha256`, and must name a non-blank `selected_source_head`.
+/// The record can therefore never qualify itself — a record whose stated
+/// address the document does not carry is refused, whoever supplied the bytes.
+/// Every other outcome (oversized, malformed, different content address, blank
+/// source head) is an explicit [`EvidenceSnapshotVerification::Refused`] naming
+/// the reason.
+fn verify_evidence_snapshot_bytes(
+    bytes: &[u8],
+    recorded_digest: &str,
+) -> EvidenceSnapshotVerification {
+    if bytes.len() > MAX_EVIDENCE_SNAPSHOT_BYTES {
+        return EvidenceSnapshotVerification::Refused(format!(
+            "{EVIDENCE_SNAPSHOT_FILE_NAME} exceeds the bounded size"
+        ));
+    }
+    let Ok(identity) = serde_json::from_slice::<EvidenceSnapshotIdentity>(bytes) else {
         return EvidenceSnapshotVerification::Refused(format!(
             "{EVIDENCE_SNAPSHOT_FILE_NAME} is not an I0.5 evidence snapshot document"
         ));
@@ -422,6 +438,92 @@ fn verify_recorded_evidence_snapshot(
         ));
     }
     EvidenceSnapshotVerification::Matched
+}
+
+/// Installs the installation-visible compatibility decision and the I0.5
+/// evidence snapshot it cites beside one Store launch config
+/// (issue #1932, audit 5856162900 defect 1).
+///
+/// This is the production producer of both sibling documents, and it runs the
+/// gate's OWN parser and validator on what it is about to install, so the
+/// installed record is the same shape and satisfies the same rules as the
+/// record this module later reads:
+///
+/// 1. `record` is rendered with `toml::to_string_pretty` from
+///    [`CompatibilityFile`] — the same struct [`parse_compatibility_bytes`]
+///    deserializes, so the emitted shape cannot drift from the accepted one;
+/// 2. the rendered bytes go back through [`parse_compatibility_bytes`], which
+///    runs [`validate_record`] on them, and the parsed record must equal the
+///    `record` argument. The ORIGINAL decided record is what is validated, and
+///    a render that lost or altered a field refuses instead of installing;
+/// 3. the supplied snapshot bytes go through the same
+///    [`verify_evidence_snapshot_bytes`] the reader uses, so the pair is
+///    qualified against the INDEPENDENT I0.5 document, never against the
+///    record's own claim about itself;
+/// 4. only then is each document written to a same-directory temporary file and
+///    renamed into place, the evidence snapshot FIRST. An interruption between
+///    the two renames therefore leaves a decision whose evidence document is
+///    absent or differently addressed, which refuses — never a pair that admits.
+///
+/// The caller is the installation / release owner: it decides the record and
+/// obtains the I0.5 snapshot bytes, and this function installs them. It does not
+/// decide or qualify a generation, because the party that qualifies a
+/// generation must not be the party that consumes the qualification (I0.5
+/// evidence discipline).
+///
+/// Fail-closed: any error above leaves the installation with either no record
+/// or the previously installed one, and an unrecorded installation resolves to
+/// [`CompatibilityVerdict::Maintenance`], which refuses every canonical write.
+pub fn install_compatibility_decision(
+    config_path: &Path,
+    record: &SurrealCompatibility,
+    evidence_snapshot_bytes: &[u8],
+) -> Result<(), String> {
+    let compatibility_path = compatibility_path_for_config(config_path).ok_or_else(|| {
+        format!("{COMPATIBILITY_FILE_NAME} has no parent directory for the Store config path")
+    })?;
+    let snapshot_path = evidence_snapshot_path_for_config(config_path).ok_or_else(|| {
+        format!("{EVIDENCE_SNAPSHOT_FILE_NAME} has no parent directory for the Store config path")
+    })?;
+    let rendered = toml::to_string_pretty(&CompatibilityFile {
+        surrealdb: record.clone(),
+    })
+    .map_err(|error| format!("render {COMPATIBILITY_FILE_NAME}: {error}"))?;
+    // Verify BEFORE install, through the parser this module reads with: the
+    // rendered bytes must parse, validate and round-trip to the decided record.
+    let round_trip = parse_compatibility_bytes(rendered.as_bytes())?;
+    if round_trip.surrealdb != *record {
+        return Err(format!(
+            "rendered {COMPATIBILITY_FILE_NAME} does not round-trip to the decided record"
+        ));
+    }
+    if let EvidenceSnapshotVerification::Refused(reason) =
+        verify_evidence_snapshot_bytes(evidence_snapshot_bytes, &record.evidence_snapshot_sha256)
+    {
+        return Err(format!(
+            "{EVIDENCE_SNAPSHOT_FILE_NAME} is not the recorded qualification: {reason}"
+        ));
+    }
+    // Evidence snapshot FIRST, so an interruption never leaves an admitting
+    // record without the document that qualifies it.
+    install_document_atomically(&snapshot_path, evidence_snapshot_bytes)?;
+    install_document_atomically(&compatibility_path, rendered.as_bytes())
+}
+
+/// Installs one document by writing a same-directory temporary file and
+/// renaming it into place, so a reader never observes a partial document.
+fn install_document_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let staging = directory.join(format!("{name}.new"));
+    std::fs::write(&staging, bytes)
+        .map_err(|error| format!("write staged {name}: {error}"))?;
+    std::fs::rename(&staging, path).map_err(|error| format!("install {name}: {error}"))
 }
 
 /// Resolves the installation-visible compatibility decision for one Store
