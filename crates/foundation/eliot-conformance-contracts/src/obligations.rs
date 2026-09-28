@@ -904,6 +904,12 @@ fn merge_cold_source(
         if obligation.conflict_field.is_none() {
             obligation.conflict_field = Some(field.to_string());
         }
+        // The row now holds the `CONFLICTED` disposition, not the
+        // `INACTIVE_RESEARCH_GATE` one, so the gate reason it was retained
+        // under is dropped. A row names exactly one non-active disposition, and
+        // its `inactive_gate_reason` is meaningful only alongside that one; the
+        // conflict field and every source lineage are still retained.
+        obligation.inactive_gate_reason = None;
     }
     let lineage = ColdSourceLineage {
         source_issue_id: source.source_issue_id.clone(),
@@ -1227,11 +1233,11 @@ fn validate_stop_conditions(conditions: &[DonorStopCondition]) -> Result<(), Obl
 /// an `ACTIVE` row carries a discriminator, a selected proof profile, and an
 /// oracle/evidence lineage. A donor-derived row always carries its adoption
 /// stage; Stage A is never executable; a Stage B+ `ACTIVE` row cites gate
-/// evidence; an `INACTIVE_RESEARCH_GATE` row retains its reason; a removed,
-/// narrowed or retired test proof is never `ACTIVE`; and a `CONFLICTED` row
-/// carries its conflict field, and only such a row does. Expiry is checked against
-/// the compilation boundary by [`validate_obligation_set`], which owns that
-/// boundary.
+/// evidence; an `INACTIVE_RESEARCH_GATE` row retains its reason, and only such
+/// a row does; a removed, narrowed or retired test proof is never `ACTIVE`; and
+/// a `CONFLICTED` row carries its conflict field, and only such a row does.
+/// Expiry is checked against the compilation boundary by
+/// [`validate_obligation_set`], which owns that boundary.
 fn validate_obligation_disposition(
     obligation: &ActiveConformanceObligation,
 ) -> Result<(), ObligationError> {
@@ -1264,6 +1270,18 @@ fn validate_obligation_disposition(
     {
         return Err(ObligationError::MissingEvidence {
             field: "obligation.inactive_gate_reason",
+        });
+    }
+    // The mirror of the check above: a gate reason is the marker of exactly one
+    // disposition, so a row that holds any other disposition must not also
+    // carry one. Without this, a group demoted to `CONFLICTED` would still
+    // advertise the INACTIVE Research Gate it no longer holds, and the two
+    // markers would name two dispositions for one row.
+    if obligation.status != ObligationStatus::InactiveResearchGate
+        && obligation.inactive_gate_reason.is_some()
+    {
+        return Err(ObligationError::InvalidDisposition {
+            reason: "only an INACTIVE Research Gate retains a gate reason",
         });
     }
     if obligation.status == ObligationStatus::Conflicted && obligation.conflict_field.is_none() {
