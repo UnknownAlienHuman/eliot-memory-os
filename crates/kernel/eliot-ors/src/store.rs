@@ -18355,15 +18355,20 @@ impl RedbRecoveryStore {
     /// Converts a host request whose claimed owner vanished with the process
     /// into the durable unknown-outcome state (issue #1853, I14.21, I1.4).
     ///
-    /// A `Routed`/`Submitted`/`PossiblyEffected` row holding a `Claimed`
-    /// attempt is a daemon that was killed after it claimed writer ownership
-    /// and may have issued effects. The restart path must not leave it looking
-    /// live, must not free the retained attempt so a replacement can silently
-    /// acquire ownership, and must not retry: it advances the row to `Unknown`
-    /// through the existing [`crate::HostRequestState::transition_to`] edge, so
-    /// exactly one result or `UNKNOWN_OUTCOME` can still be bound later from
-    /// reconciliation evidence. The attempt is retained in place and its
-    /// generation is untouched.
+    /// A non-terminal row holding a `Claimed` attempt is a daemon that was
+    /// killed after it claimed writer ownership and may have issued effects. The
+    /// restart path must not leave it looking live, must not free the retained
+    /// attempt so a replacement can silently acquire ownership, and must not
+    /// retry: it advances the row to `Unknown` through the existing
+    /// [`crate::HostRequestState::transition_to`] edge, so exactly one result or
+    /// `UNKNOWN_OUTCOME` can still be bound later from reconciliation evidence.
+    /// The attempt is retained in place and its generation is untouched.
+    ///
+    /// A `Reconciling` row keeps its retained `Claimed` attempt and still has a
+    /// legal edge to `Unknown`, so it is a candidate too: the interrupted
+    /// reconciliation cannot be resumed across a restart, and the owning route
+    /// re-advances the row to `Reconciling` when the next reconciliation
+    /// envelope arrives.
     ///
     /// The original stored record is validated before it is trusted and is
     /// never re-proved: the sweep reads the durable bytes, and a fresh proof

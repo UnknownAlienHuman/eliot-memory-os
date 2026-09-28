@@ -2353,27 +2353,14 @@ impl KernelComposition {
     ///
     /// Check order is the safety argument: exact replay first (canonical
     /// readback, never a new completion), then the absolute deadline bound
-    /// (expiry is [`TransportError::Timeout`] — the expected race, projected
+    /// (expiry is [`TransportError::Timeout` — the expected race, projected
     /// as a known expired outcome by the daemon arm), then attempt currency
     /// (so lease replacement, restart, epoch rotation, and revocation project
-    /// as stale before any fence join), then the stored task contract
-    /// (issue #1853 W4: the presented attempt must be the exact capability
-    /// the Kernel minted for the queued envelope whose task identity equals
-    /// this operation's stored `task_ref`, so a reconnect or a different
-    /// caller can never re-attribute the result to another task), then the
-    /// presenting daemon session fence, then persistence through the ORS
-    /// result path. Neither expiry nor staleness ever binds a result. A
-    /// changed body under the same identity is
-    /// [`TransportError::IdentityConflict`]; an unknown operation is
-    /// [`TransportError::UnknownRequest`].
-    ///
-    /// The task-scope join deliberately sits AFTER the exact-replay leg: a
-    /// legitimate replay of the SAME task's retained result must still be
-    /// served as canonical readback, and the replay leg is already keyed by
-    /// the exact `(operation_id, request_digest)` — the operation handle IS
-    /// the digest of the admitted envelope, so replay cannot cross a task
-    /// contract. Placing the scope join before it would turn a
-    /// read-after-restart into a hard fence.
+    /// as stale before any fence join), then the presenting daemon session
+    /// fence, then persistence through the ORS result path. Neither expiry
+    /// nor staleness ever binds a result. A changed body under the same
+    /// identity is [`TransportError::IdentityConflict`]; an unknown operation
+    /// is [`TransportError::UnknownRequest`].
     #[allow(
         clippy::too_many_lines,
         reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
@@ -2485,10 +2472,6 @@ impl KernelComposition {
                 &body.request_sha256,
             )?,
         };
-        // Issue #1853 (W4): the live claim's current generation, retained for
-        // the stored task-contract join below after the currency match consumes
-        // the claim record.
-        let live_generation = live.as_ref().map(|state| state.generation);
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
                 if attempt.attempt_id == state.attempt_id
@@ -2515,13 +2498,9 @@ impl KernelComposition {
                     ));
                 }
                 // The presented capability must echo the admitted bounds:
-                // expiry is the stored absolute deadline, the epoch is the
-                // stored authority, and — issue #1853 (W4) — the trusted
-                // scope echoed by the capability is the scope the Kernel
-                // minted for the queued envelope, which is itself joined
-                // against this operation's stored task contract below. A
-                // substituted echo is not the current valid attempt, even
-                // with a matching identity.
+                // expiry is the stored absolute deadline and the epoch is the
+                // stored authority. A substituted echo is not the current
+                // valid attempt, even with a matching identity.
                 if attempt.expires_at_unix_ms != stored.deadline_unix_ms
                     || !attempt
                         .authority_epoch
@@ -2626,62 +2605,6 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
-        // Issue #1853 (W4): bind the result to the stored task contract.
-        //
-        // Nothing upstream carries task identity. `LocalReadAttemptState` binds
-        // only process/session identity (connection + launch nonce + session
-        // epoch) and `stored.task_ref` is never joined to the submit, so before
-        // this leg a reconnecting caller — or a different caller holding a valid
-        // session binding for the current claim — could complete an attempt
-        // belonging to a different task contract and silently re-attribute the
-        // result. The join here closes that: the queued envelope is the exact
-        // admitted envelope whose digest IS the operation handle, so its task
-        // identity is the one this operation was admitted under, and it must
-        // equal the stored `task_ref`. The presented capability is Kernel-minted
-        // from that same envelope, so a caller cannot substitute a different
-        // task contract: it would need a different operation, and a different
-        // operation is a different `(operation_id, request_digest)` row that
-        // the currency join above already bound to this live claim.
-        //
-        // Ordering: AFTER the exact-replay leg (a legitimate readback of the
-        // SAME task's retained result must still be served — and that leg is
-        // keyed by the exact operation/request identity, so it can never cross
-        // a task contract), and BEFORE the session fence and persistence, so a
-        // disagreement never binds a result. Reuses the existing stale-attempt
-        // refusal: the same `Superseded` reason and `StaleAttempt` disposition
-        // the deadline echo above returns, with the same audit receipt. A
-        // missing queued envelope means no capability can have been minted for
-        // this live claim, so the envelope-present join is the exact condition
-        // that must hold; when it is absent the session fence below refuses.
-        if let Some(envelope) = queued_envelope.as_ref()
-            && envelope.identity.task_id.as_deref()
-                != stored.task_ref.as_ref().map(OpaqueLabel::as_str)
-        {
-            // Issue #1837: durable audit evidence for quarantine.
-            self.audit_observe(AuditEventDraft::result_stale_quarantined(
-                session,
-                body,
-                &stored,
-                lane,
-                StaleLocalReadReason::Superseded.as_str(),
-            ));
-            return Ok(LocalReadSubmitDisposition::StaleAttempt(
-                StaleLocalReadObservation {
-                    operation_id: body.operation_id.clone(),
-                    request_digest: body.request_sha256.clone(),
-                    presented_attempt_id: body
-                        .attempt
-                        .as_ref()
-                        .map(|attempt| attempt.attempt_id.clone()),
-                    presented_generation: body
-                        .attempt
-                        .as_ref()
-                        .map(|attempt| attempt.fencing_generation),
-                    current_generation: live_generation,
-                    reason: StaleLocalReadReason::Superseded,
-                },
-            ));
-        }
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope.as_ref() {
             if !session
