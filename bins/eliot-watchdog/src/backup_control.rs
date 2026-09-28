@@ -391,20 +391,14 @@ const WATCHDOG_OWNER_ROLES: [BackupRole; 2] = [BackupRole::CaptureOwner, BackupR
 
 /// Returns the lifecycle stage the `#954` owner maps `operation` to.
 ///
-/// Const so the accepted-method table below is a `const` item rather than a
-/// lazily built one: the role a row claims is read from the owner at compile
-/// time, and a table that could not be built would be a build failure rather
-/// than a refusal discovered while serving a request.
-const fn owner_stage(operation: BackupOperationKind) -> Option<BackupStage> {
-    let mut index = 0;
-    while index < BACKUP_STAGES.len() {
-        let stage = BACKUP_STAGES[index];
-        if matches!(operation_for_phase(stage), candidate if candidate as u8 == operation as u8) {
-            return Some(stage);
-        }
-        index += 1;
-    }
-    None
+/// Derived by inverting the owner's own [`operation_for_phase`] over the closed
+/// stage vocabulary above, so no second operation-to-stage table is written
+/// here and a new canonical operation reaches this module through the owner's
+/// own exhaustive match.
+fn owner_stage(operation: BackupOperationKind) -> Option<BackupStage> {
+    BACKUP_STAGES
+        .into_iter()
+        .find(|stage| operation_for_phase(*stage) == operation)
 }
 
 /// Returns the role the `#954` owner table names as an attester of `operation`
@@ -414,74 +408,34 @@ const fn owner_stage(operation: BackupOperationKind) -> Option<BackupStage> {
 /// attester at all or to a role this process does not hold. That is the whole
 /// authority decision for the owner side of an admission, and it is read from
 /// the owner rather than from a list any caller supplies.
-const fn watchdog_attesting_role(operation: BackupOperationKind) -> Option<BackupRole> {
-    let stage = match owner_stage(operation) {
-        Some(stage) => stage,
-        None => return None,
-    };
-    let roles = attesting_roles(stage);
-    let mut index = 0;
-    while index < roles.len() {
-        let role = roles[index];
-        if is_watchdog_owner_role(role) {
-            return Some(role);
-        }
-        index += 1;
-    }
-    None
+fn watchdog_attesting_role(operation: BackupOperationKind) -> Option<BackupRole> {
+    let stage = owner_stage(operation)?;
+    attesting_roles(stage)
+        .iter()
+        .copied()
+        .find(|role| WATCHDOG_OWNER_ROLES.contains(role))
 }
 
-/// Returns whether `role` is one of the owner roles this process holds.
-const fn is_watchdog_owner_role(role: BackupRole) -> bool {
-    let mut index = 0;
-    while index < WATCHDOG_OWNER_ROLES.len() {
-        if matches!(WATCHDOG_OWNER_ROLES[index], held if held as u8 == role as u8) {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
-
-/// One Watchdog-accepted backup method: wire identity, closed operation, and
-/// whether this owner can execute it.
+/// One Watchdog-registered backup method: wire identity and closed operation.
 ///
 /// [`wire_id`](Self::wire_id) is always the canonical wire identity of
 /// [`op`](Self::op), taken from the owner's total
 /// [`BackupOperationKind::wire_id`] lookup, so the record can never carry a
-/// copied or drifted literal. `attested_by` is the role the `#954` owner's own
-/// table names for this operation among the roles this owner holds, so an
-/// operation this owner may not attest is registered as recognized and refused
-/// rather than being absent from the table.
+/// copied or drifted literal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AcceptedWatchdogBackupMethod {
     /// Stable protocol wire identity, derived from `op`.
     pub wire_id: &'static str,
     /// Closed operation bound to the wire identity.
     pub op: BackupOperationKind,
-    /// The owner-table role that may attest `op` on this owner.
-    pub attested_by: BackupRole,
 }
 
 impl AcceptedWatchdogBackupMethod {
-    /// Binds one operation to its canonical wire identity and to the role the
-    /// owner's own table names for it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the `#954` owner table attributes no attester among
-    /// [`WATCHDOG_OWNER_ROLES`] to `op`. That is a compile-time-fixed table
-    /// mismatch, not a runtime input: every row below is a literal operation,
-    /// so a drift is a build-time defect rather than something to discover
-    /// while serving a request.
+    /// Binds one operation to its canonical wire identity.
     const fn new(op: BackupOperationKind) -> Self {
-        let Some(role) = watchdog_attesting_role(op) else {
-            panic!("watchdog backup table names an operation no held owner role attests");
-        };
         Self {
             wire_id: op.wire_id(),
             op,
-            attested_by: role,
         }
     }
 }
@@ -575,6 +529,47 @@ pub fn resolve_accepted_method(
         })
 }
 
+/// Returns `Ok(())` when this owner can actually execute `operation`, or the
+/// typed pre-effect refusal when it cannot.
+///
+/// The distinction is the whole point of the function. A method this owner
+/// registers but holds no owner method for is RECOGNIZED AND UNAVAILABLE, not
+/// supported: the refusal names the exact missing owner method, happens before
+/// the operation is claimed or the owner is entered, and therefore can never be
+/// recorded as an unresolved operation or reported as a possible effect. An
+/// operation outside this owner's registered table is rejected for the same
+/// reason, which is what keeps preparation and cutover unreachable here: they
+/// are the Host owner's separately admitted operations, and a rehearsal
+/// completion never resolves to cutover.
+fn executable_owner_method(operation: BackupOperationKind) -> Result<(), SpoolError> {
+    match operation {
+        BackupOperationKind::ReadSnapshotPage => Ok(()),
+        BackupOperationKind::RestoreStep => Err(SpoolError::Corrupt(
+            "watchdog backup control recognizes RESTORE_STEP but holds no restore-step owner method; it is advertised as unavailable rather than supported"
+                .to_owned(),
+        )),
+        BackupOperationKind::ReconcileRestore => Err(SpoolError::Corrupt(
+            "watchdog backup control recognizes RECONCILE_RESTORE but the canonical reconcile request carries no source, destination, active-installation or step body this owner could consume; it is advertised as unavailable rather than supported"
+                .to_owned(),
+        )),
+        BackupOperationKind::VerifyArchive => Err(SpoolError::Corrupt(
+            "watchdog backup control refuses VERIFY_ARCHIVE; this owner holds no archive verifier and never interprets archive bytes, and a transport acknowledgement never establishes success"
+                .to_owned(),
+        )),
+        BackupOperationKind::RestoreStatus => Err(SpoolError::Corrupt(
+            "watchdog backup control refuses RESTORE_STATUS; this owner holds no restore-status projection, and a transport acknowledgement never establishes success"
+                .to_owned(),
+        )),
+        BackupOperationKind::RequestCapture
+        | BackupOperationKind::PrepareIsolatedRestore
+        | BackupOperationKind::CompleteRehearsal
+        | BackupOperationKind::AdmitCutover => Err(SpoolError::Corrupt(format!(
+            "watchdog backup control rejects {}; it is outside this owner's registered table and fails before any owner effect",
+            operation
+        ))),
+    }
+}
+
 /// The authenticated context one admitted request is checked against.
 ///
 /// Built only by [`WatchdogBackupAdmission::observe`], which reads the
@@ -586,10 +581,6 @@ pub fn resolve_accepted_method(
 /// copies of one payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchdogBackupAdmission {
-    /// The composition's retained service identity.
-    service: &'static str,
-    /// The composition's retained protocol identity.
-    protocol: &'static str,
     /// The admitted launch session identity this composition was started
     /// under, observed from the composition's own readiness projection.
     session_id: String,
@@ -634,42 +625,10 @@ impl WatchdogBackupAdmission {
             ));
         }
         Ok(Self {
-            service: readiness.service,
-            protocol: readiness.protocol,
-            session_id: readiness.service_instance_guid.clone(),
+            session_id: readiness.service_instance_guid,
             owner_installation: port.source_installation().to_owned(),
             owner_generation: port.watchdog_generation(),
         })
-    }
-
-    /// Returns the installation identity the live owner port is bound to.
-    #[must_use]
-    pub fn owner_installation(&self) -> &str {
-        &self.owner_installation
-    }
-
-    /// Returns the watchdog generation the live owner port is bound to.
-    #[must_use]
-    pub const fn owner_generation(&self) -> u64 {
-        self.owner_generation
-    }
-
-        /// Returns the admitted launch session identity of this composition.
-    #[must_use]
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Returns the composition's retained service identity.
-    #[must_use]
-    pub const fn service(&self) -> &'static str {
-        self.service
-    }
-
-    /// Returns the composition's retained protocol identity.
-    #[must_use]
-    pub const fn protocol(&self) -> &'static str {
-        self.protocol
     }
 
     /// Returns this context bound to a freshly observed owner port.
@@ -680,8 +639,6 @@ impl WatchdogBackupAdmission {
     /// on the owner is refused rather than admitted against a stale generation.
     fn reobserved(&self, port: &WatchdogBackupPort) -> Self {
         Self {
-            service: self.service,
-            protocol: self.protocol,
             session_id: self.session_id.clone(),
             owner_installation: port.source_installation().to_owned(),
             owner_generation: port.watchdog_generation(),
@@ -702,25 +659,12 @@ pub struct AdmittedWatchdogBackupRequest {
     request: BackupSnapshotPageRead,
 }
 
-impl AdmittedWatchdogBackupRequest {
-    /// Returns the registered method this request was admitted for.
-    #[must_use]
-    pub const fn method(&self) -> &'static AcceptedWatchdogBackupMethod {
-        self.method
-    }
-
-    /// Returns the bound request identity of the admitted request.
-    #[must_use]
-    pub const fn identity(&self) -> &BackupRequestIdentity {
-        &self.request.identity
-    }
-}
-
 /// The owner's own retained result for one admitted operation.
 ///
 /// Every variant carries the owner's own values, read from the owner that
 /// produced them, never a value copied out of the request that asked for them.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum WatchdogBackupChannelOutcome {
     /// The `#955` spool capture owner produced one bounded fence for this exact
     /// operation, and the requested page was read from that retained fence.
@@ -1084,6 +1028,14 @@ impl BackupControlHandle {
         admitted: &AdmittedWatchdogBackupRequest,
     ) -> Result<WatchdogBackupChannelOutcome, BackupControlError> {
         self.require_dispatchable()?;
+        // A method this owner registers but cannot execute is refused BEFORE
+        // the operation is claimed, so it is never recorded as an operation the
+        // owner was entered for and can never be reported as a possible effect.
+        // Recognition is not availability, and an unavailable method is a
+        // pre-effect refusal, not an unresolved one.
+        if let Err(refusal) = executable_owner_method(admitted.method.op) {
+            return Err(BackupControlError::OwnerRefused(refusal));
+        }
         let identity = &admitted.request.identity;
         let binding = identity.mutation.canonical_request_hash.as_str();
         let digest = identity
@@ -1094,7 +1046,11 @@ impl BackupControlHandle {
             .retained(binding)
             .map_err(BackupControlError::Composition)?
         {
-            if record.identity_digest != digest {
+            // Both halves of the retained record are compared with THIS
+            // operation: a different canonical identity under the same binding
+            // is a replay conflict, and a different operation under the same
+            // identity is a binding that does not own what it names.
+            if record.identity_digest != digest || record.operation != admitted.method.op {
                 return Err(BackupControlError::Contract(BackupError::ReplayConflict));
             }
             return match record.outcome {
@@ -1119,6 +1075,10 @@ impl BackupControlHandle {
     }
 
     /// Runs the one owner method this operation resolved to.
+    ///
+    /// The executable set is decided by [`executable_owner_method`], which runs
+    /// before the operation is claimed, so this match has exactly one reachable
+    /// owner call and every other arm is the same pre-effect refusal.
     ///
     /// # Errors
     ///
@@ -1158,29 +1118,9 @@ impl BackupControlHandle {
                     .read_page(&fence, admitted.request.page.page_index)?;
                 Ok(WatchdogBackupChannelOutcome::Capture { fence, page })
             }
-            BackupOperationKind::RestoreStep => Err(SpoolError::Corrupt(
-                "watchdog backup control recognizes RESTORE_STEP but holds no restore-step owner method; it is advertised as unavailable rather than supported"
-                    .to_owned(),
+            _ => Err(executable_owner_method(admitted.method.op).expect_err(
+                "executable_owner_method admits exactly the ReadSnapshotPage arm",
             )),
-            BackupOperationKind::ReconcileRestore => Err(SpoolError::Corrupt(
-                "watchdog backup control recognizes RECONCILE_RESTORE but the canonical reconcile request carries no source, destination, active-installation or step body this owner could consume; it is advertised as unavailable rather than supported"
-                    .to_owned(),
-            )),
-            BackupOperationKind::VerifyArchive => Err(SpoolError::Corrupt(
-                "watchdog backup control refuses VERIFY_ARCHIVE; this owner holds no archive verifier and never interprets archive bytes, and a transport acknowledgement never establishes success"
-                    .to_owned(),
-            )),
-            BackupOperationKind::RestoreStatus => Err(SpoolError::Corrupt(
-                "watchdog backup control refuses RESTORE_STATUS; this owner holds no restore-status projection, and a transport acknowledgement never establishes success"
-                    .to_owned(),
-            )),
-            BackupOperationKind::RequestCapture
-            | BackupOperationKind::PrepareIsolatedRestore
-            | BackupOperationKind::CompleteRehearsal
-            | BackupOperationKind::AdmitCutover => Err(SpoolError::Corrupt(format!(
-                "watchdog backup control rejects {}; it is outside this owner's registered table and fails before any owner effect",
-                admitted.method.op
-            ))),
         }
     }
 
@@ -1286,6 +1226,19 @@ pub fn register_backup_control(
                 .to_owned(),
         ))
     })?;
+    // The registration must cover the complete method set the `#954` owner
+    // attributes to a role this process holds. The expected set is re-derived
+    // from the owner's own role matrix here, so a table that dropped a method
+    // or added one this owner never claimed refuses instead of serving a
+    // partial or over-broad registration.
+    if !verify_registration_is_complete() {
+        return Err(BackupControlError::Composition(
+            CompositionError::InvalidConfiguration(
+                "watchdog backup control refuses a registration that does not match the owner's accepted method table"
+                    .to_owned(),
+            ),
+        ));
+    }
     let binding = BackupOwnerBinding::observe(&port, SERVICE_NAME, PROTOCOL_VERSION)
         .map_err(BackupControlError::OwnerRefused)?;
     let admission = WatchdogBackupAdmission::observe(composition, &port)?;
