@@ -39,6 +39,17 @@ pub const OPERATOR_CAPABILITIES: [&str; 2] = ["controlboard.read", "operator.com
 pub const OPERATOR_HANDOFF_TTL_MS: u64 = 5_000;
 pub const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\operator\one-shot";
 
+/// Upper bound for the one-shot standard-input bytes one admitted launch may
+/// carry.
+///
+/// This is the same value the Windows suspended-launch primitive enforces
+/// (`eliot_platform_windows::SUSPENDED_LAUNCH_STDIN_LIMIT`). It is duplicated
+/// rather than imported because this crate is provider-neutral and owns no
+/// Windows dependency; the platform primitive is still the enforcing gate, and
+/// a request that exceeded it would be refused there after the child exists.
+/// Validating it here refuses it before a grant is even asked for.
+pub const MAX_LAUNCH_STDIN_PAYLOAD_BYTES: usize = 8 * 1024;
+
 /// Broker-to-Operator handoff bound to one interactive session and epoch.
 /// This envelope contains no bearer credential or filesystem auth reference.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -747,6 +758,38 @@ impl LaunchRequest {
         unique(&self.approved.dependency_closure, "dependency_closure")?;
         if self.observed_at == 0 || self.lease_expires_at <= self.observed_at {
             return Err(BrokerError::StaleLease);
+        }
+        self.validate_stdin_payload()?;
+        Ok(())
+    }
+
+    /// Fail-closed validation of the one-shot standard-input bytes.
+    ///
+    /// The payload is written to a suspended child before that child is
+    /// resumed, so an empty or oversized payload would either be refused by the
+    /// platform primitive after the process exists or block the spawning
+    /// thread with no reader. It is refused here, before any grant is asked
+    /// for. The bound is the same constant the platform primitive enforces, so
+    /// an admitted payload is always writable whole.
+    fn validate_stdin_payload(&self) -> Result<(), BrokerError> {
+        let Some(payload) = self.stdin_payload.as_deref() else {
+            return Ok(());
+        };
+        if payload.is_empty() || payload.len() > MAX_LAUNCH_STDIN_PAYLOAD_BYTES {
+            return Err(BrokerError::InvalidField("stdin_payload"));
+        }
+        // A line protocol is what the child reads; embedded NUL would truncate
+        // it at the child's end and an embedded control byte would let one
+        // payload smuggle a second record past the child's own reader.
+        if payload.contains('\0')
+            || payload
+                .chars()
+                .any(|character| character.is_control() && character != '\n')
+        {
+            return Err(BrokerError::InvalidField("stdin_payload"));
+        }
+        if !payload.ends_with('\n') {
+            return Err(BrokerError::InvalidField("stdin_payload"));
         }
         Ok(())
     }
@@ -1538,10 +1581,19 @@ pub trait ProcessPort: Send {
     /// Prepares the exact sealed request without crossing the physical start
     /// boundary.  The returned digest is durably recorded before `start` is
     /// called, so a crash cannot orphan an effect with no recovery cursor.
+    ///
+    /// `stdin_payload` is the exact one-shot standard-input bytes this admitted
+    /// launch carries, or `None` when the child needs no input.  It is passed
+    /// here, at the single point where the request is turned into a sealed
+    /// provider request, and NOT to [`Self::start`]: an implementation that
+    /// retains it from `prepare_start` cannot be handed different bytes at the
+    /// start boundary, so the request digest committed durably before the
+    /// effect and the bytes actually written to the child are the same bytes.
     fn prepare_start(
         &mut self,
         grant: &LaunchGrant,
         registration: &RegistrationReceipt,
+        stdin_payload: Option<&str>,
     ) -> Result<String, PortError>;
     fn start(
         &mut self,
@@ -2252,11 +2304,16 @@ impl UserBroker {
         let process_operation_id = grant.approved.operation_id.clone();
         let process_generation = grant.approved.generation;
         let permit = permit_from_grant(&grant, &current, &request_digest);
+        // The payload is handed over at the single preparation point and is
+        // already inside `request_digest`, which `permit` and the durable cursor
+        // both carry, so the bytes the provider retains here are the bytes the
+        // idempotency key is bound to.
+        let stdin_payload = request.stdin_payload.as_deref();
         let expected_process_request_digest = self
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .prepare_start(&grant, &current)
+            .prepare_start(&grant, &current, stdin_payload)
             .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
         hex_digest(&expected_process_request_digest, "process_request_digest")?;
         let cursor = cursor_from_grant(
@@ -5315,6 +5372,7 @@ mod tests {
             &mut self,
             grant: &LaunchGrant,
             _registration: &RegistrationReceipt,
+            _stdin_payload: Option<&str>,
         ) -> Result<String, PortError> {
             let (request, _authority) = process_request_for_test(grant, false)?;
             Ok(request.invocation_digest().to_owned())
@@ -5400,8 +5458,9 @@ mod tests {
             &mut self,
             grant: &LaunchGrant,
             registration: &RegistrationReceipt,
+            stdin_payload: Option<&str>,
         ) -> Result<String, PortError> {
-            self.inner.prepare_start(grant, registration)
+            self.inner.prepare_start(grant, registration, stdin_payload)
         }
 
         fn start(
@@ -5451,8 +5510,9 @@ mod tests {
             &mut self,
             grant: &LaunchGrant,
             registration: &RegistrationReceipt,
+            stdin_payload: Option<&str>,
         ) -> Result<String, PortError> {
-            self.inner.prepare_start(grant, registration)
+            self.inner.prepare_start(grant, registration, stdin_payload)
         }
 
         fn start(
@@ -5630,6 +5690,7 @@ mod tests {
             approved: approved(),
             observed_at: 11,
             lease_expires_at: 19,
+            stdin_payload: None,
         }
     }
 

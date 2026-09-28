@@ -1112,14 +1112,40 @@ impl PinnedRuntimeFile {
 /// Upper bound for the single standard-input payload one suspended launch may
 /// carry.
 ///
-/// The child is still suspended when the parent writes the payload, so a
-/// payload larger than the anonymous pipe buffer would block the parent until
-/// the child drains it. One one-shot request line is orders of magnitude below
-/// this ceiling, and an over-limit request is refused here rather than
-/// deadlocking the spawn. This is a mechanics bound, not a policy: what an
-/// admitted launch may put on the wire is decided by its own owner.
+/// The child is still suspended when the parent writes the payload, so nothing
+/// is draining the pipe yet: a payload larger than the pipe buffer would block
+/// the spawning thread forever with no reader. [`stdin_pipe_buffer_bytes`]
+/// therefore sizes the pipe this launch uses, and this ceiling stays far below
+/// that size, so a conforming payload is always accepted whole without blocking.
+/// An over-limit payload is refused here rather than deadlocking the spawn.
+/// This is a mechanics bound, not a policy: what an admitted launch may put on
+/// the wire is decided by its own owner.
 #[cfg(windows)]
-pub const SUSPENDED_LAUNCH_STDIN_LIMIT: usize = 1024;
+pub const SUSPENDED_LAUNCH_STDIN_LIMIT: usize = 8 * 1024;
+
+/// Reserved capacity of the standard-input pipe of a launch that carries a
+/// payload.
+///
+/// A zero size would leave the pipe at the system default, which for an
+/// anonymous pipe is small enough that a realistic one-shot request line could
+/// not be written before the child is resumed. The reservation is paid only by
+/// the launches that actually carry a payload; a launch without one still asks
+/// for the default buffer, so its previous behaviour is unchanged.
+#[cfg(windows)]
+const STDIN_PAYLOAD_PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
+/// Returns the reserved standard-input pipe capacity for this launch.
+///
+/// `0` means "system default" and is what a launch without a payload gets, so
+/// that path is byte-for-byte the previous behaviour.
+#[cfg(windows)]
+fn stdin_pipe_buffer_bytes(spec: &SuspendedLaunchSpec) -> u32 {
+    if spec.stdin_payload.is_some() {
+        STDIN_PAYLOAD_PIPE_BUFFER_BYTES
+    } else {
+        0
+    }
+}
 
 /// Complete deterministic input to the Windows suspended-launch primitive.
 ///
@@ -1728,6 +1754,20 @@ impl Drop for ProcThreadAttributeList {
 
 #[cfg(windows)]
 fn inheritable_pipe() -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsAdapterError> {
+    inheritable_pipe_with_buffer(0)
+}
+
+/// Creates one inheritable anonymous pipe pair with an explicit reserved
+/// capacity.
+///
+/// A `buffer_bytes` of `0` asks for the system default, which is the historical
+/// behaviour of every launch. A non-zero value is used only by the standard
+/// input of a launch that carries a one-shot payload, so that payload fits
+/// before the suspended child is resumed (see [`stdin_pipe_buffer_bytes`]).
+#[cfg(windows)]
+fn inheritable_pipe_with_buffer(
+    buffer_bytes: u32,
+) -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsAdapterError> {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Pipes::CreatePipe;
     let mut read = std::ptr::null_mut();
@@ -1739,7 +1779,7 @@ fn inheritable_pipe() -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsA
         bInheritHandle: 1,
     };
     // SAFETY: output pointers and security attributes are valid for the call.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) } == 0 {
+    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, buffer_bytes) } == 0 {
         return Err(last_windows_adapter_error());
     }
     Ok((
@@ -2099,7 +2139,7 @@ fn spawn_existing_job_member(
     let mut environment = command_environment(&spec.environment);
     let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
         .map_err(|error| windows_adapter_from_io(&error))?;
-    let (stdin_read, stdin_write) = inheritable_pipe()?;
+    let (stdin_read, stdin_write) = inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
     let (stdout_read, stdout_write) = inheritable_pipe()?;
     let (stderr_read, stderr_write) = inheritable_pipe()?;
     make_non_inheritable(stdin_write.0)?;
@@ -2770,7 +2810,7 @@ impl SuspendedJobChild {
         let mut environment = command_environment(&spec.environment);
         let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
             .map_err(|error| windows_adapter_from_io(&error))?;
-        let (stdin_read, stdin_write) = inheritable_pipe()?;
+        let (stdin_read, stdin_write) = inheritable_pipe_with_buffer(stdin_pipe_buffer_bytes(&spec))?;
         let (stdout_read, stdout_write) = inheritable_pipe()?;
         let (stderr_read, stderr_write) = inheritable_pipe()?;
         make_non_inheritable(stdin_write.0)?;

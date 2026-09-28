@@ -678,7 +678,13 @@ struct LocalProcessPort {
     executor: WindowsProcessExecutor,
     runtime: tokio::runtime::Runtime,
     evidence: Arc<Mutex<Vec<ProcessEvidence>>>,
-    pending_requests: BTreeMap<OperationId, ProcessRequest>,
+    /// Sealed request and the exact one-shot standard-input bytes retained from
+    /// `prepare_start`. The bytes live here, not in the sealed `ProcessRequest`
+    /// (which is Kernel-signed P-03 effect material and must not grow a
+    /// request-content field), and they are read at the start boundary rather
+    /// than accepted again there, so the payload written to the child is the
+    /// payload the durably committed request digest was computed from.
+    pending_requests: BTreeMap<OperationId, (ProcessRequest, Option<Vec<u8>>)>,
     identity_issuer: Option<IssuerHandle>,
 }
 
@@ -799,6 +805,7 @@ impl ProcessPort for LocalProcessPort {
         &mut self,
         grant: &LaunchGrant,
         _registration: &RegistrationReceipt,
+        stdin_payload: Option<&str>,
     ) -> Result<String, PortError> {
         let request = self.request_from_grant(grant)?;
         let operation_id = request.operation_id().clone();
@@ -813,7 +820,7 @@ impl ProcessPort for LocalProcessPort {
         );
         if self
             .pending_requests
-            .insert(operation_id, request)
+            .insert(operation_id, (request, stdin_payload.map(<[u8]>::to_vec)))
             .is_some()
         {
             return Err(PortError::Invalid(
@@ -829,7 +836,7 @@ impl ProcessPort for LocalProcessPort {
         _registration: &RegistrationReceipt,
         expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError> {
-        let request = self
+        let (request, stdin_payload) = self
             .pending_requests
             .remove(&grant.approved.operation_id)
             .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
@@ -842,7 +849,14 @@ impl ProcessPort for LocalProcessPort {
         let sink = Arc::new(BrokerEvidenceSink {
             records: self.evidence.clone(),
         });
-        match self.runtime.block_on(self.executor.start(request, sink)) {
+        // The payload is the one retained at preparation, never one supplied at
+        // the start boundary, so the bytes the child reads are the bytes the
+        // durably committed request digest covers.
+        let start = match stdin_payload.as_deref() {
+            Some(payload) => self.executor.start_with_stdin(request, sink, Some(payload)),
+            None => self.executor.start(request, sink),
+        };
+        match self.runtime.block_on(start) {
             Ok(receipt) => Ok(ProcessStartOutcome::Started {
                 request_digest,
                 receipt,
