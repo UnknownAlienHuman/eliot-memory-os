@@ -122,6 +122,12 @@
 //! ([`ReservedWriteReconciliation::proven_not_applied`]). No arm finalizes the
 //! reservation ([`ReservedWriteReconciliation::finalizes_reservation`]).
 //!
+//! The wire cannot widen that separation. A decoded payload is held to the
+//! same evidence requirements as a constructed one: a committed arm must carry
+//! the exact canonical receipt the commit entry point demands, and a payload
+//! that merely asserts proven-not-applied is refused, because asserting it on
+//! the wire is not the act.
+//!
 //! # Non-goals
 //!
 //! No wire-enum activation, no Store-client apply operation introduced in
@@ -723,12 +729,19 @@ impl ReservationEnvelopeState {
 ///
 /// Construction is closed: the fields are private, so outside this module a
 /// value can only come from the four named constructors above. Decoding is
-/// gated the same way: the wire shape deserializes into a private shadow
-/// struct and then passes through
-/// [`ReservedWriteReconciliation::validate`], so an inconsistent payload
-/// fails closed with a typed [`StoreError`] instead of yielding a value. A
-/// decoded value is still shape-only under the module contract, not fresh
-/// proof of currency; no new authority mechanism is introduced here.
+/// gated by the same requirements, not by a weaker copy: the wire shape
+/// deserializes into a private shadow struct, a payload that asserts
+/// [`ReservedWriteOutcome::ProvenNotApplied`] is refused because the wire
+/// carries no store read that could have performed the named act, and the rest
+/// passes through [`ReservedWriteReconciliation::validate`], whose committed
+/// arm applies the identical check sequence
+/// (`require_committed_receipt_evidence`) that
+/// [`ReservedWriteReconciliation::committed`] applies. So an inconsistent
+/// payload fails closed with a typed [`StoreError`] instead of yielding a
+/// value, and no decoded value carries a commit claim the commit entry point
+/// would refuse. A decoded value is still shape-only under the module
+/// contract, not fresh proof of currency; no new authority mechanism is
+/// introduced here.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "ReconciliationWire", into = "ReconciliationWire")]
 pub struct ReservedWriteReconciliation {
@@ -758,7 +771,31 @@ struct ReconciliationWire {
 impl TryFrom<ReconciliationWire> for ReservedWriteReconciliation {
     type Error = StoreError;
 
+    /// Decodes a wire payload under the SAME requirements as construction.
+    ///
+    /// Two arms survive the wire and one does not:
+    ///
+    /// - `Committed` is accepted only when the receipt passes
+    ///   [`require_committed_receipt_evidence`] — the canonical envelope must
+    ///   be present, the receipt must be valid, and its exact identity must
+    ///   match the admitting projection. This is the check
+    ///   [`ReservedWriteReconciliation::committed`] applies, so the decode
+    ///   path cannot hand out a receipt the commit entry point would refuse;
+    /// - `ProvenNotApplied` is REFUSED. It is a named act
+    ///   ([`ReservedWriteReconciliation::proven_not_applied`]) over durable
+    ///   store evidence that the wire does not carry, so a payload asserting
+    ///   it has proven nothing. A payload claiming it fails closed with a
+    ///   typed [`StoreError`] instead of yielding a value; the receiving
+    ///   boundary performs the act itself;
+    /// - `StillUnknown` is the unresolved arm and carries no evidence to
+    ///   check beyond identity consistency.
     fn try_from(wire: ReconciliationWire) -> Result<Self, Self::Error> {
+        if matches!(wire.outcome, ReservedWriteOutcome::ProvenNotApplied) {
+            return Err(StoreError::InvalidField {
+                field: "admission.outcome",
+                reason: "proven_not_applied is a named act and is not assertable on the wire",
+            });
+        }
         let value = Self {
             operation_id: wire.operation_id,
             admission: wire.admission,
@@ -837,14 +874,7 @@ impl ReservedWriteReconciliation {
         receipt: WriteReceipt,
     ) -> Result<Self, StoreError> {
         admission.validate()?;
-        receipt
-            .require_reconciliation_envelope()
-            .map_err(|_| StoreError::MissingReceiptEnvelope)?;
-        receipt.validate().map_err(|_| StoreError::InvalidReceipt)?;
-        validate_receipt_binding(admission, &receipt)?;
-        if receipt.status != WriteReceiptStatus::Committed {
-            return Err(StoreError::InvalidReceipt);
-        }
+        require_committed_receipt_evidence(admission, &receipt)?;
         Ok(Self {
             operation_id: admission.operation_id.clone(),
             admission: admission.clone(),
@@ -893,10 +923,20 @@ impl ReservedWriteReconciliation {
 
     /// Checks the outcome against the original identity and receipt binding.
     ///
-    /// A committed arm must carry a canonical receipt whose exact identity
-    /// matches both this value and its own admission projection. The other two
-    /// arms are checked only for consistency with the identity they are
-    /// reported under.
+    /// This is the decode gate as well as the checking entry point, and it is
+    /// the SAME gate: a committed arm is accepted only through
+    /// `require_committed_receipt_evidence`, which is the identical check
+    /// sequence [`ReservedWriteReconciliation::committed`] applies. Decoding
+    /// therefore cannot produce a weaker commit claim than constructing one:
+    /// an envelope-less or otherwise invalid receipt is refused with the same
+    /// typed [`StoreError`] in both paths, and a receipt that
+    /// [`ReservedWriteReconciliation::require_committed_receipt`] would hand
+    /// back has necessarily passed every requirement the commit entry point
+    /// applies.
+    ///
+    /// The other two arms are checked only for consistency with the identity
+    /// they are reported under; which of them the wire may assert is decided
+    /// by the decode gate itself (`TryFrom<ReconciliationWire>`).
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.finalizes_reservation() {
             return Err(StoreError::InvalidField {
@@ -909,10 +949,7 @@ impl ReservedWriteReconciliation {
             return Err(StoreError::IdentityConflict);
         }
         if let ReservedWriteOutcome::Committed(receipt) = &self.outcome {
-            if receipt.status != WriteReceiptStatus::Committed {
-                return Err(StoreError::InvalidReceipt);
-            }
-            validate_receipt_binding(&self.admission, receipt)?;
+            require_committed_receipt_evidence(&self.admission, receipt)?;
         }
         Ok(())
     }
@@ -969,6 +1006,43 @@ impl ReservedWriteUnsupported {
     pub const fn into_error(self) -> StoreError {
         StoreError::UnknownOperation
     }
+}
+
+/// Applies the exact canonical-receipt requirements of the committed arm.
+///
+/// This is the single owner of the commit evidence rule, shared by the commit
+/// entry point ([`ReservedWriteReconciliation::committed`]) and the decode gate
+/// ([`ReservedWriteReconciliation::validate`], reached from
+/// `TryFrom<ReconciliationWire>`). There is no second, weaker scheme: in both
+/// paths, in this exact order, the receipt must
+///
+/// 1. carry the canonical receipt envelope
+///    ([`WriteReceipt::require_reconciliation_envelope`], whose own contract
+///    states that an envelope-less transport receipt is unknown to the
+///    reconciler and must never be reported as a successful write);
+/// 2. be internally valid ([`WriteReceipt::validate`], which refuses a
+///    committed receipt with no `commit_id`, no `committed_at`, or no applied
+///    command);
+/// 3. bind to the admitting projection's exact operation identity, idempotency
+///    key, and canonical request hash ([`validate_receipt_binding`]); and
+/// 4. carry the terminal [`WriteReceiptStatus::Committed`] status.
+///
+/// A value that passes this cannot be one this crate would classify the
+/// transaction as unknown for, so the existence of the arm and the guarantee
+/// of the evidence behind it can never diverge between the two paths.
+fn require_committed_receipt_evidence(
+    admission: &WriteAdmissionProjection,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+    receipt.validate().map_err(|_| StoreError::InvalidReceipt)?;
+    validate_receipt_binding(admission, receipt)?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
 }
 
 /// Checks the exact operation identity and reservation binding of one observed
