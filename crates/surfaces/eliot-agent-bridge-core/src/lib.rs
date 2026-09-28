@@ -131,8 +131,8 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), BridgeError> {
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_recovery_proof(value: &Option<String>, field: &'static str) -> Result<(), BridgeError> {
-    if value.as_ref().is_some_and(|proof| {
+fn validate_recovery_proof(value: Option<&str>, field: &'static str) -> Result<(), BridgeError> {
+    if value.is_some_and(|proof| {
         proof.len() != 64
             || !proof
                 .bytes()
@@ -1873,7 +1873,7 @@ impl ReconciliationPortResult {
             &binding.state_fence,
         )?;
         validate_recovery_proof(
-            &request_continuation_proof,
+            request_continuation_proof.as_deref(),
             "recovery_read.request_continuation_proof",
         )?;
         let window = RecoveryWindowFacts::checked(
@@ -2455,7 +2455,7 @@ impl RecoveredStreamFacts {
 
     #[allow(clippy::result_large_err)]
     pub fn with_stream_proof(mut self, stream_proof: Option<String>) -> Result<Self, BridgeError> {
-        validate_recovery_proof(&stream_proof, "recovered_stream.stream_proof")?;
+        validate_recovery_proof(stream_proof.as_deref(), "recovered_stream.stream_proof")?;
         self.stream_proof = stream_proof;
         Ok(self)
     }
@@ -2699,8 +2699,14 @@ impl RecoveryWindowFacts {
         if let Some(cursor) = &stream_list_continuation {
             validate_text(cursor, "recovery_window.stream_list_continuation")?;
         }
-        validate_recovery_proof(&stream_list_proof, "recovery_window.stream_list_proof")?;
-        validate_recovery_proof(&unscoped_gaps_proof, "recovery_window.unscoped_gaps_proof")?;
+        validate_recovery_proof(
+            stream_list_proof.as_deref(),
+            "recovery_window.stream_list_proof",
+        )?;
+        validate_recovery_proof(
+            unscoped_gaps_proof.as_deref(),
+            "recovery_window.unscoped_gaps_proof",
+        )?;
         if live_generation.get() == 0 {
             return Err(BridgeError::InvalidContract {
                 field: "recovery_window.live_generation",
@@ -2710,7 +2716,10 @@ impl RecoveryWindowFacts {
         let mut seen = BTreeSet::new();
         let mut seen_gap_ids = BTreeSet::new();
         for facts in &stream_facts {
-            validate_recovery_proof(&facts.stream_proof, "recovery_window.stream_proof")?;
+            validate_recovery_proof(
+                facts.stream_proof.as_deref(),
+                "recovery_window.stream_proof",
+            )?;
             if window_status == RecoveryWindowStatus::Active
                 && facts.stream_proof.is_some()
                     != (facts.page_continuation.is_some() || facts.gap_continuation.is_some())
@@ -2918,7 +2927,7 @@ impl RecoveryReadRequest {
     ) -> Result<Self, BridgeError> {
         validate_text(&window_key, "recovery_read.window_key")?;
         validate_recovery_proof(
-            &Some(continuation_proof.clone()),
+            Some(continuation_proof.as_str()),
             "recovery_read.continuation_proof",
         )?;
         validate_text(&stream_id, "recovery_read.stream_id")?;
@@ -2992,7 +3001,7 @@ impl RecoveryReadRequest {
     ) -> Result<Self, BridgeError> {
         validate_text(&window_key, "recovery_read.window_key")?;
         validate_recovery_proof(
-            &Some(continuation_proof.clone()),
+            Some(continuation_proof.as_str()),
             "recovery_read.continuation_proof",
         )?;
         validate_text(&after_stream, "recovery_read.after_stream")?;
@@ -3033,7 +3042,7 @@ impl RecoveryReadRequest {
     ) -> Result<Self, BridgeError> {
         validate_text(&window_key, "recovery_read.window_key")?;
         validate_recovery_proof(
-            &Some(continuation_proof.clone()),
+            Some(continuation_proof.as_str()),
             "recovery_read.continuation_proof",
         )?;
         validate_text(&after_gap_scope, "recovery_read.after_gap_scope")?;

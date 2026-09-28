@@ -1034,13 +1034,12 @@ fn decode_recovery_reply_coverage(
             "reconciliation refused: empty stream denominator has a continuation",
         ));
     }
-    if window_status == RecoveryWindowStatus::Active
-        && stream_list_proof.is_some() != stream_list_continuation.is_some()
-    {
-        return Err(event_shape_failure(
-            "reconciliation refused: stream-list continuation proof does not match its cursor",
-        ));
-    }
+    validate_recovery_continuation_proof(
+        stream_list_proof.as_deref(),
+        stream_list_continuation.is_some(),
+        window_status,
+        "reconciliation refused: stream-list continuation proof does not match its cursor",
+    )?;
     let streams = reconciliation
         .get("streams")
         .and_then(serde_json::Value::as_array)
@@ -1087,13 +1086,12 @@ fn decode_recovery_reply_coverage(
         .get("unscoped_gaps")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
-    if window_status == RecoveryWindowStatus::Active
-        && unscoped_gaps_proof.is_some() != unscoped_gaps_continuation.is_some()
-    {
-        return Err(event_shape_failure(
-            "reconciliation refused: unscoped-gap continuation proof does not match its cursor",
-        ));
-    }
+    validate_recovery_continuation_proof(
+        unscoped_gaps_proof.as_deref(),
+        unscoped_gaps_continuation.is_some(),
+        window_status,
+        "reconciliation refused: unscoped-gap continuation proof does not match its cursor",
+    )?;
     if unscoped_gap_total == 0
         && (!unscoped_gaps.is_empty() || unscoped_gaps_continuation.is_some())
     {
@@ -1112,6 +1110,18 @@ fn decode_recovery_reply_coverage(
         unscoped_gaps_complete,
         unscoped_gaps_continuation,
     })
+}
+
+fn validate_recovery_continuation_proof(
+    proof: Option<&str>,
+    has_continuation: bool,
+    window_status: RecoveryWindowStatus,
+    mismatch_message: &'static str,
+) -> Result<(), ProviderFailure> {
+    if window_status == RecoveryWindowStatus::Active && proof.is_some() != has_continuation {
+        return Err(event_shape_failure(mismatch_message));
+    }
+    Ok(())
 }
 
 fn decode_recovery_window_expiry(
