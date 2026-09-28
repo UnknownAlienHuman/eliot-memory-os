@@ -61,9 +61,10 @@ use crate::{
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
     AdmissionReservationDisposition, AdmissionReservationReceipt, AdmissionReservationRecord,
     AdmissionReservationRelease, AdmissionReservationSnapshot, AdmissionReservationStage,
-    AdmissionReservationState, AdmissionReservationTransitionRequest, AuthorityActivationReceipt,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
-    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+    AdmissionReservationState, AdmissionReservationTransitionRequest, AlreadyTerminalWrite,
+    AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
+    AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
     BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
@@ -76,29 +77,35 @@ use crate::{
     KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
     LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
-    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
-    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceReadback, ProcessEvidenceRecord, ProcessStartReplayAbort,
-    ProcessStartReplayRecord, ProcessStartReplayState, ProcessStreamRecoveryFence,
-    ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    OperationalCurrentRecoveryCursor, OperationalCurrentRecoveryEntry,
+    OperationalCurrentRecoveryPage, OperationalMutationReceipt, OperationalPhase,
+    OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
+    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
-    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, StreamRecoveryReconciliationState,
-    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
-    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
-    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry, RecoveryInboxRecoveryPage,
+    RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage, RecoveryPayload,
+    RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, RecoveryProblemRecoveryCursor,
+    RecoveryProblemRecoveryPage, RecoveryWriteBinding, ReservationRecord, ReservationRequest,
+    ReservationState, ReservedScope, RetryState, RootTransitionCommit,
+    RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
+    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
+    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
+    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
+    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
     WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors,
     WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
-    WorkerReplayStreamRecord, WriterReservationToken, is_replay_terminal_phase,
-    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry,
+    WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor, WriteReservationRecoveryPage,
+    WriterReservationToken, is_replay_terminal_phase, parse_replay_stream_id,
+    require_replay_claim_binding, signed_supervision_lease_from_verified,
     signed_terminal_supervision_lease_from_verified,
 };
 
@@ -122,6 +129,8 @@ const RESERVATIONS: TableDefinition<&str, &str> = TableDefinition::new("ors_rese
 const RESERVATION_ORDERS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_reservation_orders_v1");
 const OPERATIONS: TableDefinition<&str, &str> = TableDefinition::new("ors_operations_v1");
+const WRITE_IDEMPOTENCY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_write_idempotency_v1");
 const SCOPE_HEADS: TableDefinition<&str, &str> = TableDefinition::new("ors_scope_heads_v1");
 const SCOPE_TERMINALS: TableDefinition<&str, &str> = TableDefinition::new("ors_scope_terminals_v1");
 const OPERATIONAL_CURRENT: TableDefinition<&str, &str> =
@@ -2554,6 +2563,13 @@ const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
 const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_effect_replay_reconciliations_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+const RECOVERY_RESERVATION_REVISION: &str = "ors_recovery_reservations_revision_v1";
+const RECOVERY_OPERATIONAL_CURRENT_REVISION: &str = "ors_recovery_operational_current_revision_v1";
+const RECOVERY_INBOX_REVISION: &str = "ors_recovery_inbox_revision_v1";
+const RECOVERY_PROBLEMS_REVISION: &str = "ors_recovery_problems_revision_v1";
+const RECOVERY_WRITE_IDEMPOTENCY_REVISION: &str = "ors_recovery_write_idempotency_revision_v1";
+const RECOVERY_INVENTORY_REVISION_SCHEMA: &str = "ors_recovery_inventory_revision_schema_v1";
+const RECOVERY_INVENTORY_REVISION_SCHEMA_V1: &str = "1";
 /// Durable monotone revision of the process-stream recovery family (issue
 /// #2884).
 ///
@@ -3028,6 +3044,44 @@ pub trait OperationalRecoveryStore: Send + Sync {
         recovery_owner: &crate::RecoveryOwner,
     ) -> Result<ReservationRecord, OrsError>;
     fn recover_page(&self, cursor: RecoveryCursor) -> Result<RecoveryPage, OrsError>;
+    /// Captures all independently revisioned startup-recovery sources in one
+    /// redb read snapshot before their bounded pages are enumerated.
+    fn begin_recovery_inventory_snapshot(&self) -> Result<RecoveryInventorySnapshot, OrsError>;
+    /// Revalidates the complete source set after all pages have been consumed.
+    fn validate_recovery_inventory_snapshot(
+        &self,
+        snapshot: &RecoveryInventorySnapshot,
+    ) -> Result<(), OrsError>;
+    /// Enumerates reservation records, including terminal identities needed
+    /// to match retained receipts and idempotency history.
+    fn scan_write_reservations(
+        &self,
+        cursor: WriteReservationRecoveryCursor,
+    ) -> Result<WriteReservationRecoveryPage, OrsError>;
+    /// Enumerates every `OPERATIONAL_CURRENT` row keyed by operation identity,
+    /// including `DurableOperationalRecord { kind: JobCheckpoint }` checkpoint
+    /// obligations and delivery cursors, without returning payload bytes.
+    fn scan_operational_current(
+        &self,
+        cursor: OperationalCurrentRecoveryCursor,
+    ) -> Result<OperationalCurrentRecoveryPage, OrsError>;
+    /// Enumerates imported recovery-inbox obligations without signatures or
+    /// protected payload bytes.
+    fn scan_recovery_inbox(
+        &self,
+        cursor: RecoveryInboxRecoveryCursor,
+    ) -> Result<RecoveryInboxRecoveryPage, OrsError>;
+    /// Enumerates all retained Recovery Problems in key order.
+    fn scan_recovery_problems(
+        &self,
+        cursor: RecoveryProblemRecoveryCursor,
+    ) -> Result<RecoveryProblemRecoveryPage, OrsError>;
+    /// Enumerates and cross-checks every durable write-idempotency mapping,
+    /// including mappings to terminal operations.
+    fn scan_write_idempotency(
+        &self,
+        cursor: WriteIdempotencyRecoveryCursor,
+    ) -> Result<WriteIdempotencyRecoveryPage, OrsError>;
     fn get_envelope(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -3042,8 +3096,11 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// [`OrsError::StagingNotDurable`] and no `ACCEPTED_PENDING` is emitted;
     /// when the staged bytes fail read-back validation a durable
     /// [`RecoveryProblem`] is retained and this fails with
-    /// [`OrsError::RecoveryProblemRetained`]. Neither path deletes the staged
-    /// record nor falls back to plaintext.
+    /// [`OrsError::RecoveryProblemRetained`]. An exact replay after terminal
+    /// reconciliation returns [`OrsError::AlreadyTerminalWrite`] carrying
+    /// the original operation and receipt identity for Kernel lookup; it is
+    /// never reported as pending. Neither failure path deletes staged state
+    /// or falls back to plaintext.
     fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError>;
     /// Revalidates one staged envelope by identity without interpreting its
     /// payload (issue #1925).
@@ -21117,6 +21174,7 @@ impl RedbRecoveryStore {
         drop(write.open_table(RESERVATIONS).map_err(storage)?);
         drop(write.open_table(RESERVATION_ORDERS).map_err(storage)?);
         drop(write.open_table(OPERATIONS).map_err(storage)?);
+        drop(write.open_table(WRITE_IDEMPOTENCY).map_err(storage)?);
         drop(write.open_table(SCOPE_HEADS).map_err(storage)?);
         drop(write.open_table(SCOPE_TERMINALS).map_err(storage)?);
         drop(write.open_table(OPERATIONAL_CURRENT).map_err(storage)?);
@@ -21268,6 +21326,7 @@ impl RedbRecoveryStore {
                 .open_table(GRANT_GRAPH_REVISION_CURRENT)
                 .map_err(storage)?,
         );
+        Self::initialize_recovery_inventory_revisions(write)?;
         if initialize_resolution_schema {
             let mut meta = write.open_table(META).map_err(storage)?;
             meta.insert(
@@ -21667,6 +21726,7 @@ impl RedbRecoveryStore {
                     }
                 }
             }
+            Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
             write.commit().map_err(storage)?;
         }
     }
@@ -21950,6 +22010,7 @@ impl RedbRecoveryStore {
                 )
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::RecoveryProblems)?;
         write.commit().map_err(storage)?;
         Ok(problem)
     }
@@ -21968,23 +22029,19 @@ impl RedbRecoveryStore {
     /// and read as "no problem, no possible acceptance", which is exactly what
     /// this state is not.
     ///
-    /// The returned error claims only what is true - the problem record could
-    /// not be written - and carries both texts verbatim. Nothing is deleted, no
-    /// envelope is removed, and the reservation keeps the state it already had.
+    /// The returned error keeps both typed causes and the operation identity.
+    /// Nothing is deleted, no envelope is removed, and the reservation keeps
+    /// the state it already had.
     fn staging_problem_record_failed(
         token: &WriterReservationToken,
-        original: &OrsError,
-        recorder: &OrsError,
+        original: OrsError,
+        recorder: OrsError,
     ) -> OrsError {
-        OrsError::IntegrityProblem {
-            record_type: "recovery_problem_record",
-            reason: format!(
-                "durable Recovery Problem for staged operation {} under reservation {} could \
-                 not be retained: {recorder}; that operation may already be accepted, nothing was \
-                 deleted or released, and the original staging failure was: {original}",
-                token.operation_id.as_str(),
-                token.reservation_id.as_str()
-            ),
+        OrsError::RecoveryProblemRecordFailed {
+            operation_id: token.operation_id.clone(),
+            reservation_id: token.reservation_id.clone(),
+            original: Box::new(original),
+            recorder: Box::new(recorder),
         }
     }
 
@@ -21992,6 +22049,99 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         request: &ReservationRequest,
     ) -> Result<Option<WriterReservationToken>, OrsError> {
+        let candidate_binding =
+            request
+                .envelope
+                .write_binding
+                .as_ref()
+                .ok_or(OrsError::InvalidField {
+                    field: "recovery_write_binding",
+                    reason: "required for a canonical write reservation",
+                })?;
+        let index_key = write_idempotency_index_key(candidate_binding);
+        let indexed_operation = {
+            let idempotency = write.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+            idempotency
+                .get(index_key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(indexed_operation) = indexed_operation {
+            let indexed_operation = OpaqueLabel::new(indexed_operation).map_err(|error| {
+                OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: error.to_string(),
+                }
+            })?;
+            let indexed_reservation = {
+                let operations = write.open_table(OPERATIONS).map_err(storage)?;
+                operations
+                    .get(indexed_operation.as_str())
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned())
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "indexed operation has no reservation mapping".to_owned(),
+                    })?
+            };
+            let record = {
+                let reservations = write.open_table(RESERVATIONS).map_err(storage)?;
+                let value = reservations
+                    .get(indexed_reservation.as_str())
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "indexed reservation is missing".to_owned(),
+                    })?;
+                decode::<ReservationRecord>(value.value())?
+            };
+            let envelope = {
+                let envelopes = write.open_table(ENVELOPES).map_err(storage)?;
+                envelopes
+                    .get(indexed_operation.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                    .transpose()?
+            };
+            let stored_binding = record.token.write_binding.as_ref();
+            if record.token.operation_id != indexed_operation
+                || stored_binding
+                    .is_none_or(|binding| write_idempotency_index_key(binding) != index_key)
+                || stored_binding
+                    .is_none_or(|binding| !write_binding_matches_token(binding, &record.token))
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "index does not resolve to its retained write identity".to_owned(),
+                });
+            }
+            let envelope_missing = envelope.is_none();
+            if let Some(envelope) = envelope {
+                if envelope.operation_or_checkpoint_id != indexed_operation
+                    || envelope.write_binding.as_ref() != stored_binding
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "indexed envelope diverges from its reservation token".to_owned(),
+                    });
+                }
+                if idempotency_retry_matches(request, &record.token, &envelope) {
+                    return Ok(Some(record.token));
+                }
+            } else if record.state.is_terminal()
+                && idempotency_terminal_retry_matches(request, &record.token)
+            {
+                return Ok(Some(record.token));
+            }
+            if envelope_missing && !record.state.is_terminal() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "nonterminal indexed write has no retained payload".to_owned(),
+                });
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+
         let reservation_id = {
             let operations = write.open_table(OPERATIONS).map_err(storage)?;
             operations
@@ -22021,6 +22171,12 @@ impl RedbRecoveryStore {
                     .ok_or_else(|| OrsError::Storage("operation envelope is missing".to_owned()))?;
                 decode::<RecoveryPayloadEnvelope>(value.value())?
             };
+            if envelope.write_binding.is_some() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "retained write envelope is missing its idempotency index".to_owned(),
+                });
+            }
             if request_matches(request, &record.token, &envelope) {
                 return Ok(Some(record.token));
             }
@@ -22035,6 +22191,206 @@ impl RedbRecoveryStore {
             return Err(OrsError::DuplicateConflict);
         }
         Ok(None)
+    }
+
+    fn recovery_inventory_revision_key(source: RecoveryInventorySource) -> &'static str {
+        match source {
+            RecoveryInventorySource::Reservations => RECOVERY_RESERVATION_REVISION,
+            RecoveryInventorySource::OperationalCurrent => RECOVERY_OPERATIONAL_CURRENT_REVISION,
+            RecoveryInventorySource::RecoveryInbox => RECOVERY_INBOX_REVISION,
+            RecoveryInventorySource::RecoveryProblems => RECOVERY_PROBLEMS_REVISION,
+            RecoveryInventorySource::WriteIdempotency => RECOVERY_WRITE_IDEMPOTENCY_REVISION,
+        }
+    }
+
+    fn initialize_recovery_inventory_revisions(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let schema = meta
+            .get(RECOVERY_INVENTORY_REVISION_SCHEMA)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned());
+        if let Some(schema) = schema {
+            if schema != RECOVERY_INVENTORY_REVISION_SCHEMA_V1 {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_meta_v1",
+                    reason: "unsupported recovery inventory revision schema".to_owned(),
+                });
+            }
+            for source in [
+                RecoveryInventorySource::Reservations,
+                RecoveryInventorySource::OperationalCurrent,
+                RecoveryInventorySource::RecoveryInbox,
+                RecoveryInventorySource::RecoveryProblems,
+                RecoveryInventorySource::WriteIdempotency,
+            ] {
+                let key = Self::recovery_inventory_revision_key(source);
+                let raw = meta
+                    .get(key)
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned())
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "ors_meta_v1",
+                        reason: format!("initialized recovery revision {key} is missing"),
+                    })?;
+                let revision = raw
+                    .parse::<u64>()
+                    .map_err(|error| OrsError::IntegrityProblem {
+                        record_type: "ors_meta_v1",
+                        reason: format!(
+                            "{key} is not a valid recovery inventory revision: {error}"
+                        ),
+                    })?;
+                if revision.to_string() != raw {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "ors_meta_v1",
+                        reason: format!("{key} is not canonically encoded"),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        // Stores written before this revision family existed get one explicit
+        // frozen baseline. The schema marker makes a later missing per-source
+        // counter corruption instead of silently resetting that source to 0.
+        for source in [
+            RecoveryInventorySource::Reservations,
+            RecoveryInventorySource::OperationalCurrent,
+            RecoveryInventorySource::RecoveryInbox,
+            RecoveryInventorySource::RecoveryProblems,
+            RecoveryInventorySource::WriteIdempotency,
+        ] {
+            let key = Self::recovery_inventory_revision_key(source);
+            let existing = meta
+                .get(key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            match existing {
+                Some(raw) => {
+                    let revision =
+                        raw.parse::<u64>()
+                            .map_err(|error| OrsError::IntegrityProblem {
+                                record_type: "ors_meta_v1",
+                                reason: format!(
+                                    "{key} is not a valid recovery inventory revision: {error}"
+                                ),
+                            })?;
+                    if revision.to_string() != raw {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "ors_meta_v1",
+                            reason: format!("{key} is not canonically encoded"),
+                        });
+                    }
+                }
+                None => {
+                    meta.insert(key, "0").map_err(storage)?;
+                }
+            }
+        }
+        meta.insert(
+            RECOVERY_INVENTORY_REVISION_SCHEMA,
+            RECOVERY_INVENTORY_REVISION_SCHEMA_V1,
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    fn read_recovery_inventory_revision(
+        meta: &impl ReadableTable<&'static str, &'static str>,
+        source: RecoveryInventorySource,
+    ) -> Result<u64, OrsError> {
+        let key = Self::recovery_inventory_revision_key(source);
+        let raw = meta
+            .get(key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned());
+        let raw = raw.ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "ors_meta_v1",
+            reason: format!("initialized recovery revision {key} is missing"),
+        })?;
+        let revision = raw
+            .parse::<u64>()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: format!("{key} is not a valid recovery inventory revision: {error}"),
+            })?;
+        if revision.to_string() != raw {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: format!("{key} is not canonically encoded"),
+            });
+        }
+        Ok(revision)
+    }
+
+    fn bump_recovery_inventory_revision(
+        write: &redb::WriteTransaction,
+        source: RecoveryInventorySource,
+    ) -> Result<u64, OrsError> {
+        let key = Self::recovery_inventory_revision_key(source);
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = Self::read_recovery_inventory_revision(&meta, source)?;
+        let next = prior
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: format!("{key} exhausted"),
+            })?;
+        meta.insert(key, next.to_string().as_str())
+            .map_err(storage)?;
+        Ok(next)
+    }
+
+    fn recovery_inventory_snapshot_from_read(
+        read: &redb::ReadTransaction,
+    ) -> Result<RecoveryInventorySnapshot, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let snapshot = RecoveryInventorySnapshot::from_revisions(
+            Self::read_recovery_inventory_revision(&meta, RecoveryInventorySource::Reservations)?,
+            Self::read_recovery_inventory_revision(
+                &meta,
+                RecoveryInventorySource::OperationalCurrent,
+            )?,
+            Self::read_recovery_inventory_revision(&meta, RecoveryInventorySource::RecoveryInbox)?,
+            Self::read_recovery_inventory_revision(
+                &meta,
+                RecoveryInventorySource::RecoveryProblems,
+            )?,
+            Self::read_recovery_inventory_revision(
+                &meta,
+                RecoveryInventorySource::WriteIdempotency,
+            )?,
+        );
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate_recovery_inventory_snapshot_in_read(
+        read: &redb::ReadTransaction,
+        expected: &RecoveryInventorySnapshot,
+    ) -> Result<(), OrsError> {
+        expected.validate()?;
+        let observed = Self::recovery_inventory_snapshot_from_read(read)?;
+        for source in [
+            RecoveryInventorySource::Reservations,
+            RecoveryInventorySource::OperationalCurrent,
+            RecoveryInventorySource::RecoveryInbox,
+            RecoveryInventorySource::RecoveryProblems,
+            RecoveryInventorySource::WriteIdempotency,
+        ] {
+            let expected_revision = expected.revision_for(source);
+            let observed_revision = observed.revision_for(source);
+            if expected_revision != observed_revision {
+                return Err(OrsError::RecoverySnapshotMoved {
+                    source,
+                    expected_revision,
+                    observed_revision,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn next_reservation_order(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
@@ -22135,6 +22491,24 @@ impl RedbRecoveryStore {
             .insert(token.operation_id.as_str(), token.reservation_id.as_str())
             .map_err(storage)?;
         drop(operations);
+        let write_binding =
+            token
+                .write_binding
+                .as_ref()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "new write reservation has no retained write binding".to_owned(),
+                })?;
+        let idempotency_key = write_idempotency_index_key(write_binding);
+        let mut idempotency = write.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+        if idempotency
+            .insert(idempotency_key.as_str(), token.operation_id.as_str())
+            .map_err(storage)?
+            .is_some()
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        drop(idempotency);
         let order_key = format!("{:020}", token.reservation_order);
         let mut orders = write.open_table(RESERVATION_ORDERS).map_err(storage)?;
         if orders
@@ -22147,7 +22521,105 @@ impl RedbRecoveryStore {
                 reason: "duplicate reservation order".to_owned(),
             });
         }
+        Self::bump_recovery_inventory_revision(write, RecoveryInventorySource::Reservations)?;
+        Self::bump_recovery_inventory_revision(write, RecoveryInventorySource::WriteIdempotency)?;
         Ok(())
+    }
+
+    fn staged_reservation_readback(
+        &self,
+        expected: &WriterReservationToken,
+    ) -> Result<bool, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let record = {
+            let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+            let Some(value) = reservations
+                .get(expected.reservation_id.as_str())
+                .map_err(storage)?
+            else {
+                return Ok(false);
+            };
+            decode::<ReservationRecord>(value.value())?
+        };
+        if record.token != *expected {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation_commit_readback",
+                reason: "durable reservation differs from the staged token".to_owned(),
+            });
+        }
+        let order_key = format!("{:020}", expected.reservation_order);
+        let order_matches = {
+            let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
+            orders
+                .get(order_key.as_str())
+                .map_err(storage)?
+                .is_some_and(|value| value.value() == expected.reservation_id.as_str())
+        };
+        let operation_matches = {
+            let operations = read.open_table(OPERATIONS).map_err(storage)?;
+            operations
+                .get(expected.operation_id.as_str())
+                .map_err(storage)?
+                .is_some_and(|value| value.value() == expected.reservation_id.as_str())
+        };
+        let Some(binding) = expected.write_binding.as_ref() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation_commit_readback",
+                reason: "new staged write has no retained identity binding".to_owned(),
+            });
+        };
+        binding.validate()?;
+        let idempotency_matches = {
+            let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+            idempotency
+                .get(write_idempotency_index_key(binding).as_str())
+                .map_err(storage)?
+                .is_some_and(|value| value.value() == expected.operation_id.as_str())
+        };
+        let envelope = {
+            let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+            envelopes
+                .get(expected.operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                .transpose()?
+        };
+        let envelope_missing = envelope.is_none();
+        let envelope_matches = match envelope {
+            Some(envelope) => {
+                envelope.operation_or_checkpoint_id == expected.operation_id
+                    && envelope.write_binding.as_ref() == Some(binding)
+                    && envelope.authority_epoch == expected.writer_epoch
+                    && envelope.state_fence == expected.state_fence
+            }
+            None => record.state.is_terminal(),
+        };
+        if !order_matches || !operation_matches || !idempotency_matches {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation_commit_readback",
+                reason: "reservation, order, operation, or idempotency index diverges".to_owned(),
+            });
+        }
+        if !envelope_matches {
+            if envelope_missing && !record.state.is_terminal() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "reservation_commit_readback",
+                    reason: "nonterminal staged reservation is missing its retained payload"
+                        .to_owned(),
+                });
+            }
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation_commit_readback",
+                reason: "staged envelope does not match the retained write binding".to_owned(),
+            });
+        }
+        if !write_binding_matches_token(binding, &record.token) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation_commit_readback",
+                reason: "durable write binding differs from the staged token".to_owned(),
+            });
+        }
+        Ok(true)
     }
 
     pub(super) fn next_operational_order(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
@@ -23076,6 +23548,7 @@ impl RedbRecoveryStore {
         history
             .insert(history_key.as_str(), encoded.as_str())
             .map_err(storage)?;
+        Self::bump_recovery_inventory_revision(write, RecoveryInventorySource::OperationalCurrent)?;
         Ok(())
     }
 
@@ -23603,9 +24076,18 @@ impl RedbRecoveryStore {
             generation_cutover: Some(committed),
         };
         Self::persist_operational_record(&write, &route_key, &durable)?;
-        {
+        let removed = {
             let mut current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
-            current.remove(transition_key.as_str()).map_err(storage)?;
+            current
+                .remove(transition_key.as_str())
+                .map_err(storage)?
+                .is_some()
+        };
+        if removed {
+            Self::bump_recovery_inventory_revision(
+                &write,
+                RecoveryInventorySource::OperationalCurrent,
+            )?;
         }
         write.commit().map_err(storage)?;
         Self::generation_snapshot(&durable)
@@ -24740,6 +25222,561 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         limit: u16,
     ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
         RedbRecoveryStore::reconcile_staged_generation_cutovers(self, limit)
+    }
+
+    fn begin_recovery_inventory_snapshot(&self) -> Result<RecoveryInventorySnapshot, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::recovery_inventory_snapshot_from_read(&read)
+    }
+
+    fn validate_recovery_inventory_snapshot(
+        &self,
+        snapshot: &RecoveryInventorySnapshot,
+    ) -> Result<(), OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, snapshot)
+    }
+
+    fn scan_write_reservations(
+        &self,
+        cursor: WriteReservationRecoveryCursor,
+    ) -> Result<WriteReservationRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+
+        match cursor.phase {
+            crate::WriteReservationRecoveryPhase::Reservations => {
+                let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+                let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
+                let operations = read.open_table(OPERATIONS).map_err(storage)?;
+                let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+                let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+                let rows = match cursor.after.as_ref() {
+                    Some(after) => reservations
+                        .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                        .map_err(storage)?,
+                    None => reservations.range::<&str>(..).map_err(storage)?,
+                };
+                for (offset, entry) in rows.take(limit + 1).enumerate() {
+                    if offset == limit {
+                        continues = true;
+                        break;
+                    }
+                    let (key, value) = entry.map_err(storage)?;
+                    let key = key.value().to_owned();
+                    let record: ReservationRecord = decode(value.value())?;
+                    let token = &record.token;
+                    if token.reservation_id.as_str() != key {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "recovery_reservation_inventory",
+                            reason: "primary reservation key differs from its retained identity"
+                                .to_owned(),
+                        });
+                    }
+                    let order_key = format!("{:020}", token.reservation_order);
+                    if !orders
+                        .get(order_key.as_str())
+                        .map_err(storage)?
+                        .is_some_and(|value| value.value() == token.reservation_id.as_str())
+                        || !operations
+                            .get(token.operation_id.as_str())
+                            .map_err(storage)?
+                            .is_some_and(|value| value.value() == token.reservation_id.as_str())
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "recovery_reservation_inventory",
+                            reason: "reservation is missing its order or operation index row"
+                                .to_owned(),
+                        });
+                    }
+                    if let Some(binding) = token.write_binding.as_ref() {
+                        binding.validate()?;
+                        if !write_binding_matches_token(binding, token)
+                            || !idempotency
+                                .get(write_idempotency_index_key(binding).as_str())
+                                .map_err(storage)?
+                                .is_some_and(|value| value.value() == token.operation_id.as_str())
+                        {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "recovery_reservation_inventory",
+                                reason:
+                                    "reservation binding differs from its durable idempotency index"
+                                        .to_owned(),
+                            });
+                        }
+                    }
+                    let envelope = envelopes
+                        .get(token.operation_id.as_str())
+                        .map_err(storage)?
+                        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                        .transpose()?;
+                    match envelope {
+                        Some(envelope)
+                            if envelope.operation_or_checkpoint_id == token.operation_id
+                                && envelope.authority_epoch == token.writer_epoch
+                                && envelope.state_fence == token.state_fence
+                                && envelope.write_binding == token.write_binding => {}
+                        Some(_) => {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "recovery_reservation_inventory",
+                                reason: "retained envelope differs from its reservation identity"
+                                    .to_owned(),
+                            });
+                        }
+                        None if record.state.is_terminal() => {}
+                        None => {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "recovery_reservation_inventory",
+                                reason: "nonterminal reservation is missing its retained envelope"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                    last_key = Some(OpaqueLabel::new(key)?);
+                    records.push(record);
+                }
+            }
+            crate::WriteReservationRecoveryPhase::ReservationOrders => {
+                let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
+                let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+                let rows = match cursor.after.as_ref() {
+                    Some(after) => orders
+                        .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                        .map_err(storage)?,
+                    None => orders.range::<&str>(..).map_err(storage)?,
+                };
+                for (offset, entry) in rows.take(limit + 1).enumerate() {
+                    if offset == limit {
+                        continues = true;
+                        break;
+                    }
+                    let (key, value) = entry.map_err(storage)?;
+                    let key = key.value().to_owned();
+                    let order = key
+                        .parse::<u64>()
+                        .map_err(|error| OrsError::IntegrityProblem {
+                            record_type: "reservation_order",
+                            reason: format!("recovery order key is malformed: {error}"),
+                        })?;
+                    if order == 0 || format!("{order:020}") != key {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "reservation_order",
+                            reason: "recovery order key is not canonical".to_owned(),
+                        });
+                    }
+                    let reservation_id = OperationIdentity::new(value.value().to_owned())?;
+                    let reservation = reservations
+                        .get(reservation_id.as_str())
+                        .map_err(storage)?
+                        .map(|value| decode::<ReservationRecord>(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| OrsError::IntegrityProblem {
+                            record_type: "reservation_order",
+                            reason: "order index names a missing primary reservation".to_owned(),
+                        })?;
+                    if reservation.token.reservation_id != reservation_id
+                        || reservation.token.reservation_order != order
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "reservation_order",
+                            reason: "order index differs from the primary reservation".to_owned(),
+                        });
+                    }
+                    last_key = Some(OpaqueLabel::new(key)?);
+                }
+            }
+            crate::WriteReservationRecoveryPhase::Operations => {
+                let operations = read.open_table(OPERATIONS).map_err(storage)?;
+                let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+                let rows = match cursor.after.as_ref() {
+                    Some(after) => operations
+                        .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                        .map_err(storage)?,
+                    None => operations.range::<&str>(..).map_err(storage)?,
+                };
+                for (offset, entry) in rows.take(limit + 1).enumerate() {
+                    if offset == limit {
+                        continues = true;
+                        break;
+                    }
+                    let (key, value) = entry.map_err(storage)?;
+                    let operation_id = OperationIdentity::new(key.value().to_owned())?;
+                    let reservation_id = OperationIdentity::new(value.value().to_owned())?;
+                    let reservation = reservations
+                        .get(reservation_id.as_str())
+                        .map_err(storage)?
+                        .map(|value| decode::<ReservationRecord>(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| OrsError::IntegrityProblem {
+                            record_type: "reservation_operation_index",
+                            reason: "operation index names a missing primary reservation"
+                                .to_owned(),
+                        })?;
+                    if reservation.token.operation_id != operation_id
+                        || reservation.token.reservation_id != reservation_id
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "reservation_operation_index",
+                            reason: "operation index differs from the primary reservation"
+                                .to_owned(),
+                        });
+                    }
+                    last_key = Some(operation_id);
+                }
+            }
+        }
+
+        let (next_cursor, complete) = if continues {
+            let last = last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "recovery_reservation_inventory",
+                reason: "continuing reservation page has no exclusive continuation".to_owned(),
+            })?;
+            (Some(cursor.continue_after(last)), false)
+        } else {
+            match cursor.phase {
+                crate::WriteReservationRecoveryPhase::Reservations => (
+                    Some(cursor.continue_in_phase(
+                        crate::WriteReservationRecoveryPhase::ReservationOrders,
+                    )),
+                    false,
+                ),
+                crate::WriteReservationRecoveryPhase::ReservationOrders => (
+                    Some(
+                        cursor.continue_in_phase(crate::WriteReservationRecoveryPhase::Operations),
+                    ),
+                    false,
+                ),
+                crate::WriteReservationRecoveryPhase::Operations => (None, true),
+            }
+        };
+        Ok(WriteReservationRecoveryPage {
+            source_revision: cursor.source_revision,
+            snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            records,
+            next_cursor,
+            complete,
+        })
+    }
+
+    fn scan_operational_current(
+        &self,
+        cursor: OperationalCurrentRecoveryCursor,
+    ) -> Result<OperationalCurrentRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
+        let table = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let rows = match cursor.after.as_ref() {
+            Some(after) => table
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let raw = value.value();
+            let durable: DurableOperationalRecord = decode_named(raw, "operational_current")?;
+            let storage_key = key.value().to_owned();
+            if Self::operational_key(durable.kind, &durable.input.subject_id) != storage_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "operational_current",
+                    reason: "row key differs from its recorded kind and subject identity"
+                        .to_owned(),
+                });
+            }
+            last_key = Some(OpaqueLabel::new(storage_key.clone())?);
+            records.push(OperationalCurrentRecoveryEntry {
+                storage_key: OpaqueLabel::new(storage_key)?,
+                kind: OpaqueLabel::new(durable.kind.key_prefix())?,
+                record_id: durable.input.record_id,
+                subject_id: durable.input.subject_id,
+                phase: durable.phase,
+                operation_order: durable.operation_order,
+                authority_epoch: durable.input.authority_epoch,
+                state_fence: durable.input.state_fence,
+                payload_sha256: durable.input.payload_sha256,
+                payload_length: durable.input.payload_length,
+                created_at_ms: durable.input.created_at_ms,
+                cleanup_after_ms: durable.input.cleanup_after_ms,
+                record_sha256: crate::model::sha256_hex(raw.as_bytes()),
+            });
+        }
+        let next_cursor = if continues {
+            Some(
+                cursor.continue_after(last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "operational_current",
+                    reason: "continuing page has no exclusive continuation".to_owned(),
+                })?),
+            )
+        } else {
+            None
+        };
+        Ok(OperationalCurrentRecoveryPage {
+            source_revision: cursor.source_revision,
+            snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            records,
+            complete: !continues,
+            next_cursor,
+        })
+    }
+
+    fn scan_recovery_inbox(
+        &self,
+        cursor: RecoveryInboxRecoveryCursor,
+    ) -> Result<RecoveryInboxRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
+        let table = read.open_table(RECOVERY_INBOX).map_err(storage)?;
+        let rows = match cursor.after.as_ref() {
+            Some(after) => table
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let raw = value.value();
+            let durable: DurableInboxRecord = decode_named(raw, "recovery_inbox")?;
+            let item_id = key.value().to_owned();
+            if durable.item.item_id.as_str() != item_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "recovery_inbox",
+                    reason: "row key differs from its imported item identity".to_owned(),
+                });
+            }
+            last_key = Some(OpaqueLabel::new(item_id.clone())?);
+            records.push(RecoveryInboxRecoveryEntry {
+                item_id: OperationIdentity::new(item_id)?,
+                operation_id: durable.item.envelope.operation_or_checkpoint_id,
+                signer_id: durable.item.signer_id,
+                disposition: durable.disposition,
+                operation_order: durable.operation_order,
+                contract_version: durable.item.envelope.contract_version,
+                privacy_and_visibility_class: durable.item.envelope.privacy_and_visibility_class,
+                payload_sha256: durable.item.envelope.payload_sha256,
+                payload_length: durable.item.envelope.payload_length,
+                authority_epoch: durable.item.envelope.authority_epoch,
+                state_fence: durable.item.envelope.state_fence,
+                created_at_ms: durable.item.envelope.created_at_ms,
+                known_at_ms: durable.item.envelope.known_at_ms,
+                expires_at_ms: durable.item.envelope.expires_at_ms,
+                envelope_sha256: durable.item.envelope_sha256,
+                signature_sha256: durable.item.signature_sha256,
+                record_sha256: crate::model::sha256_hex(raw.as_bytes()),
+            });
+        }
+        let next_cursor = if continues {
+            Some(
+                cursor.continue_after(last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "recovery_inbox",
+                    reason: "continuing page has no exclusive continuation".to_owned(),
+                })?),
+            )
+        } else {
+            None
+        };
+        Ok(RecoveryInboxRecoveryPage {
+            source_revision: cursor.source_revision,
+            snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            records,
+            complete: !continues,
+            next_cursor,
+        })
+    }
+
+    fn scan_recovery_problems(
+        &self,
+        cursor: RecoveryProblemRecoveryCursor,
+    ) -> Result<RecoveryProblemRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
+        let table = read.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+        let rows = match cursor.after.as_ref() {
+            Some(after) => table
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let problem: RecoveryProblem = decode(value.value())?;
+            if problem.operation_or_checkpoint_id.as_str() != key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "recovery_problem",
+                    reason: "row key differs from its operation identity".to_owned(),
+                });
+            }
+            last_key = Some(OpaqueLabel::new(key.value())?);
+            records.push(problem);
+        }
+        let next_cursor = if continues {
+            Some(
+                cursor.continue_after(last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "recovery_problem",
+                    reason: "continuing page has no exclusive continuation".to_owned(),
+                })?),
+            )
+        } else {
+            None
+        };
+        Ok(RecoveryProblemRecoveryPage {
+            source_revision: cursor.source_revision,
+            snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            records,
+            complete: !continues,
+            next_cursor,
+        })
+    }
+
+    fn scan_write_idempotency(
+        &self,
+        cursor: WriteIdempotencyRecoveryCursor,
+    ) -> Result<WriteIdempotencyRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
+        let index = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+        let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+        let rows = match cursor.after.as_ref() {
+            Some(after) => index
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => index.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let index_key = key.value().to_owned();
+            crate::model::validate_digest(&index_key, "write_idempotency_index_key")?;
+            let operation_id = OperationIdentity::new(value.value().to_owned())?;
+            let reservation_id = operations
+                .get(operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| OperationIdentity::new(value.value().to_owned()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "idempotency row names an operation with no reservation index"
+                        .to_owned(),
+                })?;
+            let reservation = reservations
+                .get(reservation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ReservationRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "idempotency row names a missing primary reservation".to_owned(),
+                })?;
+            let binding = reservation.token.write_binding.as_ref().ok_or_else(|| {
+                OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason:
+                        "idempotency row points to a legacy reservation without a write binding"
+                            .to_owned(),
+                }
+            })?;
+            if reservation.token.operation_id != operation_id
+                || reservation.token.reservation_id != reservation_id
+                || index_key != write_idempotency_index_key(binding)
+                || !write_binding_matches_token(binding, &reservation.token)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "idempotency mapping differs from its original reservation binding"
+                        .to_owned(),
+                });
+            }
+            let envelope = envelopes
+                .get(operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                .transpose()?;
+            match envelope {
+                Some(envelope)
+                    if envelope.operation_or_checkpoint_id == operation_id
+                        && envelope.write_binding.as_ref() == Some(binding) => {}
+                Some(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "retained payload does not match the idempotency binding"
+                            .to_owned(),
+                    });
+                }
+                None if reservation.state.is_terminal() => {}
+                None => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "nonterminal idempotency row is missing its retained payload"
+                            .to_owned(),
+                    });
+                }
+            }
+            last_key = Some(OpaqueLabel::new(index_key.clone())?);
+            records.push(WriteIdempotencyRecoveryEntry {
+                idempotency_key_sha256: index_key,
+                operation_id,
+                reservation_id,
+                write_binding: binding.clone(),
+            });
+        }
+        let next_cursor = if continues {
+            Some(
+                cursor.continue_after(last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "write_idempotency_index",
+                    reason: "continuing page has no exclusive continuation".to_owned(),
+                })?),
+            )
+        } else {
+            None
+        };
+        Ok(WriteIdempotencyRecoveryPage {
+            source_revision: cursor.source_revision,
+            snapshot_sha256: cursor.snapshot.snapshot_sha256.clone(),
+            records,
+            complete: !continues,
+            next_cursor,
+        })
     }
 
     fn stage(&self, op: StagedOperation) -> Result<StageReceipt, OrsError> {
@@ -26146,6 +27183,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .insert(history_key.as_str(), encoded.as_str())
             .map_err(storage)?;
         drop(history);
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::RecoveryInbox)?;
         write.commit().map_err(storage)?;
         Ok(RecoveryInboxReceipt::from_receipt(result))
     }
@@ -26174,6 +27212,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             reservation_order,
             scopes: reserved_scopes,
             prepared_transition_sha256: request.prepared_transition_sha256,
+            write_binding: request.envelope.write_binding.clone(),
             expires_at_ms: request.expires_at_ms,
             recovery_owner: request.recovery_owner,
         };
@@ -26184,7 +27223,24 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             terminal_receipt_id: None,
         };
         Self::persist_new_reservation(&write, &request.envelope, &record)?;
-        write.commit().map_err(storage)?;
+        if let Err(error) = write.commit() {
+            let commit_error = storage(error);
+            return match self.staged_reservation_readback(&token) {
+                Ok(true) => Ok(token),
+                Ok(false) => Err(OrsError::StagingCommitOutcomeUnknown {
+                    operation_id: token.operation_id,
+                    reservation_id: token.reservation_id,
+                    commit_error: Box::new(commit_error),
+                    readback_error: None,
+                }),
+                Err(readback_error) => Err(OrsError::StagingCommitOutcomeUnknown {
+                    operation_id: token.operation_id,
+                    reservation_id: token.reservation_id,
+                    commit_error: Box::new(commit_error),
+                    readback_error: Some(Box::new(readback_error)),
+                }),
+            };
+        }
         Ok(token)
     }
 
@@ -26208,6 +27264,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(token.reservation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
         Ok(record)
     }
@@ -26237,6 +27294,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(token.reservation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
         Ok(record)
     }
@@ -26270,6 +27328,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(token.reservation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         {
             let mut heads = write.open_table(SCOPE_HEADS).map_err(storage)?;
             for scope in &token.scopes {
@@ -26332,6 +27391,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(record.token.reservation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         Self::record_scope_terminals(&write, reconciliation)?;
         Self::clear_recovery_blocks(&write, &record)?;
         write.commit().map_err(storage)?;
@@ -26363,6 +27423,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(token.reservation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
         Ok(record)
     }
@@ -26395,6 +27456,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .remove(token.operation_id.as_str())
                 .map_err(storage)?;
         }
+        // The reservation token and its idempotency index outlive the opaque
+        // payload cleanup horizon so a later retry still resolves to the
+        // original terminal operation instead of allocating fresh scope order.
         write.commit().map_err(storage)?;
         Ok(record)
     }
@@ -26417,12 +27481,43 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     }
 
     fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError> {
-        request
-            .validate()
-            .map_err(|error| OrsError::StagingNotDurable(error.to_string()))?;
+        request.validate()?;
         let token = self
             .stage_and_reserve(request)
-            .map_err(|error| OrsError::StagingNotDurable(error.to_string()))?;
+            .map_err(|error| match error {
+                OrsError::Storage(_) => OrsError::StagingNotDurable(error.to_string()),
+                typed => typed,
+            })?;
+        let record = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+            let record = Self::load_record(&reservations, &token.reservation_id)?;
+            Self::validate_token(&record, &token)?;
+            record
+        };
+        if record.state.is_terminal() {
+            let write_binding =
+                record
+                    .token
+                    .write_binding
+                    .as_ref()
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "recovery_write_binding",
+                        reason: "terminal reservation has no retained write identity".to_owned(),
+                    })?;
+            if !write_binding_matches_token(write_binding, &record.token) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "recovery_write_binding",
+                    reason: "terminal reservation write identity does not match its token"
+                        .to_owned(),
+                });
+            }
+            return Err(OrsError::AlreadyTerminalWrite(AlreadyTerminalWrite {
+                operation_id: record.token.operation_id,
+                reservation_id: record.token.reservation_id,
+                terminal_receipt_id: record.terminal_receipt_id,
+            }));
+        }
         // Read-back proof: the committed envelope must decode and validate,
         // and the operation index must resolve to this reservation. Only then
         // may ACCEPTED_PENDING be observed. A read-back validation failure
@@ -26430,10 +27525,49 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         // fabricating the staged payload.
         match self.get_envelope(&token.operation_id) {
             Ok(Some(envelope)) => {
-                if envelope.operation_or_checkpoint_id != token.operation_id {
-                    return Err(OrsError::StagingNotDurable(
-                        "staged envelope identity does not match the reservation".to_owned(),
-                    ));
+                if let Err(original) = envelope.validate() {
+                    let fingerprint = {
+                        let read = self.database.begin_read().map_err(storage)?;
+                        let table = read.open_table(ENVELOPES).map_err(storage)?;
+                        table
+                            .get(token.operation_id.as_str())
+                            .map_err(storage)?
+                            .map(|value| raw_fingerprint(value.value()))
+                    };
+                    let retained = self
+                        .retain_staging_problem(&token, &original, fingerprint)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&token, original, recorder)
+                        })?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
+                }
+                let binding_matches = token.write_binding.is_some()
+                    && envelope.write_binding == token.write_binding
+                    && token
+                        .write_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.operation_id == token.operation_id);
+                let relation_matches = envelope.operation_or_checkpoint_id == token.operation_id
+                    && envelope.authority_epoch == token.writer_epoch
+                    && envelope.state_fence == token.state_fence
+                    && matches!(&envelope.payload, RecoveryPayload::Encrypted { .. })
+                    && binding_matches;
+                if !relation_matches {
+                    let original = OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "staged envelope identity or write binding does not match its reservation"
+                            .to_owned(),
+                    };
+                    let retained = self
+                        .retain_staging_problem(&token, &original, None)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&token, original, recorder)
+                        })?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
                 }
                 let read = self.database.begin_read().map_err(storage)?;
                 let indexed = {
@@ -26443,21 +27577,66 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         .map_err(storage)?
                         .map(|value| value.value().to_owned())
                 };
-                if indexed.as_deref() != Some(token.reservation_id.as_str()) {
-                    return Err(OrsError::StagingNotDurable(
-                        "staged operation index is missing on read-back".to_owned(),
-                    ));
+                let idempotency_indexed =
+                    {
+                        let binding = token.write_binding.as_ref().ok_or_else(|| {
+                            OrsError::IntegrityProblem {
+                                record_type: "write_idempotency_index",
+                                reason: "accepted write token has no identity binding".to_owned(),
+                            }
+                        })?;
+                        let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+                        idempotency
+                            .get(write_idempotency_index_key(binding).as_str())
+                            .map_err(storage)?
+                            .map(|value| value.value().to_owned())
+                    };
+                if indexed.as_deref() != Some(token.reservation_id.as_str())
+                    || idempotency_indexed.as_deref() != Some(token.operation_id.as_str())
+                {
+                    let original = OrsError::IntegrityProblem {
+                        record_type: "write_idempotency_index",
+                        reason: "staged operation or idempotency index is missing on read-back"
+                            .to_owned(),
+                    };
+                    let retained = self
+                        .retain_staging_problem(&token, &original, None)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&token, original, recorder)
+                        })?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
                 }
-                Ok(AcceptedPending {
+                let accepted = AcceptedPending {
                     operation_id: token.operation_id.clone(),
                     reservation_id: token.reservation_id.clone(),
                     reservation_order: token.reservation_order,
                     prepared_transition_sha256: token.prepared_transition_sha256.clone(),
+                    write_binding: token.write_binding.clone().ok_or_else(|| {
+                        OrsError::IntegrityProblem {
+                            record_type: "accepted_pending",
+                            reason: "accepted write token has no identity binding".to_owned(),
+                        }
+                    })?,
+                };
+                accepted.validate()?;
+                Ok(accepted)
+            }
+            Ok(None) => {
+                let original = OrsError::IntegrityProblem {
+                    record_type: "recovery_envelope",
+                    reason: "staged envelope is missing on read-back".to_owned(),
+                };
+                let retained = self
+                    .retain_staging_problem(&token, &original, None)
+                    .map_err(|recorder| {
+                        Self::staging_problem_record_failed(&token, original, recorder)
+                    })?;
+                Err(OrsError::RecoveryProblemRetained {
+                    operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
             }
-            Ok(None) => Err(OrsError::StagingNotDurable(
-                "staged envelope is missing on read-back".to_owned(),
-            )),
             Err(error) => {
                 let fingerprint = {
                     let read = self.database.begin_read().map_err(storage)?;
@@ -26470,7 +27649,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 let retained = self
                     .retain_staging_problem(&token, &error, fingerprint)
                     .map_err(|recorder| {
-                        Self::staging_problem_record_failed(&token, &error, &recorder)
+                        Self::staging_problem_record_failed(&token, error, recorder)
                     })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
@@ -26506,7 +27685,52 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     let retained = self
                         .retain_staging_problem(&context, &original, fingerprint)
                         .map_err(|recorder| {
-                            Self::staging_problem_record_failed(&context, &original, &recorder)
+                            Self::staging_problem_record_failed(&context, original, recorder)
+                        })?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
+                }
+                let context = self.staging_context(operation_id)?;
+                if let Err(original) = envelope.validate() {
+                    let fingerprint = Some(raw_fingerprint(&raw));
+                    let retained = self
+                        .retain_staging_problem(&context, &original, fingerprint)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&context, original, recorder)
+                        })?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
+                }
+                let relation_matches = envelope.write_binding.as_ref().is_some_and(|binding| {
+                    context.write_binding.as_ref() == Some(binding)
+                        && write_binding_matches_token(binding, &context)
+                }) && envelope.authority_epoch == context.writer_epoch
+                    && envelope.state_fence == context.state_fence
+                    && matches!(&envelope.payload, RecoveryPayload::Encrypted { .. });
+                let index_matches = if let Some(binding) = envelope.write_binding.as_ref() {
+                    let key = write_idempotency_index_key(binding);
+                    let read = self.database.begin_read().map_err(storage)?;
+                    let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+                    idempotency
+                        .get(key.as_str())
+                        .map_err(storage)?
+                        .is_some_and(|value| value.value() == operation_id.as_str())
+                } else {
+                    false
+                };
+                if !relation_matches || !index_matches {
+                    let original = OrsError::IntegrityProblem {
+                        record_type: "recovery_write_binding",
+                        reason: "staged write payload, reservation token and idempotency index do not match"
+                            .to_owned(),
+                    };
+                    let fingerprint = Some(raw_fingerprint(&raw));
+                    let retained = self
+                        .retain_staging_problem(&context, &original, fingerprint)
+                        .map_err(|recorder| {
+                            Self::staging_problem_record_failed(&context, original, recorder)
                         })?;
                     return Err(OrsError::RecoveryProblemRetained {
                         operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
@@ -26520,7 +27744,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 let retained = self
                     .retain_staging_problem(&context, &error, fingerprint)
                     .map_err(|recorder| {
-                        Self::staging_problem_record_failed(&context, &error, &recorder)
+                        Self::staging_problem_record_failed(&context, error, recorder)
                     })?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
@@ -26624,6 +27848,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 )
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::RecoveryProblems)?;
         write.commit().map_err(storage)?;
         Ok(problem)
     }
@@ -26691,6 +27916,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .insert(operation_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::RecoveryProblems)?;
         write.commit().map_err(storage)?;
         Ok(problem)
     }
@@ -26788,6 +28014,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
             }
+            drop(reservations);
+            Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         }
         write.commit().map_err(storage)
     }
@@ -27759,9 +28987,119 @@ fn request_matches(
 ) -> bool {
     request.reservation_id == token.reservation_id
         && request.envelope == *envelope
+        && request.envelope.write_binding == token.write_binding
+        && envelope.write_binding == token.write_binding
         && request.writer_epoch == token.writer_epoch
         && request.prepared_transition_sha256 == token.prepared_transition_sha256
         && request.expires_at_ms == token.expires_at_ms
+        && request.recovery_owner == token.recovery_owner
+        && request.scopes.len() == token.scopes.len()
+        && request
+            .scopes
+            .iter()
+            .zip(&token.scopes)
+            .all(|(left, right)| {
+                left.scope == right.scope && left.expected_head == right.expected_head
+            })
+}
+
+fn write_idempotency_index_key(binding: &RecoveryWriteBinding) -> String {
+    crate::model::sha256_hex(binding.idempotency_key.as_str().as_bytes())
+}
+
+fn write_binding_matches_token(
+    binding: &RecoveryWriteBinding,
+    token: &WriterReservationToken,
+) -> bool {
+    binding.operation_id == token.operation_id
+        && binding.prepared_transition_sha256 == token.prepared_transition_sha256
+        && binding.authority_epoch == token.writer_epoch
+        && binding.state_fence == token.state_fence
+        && binding.protected_payload_sha256.len() == 64
+        && binding.protected_payload_length > 0
+        && token.write_binding.as_ref() == Some(binding)
+        && binding.ordering_scopes.iter().collect::<BTreeSet<_>>()
+            == token
+                .scopes
+                .iter()
+                .map(|scope| &scope.scope)
+                .collect::<BTreeSet<_>>()
+}
+
+/// Resolves only an exact replay to its original durable reservation. Protected
+/// payload bytes and their retention metadata remain part of the idempotency
+/// identity; retries never replace the retained payload or allocate new scope
+/// order.
+fn idempotency_retry_matches(
+    request: &ReservationRequest,
+    token: &WriterReservationToken,
+    envelope: &RecoveryPayloadEnvelope,
+) -> bool {
+    let (Some(candidate), Some(stored), Some(token_binding)) = (
+        request.envelope.write_binding.as_ref(),
+        envelope.write_binding.as_ref(),
+        token.write_binding.as_ref(),
+    ) else {
+        return false;
+    };
+    candidate.operation_id == request.envelope.operation_or_checkpoint_id
+        && stored.operation_id == envelope.operation_or_checkpoint_id
+        && token.operation_id == stored.operation_id
+        && token_binding == stored
+        && candidate.same_retry_identity(stored)
+        && request.writer_epoch == token.writer_epoch
+        && request.envelope.authority_epoch == token.writer_epoch
+        && envelope.authority_epoch == token.writer_epoch
+        && request.envelope.state_fence == token.state_fence
+        && envelope.state_fence == token.state_fence
+        && request.envelope.contract_version == envelope.contract_version
+        && request.envelope.privacy_and_visibility_class == envelope.privacy_and_visibility_class
+        && request.envelope.payload == envelope.payload
+        && request.envelope.payload_sha256 == envelope.payload_sha256
+        && request.envelope.payload_length == envelope.payload_length
+        && request.envelope.created_at_ms == envelope.created_at_ms
+        && request.envelope.known_at_ms == envelope.known_at_ms
+        && request.envelope.expires_at_ms == envelope.expires_at_ms
+        && request.expires_at_ms == token.expires_at_ms
+        && request.prepared_transition_sha256 == token.prepared_transition_sha256
+        && request.recovery_owner == token.recovery_owner
+        && request.scopes.len() == token.scopes.len()
+        && request
+            .scopes
+            .iter()
+            .zip(&token.scopes)
+            .all(|(left, right)| {
+                left.scope == right.scope && left.expected_head == right.expected_head
+            })
+}
+
+/// Matches a retry after the already-terminal payload crossed its declared
+/// cleanup horizon. The retained token still proves the original identity and
+/// receipt link; this path never restages or returns `ACCEPTED_PENDING`.
+fn idempotency_terminal_retry_matches(
+    request: &ReservationRequest,
+    token: &WriterReservationToken,
+) -> bool {
+    let (Some(candidate), Some(stored)) = (
+        request.envelope.write_binding.as_ref(),
+        token.write_binding.as_ref(),
+    ) else {
+        return false;
+    };
+    candidate.operation_id == request.envelope.operation_or_checkpoint_id
+        && candidate.same_retry_identity(stored)
+        && write_binding_matches_token(stored, token)
+        && request.writer_epoch == token.writer_epoch
+        && request.envelope.authority_epoch == token.writer_epoch
+        && request.envelope.state_fence == token.state_fence
+        && request.envelope.payload_sha256 == stored.protected_payload_sha256
+        && request.envelope.payload_length == stored.protected_payload_length
+        && matches!(
+            &request.envelope.payload,
+            RecoveryPayload::Encrypted { key, .. } if key == &stored.payload_key_reference
+        )
+        && request.expires_at_ms == token.expires_at_ms
+        && request.prepared_transition_sha256 == token.prepared_transition_sha256
         && request.recovery_owner == token.recovery_owner
         && request.scopes.len() == token.scopes.len()
         && request
@@ -27844,6 +29182,14 @@ fn reconciliation_matches(
     token: &WriterReservationToken,
     reconciliation: &CanonicalReconciliation,
 ) -> Result<(), OrsError> {
+    let write_binding = token
+        .write_binding
+        .as_ref()
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "recovery_write_binding",
+            reason: "legacy reservation has no admitted write identity for reconciliation"
+                .to_owned(),
+        })?;
     reconciliation
         .receipt
         .validate()
@@ -27852,10 +29198,12 @@ fn reconciliation_matches(
     if reconciliation.reservation_id != token.reservation_id
         || reconciliation.operation_id != token.operation_id
         || reconciliation.operation_id.as_str() != receipt.core.operation.operation_id.as_str()
+        || receipt.core.operation.idempotency_key != write_binding.idempotency_key.as_str()
         || reconciliation.reservation_order != token.reservation_order
         || reconciliation.state_fence != token.state_fence
         || reconciliation.recovery_owner != token.recovery_owner
         || reconciliation.scopes.len() != token.scopes.len()
+        || !write_binding_matches_token(write_binding, token)
     {
         return Err(OrsError::ReconciliationMismatch);
     }
