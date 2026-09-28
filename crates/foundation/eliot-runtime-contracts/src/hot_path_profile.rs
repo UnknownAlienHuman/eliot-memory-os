@@ -78,7 +78,9 @@ impl HotPathManifestRevision {
 /// service end and result return. A replayed stored response is not a sixth
 /// boundary; it is [`HotPathObservationKind::Replay`] at the boundary it was
 /// served from.
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, JsonSchema, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HotPathStage {
     /// Admission of the request into the declared queue.
@@ -91,6 +93,25 @@ pub enum HotPathStage {
     ServiceEnd,
     /// Retention or return of the result to the caller.
     ResultReturn,
+}
+
+impl HotPathStage {
+    /// This boundary's position in the traversal order a hot operation follows.
+    ///
+    /// The order is fixed by the operation's own shape — admission, eligibility,
+    /// start, service end, result return — so a required-stage set is a
+    /// duplicate-free ordered subset of exactly these positions and a boundary
+    /// can be compared against another without a name comparison.
+    #[must_use]
+    pub const fn traversal_position(self) -> u8 {
+        match self {
+            Self::Enqueue => 0,
+            Self::Claim => 1,
+            Self::Start => 2,
+            Self::ServiceEnd => 3,
+            Self::ResultReturn => 4,
+        }
+    }
 }
 
 /// Whether a record came from a real execution or from a replayed stored
@@ -154,6 +175,26 @@ impl<T> HotPathObservation<T> {
         match self {
             Self::NotApplicable { reason_ref } => crate::text(reason_ref, "reason_ref"),
             Self::Measured(_) | Self::Unknown => Ok(()),
+        }
+    }
+
+    /// Whether this observation actually carries a measured value.
+    ///
+    /// This is the only read a qualification gate may use to decide whether a
+    /// required counter was observed. `NotApplicable` and `Unknown` both answer
+    /// `false`, so an unobserved counter cannot be mistaken for an observed one
+    /// however the record is shaped.
+    #[must_use]
+    pub fn is_measured(&self) -> bool {
+        matches!(self, Self::Measured(_))
+    }
+
+    /// The measured value, when this observation carries one.
+    #[must_use]
+    pub fn as_measured(&self) -> Option<&T> {
+        match self {
+            Self::Measured(value) => Some(value),
+            Self::NotApplicable { .. } | Self::Unknown => None,
         }
     }
 }
