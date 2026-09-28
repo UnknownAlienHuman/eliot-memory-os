@@ -588,6 +588,19 @@ pub(super) fn run() -> Result<(), String> {
         event = "eliotd.improvement_pipeline_owner",
         owner = eliotd::governed_improvement_pipeline_owner(),
     );
+    // #1693 (I14.22:34): publish the registered maintenance-family catalog once
+    // per process, here in the composition startup path. This is the one
+    // production reader of `maintenance_family_catalog::entries`, and it is
+    // placed on the composition startup contour rather than inside
+    // `evaluate_maintenance_trigger` so the emission is once per process and
+    // never per trigger. It performs no I/O, opens no store client, reads no
+    // clock, consults no composition state, and returns nothing, so it cannot
+    // delay or withhold startup or readiness. Do not read this line as the
+    // durable record: A13.10 lines 5-9 class it as an operational log that may
+    // rotate, and the durable record for a family that cannot start is the
+    // canonical notification the blocked family submits through
+    // `note_blocked_automation_notification` below.
+    eliotd::maintenance_family_catalog::record_registered_catalog();
     // #2560: the retained ledger answers no readiness question. This projection
     // derives the required set from the composition's own live owners and keeps
     // core control readiness separate from optional capability availability, so
