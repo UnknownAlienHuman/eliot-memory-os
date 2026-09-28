@@ -32,13 +32,16 @@
 //! per-member result identity.
 //!
 //! What that does **not** buy is owner-boundness in the provenance sense, and
-//! this module does not claim it. None of the issuer, evaluator, admission,
-//! fence or work-scope identities inside the record is verified against an
-//! external authority, because this repository holds no owner registry to verify
-//! one against. The record is internally self-consistent and cross-checked
-//! against the manifest and the account the caller also supplies; the residual
-//! trust boundary is exactly those inputs. See the limitation note on
-//! [`NoMatchEvaluation`] for the full statement.
+//! this module does not claim it. A record can only be created through
+//! [`NoMatchEvaluationIssuer::issue_for`] — the record constructor is
+//! crate-private, so there is no second, caller-constructible door — but none of
+//! the issuer, evaluator, admission, fence or work-scope identities inside the
+//! record is verified against an external authority, because this repository
+//! holds no owner registry to verify one against. The record is internally
+//! self-consistent and cross-checked against the manifest, the account and the
+//! issuer holder the caller also supplies; the residual trust boundary is
+//! exactly those inputs. See the limitation note on [`NoMatchEvaluation`] for
+//! the full statement.
 //!
 //! The assessor performs no I/O, calls no provider and no index, and the
 //! ordinary Researcher route binds no evaluation and no manifest at all, so the
@@ -2072,12 +2075,16 @@ struct NoMatchEvaluationDigestInput<'a> {
 ///
 /// # What this does not establish
 ///
-/// This record is internally self-consistent and cross-checked against the
-/// manifest and the accounting the caller presents. It is **not** owner-bound in
-/// the provenance sense, and this crate cannot make it so, because there is
-/// nothing here to bind it to: no issuer registry, no admission ledger, no
-/// signature and no externally held reference digest exists in this repository
-/// against which [`Self::issuer_id`], [`Self::evaluator_id`],
+/// A record can now only be created through
+/// [`NoMatchEvaluationIssuer::issue_for`], so no caller can hand-assemble one:
+/// the constructor is crate-private and its only caller is the issuer, which
+/// joins every held commitment against the presented accounting, vetted records
+/// and authorized manifest before the record exists. That closes the
+/// caller-constructible path this issue was filed about. It does **not** make
+/// the record owner-bound in the provenance sense, and this crate cannot make it
+/// so, because there is nothing here to bind it to: no issuer registry, no
+/// admission ledger, no signature and no externally held reference digest exists
+/// in this repository against which [`Self::issuer_id`], [`Self::evaluator_id`],
 /// [`Self::admission_receipt_id`] or [`Self::fence`] could be checked.
 /// [`StateFence::validate`] confirms a non-zero resource generation and nothing
 /// more, and [`Self::verify_integrity`] compares the record against its own
@@ -2085,20 +2092,28 @@ struct NoMatchEvaluationDigestInput<'a> {
 ///
 /// The consequence is worth stating as a bound rather than leaving to be
 /// discovered: a caller that controls the source records, the authorized
-/// manifest and the clock can mint a fully self-consistent evaluation for members
-/// it never actually searched, and the assessor will return
-/// [`AbsenceVerdict::Proven`]. Every one of those three inputs is a parameter of
-/// [`AbsencePreconditions::derive`], so the residual trust boundary is exactly
-/// the records, the manifest and `now_ms`.
+/// manifest, the clock **and the issuer** can still mint a fully self-consistent
+/// evaluation for members it never actually searched, and the assessor will
+/// return [`AbsenceVerdict::Proven`]. Each of those is a parameter of
+/// [`AbsencePreconditions::derive`] or of [`NoMatchEvaluationIssuer::new`], so
+/// the residual trust boundary is exactly the records, the manifest, `now_ms`
+/// and the issuer holder. The difference from before is one of degree, not of
+/// kind, and it is worth being exact about the degree: previously a caller
+/// needed only the records, the manifest and the clock, and could skip the
+/// issuer entirely; now it must also construct and populate the issuer, which is
+/// what the issue's "cannot skip the owner map" requirement asks for. The
+/// commitments the issuer *holds* are still the caller's to choose, and
+/// [`NoMatchEvaluationIssuer`] says so at its own construction site.
 ///
-/// Closing that boundary needs infrastructure this repository does not have: an
-/// admission owner that holds the issuer identity and the admitted receipt, and
-/// a denominator owner that issues the exact finite member set and its snapshot
-/// digest as a commitment somebody other than the caller can verify. Until one
-/// exists, this record is evidence that a consistent account was presented, not
-/// evidence that a predicate was run — the same named-owner-absent residual
-/// recorded for #1768/#1948/#1949. Fabricating a stand-in for that owner inside
-/// this module would be a second query engine, so the boundary is stated instead.
+/// Closing the remaining boundary needs infrastructure this repository does not
+/// have: an admission owner that holds the issuer identity and the admitted
+/// receipt, and a denominator owner that issues the exact finite member set and
+/// its snapshot digest as a commitment somebody other than the caller can
+/// verify. Until one exists, this record is evidence that a consistent account
+/// was presented, not evidence that a predicate was run — the same
+/// named-owner-absent residual recorded for #1768/#1948/#1949. Fabricating a
+/// stand-in for that owner inside this module would be a second query engine, so
+/// the boundary is stated instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NoMatchEvaluation {
     /// Declared wire schema of this evidence shape.
@@ -2170,10 +2185,19 @@ pub struct NoMatchEvaluation {
     digest: String,
 }
 
-/// Named constructor arguments for [`NoMatchEvaluation::issue`]. Named fields
-/// block transposition; text uses concrete `String`.
+/// Named constructor arguments for the crate-private
+/// [`NoMatchEvaluation::issue`]. Named fields block transposition; text uses
+/// concrete `String`.
+///
+/// Crate-private with the constructor it feeds. The arguments describe the
+/// evaluator owner's commitments, and the reason they are not public is the
+/// same reason the constructor is not: a caller who can name these fields can
+/// assemble a record for the complete closed member list without ever holding
+/// an issuer, which is precisely the caller-constructible evaluation this
+/// module's limitation note says does not make the negative owner-bound. See
+/// [`NoMatchEvaluationIssuer::issue_for`], the only caller.
 #[derive(Clone, Debug)]
-pub struct NoMatchEvaluationParams {
+pub(crate) struct NoMatchEvaluationParams {
     /// Exact identity of the predicate.
     pub predicate_id: String,
     /// Exact predicate revision.
@@ -2226,21 +2250,27 @@ impl NoMatchEvaluation {
     /// Results are frozen into canonical member order here, so arrival order
     /// never affects the identity. Every result identity is recomputed from this
     /// record's own predicate, index revision and source revision and must equal
-    /// the value supplied, so the issuer cannot ship a result carried over from
-    /// another predicate, index revision or source revision. To produce the values
-    /// this constructor checks, call [`Self::predicate_digest_of`] and then
+    /// the value supplied, so a result carried over from another predicate, index
+    /// revision or source revision is refused. To produce the values this
+    /// constructor checks, call [`Self::predicate_digest_of`] and then
     /// [`Self::result_identity`] for every member.
     ///
-    /// The owner-side entry point is [`NoMatchEvaluationIssuer::issue_for`],
-    /// which holds the predicate, snapshot, evaluator, scope, clock and ceiling
-    /// commitments and joins them against the presented accounting, vetted
-    /// records and authorized manifest before calling this constructor. Calling
-    /// this constructor directly checks self-consistency only — the recomputed
-    /// identities catch a result carried across a predicate, revision or record
-    /// boundary, but not a result minted without the predicate ever running — so
-    /// a directly constructed record still has to survive the join
-    /// [`AbsencePreconditions::derive`] performs before [`assess_absence`] can
-    /// read it.
+    /// This constructor is crate-private and its only caller is
+    /// [`NoMatchEvaluationIssuer::issue_for`]. That visibility is load-bearing
+    /// and is the difference between an owner-issued record and a
+    /// caller-constructible one: while this was public, a caller could name
+    /// [`NoMatchEvaluationParams`] directly, build one result per closed member
+    /// with the correct record digest, content digest and result identity, fill
+    /// the issuer, evaluator, receipt, scope and revision fields with arbitrary
+    /// non-blank text, and hand the result to [`AbsencePreconditions::derive`]
+    /// as if an evaluator had run. Every downstream check would then pass on
+    /// self-consistent caller data, because the recomputed identities only
+    /// prove the record is internally coherent, not that any predicate ran.
+    /// Making the constructor private removes that second door: the issuer,
+    /// which joins the predicate, snapshot, evaluator, scope, clock and ceiling
+    /// commitments against the presented accounting, vetted records and
+    /// authorized manifest *before* the record exists, is now the only way one
+    /// can be made.
     ///
     /// # Errors
     ///
@@ -2253,7 +2283,7 @@ impl NoMatchEvaluation {
     /// closed population produces, [`PortfolioError::UnknownGrade`] for a ceiling
     /// outside the canonical ladder, and [`PortfolioError::Unencodable`] when the
     /// record cannot be encoded into its declared identity domain.
-    pub fn issue(mut params: NoMatchEvaluationParams) -> Result<Self, PortfolioError> {
+    pub(crate) fn issue(mut params: NoMatchEvaluationParams) -> Result<Self, PortfolioError> {
         params.results.sort_by(MemberNoMatchResult::canonical_order);
         let mut evaluation = Self {
             schema_version: NO_MATCH_EVALUATION_SCHEMA_VERSION.to_owned(),
@@ -2290,12 +2320,12 @@ impl NoMatchEvaluation {
     /// exists.
     ///
     /// An issuer has to compute this commitment *before* it can compute a
-    /// [`Self::result_identity`], and therefore before [`Self::issue`] can accept
-    /// the result at all. Exposing the recipe as an associated function rather
-    /// than only as a method on an already-constructed value is what makes the
-    /// issuing sequence expressible; [`Self::predicate_digest`] is the same recipe
-    /// applied to a value's own fields, so the issuer's preimage and the
-    /// validator's recomputation cannot drift.
+    /// [`Self::result_identity`], and therefore before `Self::issue` can accept
+    /// the result at all. The recipe is public so the issuing sequence is
+    /// expressible, while the constructor that consumes it is not;
+    /// [`Self::predicate_digest`] is the same recipe applied to a value's own
+    /// fields, so the issuer's preimage and the validator's recomputation cannot
+    /// drift.
     #[must_use]
     pub fn predicate_digest_of(
         predicate_id: &str,
@@ -2382,10 +2412,11 @@ impl NoMatchEvaluation {
     /// (`eliot-contracts::canonical_json_bytes`): two otherwise identical
     /// evaluations whose `results` arrive in different orders would hash
     /// differently, so exact replay would not be byte-stable. Every field on
-    /// this struct is private, so [`Self::issue`] and [`NoMatchEvaluationIssuer`]
-    /// are the only constructors and both route through this check; refusing the
-    /// unordered shape here is what earns byte-stability rather than inheriting
-    /// it from any one constructor's sort.
+    /// this struct is private and the record constructor is crate-private, so
+    /// `Self::issue` and [`NoMatchEvaluationIssuer`] are the only constructors
+    /// and both route through this check; refusing the unordered shape here is
+    /// what earns byte-stability rather than inheriting it from any one
+    /// constructor's sort.
     ///
     /// # Errors
     ///
@@ -2635,11 +2666,12 @@ pub struct NoMatchEvaluationIssuerParams {
 /// handed. What it does not establish is provenance: the held commitments are
 /// still supplied by whoever constructs the issuer, and this repository holds
 /// no issuer registry, admission ledger or signature to check them against, so
-/// a caller that controls the records, the manifest and the clock can still
-/// mint a self-consistent issuer. The construction is narrowed — private record
-/// fields, one validated holder, join before existence — but the residual trust
-/// boundary is the same records, manifest and clock, stated rather than
-/// closed.
+/// a caller that controls the records, the manifest, the clock and this issuer
+/// can still mint a self-consistent one. The construction is narrowed — private
+/// record fields, one validated holder, join before existence, and a
+/// crate-private record constructor so this issuer is the only way a record
+/// exists at all — but the residual trust boundary is the records, manifest,
+/// clock and issuer holder, stated rather than closed.
 ///
 /// No production route holds this issuer yet: the research plane records
 /// per-source acquisition dispositions, not per-member predicate results, so
@@ -2697,8 +2729,8 @@ pub struct NoMatchEvaluationIssuer {
 impl NoMatchEvaluationIssuer {
     /// Holds one owner commitment set after validating every field it carries.
     ///
-    /// Validation is the same shape validation [`NoMatchEvaluation::issue`]
-    /// applies to a record, applied once to the holder instead of once per
+    /// Validation is the same shape validation `NoMatchEvaluation::issue` applies
+    /// to a record, applied once to the holder instead of once per
     /// record: blank identities, an unvalidated fence, a vague work scope, a
     /// malformed digest, a non-positive observation time, an inverted
     /// currentness window, an absent ceiling or a ceiling off the canonical
@@ -3104,8 +3136,8 @@ pub const INCOMPATIBLE_EVALUATION_EXPIRED: &str = "evaluation_expired_at_assessm
 ///
 /// "Owner-bound" here means every field traces to a supplied input that was
 /// itself re-proved or cross-checked — it does **not** mean any supplied input was
-/// authorized by an owner. The records, the manifest and the clock are the
-/// caller's; see the limitation note on [`NoMatchEvaluation`].
+/// authorized by an owner. The records, the manifest, the clock and the issuer
+/// holder are the caller's; see the limitation note on [`NoMatchEvaluation`].
 ///
 /// The record names which precondition is unmet through the bounded reason
 /// [`AbsenceVerdict::Unproven`] retains, and its digest binds the preconditions
@@ -3621,9 +3653,10 @@ fn member_join_reason(
 /// Package-level `Proven` is not publication authority, and it is not
 /// owner-bound either: it is the strongest statement this package can make about
 /// evidence the caller presented and the assessor was able to cross-check. The
-/// residual trust boundary is the records, the authorized manifest and `now_ms`,
-/// all three of which are parameters of
-/// [`AbsencePreconditions::derive`]; see the limitation note on
+/// residual trust boundary is the records, the authorized manifest, `now_ms` and
+/// the issuer holder, all four of which are parameters of
+/// [`AbsencePreconditions::derive`] or of [`NoMatchEvaluationIssuer::new`]; see
+/// the limitation note on
 /// [`NoMatchEvaluation`] for why no in-crate check can close it. The live
 /// composition owner does re-check the retained record: `coverage-receipt/v2`
 /// binds both this verdict's class and the reason it carries, and
