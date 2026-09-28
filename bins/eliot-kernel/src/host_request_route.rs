@@ -1818,7 +1818,13 @@ impl KernelComposition {
         let settled = self
             .generation_gateway
             .ors
-            .cancel_host_request_parent(&parent_operation, &parent_digest)
+            .cancel_host_request_parent(
+                &OperationIdentity::new(host_request_operation_id(envelope))
+                    .map_err(|_| TransportError::SessionFenced)?,
+                &envelope.envelope_sha256,
+                &parent_operation,
+                &parent_digest,
+            )
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         let disposition = match settled.state {
@@ -4223,6 +4229,7 @@ pub(crate) fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        cancellation_target: None,
         result_digest: None,
         result_response: None,
         result_evidence: None,
@@ -5934,6 +5941,7 @@ fn watchdog_intent_projection_record(
         deadline_unix_ms: payload.expires_at_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        cancellation_target: None,
         result_digest: None,
         result_response: None,
         result_evidence: None,

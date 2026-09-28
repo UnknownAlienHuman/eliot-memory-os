@@ -2124,6 +2124,7 @@ impl KernelStoreGateway {
             deadline_unix_ms: observed_unix_ms,
             state: HostRequestState::Requested,
             attempt: None,
+            cancellation_target: None,
             result_digest: None,
             result_response: None,
             result_evidence: None,
