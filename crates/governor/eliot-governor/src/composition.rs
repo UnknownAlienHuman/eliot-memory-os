@@ -27,9 +27,7 @@ use crate::owner_closure_feed::{
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
-use crate::scope_identity_admission::{
-    ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
-};
+use crate::scope_identity_admission::{ensure_snapshot_fresh, require_fresh_matched_binding};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -4827,14 +4825,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Reads the retained binding at the retained fence, evaluates `observed`
     /// at `trigger` with the caller-retained source closure, and returns the
-    /// current snapshot only when the verdict is `Allow` (full `MATCHED`
-    /// receipt). Any other verdict fails closed with the trigger and
-    /// disposition; the retained binding, task state, and project memory are
-    /// untouched.
+    /// current snapshot only when the report is `MATCHED` (identity-clear
+    /// `Allow` with a full `MATCHED` receipt). Any other report withholds
+    /// with the structured [`CompositionError::ScopeGuardWithheld`] carrying
+    /// the exact trigger report; an identity mismatch is additionally
+    /// retained in the bounded process-local diagnostic projection before
+    /// withholding. The retained binding, task state, and project memory
+    /// are untouched on any failure.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn require_scope_guard_for_observed(
-        &self,
+        &mut self,
         observed: &ScopeBinding,
         source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
         trigger: GuardTrigger,
@@ -4855,7 +4856,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if report.is_matched() {
             Ok(snapshot)
         } else {
-            Err(guard_recovery_error(&report, "scope guard withheld"))
+            if report.identity != IdentityLegOutcome::IdentityClear {
+                self.push_scope_quarantine_record(
+                    &snapshot.binding,
+                    observed,
+                    &report,
+                    fence.resource_generation.value(),
+                )?;
+            }
+            Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: snapshot.binding.scope.scope_ref.clone(),
+                observed_scope: observed.scope.scope_ref.clone(),
+                trigger: report.trigger,
+                identity: report.identity,
+                verdict: report.verdict,
+                report: Box::new(report),
+            })
         }
     }
 
@@ -5054,13 +5070,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Builds the [`QuarantinedScopeRecord`] for `report` through its
     /// existing constructor and validator, then appends it instead of
-    /// overwriting: an exact repeat of the latest record adds no new
-    /// evidence, anything else appends with oldest-first eviction at
+    /// overwriting: a record whose stable idempotency identity is already
+    /// retained adds no new evidence, anything else appends with
+    /// oldest-first eviction at
     /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`]. The retained binding,
-    /// task state, and project memory stay untouched. Construction
-    /// failure is never silent: it fails closed here so the conflicting
-    /// evidence cannot disappear while the write is withheld. This
-    /// projection is not durable, rehydrated, or an authority for
+    /// task state, and project memory stay untouched. Construction or
+    /// identity failure is never silent: it fails closed here so the
+    /// conflicting evidence cannot disappear while the write is withheld.
+    /// This projection is not durable, rehydrated, or an authority for
     /// rebind; durable quarantine still belongs to the `WorkScope`
     /// owner path.
     fn push_scope_quarantine_record(
@@ -5082,13 +5099,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 report.trigger
             ))
         })?;
+        let (_, idempotency_key) = record.operation_identity().map_err(|error| {
+            CompositionError::Recovery(format!(
+                "scope guard withheld at trigger {:?} after scope mismatch, but its quarantine identity could not be derived: {error}",
+                report.trigger
+            ))
+        })?;
         // Preserve every unresolved conflict instead of overwriting one
-        // slot: an exact repeat of the latest record adds no new
-        // evidence, anything else appends with oldest-first eviction at
-        // the bound. The retained binding, task state, and project
-        // memory stay untouched; durable quarantine still belongs to
-        // the WorkScope owner path.
-        if self.scope_quarantine.last() != Some(&record) {
+        // slot: a record whose stable idempotency identity is already
+        // retained anywhere in the bounded history adds no new evidence,
+        // anything else appends with oldest-first eviction at the bound.
+        // The retained binding, task state, and project memory stay
+        // untouched; durable quarantine still belongs to the WorkScope
+        // owner path.
+        let already_retained = self.scope_quarantine.iter().any(|retained| {
+            retained
+                .operation_identity()
+                .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
+        });
+        if !already_retained {
             if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
                 self.scope_quarantine.remove(0);
             }
