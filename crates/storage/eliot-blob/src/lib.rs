@@ -897,8 +897,9 @@ fn bind_platform_capacity_attempt(
 ///
 /// The caller states `JournalWrite` because the *journal* is the object being
 /// written; whether the port failed while writing the journal or while flushing
-/// it is the port's own observation and is preserved by
-/// [`bind_platform_capacity_with_effect`]'s stage rule (issue #864: "Wrapped
+/// it is the port's own observation, and both the stage and the effect that
+/// observation carries are preserved by
+/// [`bind_platform_capacity_with_effect`]'s boundary rules (issue #864: "Wrapped
 /// ports must preserve typed cause/code and stage"). The serialized buffer
 /// length is likewise only a caller-side default, so a port that observed its
 /// own progress keeps that observation rather than having it restated as the
@@ -964,9 +965,26 @@ fn bind_journal_capacity(
 /// that can author a root-lease stage is `claim_root`, whose stage the caller
 /// states identically.
 ///
-/// The rule drops nothing: a port stage the rule does not prefer is still the
-/// same value the caller would have supplied, and the port's cause, native code
-/// and effect evidence are carried through untouched either way.
+/// The same asymmetry decides the *effect*. A caller states the effect of the
+/// operation it asked for; it cannot state what its bytes or its directory
+/// entry became inside a port call, and `BlobCapacityEffect` is defined as the
+/// owner's own observation ("whether the owner also left a possible physical
+/// effect"). Restating a port-reported boundary failure as the caller's
+/// `PartialWriteUnknown`/`NotAttempted` default would erase a possible installed
+/// effect and its unconfirmed durability boundary, and would also downgrade the
+/// recovery disposition from same-operation reconciliation to a bare capacity
+/// revalidation — exactly the blind new attempt issue #864 forbids:
+///
+/// ```text
+/// port reported a durability boundary (FileFlush | DirectoryFlush)
+///   → the port's own effect wins, verbatim;
+/// port reported any other stage
+///   → the caller's effect wins.
+/// ```
+///
+/// The rule drops nothing: an effect the rule does not prefer is still the same
+/// value the caller would have supplied, and the port's cause, native code and
+/// other evidence are carried through untouched either way.
 fn bind_platform_capacity_with_effect(
     error: BlobError,
     stage: BlobCapacityStage,
@@ -977,7 +995,10 @@ fn bind_platform_capacity_with_effect(
         return Ok(error);
     };
     let mut evidence = failure.evidence;
-    if let Some(effect) = effect_override {
+    let port_reported_durability_boundary = failure.stage.reports_durability_boundary();
+    if let Some(effect) = effect_override
+        && !port_reported_durability_boundary
+    {
         evidence.effect = effect;
     }
     let recovery = match evidence.effect {
@@ -990,7 +1011,7 @@ fn bind_platform_capacity_with_effect(
             BlobCapacityRecovery::CapacityRevalidationRequired
         }
     };
-    let stage = if failure.stage.reports_durability_boundary() {
+    let stage = if port_reported_durability_boundary {
         failure.stage
     } else {
         stage
