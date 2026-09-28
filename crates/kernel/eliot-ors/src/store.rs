@@ -7955,6 +7955,79 @@ impl RedbRecoveryStore {
         Ok(Some(next))
     }
 
+    fn validate_host_request_cancellation(
+        cancellation: &crate::HostRequestRecord,
+        cancellation_operation_id: &crate::OperationIdentity,
+        cancellation_request_digest: &str,
+        parent_operation_id: &crate::OperationIdentity,
+    ) -> Result<(), OrsError> {
+        cancellation.validate()?;
+        if cancellation.operation_id != *cancellation_operation_id
+            || cancellation.request_digest != cancellation_request_digest
+            || cancellation.kind != crate::HostRequestKind::Cancellation
+            || cancellation
+                .parent_operation_id
+                .as_ref()
+                .map(crate::OpaqueLabel::as_str)
+                != Some(parent_operation_id.as_str())
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: cancellation_operation_id.as_str().to_owned(),
+                request_digest: cancellation_request_digest.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn host_request_cancellation_disposition(
+        parent: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestState, OrsError> {
+        let target = match parent.state {
+            crate::HostRequestState::ResultReceived
+            | crate::HostRequestState::Cancelled
+            | crate::HostRequestState::Expired
+            | crate::HostRequestState::Conflicted
+            | crate::HostRequestState::Terminal => parent.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling => parent.state,
+            crate::HostRequestState::Requested
+            | crate::HostRequestState::Submitted
+            | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
+            crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
+                match parent.attempt.as_ref().map(|attempt| attempt.phase) {
+                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
+                        crate::HostRequestState::Cancelled
+                    }
+                    Some(crate::HostRequestAttemptPhase::Claimed) => {
+                        crate::HostRequestState::Unknown
+                    }
+                }
+            }
+        };
+        if target != parent.state {
+            parent.state.transition_to(target)?;
+        }
+        Ok(target)
+    }
+
+    fn bind_host_request_cancellation(
+        cancellation: &mut crate::HostRequestRecord,
+        parent: &crate::HostRequestRecord,
+        disposition: crate::HostRequestState,
+    ) {
+        cancellation.cancellation_target = Some(crate::HostRequestCancellationTarget {
+            parent_operation_id: parent.operation_id.clone(),
+            parent_request_digest: parent.request_digest.clone(),
+            attempt: parent
+                .attempt
+                .as_ref()
+                .map(|attempt| crate::HostRequestCancellationAttempt {
+                    attempt_id: attempt.attempt_id.clone(),
+                    generation: attempt.generation,
+                }),
+            parent_disposition: disposition,
+        });
+    }
+
     /// Atomically classifies cancellation against the durable attempt phase.
     ///
     /// The parent row and its attempt are read and updated in one write
@@ -8012,21 +8085,12 @@ impl RedbRecoveryStore {
                     request_digest: cancellation_request_digest.to_owned(),
                 })?
         };
-        cancellation.validate()?;
-        if cancellation.operation_id != *cancellation_operation_id
-            || cancellation.request_digest != cancellation_request_digest
-            || cancellation.kind != crate::HostRequestKind::Cancellation
-            || cancellation
-                .parent_operation_id
-                .as_ref()
-                .map(crate::OpaqueLabel::as_str)
-                != Some(operation_id.as_str())
-        {
-            return Err(OrsError::HostRequestIdentityConflict {
-                operation_id: cancellation_operation_id.as_str().to_owned(),
-                request_digest: cancellation_request_digest.to_owned(),
-            });
-        }
+        Self::validate_host_request_cancellation(
+            &cancellation,
+            cancellation_operation_id,
+            cancellation_request_digest,
+            operation_id,
+        )?;
 
         if let Some(bound) = cancellation.cancellation_target.as_ref() {
             if bound.parent_operation_id != *operation_id
@@ -8043,49 +8107,14 @@ impl RedbRecoveryStore {
             return Ok(Some(existing));
         }
 
-        let target = match existing.state {
-            crate::HostRequestState::ResultReceived
-            | crate::HostRequestState::Cancelled
-            | crate::HostRequestState::Expired
-            | crate::HostRequestState::Conflicted
-            | crate::HostRequestState::Terminal => existing.state,
-            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling => {
-                existing.state
-            }
-            crate::HostRequestState::Requested
-            | crate::HostRequestState::Submitted
-            | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
-            crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
-                match existing.attempt.as_ref().map(|attempt| attempt.phase) {
-                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
-                        crate::HostRequestState::Cancelled
-                    }
-                    Some(crate::HostRequestAttemptPhase::Claimed) => {
-                        crate::HostRequestState::Unknown
-                    }
-                }
-            }
-        };
-        if target != existing.state {
-            existing.state.transition_to(target)?;
-        }
+        let target = Self::host_request_cancellation_disposition(&existing)?;
         let mut next = existing.clone();
         next.state = target;
         if target.is_terminal() && next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
         next.validate()?;
-        cancellation.cancellation_target = Some(crate::HostRequestCancellationTarget {
-            parent_operation_id: operation_id.clone(),
-            parent_request_digest: request_digest.to_owned(),
-            attempt: existing.attempt.as_ref().map(|attempt| {
-                crate::HostRequestCancellationAttempt {
-                    attempt_id: attempt.attempt_id.clone(),
-                    generation: attempt.generation,
-                }
-            }),
-            parent_disposition: target,
-        });
+        Self::bind_host_request_cancellation(&mut cancellation, &existing, target);
         cancellation.validate()?;
         let parent_payload = encode(&next)?;
         let cancellation_payload = encode(&cancellation)?;

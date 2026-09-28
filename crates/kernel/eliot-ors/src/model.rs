@@ -6143,47 +6143,7 @@ impl HostRequestRecord {
 
     /// Validates identity shape and state/result coherence.
     pub fn validate(&self) -> Result<(), OrsError> {
-        if self.contract_version != CONTRACT_VERSION {
-            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
-        }
-        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
-        validate_text(self.request_id.as_str(), "host_request_request_id")?;
-        self.validate_correlation_projection()?;
-        validate_text(
-            self.idempotency_key.as_str(),
-            "host_request_idempotency_key",
-        )?;
-        validate_text(
-            self.cancellation_id.as_str(),
-            "host_request_cancellation_id",
-        )?;
-        if let Some(parent) = &self.parent_operation_id {
-            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
-            if parent == &self.operation_id {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_parent_operation_id",
-                    reason: "must not reference the enclosing operation",
-                });
-            }
-        }
-        validate_digest(&self.request_digest, "host_request_request_digest")?;
-        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
-        if let Some(attempt) = &self.attempt {
-            attempt.validate(&self.fence_digest)?;
-        }
-        if let Some(target) = &self.cancellation_target {
-            if self.kind != HostRequestKind::Cancellation
-                || self.state == HostRequestState::Requested
-                || self.parent_operation_id.as_ref().map(OpaqueLabel::as_str)
-                    != Some(target.parent_operation_id.as_str())
-            {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_cancellation_target",
-                    reason: "must be ORS progression on a Cancellation row linked to the same parent operation",
-                });
-            }
-            target.validate()?;
-        }
+        self.validate_identity_and_cancellation_binding()?;
         validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
         for (value, field) in [
             (self.session_ref.as_ref(), "host_request_session_ref"),
@@ -6268,6 +6228,51 @@ impl HostRequestRecord {
                 field: "host_request_commit_order",
                 reason: "non-terminal states must not carry a commit order",
             });
+        }
+        Ok(())
+    }
+
+    fn validate_identity_and_cancellation_binding(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        validate_text(self.request_id.as_str(), "host_request_request_id")?;
+        self.validate_correlation_projection()?;
+        validate_text(
+            self.idempotency_key.as_str(),
+            "host_request_idempotency_key",
+        )?;
+        validate_text(
+            self.cancellation_id.as_str(),
+            "host_request_cancellation_id",
+        )?;
+        if let Some(parent) = &self.parent_operation_id {
+            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
+            if parent == &self.operation_id {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_parent_operation_id",
+                    reason: "must not reference the enclosing operation",
+                });
+            }
+        }
+        validate_digest(&self.request_digest, "host_request_request_digest")?;
+        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        if let Some(attempt) = &self.attempt {
+            attempt.validate(&self.fence_digest)?;
+        }
+        if let Some(target) = &self.cancellation_target {
+            if self.kind != HostRequestKind::Cancellation
+                || self.state == HostRequestState::Requested
+                || self.parent_operation_id.as_ref().map(OpaqueLabel::as_str)
+                    != Some(target.parent_operation_id.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_cancellation_target",
+                    reason: "must be ORS progression on a Cancellation row linked to the same parent operation",
+                });
+            }
+            target.validate()?;
         }
         Ok(())
     }
