@@ -116,6 +116,14 @@ pub const MAX_BACKUP_CONTROL_HANDLES: u64 = 8;
 /// table exists to prevent. There is no blind retry and no silent loss.
 pub const MAX_RETAINED_BACKUP_OPERATIONS: usize = 64;
 
+/// Reported unresolved-operation count when the composition's own bounded table
+/// cannot be read at all.
+///
+/// A distinct sentinel rather than zero, because "the table was unreadable" and
+/// "this composition ran no unresolved operation" are different facts and only
+/// the second one is a clean shutdown.
+const UNRESOLVED_COUNT_UNREADABLE: usize = usize::MAX;
+
 /// Number of bounded registration slots, derived from the declared ceiling.
 ///
 /// Declared as its own literal rather than a truncating cast of the `u64`
@@ -359,7 +367,7 @@ impl BackupControlRegistration {
 /// already depends on that crate, so the vocabulary is re-exported rather than
 /// mirrored: the Watchdog owns only which operations it *recognizes* and what
 /// it does with each one, never a second spelling of the family.
-pub use eliot_protocol::backup::BackupOperationKind as ClosedBackupOperation;
+pub use eliot_protocol::backup::BackupOperationKind;
 
 /// The closed backup lifecycle stage vocabulary.
 ///
@@ -1331,7 +1339,7 @@ pub fn stop_backup_control(handle: BackupControlHandle) -> BackupControlHandle {
     let unresolved = handle
         .registration
         .unresolved()
-        .unwrap_or(usize::MAX);
+        .unwrap_or(UNRESOLVED_COUNT_UNREADABLE);
     // Bounded, redacted shutdown diagnostics: two integers and the slot, never
     // payload text, owner internals or identity material. It reports the
     // composition's retained evidence and cannot alter the release below.
