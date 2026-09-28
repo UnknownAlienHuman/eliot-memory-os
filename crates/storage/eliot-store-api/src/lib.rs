@@ -4586,6 +4586,16 @@ impl OperationIdentity {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedTransition {
+    /// Wire revision of the `eliot.storage.store-api` contract this plan was
+    /// built under, always [`CONTRACT_VERSION`] on the producing side.
+    ///
+    /// Recorded on the plan itself so a replacement Kernel or store bridge can
+    /// decide support for the EXACT recorded revision before executing it,
+    /// instead of inferring support from the operation-manifest set alone.
+    /// Checked by [`PreparedTransition::validate`], which every owner of this
+    /// contract calls, and covered by [`prepared_transition_digest`] because
+    /// the digest is taken over the canonical bytes of this whole value.
+    pub contract_version: ContractVersion,
     pub identity: OperationIdentity,
     pub state_fence: StateFence,
     pub scope_id: ScopeId,
@@ -4627,8 +4637,14 @@ pub struct PreparedTransition {
 }
 
 impl PreparedTransition {
-    /// Validates identity, operation closure, fences and effect ceilings.
+    /// Validates the recorded contract revision, identity, operation closure,
+    /// fences and effect ceilings.
     pub fn validate(&self) -> Result<(), StoreError> {
+        // The recorded contract revision is checked FIRST: a plan staged under
+        // a revision this build does not implement is refused before any of its
+        // content is interpreted, so an unsupported plan is never partially
+        // understood under a newer contract. Unknown revisions fail closed.
+        validate_recovery_contract_version(self.contract_version)?;
         self.identity.validate()?;
         self.state_fence
             .validate()
