@@ -13,6 +13,7 @@ mod host;
 mod host_gateway;
 mod schema;
 mod semantic_profile;
+mod surface_decision;
 
 pub use contract::*;
 pub use core::*;
@@ -20,6 +21,7 @@ pub use host::*;
 pub use host_gateway::*;
 pub use schema::*;
 pub use semantic_profile::*;
+pub use surface_decision::*;
 
 /// Stable package contract name.
 pub const CONTRACT_NAME: &str = "eliot.surface.mcp";

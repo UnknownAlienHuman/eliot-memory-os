@@ -6,7 +6,7 @@ use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, HostJson
 use eliot_protocol::{
     AgentHostRequestFailure, HARD_STRUCTURED_RESPONSE_BYTES, MAX_HOST_REQUEST_TEXT_BYTES,
 };
-use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
+use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding, admit_dispatch_surface};
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
@@ -22,8 +22,9 @@ use crate::{
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection,
-    decode_protected_request_bytes, published_mcp_tool_surface, reject_duplicate_keys,
-    validate_proof_ceiling, validate_tool_request_owner,
+    bind_list_surface_budget, canonical_tool_schemas, decode_protected_request_bytes,
+    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
+    validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1129,6 +1130,33 @@ fn validate_application_request(
     }
     request.tool.validate().map_err(contract_violation)?;
     let semantic_profile = validate_tool_semantic_owner(&request.tool)?;
+    // I7.24 dispatch: join the live generated descriptor against the owner
+    // and carry the Kernel-verified task revisions into admission. Dispatch
+    // re-resolves live owners by method name on every call; no advertised
+    // disposition is trusted here, so hidden-by-name calls face the
+    // identical check. No grant owner is joined at this seam.
+    let live_descriptor = canonical_tool_schemas()
+        .map_err(|_| {
+            BridgeError::invalid("tool.name", "generated tool descriptors are unavailable")
+        })?
+        .into_iter()
+        .find(|descriptor| descriptor.name == request.tool.canonical_name())
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "tool.name",
+                "tool has no generated descriptor on the live surface",
+            )
+        })?;
+    let dispatch_task = dispatch_task_ref(request);
+    admit_dispatch_surface(
+        request.tool.canonical_name(),
+        &live_descriptor.definition_version,
+        &semantic_profile.method.definition_version,
+        &semantic_profile.profile_version,
+        dispatch_task.as_deref(),
+        None,
+    )
+    .map_err(|error| BridgeError::invalid("tool.name", error.to_string()))?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1181,6 +1209,32 @@ fn validate_tool_semantic_owner(
             format!("no registered semantic owner: {error}"),
         )
     })
+}
+
+/// Binds the Kernel-verified task identity and fence revision carried into
+/// dispatch admission. Pre-task discovery requests carry no task and bind
+/// `None` rather than an invented reference.
+fn dispatch_task_ref(request: &ApplicationRequest) -> Option<String> {
+    let task_id = request
+        .identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned());
+    let task_revision = request
+        .identity
+        .request
+        .state_fence
+        .task_revision
+        .as_ref()
+        .map(|revision| revision.value());
+    match (task_id, task_revision) {
+        (Some(id), Some(revision)) => Some(format!("{id}@{revision}")),
+        (Some(id), None) => Some(id),
+        (None, Some(revision)) => Some(format!("task-revision:{revision}")),
+        (None, None) => None,
+    }
 }
 
 fn validate_active_session_binding(
@@ -2284,6 +2338,26 @@ pub fn build_host_invocation(
             json!({ "tool": bound_wire_text(tool_name) }),
         ));
     }
+    // I7.24 call admission: carry the invoked surface/method/profile revisions
+    // through the shared dispatch gate. The wire carries no authenticated
+    // task or grant, so those bind as unresolved rather than invented; the
+    // bridge never mints them. Visibility is never consulted: a hidden
+    // method invoked by name admits through this identical check.
+    admit_dispatch_surface(
+        tool_name,
+        &descriptor.definition_version,
+        &owner.method.definition_version,
+        &owner.profile_version,
+        None,
+        None,
+    )
+    .map_err(|_| {
+        WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool surface revisions do not satisfy the dispatch contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        )
+    })?;
     reject_blank_wire_id(correlation)?;
     validate_correlation_text_budget(correlation)?;
     let correlation_projection = correlation.correlation_projection(HostCorrelationDomain::Request);
@@ -2702,7 +2776,22 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
             })
         })
         .collect();
-    Ok(json!({ "tools": tools }))
+    // I7.24 host catalogue projection: bind the actual rendered surface to
+    // its generated budget. The budget measures these exact entries; the
+    // additive `_meta` object carries the evidence without changing the
+    // `tools` array shape.
+    let budget = bind_list_surface_budget(&tools).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface budget is unavailable")
+    })?;
+    let budget_value = serde_json::to_value(&budget).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface budget is unavailable")
+    })?;
+    Ok(json!({
+        "tools": tools,
+        "_meta": {
+            "eliot/surfaceBudget": budget_value,
+        },
+    }))
 }
 
 #[cfg(test)]
