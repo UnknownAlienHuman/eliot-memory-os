@@ -15,7 +15,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::durable_dispatch::PlanDrain;
-use crate::durable_work::{BudgetAccount, DurableWorkMachine, TerminalKind, WorkUnitPhase};
+use crate::durable_work::{
+    BudgetAccount, BudgetDimension, DurableWorkMachine, TerminalKind, WorkUnitPhase,
+};
 
 /// Opaque child slot label echoed from one denominator namespace.
 ///
@@ -95,11 +97,20 @@ pub enum NextSafeAction {
     /// Active children are still draining through the owner-side cancellation
     /// path: keep draining, build nothing.
     DrainRemaining,
+    /// An expected child has no durable record, so the denominator is still
+    /// open and no relaunch candidate may be built.
+    BlockedOnMissingChild,
+    /// The drain is not terminal-ready or accounts no terminal children, but
+    /// it names no higher-priority blocker that explains the incomplete state.
+    BlockedOnIncompleteDrain,
     /// The drain names unknown or stale children that block the terminal
     /// aggregate: nothing may be inferred until they reconcile.
     BlockedOnUnknown,
-    /// The passed local budget account is exhausted. Local only: this never
-    /// touches Control Reserve and never authorizes spend elsewhere.
+    /// No local budget dimensions were supplied, so launch eligibility cannot
+    /// be determined.
+    BudgetUnavailable,
+    /// One or more supplied local budget dimensions are exhausted. This never
+    /// touches Control Reserve or authorizes spend elsewhere.
     ExhaustedLocal,
 }
 
@@ -127,35 +138,57 @@ pub struct SwarmCoverage {
     /// for kinds present. Partial, failed, and cancelled kinds stay separate;
     /// no confidence scalar, no majority vote.
     pub terminal_by_kind: Vec<(TerminalKindName, usize)>,
-    /// Echoed local budget spend. Local only.
-    pub budget_spent: u64,
-    /// Echoed local budget reservation. Local only.
-    pub budget_reserved: u64,
-    /// Local budget remaining (`limit` saturating minus reserved minus spent).
-    /// Local only, never Control Reserve.
-    pub budget_remaining: u64,
+    /// Supplied local budget accounts, kept separate by their independent
+    /// dimensions. An empty list means the caller supplied no budget evidence.
+    /// Deadline and non-budget resource evidence are not available here.
+    pub budgets: Vec<BudgetDimensionCoverage>,
     /// The next safe local action. Candidate only.
     pub next_safe_action: NextSafeAction,
+}
+
+/// One local budget account with its dimension label and admitted limit.
+///
+/// Keeping accounts separate prevents compute, cost, and evidence limits from
+/// being collapsed into an unlabeled scalar. Local only; never Control Reserve.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDimensionCoverage {
+    /// Independent budget dimension represented by this account.
+    pub dimension: BudgetDimension,
+    /// Admitted local limit for this dimension.
+    pub limit: u64,
+    /// Amount currently reserved in this dimension.
+    pub reserved: u64,
+    /// Amount already spent in this dimension.
+    pub spent: u64,
+    /// Local headroom after reservations and spend, saturating at zero.
+    pub remaining: u64,
 }
 
 /// Projects coverage over the machine and drain views without writing anything.
 ///
 /// Reads only: the machine's held records, the drain decision, and the passed
-/// budget account. No store access, no dispatch, no launch, no finish.
+/// per-dimension budget accounts. No store access, no dispatch, no launch, no
+/// finish.
 ///
 /// Action priority, in order: drain-named unknown slots block everything
 /// ([`NextSafeAction::BlockedOnUnknown`]); machine records stuck in blocked
 /// phases require reconcile first
 /// ([`NextSafeAction::ReconcileBeforeRelaunch`]); outstanding cancels or
 /// deferred active children keep draining
-/// ([`NextSafeAction::DrainRemaining`]); an exhausted local account reports
-/// [`NextSafeAction::ExhaustedLocal`] (local only, never Control Reserve);
-/// otherwise [`NextSafeAction::RelaunchReady`].
+/// ([`NextSafeAction::DrainRemaining`]); a missing expected child record blocks
+/// relaunch ([`NextSafeAction::BlockedOnMissingChild`]); a drain that is not
+/// terminal-ready or has no terminal children blocks as
+/// [`NextSafeAction::BlockedOnIncompleteDrain`]; no supplied budget evidence
+/// reports [`NextSafeAction::BudgetUnavailable`], and any exhausted local
+/// dimension reports [`NextSafeAction::ExhaustedLocal`]. Only a nonempty,
+/// terminal-ready drain and nonempty budget view with remaining budget reports
+/// [`NextSafeAction::RelaunchReady`].
 #[must_use]
 pub fn project_coverage(
     machine: &DurableWorkMachine<'_>,
     drain: &PlanDrain,
-    budget: &BudgetAccount,
+    budgets: &BTreeMap<BudgetDimension, BudgetAccount>,
     plan_revision: u64,
 ) -> SwarmCoverage {
     let records = machine.all_records();
@@ -205,10 +238,19 @@ pub fn project_coverage(
         .map(|(kind, count)| (TerminalKindName::from_terminal(kind), count))
         .collect::<Vec<_>>();
 
-    let budget_remaining = budget
-        .limit
-        .saturating_sub(budget.reserved)
-        .saturating_sub(budget.spent);
+    let budgets = budgets
+        .iter()
+        .map(|(dimension, account)| BudgetDimensionCoverage {
+            dimension: *dimension,
+            limit: account.limit,
+            reserved: account.reserved,
+            spent: account.spent,
+            remaining: account
+                .limit
+                .saturating_sub(account.reserved)
+                .saturating_sub(account.spent),
+        })
+        .collect::<Vec<_>>();
 
     let next_safe_action = if !drain.unknown.is_empty() {
         NextSafeAction::BlockedOnUnknown
@@ -216,7 +258,13 @@ pub fn project_coverage(
         NextSafeAction::ReconcileBeforeRelaunch
     } else if !drain.cancel.is_empty() || !drain.pending.is_empty() {
         NextSafeAction::DrainRemaining
-    } else if budget_remaining == 0 {
+    } else if !missing.is_empty() {
+        NextSafeAction::BlockedOnMissingChild
+    } else if !drain.terminal_ready || drain.terminal.is_empty() {
+        NextSafeAction::BlockedOnIncompleteDrain
+    } else if budgets.is_empty() {
+        NextSafeAction::BudgetUnavailable
+    } else if budgets.iter().any(|budget| budget.remaining == 0) {
         NextSafeAction::ExhaustedLocal
     } else {
         NextSafeAction::RelaunchReady
@@ -228,9 +276,7 @@ pub fn project_coverage(
         missing: missing.into_iter().map(ChildSlot::new).collect::<Vec<_>>(),
         unknown: unknown.into_iter().map(ChildSlot::new).collect::<Vec<_>>(),
         terminal_by_kind,
-        budget_spent: budget.spent,
-        budget_reserved: budget.reserved,
-        budget_remaining,
+        budgets,
         next_safe_action,
     }
 }
@@ -270,13 +316,16 @@ mod tests {
             ],
             terminal_ready: true,
         };
-        let budget = BudgetAccount {
-            limit: 100,
-            reserved: 10,
-            spent: 30,
-        };
+        let budgets = BTreeMap::from([(
+            BudgetDimension::ComputeSteps,
+            BudgetAccount {
+                limit: 100,
+                reserved: 10,
+                spent: 30,
+            },
+        )]);
 
-        let coverage = project_coverage(&machine, &drain, &budget, 7);
+        let coverage = project_coverage(&machine, &drain, &budgets, 7);
 
         assert_eq!(coverage.plan_revision, 7);
         assert_eq!(coverage.accounted, 3);
@@ -292,9 +341,16 @@ mod tests {
                 (TerminalKindName::Partial, 1),
             ]
         );
-        assert_eq!(coverage.budget_spent, 30);
-        assert_eq!(coverage.budget_reserved, 10);
-        assert_eq!(coverage.budget_remaining, 60);
+        assert_eq!(
+            coverage.budgets,
+            vec![BudgetDimensionCoverage {
+                dimension: BudgetDimension::ComputeSteps,
+                limit: 100,
+                reserved: 10,
+                spent: 30,
+                remaining: 60,
+            }]
+        );
         assert_eq!(coverage.next_safe_action, NextSafeAction::RelaunchReady);
     }
 
@@ -308,13 +364,16 @@ mod tests {
             terminal: vec![(slot("child-a"), TerminalKind::Completed)],
             terminal_ready: false,
         };
-        let budget = BudgetAccount {
-            limit: 100,
-            reserved: 0,
-            spent: 0,
-        };
+        let budgets = BTreeMap::from([(
+            BudgetDimension::ComputeSteps,
+            BudgetAccount {
+                limit: 100,
+                reserved: 0,
+                spent: 0,
+            },
+        )]);
 
-        let coverage = project_coverage(&machine, &drain, &budget, 3);
+        let coverage = project_coverage(&machine, &drain, &budgets, 3);
 
         // Unknown blocks even with funded budget and accounted terminals.
         assert_eq!(coverage.next_safe_action, NextSafeAction::BlockedOnUnknown);
@@ -325,11 +384,14 @@ mod tests {
     #[test]
     fn pending_drain_precedes_budget_exhaustion() {
         let machine = empty_machine();
-        let funded = BudgetAccount {
-            limit: 100,
-            reserved: 0,
-            spent: 0,
-        };
+        let funded = BTreeMap::from([(
+            BudgetDimension::ComputeSteps,
+            BudgetAccount {
+                limit: 100,
+                reserved: 0,
+                spent: 0,
+            },
+        )]);
         let draining = PlanDrain {
             cancel: vec![slot("child-a")],
             pending: vec![slot("child-b")],
@@ -342,11 +404,14 @@ mod tests {
             NextSafeAction::DrainRemaining
         );
 
-        let exhausted = BudgetAccount {
-            limit: 50,
-            reserved: 20,
-            spent: 30,
-        };
+        let exhausted = BTreeMap::from([(
+            BudgetDimension::CostMicrounits,
+            BudgetAccount {
+                limit: 50,
+                reserved: 20,
+                spent: 30,
+            },
+        )]);
         let drained = PlanDrain {
             cancel: Vec::new(),
             pending: Vec::new(),
@@ -357,7 +422,7 @@ mod tests {
         let coverage = project_coverage(&machine, &drained, &exhausted, 5);
         // Local exhaustion only: remaining hits zero without touching
         // Control Reserve.
-        assert_eq!(coverage.budget_remaining, 0);
+        assert_eq!(coverage.budgets[0].remaining, 0);
         assert_eq!(coverage.next_safe_action, NextSafeAction::ExhaustedLocal);
     }
 }
