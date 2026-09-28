@@ -26,7 +26,9 @@ use eliot_backup::{
     CanonicalRecord, EventRange, ExportFence, HostStateAuditFence, OrsSnapshotFence,
     WatchdogSpoolFence,
 };
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{
+    EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_kernel::{
     CaptureBudgets, CaptureCallerAuth, CaptureEvidenceLevel, CaptureRequest, CaptureState,
     FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
@@ -407,6 +409,12 @@ fn generous_budgets() -> CaptureBudgets {
 /// Builds the real `CaptureRequest` from accepted owner evidence: the frozen
 /// plan carries the input class/source/schema (scope only for `ScopeExport`,
 /// bound from the export fence), and every evidence section crosses cloned.
+///
+/// The frozen plan's approved digests are the digests the carried artifacts
+/// actually record, because `capture` now refuses a plan that is not bound to
+/// the package actually being used. Inputs that carry no artifacts (the
+/// degraded and scope classes) keep a shape-valid placeholder, which the
+/// artifact gate does not read.
 fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
     let scope_id = match input.class {
         BackupClass::ScopeExport => input
@@ -416,6 +424,13 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
             .map(|scope| scope.as_str().to_owned()),
         _ => None,
     };
+    let approved = |kind: &str, fallback: String| {
+        input
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == kind)
+            .map_or(fallback, |artifact| artifact.sha256.clone())
+    };
     CaptureRequest {
         caller: admitted_caller(),
         plan: FrozenCapturePlan {
@@ -423,11 +438,12 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
             scope_id,
             source_adapter: input.source_adapter.clone(),
             schema_generation: input.schema_generation.clone(),
-            build_digest: "a".repeat(64),
-            policy_digest: "b".repeat(64),
+            build_digest: approved("host_dependency_build", "a".repeat(64)),
+            policy_digest: approved("policy", "b".repeat(64)),
             budgets: generous_budgets(),
         },
         export_fence: input.export_fence.clone(),
+        kernel_fence: input.export_fence.state_fence.clone(),
         canonical_events: input.canonical_events.clone(),
         projections: input.projections.clone(),
         receipts: input.receipts.clone(),
@@ -539,7 +555,10 @@ fn expected_disposition_keys(input: &BackupInput) -> Vec<String> {
         keys.push(format!("receipt:{}", receipt.operation_id));
     }
     for blob in &input.blobs {
-        keys.push(format!("blob:{}", blob.locator.hash.as_str()));
+        keys.push(format!(
+            "blob:{}",
+            sha256_hex(&canonical_json_bytes(&blob.locator.residency).expect("residency encodes"))
+        ));
     }
     for entry in &input.purge_ledger {
         keys.push(format!("purge:{}", entry.purge_id));
