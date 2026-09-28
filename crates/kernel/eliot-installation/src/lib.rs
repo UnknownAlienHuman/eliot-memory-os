@@ -7011,6 +7011,13 @@ fn is_credential_unknown_operation(value: &str) -> bool {
 /// `unknown(request, "<label>")` producer set of
 /// `bins/eliot-host/src/credential_control.rs`. A label outside it is never
 /// rewritten into a representable reference.
+///
+/// This includes the two labels `write_if_absent` returns dynamically: the
+/// ordinary credential-write failure and the pre-write target race. Both flow
+/// into the same `unknown(request, label)` continuation that names this
+/// request's own transaction/effect identity, so admitting them keeps the
+/// request-correlated reference — and the cause — instead of dissolving it
+/// into an unlabeled error string (issue #1352, X1).
 fn is_credential_unknown_reason(value: &str) -> bool {
     matches!(
         value,
@@ -7046,6 +7053,8 @@ fn is_credential_unknown_reason(value: &str) -> bool {
             | "credential-csprng"
             | "credential-envelope"
             | "credential-write-mismatch"
+            | "credential-write"
+            | "credential-target-prewrite-race"
             | "credential-envelope-digest"
             | "credential-final-marker"
             | "credential-final-marker-write"
