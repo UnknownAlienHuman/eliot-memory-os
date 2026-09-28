@@ -501,6 +501,7 @@ impl KernelComposition {
                 accepted_transport: None,
                 session: None,
                 activation_completed: false,
+                activated_binding: None,
             },
         );
         Ok(super::AgentBridgeHandshake {
@@ -1756,6 +1757,17 @@ impl KernelComposition {
         if state.activation_completed || state.session.is_some() {
             return Err(TransportError::IdentityConflict);
         }
+        // Retain the exact Resolved task/scope binding for later dispatch
+        // continuity (issue #1746). The revision must be the canonical
+        // decimal `TaskRevision`; anything else fails closed here, before any
+        // retained state is mutated.
+        let activated_task_revision = binding
+            .task_revision
+            .parse::<u64>()
+            .ok()
+            .filter(|revision| revision.to_string() == binding.task_revision)
+            .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
+            .ok_or(TransportError::SessionFenced)?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.
@@ -1766,6 +1778,12 @@ impl KernelComposition {
             session.session_epoch,
         )?;
         state.session = Some(session);
+        state.activated_binding = Some(super::ActivatedApplicationBinding {
+            session_id: binding.session_id.clone(),
+            task_id: binding.task_id.clone(),
+            work_scope_id: binding.work_scope_id.clone(),
+            task_revision: activated_task_revision,
+        });
         state.activation_completed = true;
         Ok(reply)
     }
