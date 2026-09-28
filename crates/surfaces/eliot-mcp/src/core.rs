@@ -1245,7 +1245,7 @@ fn dispatch_task_binding(
                 .metadata
                 .task_id
                 .as_ref()
-                .map(|id| id.as_str())
+                .map(eliot_contracts::TaskId::as_str)
                 .ok_or_else(|| {
                     BridgeError::invalid(
                         "identity.request.metadata.task_id",
