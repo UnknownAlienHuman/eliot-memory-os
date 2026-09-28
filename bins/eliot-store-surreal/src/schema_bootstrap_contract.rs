@@ -8,7 +8,9 @@ use eliot_contracts::StateFence;
 use eliot_installation::InstallationProfile;
 use eliot_platform::ClockObservation;
 use eliot_store_api::StoreError;
-use eliot_store_surreal_adapter::{AdapterError, CompiledMigration, MigrationReceipt};
+use eliot_store_surreal_adapter::{
+    ADAPTER_NAME, AdapterError, CompiledMigration, MigrationReceipt,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -226,10 +228,27 @@ impl StoreSchemaBootstrapBinding {
         Ok(())
     }
 
+    /// Projects the provider's migration receipt into the Store bootstrap
+    /// receipt.
+    ///
+    /// The provider receipt is only accepted when it was produced under this
+    /// launch's own state fence and against the bridge range the Store
+    /// publishes, so a receipt from another launch or another bridge cannot be
+    /// re-stamped as this bootstrap.
     pub(super) fn receipt(
         &self,
         migration: &MigrationReceipt,
     ) -> Result<StoreSchemaBootstrapReceipt, StoreSchemaBootstrapError> {
+        if migration.state_fence != self.state_fence {
+            return Err(StoreSchemaBootstrapError::Rejected(
+                "provider migration receipt was issued under a different state fence".to_owned(),
+            ));
+        }
+        if migration.bridge_range != ADAPTER_NAME {
+            return Err(StoreSchemaBootstrapError::Rejected(
+                "provider migration receipt names an incompatible bridge range".to_owned(),
+            ));
+        }
         let receipt = StoreSchemaBootstrapReceipt {
             installation_id: self.installation_id.clone(),
             generation: self.generation.clone(),

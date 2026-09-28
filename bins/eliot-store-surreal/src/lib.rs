@@ -2314,11 +2314,13 @@ mod tests {
         binding
             .validate_command(&command, &migration)
             .expect("exact SystemService command");
-        let provider_receipt = MigrationReceipt {
-            migration_id: migration.migration_id().to_owned(),
-            checksum_sha256: migration.checksum_sha256().to_owned(),
-            generation_after: migration.generation_after().clone(),
-        };
+        let provider_receipt = MigrationReceipt::applied(
+            &migration,
+            "test-store-data-root",
+            &config.runtime_launch.authority_state_fence,
+            eliot_store_surreal_adapter::PINNED_SURREALDB_MAJOR,
+            "test-provider-artifact-digest",
+        );
         let receipt = binding
             .receipt(&provider_receipt)
             .expect("typed authoritative receipt");
