@@ -3765,18 +3765,38 @@ impl RedbRecoveryStore {
     /// unresolved for the members being imported, and it records that answer on
     /// the receipt together with the typed verdict of the known-zero gate.
     ///
-    /// A new empty target never means old effects are resolved: `unresolved_count`
-    /// is counted from the outcomes, and a zero is trusted only when
-    /// `current_owner_validation` covers this receipt's members completely, is
-    /// bound to this snapshot, was read from the live recovery families, and
-    /// reports no still-unresolved identity.
+    /// A new empty target never means old effects are resolved, and a zero is
+    /// trusted only when three independent facts agree: the snapshot under
+    /// import — `snapshot`, the already-validated archive `import.snapshot_digest`
+    /// names, re-proved here by the ONE existing `OrsBackupSnapshot::validate`
+    /// against its own pages — declares a member roster the pages really carry;
+    /// `per_entry` provides exactly one outcome for every one of those members,
+    /// with a duplicate or foreign outcome refused; and
+    /// `current_owner_validation` was asked about all of them, is bound to this
+    /// snapshot, was read from the live recovery families, and reports no
+    /// still-unresolved identity. `unresolved_count` is derived from the
+    /// outcomes by the receipt constructor, never asserted beside them.
+    ///
+    /// A snapshot that does not establish that its pages are its whole
+    /// denominator — a truncated walk, a cursor-paged family with no declared
+    /// denominator, or an `Incomplete` archive — cannot establish a global
+    /// known-zero result and is refused, because the roster read off its pages
+    /// would be a roster of whatever it happened to carry (I05-16: absent
+    /// coverage means `unknown`, not complete).
     pub fn reconcile_backup_import(
         &self,
         import: &crate::backup_snapshot::OrsBackupImportRequest,
+        snapshot: &crate::backup_snapshot::OrsBackupSnapshot,
         per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
         import_at_ms: i64,
     ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
-        backup_snapshot::reconcile_import_receipt(&self.database, import, per_entry, import_at_ms)
+        backup_snapshot::reconcile_import_receipt(
+            &self.database,
+            import,
+            snapshot,
+            per_entry,
+            import_at_ms,
+        )
     }
 
     /// Replays a lost import response without any duplicate effect.

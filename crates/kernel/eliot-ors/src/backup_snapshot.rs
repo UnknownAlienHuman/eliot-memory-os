@@ -16,6 +16,17 @@
 //! directions. A zero `unresolved_count` is not a zero somebody validated, so
 //! it is not trusted. No blind retry.
 //!
+//! The same issue then found the denominator itself was the vector it checked:
+//! both the record's roster and the receipt's member set were projections of the
+//! one caller-supplied `per_entry` vector, so a missing import member compared
+//! equal and the gate could not fire. The expected set is now
+//! [`OrsBackupSnapshot::expected_member_roster`] — the member identities the
+//! validated archive itself declares, with family plus record identity — and
+//! [`OrsBackupImportReceipt::owner_validation_is_complete`] requires the
+//! expected members, the provided outcomes and the consulted roster to be three
+//! rosters that agree. `unresolved_count` is derived from the outcomes inside
+//! [`OrsBackupImportReceipt::new`] rather than asserted beside them.
+//!
 //! Issue #2884 adds the typed row-family cursor. A family that has no canonical
 //! operation order cannot share the operational `after_order` window, so it is
 //! paged by its own total order through [`OrsFamilyCursor`]: an owner-issued
@@ -1949,6 +1960,63 @@ impl OrsBackupSnapshot {
             self.versioned_artifact_family.as_ref(),
         )
     }
+    /// The member identities this snapshot's own pages declare, as the expected
+    /// denominator of a quarantined import (issue #953 import-denominator repair).
+    ///
+    /// This is the INDEPENDENT expected set the import reconciliation gate
+    /// compares against. It is derived from the snapshot, which is a value the
+    /// archive itself carries and which [`Self::validate`] has already proved
+    /// against its own contents, and from nothing else: no outcome vector, no
+    /// caller-supplied roster and no live read takes part in it. A caller that
+    /// wants a global known-zero result therefore has to present a snapshot whose
+    /// pages really are its whole denominator, or be refused.
+    ///
+    /// Two dispositions are accepted and no others, and the difference is the
+    /// whole point of the check (I05-13: "an incoherent ORS fence fails that class
+    /// rather than producing a partial 'successful' backup"; I05-16: absence of a
+    /// coverage record means `unknown`, not unrestricted/complete):
+    ///
+    /// - [`BackupCompleteness::Complete`], where every axis is exhausted and
+    ///   every declared denominator was counted against the pages.
+    /// - [`BackupCompleteness::Partial`] with
+    ///   [`BackupPartialReason::EmptyDenominator`], which is how a genuinely
+    ///   EMPTY but fully verified snapshot is representable: no axis owes a row,
+    ///   and an empty roster is a measured fact rather than a missing one. This is
+    ///   the case that keeps a real empty import representable, so the gate is not
+    ///   satisfied by a shortcut that refuses every empty snapshot.
+    ///
+    /// A snapshot that is `Partial` because an axis still owes rows, `Partial`
+    /// because a cursor-paged family was never given a denominator at all, or
+    /// `Incomplete` for any reason, cannot establish a global result: its pages
+    /// are not the whole denominator, so a roster read off them is a roster of
+    /// what the archive happened to carry. Those are
+    /// [`OrsError::ReconciliationMismatch`] — unknown stays reconciling
+    /// (I14-21), never a zero.
+    ///
+    /// [`check_observed_members`] runs before the roster is set, on both accepted
+    /// dispositions, because a repeated or self-contradicted member must be
+    /// refused rather than collapsed into one apparently-covered identity. On the
+    /// `Complete` arm `validate` has already run it; running it again is what
+    /// makes the `EmptyDenominator` arm equally safe.
+    pub fn expected_member_roster(&self) -> Result<Vec<(RowFamilyKind, String)>, OrsError> {
+        match &self.completeness {
+            BackupCompleteness::Complete => {}
+            BackupCompleteness::Partial {
+                reason: BackupPartialReason::EmptyDenominator,
+            } => {}
+            BackupCompleteness::Partial { .. } | BackupCompleteness::Incomplete { .. } => {
+                return Err(OrsError::ReconciliationMismatch);
+            }
+        }
+        check_observed_members(&self.pages)?;
+        let mut roster: BTreeSet<(RowFamilyKind, String)> = BTreeSet::new();
+        for page in &self.pages {
+            for entry in &page.entries {
+                roster.insert((entry.family, entry.record_id.clone()));
+            }
+        }
+        Ok(roster.into_iter().collect())
+    }
 }
 
 /// Requires a `Complete` snapshot to declare every family denominator and to owe
@@ -2861,6 +2929,16 @@ pub enum PerEntryOutcome {
 /// and not a number the validation declared about itself. A validation that
 /// covered fewer members, more members, or different members than the receipt
 /// carries is refused, which is the property a count could never express.
+///
+/// Since the issue #953 import-denominator repair the roster is NOT built from the
+/// import outcome vector any more. It is built from the SNAPSHOT's own declared
+/// member identities, established by the store before a single outcome is read,
+/// and reaches this record as a parameter. The previous derivation cloned, sorted
+/// and de-duplicated the very `per_entry` vector the record was supposed to police,
+/// so the completeness comparison in [`OrsBackupImportReceipt::known_zero_unresolved`]
+/// set-compared two projections of one caller-supplied list and could not observe a
+/// missing import member at all. The record now states which members the owner was
+/// asked about because an INDEPENDENT roster said they existed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CurrentOwnerValidation {
     /// Snapshot denominator digest this validation covers.
@@ -2869,7 +2947,8 @@ pub struct CurrentOwnerValidation {
     /// different snapshot answers a different question, so the gate refuses a
     /// validation whose digest is not this receipt's.
     pub snapshot_digest: String,
-    /// The COMPLETE set of record ids the current owner was asked about.
+    /// The COMPLETE set of record ids the current owner was asked about, taken
+    /// from the snapshot's declared member roster.
     pub validated_record_ids: Vec<String>,
     /// Identities the current owner still holds unresolved.
     pub unresolved_effect_identities: Vec<String>,
@@ -2964,6 +3043,17 @@ pub struct OrsBackupImportReceipt {
     pub snapshot_digest: String,
     pub source_installation: String,
     pub destination_installation: String,
+    /// The snapshot's OWN member roster, established independently of every
+    /// outcome below (issue #953 import-denominator repair).
+    ///
+    /// This is the expected set the completeness comparison is made against, and
+    /// it is recorded on the receipt rather than recomputed from `per_entry` for
+    /// exactly the reason the previous projection could not fire: a roster cloned
+    /// out of the outcome vector always agrees with the outcome vector, so an
+    /// import member that was never covered was invisible. The member identity is
+    /// the pair `(row family, record id)`, because the snapshot's record ids are
+    /// family-scoped and two families may legitimately carry the same id.
+    pub expected_members: Vec<(RowFamilyKind, String)>,
     /// Per-entry outcomes keyed by record id.
     pub per_entry: Vec<(String, PerEntryOutcome)>,
     pub unresolved_count: u64,
@@ -2990,23 +3080,41 @@ impl OrsBackupImportReceipt {
     /// A gate refusal is a verdict, not a construction failure, so it is
     /// recorded on the receipt and does not fail `new` — the caller reads the
     /// verdict and the standalone gate.
+    ///
+    /// `expected_members` replaces the `unresolved_count` parameter of the
+    /// previous signature. `unresolved_count` is now DERIVED here, in this one
+    /// place, from the validated `per_entry` vector: it used to be an independent
+    /// caller-supplied number, so a receipt could declare `0` beside a vector
+    /// full of [`PerEntryOutcome::Unresolved`] and the gate's last conjunct was
+    /// the only thing standing between the two facts and a false zero. The
+    /// denominator is now supplied instead of the count, because a completeness
+    /// check needs an independent EXPECTED set to compare against and a count can
+    /// never be one.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot_digest: String,
         source_installation: String,
         destination_installation: String,
+        expected_members: Vec<(RowFamilyKind, String)>,
         per_entry: Vec<(String, PerEntryOutcome)>,
-        unresolved_count: u64,
         import_at_ms: i64,
         current_owner_validation: CurrentOwnerValidation,
     ) -> Result<Self, OrsError> {
         require_digest(&snapshot_digest, "backup_snapshot_digest")?;
         require_installation_id(&source_installation, "source_installation_id")?;
         require_installation_id(&destination_installation, "destination_installation_id")?;
+        // ONE derivation of the unresolved count, from the outcomes themselves.
+        let unresolved_count = per_entry
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, PerEntryOutcome::Unresolved { .. }))
+            .count();
+        let unresolved_count =
+            u64::try_from(unresolved_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
         let mut receipt = Self {
             snapshot_digest,
             source_installation,
             destination_installation,
+            expected_members,
             per_entry,
             unresolved_count,
             import_at_ms,
@@ -3045,10 +3153,20 @@ impl OrsBackupImportReceipt {
     /// 2. `owner.snapshot_digest == self.snapshot_digest` — bound to THIS
     ///    operation, so a well-formed validation of a different snapshot cannot
     ///    vouch for this one;
-    /// 3. `owner.validated_record_ids` set-equals the record-id set of
-    ///    `self.per_entry` — the completeness comparison. Fewer members, more
-    ///    members or different members are all refused; a count would not
-    ///    distinguish any of them;
+    /// 3. FULL COVERAGE of the snapshot's own member roster. This is the
+    ///    prerequisite of `Satisfied`, and it is a comparison against an
+    ///    INDEPENDENT expected set: the receipt's [`Self::expected_members`],
+    ///    which the store established from the validated snapshot before it read
+    ///    a single outcome. Three sets must agree —
+    ///    [`Self::expected_members`] (what the snapshot declares),
+    ///    `self.per_entry` (what the caller actually triaged) and
+    ///    `owner.validated_record_ids` (what the current owner was asked about) —
+    ///    and every one of them must be a roster, with a duplicate outcome
+    ///    refused rather than collapsed. Fewer members, more members, different
+    ///    members or a repeated outcome are all refused; a count equality could
+    ///    not distinguish any of them, and neither could a comparison of two
+    ///    projections of the caller's own outcome vector, which is what this
+    ///    check used to be;
     /// 4. `owner.unresolved_effect_identities` is empty — the current owner
     ///    still holds nothing unresolved for what it was asked about;
     /// 5. `owner.consulted_families` contains BOTH
@@ -3056,7 +3174,10 @@ impl OrsBackupImportReceipt {
     ///    [`RowFamilyKind::RecoveryProblems`] — a validation that did not read
     ///    the current owner's live recovery state proves nothing about it;
     /// 6. `unresolved_count == 0` and no `per_entry` outcome is
-    ///    [`PerEntryOutcome::Unresolved`].
+    ///    [`PerEntryOutcome::Unresolved`]. `unresolved_count` is no longer an
+    ///    independently supplied number: it is derived from `per_entry` inside
+    ///    [`Self::new`], so it is a restatement of the facts rather than a
+    ///    second claim about them.
     ///
     /// Every refusal is [`OrsError::ReconciliationMismatch`]: I14-21 — unknown
     /// stays reconciling, and a zero that nobody validated is unknown, not
@@ -3091,28 +3212,67 @@ impl OrsBackupImportReceipt {
             Err(OrsError::ReconciliationMismatch)
         }
     }
-    /// Compares the validation's asked-about roster with this receipt's members
-    /// in BOTH directions.
+    /// Requires FULL COVERAGE of the snapshot's own member roster by the
+    /// provided outcomes and by the roster the current owner was consulted about.
     ///
-    /// Two distinct failures, both refused and neither reachable from the
-    /// other: a validation that covered a SUBSET leaves members the current
-    /// owner never spoke about, and one that covered a SUPERSET (or a different
-    /// set) answers a question this receipt is not. Comparing sets rather than
-    /// lengths is what makes the difference observable at all — the W31 producer
-    /// set completeness from the same untrusted import vector it was validating,
-    /// so its length always agreed and its gate could never fire.
+    /// This is the owner's rule-10(d) check, and its whole content is that the
+    /// expected set is INDEPENDENT of the thing being checked.
+    /// [`Self::expected_members`] is the member roster the validated snapshot
+    /// declares; `self.per_entry` is what the caller actually triaged; and
+    /// `owner.validated_record_ids` is what the current owner was asked about.
+    /// The previous implementation compared the last two only, and both were
+    /// projections of the SAME caller-supplied `per_entry` vector, so a missing
+    /// import member, a subset, a foreign outcome and a duplicated outcome all
+    /// compared equal and the gate could never fire.
+    ///
+    /// Five distinct failures, none reachable from another, each of which the
+    /// import is refused for:
+    ///
+    /// 1. the expected roster repeats a member identity — it is not a roster;
+    /// 2. two DIFFERENT expected members share one record id. The outcome
+    ///    vocabulary is record-id keyed, so one id under two families cannot be
+    ///    covered by two outcomes and is refused rather than half-covered;
+    /// 3. the provided outcomes repeat a record id — a duplicate outcome is
+    ///    contradictory evidence, not a second member, and is refused rather
+    ///    than de-duplicated into apparent success;
+    /// 4. the provided outcomes and the expected roster differ in either
+    ///    direction: a subset leaves a member nobody triaged, a foreign or
+    ///    superset answers a question this receipt is not;
+    /// 5. the consulted roster and the expected roster differ in either
+    ///    direction, so the current owner was never asked about some member, or
+    ///    was asked about one this receipt does not carry.
+    ///
+    /// Sets rather than lengths, because a length cannot tell a subset from a
+    /// superset from a different set of the same size.
     fn owner_validation_is_complete(&self, owner: &CurrentOwnerValidation) -> bool {
-        let asked: BTreeSet<&str> = owner
-            .validated_record_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let members: BTreeSet<&str> = self
-            .per_entry
-            .iter()
-            .map(|(record_id, _)| record_id.as_str())
-            .collect();
-        asked == members
+        let mut expected: BTreeSet<(RowFamilyKind, &str)> = BTreeSet::new();
+        for (family, record_id) in &self.expected_members {
+            if !expected.insert((*family, record_id.as_str())) {
+                // Failure 1.
+                return false;
+            }
+        }
+        let expected_ids: BTreeSet<&str> =
+            expected.iter().map(|(_, record_id)| *record_id).collect();
+        if expected_ids.len() != expected.len() {
+            // Failure 2: one record id declared under two row families.
+            return false;
+        }
+        let mut provided: BTreeSet<&str> = BTreeSet::new();
+        for (record_id, _) in &self.per_entry {
+            if !provided.insert(record_id.as_str()) {
+                // Failure 3.
+                return false;
+            }
+        }
+        let mut consulted: BTreeSet<&str> = BTreeSet::new();
+        for record_id in &owner.validated_record_ids {
+            if !consulted.insert(record_id.as_str()) {
+                return false;
+            }
+        }
+        // Failures 4 and 5.
+        provided == expected_ids && consulted == expected_ids
     }
 }
 /// Reject imports that relabel identity or arrive without bound evidence.

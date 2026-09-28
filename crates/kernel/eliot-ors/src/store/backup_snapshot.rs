@@ -252,10 +252,30 @@
 //! of `OrsBackupImportReceipt::known_zero_unresolved`. That gate then refuses
 //! unless the validation is bound to this snapshot, covers exactly this
 //! receipt's members, read both live recovery families, and reports no
-//! still-unresolved identity. The completeness comparison is deliberately NOT
-//! derived from the untrusted import vector's own length: a validation whose
-//! asked-about roster is built from the vector it is meant to police can never
-//! disagree with it, and its gate could then never fire.
+//! still-unresolved identity.
+//!
+//! The same issue then measured that this was still circular, and repaired it.
+//! The roster `observe_current_owner_validation` recorded was a clone of the very
+//! `per_entry` vector it was meant to police, and the gate compared that clone
+//! with the receipt's copy of the same vector, so a valid nonempty snapshot whose
+//! member was never triaged compared equal on both sides and reported a known
+//! zero; the live scans could not catch it either, because they only look for
+//! unresolved rows whose identifier already occurs in the roster they were
+//! handed. `reconcile_import_receipt` now takes the ALREADY-VALIDATED snapshot
+//! the import request names by `snapshot_digest`, proves it with the ONE existing
+//! `OrsBackupSnapshot::validate` (which re-derives the declared denominator from
+//! the snapshot's own pages), compares the snapshot's original recorded
+//! `denominator_digest` against `import.snapshot_digest`, verifies the source
+//! identity, and takes the expected roster from
+//! `OrsBackupSnapshot::expected_member_roster` — family plus record identity, and
+//! a refusal unless the snapshot is `Complete` or is a verified empty one. No
+//! second registry and no invented digest: the archive the caller already holds is
+//! the only source. `unresolved_count` is derived inside the receipt constructor
+//! from the outcomes instead of being asserted beside them, and the coverage check
+//! requires the expected members, the provided outcomes and the consulted roster
+//! to be three rosters that agree, with a duplicate, foreign or missing outcome
+//! refused rather than de-duplicated. `reconcile_lost_import_response` stays
+//! historical: it re-evaluates the two recorded halves and reads no live state.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -3662,6 +3682,52 @@ fn triage_entry(
     }))
 }
 
+/// Establishes the EXPECTED member roster of the snapshot under import,
+/// independently of every import outcome (issue #953 import-denominator repair).
+///
+/// The denominator comes from the archive itself and from nothing else:
+///
+/// 1. [`OrsBackupSnapshot::validate`] is run on the presented snapshot. That is
+///    the ONE existing validator, applied to the ORIGINAL recorded value: it
+///    re-derives `denominator_digest` from the snapshot's own pages, frozen
+///    identities and entry roster and refuses a declared value that does not
+///    equal it, so the value compared below is proved rather than recomputed over
+///    whatever this function happens to hold.
+/// 2. The snapshot's own source identity must equal `import.source`. A receipt
+///    for one installation's snapshot cannot be reconciled under another's
+///    import request, and the schema version travels inside the identity, so an
+///    unsupported source is refused here too.
+/// 3. The snapshot's ORIGINAL recorded `denominator_digest` must equal
+///    `import.snapshot_digest`. This is a comparison of the recorded value
+///    against the import's recorded value, not a digest recomputed over the
+///    outcomes.
+/// 4. [`OrsBackupSnapshot::expected_member_roster`] then reads the member
+///    identities off the proved pages, and refuses a snapshot that does not
+///    establish that its pages are its whole denominator.
+///
+/// NO second registry, NO permanent snapshot table and NO invented digest is
+/// introduced: the snapshot the caller already holds is the single source, and
+/// the audited snapshot owner remains the only producer of one.
+fn expected_import_roster(
+    snapshot: &OrsBackupSnapshot,
+    import: &OrsBackupImportRequest,
+) -> Result<Vec<(RowFamilyKind, String)>, OrsError> {
+    snapshot.validate()?;
+    if snapshot.source != import.source {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "backup_import_source",
+            reason: format!(
+                "the snapshot under import was captured from installation {:?} generation {} and is not the source this import request declares",
+                snapshot.source.installation_id, snapshot.source.ors_generation
+            ),
+        });
+    }
+    if snapshot.denominator_digest != import.snapshot_digest {
+        return Err(OrsError::PayloadIntegrityMismatch);
+    }
+    snapshot.expected_member_roster()
+}
+
 /// Observes the CURRENT owner of ORS recovery effects for one import's member
 /// set, inside the caller's read transaction (issue #953, A17).
 ///
@@ -3677,6 +3743,20 @@ fn triage_entry(
 /// crate's own: unresolved problems never expire automatically, so absence of a
 /// terminal receipt is a live obligation rather than a cleanup horizon.
 ///
+/// `expected_members` — NOT the outcome vector — is the source of truth for what
+/// the current owner is asked about (issue #953 import-denominator repair). It is
+/// the roster [`expected_import_roster`] established from the validated snapshot
+/// before a single outcome was read. The previous signature took `per_entry` and
+/// cloned, sorted and de-duplicated it into `validated_record_ids`, so the record
+/// stated the caller's own list back to it and
+/// [`OrsBackupImportReceipt::owner_validation_is_complete`] compared two
+/// projections of one vector: a missing import member, a subset, a foreign
+/// outcome and a duplicated outcome all compared equal, and the live scans below
+/// could not detect any of them because they only look for unresolved rows whose
+/// identifier already occurs in the roster they were given. The record now
+/// answers for the members the ARCHIVE declares, and a caller that triaged fewer
+/// of them is caught by the coverage comparison rather than by a row scan.
+///
 /// Takes `&ReadTransaction` and never calls `load_recovery_problem` or
 /// `list_recovery_problems`, because each of those opens its OWN `begin_read()`
 /// and would therefore observe a different moment than the transaction this
@@ -3689,17 +3769,21 @@ fn triage_entry(
 fn observe_current_owner_validation(
     read: &ReadTransaction,
     snapshot_digest: &str,
-    per_entry: &[(String, PerEntryOutcome)],
+    expected_members: &[(RowFamilyKind, String)],
     validated_at_ms: i64,
 ) -> Result<CurrentOwnerValidation, OrsError> {
-    // The roster the current owner is being asked about, indexed once so the two
-    // bounded scans below are a membership test per row rather than a linear
-    // search per row against the whole member list. Sorted and de-duplicated
-    // because the record states the COMPLETE set that was asked about, and a
-    // repeated ask of one member is not a second member.
-    let mut validated_record_ids: Vec<String> = per_entry
+    // The roster the current owner is being asked about, taken from the snapshot
+    // and indexed once so the two bounded scans below are a membership test per
+    // row rather than a linear search per row against the whole member list.
+    // Sorted and de-duplicated because the record states the COMPLETE set that
+    // was asked about and a repeated ask of one member is not a second member.
+    // Family plus record identity is preserved on the expected side; a record id
+    // declared under two families is refused by the receipt's coverage check
+    // rather than half-covered here, because the outcome vocabulary is keyed by
+    // record id alone.
+    let mut validated_record_ids: Vec<String> = expected_members
         .iter()
-        .map(|(record_id, _)| record_id.clone())
+        .map(|(_, record_id)| record_id.clone())
         .collect();
     validated_record_ids.sort();
     validated_record_ids.dedup();
@@ -3781,12 +3865,27 @@ fn observe_current_owner_validation(
 
 /// Reconciles per-entry quarantine outcomes into one import receipt.
 ///
-/// Binds `import.snapshot_digest` with the source/destination installations
-/// and the full per-entry outcome vector via
-/// [`OrsBackupImportReceipt::new`], which validates every shape. Emits no
-/// store writes: receipt building is a pure function over already-triaged
-/// outcomes, and the one store read it performs is the read that observes the
-/// current owner for [`CurrentOwnerValidation`].
+/// The EXPECTED denominator is established FIRST and from the snapshot, by
+/// [`expected_import_roster`], before a single outcome is read. That ordering is
+/// the whole repair (issue #953 import-denominator repair): the previous signature
+/// took only `per_entry`, derived the validation's roster from it and compared
+/// the two, so a valid nonempty snapshot whose member was never triaged produced
+/// `Satisfied` — the producer built an empty roster, the receipt carried an empty
+/// member set, both live families were read, the unresolved count was zero, and
+/// the gate reported a known zero for a member nobody had covered.
+///
+/// `snapshot` is the already-validated archive the import request names by
+/// `snapshot_digest`. It is the retained exact reference resolved through the
+/// existing snapshot owner, not a second registry: this crate stores no snapshot
+/// table and invents no digest of its own.
+///
+/// Binds `import.snapshot_digest` with the source/destination installations, the
+/// expected roster and the full per-entry outcome vector via
+/// [`OrsBackupImportReceipt::new`], which validates every shape and derives the
+/// unresolved count from the outcomes. Emits no store writes: receipt building is
+/// a pure function over an already-proved snapshot and already-triaged outcomes,
+/// and the one store read it performs is the read that observes the current owner
+/// for [`CurrentOwnerValidation`].
 ///
 /// It opens that read ITSELF (rather than taking a `&ReadTransaction`) and hands
 /// it to [`observe_current_owner_validation`], so the current owner's answer and
@@ -3796,18 +3895,18 @@ fn observe_current_owner_validation(
 pub(super) fn reconcile_import_receipt(
     database: &Database,
     import: &OrsBackupImportRequest,
+    snapshot: &OrsBackupSnapshot,
     per_entry: &[(String, PerEntryOutcome)],
     import_at_ms: i64,
 ) -> Result<OrsBackupImportReceipt, OrsError> {
-    let unresolved_count = per_entry
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, PerEntryOutcome::Unresolved { .. }))
-        .count();
-    let unresolved_count =
-        u64::try_from(unresolved_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let expected_members = expected_import_roster(snapshot, import)?;
     let read = database.begin_read().map_err(storage)?;
-    let current_owner_validation =
-        observe_current_owner_validation(&read, &import.snapshot_digest, per_entry, import_at_ms)?;
+    let current_owner_validation = observe_current_owner_validation(
+        &read,
+        &import.snapshot_digest,
+        &expected_members,
+        import_at_ms,
+    )?;
     drop(read);
     // `new` is the receipt builder and it runs the known-zero gate against this
     // freshly observed validation, recording the typed verdict on the receipt.
@@ -3815,8 +3914,8 @@ pub(super) fn reconcile_import_receipt(
         import.snapshot_digest.clone(),
         import.source.installation_id.clone(),
         import.destination.installation_id.clone(),
+        expected_members,
         per_entry.to_vec(),
-        unresolved_count,
         import_at_ms,
         current_owner_validation,
     )
@@ -3836,6 +3935,16 @@ pub(super) fn reconcile_import_receipt(
 /// store read happens here either — the recorded validation is the record, and
 /// re-reading live state would make a replay's answer depend on when it was
 /// replayed rather than on what it attests.
+///
+/// Replay therefore remains HISTORICAL and cannot manufacture fresh current-owner
+/// evidence (issue #953 import-denominator repair, step 6). It re-derives nothing:
+/// the receipt's `expected_members` and `current_owner_validation` are the two
+/// halves recorded by the original `reconcile_import_receipt` for the SAME
+/// snapshot and the same import operation, and the coverage check compares those
+/// recorded halves. A receipt built from an incomplete roster is already refused
+/// by that check, and a replay of it stays refused; there is no re-triage, no
+/// blind effect retry and no path here that reads live state or re-derives a
+/// roster.
 pub(super) fn reconcile_lost_import_response(
     prior: &OrsBackupImportReceipt,
 ) -> OrsBackupImportReceipt {
