@@ -577,6 +577,13 @@ impl AgentCoordinator {
             lane.budget
                 .is_within(&work.budget)
                 .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            lane.budget
+                .is_within(&request.recipe.budget)
+                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            // A role may not admit effect kinds or external-effect counts
+            // excluded by its manifest. Scope containment remains unresolved
+            // until owner-validated manifest evidence is available.
+            validate_effect_ceiling(&work.effect_ceiling, &role.allowed_effects)?;
             if !role
                 .required_competence
                 .iter()
@@ -2577,6 +2584,11 @@ impl AgentCoordinator {
 fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError> {
     validate_text(request.recipe.recipe_id.as_str(), "recipe_id")?;
     validate_text(request.recipe.manifest_revision.as_str(), "recipe_revision")?;
+    request
+        .recipe
+        .schema_identity
+        .validate()
+        .map_err(provider_contract)?;
     validate_text(
         request.recipe.route_policy_revision.as_str(),
         "route_policy_revision",
@@ -2584,17 +2596,45 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
     if request.recipe.max_lanes == 0 || request.recipe.role_profiles.is_empty() {
         return Err(CoordinatorError::InvalidField("recipe"));
     }
-    if request.recipe.max_descendants > request.launch.cumulative_descendant_budget.max_descendants
+    request
+        .recipe
+        .budget
+        .validate()
+        .map_err(provider_contract)?;
+    request
+        .recipe
+        .budget
+        .is_within(&request.launch.cumulative_descendant_budget)
+        .map_err(|_| CoordinatorError::BudgetExceeded)?;
+    if request.recipe.max_descendants > request.recipe.budget.max_descendants
+        || request.recipe.max_descendants
+            > request.launch.cumulative_descendant_budget.max_descendants
     {
         return Err(CoordinatorError::BudgetExceeded);
     }
+
+    validate_recipe_references(&request.recipe)?;
+
     let mut roles = BTreeSet::new();
     for role in &request.recipe.role_profiles {
         validate_text(role.role_id.as_str(), "role_id")?;
         validate_text(role.manifest_revision.as_str(), "role_revision")?;
+        role.schema_identity.validate().map_err(provider_contract)?;
+        role.allowed_effects.validate().map_err(provider_contract)?;
         if role.required_competence.is_empty() || role.allowed_route_classes.is_empty() {
             return Err(CoordinatorError::InvalidField("role_profile"));
         }
+        validate_manifest_references(
+            &role.allowed_operations,
+            "role_profile.allowed_operations",
+            false,
+        )?;
+        validate_manifest_reference(&role.independence_requirement)?;
+        validate_manifest_references(&role.input_schemas, "role_profile.input_schemas", false)?;
+        validate_manifest_references(&role.output_schemas, "role_profile.output_schemas", false)?;
+        validate_manifest_reference(&role.visibility_policy)?;
+        validate_manifest_reference(&role.stop_condition)?;
+        validate_manifest_reference(&role.escalation_policy)?;
         for value in role
             .required_competence
             .iter()
@@ -2605,6 +2645,72 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
         if !roles.insert(role.role_id.clone()) {
             return Err(CoordinatorError::DuplicateIdentity("role_id"));
         }
+    }
+    Ok(())
+}
+
+fn validate_recipe_references(recipe: &crate::RecipeManifest) -> Result<(), CoordinatorError> {
+    validate_manifest_references(&recipe.stage_templates, "recipe.stage_templates", true)?;
+    validate_manifest_references(
+        &recipe.work_item_templates,
+        "recipe.work_item_templates",
+        true,
+    )?;
+    validate_manifest_references(
+        &recipe.dependency_templates,
+        "recipe.dependency_templates",
+        false,
+    )?;
+    validate_manifest_references(&recipe.merge_templates, "recipe.merge_templates", false)?;
+    validate_manifest_references(
+        &recipe.expansion_conditions,
+        "recipe.expansion_conditions",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.contraction_conditions,
+        "recipe.contraction_conditions",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.verifier_requirements,
+        "recipe.verifier_requirements",
+        false,
+    )?;
+    validate_manifest_references(
+        &recipe.audit_requirements,
+        "recipe.audit_requirements",
+        false,
+    )?;
+    validate_manifest_reference(&recipe.partial_result_behavior)?;
+    validate_manifest_reference(&recipe.failure_behavior)?;
+    if recipe.eligible_route_classes.is_empty() {
+        return Err(CoordinatorError::InvalidField(
+            "recipe.eligible_route_classes",
+        ));
+    }
+    for route_class in &recipe.eligible_route_classes {
+        validate_text(route_class, "recipe.eligible_route_class")?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_reference(
+    reference: &eliot_agent_contracts::PublicReference,
+) -> Result<(), CoordinatorError> {
+    reference.validate().map_err(provider_contract)
+}
+
+fn validate_manifest_references(
+    references: &[eliot_agent_contracts::PublicReference],
+    field: &'static str,
+    required: bool,
+) -> Result<(), CoordinatorError> {
+    if required && references.is_empty() {
+        return Err(CoordinatorError::InvalidField(field));
+    }
+    for reference in references {
+        validate_manifest_reference(reference)?;
     }
     Ok(())
 }
@@ -2679,7 +2785,8 @@ fn select_route(
             Some(REJECT_CAPACITY_MISMATCH)
         } else if candidate.capacity_limit == 0 {
             Some(REJECT_NO_CAPACITY)
-        } else if !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
+        } else if !route_class_allowed(&request.recipe.eligible_route_classes, &candidate.route)
+            || !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
             || !route_class_allowed(&role.allowed_route_classes, &candidate.route)
         {
             Some(REJECT_ROUTE_CLASS)
@@ -2781,7 +2888,7 @@ fn select_route(
 /// is an owner-defined property, not necessarily the provider name. The model
 /// display name never satisfies a class constraint on its own: model-name
 /// inference is forbidden, so a class naming only a model stays ineligible.
-/// Both the launch and the role allowlists must admit the candidate.
+/// The recipe, launch, and role allowlists must all admit the candidate.
 fn route_class_allowed(
     allowed_route_classes: &[String],
     route: &eliot_agent_api::RouteFingerprint,

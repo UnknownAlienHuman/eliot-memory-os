@@ -1,15 +1,15 @@
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, BudgetEnvelope, CancelReason,
-    EpochId, EventId, HostEventNormalizationReceipt, HostEventQuarantineReason, LaunchRequestId,
-    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
-    WorkUnitId,
+    EffectCeiling, EpochId, EventId, HostEventNormalizationReceipt, HostEventQuarantineReason,
+    LaunchRequestId, NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ResultDisposition, RouteFingerprint, RouteSelectionCandidate,
+    StateFence, TaskId, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
-    ParentFinishCeiling, RevisionId,
+    ParentFinishCeiling, PublicReference, RevisionId,
 };
-use eliot_contracts::LowercaseSha256;
+use eliot_contracts::{ContractIdentity, LowercaseSha256};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_kernel_core::NormalWorkClass;
 use eliot_receipts::ProofCeiling;
@@ -166,24 +166,69 @@ pub enum ProviderBindingSnapshot {
     Verified { identity: ProviderIdentity },
 }
 
+/// Closed learning responsibility from I10.15. The role name is semantic and
+/// independent from any provider, model, or route identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningRole {
+    Actor,
+    Refiner,
+    Evaluator,
+    PromotionOwner,
+    NotApplicable,
+}
+
+/// Role profile contract. `manifest_revision` is its opaque version;
+/// `schema_identity` and `content_digest` are separate declared identities.
+/// The digest type checks its lowercase SHA-256 shape, but this inline
+/// candidate has no source bytes from which to recompute or approve it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleProfileManifest {
     pub role_id: RoleProfileId,
     pub manifest_revision: RevisionId,
+    pub schema_identity: ContractIdentity,
+    pub content_digest: LowercaseSha256,
     pub required_competence: Vec<String>,
+    pub allowed_operations: Vec<PublicReference>,
+    pub allowed_effects: EffectCeiling,
+    pub independence_requirement: PublicReference,
+    pub input_schemas: Vec<PublicReference>,
+    pub output_schemas: Vec<PublicReference>,
+    pub visibility_policy: PublicReference,
+    pub learning_role: LearningRole,
+    pub stop_condition: PublicReference,
+    pub escalation_policy: PublicReference,
     pub allowed_route_classes: Vec<String>,
     pub mutation_capable: bool,
 }
 
+/// Recipe manifest contract. The revision is opaque and separate from the
+/// schema identity and content digest. The digest is shape-checked only; it
+/// is not recomputed from source bytes or treated as owner approval.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeManifest {
     pub recipe_id: RecipeId,
     pub manifest_revision: RevisionId,
+    pub schema_identity: ContractIdentity,
+    pub content_digest: LowercaseSha256,
     pub route_policy_revision: RevisionId,
     pub max_lanes: usize,
     pub max_descendants: u32,
+    pub stage_templates: Vec<PublicReference>,
+    pub work_item_templates: Vec<PublicReference>,
+    pub dependency_templates: Vec<PublicReference>,
+    pub merge_templates: Vec<PublicReference>,
+    pub eligible_route_classes: Vec<String>,
+    pub expansion_conditions: Vec<PublicReference>,
+    pub contraction_conditions: Vec<PublicReference>,
+    pub verifier_requirements: Vec<PublicReference>,
+    pub audit_requirements: Vec<PublicReference>,
+    pub budget: BudgetEnvelope,
+    pub partial_result_behavior: PublicReference,
+    pub failure_behavior: PublicReference,
+    /// The profiles in this list are the role set eligible for the recipe.
     pub role_profiles: Vec<RoleProfileManifest>,
 }
 
