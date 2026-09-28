@@ -32,11 +32,12 @@ use eliot_store_api::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_RESERVED_WRITE, CommitId, EFFECTS, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedScopeBinding, ReservedWriteRequest,
-    Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError,
-    StoreRequest, StoreResponse, TransitionClass, WriteAdmissionParams, WriteAdmissionProjection,
-    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, bind_issue18_digests,
-    bind_issue18_receipt, decode_request_frame, decode_response_frame,
+    OrderingScopeId, PolicyConfigSchemaVersions, PreparedTransition, RequestMeta,
+    ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
+    ScopeId, SecurityContext, StoreError, StoreRequest, StoreResponse, TransitionClass,
+    WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
+    WriterEpochBinding, bind_issue18_digests, bind_issue18_receipt,
+    bind_policy_config_schema_versions, decode_request_frame, decode_response_frame,
     issue_store_receipt_envelope, request_frame, response_frame,
 };
 use serde_json::{Value, json};
@@ -202,12 +203,16 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
         admission_digest: String::new(),
         mutation_plan_digest: String::new(),
         semantic_source_revisions: Vec::new(),
+        // I5.19: bound from the admitted transition through the production
+        // binder, never defaulted.
+        policy_config_schema_versions: PolicyConfigSchemaVersions::bound_to(transition),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
         envelope: None,
     };
     bind_issue18_receipt(transition, &mut receipt, &request.expected_revision_heads);
+    bind_policy_config_schema_versions(transition, &mut receipt);
     receipt.envelope =
         Some(issue_store_receipt_envelope(&request.context, transition, &receipt, 1).unwrap());
     receipt.validate().unwrap();

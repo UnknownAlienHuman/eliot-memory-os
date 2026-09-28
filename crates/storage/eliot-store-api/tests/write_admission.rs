@@ -1099,6 +1099,15 @@ impl StubClient {
             admission_digest: "d".repeat(64),
             mutation_plan_digest: "c".repeat(64),
             semantic_source_revisions: Vec::new(),
+            // I5.19: no `PreparedTransition` is in scope in this stub, so the
+            // record is built explicitly from the crate's own in-force
+            // constants. `fence()` carries no policy binding, so
+            // `policy_revision` is `None` and still agrees with the fence.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+                policy_revision: fence().policy_revision,
+                config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+                schema_revision: eliot_store_api::CONTRACT_VERSION,
+            },
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

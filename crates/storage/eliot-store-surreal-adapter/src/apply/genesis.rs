@@ -12,8 +12,9 @@ use crate::schema;
 use eliot_store_api::{
     CommitId, MAX_DIGEST_DETAIL_CHARS, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     Resubmission, StoreError, StoreGenesisRequest, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, bind_issue18_receipt, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
+    WriteReceiptStatus, bind_issue18_receipt, bind_policy_config_schema_versions, genesis_manifest,
+    genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
+    validate_genesis_receipt_envelope,
 };
 
 use super::receipt_reconciliation::read_receipt_by_operation;
@@ -298,12 +299,18 @@ pub(super) fn genesis_receipt(
         admission_digest: issue18_transition.admission_digest.clone(),
         mutation_plan_digest: issue18_transition.mutation_plan_digest.clone(),
         semantic_source_revisions: Vec::new(),
+        // I5.19: bound from the canonical genesis transition below, never
+        // defaulted; equality is enforced by the genesis receipt-issuing path.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            &issue18_transition,
+        ),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
         envelope: None,
     };
     bind_issue18_receipt(&issue18_transition, &mut receipt, &[]);
+    bind_policy_config_schema_versions(&issue18_transition, &mut receipt);
     receipt.envelope = Some(issue_genesis_receipt_envelope(
         context,
         request,

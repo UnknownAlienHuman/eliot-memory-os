@@ -2343,6 +2343,17 @@ fn restore_executor_imports_non_erasure_receipt_untouched() {
         admission_digest: "e".repeat(64),
         mutation_plan_digest: "f".repeat(64),
         semantic_source_revisions: Vec::new(),
+        // I5.19: standalone control fixture with no `PreparedTransition` in
+        // scope, so the record is built explicitly from the store API's own
+        // in-force constants. The fence below carries no policy binding, so
+        // `policy_revision` is `None` and still agrees with it, which keeps
+        // `control.validate()` below passing.
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: StateFence::new(epoch(1), ResourceGeneration::genesis())
+                .policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
         error_code: None,
         resubmission: eliot_store_api::Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
