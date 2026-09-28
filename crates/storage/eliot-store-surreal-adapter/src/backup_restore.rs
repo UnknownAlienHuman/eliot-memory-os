@@ -2504,11 +2504,16 @@ async fn read_destination_heads(
             observed.push(None);
             continue;
         };
-        observed.push(
+        // A head the destination DOES publish must carry its value; a present
+        // record whose value field is missing or not a `u64` is a malformed
+        // receipt, not an absent head, so it refuses instead of being reported
+        // as `None`. `None` above is reserved for the one case it means: the
+        // destination publishes no head at this key.
+        observed.push(Some(
             body.get(field)
                 .and_then(serde_json::Value::as_u64)
                 .ok_or(StoreError::InvalidReceipt)?,
-        );
+        ));
     }
     Ok(observed)
 }
