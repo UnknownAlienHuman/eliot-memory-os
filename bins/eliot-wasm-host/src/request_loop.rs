@@ -4270,7 +4270,7 @@ fn require_ready_publication(
 ) -> Result<(), OrdinaryDriveError> {
     let identity = claim.identity();
     match crate::dispatch_material::read_delivery_publication(directory, identity)
-        .map_err(OrdinaryDriveError::Drive)?
+        .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
     {
         Some(state) if state.is_ready() && state.names(identity) => Ok(()),
         Some(state) if !state.is_ready() => {
