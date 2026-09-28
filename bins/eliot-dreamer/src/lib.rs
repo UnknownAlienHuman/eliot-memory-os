@@ -19,6 +19,7 @@ use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 mod admitted_material;
 mod bundle_stage;
 mod controller;
+mod curation_pulse;
 mod curation_screen_stage;
 mod dispatch_stage;
 mod error;
@@ -33,6 +34,11 @@ mod validation_stage;
 #[cfg(test)]
 mod pipeline_e2e;
 
+pub use curation_pulse::{
+    CURATION_EDGE_PROOF_CEILING, CURATION_PACKAGE_PROOF_CEILING, CURATION_PULSE_ROUTE,
+    CURATION_PULSE_SCHEMA_VERSION, CurationMemberFinding, CurationProductPulse,
+    CurationPulseDisposition,
+};
 pub use error::DreamerError;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
@@ -935,6 +941,12 @@ pub enum DreamResult {
         job_id: String,
         candidates: Vec<CurationCandidate>,
         provenance: Vec<String>,
+        /// Narrow observed record of the real admitted Curation route that
+        /// produced this result: route, source/policy/fence identities, result
+        /// disposition, explicit omissions, and proof ceiling. Present on every
+        /// routed Curation result, so the receipt can never be a bare candidate
+        /// list detached from the operation that produced it.
+        pulse: CurationProductPulse,
     },
     Clarification {
         job_id: String,
@@ -1120,17 +1132,35 @@ fn build_result(input: &DreamJobInput) -> DreamResult {
     }
     if input.job_class == JobClass::Curation {
         let handles = all_handles(input);
-        return DreamResult::Curation {
-            job_id: input.job_id.clone(),
-            candidates: handles.iter().enumerate().map(|(index, handle)| CurationCandidate {
+        let candidates: Vec<CurationCandidate> = handles
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| CurationCandidate {
                 candidate_id: format!("{}-candidate-{}", input.job_id, index + 1),
                 kind: "review_required".into(),
                 source_handles: vec![handle.clone()],
                 proposed_transformation: "Inspect provenance and propose a reversible derived projection; do not alter the source.".into(),
                 uncertainty: "No semantic promotion is possible from a handle-only bounded bundle.".into(),
                 rollback: "Discard the candidate and reopen the source handle.".into(),
-            }).collect(),
+            })
+            .collect();
+        let pulse = curation_pulse::fixture_pulse(
+            &input.job_id,
+            &input.job_id,
+            &input.job_id,
+            &input.scope_id,
+            &input.state_fence,
+            handles.clone(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect(),
+        );
+        return DreamResult::Curation {
+            job_id: input.job_id.clone(),
+            candidates,
             provenance: handles,
+            pulse,
         };
     }
     let handles = all_handles(input);
