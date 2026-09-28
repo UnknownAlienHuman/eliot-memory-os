@@ -21,15 +21,15 @@ use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
-    UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
-    UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
-    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
-    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
-    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
-    resolve_due_wake,
+    StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
+    UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
+    UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
+    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -6498,7 +6498,7 @@ impl KernelComposition {
                 }
                 Ok(store_apply_response(&receipt, verified_correction.as_ref()))
             }
-            Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
+            Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
     }
 
@@ -6612,7 +6612,7 @@ impl KernelComposition {
         {
             Ok(receipt) => receipt,
             Err(error) => {
-                return Ok(Self::store_error_response_text(
+                return Ok(Self::store_apply_refusal_response(
                     NOTIFICATION_STATE_RESPONSE_KIND,
                     &error,
                 ));
@@ -8029,6 +8029,33 @@ impl KernelComposition {
                 "pre_stage_rejection": rejection,
             },
         })
+    }
+
+    /// Renders one refused Store `apply` as the operation's error response.
+    ///
+    /// A typed I5.19 admission decision is the one refusal that carries
+    /// evidence rather than prose, so the full typed `WriteSubmission` —
+    /// submission id, state, reason codes, retry-identity rule, and next
+    /// allowed action — travels in `recovery` exactly as the I6.8
+    /// [`Self::pre_stage_rejection_response`] record does. That is what lets a
+    /// client tell a `not_accepted` submission from any other failure without
+    /// parsing the operator line, and it is I5.19 line 21: a syntax/shape
+    /// refusal is an operational response, so it is reported as one.
+    ///
+    /// Every other refusal is handed to [`Self::store_error_response_text`]
+    /// with its preserved text, so no other route's response changes.
+    #[cfg(windows)]
+    fn store_apply_refusal_response(kind: &str, error: &StoreApplyRefusal) -> serde_json::Value {
+        match error.admission_decision() {
+            Some(submission) => serde_json::json!({
+                "status": "error",
+                "value": { "kind": kind, "value": null },
+                "recovery": {
+                    "write_submission": submission,
+                },
+            }),
+            None => Self::store_error_response_text(kind, &error.to_string()),
+        }
     }
 
     #[cfg(windows)]
