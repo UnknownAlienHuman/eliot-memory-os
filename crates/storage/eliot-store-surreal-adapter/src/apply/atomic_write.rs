@@ -130,6 +130,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "canonical_owner_create_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "integration_candidate_revision_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -552,6 +553,7 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
+    append_integration_candidate_statements(&mut sql, &mut bindings, transition)?;
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
@@ -1030,6 +1032,27 @@ fn append_blackboard_item_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "blackboard binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the named manifest revision and candidate-head CAS to this
+/// canonical transition, preserving immutable prior revisions and
+/// candidate-only scope.
+fn append_integration_candidate_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_integration_candidate::integration_candidate_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "integration-candidate binding collided with a canonical binding".to_owned(),
             ));
         }
     }

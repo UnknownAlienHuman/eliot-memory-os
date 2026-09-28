@@ -281,7 +281,7 @@ struct ActivatedReadDescriptor {
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
 /// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -392,11 +392,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetIntegrationCandidate,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -420,6 +425,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
+        ACTIVATED_READS[22].operation,
     ]
 }
 
@@ -466,11 +472,15 @@ struct ActivatedMutationDescriptor {
 /// keyed `(skill_id, scope_key)` with the closed capability-evidence typed
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
-/// influence, or lifecycle change). All
-/// eighteen address no store scope, mirroring the scope-free read
+/// influence, or lifecycle change);
+/// `ApplyIntegrationCandidate` persists `Candidate` through the same family
+/// (issue #1818: a Kernel-admitted integration-candidate manifest revision
+/// with its closed manifest contract; the write itself grants no lifecycle
+/// transition, decision, or acceptance). All
+/// nineteen address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -575,6 +585,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordCapabilityEvidenceRecord,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyIntegrationCandidate,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -814,6 +830,10 @@ pub fn validate_read_against_catalogue(
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed catalogue gate; one arm per activated mutation"
+)]
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -909,6 +929,9 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::ApplyBlackboardItem => {
                 validate_blackboard_transition(transition, &command.parameters)?;
             }
+            NamedMutationOperation::ApplyIntegrationCandidate => {
+                validate_integration_candidate_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordLearningRecord => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::decode_learning_mutation(command.operation, &command.parameters)
@@ -952,6 +975,26 @@ fn validate_blackboard_transition(
     if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
         return Err(StoreError::InvalidField {
             field: "blackboard.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_integration_candidate_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let revision = crate::decode_integration_candidate(
+        NamedMutationOperation::ApplyIntegrationCandidate,
+        parameters,
+    )?;
+    if revision.record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "integration_candidate.task_id",
             reason: "must match the prepared transition task",
         });
     }

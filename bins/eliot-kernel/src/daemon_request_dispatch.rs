@@ -6459,6 +6459,10 @@ impl KernelComposition {
             Ok(link) => link,
         };
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
+        super::integration_candidate::validate_integration_candidate_transition(
+            session,
+            &operation.transition,
+        )?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
             .replay_committed_apply_receipt(&gateway, &operation, verified_correction.as_ref())

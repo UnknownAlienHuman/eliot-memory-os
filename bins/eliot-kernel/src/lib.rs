@@ -274,6 +274,8 @@ mod health_view;
 pub use health_view::KernelActivationView;
 #[cfg(windows)]
 mod host_request_route;
+#[cfg(windows)]
+mod integration_candidate;
 pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
