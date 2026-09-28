@@ -13,9 +13,11 @@ use crate::capsule::{ModuleContractKit, invoke_typed};
 use crate::component_contract::TypedContractError;
 use crate::lifecycle::{DivergenceReport, classify_reference_divergence};
 use crate::replacement::{
-    DrainSnapshot, GenerationCoordinator, GenerationRecord, PrepareRequest, PreparedSummary,
-    ReadinessOracle, ReplacementError, RollbackArmed, RollbackReceipt, RollbackRequest,
-    SwitchReceipt, SwitchRequest,
+    CallCompletion, CallLease, CallOutcome, CandidateDescriptor, DrainSnapshot, DrainStatus,
+    GenerationCoordinator, GenerationRecord, LifecycleLogEntry, ObservedGeneration, PrepareRequest,
+    PreparedSummary, ReadinessEvidence, ReadinessOracle, ReconcileReceipt, RehydratedState,
+    ReplacementError, RollbackArmed, RollbackReceipt, RollbackRequest, SwitchReceipt,
+    SwitchRequest,
 };
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineInvocation, EngineReport,
@@ -131,8 +133,13 @@ impl WasmRuntime {
         self.generation_coordinator.switch(request)
     }
 
-    /// Returns a typed refusal until rollback is authorized by a Kernel/ORS
-    /// cutover to a newer epoch.
+    /// Arms an exact old/new rollback on the coordinator. Rollback is a second
+    /// cutover, not a restoration: the caller presents the
+    /// owner-committed `GenerationCutoverReceipt` for a strictly newer
+    /// authority epoch in the active fence's own lineage, and the coordinator
+    /// validates it without minting any cutover authority. A request with no
+    /// cutover evidence is refused with
+    /// [`ReplacementError::KernelCutoverRequired`].
     pub fn arm_replacement_rollback(
         &self,
         request: &RollbackRequest,
@@ -140,15 +147,136 @@ impl WasmRuntime {
         self.generation_coordinator.arm_rollback(request)
     }
 
-    /// Returns a typed refusal until Kernel/ORS commits rollback as a newer-epoch
-    /// cutover; the local coordinator cannot restore a retained old epoch.
+    /// Completes the rollback as the second single compare-and-swap of the
+    /// admission target, after the drain armed by the same operation closes.
+    /// The generation being retired is retained and all new-call history
+    /// survives; the restored generation re-admits under the newer epoch, never
+    /// as a reactivated old one.
     pub fn complete_replacement_rollback(
         &self,
         operation_id: &str,
         expected_current: u64,
+        expected_restore: u64,
     ) -> Result<RollbackReceipt, ReplacementError> {
+        self.generation_coordinator.complete_rollback(
+            operation_id,
+            expected_current,
+            expected_restore,
+        )
+    }
+
+    /// Prepares a candidate with the production [`ReadinessOracle`]: one bounded
+    /// probe over the injected [`ComponentEnginePort`], admitted and executed
+    /// through the same Governor/authority/source/promotion and P-03 path as
+    /// [`Self::execute`], and classified by the same engine-report classifier.
+    ///
+    /// The oracle runs with no coordinator lock held: the coordinator releases
+    /// its lock before probing and re-takes it to store the result. The probe
+    /// refuses to run at all when the owner-admitted envelope for the candidate
+    /// exceeds the declared `probe_deadline_ms` or `max_probe_output_bytes`, so
+    /// a probe is always bounded by the candidate's own declaration.
+    pub fn prepare_replacement_with_engine(
+        &mut self,
+        request: &PrepareRequest,
+        probe: EngineReadinessProbe,
+    ) -> Result<PreparedSummary, ReplacementError> {
+        let WasmRuntime {
+            ports,
+            generation_coordinator,
+            ..
+        } = self;
+        let Some(ports) = ports.as_mut() else {
+            return Err(ReplacementError::ExternalContract(
+                "readiness-probe-requires-ports".to_owned(),
+            ));
+        };
+        let mut oracle = EngineReadinessOracle { ports, probe };
+        generation_coordinator.prepare(request, &mut oracle)
+    }
+
+    /// Observes the coordinator's drain state without mutating it.
+    pub fn replacement_drain_status(&self) -> Result<DrainStatus, ReplacementError> {
+        self.generation_coordinator.drain_status()
+    }
+
+    /// Notes that the drain deadline passed. With unresolved calls the drain
+    /// stays blocked/unknown; it never creates two active targets.
+    pub fn note_replacement_drain_deadline(
+        &self,
+        operation_id: &str,
+    ) -> Result<DrainStatus, ReplacementError> {
         self.generation_coordinator
-            .complete_rollback(operation_id, expected_current)
+            .note_drain_deadline(operation_id)
+    }
+
+    /// Attaches durable-owner publication evidence to a local switch receipt.
+    pub fn note_replacement_publication(
+        &self,
+        sequence: u64,
+        evidence: Sha256Digest,
+    ) -> Result<SwitchReceipt, ReplacementError> {
+        self.generation_coordinator
+            .note_external_publication(sequence, evidence)
+    }
+
+    /// Atomically acquires and registers one new-call lease on the current
+    /// admission target.
+    pub fn acquire_replacement_call(&self, call_id: &str) -> Result<CallLease, ReplacementError> {
+        self.generation_coordinator.acquire_call(call_id)
+    }
+
+    /// Records one call's own observed terminal or unknown result, tagged with
+    /// the generation that produced it.
+    pub fn complete_replacement_call(
+        &self,
+        outcome: &CallOutcome,
+    ) -> Result<CallCompletion, ReplacementError> {
+        self.generation_coordinator.complete_call(outcome)
+    }
+
+    /// Cancels a tracked call. Unproven cancellation moves the lease to
+    /// `Unknown` and keeps blocking the drain.
+    pub fn cancel_replacement_call(
+        &self,
+        call_id: &str,
+        no_effect_proven: bool,
+    ) -> Result<CallLease, ReplacementError> {
+        self.generation_coordinator
+            .cancel_call(call_id, no_effect_proven)
+    }
+
+    /// Reconciles an unknown switch to exactly one observed active generation
+    /// instead of a blind rollback.
+    pub fn reconcile_unknown_replacement(
+        &self,
+        observed: &ObservedGeneration,
+    ) -> Result<ReconcileReceipt, ReplacementError> {
+        self.generation_coordinator.reconcile_unknown(observed)
+    }
+
+    /// Pure rehydration over an owner-supplied lifecycle log. It performs no
+    /// I/O and derives exactly one active/no-active/unknown state.
+    pub fn rehydrate_replacement(
+        entries: &[LifecycleLogEntry],
+    ) -> Result<RehydratedState, ReplacementError> {
+        GenerationCoordinator::rehydrate_replacement(entries)
+    }
+
+    /// Disposes a retained generation. Referenced generations and generations
+    /// with open call leases are never disposed.
+    pub fn dispose_replacement_generation(&self, generation: u64) -> Result<(), ReplacementError> {
+        self.generation_coordinator.dispose_generation(generation)
+    }
+
+    /// Moves a retained generation into explicit bounded quarantine with
+    /// evidence instead of forgetting it.
+    pub fn quarantine_replacement_generation(
+        &self,
+        generation: u64,
+        evidence: &Sha256Digest,
+    ) -> Result<(), ReplacementError> {
+        self.generation_coordinator
+            .quarantine_generation(generation, evidence)
     }
 
     /// Returns the seated engine's cloneable cross-thread interruption
@@ -445,6 +573,166 @@ impl WasmRuntime {
         );
         result
     }
+}
+
+/// The bounded readiness probe the production oracle runs: one inert
+/// invocation whose input is the exact bytes the caller declared on the
+/// candidate as `CandidateDescriptor::probe_input_digest`.
+///
+/// The coordinator only ever sees that digest, never the input, so the input
+/// travels here inside a sealed [`InvocationRequest`]. The template's identity
+/// fields are inert caller intent only: the Governor, authority, source, and
+/// promotion ports still resolve and bind everything that actually runs, and
+/// the probe refuses to run unless they admit exactly the candidate generation.
+#[derive(Clone, Debug)]
+pub struct EngineReadinessProbe {
+    /// Sealed invocation carrying the bounded probe input.
+    pub request: InvocationRequest,
+}
+
+impl EngineReadinessProbe {
+    /// Binds a probe to its sealed invocation.
+    #[must_use]
+    pub const fn new(request: InvocationRequest) -> Self {
+        Self { request }
+    }
+}
+
+/// The production [`ReadinessOracle`]: exactly one bounded probe over the
+/// already-injected [`ComponentEnginePort`].
+///
+/// It adds no second engine, authority, or process owner. The probe is
+/// admitted by the same [`resolve_admission`] the invocation path uses, seated
+/// through the same P-03 prepare/start/verify sequence, executed by
+/// `ComponentEnginePort::invoke`, and classified by the same
+/// [`classify_engine_report`] that decides every other invocation. Its result
+/// is mapped onto the existing [`ReadinessEvidence`] shape: a `Succeeded`
+/// disposition is a passing probe, a `Rejected` one is
+/// [`ReplacementError::ReadinessFailed`], and `Unavailable`/`Unknown` are
+/// [`ReplacementError::ReadinessUnknown`] rather than a fabricated failure.
+///
+/// It is never called with the coordinator's lock held:
+/// `GenerationCoordinator::prepare` claims the operation under the lock,
+/// releases it, probes, and re-takes the lock to store the result.
+struct EngineReadinessOracle<'a> {
+    ports: &'a mut RuntimePorts,
+    probe: EngineReadinessProbe,
+}
+
+impl ReadinessOracle for EngineReadinessOracle<'_> {
+    fn probe(
+        &mut self,
+        candidate: &CandidateDescriptor,
+    ) -> Result<ReadinessEvidence, ReplacementError> {
+        let request = self.probe.request.clone();
+        // The candidate's declaration is the ceiling for this probe, checked
+        // against the exact bytes that will run before anything else does.
+        if request.input.len() as u64 > candidate.max_probe_output_bytes {
+            return Err(ReplacementError::InvalidField("probe.input".to_owned()));
+        }
+        if canonical_digest(&request.input)
+            .map_err(|_| external_contract("probe-input-seal-failed"))?
+            != candidate.probe_input_digest
+        {
+            return Err(ReplacementError::InvalidField(
+                "probe.input-digest-mismatch".to_owned(),
+            ));
+        }
+        self.run_bounded_probe(&request, candidate)
+    }
+}
+
+impl EngineReadinessOracle<'_> {
+    fn run_bounded_probe(
+        &mut self,
+        request: &InvocationRequest,
+        candidate: &CandidateDescriptor,
+    ) -> Result<ReadinessEvidence, ReplacementError> {
+        let ports = &mut *self.ports;
+        let admission = resolve_admission(ports, request)
+            .map_err(|(_, _)| ReplacementError::ReadinessUnknown)?;
+        if ports.engine.binding() != &admission.governor.manifest.engine
+            || ports.engine.binding().validate().is_err()
+        {
+            return Err(ReplacementError::ReadinessFailed);
+        }
+        if admission.governor.manifest.component_id.as_str() != candidate.record.module_id()
+            || admission.governor.generation.generation.value()
+                != candidate.record.generation_number()
+        {
+            return Err(ReplacementError::ReadinessFailed);
+        }
+        // The admitted envelope must fit inside the candidate's own declared
+        // probe bounds, so the probe is bounded by the declaration.
+        if admission.governor.limits.wall_deadline_ms > candidate.probe_deadline_ms
+            || admission.governor.limits.max_output_bytes > candidate.max_probe_output_bytes
+        {
+            return Err(ReplacementError::InvalidField(
+                "probe.exceeds-candidate-bounds".to_owned(),
+            ));
+        }
+        let envelope = launch_envelope(request, &admission);
+        let process_request = ports
+            .process
+            .prepare(&envelope)
+            .map_err(|_| ReplacementError::ReadinessUnknown)?;
+        if validate_process_binding(&process_request, &envelope).is_err() {
+            return Err(ReplacementError::ReadinessFailed);
+        }
+        let process_binding = ProcessBinding::from_request(&process_request);
+        let start_receipt = match ports.process.start(process_request) {
+            Ok(receipt) => receipt,
+            Err(PortError::Denied) => return Err(ReplacementError::ReadinessFailed),
+            Err(PortError::Unavailable | PortError::UnknownOutcome) => {
+                return Err(ReplacementError::ReadinessUnknown);
+            }
+        };
+        if !basic_start_receipt_matches(&process_binding, &start_receipt)
+            || ports
+                .process_receipt_verifier
+                .verify_start(&process_binding, &start_receipt, &envelope)
+                .is_err()
+        {
+            return Err(ReplacementError::ReadinessUnknown);
+        }
+        let invocation = engine_invocation(request, &admission, process_binding, start_receipt);
+        let report = ports
+            .engine
+            .invoke(&invocation)
+            .map_err(|_| ReplacementError::ReadinessUnknown)?;
+        if report.output.len() as u64 > candidate.max_probe_output_bytes
+            || report.usage.elapsed_ms > candidate.probe_deadline_ms
+        {
+            return Err(ReplacementError::ReadinessFailed);
+        }
+        let p03_verified = matches!(report.termination, EngineTermination::Completed)
+            && verify_p03_reap(ports, &invocation, &envelope);
+        let result = classify_engine_report(
+            ports,
+            request,
+            &admission,
+            &invocation,
+            report,
+            p03_verified,
+        );
+        let probe_output_digest =
+            Sha256Digest::of_bytes(result.output.as_deref().unwrap_or_default());
+        match result.receipt.disposition {
+            InvocationDisposition::Succeeded => Ok(ReadinessEvidence {
+                generation: candidate.record.generation_number(),
+                probe_output_digest,
+                success: true,
+            }),
+            InvocationDisposition::Rejected => Err(ReplacementError::ReadinessFailed),
+            InvocationDisposition::Unavailable | InvocationDisposition::Unknown => {
+                Err(ReplacementError::ReadinessUnknown)
+            }
+        }
+    }
+}
+
+fn external_contract(code: &'static str) -> ReplacementError {
+    ReplacementError::ExternalContract(code.to_owned())
 }
 
 #[allow(clippy::too_many_lines)]
