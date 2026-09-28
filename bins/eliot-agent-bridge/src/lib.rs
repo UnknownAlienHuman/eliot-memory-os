@@ -282,21 +282,7 @@ struct DeliveredEventReceipt {
     owner_identity: Option<OwnerStreamIdentity>,
 }
 
-impl OwnerStreamIdentity {
-    fn from_facts(stream: &RecoveredStreamFacts) -> Option<Self> {
-        let (producer_id, incarnation) = stream.owner_identity()?;
-        let owner_revision = stream.recovery_cut()?.owner_revision();
-        Some(Self {
-            owner_namespace: stream.owner_namespace()?.to_owned(),
-            producer_id: producer_id.to_owned(),
-            incarnation,
-            owner_revision,
-        })
-    }
-}
-
 fn project_reconciled_owner_ack_state(
-    window: &RecoveryView,
     candidate_streams: &[RecoveryCandidateStreamFacts],
     owner_acked: &mut BTreeMap<String, u64>,
     delivered_sequences: &mut BTreeMap<String, BTreeMap<u64, DeliveredEventReceipt>>,
@@ -304,53 +290,6 @@ fn project_reconciled_owner_ack_state(
     offer_stream_identities: &BTreeMap<String, OwnerStreamIdentity>,
 ) -> Vec<String> {
     let mut replaced_offer_streams = Vec::new();
-    for stream in window.stream_facts() {
-        let Some(identity) = OwnerStreamIdentity::from_facts(stream) else {
-            continue;
-        };
-        let stream_id = stream.stream_id();
-        let prior_identity = owner_identity.get(stream_id);
-        let offered_identity = offer_stream_identities.get(stream_id);
-        let replaced = prior_identity.is_some_and(|prior| prior != &identity)
-            || offered_identity.is_some_and(|offered| offered != &identity);
-        if replaced {
-            // Exact active owner facts prove the successor. Reset the
-            // predecessor's local base and held receipts instead of carrying
-            // either across the reused stream text.
-            owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
-            delivered_sequences.remove(stream_id);
-            if offered_identity.is_some_and(|offered| offered != &identity) {
-                replaced_offer_streams.push(stream_id.to_owned());
-            }
-        } else {
-            let known = owner_acked.get(stream_id).copied().unwrap_or(0);
-            let base = known.max(stream.acked_cursor());
-            owner_acked.insert(stream_id.to_owned(), base);
-            if let Some(held) = delivered_sequences.get_mut(stream_id) {
-                let confirmed: Vec<u64> =
-                    held.range(..=base).map(|(sequence, _)| *sequence).collect();
-                for sequence in confirmed {
-                    held.remove(&sequence);
-                }
-                if held.is_empty() {
-                    delivered_sequences.remove(stream_id);
-                }
-            }
-            if let Some(held) = delivered_sequences.get_mut(stream_id) {
-                for (sequence, receipt) in held.iter_mut() {
-                    if stream.events().iter().any(|fact| {
-                        fact.sequence() == *sequence
-                            && fact.event_id() == receipt.event_id
-                            && fact.producer_id() == receipt.producer_id
-                            && fact.producer_generation() == receipt.producer_generation
-                    }) {
-                        receipt.owner_identity = Some(identity.clone());
-                    }
-                }
-            }
-        }
-        owner_identity.insert(stream_id.to_owned(), identity);
-    }
     // A later non-pure reconciliation receives the aggregate facts that Core
     // staged from earlier pure continuation pages. Bind only exact delivered
     // event identities here, after pagination itself returned without any
@@ -2803,7 +2742,7 @@ impl KernelMcpForwardingPort {
             .or_insert_with(|| DeliveredEventReceipt {
                 event_id: event.event_id.clone(),
                 producer_id: event.producer_id.clone(),
-                producer_generation: event.producer_generation.get(),
+                producer_generation: event.producer_generation.value(),
                 owner_identity: None,
             });
     }
@@ -3470,7 +3409,6 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         // Pure projection: every allocation happens before acquiring the
         // mutable owner borrow, preserving the joint import's atomic swap.
         let replaced_offer_streams = project_reconciled_owner_ack_state(
-            window,
             result.recovery_candidate_stream_facts(),
             &mut owner_acked,
             &mut delivered_sequences,

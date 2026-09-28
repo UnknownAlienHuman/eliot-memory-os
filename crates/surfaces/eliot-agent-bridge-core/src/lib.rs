@@ -2286,7 +2286,12 @@ impl RecoveredGapFact {
         reason_ref: String,
     ) -> Result<Self, BridgeError> {
         validate_text(&gap_id, "recovered_gap.gap_id")?;
-        if !stream_id.is_empty() {
+        if stream_id.is_empty() {
+            validate_recovery_proof(
+                Some(gap_owner_scope.as_str()),
+                "recovered_gap.gap_owner_scope",
+            )?;
+        } else {
             validate_text(&stream_id, "recovered_gap.stream_id")?;
             if stream_id.contains("::") {
                 return Err(BridgeError::InvalidContract {
@@ -2300,11 +2305,6 @@ impl RecoveredGapFact {
                     reason: "stream-scoped gap must not carry a top-level owner namespace",
                 });
             }
-        } else {
-            validate_recovery_proof(
-                Some(gap_owner_scope.as_str()),
-                "recovered_gap.gap_owner_scope",
-            )?;
         }
         if start_sequence == 0 || end_sequence == 0 {
             return Err(BridgeError::InvalidContract {
@@ -2876,13 +2876,16 @@ fn validate_recovery_window_stream_facts(
                 reason: "owner namespace, producer identity, and recovery cut must arrive together",
             });
         }
-        if let (Some((_, incarnation)), Some(cut)) = (&facts.owner_identity, facts.recovery_cut) {
-            if *incarnation != cut.owner_incarnation() {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovery_window.stream_owner_identity",
-                    reason: "owner incarnation must match the recovery cut",
-                });
-            }
+        if facts
+            .owner_identity
+            .as_ref()
+            .zip(facts.recovery_cut)
+            .is_some_and(|((_, incarnation), cut)| *incarnation != cut.owner_incarnation())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.stream_owner_identity",
+                reason: "owner incarnation must match the recovery cut",
+            });
         }
         validate_recovery_proof(
             facts.stream_proof.as_deref(),
@@ -4090,12 +4093,9 @@ impl AgentBridgeCore {
             None
         };
         let mut import_result = result.clone();
-        if !result.is_pure_recovery_read() {
-            if let Some((Some(candidate), _)) = &prepared {
-                import_result = import_result.with_recovery_candidate_stream_facts(
-                    candidate.owner_candidate_stream_facts()?,
-                );
-            }
+        if let (false, Some((Some(candidate), _))) = (result.is_pure_recovery_read(), &prepared) {
+            import_result = import_result
+                .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
         }
         // Joint commit (issue #2799): the production adapter swaps its
         // process-local ack-cache replacement first; only then does the core
@@ -4211,12 +4211,9 @@ impl AgentBridgeCore {
             (candidate, disposition)
         };
         let mut import_result = result.clone();
-        if !result.is_pure_recovery_read() {
-            if let Some(candidate) = prepared.0.as_ref() {
-                import_result = import_result.with_recovery_candidate_stream_facts(
-                    candidate.owner_candidate_stream_facts()?,
-                );
-            }
+        if let (false, Some(candidate)) = (result.is_pure_recovery_read(), prepared.0.as_ref()) {
+            import_result = import_result
+                .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
         }
         // Joint commit (issue #2799): the transport half swaps first; the
         // core half below publishes through infallible field moves, so a
