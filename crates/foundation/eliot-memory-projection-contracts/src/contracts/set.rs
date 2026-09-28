@@ -34,6 +34,17 @@ fn text(value: &str, field: &'static str) -> Result<(), MemoryProjectionError> {
 /// deliberately no `CueHit...` variant: a cue hit is advisory evidence, and
 /// using cue-hit-ness itself as an exclusion reason would invert the same
 /// error (treating activation as applicability proof, only negatively).
+///
+/// [`InfluenceIneligible`](Self::InfluenceIneligible) is the owner's own
+/// prohibition, read from the record's `influence_eligible` flag. It is a
+/// first-class reason and never a spelling of [`Protected`](Self::Protected),
+/// [`Rejected`](Self::Rejected) or
+/// [`LifecycleInactive`](Self::LifecycleInactive): those three name a
+/// different owner fact (a withheld role, a governed rejection, an inactive
+/// lifecycle), and reporting an influence prohibition under any of them would
+/// lose the record's own admission state. I12.26 likewise evaluates
+/// `MemoryAdmissionDecision` over "source assurance and allowed influence" as
+/// its own dimension beside epistemic status and freshness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "rule", deny_unknown_fields)]
 pub enum ExclusionReason {
@@ -52,6 +63,16 @@ pub enum ExclusionReason {
     /// Protected role withheld from task-local applicability.
     #[serde(rename = "PROTECTED")]
     Protected,
+    /// The projecting owner marked the record ineligible for downstream
+    /// influence at all.
+    ///
+    /// `false` is a valid record state, independent of lifecycle, freshness,
+    /// epistemic status and roles, so the prohibition is reportable without
+    /// inventing any of them. The record itself stays in the projection and
+    /// in the batch accounting: this reason withholds it from *applicability*,
+    /// and never deletes, rewrites, or silently drops it.
+    #[serde(rename = "INFLUENCE_INELIGIBLE")]
+    InfluenceIneligible,
     /// An exact negative-memory trigger matched the current task key.
     #[serde(rename = "NEGATIVE_MEMORY")]
     NegativeMemory,
@@ -90,6 +111,7 @@ impl ExclusionReason {
             | Self::Rejected
             | Self::EpistemicallyUnknown
             | Self::Protected
+            | Self::InfluenceIneligible
             | Self::NegativeMemory
             | Self::LifecycleInactive
             | Self::FenceMismatch

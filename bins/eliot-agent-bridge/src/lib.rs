@@ -3959,7 +3959,9 @@ impl BridgeRunner {
         ))
     }
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
-        self.core.attach(request)
+        let view = self.core.attach(request)?;
+        self.reset_bootstrap_gate_on_session_change();
+        Ok(view)
     }
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         self.core.reconnect(request)
@@ -4320,6 +4322,33 @@ impl BridgeRunner {
         // and a production verifier consumer; until then the evidence slot
         // carries the preview+handle.
         Some(view)
+    }
+    /// Re-arms the once-per-session auto-boot when the live attach belongs to
+    /// a different application session than the sealed snapshot's (I7.17).
+    ///
+    /// Auto-boot is scoped to the authenticated application session ("first
+    /// successful ELIOT response in a Session includes once"), and the session
+    /// is bound by explicit attach metadata, never inferred from the transport
+    /// connection (I7.7). A reconnect keeps the session (new connection only),
+    /// a detached note carries no session, and a same-session replacement
+    /// keeps the consumed slot — only a live session that differs from the
+    /// sealed one re-arms the gate, so the new session's first response can
+    /// carry its own bootstrap after the owner re-notes under the new seal.
+    /// Composition still requires that re-noted seal; this re-arms delivery
+    /// state only and grants no authority by itself.
+    fn reset_bootstrap_gate_on_session_change(&mut self) {
+        let live_session = self
+            .attach_view()
+            .map(|view| view.binding().session_id().as_str().to_owned());
+        let sealed_session = self.bootstrap_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .binding
+                .as_ref()
+                .map(|seal| seal.session_id().as_str().to_owned())
+        });
+        if live_session != sealed_session {
+            self.bootstrap_session = BootstrapSession::default();
+        }
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///

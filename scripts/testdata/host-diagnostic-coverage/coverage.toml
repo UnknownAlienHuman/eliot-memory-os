@@ -672,7 +672,7 @@ owner = 979
 
 [[file]]
 path = "bins/eliot-host/src/windows_event_log.rs"
-sha256 = "be392a4d298e4c22247754aeaa8d0753ca3d7f35948823922756026aa71acf71"
+sha256 = "939e1bdb7d5d2e3ef643ee7ed5278c430b52d17c8e44793d2b42038e392267b0"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"

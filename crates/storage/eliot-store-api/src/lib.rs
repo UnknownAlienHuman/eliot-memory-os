@@ -5813,6 +5813,10 @@ pub enum StoreError {
     },
     #[error("receipt envelope is missing; write outcome is unknown")]
     MissingReceiptEnvelope,
+    /// A submitted write may have taken effect; reconcile only this admitted
+    /// operation identity before any further mutation.
+    #[error("receipt envelope is missing; write outcome is unknown")]
+    UnknownOutcome { operation_id: OperationId },
     #[error("payload exceeds named-operation limit")]
     PayloadTooLarge,
     #[error("store unavailable")]

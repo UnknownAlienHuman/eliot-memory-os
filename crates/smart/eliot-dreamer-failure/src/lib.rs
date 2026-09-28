@@ -30,7 +30,7 @@ pub use negative_memory::{
     LegacyFailureFingerprintRecord, NEGATIVE_MEMORY_MAX_BYTES, NEGATIVE_MEMORY_MAX_TEXT,
     NEGATIVE_MEMORY_POLICY_SCHEMA_VERSION, NEGATIVE_MEMORY_SCHEMA_VERSION,
     NegativeMemoryActionPolicy, NegativeMemoryAffectedScope, NegativeMemoryCheckExecution,
-    NegativeMemoryCheckOutcome, NegativeMemoryDiscriminatingCheck,
+    NegativeMemoryCheckOutcome, NegativeMemoryDiscriminatingCheck, NegativeMemoryDisposition,
     NegativeMemoryFalseActivationHistory, NegativeMemoryFingerprint, NegativeMemoryHorizon,
     NegativeMemoryHorizonDomain, NegativeMemoryHorizonDomainKind, NegativeMemoryHorizonRelation,
     NegativeMemoryInvariant, NegativeMemoryInvariantVerification, NegativeMemoryLegacyAdvisory,

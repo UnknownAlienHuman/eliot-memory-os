@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
+use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
@@ -1381,6 +1382,13 @@ async fn run_loop(
     // submits finish candidates, and acknowledges terminals, all through
     // the Kernel owner routes.
     let mut testd_owner_flight = TestdOwnerFlight::Idle;
+    // Issue #1867 W1: sole owner of the improvement-intake dispatch state. The
+    // same tick drives it: a real maintenance observation is turned into an
+    // owner-actionable improvement artifact and committed durably through the
+    // Governor `RecordLearningRecord` seam. Its lock wait stays in this
+    // independently polled flight so a cadence handler never suspends polling
+    // of the owner-feed lock holder.
+    let mut improvement_intake_flight = ImprovementIntakeFlight::Idle;
     // Issue #2559: one cadence observation may wait for the composition lock,
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
@@ -1432,6 +1440,7 @@ async fn run_loop(
                     &mut owner_feed_flight,
                     &mut owner_feed,
                     &mut maintenance_flight,
+                    &mut improvement_intake_flight,
                     &mut health_heartbeat_flight,
                     &mut supervision_progress,
                     &mut deferred_supervision_activity,
@@ -1488,6 +1497,16 @@ async fn run_loop(
                     &flight,
                     &mut maintenance_flight,
                     &mut maintenance_failure_guard,
+                );
+                // Issue #1867 W1: the improvement-intake dispatch rides the same
+                // cadence and the same real idle observation, on its own single-
+                // owner flight. It never shares the notification completion
+                // branch, so a blocked durable commit cannot delay the
+                // maintenance notification.
+                maybe_start_improvement_intake(
+                    &composition,
+                    &flight,
+                    &mut improvement_intake_flight,
                 );
             }
             completion = next_activation_completion(&mut flight) => {
@@ -1547,6 +1566,9 @@ async fn run_loop(
                     &mut maintenance_flight,
                     &mut maintenance_failure_guard,
                 );
+            }
+            completion = next_improvement_intake_completion(&mut improvement_intake_flight) => {
+                settle_improvement_intake_completion(&mut improvement_intake_flight, completion);
             }
             heartbeat_completion = next_health_heartbeat_completion(&mut health_heartbeat_flight) => {
                 settle_health_heartbeat_completion(
@@ -2459,6 +2481,7 @@ async fn drain_flights_on_shutdown(
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
     maintenance_flight: &mut MaintenanceFlight,
+    improvement_intake_flight: &mut ImprovementIntakeFlight,
     health_heartbeat_flight: &mut HealthHeartbeatFlight,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     deferred_activity: &mut DeferredSupervisionActivity,
@@ -2479,6 +2502,7 @@ async fn drain_flights_on_shutdown(
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
+            && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
         {
             return Ok(activation_exit);
@@ -2571,6 +2595,9 @@ async fn drain_flights_on_shutdown(
                     &mut shutdown_failure_guard,
                 );
             }
+            completion = next_improvement_intake_completion(improvement_intake_flight) => {
+                settle_improvement_intake_completion(improvement_intake_flight, completion);
+            }
             heartbeat_completion = next_health_heartbeat_completion(health_heartbeat_flight) => {
                 discard_shutdown_heartbeat_completion(
                     heartbeat_completion,
@@ -2590,6 +2617,7 @@ async fn drain_flights_on_shutdown(
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
+                *improvement_intake_flight = ImprovementIntakeFlight::Idle;
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
@@ -3860,6 +3888,235 @@ struct TestdOwnerFlightState {
 enum TestdOwnerFlight {
     Idle,
     InFlight(TestdOwnerFlightState),
+}
+
+/// Completion of one in-flight improvement-intake step.
+enum ImprovementIntakeCompletion {
+    Settled(Result<(), String>),
+}
+
+struct ImprovementIntakeFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = ImprovementIntakeCompletion>>>,
+}
+
+/// Sole owner of the improvement-intake dispatch state in `run_loop`
+/// (issue #1867 W1, I12.24).
+///
+/// This is the twelfth single-owner polled flight and the production reach
+/// point for `eliot-improvement`: before it, the improvement intake bridge
+/// had no call site in the daemon and the candidate/brief path was
+/// unreachable. `Idle` means no dispatch is outstanding; `InFlight` holds
+/// the one pending bounded step. No second owner and no second concurrent
+/// dispatch exist.
+enum ImprovementIntakeFlight {
+    Idle,
+    InFlight(ImprovementIntakeFlightState),
+}
+
+/// Evaluates one real maintenance observation, assembles the
+/// owner-actionable improvement artifact over it, and admits it into the
+/// bounded backlog through the GOVERNED path, under the composition guard.
+///
+/// Three reads and one pure assembly plus one governed admission, all under
+/// the lock:
+///
+/// - the maintenance trigger decision, from the live observation;
+/// - the admitted Kernel fence for this pass;
+/// - the maintenance (`G-19`) improvement admission policy record, read from
+///   the live `GovernorOwners::maintenance` owner — this is where the
+///   per-surface bound numbers and the owning authority come from
+///   (`eliotd::improvement_intake_dispatch::maintenance_bound`), so the
+///   daemon spells none of them;
+/// - the live `Governor` handle, which mints and re-verifies the learning
+///   admission permit the bound is checked against.
+///
+/// The guarded phase performs no exchange: assembling, reading the policy and
+/// issuing a permit are all pure with respect to the Kernel.
+fn improvement_intake_artifact(
+    composition: &DaemonComposition,
+    observation: MaintenanceObservation,
+) -> Result<
+    (
+        eliotd::improvement_intake_dispatch::ImprovementArtifact,
+        eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
+        eliot_contracts::StateFence,
+    ),
+    String,
+> {
+    let decision = composition
+        .evaluate_maintenance_trigger(observation)
+        .map_err(|error| error.to_string())?;
+    let fence = composition
+        .notification_state_admission_fence()
+        .map_err(|error| error.to_string())?;
+    let artifact =
+        eliotd::improvement_intake_dispatch::assemble_improvement_artifact(&decision, &fence)
+            .map_err(|error| error.to_string())?;
+    // The G-19 decision record, read through the EXISTING maintenance owner.
+    // The operation and idempotency key bind this exact observation, so the
+    // policy a candidate is admitted under names the observation it belongs to.
+    let policy = composition
+        .maintenance_improvement_admission_policy(
+            &eliotd::improvement_intake_dispatch::improvement_bound_operation(&decision),
+            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(&decision),
+        )
+        .map_err(|error| error.to_string())?;
+    // The dedup registry. Its bound comes from the owner record above, and it
+    // is deliberately per-pass: the durable artifact is the committed learning
+    // record, and nothing here claims the registry itself is durable.
+    let mut backlog = BoundedBacklog::new(vec![
+        eliotd::improvement_intake_dispatch::maintenance_bound(&policy)
+            .map_err(|error| error.to_string())?,
+    ])
+    .map_err(|error| error.to_string())?;
+    let admitted = eliotd::improvement_intake_dispatch::admit_improvement_artifact(
+        composition.improvement_governor(),
+        &policy,
+        &mut backlog,
+        &artifact,
+        &fence,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((artifact, admitted, fence))
+}
+
+/// Runs one improvement-intake step: evaluate, assemble, and admit the
+/// artifact over a real observation under the composition guard, then commit
+/// it — and every archive receipt the admission produced — durably through
+/// the Governor `RecordLearningRecord` seam with the guard released.
+///
+/// No kernel handle is carried: this step's durable write is owned entirely by
+/// [`eliotd::DaemonComposition::commit_learning_record`], the one
+/// Governor-owned caller of the closed `RecordLearningRecord` mutation, so a
+/// parameter it never consumes would be a stand-in rather than a transport.
+/// The commit is a retained run-loop flight rather than detached work, the
+/// composition lock is never held across the durable exchange, and a refusal
+/// is a typed diagnostic rather than a loop failure — exactly the discipline
+/// [`evaluate_and_emit_maintenance_notification`] already uses for the
+/// notification leg.
+async fn run_improvement_intake(
+    composition: &SharedComposition,
+    observation: MaintenanceObservation,
+) -> Result<(), String> {
+    let prepared = {
+        let guard = composition.lock().await;
+        improvement_intake_artifact(&guard, observation)
+    };
+    let (artifact, admitted, fence) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-intake",
+                &error,
+            )
+            .emit();
+            return Ok(());
+        }
+    };
+    let committed = {
+        let mut guard = composition.lock().await;
+        eliotd::improvement_intake_dispatch::commit_improvement_artifact(
+            &mut guard, &artifact, &admitted, &fence,
+        )
+        .await
+    };
+    match committed {
+        Ok((receipt, effective)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.improvement_candidate_committed",
+                candidate_id = %artifact.candidate.candidate_id,
+                brief_id = %artifact.brief.brief_id,
+                operation_id = %receipt.operation_id,
+                effective,
+                // The owner-decided bound and the owner-issued admission that
+                // enforced it, so the diagnostic names the bound rather than
+                // implying one.
+                bound_max_active = admitted.bound.max_active,
+                bound_min_value = admitted.bound.min_value,
+                governor_authority_ref = %admitted.bound.governor_authority_ref,
+                governed_admission_digest = %admitted.admission_digest,
+            );
+            for archived in &admitted.report.archived {
+                // Every archive receipt is a recorded disposition, and the
+                // commit above has already made it durable. This line makes
+                // the disposition observable in the daemon's own operational
+                // surface so an archival is never process-local (W3).
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.improvement_candidate_archived",
+                    candidate_id = %archived.candidate_id,
+                    target_surface = ?archived.target_surface,
+                    cause = ?archived.cause,
+                    archived_lifecycle = ?archived.archived_lifecycle,
+                    archived_revision = archived.archived_revision,
+                );
+            }
+        }
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-commit",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
+    Ok(())
+}
+
+/// Starts one improvement-intake step when its flight is idle. The
+/// observation is captured from the activation state before the future is
+/// created, so the decision and its evidence are the same observation; a busy
+/// flight is left untouched.
+fn maybe_start_improvement_intake(
+    composition: &SharedComposition,
+    activation_flight: &ActivationFlight,
+    flight: &mut ImprovementIntakeFlight,
+) {
+    if !matches!(flight, ImprovementIntakeFlight::Idle) {
+        return;
+    }
+    let observation = idle_maintenance_observation(activation_flight);
+    let composition = Arc::clone(composition);
+    *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
+        future: Box::pin(async move {
+            let result = run_improvement_intake(&composition, observation).await;
+            ImprovementIntakeCompletion::Settled(result)
+        }),
+    });
+}
+
+/// Polls one retained improvement-intake step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_improvement_intake_completion(
+    flight: &mut ImprovementIntakeFlight,
+) -> ImprovementIntakeCompletion {
+    match flight {
+        ImprovementIntakeFlight::Idle => std::future::pending().await,
+        ImprovementIntakeFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Releases a completed improvement-intake flight so a later cadence
+/// observation can start. Settlement itself is synchronous and cannot block
+/// the run loop; the step never fails the loop, so every outcome idles. The
+/// settled result is consumed here so a step that did not complete is still
+/// recorded as a diagnostic rather than dropped.
+fn settle_improvement_intake_completion(
+    flight: &mut ImprovementIntakeFlight,
+    completion: ImprovementIntakeCompletion,
+) {
+    if let ImprovementIntakeCompletion::Settled(Err(error)) = completion {
+        let _ = eliotd::diagnostics::ErrorRecord::of(
+            eliotd::diagnostics::OwningComponent::DaemonRuntime,
+            "improvement-intake-settle",
+            &error,
+        )
+        .emit();
+    }
+    *flight = ImprovementIntakeFlight::Idle;
 }
 
 /// Pure tick gate: the `TestD` owner timer starts work only when the flight

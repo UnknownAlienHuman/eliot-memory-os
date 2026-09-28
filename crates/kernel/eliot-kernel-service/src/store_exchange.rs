@@ -112,15 +112,14 @@ impl RequestFailure {
             // Unknown means the effect boundary may have been crossed for the
             // admitted operation. It is never `Unavailable` (same-identity
             // retry after a possible write is forbidden), never NotAttempted,
-            // never success, and never a new operation. `MissingReceiptEnvelope`
-            // is the only `StoreError` variant that preserves unknown-outcome
-            // semantics; downstream must reconcile the exact operation.
+            // never success, and never a new operation. The public error keeps
+            // the admitted operation identity for exact reconciliation.
             // Reachability note: every `Unknown` constructor requires an
             // admitted operation identity (`None` maps to `Contract` or
             // `IdentityConflict` instead), so this arm only fires where an
             // operation was admitted — receipt queries and the exact
             // reconciliation path — never for operation-less reads.
-            Self::Unknown { .. } => StoreError::MissingReceiptEnvelope,
+            Self::Unknown { operation_id } => StoreError::UnknownOutcome { operation_id },
         }
     }
 
@@ -190,7 +189,12 @@ fn failure_into_store_error(failure: &StoreFailure) -> StoreError {
             "EFFECT_CEILING_EXCEEDED" => StoreError::EffectCeilingExceeded,
             _ => StoreError::UnknownOperation,
         },
-        StoreFailureDisposition::UnknownOutcome => StoreError::MissingReceiptEnvelope,
+        StoreFailureDisposition::UnknownOutcome => match &failure.operation_id {
+            Some(operation_id) => StoreError::UnknownOutcome {
+                operation_id: operation_id.clone(),
+            },
+            None => StoreError::MissingReceiptEnvelope,
+        },
         StoreFailureDisposition::InternalDefect => match failure.reason_code.as_str() {
             "INVALID_PROJECTION" => StoreError::InvalidProjection,
             "INVALID_OUTBOX" => StoreError::InvalidOutbox,
@@ -471,7 +475,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// Queries the exact receipt for one admitted operation after an uncertain
     /// write. This is the reconciliation step itself, so every failure below
     /// is reported without synthesizing retryability: transport loss during
-    /// the query stays `MissingReceiptEnvelope` (unknown — never `Unavailable`,
+    /// the query stays an exact-operation unknown outcome (never `Unavailable`,
     /// which would invite same-identity write retry after a possible commit),
     /// and an absent receipt after the exact query stays unknown for the same
     /// reason. Only a substituted receipt (wrong operation identity) is an
@@ -497,14 +501,18 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             )
             .await
             .map_err(|failure| match failure {
-                RequestFailure::Unknown { .. } => StoreError::MissingReceiptEnvelope,
+                RequestFailure::Unknown { .. } => StoreError::UnknownOutcome {
+                    operation_id: expected.clone(),
+                },
                 failure => failure.into_store_error(),
             })?;
         let StoreResponse::Receipt {
             receipt: Some(receipt),
         } = response
         else {
-            return Err(StoreError::MissingReceiptEnvelope);
+            return Err(StoreError::UnknownOutcome {
+                operation_id: expected,
+            });
         };
         if receipt.operation_id != expected {
             return Err(StoreError::IdentityConflict);

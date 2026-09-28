@@ -451,7 +451,9 @@ impl RestoreFailureRecord {
             StoreError::RevisionConflict => "REVISION_CONFLICT",
             StoreError::OrderingConflict => "ORDERING_CONFLICT",
             StoreError::ReceiptNotFound => "RECEIPT_NOT_FOUND",
-            StoreError::MissingReceiptEnvelope => "UNKNOWN_OUTCOME",
+            StoreError::MissingReceiptEnvelope | StoreError::UnknownOutcome { .. } => {
+                "UNKNOWN_OUTCOME"
+            }
             StoreError::InvalidReceipt => "INVALID_RECEIPT",
             StoreError::InvalidProjection => "INVALID_PROJECTION",
             StoreError::InvalidField { .. }

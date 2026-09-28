@@ -401,7 +401,7 @@ pub struct InstrumentSpecParams {
     /// Invocation schema authority: the contract that validates arguments.
     pub schema: ContractId,
     /// Fixed command template; empty when the manifest declares none, in
-    /// which case arguments validate against the schema only.
+    /// which case only the empty argument vector is admitted.
     pub argument_template: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
@@ -444,7 +444,7 @@ pub struct InstrumentSpec {
     pub environment_profile: String,
     /// Invocation schema authority.
     pub schema: ContractId,
-    /// Fixed command template; empty when the manifest declares none.
+    /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
@@ -879,11 +879,12 @@ impl InstrumentProfile {
 /// authority, the isolated-process environment/credential/network classes,
 /// and the adapter's real capture bound where the adapter defines one (the
 /// cargo adapter defines none, so its ceiling stays with the
-/// composition-root port). No fixed command template is declared: builtin
-/// invocations carry instrument-level filters, never argv, so arguments
-/// validate against the schema and shell-text rules at launch. No machine
-/// observation exists at registry construction, so builtins ship no
-/// supply-chain receipt and pin no tool version.
+/// composition-root port). No fixed command template is declared, so the
+/// shared gate admits only the empty invocation argument vector for
+/// builtins; a manifest that needs further arguments admits them as an
+/// exact fixed template. No machine observation exists at registry
+/// construction, so builtins ship no supply-chain receipt and pin no tool
+/// version.
 pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
     let credential = ContractId::new(ISOLATED_CREDENTIAL_POLICY)?;
     let network = ContractId::new(ISOLATED_NETWORK_POLICY)?;
@@ -1741,7 +1742,7 @@ pub struct AdmittedStage {
     /// Admitted supply-chain receipt for the kind, when a machine
     /// observation was admitted for it at this generation.
     pub supply_receipt: Option<SupplyChainReceipt>,
-    /// Fixed command template; empty when the manifest declares none.
+    /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
     /// Invocation schema authority.
     pub schema: ContractId,
@@ -1939,9 +1940,11 @@ impl AdmittedStage {
     /// launcher-observed machine identity, never shell text or an
     /// agent-composed command. The admitted spec, fixed argument template,
     /// supply-chain receipt, and `profile_revision` come from the planned
-    /// stage and the owning route; the caller never supplies them. Success
-    /// seals every bound field into an [`InstrumentAdmissionGrant`] whose
-    /// digest the launch receipt records.
+    /// stage and the owning route; the caller never supplies them. The
+    /// requested arguments must equal the admitted fixed template exactly;
+    /// an empty admitted template admits only the empty argument vector.
+    /// Success seals every bound field into an
+    /// [`InstrumentAdmissionGrant`] whose digest the launch receipt records.
     ///
     /// # Errors
     ///
@@ -1971,9 +1974,8 @@ impl AdmittedStage {
                 observed: request.kind,
             });
         }
-        if self.argument_template.is_empty() {
+        if request.arguments != self.argument_template {
             reject_shell_text(&request.arguments)?;
-        } else if request.arguments != self.argument_template {
             return Err(AdmissionError::ArgumentMismatch {
                 detail: "requested arguments differ from the admitted fixed template".to_owned(),
             });

@@ -1176,6 +1176,37 @@ pub(super) fn phase_b_bytes_digest(bytes: &[u8]) -> Result<PlatformHandle, HostE
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
+/// Refuses a Phase-B file destination that is the running Host service binary.
+///
+/// I1.2 (`#1801` W2): Host never selects or replaces its own service binary
+/// while running; Host-service replacement belongs to the installer/SCM
+/// procedure. Every Phase-B destination is a managed-child artifact (daemon
+/// bridge, configuration, launch descriptor), so naming the running Host
+/// image is always a caller defect, never a legitimate cutover. The check
+/// runs before any readback, backup, or publication, and covers rollback
+/// restores too: they funnel through the same inner choke point. Fail-closed:
+/// an unreadable current image refuses rather than risks self-replacement.
+#[cfg(windows)]
+fn refuse_host_service_binary_destination(path: &Path, label: &str) -> Result<(), HostError> {
+    let current = std::env::current_exe().map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B {label} destination cannot be proven distinct from the running Host binary: {error}"
+        ))
+    })?;
+    // `canonicalize` fails for not-yet-existing destinations; fall back to a
+    // lexical comparison there rather than skipping the check.
+    let same = match (std::fs::canonicalize(path), std::fs::canonicalize(&current)) {
+        (Ok(destination), Ok(running)) => windows_paths_equal(&destination, &running),
+        _ => windows_paths_equal(path, &current),
+    };
+    if same {
+        return Err(HostError::ProcessContour(format!(
+            "Phase-B {label} destination is the running Host service binary; Host-service replacement belongs to the installer/SCM procedure"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub(super) fn phase_b_materialize_file(
     profile: InstallationProfile,
@@ -1226,6 +1257,9 @@ fn phase_b_materialize_file_inner(
     label: &str,
     retain_previous: bool,
 ) -> Result<(PlatformHandle, FileIdentity), HostError> {
+    // I1.2 (`#1801` W2): Host-service replacement belongs to the
+    // installer/SCM procedure; refuse before any readback or publication.
+    refuse_host_service_binary_destination(path, label)?;
     let desired_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(desired)))
         .map_err(|error| HostError::Platform(error.to_string()))?;
     let mut previous_bytes = None;

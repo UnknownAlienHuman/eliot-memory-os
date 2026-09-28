@@ -15,7 +15,7 @@
 //! present; a partial slice never closes #1813/#1814 and grants no
 //! Product/Release proof.
 
-use eliot_contracts::{ArtifactId, sha256_hex};
+use eliot_contracts::{ArtifactId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentKind, VerificationOutcome};
 use eliot_process::ProcessExecutor;
 use eliot_test_selection::{FrozenDisposition, FrozenSelection, TestSelectionReceipt};
@@ -59,7 +59,43 @@ pub const DEV_FAST_STAGE_RUSTFMT: &str = "rustfmt-check";
 pub const DEV_FAST_FIRST_PACKAGE: &str = "eliot-test-selection";
 /// Version of the persisted `VerificationProfileRun` semantics (I18.6 step
 /// 9).
-pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v2";
+///
+/// This is the current record semantics version. It moves whenever the
+/// record's own meaning or its digest preimage changes, so a retained
+/// record is only ever interpreted under the encoding that produced it
+/// (I5.27 `canonical_encoding_version`).
+pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v3";
+
+/// Retired record encoding whose `run_digest` is not a commitment.
+///
+/// The `v2` encoding hashed a NUL-joined field list whose raw-reference
+/// vector was flattened with `join(",")` while `validate_text` admits
+/// commas inside a reference. Two distinct admitted vectors —
+/// `["raw:a,raw:b", "raw:c"]` and `["raw:a", "raw:b,raw:c"]` — therefore
+/// produced identical preimages, so `run_digest` did not bind list
+/// boundaries and readback could not detect a rewritten vector. A `v2`
+/// digest is an unversioned hash of caller spelling (I5.27), so it is
+/// never re-derived, compared, or certified under the current encoding:
+/// [`VerificationProfileRun::check_digest`] and
+/// [`VerificationProfileRun::resolve_lost_ack`] refuse the retired
+/// version before recomputing anything. Such a record stays readable as
+/// its own historical evidence; it is never re-interpreted as a
+/// current record.
+pub const VERIFICATION_PROFILE_RUN_LEGACY_VERSION: &str = "eliot-verification-profile-run-v2";
+
+/// Domain separator of the profile-run digest preimage (I5.27
+/// `domain_separator`).
+const PROFILE_RUN_PREIMAGE_DOMAIN: &str = "eliot-verification-profile-run-digest";
+
+/// Canonical encoding version of the profile-run digest preimage (I5.27
+/// `canonical_encoding_version`).
+///
+/// The preimage is the project's canonical serialization of the complete
+/// record with object keys sorted recursively, so every scalar field keeps
+/// its own JSON encoding and every vector stays an actual JSON array. No
+/// field is joined by a character a field may itself contain, so no two
+/// distinct admitted records can share a preimage.
+const PROFILE_RUN_PREIMAGE_ENCODING: &str = "v1";
 
 /// Failures raised while binding, freezing, or aggregating `dev-fast`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1169,6 +1205,11 @@ pub async fn dev_fast_execute<E: ProcessExecutor + 'static>(
 /// The record serializes to the evidence owner (I18.6 step 9) as canonical
 /// JSON. Unknown fields are refused on readback, so a record written by a
 /// newer semantics version fails closed instead of decoding as this version.
+/// `run_digest` is a versioned canonical commitment over the complete record
+/// (I5.27): the raw references are hashed as an actual array, so list
+/// boundaries, order, and content are bound and a rewritten vector fails
+/// readback. The retired [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`] encoding
+/// is refused, never re-interpreted under the current preimage.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationProfileRun {
@@ -1194,9 +1235,10 @@ pub struct VerificationProfileRun {
     pub status: AggregateStatus,
     /// Slice completeness label ([`DEV_FAST_SLICE_PARTIAL`]).
     pub slice: String,
-    /// Raw retained output references bound to the run.
+    /// Raw retained output references bound to the run, as an actual array.
     pub raw_refs: Vec<String>,
-    /// Stable digest binding the complete record.
+    /// Stable digest binding the complete record, including the
+    /// raw-reference list boundaries.
     pub run_digest: String,
 }
 
@@ -1266,41 +1308,100 @@ impl VerificationProfileRun {
             raw_refs,
             run_digest: String::new(),
         };
-        record.run_digest = record.compute_digest();
+        record.run_digest = record.compute_digest()?;
         Ok(record)
     }
 
     /// Computes the digest binding every record field.
-    fn compute_digest(&self) -> String {
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}",
-            self.version,
-            self.run_id,
-            self.candidate,
-            self.candidate_identity,
-            self.profile,
-            self.profile_revision,
-            self.aggregate_digest,
-            self.receipt_digest,
-            self.status,
-            self.slice,
-            self.raw_refs.join(","),
+    ///
+    /// The preimage is the project's canonical serialization
+    /// ([`canonical_json_bytes`]) of this record with `run_digest` itself
+    /// blanked, prefixed by the preimage domain separator and its
+    /// encoding version. Two consequences matter for readback:
+    ///
+    /// * the raw references are hashed as an actual JSON array of their
+    ///   own strings, so list boundaries, order, and content are all
+    ///   bound; changing only a boundary produces a different preimage;
+    /// * every scalar field keeps its own JSON encoding, so no field can
+    ///   be shifted across a separator by embedding one.
+    ///
+    /// The preimage carries the record's own `version` field, so a digest
+    /// produced by another encoding can never be reproduced here. The
+    /// digest owner remains the single [`sha256_hex`] helper this module
+    /// already used; no second digest authority is introduced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DevFastError::Admission`] when the record cannot be
+    /// serialized to its canonical preimage. It never falls back to an
+    /// unversioned or delimiter-joined encoding.
+    fn compute_digest(&self) -> Result<String, DevFastError> {
+        let mut preimage = self.clone();
+        preimage.run_digest = String::new();
+        let canonical = canonical_json_bytes(&preimage).map_err(|error| {
+            DevFastError::Admission(format!(
+                "profile run canonical preimage could not be serialized: {error}"
+            ))
+        })?;
+        let mut material = Vec::with_capacity(
+            PROFILE_RUN_PREIMAGE_DOMAIN.len()
+                + PROFILE_RUN_PREIMAGE_ENCODING.len()
+                + canonical.len()
+                + 2,
         );
-        sha256_hex(material.as_bytes())
+        material.extend_from_slice(PROFILE_RUN_PREIMAGE_DOMAIN.as_bytes());
+        material.push(0);
+        material.extend_from_slice(PROFILE_RUN_PREIMAGE_ENCODING.as_bytes());
+        material.push(0);
+        material.extend_from_slice(&canonical);
+        Ok(sha256_hex(&material))
     }
 
     /// Verifies the record still binds every field it carries.
     ///
-    /// Readback calls this before trusting a deserialized record: a digest
-    /// that no longer matches the fields fails here instead of travelling
-    /// on as retained evidence.
+    /// Readback calls this before trusting a deserialized record: a record
+    /// under the retired [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`], whose
+    /// digest never bound the raw-reference list boundaries, is refused
+    /// here without being recomputed, and a digest that no longer matches
+    /// the fields of a current record fails here instead of travelling on
+    /// as retained evidence.
     pub fn check_digest(&self) -> Result<(), DevFastError> {
-        if self.compute_digest() != self.run_digest {
+        self.require_current_encoding()?;
+        if self.compute_digest()? != self.run_digest {
             return Err(DevFastError::ReceiptMismatch(
                 "profile run record digest does not bind its fields".to_owned(),
             ));
         }
         Ok(())
+    }
+
+    /// Refuses any record not written under the current encoding.
+    ///
+    /// The persisted encoding version is the record's own disposition:
+    /// [`VERIFICATION_PROFILE_RUN_LEGACY_VERSION`] is not re-interpreted
+    /// under the current preimage, and a newer unknown version fails
+    /// closed the same way. Nothing here inspects a retired digest, so an
+    /// old encoding can never certify the current interpretation.
+    fn require_current_encoding(&self) -> Result<(), DevFastError> {
+        if self.version == VERIFICATION_PROFILE_RUN_VERSION {
+            return Ok(());
+        }
+        // The retired version is named rather than treated as an anonymous
+        // mismatch, so the disposition of retained `v2` evidence is explicit
+        // in the refusal itself.
+        let disposition = if self.version == VERIFICATION_PROFILE_RUN_LEGACY_VERSION {
+            "it is the retired encoding whose preimage did not bind \
+             raw-reference list boundaries, and it is never re-interpreted \
+             under the current one"
+        } else {
+            "it is an unknown encoding and is never re-interpreted under the \
+             current one"
+        };
+        Err(DevFastError::ReceiptMismatch(format!(
+            "profile run record encoding '{}' is not the current encoding \
+             '{}': {disposition}",
+            self.version, VERIFICATION_PROFILE_RUN_VERSION,
+        )))
     }
 
     /// Resolves a lost acknowledgement against retained inputs without
@@ -1310,8 +1411,9 @@ impl VerificationProfileRun {
     /// retained candidate/configuration identity, aggregate, and receipt:
     /// when it names this exact record, the caller reuses the retained record
     /// as the answer. A renamed candidate, changed configuration, different
-    /// aggregate, or rebound receipt fails here instead of reconstructing an
-    /// answer by rerunning build/test effects.
+    /// aggregate, rebound receipt, or record under a non-current encoding
+    /// fails here instead of reconstructing an answer by rerunning build/test
+    /// effects.
     pub fn resolve_lost_ack(
         &self,
         candidate: &DevFastCandidate,
@@ -1321,6 +1423,7 @@ impl VerificationProfileRun {
         receipt
             .validate()
             .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+        self.require_current_encoding()?;
         let candidate_identity = candidate.digest();
         let expected = profile_run_id(
             &candidate.candidate,
@@ -1348,7 +1451,7 @@ impl VerificationProfileRun {
             || receipt.profile_digest != aggregate.profile_digest
             || receipt.dag_digest != aggregate.dag_digest
             || receipt.receipt_digest != self.receipt_digest
-            || self.compute_digest() != self.run_digest
+            || self.compute_digest()? != self.run_digest
         {
             return Err(DevFastError::ReceiptMismatch(
                 "lost acknowledgement does not resolve the retained profile run".to_owned(),

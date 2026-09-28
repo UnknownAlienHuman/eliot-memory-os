@@ -1814,7 +1814,9 @@ fn reason_code_for(refusal: &StoreError) -> ErrorCode {
         | StoreError::Serialization(_) => ErrorCode::Internal,
         StoreError::ReceiptNotFound => ErrorCode::NotFound,
         StoreError::Unavailable => ErrorCode::Unavailable,
-        StoreError::SnapshotClosePending { .. } => ErrorCode::UnknownOutcome,
+        StoreError::SnapshotClosePending { .. } | StoreError::UnknownOutcome { .. } => {
+            ErrorCode::UnknownOutcome
+        }
         StoreError::InvalidField { .. }
         | StoreError::Empty { .. }
         | StoreError::Duplicate { .. }

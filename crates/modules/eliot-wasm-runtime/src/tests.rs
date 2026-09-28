@@ -11,7 +11,7 @@ use eliot_process::{
     ProcessIntent, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
     ProcessTreeId, ResourceLimits as ProcessLimits, SessionId, SuspendedProcessIdentity,
 };
-use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
+use eliot_runtime_contracts::{GenerationCutoverReceipt, ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SourceAssurance};
 use serde_json::json;
 
@@ -1478,6 +1478,23 @@ fn replacement_prepare(
     }
 }
 
+/// The owner-committed (Kernel/ORS) cutover receipt a rollback must present:
+/// a `COMPLETED` cutover naming the retired and restored generations exactly,
+/// under the next authority epoch of the fixture fence's own lineage.
+fn owner_rollback_cutover(old_generation: u64, new_generation: u64) -> GenerationCutoverReceipt {
+    must(serde_json::from_value(json!({
+        "cutover_id": format!("cutover-{old_generation}-{new_generation}"),
+        "old_generation": old_generation,
+        "new_generation": new_generation,
+        "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 2,
+        },
+        "state": "COMPLETED",
+        "unresolved_scopes": [],
+    })))
+}
+
 struct ScriptedReadiness {
     pass: bool,
     calls: usize,
@@ -1674,16 +1691,19 @@ fn safe_rollback_before_new_call_admission() {
             .generation_coordinator()
             .note_external_publication(switched.sequence, digest('f')),
     );
+    let cutover = owner_rollback_cutover(2, 1);
     let armed = must(facade.arm_replacement_rollback(&RollbackRequest {
         operation_id: "op-22-back".to_owned(),
         expected_current: 2,
         target_generation: 1,
         target_artifact: digest('a'),
+        cutover: Some(cutover.clone()),
+        cutover_digest: Some(must(canonical_digest(&cutover))),
     }));
     assert_eq!(armed.current_generation, 2);
     assert_eq!(armed.target_generation, 1);
     must(facade.begin_replacement_drain("op-22-back", 1_000));
-    let rolled_back = must(facade.complete_replacement_rollback("op-22-back", 2));
+    let rolled_back = must(facade.complete_replacement_rollback("op-22-back", 2, 1));
     assert_eq!(rolled_back.from_generation, 2);
     assert_eq!(rolled_back.restored_generation, 1);
     assert_eq!(rolled_back.restored_artifact, digest('a'));

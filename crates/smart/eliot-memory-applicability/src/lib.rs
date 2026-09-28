@@ -18,6 +18,18 @@
 //! Record checks run in a fixed documented order and the first failing rule
 //! decides the exclusion reason, so a record failing several rules always
 //! reports the same reason.
+//!
+//! The owner's own `influence_eligible` flag is read as an applicability gate
+//! on its own terms. A record the projecting owner marked ineligible for
+//! downstream influence is excluded as
+//! [`ExclusionReason::InfluenceIneligible`] and is never reported as
+//! applicable, however favourable its status, however well it matches the
+//! scope and fence, and however many cue hits name it. The flag is not a
+//! synonym for the `Protected` role, for a `Rejected` status or an inactive
+//! lifecycle, so it keeps its own reason instead of borrowing one of theirs.
+//! The prohibition is fail-closed and content-bearing on the record itself;
+//! applicability remains a separate dimension from assertability, and an
+//! applicable record still grants no permission to assert anything as true.
 
 #![forbid(unsafe_code)]
 
@@ -115,7 +127,8 @@ struct EvalContext<'a> {
 /// Fixed rule order (first match wins): scope equality, fence
 /// compatibility, active lifecycle, freshness, epistemic standing,
 /// protected role, exact negative-trigger match, owner-assessed
-/// preconditions.
+/// preconditions, and finally the owner's own influence eligibility, which
+/// gates the one path that can return an applicable verdict.
 fn classify(record: &MemoryProjectionRecord, context: &EvalContext<'_>) -> Option<ExclusionReason> {
     if record.binding.task_id != context.binding.task_id
         || record.binding.scope_id != context.binding.scope_id
@@ -151,7 +164,20 @@ fn classify(record: &MemoryProjectionRecord, context: &EvalContext<'_>) -> Optio
     {
         return Some(ExclusionReason::NegativeMemory);
     }
-    classify_preconditions(record)
+    if let Some(reason) = classify_preconditions(record) {
+        return Some(reason);
+    }
+    // The owner's influence prohibition is the last gate before an applicable
+    // verdict, and it is a content decision on this record's own
+    // `influence_eligible` flag: no other field, no cue hit, and no other
+    // record in the batch can stand in for it. `false` is a valid record
+    // state, so nothing is inferred from lifecycle, freshness, epistemic
+    // status or roles, and the record keeps its own place in the batch and in
+    // the accounting: it is withheld from applicability, never dropped.
+    if !record.influence_eligible {
+        return Some(ExclusionReason::InfluenceIneligible);
+    }
+    None
 }
 
 /// Map the epistemic standing to an exclusion, or `None` when it passes.

@@ -247,7 +247,7 @@ impl<'a> StoreRecoveryProjection<'a> {
             StoreError::ReceiptNotFound => {
                 deterministic_rejection_parts("RECEIPT_NOT_FOUND", ResolveWriteReceipt)
             }
-            StoreError::MissingReceiptEnvelope => (
+            StoreError::MissingReceiptEnvelope | StoreError::UnknownOutcome { .. } => (
                 UnknownOutcome,
                 "RECEIPT_ENVELOPE_MISSING",
                 Unknown,

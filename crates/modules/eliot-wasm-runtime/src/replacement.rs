@@ -3,10 +3,20 @@
 //! This module is Slice B of issue #760 (cases 13-39). It owns the local,
 //! provider-neutral replacement state machine for `eliot-wasm-runtime`: one
 //! exclusive replacement operation at a time, atomic drain linearization, one
-//! compare-and-swap admission switch, reconciliation of unknown outcomes, and
-//! pure rehydration from owner-supplied lifecycle evidence. Local rollback is
-//! refused because this coordinator cannot consume a Kernel/ORS cutover receipt
-//! or issue the required newer authority epoch.
+//! compare-and-swap admission switch, a second compare-and-swap for an
+//! owner-committed rollback cutover, reconciliation of unknown outcomes, and
+//! pure rehydration from owner-supplied lifecycle evidence.
+//!
+//! Rollback boundary (I14.14 "Rollback is another cutover with a newer epoch; an
+//! old epoch is never reactivated"; I14.19 "Old epochs are never reactivated"):
+//! this coordinator mints no cutover authority. It executes the local
+//! admission-target restore only when the caller supplies the owner-committed
+//! [`GenerationCutoverReceipt`] that already names the retired and restored
+//! generations and carries a strictly newer authority epoch in the active
+//! fence's own lineage. Without that evidence the typed answer stays
+//! [`ReplacementError::KernelCutoverRequired`]; with it, the restore is still
+//! the ordinary drain plus compare-and-swap, so an old epoch is never
+//! reactivated — the restored record re-admits under the newer epoch.
 //!
 //! Authority boundaries (enforced, not merely documented):
 //!
@@ -15,10 +25,14 @@
 //!   durably committed, and never executes guest code. Durable publication and
 //!   execution stay with the existing Kernel/ORS, P-03, and engine owners.
 //! - Candidate readiness is observed through the caller-supplied
-//!   [`ReadinessOracle`]. In production the `WasmRuntime` hook adapts the
-//!   injected [`crate::ComponentEnginePort`] to that oracle with a declared
-//!   bounded probe; tests supply deterministic scripted oracles. The
-//!   coordinator itself performs no I/O.
+//!   [`ReadinessOracle`]. The production adapter is
+//!   [`crate::runtime::EngineReadinessOracle`], reached through
+//!   [`crate::runtime::WasmRuntime::prepare_replacement_with_engine`]: it runs
+//!   exactly one bounded probe over the already-injected
+//!   [`crate::ComponentEnginePort`] and reuses the same engine-report
+//!   classification the invocation path uses. Tests supply deterministic
+//!   scripted oracles. The coordinator itself performs no I/O and never calls
+//!   the oracle while holding its lock.
 //! - Rehydration ([`GenerationCoordinator::rehydrate_replacement`]) is a pure
 //!   function over an owner-supplied log. It performs no engine observation;
 //!   callers that need fresh observations supply them as log entries derived
@@ -39,10 +53,11 @@
 //! local-only linearization evidence plus later external publication (17);
 //! exclusive operation admits exactly one switch (18); stale expectations
 //! change nothing (19); post-switch calls acquire the new generation only
-//! (20); retention until references clear (21); typed local rollback refusal
-//! pending a Kernel/ORS cutover (22); reconcile-first for possible new calls or
-//! unknown receipts (23);
-//! Kernel-owned rollback refusal pending a newer-epoch cutover (24-25);
+//! (20); retention until references clear (21); owner-committed newer-epoch
+//! rollback before any new-call admission (22); reconcile-first for possible
+//! new calls or unknown receipts (23);
+//! rollback drains the new generation then atomically restores the old under
+//! the same owner-committed cutover (24-25);
 //! incompatibility families (26) including
 //! same-version ABI drift (27); per-stage typed failures (28); rehydration
 //! with fabricated-durability rejection (29); late old output isolation (30);
@@ -55,7 +70,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
-use eliot_runtime_contracts::ModuleGeneration;
+use eliot_runtime_contracts::{GenerationCutoverReceipt, GenerationCutoverState, ModuleGeneration};
 use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
@@ -164,9 +179,30 @@ pub enum ReplacementError {
     /// New calls may exist or the switch receipt is unknown: reconcile first.
     #[error("reconciliation required before rollback")]
     ReconciliationRequired,
-    /// Rollback must be committed by Kernel/ORS as a newer-epoch cutover.
+    /// The caller supplied no owner-committed cutover evidence, so no rollback
+    /// is armed. Rollback is a Kernel/ORS cutover with a newer authority epoch;
+    /// this coordinator mints neither.
     #[error("rollback requires a Kernel/ORS cutover with a newer authority epoch")]
     KernelCutoverRequired,
+    /// The supplied cutover epoch is inside the active fence's own lineage but
+    /// is not strictly newer than it. An old epoch is never reactivated.
+    #[error("rollback would reactivate an old authority epoch")]
+    OldEpochReactivation,
+    /// The supplied cutover epoch is outside the active fence's own lineage
+    /// (or otherwise not strictly newer), so it cannot order against the active
+    /// authority. Equal sequences from different lineages are unrelated.
+    #[error("rollback authority epoch is not newer than the active fence")]
+    RollbackEpochNotNewer,
+    /// The pending candidate is an owner-committed rollback target, not a
+    /// forward candidate; its local switch must be completed through
+    /// [`GenerationCoordinator::complete_rollback`].
+    #[error("rollback cutover pending: complete the rollback instead")]
+    RollbackCutoverPending,
+    /// The pending candidate is a forward candidate admitted by a bounded
+    /// readiness probe, not an owner-committed rollback target, so there is no
+    /// armed rollback to complete.
+    #[error("no armed rollback for this operation")]
+    NoArmedRollback,
     /// Rollback replay carried a different payload than the retained record.
     #[error("rollback payload changed")]
     RollbackPayloadChanged,
@@ -588,23 +624,37 @@ pub enum CallCompletion {
     DuplicateReplay,
 }
 
-/// Requested rollback identity and retained target evidence. This local
-/// coordinator validates the request shape but refuses execution because a
-/// rollback must be a Kernel/ORS cutover with a newer authority epoch.
+/// Rollback identity, retained target evidence, and the owner-committed
+/// cutover that authorises the restore.
+///
+/// The coordinator never mints a cutover. `cutover` is the
+/// [`GenerationCutoverReceipt`] Kernel/ORS emitted for this exact rollback
+/// (I14.14: the ORS commit is the durable linearization point, and the receipt
+/// is the operational proof of it); `cutover_digest` is its canonical digest,
+/// checked for exact equality so a caller cannot relabel one receipt as another.
+/// `None` is not a weaker request: it is the typed refusal
+/// [`ReplacementError::KernelCutoverRequired`].
 #[derive(Clone, Debug)]
 pub struct RollbackRequest {
     /// Caller-chosen exclusive rollback operation identity.
     pub operation_id: String,
     /// Rechecked currently active generation number.
     pub expected_current: u64,
-    /// Retained generation number proposed to Kernel/ORS for cutover.
+    /// Retained generation number Kernel/ORS committed as the new route.
     pub target_generation: u64,
     /// Expected retained target artifact digest, used only for local validation.
     pub target_artifact: Sha256Digest,
+    /// Owner-committed cutover receipt authorising the restore, or `None` to
+    /// obtain the typed refusal.
+    pub cutover: Option<GenerationCutoverReceipt>,
+    /// Canonical digest of `cutover`; must equal it exactly.
+    pub cutover_digest: Option<Sha256Digest>,
 }
 
-/// Legacy summary shape for a rollback arm. Current local rollback requests
-/// return [`ReplacementError::KernelCutoverRequired`] and never produce it.
+/// Summary returned when rollback arming succeeds. Arming holds the exclusive
+/// operation and pins the retained target, so the ordinary
+/// [`GenerationCoordinator::begin_drain`] can drain the generation being
+/// retired; it does not itself change the admission target.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackArmed {
@@ -612,12 +662,21 @@ pub struct RollbackArmed {
     pub operation_id: String,
     /// Generation being drained and retired.
     pub current_generation: u64,
-    /// Retained generation proposed for a Kernel/ORS cutover.
+    /// Retained generation the owner-committed cutover restores.
     pub target_generation: u64,
+    /// Canonical digest of the owner-committed
+    /// [`GenerationCutoverReceipt`] that authorised this arm, pinned to the
+    /// pending candidate. It is the exact owner authority under which the drain
+    /// runs, so the caller can prove *which* cutover is in flight rather than
+    /// only that some rollback is.
+    pub cutover_digest: Sha256Digest,
 }
 
-/// Historical rollback receipt shape. This coordinator does not mint rollback
-/// receipts; Kernel/ORS owns the newer-epoch cutover record and receipt.
+/// Local rollback receipt. It records the same local compare-and-swap of the
+/// admission target that a switch does; the durable cutover it executes is
+/// owned by Kernel/ORS and proved by the [`GenerationCutoverReceipt`] the
+/// request supplied, not by this receipt. `restored_generation` is a re-admitted
+/// generation under a newer epoch, never a reactivated old epoch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackReceipt {
@@ -627,9 +686,9 @@ pub struct RollbackReceipt {
     pub operation_id: String,
     /// Generation retired by the rollback.
     pub from_generation: u64,
-    /// Generation that previously became active under an older rollback record.
+    /// Generation the owner-committed cutover restored.
     pub restored_generation: u64,
-    /// Artifact digest recorded by the older rollback record.
+    /// Artifact digest bound to the restored generation.
     pub restored_artifact: Sha256Digest,
     /// Accepted calls on the retired generation retained as history.
     pub new_calls_retained: u64,
@@ -725,10 +784,32 @@ pub enum RehydratedState {
     Unknown,
 }
 
+/// Why the pending candidate may take the admission target. A forward
+/// candidate is admitted by its retained bounded probe result; a rollback
+/// target is admitted by the owner-committed cutover, never by a probe — the
+/// retained generation already passed readiness when it was first prepared, and
+/// fabricating a fresh probe result here would invent evidence.
+#[derive(Clone, Debug)]
+enum CandidateBasis {
+    Probe(ReadinessEvidence),
+    CommittedCutover { cutover: GenerationCutoverReceipt },
+}
+
+impl CandidateBasis {
+    /// The owner-committed cutover a pending rollback target is armed under, or
+    /// `None` for a forward candidate.
+    fn committed_cutover(&self) -> Option<&GenerationCutoverReceipt> {
+        match self {
+            Self::Probe(_) => None,
+            Self::CommittedCutover { cutover } => Some(cutover),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedCandidate {
     record: GenerationRecord,
-    evidence: ReadinessEvidence,
+    basis: CandidateBasis,
     operation_id: String,
     active_number: u64,
     active_fence_digest: Sha256Digest,
@@ -836,12 +917,24 @@ impl CoordinatorState {
         self.history.push_back(entry);
     }
 
+    /// A generation held by the pending candidate slot is retained until the
+    /// operation resolves. That slot carries both bases: a forward candidate
+    /// and, equally, the retained generation an in-progress rollback has armed
+    /// to restore. I14.24 case 21 requires the old generation to survive until
+    /// no exact call *or* rollback references it, so a pending rollback pins
+    /// its own target against `evictible_retained` for as long as the arm lives.
     fn referenced_elsewhere(&self, generation: u64) -> bool {
         self.candidate
             .as_ref()
             .is_some_and(|candidate| candidate.record.generation_number() == generation)
     }
 
+    /// The only eviction candidate set is `retained`, and a generation is only
+    /// evictible when nothing pins it. A generation that `complete_rollback`
+    /// restored is removed from `retained` and becomes `active`, so it is
+    /// outside this universe entirely and can never be its own eviction victim;
+    /// before that commit it is both retained and pinned by
+    /// [`Self::referenced_elsewhere`], so it is unreachable here too.
     fn evictible_retained(&self) -> Option<u64> {
         self.retained.keys().find_map(|number| {
             let referenced = self
@@ -883,8 +976,10 @@ impl GenerationCoordinator {
     }
 
     /// Records the first externally admitted generation. Later generations
-    /// arrive through prepare/switch; local rollback is refused pending a
-    /// Kernel/ORS newer-epoch cutover.
+    /// arrive through prepare/switch, or through
+    /// `arm_rollback`/`complete_rollback`
+    /// when Kernel/ORS has committed a newer-epoch cutover restoring a retained
+    /// generation.
     ///
     /// # Errors
     ///
@@ -1224,22 +1319,41 @@ impl GenerationCoordinator {
         }
     }
 
-    /// Refuses local rollback. A rollback must be committed by Kernel/ORS as a
-    /// new cutover with a newer authority epoch; this coordinator has no
-    /// authenticated cutover receipt and cannot safely restore a retained
-    /// generation's old fence. This refusal leaves operation, drain, call
-    /// history, and reconciliation evidence unchanged.
+    /// Arms an exact old/new rollback, gated on owner-committed newer-epoch
+    /// evidence.
+    ///
+    /// Rollback is a second cutover, not a restoration (I14.19): the retained
+    /// generation stops nothing by itself, the currently active generation is
+    /// drained like any other replacement, and the admission target is moved by
+    /// the same single compare-and-swap in [`Self::complete_rollback`]. The
+    /// coordinator supplies no authority. The caller must present the
+    /// [`GenerationCutoverReceipt`] Kernel/ORS committed for this restore, and
+    /// it must (a) validate through its own `validate()`, (b) be `Completed`,
+    /// (c) name exactly `expected_current` as the retired generation and
+    /// `target_generation` as the restored one, and (d) carry an authority
+    /// epoch in the active fence's own lineage with a strictly greater
+    /// sequence. An old epoch is never reactivated and a foreign lineage is
+    /// never ordered against the active authority.
+    ///
+    /// On success the exclusive operation is held and the retained target is
+    /// pinned, so the existing [`Self::begin_drain`] arms the drain and no new
+    /// lease is acquired on the generation being retired.
     ///
     /// # Errors
     ///
-    /// Returns a typed failure for invalid expectations or when Kernel/ORS
-    /// cutover authority is required. No local rollback operation is armed.
+    /// Returns [`ReplacementError::KernelCutoverRequired`] when the caller
+    /// supplies no cutover evidence, and otherwise a typed failure for an
+    /// invalid expectation, a missing or changed retained target, an
+    /// incompatible target, unresolved new calls or an unknown switch receipt
+    /// ([`ReplacementError::ReconciliationRequired`]), or cutover evidence that
+    /// does not validate as a newer-epoch cutover. A refusal arms nothing and
+    /// leaves operation, drain, call history, and receipts unchanged.
     pub fn arm_rollback(
         &self,
         request: &RollbackRequest,
     ) -> Result<RollbackArmed, ReplacementError> {
         check_text(&request.operation_id, "replacement.operation_id")?;
-        let state = self.lock_state()?;
+        let mut state = self.lock_state()?;
         if state.operation.is_some() {
             return Err(ReplacementError::ReplacementInProgress);
         }
@@ -1260,6 +1374,9 @@ impl GenerationCoordinator {
         if target.artifact_digest != request.target_artifact {
             return Err(ReplacementError::RollbackPayloadChanged);
         }
+        // Direction-agnostic compatibility only. `check_compatible` additionally
+        // refuses a generation-number regression, which is correct for a forward
+        // replacement and would make the restore direction unreachable.
         check_compatible_fields(&active, &target)?;
         if let Some(adoption) = state.adoption.as_ref() {
             let risky = !adoption.confirmed || adoption.calls_accepted_since > 0;
@@ -1271,26 +1388,65 @@ impl GenerationCoordinator {
                 return Err(ReplacementError::ReconciliationRequired);
             }
         }
-        Err(ReplacementError::KernelCutoverRequired)
+        // The owner evidence is pinned, not just its digest: the completion CAS
+        // re-validates this exact receipt under the same lock, so a rollback can
+        // only be completed under the cutover that armed it.
+        let cutover = check_rollback_cutover(request, &active)?;
+        let cutover_digest = request
+            .cutover_digest
+            .clone()
+            .ok_or(ReplacementError::KernelCutoverRequired)?;
+        target.validate_owned()?;
+        let fence_digest = canonical_digest(&active.generation.state_fence)
+            .map_err(|_| external_contract("fence-seal-failed"))?;
+        state.operation = Some(request.operation_id.clone());
+        state.candidate = Some(PreparedCandidate {
+            record: target,
+            basis: CandidateBasis::CommittedCutover { cutover },
+            operation_id: request.operation_id.clone(),
+            active_number: active.generation_number(),
+            active_fence_digest: fence_digest,
+        });
+        Ok(RollbackArmed {
+            operation_id: request.operation_id.clone(),
+            current_generation: request.expected_current,
+            target_generation: request.target_generation,
+            cutover_digest,
+        })
     }
 
-    /// Refuses local rollback even if stale or internally supplied state says
-    /// one was armed. Only a Kernel/ORS newer-epoch cutover may change the
-    /// active generation. Existing local history and reconciliation evidence
-    /// are preserved.
+    /// Completes the rollback as the second single compare-and-swap of the
+    /// admission target.
+    ///
+    /// Under the same lock and in the same order as [`Self::switch`], this
+    /// rechecks operation ownership, that the drain was armed by this same
+    /// operation, that the expected current generation and the fence digest
+    /// still match what arming observed, that the restore target equals the
+    /// expected restore generation and is still the exact retained record, and
+    /// that the generation being retired has no unresolved call. It then
+    /// retains the generation being retired through the same bounded
+    /// [`Self::retain_old`] a switch uses, records the sealed
+    /// [`RollbackReceipt`] on the shared receipt chain, and leaves the call
+    /// history untouched: all new-call history survives the rollback.
     ///
     /// # Errors
     ///
-    /// Returns [`ReplacementError::InvalidField`] for an invalid operation ID
-    /// or [`ReplacementError::KernelCutoverRequired`] because local rollback
-    /// cannot authorize a newer-epoch Kernel/ORS cutover.
+    /// Returns a typed failure when the operation, target, drain, or
+    /// expectation does not validate, when the generation being retired still
+    /// has unresolved calls, or when bounded retention cannot admit the retired
+    /// generation. A mid-operation failure restores the pre-call state, so a
+    /// failure can never leave `active` pointing at a generation with neither an
+    /// operation nor a drain.
     pub fn complete_rollback(
         &self,
         operation_id: &str,
-        _expected_current: u64,
+        expected_current: u64,
+        expected_restore: u64,
     ) -> Result<RollbackReceipt, ReplacementError> {
         check_text(operation_id, "replacement.operation_id")?;
-        Err(ReplacementError::KernelCutoverRequired)
+        let mut state = self.lock_state()?;
+        state.check_rollback(operation_id, expected_current, expected_restore)?;
+        state.commit_rollback(operation_id, expected_current, expected_restore)
     }
 
     /// Reconciles an unknown switch to exactly one observed active generation
@@ -1511,8 +1667,9 @@ impl GenerationCoordinator {
     }
 
     /// Returns retained switch, rollback, and reconciliation receipt counts.
-    /// Existing rollback receipts remain part of history; new rollback
-    /// receipts require a Kernel/ORS newer-epoch cutover.
+    /// A rollback receipt exists only after an owner-committed newer-epoch
+    /// cutover armed and completed one, so this count is bounded evidence of
+    /// executed cutovers rather than of proposals.
     ///
     /// # Errors
     ///
@@ -1741,7 +1898,7 @@ impl GenerationCoordinator {
         }
         state.candidate = Some(PreparedCandidate {
             record: request.candidate.record.clone(),
-            evidence: evidence.clone(),
+            basis: CandidateBasis::Probe(evidence.clone()),
             operation_id: request.operation_id.clone(),
             active_number: snapshot.number,
             active_fence_digest: snapshot.fence_digest.clone(),
@@ -1786,6 +1943,141 @@ impl GenerationRecord {
 }
 
 impl CoordinatorState {
+    fn check_rollback(
+        &self,
+        operation_id: &str,
+        expected_current: u64,
+        expected_restore: u64,
+    ) -> Result<(), ReplacementError> {
+        if !self.holds_operation(operation_id) {
+            return Err(ReplacementError::UnknownOperation);
+        }
+        let Some(candidate) = self.candidate.as_ref() else {
+            return Err(ReplacementError::NoPreparedCandidate);
+        };
+        let Some(cutover) = candidate.basis.committed_cutover() else {
+            return Err(ReplacementError::NoArmedRollback);
+        };
+        if candidate.operation_id != operation_id {
+            return Err(ReplacementError::UnknownOperation);
+        }
+        if self
+            .draining
+            .as_ref()
+            .is_none_or(|drain| drain.operation_id != operation_id)
+        {
+            return Err(ReplacementError::DrainNotArmed);
+        }
+        let Some(active) = self.active.as_ref() else {
+            return Err(ReplacementError::NoActiveGeneration);
+        };
+        if active.generation_number() != expected_current
+            || active.generation_number() != candidate.active_number
+        {
+            return Err(ReplacementError::StaleExpectedGeneration);
+        }
+        if candidate.record.generation_number() != expected_restore {
+            return Err(ReplacementError::StaleExpectedGeneration);
+        }
+        // The pinned owner evidence is re-checked here, at the linearization
+        // point, so a rollback is only completed under the exact cutover that
+        // armed it. The fence is still the one arming observed (checked
+        // immediately below), so the newer-epoch rule is re-evaluated against
+        // that same fence.
+        check_committed_cutover(cutover, expected_current, expected_restore, active)?;
+        let fence_digest = canonical_digest(&active.generation.state_fence)
+            .map_err(|_| external_contract("fence-seal-failed"))?;
+        if fence_digest != candidate.active_fence_digest {
+            return Err(ReplacementError::StaleExpectedGeneration);
+        }
+        match self.retained.get(&expected_restore) {
+            Some(retained) if retained.artifact_digest == candidate.record.artifact_digest => {}
+            Some(_) => return Err(ReplacementError::RollbackPayloadChanged),
+            None => return Err(ReplacementError::UnknownGeneration),
+        }
+        if !self.unresolved_on(active.generation_number()).is_empty() {
+            return Err(ReplacementError::DrainUnresolved);
+        }
+        Ok(())
+    }
+
+    fn commit_rollback(
+        &mut self,
+        operation_id: &str,
+        expected_current: u64,
+        expected_restore: u64,
+    ) -> Result<RollbackReceipt, ReplacementError> {
+        let sequence = self.next_sequence()?;
+        let Some(candidate) = self.candidate.take() else {
+            return Err(ReplacementError::NoPreparedCandidate);
+        };
+        let Some(previous) = self.active.take() else {
+            self.candidate = Some(candidate);
+            return Err(ReplacementError::NoActiveGeneration);
+        };
+        if let Err(error) = self.retain_old(previous.clone()) {
+            self.active = Some(previous);
+            self.candidate = Some(candidate);
+            return Err(error);
+        }
+        // The restored generation leaves `retained` as it becomes the active
+        // admission target; it is restored here if any later step fails.
+        let withdrawn = self.retained.remove(&expected_restore);
+        let restored_artifact = candidate.record.artifact_digest.clone();
+        // New-call history is never cleared by a rollback.
+        let new_calls_retained = self.new_calls_on(expected_current);
+        let prev = self.chain_prev();
+        let receipt = match seal_rollback_receipt(
+            sequence,
+            operation_id,
+            expected_current,
+            expected_restore,
+            &restored_artifact,
+            new_calls_retained,
+            &prev,
+        ) {
+            Ok(receipt) => receipt,
+            // The admission target has not moved yet, so the whole pre-call
+            // state — active generation, pending candidate, and the withdrawn
+            // retained record — is restored exactly. Operation, drain, and
+            // adoption were never touched.
+            Err(error) => {
+                if let Some(record) = withdrawn {
+                    self.retained.insert(record.generation_number(), record);
+                }
+                self.active = Some(previous);
+                self.candidate = Some(candidate);
+                return Err(error);
+            }
+        };
+        self.active = Some(candidate.record);
+        self.adoption = Some(AdoptionInfo {
+            operation_id: operation_id.to_owned(),
+            calls_accepted_since: 0,
+            confirmed: false,
+        });
+        self.draining = None;
+        self.operation = None;
+        if self.rollback_log.len() >= MAX_RECEIPTS {
+            self.rollback_log.pop_front();
+        }
+        self.rollback_log.push_back(receipt.clone());
+        self.chain_head = Some(receipt.receipt_digest.clone());
+        Ok(receipt)
+    }
+
+    /// Counts the recorded new-call history on one generation, saturating
+    /// rather than wrapping if a bounded history ever exceeded `u64::MAX`.
+    fn new_calls_on(&self, generation: u64) -> u64 {
+        u64::try_from(
+            self.history
+                .iter()
+                .filter(|entry| entry.generation == generation)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     fn check_switch(&self, request: &SwitchRequest) -> Result<(), ReplacementError> {
         if !self.holds_operation(&request.operation_id) {
             return Err(ReplacementError::UnknownOperation);
@@ -1816,12 +2108,20 @@ impl CoordinatorState {
         if fence_digest != candidate.active_fence_digest {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
-        if candidate.evidence.generation != candidate.record.generation_number()
-            || !candidate.evidence.success
-        {
-            return Err(ReplacementError::InvalidGeneration(
-                "readiness-not-retained".to_owned(),
-            ));
+        match &candidate.basis {
+            CandidateBasis::Probe(evidence) => {
+                if evidence.generation != candidate.record.generation_number() || !evidence.success
+                {
+                    return Err(ReplacementError::InvalidGeneration(
+                        "readiness-not-retained".to_owned(),
+                    ));
+                }
+            }
+            // A rollback target is admitted by the owner-committed cutover, not
+            // by a forward probe, so it has no forward switch to perform.
+            CandidateBasis::CommittedCutover { .. } => {
+                return Err(ReplacementError::RollbackCutoverPending);
+            }
         }
         if !self.unresolved_on(active.generation_number()).is_empty() {
             return Err(ReplacementError::DrainUnresolved);
@@ -1895,12 +2195,87 @@ fn check_compatible(
     old: &GenerationRecord,
     new: &GenerationRecord,
 ) -> Result<(), ReplacementError> {
+    // Forward replacements only. A rollback restores a retained generation,
+    // which is by definition older; `arm_rollback` uses
+    // `check_compatible_fields` for exactly that reason.
     if new.generation_number() <= old.generation_number() {
         return Err(ReplacementError::IncompatibleCandidate(
             "generation-regression".to_owned(),
         ));
     }
     check_compatible_fields(old, new)
+}
+
+/// Validates the owner-committed cutover that authorises a rollback restore and
+/// returns the exact receipt to pin on the armed candidate.
+///
+/// `EpochId` is not nameable from this crate (`eliot-runtime-contracts` keeps
+/// it a private import), so the lineage and sequence are compared through the
+/// public fields of the value, exactly as
+/// `eliot_contracts::EpochId::is_same_authority` defines exact authority
+/// (lineage AND sequence; equal sequences from different lineages are
+/// unrelated). No new dependency is introduced for this.
+fn check_rollback_cutover(
+    request: &RollbackRequest,
+    active: &GenerationRecord,
+) -> Result<GenerationCutoverReceipt, ReplacementError> {
+    let (Some(cutover), Some(expected_digest)) = (&request.cutover, &request.cutover_digest) else {
+        return Err(ReplacementError::KernelCutoverRequired);
+    };
+    let digest = canonical_digest(cutover).map_err(|_| external_contract("cutover-seal-failed"))?;
+    if digest != *expected_digest {
+        return Err(ReplacementError::RollbackPayloadChanged);
+    }
+    check_committed_cutover(
+        cutover,
+        request.expected_current,
+        request.target_generation,
+        active,
+    )?;
+    Ok(cutover.clone())
+}
+
+/// The owner-evidence half of a rollback gate, shared by arming and completion
+/// so both linearization points apply exactly the same rules.
+///
+/// The receipt must be a `Completed` cutover (a
+/// `FAILED_REQUIRES_FORWARD_CUTOVER` receipt is the owner demanding forward
+/// repair, not permission to restore a route), must name exactly
+/// `expected_current` as the generation being retired and `expected_restore` as
+/// the restored one, and must carry an authority epoch in the retired
+/// generation's own fence lineage with a strictly greater sequence. An old
+/// epoch is never reactivated and a foreign lineage is never ordered against
+/// the active authority.
+fn check_committed_cutover(
+    cutover: &GenerationCutoverReceipt,
+    expected_current: u64,
+    expected_restore: u64,
+    retired: &GenerationRecord,
+) -> Result<(), ReplacementError> {
+    cutover
+        .validate()
+        .map_err(|_| external_contract("cutover-receipt-rejected"))?;
+    if !matches!(cutover.state, GenerationCutoverState::Completed) {
+        return Err(external_contract("cutover-not-completed"));
+    }
+    if cutover.new_generation.value() != expected_restore {
+        return Err(external_contract("cutover-new-generation-mismatch"));
+    }
+    if cutover
+        .old_generation
+        .is_none_or(|retired| retired.value() != expected_current)
+    {
+        return Err(external_contract("cutover-old-generation-mismatch"));
+    }
+    let supplied = &cutover.authority_epoch;
+    let fenced = &retired.generation.state_fence.authority_epoch;
+    if supplied.lineage_id != fenced.lineage_id {
+        return Err(ReplacementError::RollbackEpochNotNewer);
+    }
+    if supplied.sequence <= fenced.sequence {
+        return Err(ReplacementError::OldEpochReactivation);
+    }
+    Ok(())
 }
 
 fn check_compatible_fields(
@@ -2058,6 +2433,54 @@ fn seal_switch_receipt(
         receipt_digest,
         durable_published: false,
         external_evidence: None,
+    })
+}
+
+#[derive(Serialize)]
+struct RollbackSeal<'a> {
+    sequence: u64,
+    operation_id: &'a str,
+    from_generation: u64,
+    restored_generation: u64,
+    restored_artifact: &'a Sha256Digest,
+    new_calls_retained: u64,
+    prev_receipt_digest: &'a Sha256Digest,
+}
+
+/// Seals over exactly the fields [`RollbackReceipt`] declares, so the receipt
+/// and its chain link are one digest in the same shape as the switch and
+/// reconcile seals. It attests to the local compare-and-swap only; the durable
+/// cutover is proved by the [`GenerationCutoverReceipt`] the request supplied.
+#[allow(clippy::too_many_arguments)]
+fn seal_rollback_receipt(
+    sequence: u64,
+    operation_id: &str,
+    from_generation: u64,
+    restored_generation: u64,
+    restored_artifact: &Sha256Digest,
+    new_calls_retained: u64,
+    prev: &Sha256Digest,
+) -> Result<RollbackReceipt, ReplacementError> {
+    let seal = RollbackSeal {
+        sequence,
+        operation_id,
+        from_generation,
+        restored_generation,
+        restored_artifact,
+        new_calls_retained,
+        prev_receipt_digest: prev,
+    };
+    let receipt_digest =
+        canonical_digest(&seal).map_err(|_| external_contract("receipt-seal-failed"))?;
+    Ok(RollbackReceipt {
+        sequence,
+        operation_id: operation_id.to_owned(),
+        from_generation,
+        restored_generation,
+        restored_artifact: restored_artifact.clone(),
+        new_calls_retained,
+        prev_receipt_digest: prev.clone(),
+        receipt_digest,
     })
 }
 

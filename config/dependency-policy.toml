@@ -495,3 +495,14 @@ reason = "Pass SecretReference handles to owner-closure admission while keeping 
 features = ["default"]
 public_exposure = "SecretReference is a public admission parameter; secret bytes are not exposed."
 removal_plan = "Remove when owner-closure admission no longer consumes eliot_platform::SecretReference and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-dreamer-failure"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Admit the owner-issued negative-memory rule and run the bounded pure matcher over an owner-resolved rule snapshot; the provider supplies only semantic owner types and performs no I/O."
+features = ["default"]
+public_exposure = "Negative-memory record, policy and matcher types are public activation and gate parameters; no provider store handle, I/O or runtime state is exposed."
+removal_plan = "Remove when governed negative-memory activation and the Context exposure gate no longer consume eliot_dreamer_failure record, policy and matcher types and the manifest edge is deleted."
