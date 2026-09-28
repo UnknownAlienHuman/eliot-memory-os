@@ -2066,19 +2066,145 @@ fn check_declared_operational(
     Ok(())
 }
 
+/// What one page's own entries say about the operational walk (issue #2967).
+///
+/// The three facts the page's continuation rules and the cross-page chain rule are
+/// both decided from, measured once so that neither has to re-walk the entries.
+/// [`Self::last_order`] is the cursor's own bound when the page emitted no
+/// operational row, which is what makes "did this page move the walk" a question
+/// about [`Self::emitted`] alone.
+struct OperationalPageTail {
+    /// Operational rows this page emitted.
+    emitted: u64,
+    /// Order of this page's last emitted operational row, or the incoming cursor's
+    /// own bound when the page emitted none.
+    last_order: u64,
+    /// The incoming cursor's row count plus this page's emitted rows.
+    walked: u64,
+}
+
+/// Measures one page's operational tail from its own entries (issue #2967).
+///
+/// Per entry, in one pass and no sort: the operational rows must strictly increase
+/// and follow the incoming cursor's exclusive bound, and none may sit above the
+/// frozen high-water. The high-water half is A5 — a row above it belongs to a
+/// successor snapshot and cannot appear under the older fence even though it may
+/// have been durable and stable before the export began — and the ordering half is
+/// what makes a repeated or reordered row a refusal rather than a member.
+fn measure_operational_tail(
+    page: &OrsBackupPage,
+    identity: &OrsOperationalSnapshotIdentity,
+) -> Result<OperationalPageTail, OrsError> {
+    let continuation = &page.operational_continuation;
+    let mut last_order = continuation.cursor.after_order;
+    let mut emitted: u64 = 0;
+    for entry in &page.entries {
+        if entry.family != RowFamilyKind::OperationalHistory {
+            continue;
+        }
+        emitted = emitted.checked_add(1).ok_or(OrsError::InvalidField {
+            field: "backup_operational_entry",
+            reason: "operational entry count overflow",
+        })?;
+        if entry.order <= last_order {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_entry",
+                reason: "operational entries must strictly increase and follow the incoming cursor; a repeated or reordered row is a duplicated or out-of-order member",
+            });
+        }
+        if entry.order > identity.high_water_order {
+            return Err(OrsError::InvalidField {
+                field: "backup_operational_entry",
+                reason: "an operational entry is above the frozen high-water order and belongs to a successor snapshot",
+            });
+        }
+        last_order = entry.order;
+    }
+    let walked = continuation
+        .cursor
+        .emitted_rows
+        .checked_add(emitted)
+        .ok_or(OrsError::InvalidField {
+            field: "backup_operational_cursor",
+            reason: "emitted operational row count overflow",
+        })?;
+    Ok(OperationalPageTail {
+        emitted,
+        last_order,
+        walked,
+    })
+}
+
+/// Checks a page's OWN operational continuation against the tail its entries
+/// measured (issue #2967).
+///
+/// A page that declares a next cursor must have moved the walk — otherwise the page
+/// budget would be spent without the walk ever moving — and that cursor must be
+/// derived from the page's exact emitted tail, in both its order and its row count.
+/// A page that declares none must instead have consumed the frozen denominator
+/// exactly, so "no continuation" is only ever the truthful statement that the walk
+/// finished, never a way to stop early.
+fn check_operational_continuation(
+    continuation: &OrsOperationalContinuation,
+    tail: &OperationalPageTail,
+    identity: &OrsOperationalSnapshotIdentity,
+) -> Result<(), OrsError> {
+    match &continuation.next {
+        Some(next) => {
+            if tail.emitted == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_continuation",
+                    reason: "a page must not declare an operational continuation without emitting an operational row",
+                });
+            }
+            if next.after_order != tail.last_order {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_continuation",
+                    reason: "the next operational cursor is not derived from the page's last operational member",
+                });
+            }
+            if next.emitted_rows != tail.walked {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_continuation",
+                    reason: "the next operational cursor does not account for exactly the rows this page emitted",
+                });
+            }
+        }
+        None => {
+            if tail.walked != identity.operational_row_count {
+                return Err(OrsError::InvalidField {
+                    field: "backup_operational_continuation",
+                    reason: "the walk stopped without a continuation before the frozen operational denominator was reached",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Proves cross-page operational continuity independently of the family axes
 /// (issue #2967, A11/A12).
 ///
 /// Every page is checked against the SAME frozen identity, and the pages must form
 /// ONE exact chain:
 ///
-/// - `pages[i].operational_continuation.next == pages[i + 1].operational_continuation.cursor`,
-///   exactly. This single rule is what makes duplication and skipping structurally
-///   impossible rather than merely unlikely: page N+1 cannot re-read anything page N
-///   emitted, and cannot start anywhere other than where page N actually stopped,
-///   because the boundary it must present IS page N's emitted tail. A page after an
-///   exhausted walk is refused here too, since an exhausted walk has no next cursor
-///   for the following page to present.
+/// - A page that EMITTED operational rows must be continued by the next page from its
+///   exact emitted tail, `pages[i].operational_continuation.next ==
+///   pages[i + 1].operational_continuation.cursor`. This single rule is what makes
+///   duplication and skipping structurally impossible rather than merely unlikely:
+///   page N+1 cannot re-read anything page N emitted, and cannot start anywhere other
+///   than where page N actually stopped, because the boundary it must present IS page
+///   N's emitted tail.
+/// - A page that emitted NO operational row imposes no such requirement, and that is
+///   the second arm rather than an omission. It has no emitted tail for a successor to
+///   present, `check_operational_continuation` has already proved that a page emitting
+///   no row cannot declare a next cursor, and that helper's `None` arm has already
+///   proved `walked == identity.operational_row_count` — so the walk is EXHAUSTED, and
+///   the pages that follow exist to carry the family axes. Refusing that shape is what
+///   made the store's own family-only multi-page output unvalidatable: it is the
+///   "only the family continuation" state that `next_operational_cursor`'s own
+///   documentation names ("a snapshot may carry both, either, or neither"), and it is
+///   the only one of the four states that the page chain used to reject.
 /// - The first page starts the walk: its in-force cursor must have emitted nothing.
 ///   A chain that is exact from page 1 onward can still under-report coverage if
 ///   page 0 opens in the middle, which is the same defect as a stride window with a
@@ -2126,69 +2252,10 @@ fn check_operational_pages(
                 reason: "the first page must start the walk, not continue one that is already under way",
             });
         }
-        let mut previous_order = continuation.cursor.after_order;
-        let mut emitted: u64 = 0;
-        for entry in &page.entries {
-            if entry.family != RowFamilyKind::OperationalHistory {
-                continue;
-            }
-            emitted = emitted.checked_add(1).ok_or(OrsError::InvalidField {
-                field: "backup_operational_entry",
-                reason: "operational entry count overflow",
-            })?;
-            if entry.order <= previous_order {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_entry",
-                    reason: "operational entries must strictly increase and follow the incoming cursor; a repeated or reordered row is a duplicated or out-of-order member",
-                });
-            }
-            if entry.order > identity.high_water_order {
-                return Err(OrsError::InvalidField {
-                    field: "backup_operational_entry",
-                    reason: "an operational entry is above the frozen high-water order and belongs to a successor snapshot",
-                });
-            }
-            previous_order = entry.order;
-        }
-        let walked = continuation
-            .cursor
-            .emitted_rows
-            .checked_add(emitted)
-            .ok_or(OrsError::InvalidField {
-                field: "backup_operational_cursor",
-                reason: "emitted operational row count overflow",
-            })?;
-        match &continuation.next {
-            Some(next) => {
-                if emitted == 0 {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "a page must not declare an operational continuation without emitting an operational row",
-                    });
-                }
-                if next.after_order != previous_order {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "the next operational cursor is not derived from the page's last operational member",
-                    });
-                }
-                if next.emitted_rows != walked {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "the next operational cursor does not account for exactly the rows this page emitted",
-                    });
-                }
-            }
-            None => {
-                if walked != identity.operational_row_count {
-                    return Err(OrsError::InvalidField {
-                        field: "backup_operational_continuation",
-                        reason: "the walk stopped without a continuation before the frozen operational denominator was reached",
-                    });
-                }
-            }
-        }
+        let tail = measure_operational_tail(page, identity)?;
+        check_operational_continuation(continuation, &tail, identity)?;
         if let Some(next_page) = pages.get(index + 1)
+            && tail.emitted > 0
             && continuation.next.as_ref() != Some(&next_page.operational_continuation.cursor)
         {
             return Err(OrsError::InvalidField {
