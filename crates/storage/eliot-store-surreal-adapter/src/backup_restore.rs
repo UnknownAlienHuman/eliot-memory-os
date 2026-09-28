@@ -174,10 +174,13 @@ struct RestoreMemberRecord {
     /// Class token of the imported record, present exactly with
     /// [`Self::imported_record_id`].
     imported_class: Option<String>,
-    /// Digest of the bytes read back from the destination's canonical read path
-    /// for this member, present exactly with [`Self::imported_record_id`]. It is
-    /// absent whenever the import was not observed, so a member can never claim
-    /// a canonical import it has no readback for.
+    /// Content digest this operation bound for this member's canonical import:
+    /// the digest of the resolved payload validated against the archive owner's
+    /// attested value. It is present exactly with [`Self::imported_record_id`],
+    /// and the post-commit readback must reproduce it from the destination's own
+    /// canonical read path before the member is reported `Restored`. A member
+    /// without a `Restored` disposition never carries one, so it cannot claim an
+    /// import it has no expectation for.
     imported_digest: Option<String>,
 }
 
