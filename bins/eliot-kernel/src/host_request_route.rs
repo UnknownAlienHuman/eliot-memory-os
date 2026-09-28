@@ -2875,10 +2875,8 @@ impl KernelComposition {
         if !self.application_binding_live_for_claim(envelope, pending, false)? {
             return Ok(None);
         }
-        Ok(candidate
-            .local_read_attempt
-            .clone()
-            .filter(LocalReadAttemptState::is_live))
+        let attempt = candidate.local_read_attempt.clone();
+        Ok(attempt.is_live().then_some(attempt))
     }
 
     /// Retires one queued local-read pair without failing.
