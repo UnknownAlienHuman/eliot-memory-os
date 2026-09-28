@@ -15,7 +15,10 @@
 //!    reached from the daemon's live Skill-intake commit step
 //!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)) for the
 //!    intake's own Skill, so a record committed while the daemon runs is
-//!    observed without waiting for a restart.
+//!    observed without waiting for a restart. The one-shot apply installs only
+//!    a COMPLETE page: a page that reports further eligible rows is refused
+//!    whole before any row is minted, so partial coverage can never present
+//!    itself as the view and admit past an unread restriction.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -151,6 +154,11 @@ pub enum EvidenceBridgeError {
     /// evidence coverage was not retained.
     #[error("capability evidence registry is full; new capability coverage was refused")]
     CapacityExceeded,
+    /// A one-shot page hydration cannot claim complete coverage: the store
+    /// reports further eligible rows past this page and the caller supplied no
+    /// continuation to drain. Nothing from the page is installed.
+    #[error("capability evidence page is truncated; complete coverage requires the paged drain")]
+    CoverageIncomplete,
 }
 
 /// Daemon-held Governor capability admission view.
@@ -408,8 +416,8 @@ impl GovernorCapabilityAdmission {
         Ok(request)
     }
 
-    /// Applies one capability-evidence RECORD page to the held view, minting
-    /// real records under the store-issued owner revision.
+    /// Applies one COMPLETE capability-evidence RECORD page to the held view,
+    /// minting real records under the store-issued owner revision.
     ///
     /// Each projected row is re-proved at this read edge before it can become
     /// registry state: the row's presented `record_digest` must equal the
@@ -422,62 +430,91 @@ impl GovernorCapabilityAdmission {
     /// is `&self` and mints nothing, so it cannot be the path that rebuilds
     /// this view.
     ///
+    /// A page that reports further eligible rows (`truncated`) is refused whole
+    /// with [`EvidenceBridgeError::CoverageIncomplete`] before any row is
+    /// minted. A one-shot apply has no continuation to drain, so installing its
+    /// prefix would present partial coverage as the view: a restriction, or a
+    /// newer revision, sitting past the cursor would stay invisible while the
+    /// installed prefix admits. The complete paged drain
+    /// ([`drain_capability_evidence_records`]) remains the only multi-page path;
+    /// it follows every continuation to exhaustion instead.
+    ///
+    /// The apply is atomic: envelope and row re-proofs, the truncation refusal,
+    /// and the capacity fit check all run before the first insert, so an error
+    /// leaves the held view exactly as it was. A refusal therefore keeps every
+    /// retained restriction and admits nothing new, which is the fail-closed
+    /// direction.
+    ///
     /// # Errors
     ///
     /// Returns [`EvidenceBridgeError`] when the response does not answer the
     /// planned read, the payload is not the versioned record shape, a row fails
-    /// its digest/key re-proof, or the bounded registry refused a new key.
+    /// its digest/key re-proof, the page reports further eligible rows, or the
+    /// page carries more new keys than the bounded registry can retain.
     pub fn hydrate_from_evidence_record_page(
         &mut self,
         request: &NamedReadRequest,
         response: &NamedReadResponse,
     ) -> Result<EvidenceRecordPage, EvidenceBridgeError> {
-        if response.operation != NamedReadOperation::GetCapabilityEvidenceRecordRange
-            || response.operation != request.operation
+        let decoded = decode_evidence_record_page(request, response)?;
+        if decoded.truncated {
+            return Err(EvidenceBridgeError::CoverageIncomplete);
+        }
+        // Atomic fit check before the first insert: the distinct new keys the
+        // page carries must fit the bound alongside what is already retained,
+        // so a page that cannot be installed whole is refused whole instead of
+        // leaving a minted prefix behind.
         {
-            return Err(EvidenceBridgeError::ResponseMismatch("operation"));
+            let mut unseen_new: Vec<(&str, &RouteScopeFingerprint)> = Vec::new();
+            for (record, _) in &decoded.rows {
+                if self
+                    .registry
+                    .retained_revision(&record.skill_id, &record.scope_fingerprint)
+                    .is_some()
+                {
+                    continue;
+                }
+                if unseen_new.iter().any(|(skill, scope)| {
+                    *skill == record.skill_id.as_str() && *scope == &record.scope_fingerprint
+                }) {
+                    continue;
+                }
+                unseen_new.push((record.skill_id.as_str(), &record.scope_fingerprint));
+            }
+            if self.registry.len() + unseen_new.len() > MAX_CAPABILITY_EVIDENCE_RECORDS {
+                return Err(EvidenceBridgeError::CapacityExceeded);
+            }
         }
-        if response.state_fence != request.state_fence {
-            return Err(EvidenceBridgeError::ResponseMismatch("fence"));
-        }
-        response
-            .validate()
-            .map_err(|_| EvidenceBridgeError::ResponseMismatch("shape"))?;
-        let payload = &response.payload;
-        if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-            return Err(EvidenceBridgeError::Payload("version"));
-        }
-        let planned_scope = request
-            .scope_id
-            .clone()
-            .ok_or(EvidenceBridgeError::Payload("scope"))?;
-        let planned_scope_value = serde_json::to_value(&planned_scope)
-            .map_err(|_| EvidenceBridgeError::Payload("scope"))?;
-        if payload.get("scope_id") != Some(&planned_scope_value) {
-            return Err(EvidenceBridgeError::Payload("scope"));
-        }
-        let truncated = payload
-            .get("truncated")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or(EvidenceBridgeError::Payload("truncated"))?;
-        let next_cursor = match payload.get("next_cursor") {
-            Some(serde_json::Value::Null) | None => None,
-            Some(serde_json::Value::String(cursor)) => Some(cursor.clone()),
-            Some(_) => return Err(EvidenceBridgeError::Payload("next_cursor")),
-        };
-        // A page that reports truncation without a usable continuation token is
-        // not a prefix a caller can drain; it is a coverage claim the store did
-        // not back, and it is refused rather than reported as hydrated.
-        if truncated && next_cursor.is_none() {
-            return Err(EvidenceBridgeError::Payload("next_cursor"));
-        }
-        let rows = payload
-            .get("records")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(EvidenceBridgeError::Payload("records"))?;
         let mut minted = 0_usize;
-        for row in rows {
-            let (record, revision) = decode_evidence_record_row(row)?;
+        for (record, revision) in decoded.rows {
+            // The fit check above guarantees a new key is never refused here.
+            // An equal/older replay converges silently: it displaces nothing.
+            if self.registry.insert(record, revision) {
+                minted = minted.saturating_add(1);
+            }
+        }
+        Ok(EvidenceRecordPage {
+            minted,
+            truncated: false,
+            next_cursor: decoded.next_cursor,
+            retained: self.len(),
+        })
+    }
+
+    /// Applies one RECORD page to the held view while tolerating truncation.
+    ///
+    /// Only [`drain_capability_evidence_records`] calls this, and only with the
+    /// continuation the page issued: the drain follows every page to exhaustion
+    /// and replaces the held view solely after the last one, so a truncated
+    /// page here is a drain in progress, never installed partial coverage.
+    fn apply_evidence_record_page(
+        &mut self,
+        request: &NamedReadRequest,
+        response: &NamedReadResponse,
+    ) -> Result<EvidenceRecordPage, EvidenceBridgeError> {
+        let decoded = decode_evidence_record_page(request, response)?;
+        let mut minted = 0_usize;
+        for (record, revision) in decoded.rows {
             // A new key refused because the bounded registry is full means the
             // requested coverage was NOT retained, so hydration reports the
             // refusal instead of claiming coverage. An equal/older replay
@@ -494,8 +531,8 @@ impl GovernorCapabilityAdmission {
         }
         Ok(EvidenceRecordPage {
             minted,
-            truncated,
-            next_cursor,
+            truncated: decoded.truncated,
+            next_cursor: decoded.next_cursor,
             retained: self.len(),
         })
     }
@@ -643,6 +680,80 @@ pub struct ObservedLifecycleSummary {
     pub truncated: bool,
 }
 
+/// One decoded capability-evidence RECORD page: envelope validated, every row
+/// re-proved, nothing yet applied to any registry.
+struct DecodedEvidenceRecordPage {
+    rows: Vec<(CapabilityEvidenceRecord, OwnerEvidenceRevision)>,
+    truncated: bool,
+    next_cursor: Option<String>,
+}
+
+/// Validates one RECORD-page envelope and re-proves every row it carries.
+///
+/// Operation, fence, scope, version, truncation-token, and per-row
+/// digest/key checks are exactly the ones the page apply used to inline, so a
+/// page accepted here carries the same owner authority wherever it is applied.
+/// Rows are decoded and re-proved but NOTHING is inserted: the caller decides
+/// whether this page may become registry state (complete pages only for a
+/// one-shot apply; continued pages only inside the drain).
+fn decode_evidence_record_page(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+) -> Result<DecodedEvidenceRecordPage, EvidenceBridgeError> {
+    if response.operation != NamedReadOperation::GetCapabilityEvidenceRecordRange
+        || response.operation != request.operation
+    {
+        return Err(EvidenceBridgeError::ResponseMismatch("operation"));
+    }
+    if response.state_fence != request.state_fence {
+        return Err(EvidenceBridgeError::ResponseMismatch("fence"));
+    }
+    response
+        .validate()
+        .map_err(|_| EvidenceBridgeError::ResponseMismatch("shape"))?;
+    let payload = &response.payload;
+    if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(EvidenceBridgeError::Payload("version"));
+    }
+    let planned_scope = request
+        .scope_id
+        .clone()
+        .ok_or(EvidenceBridgeError::Payload("scope"))?;
+    let planned_scope_value =
+        serde_json::to_value(&planned_scope).map_err(|_| EvidenceBridgeError::Payload("scope"))?;
+    if payload.get("scope_id") != Some(&planned_scope_value) {
+        return Err(EvidenceBridgeError::Payload("scope"));
+    }
+    let truncated = payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(EvidenceBridgeError::Payload("truncated"))?;
+    let next_cursor = match payload.get("next_cursor") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(serde_json::Value::String(cursor)) => Some(cursor.clone()),
+        Some(_) => return Err(EvidenceBridgeError::Payload("next_cursor")),
+    };
+    // A page that reports truncation without a usable continuation token is
+    // not a prefix a caller can drain; it is a coverage claim the store did
+    // not back, and it is refused rather than reported as hydrated.
+    if truncated && next_cursor.is_none() {
+        return Err(EvidenceBridgeError::Payload("next_cursor"));
+    }
+    let rows = payload
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(EvidenceBridgeError::Payload("records"))?;
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        decoded.push(decode_evidence_record_row(row)?);
+    }
+    Ok(DecodedEvidenceRecordPage {
+        rows: decoded,
+        truncated,
+        next_cursor,
+    })
+}
+
 /// Decodes one projected capability-evidence row into a real record plus the
 /// store-issued owner revision that orders its key.
 ///
@@ -750,7 +861,7 @@ pub fn drain_capability_evidence_records(
         let response = kernel
             .store_named_blocking(request.clone())
             .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
-        let page = staging.hydrate_from_evidence_record_page(&request, &response)?;
+        let page = staging.apply_evidence_record_page(&request, &response)?;
         pages = pages.saturating_add(1);
         minted = minted.saturating_add(page.minted);
         if !page.truncated {
@@ -764,7 +875,7 @@ pub fn drain_capability_evidence_records(
             //             `CapabilityRegistry::len` is that key vector's length.
             // READ SIDE   `staging.len()` -> `GovernorCapabilityAdmission::len`
             //             -> `self.registry.len()`, where `self.registry` is the
-            //             registry `hydrate_from_evidence_record_page` inserts
+            //             registry `apply_evidence_record_page` inserts
             //             into above.
             //
             // It therefore counts DISTINCT keys, so a store that re-serves a
