@@ -1314,7 +1314,7 @@ impl DocumentationBurdenReceipt {
     /// The set is canonicalized once, so two receipts over the same canonical
     /// state expose the same references in the same order.
     pub fn input_revisions(&self) -> Vec<ReportInputRevision> {
-        let mut inputs: Vec<ReportInputRevision> = self
+        let inputs: Vec<ReportInputRevision> = self
             .changed_document_and_contract_digests
             .iter()
             .map(|row| row.observed_by.clone())
