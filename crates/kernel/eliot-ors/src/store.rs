@@ -262,6 +262,20 @@ const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
 /// intake or application claim.
 const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_handoffs_v1");
+/// Durable normalized projections of staged bridge events (issue #1934,
+/// I7.23). One projection per staged event identity, keyed exactly like
+/// [`BRIDGE_EVENT_RECORDS`], and bound to that record by the immutable
+/// transport hash plus the recorded `EventEnvelope` disposition. This is the
+/// I7.23 "normalized `HostEventEnvelope`" item of the storage list: before any
+/// stream cursor is published, the raw-or-redacted record, this projection,
+/// and the disposition must be durably related (see
+/// [`RedbRecoveryStore::require_bridge_event_relation_in`]). A redacted event
+/// therefore has a durable normalized projection of its own instead of only
+/// the deterministic redacted marker, and the projection never carries source
+/// content. Disjoint from `HOST_REQUESTS`; it is a second durable item of ONE
+/// relation, not a second ingestion owner.
+const BRIDGE_EVENT_PROJECTIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_projections_v1");
 /// Maximum staged bridge-event rows. Mirrors the I14.2 canonical-writes pool
 /// (2048 items): breach fails with [`OrsError::ProjectionLimitExceeded`]
 /// (typed backpressure), never with silent loss.
@@ -356,6 +370,15 @@ const BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN: &str = "FORBIDDEN_CONTENT_DETECTE
 /// own deterministic projection so a receipt always names the projection its
 /// owner actually stored.
 const BRIDGE_EVENT_REDACTED_PROJECTION_MARKER: &str = "redacted/bridge-event-v1";
+/// Marker prefix of the deterministic NORMALIZED projection minted for a
+/// redacted bridge event (issue #1934, I7.23). The redacted record stores
+/// [`BRIDGE_EVENT_REDACTED_PROJECTION_MARKER`] bytes; the durable normalized
+/// projection of the same event is this distinct, separately validated form,
+/// so a reader can never mistake a copy of the record marker for the
+/// normalized envelope. Like the record marker it is a pure function of the
+/// immutable transport hash and the redaction receipt, and it carries no
+/// source content.
+const BRIDGE_EVENT_REDACTED_NORMALIZED_MARKER: &str = "redacted/bridge-event-normalized-v1";
 /// Byte patterns that must never persist as admissible staged bytes. Matched
 /// case-insensitively against the lossy UTF-8 decoding of the canonical
 /// envelope bytes.
@@ -404,6 +427,12 @@ const BRIDGE_EVENT_BLOB_CONTENT_WARNING: &str = "blob_payload_content_not_staged
 /// bound: breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
 /// backpressure), never with silent loss of handoff state.
 const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
+/// Maximum durable normalized projections. A projection exists exactly when
+/// its raw-or-redacted record exists (issue #1934, I7.23), so it shares the
+/// record admission budget one-for-one: breach fails the whole stage with
+/// typed `EventRecords` backpressure and commits neither row, never a record
+/// whose normalized projection is missing.
+const MAX_BRIDGE_EVENT_PROJECTIONS: usize = 2048;
 /// Handoff state persisted at DURABLE stage time: the staged envelope is
 /// durably held and handed toward Governor/coordinator intake, not yet
 /// reconciled against a consumed frontier.
@@ -846,6 +875,235 @@ impl BridgeEventRow {
 
 impl persistence_codec::PersistedValue for BridgeEventRow {
     const RECORD_TYPE: &'static str = "bridge_event_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// The durable normalized projection of one staged bridge event, related to
+/// its raw-or-redacted record (issue #1934, I7.23).
+///
+/// I7.23 requires the storage list to contain BOTH the immutable raw/hash
+/// record AND the normalized `HostEventEnvelope`, and requires cursor
+/// advancement to be published only after the two are durably related and the
+/// `EventEnvelope` disposition is recorded. [`BridgeEventRow`] alone cannot
+/// carry that second item on the redacted path: its `envelope_bytes` are
+/// structurally constrained by [`BridgeEventRow::validate_privacy`] to the
+/// deterministic redacted marker, so the normalized projection had nowhere to
+/// live and the cursor advanced over an event with no normalized form in any
+/// durable store.
+///
+/// This row is that second item. It is keyed by exactly the same
+/// `namespace::event_id` key as its record, so the relation is an exclusive
+/// creation inside the same ORS transaction — never a second owner, never a
+/// predictable name standing in for a proven claim:
+///
+/// ```text
+/// normalized_envelope  the durable normalized projection (see
+///                       [`RedbRecoveryStore::bridge_event_normalized_bytes`]);
+/// record_transport_hash the immutable transport hash of the ORIGINAL source
+///                       bytes this projection belongs to — the same value the
+///                       record row persists as `transport_hash`;
+/// record_redacted        whether that record stores the deterministic
+///                       redacted representation instead of the original bytes;
+/// record_disposition     the recorded `EventEnvelope` privacy disposition
+///                       (`allowed` | `redacted`);
+/// record_redaction_reason / record_redacted_classes
+///                       the record's redaction receipt, so the disposition
+///                       this projection is bound to is reconstructible without
+///                       reading the record row first.
+/// ```
+///
+/// `binds_record` is the relation check the stage entry re-verifies through
+/// [`BridgeEventProjectionRow::validate`] before it may advance any cursor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventProjectionRow {
+    contract_version: u16,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    /// Owner namespace this projection is bound under (issue #2729): the
+    /// same namespace the record row and the stage key carry. Empty only on
+    /// the legacy ownerless stage entry, mirroring
+    /// [`BridgeEventRow::owner_namespace`]; never a partial binding.
+    owner_namespace: String,
+    /// The durable normalized projection bytes. Verbatim canonical envelope
+    /// bytes on the admissible path; the deterministic source-free normalized
+    /// projection on the redacted path.
+    normalized_envelope: Vec<u8>,
+    /// Immutable transport hash of the original source bytes, equal to the
+    /// bound record's own `transport_hash`.
+    record_transport_hash: String,
+    /// Whether the bound record stores the deterministic redacted
+    /// representation rather than the original bytes.
+    record_redacted: bool,
+    /// The recorded `EventEnvelope` disposition this projection belongs to.
+    record_disposition: String,
+    /// Rejection reason of the bound record's redaction receipt; empty exactly
+    /// when `record_redacted` is false.
+    record_redaction_reason: String,
+    /// Redaction classes of the bound record's receipt; empty exactly when
+    /// `record_redacted` is false.
+    record_redacted_classes: Vec<String>,
+    /// Scope the privacy owner evaluated the source bytes under.
+    admitted_scope: String,
+    /// Privacy policy revision the owner's verdict was made under.
+    admitted_policy_revision: u64,
+    staged_at_ms: u64,
+    staging_connection: String,
+}
+
+impl BridgeEventProjectionRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        bridge_identity_text(&self.event_id, "event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "bridge event projection sequence must be nonzero",
+            });
+        }
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
+        crate::model::validate_digest(&self.record_transport_hash, "record_transport_hash")?;
+        crate::model::validate_digest(&self.admitted_scope, "admitted_scope")?;
+        if self.admitted_policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "admitted_policy_revision",
+                reason: "bridge event projection binds a nonzero privacy policy revision",
+            });
+        }
+        crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        self.validate_record_disposition()?;
+        self.validate_normalized_envelope()
+    }
+
+    /// Validates the recorded `EventEnvelope` disposition and its redaction
+    /// receipt facts as one binding: a redacted record binds a known wire
+    /// reason plus a bounded nonempty class list, an admissible record binds
+    /// neither. A disposition that names a redaction without the receipt, or a
+    /// receipt without the disposition, is refused rather than read as either
+    /// state.
+    fn validate_record_disposition(&self) -> Result<(), OrsError> {
+        let disposition = match self.record_disposition.as_str() {
+            x if x == BRIDGE_EVENT_PRIVACY_ALLOWED => {
+                if self.record_redacted
+                    || !self.record_redaction_reason.is_empty()
+                    || !self.record_redacted_classes.is_empty()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "record_disposition",
+                        reason: "an admissible bridge event binds no redaction receipt",
+                    });
+                }
+                false
+            }
+            x if x == BRIDGE_EVENT_PRIVACY_REDACTED => {
+                if !self.record_redacted {
+                    return Err(OrsError::InvalidField {
+                        field: "record_disposition",
+                        reason: "a redacted bridge event binds a redacted record",
+                    });
+                }
+                true
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "record_disposition",
+                    reason: "bridge event projection disposition must be allowed or redacted",
+                });
+            }
+        };
+        if !disposition {
+            return Ok(());
+        }
+        if self.record_redaction_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
+            && self.record_redaction_reason != BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE
+        {
+            return Err(OrsError::InvalidField {
+                field: "record_redaction_reason",
+                reason: "bridge event projection redaction carries a known wire reason",
+            });
+        }
+        if self.record_redacted_classes.is_empty()
+            || self.record_redacted_classes.len() > MAX_BRIDGE_EVENT_REDACTED_CLASSES
+        {
+            return Err(OrsError::InvalidField {
+                field: "record_redacted_classes",
+                reason: "bridge event projection redaction classes must be nonempty and bounded",
+            });
+        }
+        for class in &self.record_redacted_classes {
+            crate::model::validate_text(class, "record_redacted_classes")?;
+        }
+        Ok(())
+    }
+
+    /// Validates the stored normalized projection bytes against the recorded
+    /// disposition. The admissible form must be exactly the canonical envelope
+    /// bytes the transport hash covers, so a projection that claims a verbatim
+    /// normalized envelope over other bytes fails as an integrity mismatch. The
+    /// redacted form must be the deterministic source-free projection
+    /// recomputed here from the transport hash and the receipt classes, so a
+    /// corrupted or content-bearing projection is refused instead of being read
+    /// as the normalized form of a redacted event.
+    fn validate_normalized_envelope(&self) -> Result<(), OrsError> {
+        if self.normalized_envelope.is_empty()
+            || self.normalized_envelope.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES
+        {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.record_redacted {
+            let expected = RedbRecoveryStore::bridge_event_redacted_normalized_bytes(
+                &self.record_transport_hash,
+                &self.record_redacted_classes,
+                &self.record_redaction_reason,
+            );
+            if self.normalized_envelope != expected {
+                return Err(OrsError::PayloadIntegrityMismatch);
+            }
+            return Ok(());
+        }
+        if crate::model::sha256_hex(&self.normalized_envelope) != self.record_transport_hash {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reports whether this projection durably relates to exactly this
+    /// raw-or-redacted record. Every relation leg is compared, not a digest of
+    /// them: identity, sequence, owner namespace, the immutable transport hash,
+    /// the stored form, and the recorded disposition with its redaction
+    /// receipt. A projection that does not bind the record it was found under
+    /// is a torn relation, never a verified one.
+    fn binds_record(&self, record: &BridgeEventRow) -> bool {
+        self.stream_id == record.stream_id
+            && self.event_id == record.event_id
+            && self.sequence == record.sequence
+            && self.owner_namespace == record.owner_namespace
+            && self.record_transport_hash == record.transport_hash
+            && self.record_redacted == record.redacted
+            && self.record_disposition
+                == if record.redacted {
+                    BRIDGE_EVENT_PRIVACY_REDACTED
+                } else {
+                    BRIDGE_EVENT_PRIVACY_ALLOWED
+                }
+            && self.record_redaction_reason == record.redaction_reason
+            && self.record_redacted_classes == record.redacted_classes
+            && self.admitted_scope == record.admitted_scope
+            && self.admitted_policy_revision == record.admitted_policy_revision
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventProjectionRow {
+    const RECORD_TYPE: &'static str = "bridge_event_projection";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1842,6 +2100,12 @@ struct BridgeEventPrivacyStaging {
     /// #1934).
     policy_revision: u64,
     stored_bytes: Vec<u8>,
+    /// Durable normalized projection of the same event (issue #1934, I7.23):
+    /// the canonical envelope bytes on the admissible path, or the
+    /// deterministic source-free normalized projection of the redacted record.
+    /// Persisted as its own durable row and related to `stored_bytes` before
+    /// any cursor may be advanced.
+    normalized_bytes: Vec<u8>,
 }
 
 /// Resolved I7.23 ingest provenance for one staged bridge event (issue
@@ -8164,6 +8428,52 @@ impl RedbRecoveryStore {
         .into_bytes()
     }
 
+    /// Builds the durable NORMALIZED projection bytes for one staged event
+    /// (issue #1934, I7.23).
+    ///
+    /// An admissible event's normalized form is its canonical envelope JSON:
+    /// the normalized envelope IS the canonical `EventEnvelope` on the wire,
+    /// so it is persisted verbatim and stays covered by the immutable transport
+    /// hash.
+    ///
+    /// A redacted event has no admissible canonical envelope to normalize, and
+    /// persisting the denied bytes as a "normalized" copy would re-persist
+    /// exactly the content the redaction withheld. Its normalized projection is
+    /// therefore the deterministic, source-free form built from the immutable
+    /// transport hash and the redaction receipt — a pure function of its
+    /// inputs, recomputed by
+    /// [`BridgeEventProjectionRow::validate_normalized_envelope`], so a stored
+    /// projection is verified rather than trusted.
+    fn bridge_event_normalized_bytes(
+        envelope_bytes: &[u8],
+        transport_hash: &str,
+        denied: bool,
+        classes: &[String],
+        reason: &str,
+    ) -> Vec<u8> {
+        if denied {
+            return Self::bridge_event_redacted_normalized_bytes(transport_hash, classes, reason);
+        }
+        envelope_bytes.to_vec()
+    }
+
+    /// Builds the deterministic source-free normalized projection of a
+    /// redacted bridge event. The output is a pure function of the immutable
+    /// transport hash, the redaction receipt classes, and the receipt reason;
+    /// it carries no source content beyond the hash itself, so a redacted event
+    /// has a durable normalized form without republishing withheld content.
+    fn bridge_event_redacted_normalized_bytes(
+        transport_hash_hex: &str,
+        sorted_classes: &[String],
+        redaction_reason: &str,
+    ) -> Vec<u8> {
+        format!(
+            "{BRIDGE_EVENT_REDACTED_NORMALIZED_MARKER}:hash={transport_hash_hex}:classes={}:reason={redaction_reason}",
+            sorted_classes.join(",")
+        )
+        .into_bytes()
+    }
+
     /// Derives the advisory normalization warnings for one staged envelope
     /// (issue #1934, I7.23).
     ///
@@ -8409,6 +8719,18 @@ impl RedbRecoveryStore {
         } else {
             envelope_bytes.to_vec()
         };
+        // The durable normalized projection of the same event (issue #1934,
+        // I7.23). It is resolved here, beside the disclosure decision, so a
+        // redacted event has a normalized form that is bound to the same
+        // transport hash and redaction receipt as its stored bytes — never a
+        // copy of withheld content and never a second independent decision.
+        let normalized_bytes = Self::bridge_event_normalized_bytes(
+            envelope_bytes,
+            &transport_hash,
+            denied,
+            &classes,
+            &reason,
+        );
         Ok(BridgeEventPrivacyStaging {
             denied,
             reason,
@@ -8417,6 +8739,7 @@ impl RedbRecoveryStore {
             scope: grant.scope,
             policy_revision: grant.policy_revision,
             stored_bytes,
+            normalized_bytes,
         })
     }
 
@@ -8661,7 +8984,7 @@ impl RedbRecoveryStore {
                     producer_generation,
                     authority_epoch,
                     envelope_sha256: presented_sha,
-                    envelope_bytes: staging.stored_bytes,
+                    envelope_bytes: staging.stored_bytes.clone(),
                     staging_connection,
                     staged_at_ms: now_ms,
                     phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
@@ -8673,7 +8996,7 @@ impl RedbRecoveryStore {
                     transport_hash: staging.transport_hash.clone(),
                     redacted: staging.denied,
                     redaction_reason: staging.reason.clone(),
-                    redacted_classes: staging.classes,
+                    redacted_classes: staging.classes.clone(),
                     redaction_marker: if staging.denied {
                         BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
                     } else {
@@ -8688,8 +9011,8 @@ impl RedbRecoveryStore {
                     // decision even on this ownerless entry, so the persisted
                     // verdict stays attributable to the exact bytes, the
                     // scope, and the policy revision it was made about.
-                    admitted_source: staging.transport_hash,
-                    admitted_scope: staging.scope,
+                    admitted_source: staging.transport_hash.clone(),
+                    admitted_scope: staging.scope.clone(),
                     admitted_policy_revision: staging.policy_revision,
                     // No provenance was presented on this entry: the row
                     // stays pre-provenance, exactly as before.
@@ -8706,6 +9029,13 @@ impl RedbRecoveryStore {
                         .insert(key.as_str(), encode(&row)?.as_str())
                         .map_err(storage)?;
                 }
+                // Same I7.23 relation as the owner-checked entry (issue #1934):
+                // the durable normalized projection is written beside the
+                // raw-or-redacted record and re-verified through its own
+                // validator before the cursor advance below is allowed to
+                // publish a new frontier.
+                Self::insert_bridge_projection_in(&write, &key, &row, &staging, now_ms)?;
+                Self::require_bridge_event_relation_in(&write, &row, &key)?;
                 Self::mark_bridge_recovery_legacy_unproven_in(&write)?;
                 let (durable, acked) = Self::advance_bridge_cursor_in(&write, &stream_id)?;
                 let handoff = Self::bridge_handoff_state_in(&write, &stream_id, &event_id)?;
@@ -12394,6 +12724,111 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Stages the durable normalized projection of one freshly staged event
+    /// (issue #1934, I7.23). Runs inside a stage transaction, immediately
+    /// after the raw-or-redacted record row and under the identical
+    /// `namespace::event_id` key, so the projection is an exclusive creation
+    /// owned by this stage call rather than a row that merely happens to have
+    /// a predictable name.
+    ///
+    /// A projection table at its admission budget fails the whole stage with
+    /// typed `EventRecords` backpressure before any cursor moves: a record
+    /// without its normalized projection is never committed.
+    ///
+    /// Every relation leg is copied from the VALIDATED record row that was just
+    /// written, not re-derived from the staging input, so the projection
+    /// describes the record that actually exists on disk.
+    fn insert_bridge_projection_in(
+        write: &redb::WriteTransaction,
+        key: &str,
+        record: &BridgeEventRow,
+        staging: &BridgeEventPrivacyStaging,
+        now_ms: u64,
+    ) -> Result<(), OrsError> {
+        let projection = BridgeEventProjectionRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: record.stream_id.clone(),
+            event_id: record.event_id.clone(),
+            sequence: record.sequence,
+            owner_namespace: record.owner_namespace.clone(),
+            normalized_envelope: staging.normalized_bytes.clone(),
+            record_transport_hash: record.transport_hash.clone(),
+            record_redacted: record.redacted,
+            record_disposition: if record.redacted {
+                BRIDGE_EVENT_PRIVACY_REDACTED.to_owned()
+            } else {
+                BRIDGE_EVENT_PRIVACY_ALLOWED.to_owned()
+            },
+            record_redaction_reason: record.redaction_reason.clone(),
+            record_redacted_classes: record.redacted_classes.clone(),
+            admitted_scope: record.admitted_scope.clone(),
+            admitted_policy_revision: record.admitted_policy_revision,
+            staged_at_ms: now_ms,
+            staging_connection: record.staging_connection.clone(),
+        };
+        projection.validate()?;
+        let mut projections = write
+            .open_table(BRIDGE_EVENT_PROJECTIONS)
+            .map_err(storage)?;
+        if projections.len().map_err(storage)? >= MAX_BRIDGE_EVENT_PROJECTIONS as u64
+            && projections.get(key).map_err(storage)?.is_none()
+        {
+            return Err(OrsError::BridgeEventCapacityExceeded(
+                eliot_contracts::BridgeEventCapacityPressure::event_records(
+                    eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                ),
+            ));
+        }
+        projections
+            .insert(key, encode(&projection)?.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Requires the durable I7.23 relation for one staged record before any
+    /// cursor may be published (issue #1934).
+    ///
+    /// The projection stored under the record's own key is READ BACK and
+    /// validated through [`BridgeEventProjectionRow::validate`] — the
+    /// originally recorded value, checked by its own validator, not a
+    /// recomputed copy of what the caller still holds — and then compared leg
+    /// by leg with the record it claims to normalize
+    /// ([`BridgeEventProjectionRow::binds_record`]). A missing projection, a
+    /// foreign namespace, a different transport hash, a different stored form,
+    /// or a disposition that disagrees with the redaction receipt is a torn
+    /// relation and fails closed as an integrity problem: the whole stage fails
+    /// before the cursor frontier moves, so the unacknowledged event is
+    /// redelivered instead of answered `DURABLE` over an unproven relation.
+    fn require_bridge_event_relation_in(
+        write: &redb::WriteTransaction,
+        record: &BridgeEventRow,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        let stored: Option<BridgeEventProjectionRow> = {
+            let projections = write
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
+            projections
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let stored = stored.ok_or(OrsError::IntegrityProblem {
+            record_type: "bridge_event_projection",
+            reason: "staged bridge event has no durable normalized projection".to_owned(),
+        })?;
+        stored.validate()?;
+        if !stored.binds_record(record) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_projection",
+                reason: "durable normalized projection does not bind its raw-or-redacted record"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Inserts one fresh owner-checked row and advances its cursor (issue
     /// #2729). Runs inside the stage transaction owned by
     /// [`Self::stage_bridge_event_checked`].
@@ -12418,6 +12853,19 @@ impl RedbRecoveryStore {
     /// storage list — transport hash, raw-or-redacted bytes, receipt,
     /// adapter/transformation versions, routes, and warnings — durably
     /// related.
+    ///
+    /// Issue #1934 also makes the durable relation a COMMIT PRECONDITION of the
+    /// cursor advance rather than a description of it. The record row and its
+    /// normalized projection are both written first; the stored projection is
+    /// then re-read and re-validated through
+    /// [`Self::require_bridge_event_relation_in`] and compared against the
+    /// record it claims to normalize; only then may
+    /// [`Self::advance_bridge_cursor_in_checked`] publish a new durable
+    /// frontier. On the redacted path this is what was missing: the event has
+    /// its own durable normalized projection instead of only the deterministic
+    /// redacted marker, and a stage that cannot prove the relation fails the
+    /// whole transaction, leaving the cursor unadvanced for redelivery rather
+    /// than answering `DURABLE` over an event with no normalized form.
     fn insert_bridge_event_row_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -12482,6 +12930,12 @@ impl RedbRecoveryStore {
                 .insert(stage.key.as_str(), encode(&row)?.as_str())
                 .map_err(storage)?;
         }
+        Self::insert_bridge_projection_in(write, &stage.key, &row, staging, now_ms)?;
+        // The cursor advance is conditioned on the durable relation, not merely
+        // ordered after it: the projection just written is read back from the
+        // table, validated through its own `validate()`, and compared leg by
+        // leg against the record row before any frontier moves.
+        Self::require_bridge_event_relation_in(write, &row, &stage.key)?;
         {
             Self::check_bridge_position_budget_in(write, access)?;
             let position = BridgeEventPosition {
@@ -13085,6 +13539,21 @@ impl RedbRecoveryStore {
             for victim in &victims {
                 let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
                 records.remove(key.as_str()).map_err(storage)?;
+            }
+        }
+        // The normalized projection is retired with its record (issue #1934):
+        // the retained commitment is the admissible representation of a
+        // compacted event, so a projection left behind under the same key would
+        // be a projection whose raw-or-redacted record no longer exists. Both
+        // removals commit in the transaction that writes the commitment and the
+        // compacted boundary.
+        {
+            let mut projections = write
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
+            for victim in &victims {
+                let key = format!("{}::{}", victim.owner_namespace, victim.event_id);
+                projections.remove(key.as_str()).map_err(storage)?;
             }
         }
         Self::write_bridge_cursors_compacted_in(
