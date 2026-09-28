@@ -5,16 +5,17 @@
 //! daemon composition root's handle on that view. The single
 //! [`GovernorCapabilityAdmission`] is constructed empty at
 //! [`DaemonComposition::start`](super::DaemonComposition::start) and is
-//! mutated in production at exactly two sites, both non-test:
+//! mutated in production at exactly two sites, both non-test, and both reading
+//! DURABLE capability-evidence rows:
 //!
-//! 1. [`GovernorCapabilityAdmission::hydrate_from_evidence_response`], reached
-//!    from the daemon's live Skill-intake commit step
-//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)), which
-//!    applies the canonical `GetCapabilityEvidenceState` response that same
-//!    intake already read;
-//! 2. [`GovernorCapabilityAdmission::apply_scope_change`], reached from
-//!    [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//!    with the route scope the caller observed.
+//! 1. [`drain_capability_evidence_records`], reached from the startup attach
+//!    (`daemon_runtime::hydrate_capability_evidence_view`), which drains the
+//!    complete `GetCapabilityEvidenceRecordRange` read to exhaustion;
+//! 2. [`GovernorCapabilityAdmission::hydrate_from_evidence_record_page`],
+//!    reached from the daemon's live Skill-intake commit step
+//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)) for the
+//!    intake's own Skill, so a record committed while the daemon runs is
+//!    observed without waiting for a restart.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -31,15 +32,11 @@
 //! constructed in production by `daemon_runtime::attach_dreamer_model`
 //! through [`DaemonComposition::dreamer_model`](super::DaemonComposition::dreamer_model).
 //!
-//! The daemon route gate
-//! ([`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route))
+//! Residual STITCH, measured and not papered over:
+//! [`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route)
 //! is a second, distinct consumer of the same predicate, reached through
 //! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
 //! from [`DaemonComposition::drive_verified_agent_fabric`](super::DaemonComposition::drive_verified_agent_fabric).
-//! Its refusal is the typed [`FabricError::NoRoute`](super::agent_fabric::FabricError::NoRoute)
-//! residual; it never falls back to a local route.
-//!
-//! Residual STITCH, measured and not papered over:
 //! `drive_verified_agent_fabric` itself has no in-crate caller, and the
 //! production B-MOD model-registry port (`ProductionModelRegistryPort`) reports
 //! `PortBindingState::Missing`, so a production route resolution cannot succeed
@@ -47,55 +44,68 @@
 //! per-operation executor binds that driver; the driver seam lives outside
 //! `bins/eliotd`, and no composition method here invents a caller for it.
 //!
-//! Evidence bridge: `GetCapabilityEvidenceState` is the existing canonical
-//! read for capability evidence (selected by exact `skill_id` +
-//! `max_records`; see `operation_catalogue` and the `Affordances` role in
-//! `GovernorContextInputs`). [`GovernorCapabilityAdmission::plan_evidence_read`]
-//! builds that closed request for one skill, and
-//! [`GovernorCapabilityAdmission::ingest_evidence_response`] decodes the
-//! versioned store payload.
+//! **Trap recorded for the next writer: do NOT reintroduce an
+//! `apply_scope_change` call here.** `CapabilityRegistry::apply_scope_change`
+//! stales a record when its fingerprint DIFFERS from the scope supplied as
+//! `current` on a selected dimension, and a scope once invalidated is not
+//! revived by a later matching record. A call that passes an OBSERVED route as
+//! `current` with `ScopeDependencySelector::all()` therefore inserts every
+//! other account's and route's still-valid record into the growing invalidation
+//! set, on every call, and permanently. I3.4 requires capability to be
+//! route/account-specific, so that call erases exactly the dimension the
+//! document protects. The over-broad call has been REMOVED from
+//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route),
+//! so no production path invokes it any more; staleness is instead DERIVED at the
+//! gate (below). [`apply_scope_change`](Self::apply_scope_change) is left in
+//! place, unreferenced from production: it is pre-existing public surface whose
+//! correct direction is a narrower selector than any current observation site
+//! can supply, and an existing test exercises it, so removing the method itself
+//! would exceed this issue.
 //!
-//! What the read actually carries, measured on current store source: the
-//! store answers with committed `ApplyLifecyclePolicy` authority-receipt rows,
-//! each carrying exactly the six declared lifecycle parameters (`action`,
-//! `base_view_digest`, `candidate_digest`, `candidate_package_digest`,
-//! `skill_id`, `verifier_ref`) plus its commit-order `capture_index`. A row
-//! carries no probe status, no evidence source, and no route-scope
-//! fingerprint, so `ingest_evidence_response` mints no verified record from it
-//! and reports observation currency only.
+//! Evidence bridges, and why there are two. Both are canonical reads, and they
+//! carry different things — measured on current store source:
 //!
-//! Hydration therefore admits exactly one shape, and it is deliberately
-//! non-admitting: [`GovernorCapabilityAdmission::hydrate_from_evidence_response`]
-//! imports the read's skill through the legacy importer
-//! ([`GovernorCapabilityAdmission::import_legacy`]), the only construction path
-//! the adopted `CapabilityEvidenceRecord` relation allows for `declared`, and
-//! leaves every scope-fingerprint field `None` (unknown, never inferred)
-//! because the read exposes none. Such a record places the skill in
-//! [`GovernorCapabilityAdmission::required_set`] and evaluates as
-//! [`SkillStanding::Unevaluated`]. It can never satisfy
-//! [`GovernorCapabilityAdmission::admit_production_route`], which requires
-//! `probe_passed` or `observed` evidence from an admissible source on a
-//! matching scope. Absence of canonical evidence therefore REFUSES a
-//! production route; it is never treated as a pass, and never as "nothing to
-//! check".
+//! * `GetCapabilityEvidenceState` answers committed `ApplyLifecyclePolicy`
+//!   authority-receipt rows, each carrying exactly the six declared lifecycle
+//!   parameters (`action`, `base_view_digest`, `candidate_digest`,
+//!   `candidate_package_digest`, `skill_id`, `verifier_ref`) plus its
+//!   commit-order `capture_index`. A row carries no probe status, no evidence
+//!   source, and no route-scope fingerprint, so
+//!   [`ingest_evidence_response`](Self::ingest_evidence_response) mints no
+//!   verified record from it and reports observation currency only.
+//!   [`hydrate_from_evidence_response`](Self::hydrate_from_evidence_response)
+//!   therefore imports exactly one shape, and it is deliberately non-admitting:
+//!   it runs the read's skill through the legacy importer
+//!   ([`import_legacy`](Self::import_legacy)) and leaves every
+//!   scope-fingerprint field `None`, because the read exposes none of the six
+//!   dimensions it could carry. Such a record places the skill in
+//!   [`required_set`](Self::required_set) and evaluates as
+//!   [`SkillStanding::Unevaluated`]; it can never satisfy
+//!   [`admit_production_route`](Self::admit_production_route). Marking the
+//!   unavailable dimensions unknown is I3.4's rule; inferring them from the
+//!   requested route is not.
+//! * `GetCapabilityEvidenceRecordRange` answers the durable evidence rows
+//!   themselves — the verbatim `CapabilityEvidenceRecord` document, the
+//!   owner-issued `record_digest` of those bytes, and the store-issued
+//!   `revision` the fenced compare-and-set assigned. This is the only leg that
+//!   can mint a real `probe_passed`, `observed`, or `broken` record, and so the
+//!   only leg on which a positive admits, a negative restricts, or a
+//!   fingerprint change stales anything. Absence of canonical evidence REFUSES a
+//!   production route; it is never treated as a pass, and never as "nothing to
+//!   check".
 //!
-//! Staleness is applied on the observed route and it is **durable**, not merely
-//! remembered. A changed runtime hash, adapter hash, provider/model/auth route,
-//! serializer, or feature-flag scope stops admitting on three independent
-//! grounds: [`admit_production_route`](Self::admit_production_route) compares
-//! the observed scope against each record's fingerprint by exact value, so a
-//! record that no longer matches cannot authorize the changed route;
-//! [`apply_scope_change`](Self::apply_scope_change), called by
-//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//! with the caller-observed scope, writes the owner-issued change reference
-//! into every affected record's own persisted
-//! `limitations_and_negative_evidence` and re-derives the per-`(skill_id,
-//! scope_fingerprint)` invalidation index from those bytes; and
+//! Staleness (I3.4: "runtime/adapter/provider/serializer change makes dependent
+//! evidence stale") is therefore enforced against real durable records on two
+//! independent grounds, both derived rather than remembered:
+//! [`admit_production_route`](Self::admit_production_route) compares the
+//! observed scope against each retained record's fingerprint by EXACT value, so
+//! a record whose adapter hash, serializer fingerprint, or any other dimension
+//! no longer matches cannot authorize the changed route; and
 //! [`hydrate_from_evidence_record_page`](Self::hydrate_from_evidence_record_page)
-//! re-derives the same invalidation from whatever the canonical store served, so
-//! a fresh process cannot re-admit evidence a committed change restricted.
-//! Either way the exact route must be re-probed before it authorizes
-//! production work again.
+//! re-derives the per-`(skill_id, scope_fingerprint)` invalidation index from
+//! each served record's own persisted `limitations_and_negative_evidence`, so a
+//! committed restriction survives a restart. Either way the exact route must be
+//! re-probed before it authorizes production work again.
 //!
 //! [`drain_capability_evidence_records`] is the production rebuild path and it
 //! is atomic: pages are staged and the held view is replaced only after the
@@ -642,6 +652,16 @@ pub struct ObservedLifecycleSummary {
 /// scope_fingerprint)` must reproduce the row's `scope_key` address. A row that
 /// fails either check is refused whole, so no substituted document can become
 /// registry state under a reference the canonical store never issued for it.
+///
+/// Those two checks together already bind the whole record, so no third
+/// field-completeness check is added here. Measured: the only producer of a
+/// record document is `canonical_json_bytes(record)` in the Governor's commit
+/// owner, and [`RouteScopeFingerprint`] has no `skip_serializing_if`, so every
+/// field is always present as an explicit key or an explicit `null` — I3.4's
+/// "unknown rather than inferred" marker. A document that dropped a field would
+/// change its `reference_digest()` and therefore fail the `scope_key`
+/// re-proof, and any substituted bytes change the `record_digest`. A check that
+/// cannot fire is not a check.
 fn decode_evidence_record_row(
     row: &serde_json::Value,
 ) -> Result<(CapabilityEvidenceRecord, OwnerEvidenceRevision), EvidenceBridgeError> {
@@ -662,6 +682,9 @@ fn decode_evidence_record_row(
         .get("revision")
         .and_then(serde_json::Value::as_u64)
         .ok_or(EvidenceBridgeError::Payload("revision"))?;
+    // Read the ORIGINAL recorded bytes, not a re-derivation over what we hold:
+    // the record is taken from the document the store committed under the digest
+    // it echoed, and the two re-proofs below bind those exact bytes.
     let record: CapabilityEvidenceRecord =
         serde_json::from_str(&record_json).map_err(|_| EvidenceBridgeError::Payload("record"))?;
     if record.skill_id != row_skill_id {

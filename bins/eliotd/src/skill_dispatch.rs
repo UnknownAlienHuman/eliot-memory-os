@@ -31,10 +31,12 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
 };
+use eliot_store_api::{NamedReadRequest, NamedReadResponse, ScopeId};
 use serde_json::Value;
 use thiserror::Error;
 
 use super::DaemonComposition;
+use super::capability_evidence_wiring::GovernorCapabilityAdmission;
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceResolution, AcceptanceVerdict};
 ///
@@ -107,7 +109,44 @@ enum PlannedSkillPair {
         /// the commit step hydrates the daemon-held capability admission view
         /// from the same read (issue #1957, I3.4) without a second round trip.
         resolution: Box<AcceptanceResolution>,
+        /// The durable capability-evidence RECORD read for the same Skill at
+        /// the same fence, retained for the same reason
+        /// ([`CapabilityRecordRead`]).
+        capability_records: CapabilityRecordRead,
     },
+}
+
+/// Outcome of the plan's durable capability-evidence RECORD read for one
+/// Skill (issue #1957, I3.4, acceptance A2/A3).
+///
+/// This leg is distinct from the intake's own `AcceptanceResolution` and both
+/// travel through the same plan. The distinction is load-bearing and is the
+/// reason the daemon can act on A2 at all:
+///
+/// * `GetCapabilityEvidenceState` answers committed `ApplyLifecyclePolicy`
+///   governance rows. The measured payload carries exactly the six declared
+///   lifecycle parameters (`action`, `base_view_digest`, `candidate_digest`,
+///   `candidate_package_digest`, `skill_id`, `verifier_ref`) plus
+///   `capture_index`, so it exposes NO capability status, NO evidence source
+///   and NO route-scope fingerprint. It can only ever mint a non-admitting
+///   `declared` / `imported_legacy_declaration` record.
+/// * `GetCapabilityEvidenceRecordRange` answers the durable evidence rows
+///   themselves, with their owner-issued `record_digest` and the store-issued
+///   `revision` the fenced compare-and-set assigned. That is the only leg that
+///   can mint a real `probe_passed` / `observed` / `broken` record, and
+///   therefore the only leg on which A2's admitting half and A3's staleness
+///   can be observed at all.
+///
+/// `Unavailable` is the honest unresolved case: the reason is named at the
+/// commit step and the held view keeps its previous contents, so a production
+/// route the view cannot evidence stays refused rather than being read as
+/// "nothing to check".
+pub enum CapabilityRecordRead {
+    /// The store served this page of real evidence rows for the Skill.
+    Served(Box<NamedReadRequest>, Box<NamedReadResponse>),
+    /// The read did not answer, or the store served a page this bridge cannot
+    /// decode. The exact reason is reported; nothing is inferred.
+    Unavailable(String),
 }
 
 /// Activation ingest plan: the presented harness receipt kept DISTINCT from
@@ -536,10 +575,28 @@ async fn plan_accepted_inject(
                 request,
                 response,
             };
+            // #1957 I3.4 (A2/A3): the durable capability-evidence RECORD read
+            // for the SAME Skill at the SAME fence travels with the plan. The
+            // acceptance response above can only mint a non-admitting
+            // `declared` record; this one is the leg that can mint a real
+            // `probe_passed` / `observed` / `broken` record, which is what makes
+            // the admitting half of A2 and the staleness property of A3
+            // observable in a running daemon instead of only after a restart.
+            //
+            // It is read HERE, without the composition lock, alongside the
+            // acceptance read that already ran without it; the commit step
+            // applies it under the fresh guard after rechecking the fence.
+            let capability_records = read_capability_evidence_records(
+                kernel,
+                &admitted_fence,
+                &payload.package.registration.skill_id,
+            )
+            .await;
             PlannedSkillPair::AcceptedIntake {
                 payload: Box::new(payload),
                 record,
                 resolution: Box::new(resolution),
+                capability_records,
             }
         }
         Ok(AcceptanceResolution {
@@ -563,6 +620,57 @@ async fn plan_accepted_inject(
         Err(error) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::Surface(error.to_string()),
         )),
+    }
+}
+
+/// Reads the durable capability-evidence records held for one Skill at the
+/// admitted fence (issue #1957, I3.4, acceptance A2/A3).
+///
+/// This is the leg that makes A2 observable. The intake's own acceptance read
+/// answers `ApplyLifecyclePolicy` governance rows, which expose no capability
+/// status, source, or route-scope fingerprint, so hydration through it can only
+/// ever add a non-admitting `declared` record. `GetCapabilityEvidenceRecordRange`
+/// is the read that serves the durable evidence rows themselves — the verbatim
+/// `CapabilityEvidenceRecord` document, the owner-issued `record_digest` of
+/// those bytes, and the store-issued `revision` the fenced compare-and-set
+/// assigned — so it is the only leg that can mint a real `probe_passed`,
+/// `observed`, or `broken` record and make the admission decision in
+/// [`CapabilityRegistry::admit_production_route`](eliot_governor::CapabilityRegistry::admit_production_route)
+/// answer differently.
+///
+/// The read is planned and executed under the SAME admitted fence as the intake
+/// it travels with, and the exact request/response pair is carried into the
+/// plan so the commit step re-proves it against the response rather than
+/// re-deriving a value over what it holds. A refusal is the honest
+/// `Unavailable` case, never a silent pass: the held view keeps its previous
+/// contents and a production route it cannot evidence stays refused.
+///
+/// The Governor scope is the same `governor` scope the durable rows are
+/// committed under and the same scope the startup drain reads
+/// ([`drain_capability_evidence_records`](super::capability_evidence_wiring::drain_capability_evidence_records)),
+/// so a row committed by one leg is visible to the other.
+async fn read_capability_evidence_records(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    skill_id: &str,
+) -> CapabilityRecordRead {
+    let scope = match ScopeId::new(eliot_governor::GOVERNOR_SCOPE_ID) {
+        Ok(scope) => scope,
+        Err(error) => return CapabilityRecordRead::Unavailable(error.to_string()),
+    };
+    let request = match GovernorCapabilityAdmission::plan_evidence_record_read(
+        Some(skill_id),
+        eliot_store_api::MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+        None,
+        scope,
+        admitted_fence.clone(),
+    ) {
+        Ok(request) => request,
+        Err(error) => return CapabilityRecordRead::Unavailable(error.to_string()),
+    };
+    match kernel.store_named_async(request.clone()).await {
+        Ok(response) => CapabilityRecordRead::Served(Box::new(request), Box::new(response)),
+        Err(error) => CapabilityRecordRead::Unavailable(error.to_string()),
     }
 }
 
@@ -624,6 +732,111 @@ fn commit_activation_candidate(
             }
             Err(error) => SkillResultEnvelope::refused(&error),
         },
+    }
+}
+
+/// Refreshes the daemon-held Governor capability admission view from the two
+/// canonical reads the accepted-intake plan carried (issue #1957, I3.4, A2/A3).
+///
+/// **This is a refresh, never a decision.** It runs after the caller has
+/// rechecked the admitted fence and before the intake is published, and it never
+/// refuses or rewrites the intake. That is the fail-closed direction: a
+/// production route the view cannot evidence stays refused rather than being
+/// read as "nothing to check".
+///
+/// Note the difference between the two legs on failure, because they are not
+/// symmetric. The lifecycle leg replaces the view through the registry's own
+/// import and leaves the held contents as they were when it refuses. The DURABLE
+/// leg applies the served page ROW BY ROW into the live registry, so a refusal
+/// part-way through a page leaves the rows before it applied. That is the
+/// registry's own bounded-retain behaviour (a new key refused because the
+/// registry is full means the requested coverage was NOT retained, which is
+/// exactly what must be reported), and it is not a silent pass: the intake is
+/// unaffected either way, and any route the partial page did not cover simply
+/// stays refused. The startup drain is the leg that is atomic — it stages pages
+/// and replaces the registry only after a complete drain.
+///
+/// The two legs carry different things and are reported separately:
+///
+/// * The intake's own `AcceptanceResolution` answers `GetCapabilityEvidenceState`,
+///   which serves committed `ApplyLifecyclePolicy` governance rows carrying the
+///   six declared lifecycle parameters and no capability status, source, or
+///   route-scope fingerprint. It can therefore only ever contribute the
+///   non-admitting `declared` / `imported_legacy_declaration` record.
+/// * The plan's [`CapabilityRecordRead`] answers
+///   `GetCapabilityEvidenceRecordRange`, which serves the durable evidence rows
+///   themselves with their owner-issued `record_digest` and store-issued
+///   `revision`. **This is the leg that can change an admission verdict:** a
+///   fresh exact-fingerprint `probe_passed` / `observed` record mints real
+///   admitting evidence, and an exact-fingerprint `broken` record for the same
+///   `(skill_id, scope_fingerprint)` key supersedes it under the store-issued
+///   revision and restricts the route. Both are the Governor registry's
+///   decisions, reached through the one held view — this function defines no
+///   admission rule of its own.
+fn hydrate_capability_admission_view(
+    composition: &mut DaemonComposition,
+    record: &AcceptanceRecord,
+    resolution: &AcceptanceResolution,
+    capability_records: &CapabilityRecordRead,
+) {
+    let lifecycle = composition
+        .capability_admission_mut()
+        .map_err(|error| error.to_string())
+        .and_then(|view| {
+            view.hydrate_from_evidence_response(&resolution.request, &resolution.response)
+                .map_err(|error| error.to_string())
+        });
+    match lifecycle {
+        Ok(hydrated) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydrated",
+                skill_id = %hydrated.summary.skill_id,
+                matched_lifecycle_rows = hydrated.summary.matched_total,
+                declared_records = hydrated.declared_records,
+                retained_records = hydrated.retained,
+            );
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_hydration_unavailable",
+                skill_id = %record.skill_id,
+                reason = %reason,
+                "canonical capability evidence did not refresh the admission view; the held view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
+    }
+    let durable = match capability_records {
+        CapabilityRecordRead::Served(request, response) => composition
+            .capability_admission_mut()
+            .map_err(|error| error.to_string())
+            .and_then(|view| {
+                view.hydrate_from_evidence_record_page(request, response)
+                    .map_err(|error| error.to_string())
+            }),
+        CapabilityRecordRead::Unavailable(reason) => Err(reason.clone()),
+    };
+    match durable {
+        Ok(page) => {
+            tracing::info!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_records_hydrated",
+                skill_id = %record.skill_id,
+                minted_records = page.minted,
+                truncated = page.truncated,
+                retained_records = page.retained,
+            );
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_records_unavailable",
+                skill_id = %record.skill_id,
+                reason = %reason,
+                "durable capability evidence did not refresh the admission view; the held view keeps its previous contents and any production route it cannot evidence stays refused"
+            );
+        }
     }
 }
 
@@ -689,49 +902,15 @@ pub fn commit_skill_pair(
                 payload,
                 record,
                 resolution,
+                capability_records,
             } => {
-                // The commit step is also where the daemon-held Governor
-                // capability admission view is hydrated (issue #1957, I3.4):
-                // the same canonical `GetCapabilityEvidenceState` response that
-                // decided this intake is applied to the held registry, so the
-                // admission view stops being permanently empty. A hydration
-                // failure is a `warn` diagnostic naming the exact reason, never
-                // a silent pass and never a rewritten verdict — the held view
-                // keeps its previous contents, and a production route that
-                // view cannot evidence stays refused, because `declared` /
-                // `imported_legacy` records never admit.
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
-                    let hydration = composition
-                        .capability_admission_mut()
-                        .map_err(|error| error.to_string())
-                        .and_then(|view| {
-                            view.hydrate_from_evidence_response(
-                                &resolution.request,
-                                &resolution.response,
-                            )
-                            .map_err(|error| error.to_string())
-                        });
-                    match hydration {
-                        Ok(hydrated) => {
-                            tracing::info!(
-                                target: "eliotd::capability_evidence",
-                                event = "eliotd.capability_evidence_hydrated",
-                                skill_id = %hydrated.summary.skill_id,
-                                matched_lifecycle_rows = hydrated.summary.matched_total,
-                                declared_records = hydrated.declared_records,
-                                retained_records = hydrated.retained,
-                            );
-                        }
-                        Err(reason) => {
-                            tracing::warn!(
-                                target: "eliotd::capability_evidence",
-                                event = "eliotd.capability_evidence_hydration_unavailable",
-                                skill_id = %record.skill_id,
-                                reason = %reason,
-                                "canonical capability evidence did not refresh the admission view; the held view keeps its previous contents and any production route it cannot evidence stays refused"
-                            );
-                        }
-                    }
+                    hydrate_capability_admission_view(
+                        composition,
+                        &record,
+                        &resolution,
+                        &capability_records,
+                    );
                     match composition.skill_ingest_accepted_intake(&payload, &record) {
                         Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
                         Err(error) => SkillResultEnvelope::refused(&error),

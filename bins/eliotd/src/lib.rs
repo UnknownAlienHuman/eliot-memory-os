@@ -2876,55 +2876,35 @@ impl DaemonComposition {
         now: u64,
     ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
         let view = self.capability_admission_mut()?;
-        // The applied-change restriction is written into each affected record's
-        // own persisted `limitations_and_negative_evidence` under the exact
-        // owner-issued reference of the observed behaviour scope. Two things
-        // follow, and both are load-bearing:
+        // NO `apply_scope_change` CALL HERE, and the reason is the whole point
+        // of issue #1957's W4. That method stales a record whenever its
+        // fingerprint DIFFERS from the scope supplied as `current` on a selected
+        // dimension, and a scope once invalidated is not revived by a later
+        // matching record. Handing it an OBSERVED route as `current` with
+        // `ScopeDependencySelector::all()` therefore invalidates every other
+        // account's and route's still-valid evidence, on every call, and
+        // permanently — so admitting one route destroyed the evidence for the
+        // rest. I3.4 requires capability to be route/account-specific, so that
+        // call erased exactly the dimension the document protects. A documented
+        // coarse selector does not make a wrong direction right.
         //
-        // * only a fresh requalification that names that reference, and is
-        //   strictly newer than the owner-issued revision of the evidence it
-        //   staled, can clear it; and
-        // * the restriction is a property of the record's own bytes, so a
-        //   restart re-derives it from what the canonical store served instead
-        //   of starting from an empty invalidation set.
-        let staled = view
-            .apply_scope_change(
-                observed_scope,
-                eliot_governor::ScopeDependencySelector::all(),
-                &observed_scope.reference_digest(),
-            )
-            .map_err(|error| {
-                DaemonError::Composition(CompositionError::Owner(format!(
-                    "capability evidence scope change is not owner-referenced: {error}"
-                )))
-            })?;
-        if staled.newly_staled > 0 {
-            // LOUD, and deliberately not phrased as if the restriction were
-            // recorded durably. `staled.records` are the durable half — each
-            // carries this change reference in its own persisted
-            // `limitations_and_negative_evidence`, which the canonical store
-            // serves verbatim — and this call site DOES NOT COMMIT THEM.
-            //
-            // The restriction therefore holds in this process only and a restart
-            // erases it. That is the W2 gap, and it is `STITCH` because
-            // `commit_capability_evidence_record` has no production caller: no
-            // capability-probe producer exists in the repository, so there is no
-            // observation to commit from. Committing here anyway would require
-            // inventing a request identity and would turn a working route refusal
-            // into a possible error, which is not an improvement.
-            //
-            // The log therefore states the limitation's scope rather than
-            // implying durability the code does not achieve.
-            tracing::warn!(
-                target: "eliotd::capability_evidence",
-                event = "eliotd.capability_evidence_staled",
-                staled_records = staled.newly_staled,
-                uncommitted_records = staled.records.len(),
-                change_reference = %staled.blocking_evidence_ref,
-                durable = false,
-                "an observed runtime/adapter/provider/serializer change limited dependent capability evidence IN THIS PROCESS ONLY; the mutated records carrying this change reference are NOT committed, so a restart will forget the restriction. The exact route must requalify, naming this change reference, before production work"
-            );
-        }
+        // Staleness is therefore DERIVED at the gate and needs no mutation:
+        // `admit_production_route` already requires each retained record's
+        // `scope_fingerprint` to equal the observed scope by EXACT value, so a
+        // changed adapter hash, serializer fingerprint, or any other dimension
+        // stops admitting on its own. That is the simplest correct mechanism for
+        // "runtime/adapter/provider/serializer change makes dependent evidence
+        // stale", and it is the one the document describes.
+        //
+        // `GovernorCapabilityAdmission::apply_scope_change` itself is left in
+        // place, unreferenced from production: it is pre-existing public surface
+        // whose correct direction is a narrower selector than any current
+        // observation site can supply, and removing it would exceed this issue.
+        // The intake path's durable leg
+        // (`capability_evidence_wiring::hydrate_capability_admission_view`)
+        // re-derives the invalidation index from each served record's own
+        // persisted `limitations_and_negative_evidence`, so a committed
+        // restriction still survives a restart.
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
     }
 
