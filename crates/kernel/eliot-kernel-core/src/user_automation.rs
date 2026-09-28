@@ -278,7 +278,13 @@ pub struct NormalizedSchedule {
     /// separate migration path: a stored revision without an owner-issued
     /// binding is not a normalized schedule under this contract, and the owning
     /// calendar adapter must re-normalize it into a new immutable revision.
-    pub normalization_receipt: ScheduleNormalizationReceipt,
+    ///
+    /// It is boxed because `NormalizedSchedule` is reachable by value from
+    /// `UserAutomationOperation`, and inlining it would grow that enum past the
+    /// existing `large_enum_variant` threshold. The box is a layout detail only:
+    /// serde encodes a boxed value exactly as the unboxed one, so the wire format
+    /// and the required-field decode behavior are unchanged.
+    pub normalization_receipt: Box<ScheduleNormalizationReceipt>,
 }
 
 /// Owner-issued evidence binding one ordered occurrence set to the compiled
@@ -463,7 +469,7 @@ impl NormalizedSchedule {
         &self,
         core: eliot_receipts::ReceiptCore,
         normalizer_authority: &str,
-    ) -> Result<ScheduleNormalizationReceipt, UserAutomationError> {
+    ) -> Result<Box<ScheduleNormalizationReceipt>, UserAutomationError> {
         let occurrences_digest = self.compiled_occurrences_digest()?;
         if !core
             .artifacts
@@ -478,13 +484,13 @@ impl NormalizedSchedule {
         }
         let envelope = ReceiptEnvelope::issue(core)
             .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
-        Ok(ScheduleNormalizationReceipt {
+        Ok(Box::new(ScheduleNormalizationReceipt {
             receipt_id: envelope.identity.receipt_id.as_str().to_owned(),
             normalizer_authority: normalizer_authority.to_owned(),
             source_digest: self.source_digest()?,
             zone_database_revision: user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
             occurrences_digest,
-        })
+        }))
     }
 
     /// Requires the owner-issued binding between this schedule's expression and
