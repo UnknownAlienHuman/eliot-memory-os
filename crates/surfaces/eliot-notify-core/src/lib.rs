@@ -1644,21 +1644,57 @@ where
             provider: ProviderId::A08Admission,
             reason: "A-08 admission verification port is missing",
         })?;
-        let admission = require_known(a08.admit(&admission_request), ProviderId::A08Admission)?;
-        validate_recipient(&admission.recipient)?;
+        let admission = match require_known(a08.admit(&admission_request), ProviderId::A08Admission)
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Err(self.pre_deliver_loss(
+                    error,
+                    source_kind,
+                    notification_id,
+                    request,
+                    canonical,
+                    "delivery admission failed",
+                ));
+            }
+        };
+        if let Err(error) = validate_recipient(&admission.recipient) {
+            return Err(self.pre_deliver_loss(
+                error,
+                source_kind,
+                notification_id,
+                request,
+                canonical,
+                "delivery recipient refused",
+            ));
+        }
         if admission.route != admission_request.requested_route
             || admission.effect != admission_request.requested_effect
             || admission.recipient.principal != request.audience
             || (!normal_candidates.is_empty() && !normal_candidates.contains(&admission.recipient))
         {
-            return Err(NotifyError::RecipientMismatch);
+            return Err(self.pre_deliver_loss(
+                NotifyError::RecipientMismatch,
+                source_kind,
+                notification_id,
+                request,
+                canonical,
+                "delivery route refused",
+            ));
         }
 
         if self.ports.delivery_receipt.is_none() {
-            return Err(NotifyError::PlanGap {
-                provider: ProviderId::DeliveryReceipt,
-                reason: "delivery receipt verification port is missing",
-            });
+            return Err(self.pre_deliver_loss(
+                NotifyError::PlanGap {
+                    provider: ProviderId::DeliveryReceipt,
+                    reason: "delivery receipt verification port is missing",
+                },
+                source_kind,
+                notification_id,
+                request,
+                canonical,
+                "delivery receipt port missing",
+            ));
         }
         if canonical.is_some() && self.ports.notification_state.is_none() {
             return Err(NotifyError::PlanGap {
@@ -1667,11 +1703,43 @@ where
             });
         }
 
-        let one_shot_key = admission_request.one_shot_key(&admission.recipient)?;
-        let claim_digest = admission_request.claim_digest(&admission.recipient)?;
-        let admission_artifact =
-            admission_request.admission_artifact_digest(&admission.recipient)?;
-        validate_receipt_structure(
+        let one_shot_key = admission_request
+            .one_shot_key(&admission.recipient)
+            .map_err(|error| {
+                self.pre_deliver_loss(
+                    error,
+                    source_kind,
+                    notification_id,
+                    request,
+                    canonical,
+                    "delivery identity derivation failed",
+                )
+            })?;
+        let claim_digest = admission_request
+            .claim_digest(&admission.recipient)
+            .map_err(|error| {
+                self.pre_deliver_loss(
+                    error,
+                    source_kind,
+                    notification_id,
+                    request,
+                    canonical,
+                    "delivery identity derivation failed",
+                )
+            })?;
+        let admission_artifact = admission_request
+            .admission_artifact_digest(&admission.recipient)
+            .map_err(|error| {
+                self.pre_deliver_loss(
+                    error,
+                    source_kind,
+                    notification_id,
+                    request,
+                    canonical,
+                    "delivery identity derivation failed",
+                )
+            })?;
+        if let Err(error) = validate_receipt_structure(
             &admission.receipt,
             source_receipt,
             &ReceiptExpectation {
@@ -1684,13 +1752,32 @@ where
                 proof: ProofCeiling::ScopedVerification,
                 artifact_digest: &admission_artifact,
             },
-        )?;
+        ) {
+            return Err(self.pre_deliver_loss(
+                error,
+                source_kind,
+                notification_id,
+                request,
+                canonical,
+                "delivery admission receipt refused",
+            ));
+        }
 
         let ledger_intent = LedgerIntent {
             one_shot_key: one_shot_key.clone(),
             claim_digest: claim_digest.clone(),
-            request_id: PlatformHandle::new(request.context.request_id.as_str())
-                .map_err(NotifyError::Port)?,
+            request_id: PlatformHandle::new(request.context.request_id.as_str()).map_err(
+                |error| {
+                    self.pre_deliver_loss(
+                        NotifyError::Port(error),
+                        source_kind,
+                        notification_id,
+                        request,
+                        canonical,
+                        "delivery identity derivation failed",
+                    )
+                },
+            )?,
         };
         let reservation = {
             let ledger = self.ports.ledger.as_mut().ok_or(NotifyError::PlanGap {
@@ -1727,10 +1814,17 @@ where
                 }
                 LedgerReserveOutcome::Conflict => return Err(NotifyError::LedgerConflict),
                 LedgerReserveOutcome::Unavailable => {
-                    return Err(NotifyError::PlanGap {
-                        provider: ProviderId::OneShotLedger,
-                        reason: "durable one-shot ledger is unavailable",
-                    });
+                    return Err(self.pre_deliver_loss(
+                        NotifyError::PlanGap {
+                            provider: ProviderId::OneShotLedger,
+                            reason: "durable one-shot ledger is unavailable",
+                        },
+                        source_kind,
+                        notification_id,
+                        request,
+                        canonical,
+                        "delivery ledger unavailable",
+                    ));
                 }
             }
         };
@@ -1905,6 +1999,36 @@ where
                 Err(NotifyError::LedgerCommitUncertain(Box::new(observation)))
             }
         }
+    }
+
+    /// Attempts one `Unknown` delivery-degradation write for a verified
+    /// delivery that failed before the adapter ran, then returns the
+    /// original failure unchanged.
+    ///
+    /// The source is already verified and the canonical item already exists
+    /// on this path, so a pre-adapter failure still leaves delivery evidence
+    /// without resolving anything (`validate_state_response` refuses a
+    /// delivery write that finds the record resolved). The write is
+    /// best-effort: when the owner cannot take it, the original failure is
+    /// what the caller sees. Ledger conflicts are excluded by the caller: a
+    /// competing reservation owns that outcome and will write it.
+    fn pre_deliver_loss(
+        &mut self,
+        error: NotifyError,
+        source_kind: DeliverySourceKind,
+        notification_id: &PlatformHandle,
+        request: &NotificationRequest,
+        canonical: Option<&NotificationDraft>,
+        context: &'static str,
+    ) -> NotifyError {
+        let _ = self.persist_unknown_delivery_state(
+            source_kind,
+            notification_id,
+            request,
+            canonical,
+            format!("{context}: {error}"),
+        );
+        error
     }
 
     fn persist_delivery_state(
