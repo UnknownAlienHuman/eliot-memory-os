@@ -94,12 +94,11 @@
 use std::collections::BTreeMap;
 
 use eliot_config::legacy_capability_import::{
-    LegacyCapabilityDeclaration, LegacyImportError, LegacyScopeFingerprint,
-    import_legacy_declaration,
+    LegacyCapabilityDeclaration, LegacyScopeFingerprint, import_legacy_declaration,
 };
 use eliot_governor::{
-    CapabilityEvidenceRecord, CapabilityRegistry, RouteScopeFingerprint, ScopeDependencySelector,
-    SkillStanding,
+    CapabilityEvidenceRecord, CapabilityRegistry, MAX_CAPABILITY_EVIDENCE_RECORDS,
+    RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
@@ -126,6 +125,10 @@ pub enum EvidenceBridgeError {
     /// The store payload is not the versioned capability-evidence shape.
     #[error("capability evidence payload is not the versioned shape: {0}")]
     Payload(&'static str),
+    /// The bounded registry refused a new capability key, so the requested
+    /// evidence coverage was not retained.
+    #[error("capability evidence registry is full; new capability coverage was refused")]
+    CapacityExceeded,
 }
 
 /// Daemon-held Governor capability admission view.
@@ -166,24 +169,34 @@ impl GovernorCapabilityAdmission {
     }
 
     /// Inserts one canonical evidence record (probe/observation path).
-    pub fn insert(&mut self, record: CapabilityEvidenceRecord) {
-        self.registry.insert(record);
+    pub fn insert(&mut self, record: CapabilityEvidenceRecord) -> bool {
+        self.registry.insert(record)
     }
 
     /// Imports one legacy declaration as `declared/imported_legacy`.
     ///
     /// # Errors
     ///
-    /// Returns [`LegacyImportError`] when the legacy skill identity is
-    /// blank or carries control characters.
+    /// Returns [`EvidenceBridgeError::BlankSkill`] for an invalid identity or
+    /// [`EvidenceBridgeError::CapacityExceeded`] when a new key cannot be
+    /// retained by the bounded registry.
     pub fn import_legacy(
         &mut self,
         declaration: &LegacyCapabilityDeclaration,
-    ) -> Result<(), LegacyImportError> {
-        let imported = import_legacy_declaration(declaration)?;
-        self.registry
-            .insert(CapabilityEvidenceRecord::from(&imported));
-        Ok(())
+    ) -> Result<bool, EvidenceBridgeError> {
+        let imported =
+            import_legacy_declaration(declaration).map_err(|_| EvidenceBridgeError::BlankSkill)?;
+        let record = CapabilityEvidenceRecord::from(&imported);
+        let already_retained = self.registry.records().iter().any(|retained| {
+            retained.skill_id == record.skill_id
+                && retained.scope_fingerprint == record.scope_fingerprint
+        });
+        let inserted = self.registry.insert(record);
+        if !inserted && !already_retained && self.registry.len() >= MAX_CAPABILITY_EVIDENCE_RECORDS
+        {
+            return Err(EvidenceBridgeError::CapacityExceeded);
+        }
+        Ok(inserted)
     }
 
     /// Returns the canonical required capability set: distinct skill
@@ -261,14 +274,14 @@ impl GovernorCapabilityAdmission {
         let summary = self.ingest_evidence_response(request, response)?;
         let mut declared_records = 0;
         if summary.returned > 0 {
-            self.import_legacy(&LegacyCapabilityDeclaration {
+            let imported = self.import_legacy(&LegacyCapabilityDeclaration {
                 skill_id: summary.skill_id.clone(),
                 scope: LegacyScopeFingerprint::default(),
             })
-            // The importer's only rejection is a blank or control-bearing skill
-            // identity, which is exactly the bridge's own identity failure.
-            .map_err(|_| EvidenceBridgeError::BlankSkill)?;
-            declared_records = 1;
+            // Identity failures were rejected by the response decoder; any
+            // bridge-level refusal here means coverage was not retained.
+            ?;
+            declared_records = usize::from(imported);
         }
         Ok(CapabilityHydration {
             summary,
@@ -423,8 +436,9 @@ pub struct ObservedLifecycleSummary {
 /// Result of hydrating the held view from one canonical evidence read.
 ///
 /// `declared_records` is the count of `declared` / `imported_legacy`
-/// contributions the read added; a read that matched no committed governance
-/// row adds none and leaves the registry exactly as it was.
+/// contributions the read newly retained; a read that matched no committed
+/// governance row or replayed an already-retained record adds none. Capacity
+/// refusal returns an error and is never reported as hydrated coverage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityHydration {
     /// Observation currency decoded from the served payload.
