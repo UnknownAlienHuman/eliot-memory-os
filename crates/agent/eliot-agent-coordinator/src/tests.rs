@@ -29,8 +29,8 @@ use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
     CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
-    OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
+    CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, LearningRole, ObservationId,
+    OperationId, OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
     ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
@@ -91,6 +91,25 @@ impl ProviderVerifier for TestProvider {
 fn rev(value: &str) -> RevisionId {
     RevisionId::new(value)
         .unwrap_or_else(|error| panic!("valid fixture revision required: {error}"))
+}
+
+fn fixture_reference(label: &str) -> eliot_agent_contracts::PublicReference {
+    eliot_agent_contracts::PublicReference {
+        kind: "fixture".to_owned(),
+        id: eliot_agent_contracts::TargetId::new(format!("fixture-{label}"))
+            .expect("fixture reference identity is valid"),
+        revision: rev("fixture-v1"),
+        digest: None,
+    }
+}
+
+fn fixture_schema_identity(label: &str) -> eliot_contracts::ContractIdentity {
+    eliot_contracts::contract_identity(
+        format!("fixture-{label}"),
+        eliot_contracts::ContractVersion::new(1, 0, 0),
+        &serde_json::json!({ "fixture_schema": label }),
+    )
+    .expect("fixture schema identity is valid")
 }
 
 fn fence() -> StateFence {
@@ -312,11 +331,23 @@ fn request(
         .collect::<Result<Vec<_>, _>>()?;
     let role_profiles = specs
         .iter()
-        .map(|spec| {
+        .zip(&work_units)
+        .map(|(spec, work)| {
             Ok(RoleProfileManifest {
                 role_id: RoleProfileId::new(spec.role)?,
                 manifest_revision: rev(&format!("role-rev-{}", spec.role)),
+                schema_identity: fixture_schema_identity(&format!("role-{}", spec.role)),
+                content_digest: try_zero_digest(),
                 required_competence: vec!["rust".to_owned()],
+                allowed_operations: vec![fixture_reference("role-operation")],
+                allowed_effects: work.effect_ceiling.clone(),
+                independence_requirement: fixture_reference("independence-requirement"),
+                input_schemas: vec![fixture_reference("role-input-schema")],
+                output_schemas: vec![fixture_reference("role-output-schema")],
+                visibility_policy: fixture_reference("visibility-policy"),
+                learning_role: LearningRole::NotApplicable,
+                stop_condition: fixture_reference("candidate-submitted"),
+                escalation_policy: fixture_reference("integration-owner"),
                 allowed_route_classes: vec![format!("provider-{}", spec.route)],
                 mutation_capable: spec.write,
             })
@@ -345,7 +376,7 @@ fn request(
             parent_attempt,
             work_units,
             required_competence: vec!["rust".to_owned()],
-            allowed_route_classes: route_classes,
+            allowed_route_classes: route_classes.clone(),
             native_child_policy: "bounded".to_owned(),
             root_context_revision: "root-v1".to_owned(),
             context_budget: budget(),
@@ -367,9 +398,23 @@ fn request(
         recipe: RecipeManifest {
             recipe_id: RecipeId::new(format!("recipe-{tag}"))?,
             manifest_revision: rev(&format!("recipe-rev-{tag}")),
+            schema_identity: fixture_schema_identity(&format!("recipe-{tag}")),
+            content_digest: try_zero_digest(),
             route_policy_revision: rev("route-policy-1"),
             max_lanes: specs.len(),
             max_descendants: 8,
+            stage_templates: vec![fixture_reference("stage-template")],
+            work_item_templates: vec![fixture_reference("work-item-template")],
+            dependency_templates: vec![fixture_reference("dependency-template")],
+            merge_templates: vec![fixture_reference("merge-template")],
+            eligible_route_classes: route_classes,
+            expansion_conditions: vec![fixture_reference("expansion-condition")],
+            contraction_conditions: vec![fixture_reference("contraction-condition")],
+            verifier_requirements: vec![fixture_reference("verifier-requirement")],
+            audit_requirements: vec![fixture_reference("audit-requirement")],
+            budget: budget(),
+            partial_result_behavior: fixture_reference("partial-result-behavior"),
+            failure_behavior: fixture_reference("failure-behavior"),
             role_profiles,
         },
         task_revision: "task-rev-1".to_owned(),
