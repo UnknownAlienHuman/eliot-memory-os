@@ -3846,7 +3846,7 @@ impl BootstrapSnapshot {
     }
 
     /// Requires the typed owner surface to overlap the live activation on
-    /// principal, session, WorkScope, exact task revision, and the typed
+    /// principal, session, `WorkScope`, exact task revision, and the typed
     /// epoch/generation carried by both sides. The bridge has no defined
     /// encoding for `BootstrapContext::state_fence_ref`, so material readiness
     /// is already refused by `from_compiled_surface`; this check does not
@@ -4466,7 +4466,7 @@ impl BridgeRunner {
     /// this receipt forward all fail closed with their own codes; none of them
     /// degrades into a caller READY flag.
     ///
-    /// The supplied principal, WorkScope, and route-profile refs must equal the
+    /// The supplied principal, `WorkScope`, and route-profile refs must equal the
     /// corresponding owner fields. Task-selection content must preserve the
     /// owner task/selection disposition. When attached, the surface must also
     /// match the live principal, session, scope, task revision, and overlapping

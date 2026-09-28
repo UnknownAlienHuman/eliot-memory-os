@@ -858,7 +858,7 @@ fn bounded_list(values: &[String], field: &'static str, max: usize) -> Result<()
     Ok(())
 }
 
-/// Checks the two GovernanceProfile authorization axes against the derivation
+/// Checks the two `GovernanceProfile` authorization axes against the derivation
 /// contract. Freshness inputs remain owner-supplied fields in the typed
 /// profile; this consistency check does not authenticate their origin.
 fn validate_governance_axes(
