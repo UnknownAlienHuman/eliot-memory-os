@@ -86,10 +86,10 @@ use crate::{
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
     ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    StateFenceSnapshot, StreamRecoveryActivation, StreamRecoveryReconciliationState,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
@@ -17781,9 +17781,37 @@ impl RedbRecoveryStore {
     /// continuation holding the family frozen detect the movement. An exact
     /// re-presentation that wrote nothing leaves the revision alone, so a
     /// replayed observation never looks like movement.
+    ///
+    /// This path never CREATES a terminal projection. A move into `Retired`
+    /// from any other activation is refused here with a typed error, because a
+    /// terminal disposition and a proven evidence handoff/readback are facts
+    /// about the owning operation contract that this projection cannot carry.
+    /// Only [`Self::retire_process_stream_recovery`] may create terminal
+    /// evidence, and it creates it from the row it read back. An already
+    /// `Retired` row that a restore re-presents is not a move and is still
+    /// accepted unchanged, so terminal evidence survives backup/restore.
     pub fn put_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        self.write_process_stream_recovery(projection, false)
+    }
+
+    /// The family's one durable write body, shared by the gated public writer
+    /// and by retirement.
+    ///
+    /// `terminal_creation_proven` is `true` on exactly one call site:
+    /// [`Self::retire_process_stream_recovery`], which has already read the
+    /// durable row back and proven terminal disposition, the terminal receipt
+    /// and the reconciliation handoff against that durable row before it
+    /// reaches this write. Every other caller passes `false` and can never
+    /// move a live projection into `Retired`, which is what makes retirement
+    /// the exclusive creator of a terminal projection rather than a second,
+    /// ungated transition.
+    fn write_process_stream_recovery(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+        terminal_creation_proven: bool,
     ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
         projection.validate()?;
         let key = projection.record_key()?;
@@ -17833,6 +17861,17 @@ impl RedbRecoveryStore {
                             ProcessStreamRecoveryWriteOutcome::Advanced
                         }
                     } else {
+                        if projection.activation == StreamRecoveryActivation::Retired
+                            && !terminal_creation_proven
+                        {
+                            return Err(OrsError::InvalidField {
+                                field: "stream_recovery_activation",
+                                reason: "retire_process_stream_recovery is the only path to a \
+                                         terminal recovery projection; it requires the owning \
+                                         operation's proven terminal disposition and evidence \
+                                         handoff/readback",
+                            });
+                        }
                         if !existing
                             .activation
                             .permits_transition_to(projection.activation)
@@ -17965,8 +18004,18 @@ impl RedbRecoveryStore {
     /// Retirement is not deletion: the row stays durable as terminal evidence so
     /// a mistaken retirement remains recoverable, which is why the Architecture
     /// forbids destroying it outright. Nothing here infers terminality from the
-    /// projection; the terminal reservation state, its named recovery owner,
-    /// its terminal receipt and the proven handoff digest must all agree.
+    /// projection the caller passed in: the terminal reservation state, its named
+    /// recovery owner, its terminal receipt and the proven handoff digest are
+    /// all read from durable state — the reservation rows and the recovery
+    /// projection row this operation owns — and the caller's proof must match
+    /// them, never replace them. A handoff the owning operation contract has not
+    /// already recorded and read back into this row is refused.
+    ///
+    /// This is the exclusive creator of a terminal projection:
+    /// [`Self::put_process_stream_recovery`] refuses a move into `Retired` from
+    /// any other activation, so a caller cannot reach a terminal record by
+    /// presenting a retired copy of its own projection. The row written here is
+    /// the row that was read back, with only `activation` changed.
     ///
     /// Because the retired row is written through the family's one write path,
     /// retirement advances the durable family revision in the same transaction
@@ -17982,9 +18031,13 @@ impl RedbRecoveryStore {
         proof.validate()?;
         let key = projection.record_key()?;
         let read = self.database.begin_read().map_err(storage)?;
-        {
+        // The durable row, already decoded and validated by the existing ORS
+        // codec. It is the ORIGINAL RECORDED projection: every fact below is
+        // checked against this row, never against the caller's copy of it, so a
+        // caller cannot carry its own reconciliation into a terminal record.
+        let stored = {
             let table = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
-            let stored = table
+            table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
@@ -17992,13 +18045,13 @@ impl RedbRecoveryStore {
                 .ok_or(OrsError::IntegrityProblem {
                     record_type: "process_stream_recovery",
                     reason: "the named recovery projection row is not durable".to_owned(),
-                })?;
-            if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "process_stream_recovery",
-                    reason: "retirement target does not match the durable evidence axes".to_owned(),
-                });
-            }
+                })?
+        };
+        if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_stream_recovery",
+                reason: "retirement target does not match the durable evidence axes".to_owned(),
+            });
         }
         let reservation_id = {
             let operations = read.open_table(OPERATIONS).map_err(storage)?;
@@ -18020,22 +18073,35 @@ impl RedbRecoveryStore {
             decode::<ReservationRecord>(value.value())?
         };
         if reservation.token.recovery_owner != proof.recovery_owner
-            || projection.reconciliation.owner != proof.recovery_owner
+            || stored.reconciliation.owner != proof.recovery_owner
         {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         if !reservation.state.is_terminal() {
             return Err(OrsError::UnsafeExpiry);
         }
-        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id)
-            || projection.reconciliation.handoff_sha256.as_deref()
+        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        // The handoff/readback proof is read off the DURABLE reconciliation,
+        // not recomputed over what the caller holds. A live projection records
+        // `Unreconciled` with no handoff digest, so an unfabricated handoff is
+        // refused here: absent a handoff that the owning operation contract
+        // already recorded and read back into this row, no proof object can
+        // retire anything.
+        if stored.reconciliation.state != StreamRecoveryReconciliationState::Reconciled
+            || stored.reconciliation.handoff_sha256.as_deref()
                 != Some(proof.handoff_sha256.as_str())
         {
             return Err(OrsError::ReconciliationMismatch);
         }
         drop(read);
-        let retired = projection.with_activation(StreamRecoveryActivation::Retired)?;
-        self.put_process_stream_recovery(&retired)
+        // The row that becomes terminal is the row that was read back and
+        // checked, with only its activation changed. Nothing the gate did not
+        // compare against the durable row can be smuggled in through the
+        // caller's copy.
+        let retired = stored.with_activation(StreamRecoveryActivation::Retired)?;
+        self.write_process_stream_recovery(&retired, true)
     }
 
     /// Imports a recovery projection from backup/restore as suspended evidence.
@@ -18046,6 +18112,14 @@ impl RedbRecoveryStore {
     /// state through this record. Only the recovery projection row is written;
     /// no reservation, session or authority row is created, reactivated or
     /// otherwise revived.
+    ///
+    /// A restore is also not a way to CREATE terminality: when the destination
+    /// already holds a live row for the same `(operation, stream)` key, a
+    /// retired backup row is refused by
+    /// [`Self::put_process_stream_recovery`] rather than terminating the
+    /// destination's row, because the restore proves no handoff and no terminal
+    /// disposition. Re-presenting an already-`Retired` row over an
+    /// already-`Retired` row, or into an empty slot, is unchanged.
     ///
     /// This stays the only durable restore route for the family (issue #2884):
     /// paging the family into more backup pages raises no authority, and every
