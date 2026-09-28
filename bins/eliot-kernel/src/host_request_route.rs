@@ -187,6 +187,13 @@ pub(crate) const AGENT_BRIDGE_EVENT_GAP_OPERATION: &str = "agent_bridge_event_ga
 /// Closed event-ownership/cursor reconciliation entry: reads the bridge-event
 /// tables only, never the host-request ledger.
 pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_event_reconcile";
+/// Version of the Kernel bridge-ingest adapter that admits durable/control
+/// bridge events (issue #1934, I7.23): staged with every event as
+/// `adapter_version` so the durable row answers which adapter admitted it
+/// after restart. Bump when the admit/stage adapter semantics change; it
+/// names this adapter's own revision, never a producer-side version the
+/// Kernel cannot observe.
+const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -4546,6 +4553,14 @@ impl KernelComposition {
             // at the policy revision it names. Without it persistence is
             // refused, never inferred.
             "privacy_authorization": privacy_legs.authorization,
+            // Issue #1934: the ingest provenance travels with the decision so
+            // the ORS row answers the I7.23 storage list after restart. The
+            // requested route is the closed wire operation that reached this
+            // entry — the only forward operation that can — and the adapter
+            // version is this adapter's own revision, never a producer-side
+            // version this Kernel cannot observe.
+            "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
+            "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_connection": evidence.connection,

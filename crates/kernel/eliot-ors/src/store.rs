@@ -379,6 +379,27 @@ const BRIDGE_EVENT_DENIED_CONTENT_TOKENS: &[&str] = &[
 ];
 /// Maximum redacted classes carried by one bridge-event redaction.
 const MAX_BRIDGE_EVENT_REDACTED_CLASSES: usize = 16;
+/// Version of the verbatim-or-projection transformation this owner performs
+/// at stage time (issue #1934, I7.23): the canonical envelope bytes become
+/// either the verbatim admissible row bytes or the deterministic redacted
+/// projection. Stamped on every owner-checked row as `transformation_version`
+/// so the storage list stays reconstructible after restart; nonzero on every
+/// current row, zero only on rows written before provenance existed.
+const BRIDGE_EVENT_STAGING_TRANSFORMATION_VERSION: u16 = 1;
+/// Actual intake route that persisted an owner-checked row (issue #1934,
+/// I7.23): the store stamps the entry that ran, while the Kernel stages the
+/// wire operation the frame requested, so requested versus actual stays
+/// answerable after restart.
+const BRIDGE_EVENT_CHECKED_STAGE_ROUTE: &str = "eliot.bridge-event.stage-checked.v1";
+/// Maximum normalization warnings carried by one bridge-event row (issue
+/// #1934, I7.23). Warnings are advisory provenance only: they never gate
+/// persistence and never carry raw provider content.
+const BRIDGE_EVENT_MAX_NORMALIZATION_WARNINGS: usize = 8;
+/// Normalization warning recorded when the staged envelope addresses its
+/// payload through an immutable blob handle (issue #1934, I7.23): the row
+/// preserves the handle, not the referenced content, so forensic replay of
+/// the raw payload cannot be satisfied from this row alone.
+const BRIDGE_EVENT_BLOB_CONTENT_WARNING: &str = "blob_payload_content_not_staged";
 /// Maximum staged bridge-event handoff rows. Mirrors the bridge-event record
 /// bound: breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
 /// backpressure), never with silent loss of handoff state.
@@ -588,6 +609,26 @@ struct BridgeEventRow {
     /// event identity is a policy change, never a duplicate.
     #[serde(default)]
     admitted_policy_revision: u64,
+    /// Ingest provenance reconstructible after restart (issue #1934, I7.23):
+    /// the bridge-ingest adapter version the Kernel staged, the staging
+    /// transformation version this owner stamped, the wire operation the
+    /// frame requested, and the intake route that actually persisted the row.
+    /// All empty/zero only on rows written before provenance existed; a row
+    /// written by the current checked stage entry always carries all four.
+    #[serde(default)]
+    adapter_version: String,
+    #[serde(default)]
+    transformation_version: u16,
+    #[serde(default)]
+    requested_route: String,
+    #[serde(default)]
+    actual_route: String,
+    /// Advisory normalization warnings derived at stage time (issue #1934,
+    /// I7.23): bounded, never raw provider content, never a persistence gate.
+    /// Empty means no warning was emitted, which is itself a reconstructible
+    /// answer.
+    #[serde(default)]
+    normalization_warnings: Vec<String>,
 }
 
 impl BridgeEventRow {
@@ -629,7 +670,56 @@ impl BridgeEventRow {
         if !self.owner_namespace.is_empty() {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
-        self.validate_privacy()
+        self.validate_privacy()?;
+        self.validate_provenance()
+    }
+
+    /// Validates the I7.23 ingest provenance carried by this row (issue
+    /// #1934): adapter version, transformation version, requested route, and
+    /// actual route are either all unbound (rows written before provenance
+    /// existed, which keep validating) or all bound on a row written by the
+    /// current checked stage entry — never a partial binding, which would
+    /// attribute the row to an adapter, transform, or route that did not
+    /// jointly produce it. Normalization warnings are always allowed (empty
+    /// included) and stay bounded advisory text, never raw content and never
+    /// a second digest scheme: the ORIGINAL digest checks in
+    /// [`Self::validate_privacy`] are unchanged.
+    fn validate_provenance(&self) -> Result<(), OrsError> {
+        let bound = [
+            self.adapter_version.as_str(),
+            self.requested_route.as_str(),
+            self.actual_route.as_str(),
+        ];
+        let none_bound =
+            bound.iter().all(|field| field.is_empty()) && self.transformation_version == 0;
+        if none_bound {
+            return self.validate_warnings();
+        }
+        if bound.iter().any(|field| field.is_empty()) || self.transformation_version == 0 {
+            return Err(OrsError::InvalidField {
+                field: "adapter_version",
+                reason: "bridge event ingest provenance binds adapter, transformation, requested route, and actual route together",
+            });
+        }
+        crate::model::validate_text(&self.adapter_version, "adapter_version")?;
+        crate::model::validate_text(&self.requested_route, "requested_route")?;
+        crate::model::validate_text(&self.actual_route, "actual_route")?;
+        self.validate_warnings()
+    }
+
+    /// Validates the advisory normalization warnings: bounded count, bounded
+    /// text each, never a persistence gate.
+    fn validate_warnings(&self) -> Result<(), OrsError> {
+        if self.normalization_warnings.len() > BRIDGE_EVENT_MAX_NORMALIZATION_WARNINGS {
+            return Err(OrsError::InvalidField {
+                field: "normalization_warnings",
+                reason: "bridge event normalization warnings must be bounded",
+            });
+        }
+        for warning in &self.normalization_warnings {
+            crate::model::validate_text(warning, "normalization_warnings")?;
+        }
+        Ok(())
     }
 
     /// Validates the I7.23 disclosure/retention decision carried by this row.
@@ -1753,6 +1843,25 @@ struct BridgeEventPrivacyStaging {
     stored_bytes: Vec<u8>,
 }
 
+/// Resolved I7.23 ingest provenance for one staged bridge event (issue
+/// #1934).
+///
+/// The adapter version and the requested route arrive as staged legs from the
+/// Kernel bridge-ingest adapter that admitted the event; the transformation
+/// version and the actual route are stamped by this owner for the entry that
+/// ran; the warnings are derived here from the staged envelope itself. The
+/// row persists all five, so the I7.23 storage list stays reconstructible
+/// after restart. Provenance never authorizes and never gates: verbatim
+/// persistence still requires the owner's privacy authorization plus a clean
+/// deny scan (see [`Self::bridge_event_privacy_staging`]).
+struct BridgeEventIngestProvenance {
+    adapter_version: String,
+    transformation_version: u16,
+    requested_route: String,
+    actual_route: String,
+    warnings: Vec<String>,
+}
+
 /// Builds the stage/lookup outcome object for one bridge-event row.
 ///
 /// The owner authorization rides the answer (issue #1934) so a consumer can
@@ -1816,6 +1925,11 @@ fn bridge_event_outcome(
         "redaction": redaction,
         "privacy_authorization": privacy_authorization,
         "handoff": handoff,
+        "adapter_version": row.adapter_version,
+        "transformation_version": row.transformation_version,
+        "requested_route": row.requested_route,
+        "actual_route": row.actual_route,
+        "normalization_warnings": row.normalization_warnings,
     })
 }
 
@@ -7983,6 +8097,82 @@ impl RedbRecoveryStore {
         .into_bytes()
     }
 
+    /// Derives the advisory normalization warnings for one staged envelope
+    /// (issue #1934, I7.23).
+    ///
+    /// Read-only over the already-validated canonical envelope JSON: a
+    /// `blob_ref` payload addresses its content through an immutable handle,
+    /// so the row preserves the handle rather than the referenced bytes.
+    /// Advisory only — warnings never gate persistence, never carry raw
+    /// content, and an empty result is itself a reconstructible answer. An
+    /// envelope that carries no recognized loss shape warns about nothing
+    /// rather than guessing.
+    fn bridge_event_normalization_warnings(envelope: &serde_json::Value) -> Vec<String> {
+        let blob_ref = envelope
+            .get("payload_or_blob_ref")
+            .and_then(|payload| payload.get("blob_ref"))
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+        if blob_ref {
+            vec![BRIDGE_EVENT_BLOB_CONTENT_WARNING.to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Resolves the I7.23 ingest provenance for one stage call (issue #1934).
+    ///
+    /// On the owner-checked entry (`checked == true`) the Kernel stages its
+    /// own adapter version and the wire operation the frame requested, and
+    /// this owner stamps the transformation version and the actual route of
+    /// the entry that ran, deriving the warnings from the staged envelope.
+    /// The legacy ownerless entry (`checked == false`) binds no provenance at
+    /// all, so its rows keep validating as pre-provenance rows; it stages no
+    /// invented adapter, transform, or route for bytes it did not admit
+    /// through the checked path.
+    fn bridge_event_provenance_staging(
+        staged: &serde_json::Value,
+        envelope: &serde_json::Value,
+        checked: bool,
+    ) -> Result<BridgeEventIngestProvenance, OrsError> {
+        let warnings = Self::bridge_event_normalization_warnings(envelope);
+        if !checked {
+            return Ok(BridgeEventIngestProvenance {
+                adapter_version: String::new(),
+                transformation_version: 0,
+                requested_route: String::new(),
+                actual_route: String::new(),
+                warnings: Vec::new(),
+            });
+        }
+        let adapter_version = bridge_text(staged, "adapter_version")?;
+        let requested_route = bridge_text(staged, "requested_route")?;
+        Ok(BridgeEventIngestProvenance {
+            adapter_version,
+            transformation_version: BRIDGE_EVENT_STAGING_TRANSFORMATION_VERSION,
+            requested_route,
+            actual_route: BRIDGE_EVENT_CHECKED_STAGE_ROUTE.to_owned(),
+            warnings,
+        })
+    }
+
+    /// Compares one persisted row's ingest provenance against the provenance
+    /// resolved for the current stage call (issue #1934): adapter version,
+    /// transformation version, requested route, actual route, and warnings
+    /// must all agree, so a replay admitted under different provenance
+    /// conflicts instead of answering stale provenance as a duplicate. A
+    /// pre-provenance row never matches current provenance.
+    fn bridge_event_provenance_matches(
+        row: &BridgeEventRow,
+        provenance: &BridgeEventIngestProvenance,
+    ) -> bool {
+        row.adapter_version == provenance.adapter_version
+            && row.transformation_version == provenance.transformation_version
+            && row.requested_route == provenance.requested_route
+            && row.actual_route == provenance.actual_route
+            && row.normalization_warnings == provenance.warnings
+    }
+
     /// Runs the conservative deny detector over the canonical envelope bytes
     /// and returns the sorted matched classes (issue #1934). Matched
     /// case-insensitively over the lossy UTF-8 decoding, so binary frames
@@ -8330,6 +8520,10 @@ impl RedbRecoveryStore {
     /// are staged as the deterministic redacted projection plus the redaction
     /// receipt facts — never as verbatim raw. A decision mismatch fails the
     /// stage instead of persisting a disputed form.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "legacy stage keeps the duplicate-check and fresh-insert branches in one auditable decision"
+    )]
     pub fn stage_bridge_event(
         &self,
         staged: &serde_json::Value,
@@ -8362,6 +8556,10 @@ impl RedbRecoveryStore {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
         let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes, None)?;
+        // Legacy entry binds no ingest provenance: its rows keep validating
+        // as pre-provenance rows, and the duplicate check below compares the
+        // same empty legs, so legacy behavior is unchanged.
+        let provenance = Self::bridge_event_provenance_staging(staged, &envelope_value, false)?;
         let key = format!("{stream_id}::{event_id}");
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -8378,6 +8576,7 @@ impl RedbRecoveryStore {
                     || row.transport_hash != staging.transport_hash
                     || row.admitted_scope != staging.scope
                     || row.admitted_policy_revision != staging.policy_revision
+                    || !Self::bridge_event_provenance_matches(&row, &provenance)
                     || !row.owner_namespace.is_empty()
                 {
                     return Err(OrsError::DuplicateConflict);
@@ -8425,6 +8624,13 @@ impl RedbRecoveryStore {
                     admitted_source: staging.transport_hash,
                     admitted_scope: staging.scope,
                     admitted_policy_revision: staging.policy_revision,
+                    // No provenance was presented on this entry: the row
+                    // stays pre-provenance, exactly as before.
+                    adapter_version: provenance.adapter_version,
+                    transformation_version: provenance.transformation_version,
+                    requested_route: provenance.requested_route,
+                    actual_route: provenance.actual_route,
+                    normalization_warnings: provenance.warnings,
                 };
                 row.validate()?;
                 {
@@ -11673,7 +11879,7 @@ impl RedbRecoveryStore {
         &self,
         staged: &serde_json::Value,
     ) -> Result<serde_json::Value, OrsError> {
-        let (stage, staging) = Self::parse_bridge_stage_checked(staged)?;
+        let (stage, staging, provenance) = Self::parse_bridge_stage_checked(staged)?;
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
         let outcome = {
@@ -11690,10 +11896,21 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
                 BridgeStreamRight::Append,
             )?;
-            match Self::check_bridge_retained_replay_in(&write, &access, &stage, &staging)? {
+            match Self::check_bridge_retained_replay_in(
+                &write,
+                &access,
+                &stage,
+                &staging,
+                &provenance,
+            )? {
                 Some(outcome) => outcome,
                 None => Self::stage_fresh_bridge_event_checked(
-                    &write, &access, &stage, &staging, now_ms,
+                    &write,
+                    &access,
+                    &stage,
+                    &staging,
+                    &provenance,
+                    now_ms,
                 )?,
             }
         };
@@ -11726,11 +11943,12 @@ impl RedbRecoveryStore {
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
     ) -> Result<Option<serde_json::Value>, OrsError> {
         if let Some(row) = Self::load_bridge_event_row_in(write, &stage.key)? {
             row.validate()?;
             return Ok(Some(Self::replay_bridge_event_outcome_checked(
-                write, access, &row, stage, staging,
+                write, access, &row, stage, staging, provenance,
             )?));
         }
         if let Some(commitment) =
@@ -11809,21 +12027,32 @@ impl RedbRecoveryStore {
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
         now_ms: u64,
     ) -> Result<serde_json::Value, OrsError> {
         access.require(BridgeStreamRight::Append)?;
         Self::check_bridge_handoff_compatible_in(write, access, stage)?;
-        let outcome = Self::insert_bridge_event_row_checked(write, access, stage, staging, now_ms)?;
+        let outcome = Self::insert_bridge_event_row_checked(
+            write, access, stage, staging, provenance, now_ms,
+        )?;
         Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
         Ok(outcome)
     }
 
     /// Parses and validates one owner-checked stage request (issue #2729):
     /// the sidecar identity, the Kernel-derived owner evidence, the
-    /// sidecar-to-envelope bind, the digest, and the disclosure staging.
+    /// sidecar-to-envelope bind, the digest, the disclosure staging, and the
+    /// ingest provenance (issue #1934).
     fn parse_bridge_stage_checked(
         staged: &serde_json::Value,
-    ) -> Result<(BridgeCheckedStage, BridgeEventPrivacyStaging), OrsError> {
+    ) -> Result<
+        (
+            BridgeCheckedStage,
+            BridgeEventPrivacyStaging,
+            BridgeEventIngestProvenance,
+        ),
+        OrsError,
+    > {
         let stream_id = bridge_key_text(staged, "stream_id")?;
         let event_id = bridge_key_text(staged, "event_id")?;
         let sequence = bridge_sequence(staged, "sequence")?;
@@ -11878,6 +12107,10 @@ impl RedbRecoveryStore {
         // bytes inside the scope this store will actually record.
         let staging =
             Self::bridge_event_privacy_staging(staged, &envelope_bytes, Some(&namespace))?;
+        // The ingest provenance is resolved from the staged adapter legs plus
+        // this owner's stamps, so the row answers the I7.23 storage list
+        // after restart.
+        let provenance = Self::bridge_event_provenance_staging(staged, &envelope_value, true)?;
         let key = format!("{namespace}::{event_id}");
         let stage = BridgeCheckedStage {
             evidence,
@@ -11891,7 +12124,7 @@ impl RedbRecoveryStore {
             namespace,
             key,
         };
-        Ok((stage, staging))
+        Ok((stage, staging, provenance))
     }
 
     /// Answers an exact replay under an owner-checked identity (issue
@@ -11910,12 +12143,19 @@ impl RedbRecoveryStore {
     /// privacy policy conflicts rather than answering a stale permission as a
     /// duplicate. The exact source digest is already covered by
     /// `transport_hash`.
+    ///
+    /// Issue #1934 also binds the ingest provenance: a replay admitted by a
+    /// different adapter version, staging transform, requested route, actual
+    /// route, or warning set under the same identity conflicts instead of
+    /// answering stale provenance as a duplicate. A pre-provenance row never
+    /// matches current provenance, so it conflicts rather than duplicating.
     fn replay_bridge_event_outcome_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         row: &BridgeEventRow,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
     ) -> Result<serde_json::Value, OrsError> {
         if row.owner_namespace != stage.namespace
             || row.envelope_sha256 != stage.presented_sha
@@ -11940,6 +12180,7 @@ impl RedbRecoveryStore {
                 }
             || row.admitted_scope != staging.scope
             || row.admitted_policy_revision != staging.policy_revision
+            || !Self::bridge_event_provenance_matches(row, provenance)
         {
             return Err(OrsError::DuplicateConflict);
         }
@@ -12028,11 +12269,20 @@ impl RedbRecoveryStore {
     /// stages the event plus its pending delivery intent atomically, so no
     /// crash or timeout between the former split commits can leave a staged
     /// event without its required handoff.
+    ///
+    /// Issue #1934 persists the ingest provenance on the same row in the same
+    /// transaction: the row, its ordered position binding, its cursor
+    /// advance, and its pending handoff commit together, so a crash before
+    /// commit advances nothing and a crash after commit leaves the full I7.23
+    /// storage list — transport hash, raw-or-redacted bytes, receipt,
+    /// adapter/transformation versions, routes, and warnings — durably
+    /// related.
     fn insert_bridge_event_row_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
         now_ms: u64,
     ) -> Result<serde_json::Value, OrsError> {
         let row = BridgeEventRow {
@@ -12071,6 +12321,18 @@ impl RedbRecoveryStore {
             admitted_source: staging.transport_hash.clone(),
             admitted_scope: staging.scope.clone(),
             admitted_policy_revision: staging.policy_revision,
+            // The ingest provenance travels with the row in the same
+            // transaction: adapter and transformation versions, requested
+            // and actual route references, and normalization warnings, so
+            // the I7.23 storage list is reconstructible after restart. A
+            // later replay under different provenance is a different
+            // admission, not a duplicate (see
+            // [`Self::replay_bridge_event_outcome_checked`]).
+            adapter_version: provenance.adapter_version.clone(),
+            transformation_version: provenance.transformation_version,
+            requested_route: provenance.requested_route.clone(),
+            actual_route: provenance.actual_route.clone(),
+            normalization_warnings: provenance.warnings.clone(),
         };
         row.validate()?;
         {
