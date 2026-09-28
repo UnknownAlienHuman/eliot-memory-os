@@ -999,6 +999,7 @@ impl RecoveryStreamView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryView {
     window_key: String,
+    expires_at_ms: u64,
     live_generation: u64,
     streams: Vec<RecoveryStreamView>,
     unscoped_gaps: u64,
@@ -1011,6 +1012,11 @@ pub struct RecoveryView {
 impl RecoveryView {
     pub fn window_key(&self) -> &str {
         &self.window_key
+    }
+
+    /// Owner-issued expiry for this recovery window, in Unix milliseconds.
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 
     pub const fn live_generation(&self) -> u64 {
@@ -1783,6 +1789,7 @@ impl ReconciliationPortResult {
         binding: &AttachBinding,
         receipt_ref: ReconciliationReceiptRef,
         window_key: String,
+        expires_at_ms: u64,
         window_status: RecoveryWindowStatus,
         live_generation: Generation,
         presenting_connection: ConnectionId,
@@ -1802,6 +1809,7 @@ impl ReconciliationPortResult {
         )?;
         let window = RecoveryWindowFacts::checked(
             window_key,
+            expires_at_ms,
             window_status,
             live_generation,
             presenting_connection,
@@ -2521,6 +2529,7 @@ impl RecoveredStreamFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryWindowFacts {
     window_key: String,
+    expires_at_ms: u64,
     window_status: RecoveryWindowStatus,
     live_generation: Generation,
     presenting_connection: ConnectionId,
@@ -2541,6 +2550,7 @@ impl RecoveryWindowFacts {
     #[allow(clippy::result_large_err)]
     pub fn checked(
         window_key: String,
+        expires_at_ms: u64,
         window_status: RecoveryWindowStatus,
         live_generation: Generation,
         presenting_connection: ConnectionId,
@@ -2554,6 +2564,12 @@ impl RecoveryWindowFacts {
         unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
     ) -> Result<Self, BridgeError> {
         validate_text(&window_key, "recovery_window.window_key")?;
+        if expires_at_ms == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.expires_at_ms",
+                reason: "owner expiry must be a nonzero Unix timestamp",
+            });
+        }
         if window_status == RecoveryWindowStatus::Active
             && (stream_list_complete != stream_list_continuation.is_none()
                 || unscoped_gaps_complete != unscoped_gaps_continuation.is_none())
@@ -2606,6 +2622,7 @@ impl RecoveryWindowFacts {
         }
         Ok(Self {
             window_key,
+            expires_at_ms,
             window_status,
             live_generation,
             presenting_connection,
@@ -2622,6 +2639,10 @@ impl RecoveryWindowFacts {
 
     pub fn window_key(&self) -> &str {
         &self.window_key
+    }
+
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 
     pub const fn window_status(&self) -> RecoveryWindowStatus {
@@ -2672,15 +2693,16 @@ impl RecoveryWindowFacts {
 /// One bounded read continuation: a pure selector, never an
 /// acknowledgement.
 ///
-/// The request names the declared window, one stream scope, the predecessor
-/// sequence the next page must advance past, and explicit event/gap budgets.
-/// It carries the expected live authority (generation plus presenting
-/// connection) so each call rechecks the #2729 rights against the live
-/// attach: possession of the token alone authorizes nothing, and a request
-/// built before a reconnect fails closed instead of resuming a stale walk.
+/// A keyed continuation names the declared window, one stream scope, the
+/// predecessor sequence the next page must advance past, and explicit
+/// event/gap budgets. A resume selector deliberately omits the volatile
+/// window key so the existing authenticated owner scope can find the same
+/// persisted window after process restart. Every form carries the expected
+/// live authority (generation plus presenting connection), so each call
+/// rechecks the #2729 rights against the current attach.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReadRequest {
-    window_key: String,
+    window_key: Option<String>,
     selector: RecoveryReadSelector,
     expected_generation: u64,
     expected_connection: String,
@@ -2688,6 +2710,7 @@ pub struct RecoveryReadRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RecoveryReadSelector {
+    Resume,
     Stream {
         stream_id: String,
         after_sequence: u64,
@@ -2776,7 +2799,7 @@ impl RecoveryReadRequest {
         }
         validate_text(&expected_connection, "recovery_read.expected_connection")?;
         Ok(Self {
-            window_key,
+            window_key: Some(window_key),
             selector: RecoveryReadSelector::Stream {
                 stream_id,
                 after_sequence,
@@ -2814,7 +2837,7 @@ impl RecoveryReadRequest {
             });
         }
         Ok(Self {
-            window_key,
+            window_key: Some(window_key),
             selector: RecoveryReadSelector::Streams {
                 after_stream,
                 stream_limit,
@@ -2853,7 +2876,7 @@ impl RecoveryReadRequest {
             });
         }
         Ok(Self {
-            window_key,
+            window_key: Some(window_key),
             selector: RecoveryReadSelector::UnscopedGaps {
                 after_gap_scope,
                 gap_offset,
@@ -2864,8 +2887,35 @@ impl RecoveryReadRequest {
         })
     }
 
-    pub fn window_key(&self) -> &str {
-        &self.window_key
+    /// Constructs an owner-scoped resume read for the current admitted
+    /// attach. It carries no window key; the owner resolves the unique live
+    /// persisted window for this authenticated scope or fails closed.
+    #[allow(clippy::result_large_err)]
+    pub fn checked_resume(
+        expected_generation: u64,
+        expected_connection: String,
+    ) -> Result<Self, BridgeError> {
+        if expected_generation == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_read.expected_generation",
+                reason: "expected live generation must be nonzero",
+            });
+        }
+        validate_text(&expected_connection, "recovery_read.expected_connection")?;
+        Ok(Self {
+            window_key: None,
+            selector: RecoveryReadSelector::Resume,
+            expected_generation,
+            expected_connection,
+        })
+    }
+
+    pub fn window_key(&self) -> Option<&str> {
+        self.window_key.as_deref()
+    }
+
+    pub fn is_resume(&self) -> bool {
+        matches!(&self.selector, RecoveryReadSelector::Resume)
     }
 
     pub fn stream_scope(&self) -> Option<(&str, u64, RecoveryStreamCut, u64, u64, u64)> {
@@ -3172,6 +3222,7 @@ fn recovery_progress_changed(
 #[derive(Clone)]
 struct RecoveryWindow {
     window_key: String,
+    expires_at_ms: u64,
     live_generation: u64,
     import_revision: u64,
     stream_order: Vec<String>,
@@ -3225,6 +3276,7 @@ impl RecoveryWindow {
     fn view(&self) -> RecoveryView {
         RecoveryView {
             window_key: self.window_key.clone(),
+            expires_at_ms: self.expires_at_ms,
             live_generation: self.live_generation,
             streams: self
                 .stream_order
@@ -3540,13 +3592,24 @@ impl AgentBridgeCore {
         self.ensure_contracts()?;
         let (binding, request) = {
             let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
-            let window = active
-                .recovery
-                .as_ref()
-                .ok_or(BridgeError::InvalidTransition(
-                    "no declared recovery window; reconcile_external opens the walk",
-                ))?;
-            let request = window.next_request(&active.binding)?;
+            let generation = active.binding.activation_generation.get();
+            let connection = active.binding.connection_id.as_str().to_owned();
+            let request = match active.recovery.as_ref() {
+                Some(window) => window.next_request(&active.binding)?,
+                None if active.reconciliation_required => {
+                    if active.blind_interval.is_none() {
+                        return Err(BridgeError::InvalidTransition(
+                            "an unreconciled attach requires its declared blind interval",
+                        ));
+                    }
+                    RecoveryReadRequest::checked_resume(generation, connection)?
+                }
+                None => {
+                    return Err(BridgeError::InvalidTransition(
+                        "no declared recovery window; reconcile_external opens the walk",
+                    ));
+                }
+            };
             (active.binding.clone(), request)
         };
         if request.expected_generation != binding.activation_generation.get()
@@ -3565,6 +3628,11 @@ impl AgentBridgeCore {
                 return Err(BridgeError::ExternalReconciliationDenied(reason_code));
             }
         };
+        if request.is_resume() && !result.consumed_frontiers().is_empty() {
+            return Err(BridgeError::InvalidTransition(
+                "owner-scoped recovery resume cannot consume frontiers",
+            ));
+        }
         let permit = ReconciliationPermit::seal(result.clone())?;
         // See the initial page path above: stage the entire continuation
         // off to the side before publishing any fact or committing its
@@ -3730,7 +3798,9 @@ impl AgentBridgeCore {
             .is_none_or(|window| window.live_generation != facts.live_generation.get());
         let window = match recovery {
             Some(window) if window.live_generation == facts.live_generation.get() => {
-                if window.window_key != facts.window_key {
+                if window.window_key != facts.window_key
+                    || window.expires_at_ms != facts.expires_at_ms
+                {
                     return Err(BridgeError::StaleAuthority);
                 }
                 window
@@ -3738,6 +3808,7 @@ impl AgentBridgeCore {
             _ => {
                 *recovery = Some(RecoveryWindow {
                     window_key: facts.window_key.clone(),
+                    expires_at_ms: facts.expires_at_ms,
                     live_generation: facts.live_generation.get(),
                     import_revision: 0,
                     stream_order: Vec::new(),
