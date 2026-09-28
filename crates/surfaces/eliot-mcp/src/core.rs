@@ -23,9 +23,8 @@ use crate::{
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, ToolRequest, ToolSchema,
     TypedRejection, bind_act_owner_inputs, bind_list_surface_budget, canonical_tool_schemas,
-    classify_tool_request, decode_protected_request_bytes,
-    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
-    validate_tool_request_owner,
+    classify_tool_request, decode_protected_request_bytes, published_mcp_tool_surface,
+    reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1245,7 +1244,7 @@ fn dispatch_task_binding(
                 .metadata
                 .task_id
                 .as_ref()
-                .map(|id| id.as_str())
+                .map(eliot_contracts::TaskId::as_str)
                 .ok_or_else(|| {
                     BridgeError::invalid(
                         "identity.request.metadata.task_id",
