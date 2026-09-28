@@ -48,6 +48,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// from an unknown outcome.
     public const string StaleFenceReasonCode = "STALE_STATE_FENCE";
 
+    private static readonly JsonSerializerOptions UserAutomationRevisionReader = new(OperatorJson.Reader)
+    {
+        PropertyNameCaseInsensitive = false
+    };
+
     private readonly IGovernorClient _client;
     private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
@@ -522,13 +527,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        // What this create/edit is BOUND to, stated before transmission: the
-        // exact contract version, the pinned zone database release, the zone
-        // identity and the occurrence source digest the caller-supplied revision
-        // bytes carry, together with the one retry-stable operation identity
-        // those exact canonical bytes derive. This is the effect-relevant
-        // contract identity of the request. It is NOT a normalization claim:
-        // admission and normalization remain the owner's decision.
+        // Show the exact caller-supplied schedule projection before transmission.
+        // Parsing establishes the V4 wire shape and the fields the bytes carry;
+        // it does not establish who normalized them. The typed operation key is
+        // derived from the whole canonical request and is the retry-stable
+        // identity journaled and sent below.
         if (UserAutomationOperation is "create" or "edit"
             && operation is UserAutomationCreateOperation or UserAutomationEditOperation)
         {
@@ -539,30 +542,33 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 _ => throw new InvalidOperationException(
                     "typed UserAutomation create/edit is not a schedule-carrying operation.")
             };
-            var receipt = schedule.NormalizationReceipt();
+            var projection = schedule.NormalizationReceipt();
             const int maxPreviewOccurrences = 4;
-            var shownOccurrences = Math.Min(maxPreviewOccurrences, receipt.Occurrences.Count);
+            var shownOccurrences = Math.Min(maxPreviewOccurrences, projection.Occurrences.Count);
             var occurrencePreview = string.Join(
                 Environment.NewLine,
-                receipt.Occurrences
+                projection.Occurrences
                     .Take(shownOccurrences)
                     .Select((occurrence, index) =>
-                        $"supplied occurrence {index + 1}: requested local {occurrence.RequestedLocal}; resolved local {occurrence.ResolvedLocal}"));
+                        $"supplied V4 occurrence {index + 1}: {occurrence.Describe()}"));
+            var idempotencyKey = UserAutomationOperatorRequest.DeriveIdempotencyKey(operation);
             var submissionDescription = UserAutomationOutcomeClassifier.DescribeSubmission(
                 UserAutomationOperation,
-                receipt,
-                UserAutomationOperatorRequest.DeriveIdempotencyKey(operation));
+                projection,
+                idempotencyKey)
+                + Environment.NewLine
+                + "No owner-issued normalization receipt is present; occurrence provenance is unverified.";
             if (occurrencePreview.Length != 0)
             {
                 submissionDescription += Environment.NewLine + occurrencePreview;
             }
-            if (receipt.Occurrences.Count > shownOccurrences)
+            if (projection.Occurrences.Count > shownOccurrences)
             {
                 submissionDescription += Environment.NewLine
-                    + $"...{receipt.Occurrences.Count - shownOccurrences} further occurrence(s); inspect the retained schedule for the complete list.";
+                    + $"...{projection.Occurrences.Count - shownOccurrences} further V4 occurrence record(s) remain in the submitted revision.";
             }
             SetBanner(
-                "UserAutomation create/edit admitted for submission",
+                "UserAutomation create/edit ready for owner submission",
                 submissionDescription,
                 OperatorBannerSeverity.Informational);
         }
@@ -844,7 +850,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// </remarks>
     private static UserAutomationRevision ParseRevision(string value)
     {
-        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value)
+        // This is operator-typed JSON, so apply its independent structural caps
+        // and duplicate-key rejection before allocating the typed revision. The
+        // shared closed reader then rejects unknown fields at every schema level.
+        OperatorResponseGuard.ValidateLocalParameter(value, "user_automation_revision");
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, UserAutomationRevisionReader)
             ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
         revision.Validate();
         return revision;

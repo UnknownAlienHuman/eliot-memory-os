@@ -571,8 +571,8 @@ public sealed record UserAutomationNormalizedSchedule(
     }
 
     /// <summary>
-    /// The typed normalization receipt this Operator preserves for a schedule it
-    /// has admitted for submission.
+    /// The local projection of the exact supported schedule contract carried by
+    /// the caller-supplied occurrence bytes.
     /// </summary>
     /// <remarks>
     /// This is a METHOD, not a property, for the same reason
@@ -581,9 +581,9 @@ public sealed record UserAutomationNormalizedSchedule(
     /// know would make every request undecodable. A method has no serialized
     /// surface at all, which keeps the exclusion exact.
     /// <para>
-    /// The receipt carries only what the owner-issued bytes decide. It is NOT an
-    /// owner receipt, and it does not certify that the owner admitted or
-    /// normalized the revision.
+    /// This local projection carries only what the supplied bytes decide. It is
+    /// NOT an owner-issued normalization receipt, and it does not certify that
+    /// the owner admitted or normalized the revision.
     /// </para>
     /// </remarks>
     public UserAutomationScheduleReceipt NormalizationReceipt()
