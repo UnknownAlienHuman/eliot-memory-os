@@ -38,5 +38,10 @@ pub use set::{ApplicableMemory, ApplicableMemorySet, ExcludedMemory, ExclusionRe
 /// Stable wire name for this contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.memory-projection-contracts";
 /// Current wire revision for this contract family.
+///
+/// Version 0.2.0 adds the closed `INFLUENCE_INELIGIBLE` exclusion tag.
+/// Consumers of the 0.1.0 set contract cannot decode that tag, so projections
+/// use exact-version validation and must be regenerated for 0.2.0; old bytes
+/// are never silently relabeled.
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
-    eliot_contracts::ContractVersion::new(0, 1, 0);
+    eliot_contracts::ContractVersion::new(0, 2, 0);

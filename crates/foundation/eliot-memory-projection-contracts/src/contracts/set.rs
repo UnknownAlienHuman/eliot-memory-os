@@ -49,6 +49,9 @@ pub enum ExclusionReason {
     /// The material cannot establish a position.
     #[serde(rename = "EPISTEMICALLY_UNKNOWN")]
     EpistemicallyUnknown,
+    /// The projection owner disallowed downstream influence for this record.
+    #[serde(rename = "INFLUENCE_INELIGIBLE")]
+    InfluenceIneligible,
     /// Protected role withheld from task-local applicability.
     #[serde(rename = "PROTECTED")]
     Protected,
@@ -89,6 +92,7 @@ impl ExclusionReason {
             | Self::Conflicted
             | Self::Rejected
             | Self::EpistemicallyUnknown
+            | Self::InfluenceIneligible
             | Self::Protected
             | Self::NegativeMemory
             | Self::LifecycleInactive

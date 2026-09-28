@@ -74,7 +74,9 @@ pub const QUALITY_CONTRACT_NAME: &str = "eliot.smart.memory-quality";
 ///
 /// Exact equality only: an assessment written against any other revision is
 /// rejected with [`QualityError::VersionMismatch`].
-pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
+/// Version 0.2.0 adds `INFLUENCE_INELIGIBLE` to the closed `RuleCount` rule
+/// vocabulary; consumers must agree on this revision to validate assessments.
+pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 2, 0);
 /// Freeze identity this consumer package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
@@ -484,10 +486,11 @@ pub struct RuleCount {
 /// The [`rule_name`] match is exhaustive over [`ExclusionReason`]; this list
 /// mirrors it so serialized validation rejects invented rules without
 /// relying on a silent default.
-const CLOSED_RULES: [&str; 11] = [
+const CLOSED_RULES: [&str; 12] = [
     "CONFLICTED",
     "EPISTEMICALLY_UNKNOWN",
     "FENCE_MISMATCH",
+    "INFLUENCE_INELIGIBLE",
     "LIFECYCLE_INACTIVE",
     "NEGATIVE_MEMORY",
     "PRECONDITION_FAILED",
@@ -791,6 +794,7 @@ fn rule_name(reason: &ExclusionReason) -> &'static str {
         ExclusionReason::Conflicted => "CONFLICTED",
         ExclusionReason::Rejected => "REJECTED",
         ExclusionReason::EpistemicallyUnknown => "EPISTEMICALLY_UNKNOWN",
+        ExclusionReason::InfluenceIneligible => "INFLUENCE_INELIGIBLE",
         ExclusionReason::Protected => "PROTECTED",
         ExclusionReason::NegativeMemory => "NEGATIVE_MEMORY",
         ExclusionReason::PreconditionFailed { .. } => "PRECONDITION_FAILED",

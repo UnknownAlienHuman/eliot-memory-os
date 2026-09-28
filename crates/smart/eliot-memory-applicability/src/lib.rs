@@ -115,7 +115,7 @@ struct EvalContext<'a> {
 /// Fixed rule order (first match wins): scope equality, fence
 /// compatibility, active lifecycle, freshness, epistemic standing,
 /// protected role, exact negative-trigger match, owner-assessed
-/// preconditions.
+/// preconditions, then the projection owner's influence-eligibility flag.
 fn classify(record: &MemoryProjectionRecord, context: &EvalContext<'_>) -> Option<ExclusionReason> {
     if record.binding.task_id != context.binding.task_id
         || record.binding.scope_id != context.binding.scope_id
@@ -151,7 +151,13 @@ fn classify(record: &MemoryProjectionRecord, context: &EvalContext<'_>) -> Optio
     {
         return Some(ExclusionReason::NegativeMemory);
     }
-    classify_preconditions(record)
+    if let Some(reason) = classify_preconditions(record) {
+        return Some(reason);
+    }
+    if !record.influence_eligible {
+        return Some(ExclusionReason::InfluenceIneligible);
+    }
+    None
 }
 
 /// Map the epistemic standing to an exclusion, or `None` when it passes.
