@@ -1715,11 +1715,12 @@ impl GrantGraph {
     ///    A dependent reference that resolves to nothing in this graph is
     ///    unknown evidence, never a silent skip;
     /// 4. every reachable in-graph member must be represented by the
-    ///    committed membership — named directly, owned by the declared
-    ///    authority root, or inheriting from one of those — otherwise the
-    ///    closure under-claims its transitive descendants and the stored
-    ///    target set drifted. No different historical affected set is
-    ///    reconstructed under the same closure identity.
+    ///    committed membership — named directly, or owned by the declared
+    ///    authority root whose retained marker stands for it — otherwise
+    ///    the closure under-claims its transitive descendants and the
+    ///    stored target set drifted. A suppressed ancestor never stands in
+    ///    for an omitted descendant: no different historical affected set
+    ///    is reconstructed under the same closure identity.
     ///
     /// Descendant completeness is checked against that one origin result.
     /// The declared origin is never re-traversed from each supplied member:
@@ -1838,11 +1839,15 @@ impl GrantGraph {
     /// The first denominator member the committed closure leaves
     /// unrepresented, if any.
     ///
-    /// A member is represented when the committed membership names it, when
-    /// the declared origin is the authority root that owns it, or when any
-    /// ancestor of it is represented. The walk keeps a visited set so a
-    /// delegation cycle (rejected at construction, but defended here)
-    /// terminates instead of looping.
+    /// A member is represented only when the committed membership names it
+    /// directly, or when the declared origin is the authority root that
+    /// owns it. A represented ancestor never stands in for an omitted
+    /// descendant: the committed origin is always a member of the affected
+    /// set and an ancestor of every denominator member, so an ancestor
+    /// walk would accept every omission and the drift refusal would be
+    /// dead. A required reachable descendant omitted from a committed
+    /// complete closure therefore stays `TargetDrift`, and no different
+    /// historical affected set is reconstructed under the old closure ID.
     fn unrepresented_member(
         &self,
         closure: &ValidatedRevocationClosure,
@@ -1850,33 +1855,17 @@ impl GrantGraph {
         denominator: &RevocationDenominator,
     ) -> Option<String> {
         for member in &denominator.members {
-            let mut seen = BTreeSet::new();
-            let mut cursor = Some(member.as_str());
-            let mut represented = false;
-            while let Some(current) = cursor {
-                if !seen.insert(current.to_owned()) {
-                    break;
-                }
-                if closure.affected.contains(current) {
-                    represented = true;
-                    break;
-                }
-                if let RevocationOrigin::AuthorityRoot(root_ref) = origin
-                    && self
-                        .grant(current)
-                        .is_some_and(|grant| grant.authority_root_ref == root_ref.as_str())
-                {
-                    represented = true;
-                    break;
-                }
-                cursor = self
-                    .grant(current)
-                    .and_then(|grant| grant.parent_grant_id.as_ref())
-                    .map(GrantId::as_str);
+            if closure.affected.contains(member.as_str()) {
+                continue;
             }
-            if !represented {
-                return Some(member.clone());
+            if let RevocationOrigin::AuthorityRoot(root_ref) = origin
+                && self
+                    .grant(member.as_str())
+                    .is_some_and(|grant| grant.authority_root_ref == root_ref.as_str())
+            {
+                continue;
             }
+            return Some(member.clone());
         }
         None
     }

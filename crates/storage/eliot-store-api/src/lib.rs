@@ -318,7 +318,8 @@ pub use operation_parameters::{
 
 pub use revocation_history::{
     REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation,
-    RevocationHistoryPayload, parse_revocation_history_payload,
+    RecordedRevocationBounds, RecordedRevocationDisposition, RevocationHistoryPayload,
+    parse_revocation_history_payload,
 };
 
 /// Stable identity of this contract surface.

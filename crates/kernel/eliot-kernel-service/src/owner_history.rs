@@ -20,6 +20,29 @@
 //!   revoked source lineage — never an invented cause;
 //! - the affected set comes verbatim from the committed closure row (the
 //!   complete denominator, never re-derived);
+//!
+//! Issue #2966, step 2: every served row declares the full versioned
+//! evidence coordinates, computed here from the durable material through
+//! the one shared canonical codec (`eliot_security_contracts`), so the
+//! decoding adapter carries them verbatim and recovery recomputes and
+//! compares them:
+//!
+//! - the owner namespace is the committed declaration's own authority
+//!   root, never the request selector echoed back;
+//! - the bounds are the engine limits the committed membership was proven
+//!   under. The Governor emits a declaration only under
+//!   `RevocationBounds::default_bounds()` (its complete-verdict gate), so
+//!   that standing fact is what this projector declares, pinned by the
+//!   wire version: a commit path proven under different bounds needs a new
+//!   wire version, never a silent shift;
+//! - the disposition is `Complete` with no omissions, because only
+//!   honestly-complete committed closures are ever recorded (the N3 gate
+//!   refuses a partial verdict, consumes every quarantine binding into a
+//!   separate receipt, and keeps quarantined identities out of `members`);
+//! - the affected-member count and digest and the canonical request hash
+//!   are the content addresses of exactly these served bytes. They bind
+//!   the decode-to-restore path: any adapter mistranslation breaks the
+//!   digest at validation instead of being re-blessed.
 //! - the served rows plus the revision watermark are read under one
 //!   durable snapshot as one bounded selected set; a closure newer than
 //!   the watermark refuses instead of serving a partial view, and a
@@ -36,12 +59,19 @@
 //! daemon-facing payload instead of being folded into a shape other owners
 //! already froze.
 
+use eliot_influence::RevocationBounds;
 use eliot_ors::{GrantClosureState, OpaqueLabel, OperationalRecoveryStore};
 use eliot_receipts::ReceiptIdentity;
-use eliot_security_contracts::RevocationReason;
+use eliot_security_contracts::{
+    InfluenceState, REVOCATION_DISPOSITION_COMPLETE, REVOCATION_HISTORY_EVIDENCE_VERSION,
+    RevocationClosureDigestBounds, RevocationClosureDigestInput, RevocationReason,
+    revocation_affected_members, revocation_affected_members_digest,
+    revocation_closure_canonical_digest,
+};
 use eliot_store_api::{
     NamedReadOperation, NamedReadRequest, NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS,
-    REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation, RevocationHistoryPayload, StoreError,
+    REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation, RecordedRevocationBounds,
+    RecordedRevocationDisposition, RevocationHistoryPayload, StoreError,
 };
 
 /// Closed payload version of the canonical second-phase link projection.
@@ -287,12 +317,73 @@ pub fn serve_authority_revocation_history(
             .collect();
         dependents.sort();
         dependents.dedup();
+        // Issue #2966, step 2: the row declares every coordinate the
+        // versioned evidence binds, through the one shared canonical
+        // codec. The decoding adapter carries them verbatim and recovery
+        // recomputes and compares them; an unaddressable membership is
+        // unprojectable, never defaulted.
+        let affected = revocation_affected_members(target, &dependents);
+        let affected_member_digest =
+            revocation_affected_members_digest(&affected).ok_or(StoreError::InvalidProjection)?;
+        // The Governor emits a declaration only under these engine limits
+        // (its complete-verdict gate), so this standing fact is what the
+        // row declares. The wire and digest views map it independently, so
+        // a mistranslation breaks the digest instead of shifting the
+        // bounds silently; a commit path proven under different bounds
+        // needs a new wire version.
+        let engine_bounds = RevocationBounds::default_bounds();
+        let bounds = RecordedRevocationBounds {
+            max_nodes: engine_bounds.max_nodes,
+            max_edges: engine_bounds.max_edges,
+            max_depth: engine_bounds.max_depth,
+            max_result: engine_bounds.max_result,
+            max_work: engine_bounds.max_work,
+            max_frontier: engine_bounds.max_frontier,
+            max_time: engine_bounds.max_time,
+        };
+        let omissions: Vec<String> = Vec::new();
+        let closure_id = commit.operation_id.as_str().to_owned();
+        let revision = commit.declaration.grant_graph_revision;
+        let canonical_request_digest =
+            revocation_closure_canonical_digest(&RevocationClosureDigestInput {
+                evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
+                closure_id: &closure_id,
+                owner_namespace: root,
+                root_ref: target,
+                dependent_refs: &dependents,
+                invalidation_reason: Some(RevocationReason::SourceRevoked),
+                current_influence: InfluenceState::Revoked,
+                state_fence: fence,
+                revision,
+                bounds: RevocationClosureDigestBounds {
+                    max_nodes: engine_bounds.max_nodes,
+                    max_edges: engine_bounds.max_edges,
+                    max_depth: engine_bounds.max_depth,
+                    max_result: engine_bounds.max_result,
+                    max_work: engine_bounds.max_work,
+                    max_frontier: engine_bounds.max_frontier,
+                    max_time: engine_bounds.max_time,
+                },
+                disposition: REVOCATION_DISPOSITION_COMPLETE,
+                omissions: &omissions,
+                affected_member_count: affected.len() as u64,
+                affected_member_digest: &affected_member_digest,
+            })
+            .ok_or(StoreError::InvalidProjection)?;
         let record = RecordedRevocation {
-            closure_id: commit.operation_id.as_str().to_owned(),
+            closure_id,
             root_ref: target.to_owned(),
             dependent_refs: dependents,
             invalidation_reason: RevocationReason::SourceRevoked,
-            revision: commit.declaration.grant_graph_revision,
+            revision,
+            owner_namespace: root.to_owned(),
+            bounds,
+            disposition: RecordedRevocationDisposition::Complete,
+            omissions,
+            current_influence: InfluenceState::Revoked,
+            affected_member_count: affected.len() as u64,
+            affected_member_digest,
+            canonical_request_digest,
         };
         record.validate()?;
         matched.push(record);
