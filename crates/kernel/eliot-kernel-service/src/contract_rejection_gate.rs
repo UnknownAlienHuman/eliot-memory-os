@@ -304,25 +304,31 @@ impl PreStageIdentityCache {
     /// entry: a changed-bytes `IDENTITY_CONFLICT` refusal must never overwrite
     /// the stored rejection for that key.
     ///
-    /// The first refusal of an operation identity is the one retained, so the
-    /// corrected identity issued for that operation never changes.
+    /// Every refusal retains its own correction, not only the first.
+    ///
+    /// Each corrected identity is derived from the rejected operation identity
+    /// together with that refusal's own rejection identity, so a second refusal
+    /// of the same operation identity issues a distinct corrected identity.
+    /// Retaining only the first would leave every later corrected identity
+    /// unprovable: the gate would hand a client an identity whose
+    /// `corrected_from_operation_id` it could not confirm, so a resubmission
+    /// obeying that rejection's own `next_allowed_action` would commit with no
+    /// lineage. I6.8 requires that `corrected_from_operation_id` preserves
+    /// lineage, and it states no first-refusal-only exception.
     fn retain_refused_operation(
         &mut self,
         proposed_operation_id: &str,
         rejection: &PreStageRejection,
     ) {
-        if self
-            .refused_operations
-            .insert(proposed_operation_id.to_owned())
-        {
-            self.issued_corrections.insert(
-                rejection.corrected_operation_id.clone(),
-                IssuedCorrection {
-                    rejected_operation_id: proposed_operation_id.to_owned(),
-                    rejection_id: rejection.rejection_id.clone(),
-                },
-            );
-        }
+        self.refused_operations
+            .insert(proposed_operation_id.to_owned());
+        self.issued_corrections.insert(
+            rejection.corrected_operation_id.clone(),
+            IssuedCorrection {
+                rejected_operation_id: proposed_operation_id.to_owned(),
+                rejection_id: rejection.rejection_id.clone(),
+            },
+        );
     }
 
     /// Verifies a presented operation identity against this cache's own record.
