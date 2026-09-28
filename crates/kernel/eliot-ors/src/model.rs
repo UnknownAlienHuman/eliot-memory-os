@@ -4105,6 +4105,14 @@ impl MaintenanceTriggerLifecycleRecord {
     /// Validates identities, exact opaque-record hashes, timestamps, and
     /// phase-specific record combinations without interpreting protocol data.
     pub fn validate(&self) -> Result<(), OrsError> {
+        self.validate_identity_and_timestamps()?;
+        self.validate_claim_and_terminal_records()?;
+        self.validate_phase_record_combination()?;
+        self.validate_retention_and_compaction()?;
+        Ok(())
+    }
+
+    fn validate_identity_and_timestamps(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
@@ -4134,7 +4142,10 @@ impl MaintenanceTriggerLifecycleRecord {
                 reason: "expiry must be a finite timestamp no earlier than retention",
             });
         }
+        Ok(())
+    }
 
+    fn validate_claim_and_terminal_records(&self) -> Result<(), OrsError> {
         let claim_pair = self.claim.is_some() == self.claim_record.is_some();
         if !claim_pair {
             return Err(OrsError::InvalidField {
@@ -4191,7 +4202,10 @@ impl MaintenanceTriggerLifecycleRecord {
                 reason: "expiry and supersession require a terminal record, and other phases forbid it",
             });
         }
+        Ok(())
+    }
 
+    fn validate_phase_record_combination(&self) -> Result<(), OrsError> {
         let has_claim = self.claim.is_some();
         let has_decision = self.decision_record.is_some();
         let has_intent = self.downstream_intent_record.is_some();
@@ -4223,7 +4237,10 @@ impl MaintenanceTriggerLifecycleRecord {
                 reason: "lifecycle phase does not match its retained records",
             });
         }
+        Ok(())
+    }
 
+    fn validate_retention_and_compaction(&self) -> Result<(), OrsError> {
         if let Some(retention) = &self.downstream_retention {
             retention.validate()?;
             if retention.retained_until_ms < self.retained_at_ms
