@@ -16,8 +16,8 @@ use eliot_store_surreal::diagnostics::{
     emit_received, emit_validation_rejected, install_startup_subscriber, report_events,
 };
 use eliot_store_surreal::{
-    CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake,
-    dispatch_with_log, load_compatibility_for_config, load_config,
+    CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
+    admit_authenticated_handshake, dispatch_with_log, load_compatibility_for_config, load_config,
     load_evidence_snapshot_verification, observed_identity_verdict,
     require_semantic_ready_for_pipe, resolve_compatibility_verdict, store_bootstrap_descriptor,
     validate_request_frame_with_log,
@@ -474,29 +474,35 @@ async fn serve_handshake_loop(
             "claim_id": composition.blob_owner().claim_id(),
         }),
     );
-    let (mut session, server_hello) =
-        match admit_handshake(hello_frame, limits, config, &handshake_identity) {
-            Ok(admitted) => {
-                let mut events = BoundedEventLog::new();
-                emit_received(
-                    &mut events,
-                    BridgeBoundary::HandshakeAdmit,
-                    "handshake",
-                    &BridgeIdentity::new(),
-                );
-                report_events(&events);
-                admitted
-            }
-            Err(error) => {
-                report_stage_outcome(
-                    BridgeBoundary::HandshakeAdmit,
-                    "handshake",
-                    &BridgeIdentity::new(),
-                    false,
-                );
-                return Err(error);
-            }
-        };
+    let authenticated_peer = server.peer_identity().clone();
+    let (mut session, server_hello) = match admit_authenticated_handshake(
+        hello_frame,
+        limits,
+        config,
+        &handshake_identity,
+        &authenticated_peer,
+    ) {
+        Ok(admitted) => {
+            let mut events = BoundedEventLog::new();
+            emit_received(
+                &mut events,
+                BridgeBoundary::HandshakeAdmit,
+                "handshake",
+                &BridgeIdentity::new(),
+            );
+            report_events(&events);
+            admitted
+        }
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::HandshakeAdmit,
+                "handshake",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(error);
+        }
+    };
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes();
     let handshake_frame = control_frame(
