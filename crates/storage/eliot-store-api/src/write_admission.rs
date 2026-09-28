@@ -1803,7 +1803,14 @@ fn reason_code_for(refusal: &StoreError) -> ErrorCode {
         StoreError::RevisionConflict => ErrorCode::StaleRevision,
         StoreError::OrderingConflict
         | StoreError::IdentityConflict
-        | StoreError::TransitionDigestMismatch { .. } => ErrorCode::Conflict,
+        // A disposition naming stale, foreign, partial or changed evidence
+        // (issue #1684) is the same kind of refusal as a transition-digest
+        // mismatch: the request is well formed, the world moved under it, and
+        // nothing was changed. It carries the conflict code, never an internal
+        // one, so a caller can tell "re-read and decide again" apart from "the
+        // store is inconsistent".
+        | StoreError::TransitionDigestMismatch { .. }
+        | StoreError::StaleDisposition { .. } => ErrorCode::Conflict,
         StoreError::InvalidReceipt
         | StoreError::MissingReceiptEnvelope
         | StoreError::InvalidOutbox
