@@ -10,6 +10,7 @@
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,8 +22,12 @@ use eliot_contracts::{
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::UserAutomationOperation;
+use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    UserAutomationConfigurationState, UserAutomationInvocation, UserAutomationRevision,
+    AutomationWorkClass, ConfigPolicySnapshot, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationExecutionMode, UserAutomationInvocation,
+    UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
@@ -33,12 +38,14 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOper
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteSubmission,
-    WriteSubmissionState, admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
-    generated_operation_manifests, verify_canonical_request_hash,
+    PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission, WriteSubmissionState, admit_write_submission,
+    canonical_request_hash, dreamer_job_queue_key, generated_operation_manifests,
+    verify_canonical_request_hash,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PauseReleaseOutcome,
@@ -54,10 +61,11 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationRemovalResult,
-    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
-    read_retirement_wake_targets, retirement_wake_enumeration_request,
+    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
+    UserAutomationRemovalResult, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
+    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+    retirement_wake_enumeration_request,
 };
 use crate::user_automation_orchestration::{
     USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationRecord,
@@ -71,11 +79,11 @@ use crate::{
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
     UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationService, UserAutomationServiceRequest,
-    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
-    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
-    run_now_wake_read_request,
+    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationReadResult,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationService,
+    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStoreRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePhase, UserAutomationWakePort,
+    committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
@@ -599,6 +607,39 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
 }
 
 /// Canonical-store gateway bound to the active Kernel generation route.
+/// Governor-issued wire envelope of the `owner/policy` recovery record.
+///
+/// The Governor owns the record bytes; this struct only names the exact shape
+/// the Kernel decoder accepts, with the same deny-unknown-fields closure the
+/// Kernel applies to every typed boundary. It lives beside its single decoder
+/// so no second interpretation of the record can drift in elsewhere.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationPolicyOwnerSnapshotWire {
+    /// Fence under which the Governor issued the record.
+    pub state_fence: StateFence,
+    /// Durable outer revision of the record.
+    pub revision: u64,
+    /// Digest of the canonical snapshot bytes.
+    pub policy_digest: String,
+    /// Complete B-owned config snapshot.
+    pub snapshot: ConfigPolicySnapshot,
+}
+
+/// Refusal of one `RunNow` preflight assembly that preserves whether an owner
+/// was unreadable or simply has no Kernel-side evidence issuer.
+///
+/// The distinction is load-bearing for the transition phases: an unreadable
+/// owner may already have effected the disposition, so it reports unknown;
+/// absent evidence means nothing was sent, so it reports unavailable with the
+/// exact missing owner named.
+enum RunNowPreflightAssembly {
+    /// An owner could not be read; the execution disposition may be effected.
+    Unknown(String),
+    /// Named owner evidence has no issuer at this boundary; nothing was sent.
+    Unavailable(String),
+}
+
 impl KernelStoreGateway {
     /// Constructs the gateway from the Kernel-approved service and Store client.
     #[doc(hidden)]
@@ -2107,6 +2148,482 @@ impl KernelStoreGateway {
             .map_err(|error| error.to_string())
     }
 
+    /// Reads the exact retained Governor Policy owner record from Store.
+    ///
+    /// This route deliberately accepts no handshake digest as snapshot data:
+    /// the Store record key, owner schema, canonical bytes, owner revision,
+    /// policy digest, embedded fence, and embedded revision must all correlate.
+    /// It is the single decoder of the `owner/policy` owner record: the daemon
+    /// trigger path calls this method rather than decoding the record a second
+    /// time, so the typed snapshot has one producer.
+    pub async fn read_user_automation_policy_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<ConfigPolicySnapshot, UserAutomationRuntimeError> {
+        let recovery = self
+            .read_user_automation_preflight_owner_snapshot(state_fence)
+            .await?;
+        Self::user_automation_policy_snapshot_from_recovery(&recovery, state_fence)
+    }
+
+    /// Decodes the B-owned complete config snapshot from one validated owner
+    /// recovery snapshot.
+    pub fn user_automation_policy_snapshot_from_recovery(
+        recovery: &StoreRecoverySnapshot,
+        state_fence: &StateFence,
+    ) -> Result<ConfigPolicySnapshot, UserAutomationRuntimeError> {
+        let record = recovery
+            .owner_records
+            .iter()
+            .find(|record| record.namespace == "owner" && record.key == "policy")
+            .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
+        if recovery.state_fence != *state_fence
+            || record.state_fence != *state_fence
+            || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let owner: UserAutomationPolicyOwnerSnapshotWire = serde_json::from_slice(&record.payload)
+            .map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "canonical Policy owner snapshot schema is invalid".to_owned(),
+                )
+            })?;
+        let canonical_owner = canonical_json_bytes(&owner).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot encoding failed: {error}"
+            ))
+        })?;
+        let snapshot_bytes = canonical_json_bytes(&owner.snapshot).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy snapshot encoding failed: {error}"
+            ))
+        })?;
+        owner.snapshot.validate().map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot is invalid: {error}"
+            ))
+        })?;
+        if canonical_owner != record.payload
+            || owner.state_fence != *state_fence
+            || owner.revision != record.revision
+            || owner.revision == 0
+            || owner.snapshot.state_fence != *state_fence
+            || owner.snapshot.revision.value() != owner.revision
+            || owner.policy_digest != sha256_hex(&snapshot_bytes)
+            || owner.policy_digest.len() != 64
+            || !owner
+                .policy_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(owner.snapshot)
+    }
+
+    /// Reads the canonical owner and Durable Job inputs for one `UserAutomation`
+    /// preflight at a single Store State Fence. This remains a mechanical
+    /// Kernel join: payloads stay opaque, but Store record identity, schema,
+    /// canonical bytes, and any embedded fence must agree before the caller
+    /// can use the readback as preflight evidence.
+    async fn read_user_automation_preflight_owner_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<StoreRecoverySnapshot, UserAutomationRuntimeError> {
+        state_fence
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let records = ["config", "policy", "task", "skill", "module_registry"]
+            .into_iter()
+            .map(|key| {
+                RecoveryRecordKey::new("owner", key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_records = records.iter().cloned().collect::<BTreeSet<_>>();
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records,
+            include_receipts: false,
+            include_jobs: true,
+        };
+        let recovery = self
+            .recovery(request)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        recovery
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let observed_records = recovery
+            .owner_records
+            .iter()
+            .map(RecoveryRecord::record_key)
+            .collect::<BTreeSet<_>>();
+        if recovery.state_fence != *state_fence
+            || recovery.canonical_scope.state_fence != *state_fence
+            || recovery.owner_records.len() != expected_records.len()
+            || observed_records != expected_records
+            || !recovery.receipts.is_empty()
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        for record in &recovery.owner_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, true)?;
+        }
+        for record in &recovery.job_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, false)?;
+        }
+        Ok(recovery)
+    }
+
+    /// Validates one preflight recovery record as opaque canonical bytes.
+    ///
+    /// Owner records must additionally carry the Governor owner snapshot
+    /// schema; every record must be canonical JSON and every embedded fence
+    /// must equal the request fence. Payloads are never interpreted here: the
+    /// policy snapshot decoder above is the only typed consumer.
+    fn validate_user_automation_preflight_record(
+        record: &RecoveryRecord,
+        state_fence: &StateFence,
+        owner_record: bool,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        record
+            .validate()
+            .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+        if record.state_fence != *state_fence
+            || (owner_record && record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA)
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&record.payload).map_err(|_| {
+            UserAutomationRuntimeError::Rejected(
+                "canonical UserAutomation preflight owner payload is invalid JSON".to_owned(),
+            )
+        })?;
+        let canonical = canonical_json_bytes(&payload).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical UserAutomation preflight owner encoding failed: {error}"
+            ))
+        })?;
+        if canonical != record.payload {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Self::validate_embedded_user_automation_fences(&payload, state_fence)
+    }
+
+    /// Requires every embedded fence in one owner payload to equal the request
+    /// fence, recursing through arrays and objects.
+    fn validate_embedded_user_automation_fences(
+        value: &serde_json::Value,
+        expected: &StateFence,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(fence_value) = fields.get("state_fence") {
+                    let observed: StateFence = serde_json::from_value(fence_value.clone())
+                        .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                    if &observed != expected {
+                        return Err(UserAutomationRuntimeError::IdentityConflict);
+                    }
+                }
+                for value in fields.values() {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Assembles the complete preflight projection for one committed `RunNow`
+    /// occurrence from its owner members.
+    ///
+    /// Joins the canonical owner revision and live state, the B-owned policy
+    /// snapshot, the committed Store receipt envelope, the complete owner
+    /// execution view, and — when the owner reports `blocked_config` — the last
+    /// owner-issued failure. Live evidence the Governor owners attest in their
+    /// own records (exact Tool Definitions, delivery capability, agent provider
+    /// observation) has no Kernel-side decoder: the Kernel keeps those payloads
+    /// opaque, so their absence is reported as the named missing owner rather
+    /// than synthesized. A paused or retired revision defers without consulting
+    /// that evidence; an active revision stays unadmitted until an owner issues
+    /// it. No model, provider, scheduler, or notification call is reachable
+    /// from this join.
+    async fn assemble_run_now_preflight_projection(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<UserAutomationPreflightProjection, RunNowPreflightAssembly> {
+        let state_fence = &sealed.context.state_fence;
+        if invocation.automation_id != owner.automation_id
+            || invocation.automation_revision != owner.revision.revision
+        {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "committed UserAutomation occurrence does not bind to the current owner revision"
+                    .to_owned(),
+            ));
+        }
+        let config_snapshot = self
+            .read_user_automation_policy_snapshot(state_fence)
+            .await
+            .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        let source_receipt = self
+            .read_run_now_source_envelope(sealed, invocation)
+            .await?;
+        let execution = self
+            .read_user_automation_owner_execution_view(sealed, &owner.automation_id)
+            .await
+            .map_err(RunNowPreflightAssembly::Unknown)?;
+        if execution.history_query_ref != owner.revision.execution_history_query_ref {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "owner execution view does not bind to the current owner revision".to_owned(),
+            ));
+        }
+        let failure = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => Some(
+                self.read_run_now_owner_failure(sealed, owner)
+                    .await?
+                    .ok_or_else(|| {
+                        RunNowPreflightAssembly::Unavailable(
+                            "the current owner configuration state is blocked_config but the \
+                             owner retains no owner-issued failure projection, so no preflight \
+                             decision can be reported"
+                                .to_owned(),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        // Live evidence below the Kernel decoding boundary. The run-now path
+        // issues no provider call before preflight, so the only honest provider
+        // observation here is none; the exact Tool Definitions and the delivery
+        // capability live in Governor-owned records the Kernel keeps opaque, so
+        // they arrive unattested. Assembly refuses an active revision on exactly
+        // those grounds; paused, retired and owner-failed revisions decide
+        // without consulting them.
+        let evidence = UserAutomationPreflightEvidence {
+            observed_provider_fingerprint: None,
+            trusted_tool_definition_refs: Vec::new(),
+            delivery_available: false,
+            failure,
+        };
+        if owner.current_configuration_state == UserAutomationConfigurationState::Active {
+            Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
+        }
+        UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
+            revision: &owner.revision,
+            configuration_state: owner.current_configuration_state,
+            config_snapshot: &config_snapshot,
+            source_receipt: &source_receipt,
+            execution: &execution,
+            invocation,
+            request_metadata: &sealed.context,
+            evidence: &evidence,
+        })
+        .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))
+    }
+
+    /// Requires the complete live evidence set an active revision admits.
+    ///
+    /// Each refusal names the owner that must issue the missing member: the
+    /// exact Tool Definitions and the delivery capability live in
+    /// Governor-owned records the Kernel keeps opaque, the agent provider
+    /// observation needs a provider-route observer this boundary does not have,
+    /// and unresolved prior effects belong to I14.21 reconciliation. The
+    /// deterministic closed world is enforced from the revision itself: no
+    /// provider observation, a deterministic-only policy, a clean capability
+    /// profile, and a non-model work class.
+    fn require_run_now_active_evidence(
+        owner: &UserAutomationOwnerSnapshot,
+        execution: &eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
+        evidence: &UserAutomationPreflightEvidence,
+    ) -> Result<(), RunNowPreflightAssembly> {
+        let revision = &owner.revision;
+        if execution.requires_reconciliation() {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "the committed occurrence has unresolved prior effects: their I14.21 \
+                 disposition belongs to the reconciliation owner, so no new admission is \
+                 attempted and the occurrence stays unadmitted"
+                    .to_owned(),
+            ));
+        }
+        if evidence.trusted_tool_definition_refs.is_empty() {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no owner-issued Tool Definition attestation is readable at the Kernel \
+                 preflight boundary: the exact trusted Tool Definitions live in the \
+                 Governor-owned skill/module records, which the Kernel keeps opaque, so \
+                 the committed occurrence stays unadmitted for a later owner-issued \
+                 submission to admit"
+                    .to_owned(),
+            ));
+        }
+        if !evidence.delivery_available {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no delivery-capability observation is readable at the Kernel preflight \
+                 boundary: whether the declared delivery target is currently capable is \
+                 attested by the notification owner, so the committed occurrence stays \
+                 unadmitted"
+                    .to_owned(),
+            ));
+        }
+        if revision.mode == UserAutomationExecutionMode::DeterministicProcess {
+            if evidence.observed_provider_fingerprint.is_some()
+                || !matches!(
+                    revision.provider_policy,
+                    ProviderFingerprintPolicy::DeterministicOnly
+                )
+                || revision.task.capability_profile.model_access
+                || revision.task.capability_profile.provider_access
+                || revision.task.capability_profile.automation_scheduling
+                || revision.work_class == AutomationWorkClass::ModelJobs
+            {
+                return Err(RunNowPreflightAssembly::Unavailable(
+                    "the revision violates the deterministic closed world: deterministic \
+                     mode admits no provider observation, a deterministic-only policy, a \
+                     capability profile without model, provider or scheduling access, and \
+                     a non-model work class"
+                        .to_owned(),
+                ));
+            }
+        } else if !revision
+            .provider_policy
+            .admits(evidence.observed_provider_fingerprint.as_ref())
+        {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no provider-route observer issues an observed fingerprint at the Kernel \
+                 preflight boundary: the run-now path makes no provider call before \
+                 preflight, so an agent revision whose policy admits only an observed \
+                 compatible set stays unadmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the committed `RunNow` Store receipt envelope that sources one
+    /// occurrence.
+    ///
+    /// The invocation provenance must bind the sealed parent identity exactly;
+    /// the receipt must be committed under the request fence and carry its
+    /// reconciliation envelope. A receipt the owner cannot prove is an unknown
+    /// disposition, never a missing fact.
+    async fn read_run_now_source_envelope(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<eliot_receipts::ReceiptEnvelope, RunNowPreflightAssembly> {
+        let unknown = |reason: &str| RunNowPreflightAssembly::Unknown(reason.to_owned());
+        let provenance = invocation
+            .require_run_now_provenance(&sealed.context.state_fence)
+            .map_err(|error| unknown(&error.to_string()))?;
+        if provenance.operation_id != sealed.identity.operation_id
+            || provenance.idempotency_key != sealed.identity.idempotency_key
+            || provenance.canonical_request_hash != sealed.identity.canonical_request_hash
+        {
+            return Err(unknown(
+                "committed UserAutomation occurrence does not bind to the sealed parent identity",
+            ));
+        }
+        let receipt = self
+            .receipt(
+                &sealed.context.state_fence,
+                sealed.identity.operation_id.clone(),
+            )
+            .await
+            .map_err(RunNowPreflightAssembly::Unknown)?
+            .ok_or_else(|| unknown("canonical UserAutomation Store receipt is not retained"))?;
+        receipt
+            .validate()
+            .map_err(|error| unknown(&error.to_string()))?;
+        if receipt.operation_id != sealed.identity.operation_id
+            || receipt.idempotency_key != sealed.identity.idempotency_key
+            || receipt.canonical_request_hash != sealed.identity.canonical_request_hash
+            || receipt.state_fence != sealed.context.state_fence
+        {
+            return Err(unknown(
+                "canonical UserAutomation Store receipt does not bind to the sealed parent identity",
+            ));
+        }
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(unknown(
+                "canonical UserAutomation Store operation is not committed",
+            ));
+        }
+        receipt
+            .require_reconciliation_envelope()
+            .cloned()
+            .map_err(|error| unknown(&error.to_string()))
+    }
+
+    /// Reads the last owner-issued failure projection for one automation.
+    ///
+    /// The read reuses the sealed parent identity and issues no transition, so
+    /// it mints no canonical identity. A failure the owner cannot prove is an
+    /// unknown disposition; no failure content is synthesized.
+    async fn read_run_now_owner_failure(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+    ) -> Result<
+        Option<eliot_kernel_core::user_automation::UserAutomationFailureProjection>,
+        RunNowPreflightAssembly,
+    > {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let response = Box::pin(UserAutomationService::new(&store).dispatch(
+            UserAutomationServiceRequest {
+                context: sealed.context.clone(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                identity: sealed.identity.clone(),
+                intent: UserAutomationOperatorIntent {
+                    intent_id: format!(
+                        "{}:run-now-preflight-last-failure",
+                        sealed.identity.operation_id.as_str()
+                    ),
+                    principal_ref: sealed.authenticated_principal.clone(),
+                    state_fence: sealed.context.state_fence.clone(),
+                    operation: UserAutomationOperation::InspectLastFailure {
+                        automation_id: owner.automation_id.clone(),
+                    },
+                },
+            },
+        ))
+        .await
+        .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        match response.outcome {
+            UserAutomationStoreOutcome::Read {
+                result:
+                    UserAutomationReadResult::InspectLastFailure {
+                        automation_id,
+                        revision,
+                        failure,
+                    },
+            } => {
+                if revision.revision != owner.revision.revision
+                    || revision.automation_id != owner.automation_id
+                    || automation_id != owner.automation_id
+                {
+                    return Err(RunNowPreflightAssembly::Unknown(
+                        "owner failure read does not bind to the current owner revision".to_owned(),
+                    ));
+                }
+                Ok(failure)
+            }
+            _ => Err(RunNowPreflightAssembly::Unknown(
+                "owner failure read did not return a failure projection".to_owned(),
+            )),
+        }
+    }
+
     /// Seals the canonical request hash over the exact prepared transition.
     async fn seal_user_automation_operation<C: CanonicalStoreClient>(
         &self,
@@ -3480,62 +3997,21 @@ impl KernelStoreGateway {
         let occurrence_id = invocation
             .occurrence_identity()
             .map_err(|error| error.to_string())?;
-        // Exact committed/replayed invocation readback. The persisted document
-        // is compared with the answer of this very identity, so a replayed Store
-        // mutation resumes the same occurrence and can never mint a second
-        // manual nonce or a second occurrence.
-        let persisted = self
-            .read_user_automation_invocation(
-                &sealed.context.state_fence,
+        let (owner, invocation) = self
+            .read_run_now_owner(
+                sealed,
+                invocation,
                 automation_id,
+                automation_revision,
                 &occurrence_id,
             )
             .await?;
-        if persisted != *invocation {
-            return Err(
-                "committed UserAutomation occurrence does not match the canonical invocation readback"
-                    .to_owned(),
-            );
-        }
-        let owner = self
-            .read_user_automation_owner(&UserAutomationOwnerLookup {
-                automation_id: automation_id.to_owned(),
-                requested_revision: automation_revision.to_owned(),
-                authenticated_principal: sealed.authenticated_principal.clone(),
-                state_fence: sealed.context.state_fence.clone(),
-            })
-            .await?;
-        if owner.automation_id != automation_id
-            || owner.revision.revision != automation_revision
-            || owner.revision.owner_principal != sealed.authenticated_principal
-        {
-            return Err(
-                "committed UserAutomation occurrence does not bind to the current owner revision"
-                    .to_owned(),
-            );
-        }
-        // The current configuration state is the owner's admission fact. A
-        // paused, retired or blocked owner admits no occurrence, so no wake or
-        // Durable Job owner is asked. The committed configuration phase stays
-        // visible: an unadmitted occurrence is reported as such, never as a
-        // failed commit.
-        if owner.current_configuration_state != UserAutomationConfigurationState::Active {
-            return Ok((
-                UserAutomationWakePhase::NotApplicable {
-                    reason: unadmitted_wake_reason(
-                        automation_id,
-                        automation_revision,
-                        owner.current_configuration_state,
-                    ),
-                },
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unadmitted_execution_reason(
-                        &occurrence_id,
-                        owner.current_configuration_state,
-                    ),
-                },
-            ));
-        }
+        // The current configuration state is the owner's admission fact. It is
+        // joined into the preflight projection below rather than short-circuit
+        // here, so a paused or retired owner reports its deterministic deferral
+        // and an active owner reports its exact missing evidence; the committed
+        // configuration phase stays visible either way, never as a failed
+        // commit.
         let Some(runtime) = runtime else {
             return Ok((
                 UserAutomationWakePhase::Unavailable {
@@ -3558,10 +4034,166 @@ impl KernelStoreGateway {
                 reason: error.to_string(),
             },
         };
-        let execution = UserAutomationExecutionPhase::Unavailable {
-            reason: unproven_durable_job_material_reason(&occurrence_id, automation_revision),
+        // The committed occurrence joins the existing Durable Job execution
+        // path through deterministic preflight: the complete projection is
+        // assembled from the live owners, the service runs the model-free
+        // preflight, and an admitted occurrence reaches the Durable Job owner
+        // over the composed runtime channel. Without a proven pending wake
+        // there is no occurrence to join, so the execution stays unavailable
+        // beside the unresolved wake instead of inventing an admission.
+        let UserAutomationWakePhase::Published { readback } = &wake else {
+            return Ok((
+                wake,
+                UserAutomationExecutionPhase::Unavailable {
+                    reason: unproven_run_now_wake_reason(&occurrence_id),
+                },
+            ));
         };
-        Ok((wake, execution))
+        let wake_intent = readback.intent.clone();
+        let projection = match self
+            .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
+            .await
+        {
+            Ok(projection) => projection,
+            Err(RunNowPreflightAssembly::Unknown(reason)) => return Err(reason),
+            Err(RunNowPreflightAssembly::Unavailable(reason)) => {
+                return Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }));
+            }
+        };
+        // The blocked fingerprint is retained before the execution join moves
+        // the projection: a blocked decision the notification owner cannot be
+        // reached for must still name its deterministic failure class instead
+        // of collapsing into an unattributed error.
+        let blocked_fingerprint = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => projection
+                .failure
+                .as_ref()
+                .map(|failure| failure.failure_fingerprint.clone()),
+            _ => None,
+        };
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let outcome = UserAutomationService::new(&store)
+            .execute_occurrence(
+                UserAutomationExecutionRequest {
+                    context: sealed.context.clone(),
+                    authenticated_principal: sealed.authenticated_principal.clone(),
+                    identity: sealed.identity.clone(),
+                    invocation: invocation.clone(),
+                    projection,
+                    wake_intent,
+                },
+                runtime,
+            )
+            .await;
+        Self::project_run_now_execution_outcome(
+            wake,
+            outcome,
+            owner.current_configuration_state,
+            blocked_fingerprint,
+            &occurrence_id,
+        )
+    }
+
+    /// Re-proves one committed `RunNow` occurrence against the live owner.
+    ///
+    /// The exact committed/replayed invocation readback is compared with the
+    /// answer of this very identity, so a replayed Store mutation resumes the
+    /// same occurrence and can never mint a second manual nonce or a second
+    /// occurrence; the current owner revision must then bind the same
+    /// automation, revision, and authenticated principal.
+    async fn read_run_now_owner(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        committed: &UserAutomationInvocation,
+        automation_id: &str,
+        automation_revision: &str,
+        occurrence_id: &str,
+    ) -> Result<(UserAutomationOwnerSnapshot, UserAutomationInvocation), String> {
+        let persisted = self
+            .read_user_automation_invocation(
+                &sealed.context.state_fence,
+                automation_id,
+                occurrence_id,
+            )
+            .await?;
+        if persisted != *committed {
+            return Err(
+                "committed UserAutomation occurrence does not match the canonical invocation readback"
+                    .to_owned(),
+            );
+        }
+        let owner = self
+            .read_user_automation_owner(&UserAutomationOwnerLookup {
+                automation_id: automation_id.to_owned(),
+                requested_revision: automation_revision.to_owned(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                state_fence: sealed.context.state_fence.clone(),
+            })
+            .await?;
+        if owner.automation_id != automation_id
+            || owner.revision.revision != automation_revision
+            || owner.revision.owner_principal != sealed.authenticated_principal
+        {
+            return Err(
+                "committed UserAutomation occurrence does not bind to the current owner revision"
+                    .to_owned(),
+            );
+        }
+        Ok((owner, persisted))
+    }
+
+    /// Projects one `RunNow` execution join into its transition phases.
+    ///
+    /// An admitted occurrence reaches the Durable Job owner; a deferred one
+    /// carries its owner reason; a blocked one carries its deterministic
+    /// failure fingerprint. An unreachable runtime owner leaves the occurrence
+    /// unadmitted beside its named reason, except for a blocked decision the
+    /// notification owner cannot be reached for, which stays unknown under its
+    /// failure fingerprint instead of collapsing into an unattributed error.
+    /// Any other join failure is an unknown disposition: an owner may already
+    /// have effected it.
+    fn project_run_now_execution_outcome(
+        wake: UserAutomationWakePhase,
+        outcome: Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>,
+        configuration_state: UserAutomationConfigurationState,
+        blocked_fingerprint: Option<String>,
+        occurrence_id: &str,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
+        match outcome {
+            Ok(UserAutomationExecutionOutcome::Admitted { execution, .. }) => Ok((
+                wake,
+                UserAutomationExecutionPhase::Admitted {
+                    execution: Box::new(execution),
+                },
+            )),
+            Ok(UserAutomationExecutionOutcome::Deferred { reason, .. }) => {
+                Ok((wake, UserAutomationExecutionPhase::Deferred { reason }))
+            }
+            Ok(UserAutomationExecutionOutcome::BlockedConfig { failure, .. }) => Ok((
+                wake,
+                UserAutomationExecutionPhase::BlockedConfig {
+                    failure_fingerprint: failure.failure_fingerprint,
+                },
+            )),
+            Err(UserAutomationExecutionError::Runtime(
+                UserAutomationRuntimeError::Unavailable(reason),
+            )) => {
+                if configuration_state == UserAutomationConfigurationState::BlockedConfig
+                    && let Some(fingerprint) = blocked_fingerprint
+                {
+                    return Err(format!(
+                        "occurrence {occurrence_id} is blocked_config under failure \
+                         fingerprint {fingerprint}, decided before any model call, but the \
+                         failure-history and notification owners are not reachable from the \
+                         operator route: {reason}"
+                    ));
+                }
+                Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }))
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
@@ -5246,31 +5878,6 @@ fn unproven_wake_channel_reason() -> String {
         .to_owned()
 }
 
-/// Wake phase reason for a committed occurrence the current owner does not admit.
-fn unadmitted_wake_reason(
-    automation_id: &str,
-    automation_revision: &str,
-    state: UserAutomationConfigurationState,
-) -> String {
-    format!(
-        "the current owner configuration state of {automation_id}/{automation_revision} is {state:?}, \
-         which admits no wake, so the committed occurrence was not handed to the wake owner"
-    )
-}
-
-/// Execution phase reason for a committed occurrence the current owner does not
-/// admit.
-fn unadmitted_execution_reason(
-    occurrence_id: &str,
-    state: UserAutomationConfigurationState,
-) -> String {
-    format!(
-        "the current owner configuration state for occurrence {occurrence_id} is {state:?}, which \
-         admits no execution, so the Durable Job owner was never asked and the occurrence stays \
-         unadmitted"
-    )
-}
-
 /// Execution phase reason used when no authenticated runtime channel was composed.
 fn unproven_execution_channel_reason() -> String {
     "no authenticated UserAutomation runtime channel was composed for this transition, so the \
@@ -5278,22 +5885,16 @@ fn unproven_execution_channel_reason() -> String {
         .to_owned()
 }
 
-/// Execution phase reason for a committed occurrence with no owner-issued
-/// Durable Job submission material.
+/// Execution phase reason for a committed occurrence whose wake handoff did
+/// not prove a pending wake.
 ///
-/// The existing Durable Job owner admits a complete submission. That submission
-/// carries the qualified artifact content reference and the job admission
-/// receipt; neither is derivable from the canonical Store receipt, and deriving
-/// either would fabricate content evidence and authority. The Durable Job owner
-/// is therefore never asked, so the phase is `Unavailable` rather than a lost
-/// answer: nothing was sent, no job was minted, and the occurrence stays
-/// unadmitted for a later owner-issued submission to admit.
-fn unproven_durable_job_material_reason(occurrence_id: &str, automation_revision: &str) -> String {
+/// The preflight execution join needs the retained pending wake as its
+/// occurrence binding. An unreadable or absent wake proves nothing to join, so
+/// no admission is invented and the Durable Job owner is never asked.
+fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
     format!(
-        "occurrence {occurrence_id} of revision {automation_revision} is committed and its wake is \
-         owner-read, but the Durable Job owner was never asked: no owner-issued submission material \
-         exists for it, because the qualified artifact content reference and the job admission \
-         receipt are issued by that owner and are not derivable from the canonical Store commit"
+        "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
+         so no occurrence joins the Durable Job owner and the occurrence stays unadmitted"
     )
 }
 
