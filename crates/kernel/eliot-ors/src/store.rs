@@ -21783,44 +21783,32 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
 
     fn stage_admission_reservation(
         &self,
-        reservation: AdmissionReservation,
+        _reservation: AdmissionReservation,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            reservation.0,
-            false,
-            &[],
-            OperationalPhase::Staged,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_stage",
+            reason: "legacy generic admission reservation staging is retired; use typed Kernel reservation staging",
+        })
     }
 
     fn activate_admission_reservation(
         &self,
-        activation: AdmissionReservationActivation,
+        _activation: AdmissionReservationActivation,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            activation.0,
-            true,
-            &[OperationalPhase::Staged],
-            OperationalPhase::Active,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_activation",
+            reason: "legacy generic admission reservation activation is retired; typed activation awaits the canonical owner contract",
+        })
     }
 
     fn release_admission_reservation(
         &self,
-        release: AdmissionReservationRelease,
+        _release: AdmissionReservationRelease,
     ) -> Result<AdmissionReservationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::AdmissionReservation,
-            release.0,
-            true,
-            &[OperationalPhase::Staged, OperationalPhase::Active],
-            OperationalPhase::Released,
-        )
-        .map(AdmissionReservationReceipt::from_receipt)
+        Err(OrsError::InvalidField {
+            field: "admission_reservation.legacy_release",
+            reason: "legacy generic admission reservation release is retired; use typed receipt-backed reservation release",
+        })
     }
 
     fn stage_kernel_admission_reservation(
@@ -21859,7 +21847,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 return Err(OrsError::DuplicateConflict);
             };
             existing_record.validate()?;
-            if existing_record != &record {
+            // A replay names the original immutable stage request, while the
+            // persisted reservation may have advanced through later
+            // receipt-backed transitions. Compare only the stage inputs so an
+            // exact replay returns that current snapshot without overwriting
+            // its lifecycle state.
+            let same_stage_request = existing_record.reservation_id == record.reservation_id
+                && existing_record.work_item_id == record.work_item_id
+                && existing_record.proposed_attempt_id == record.proposed_attempt_id
+                && existing_record.stage_operation_id == record.stage_operation_id
+                && existing_record.claims == record.claims
+                && existing_record.authority_epoch == record.authority_epoch
+                && existing_record.state_fence == record.state_fence
+                && existing_record.expires_at_ms == record.expires_at_ms
+                && existing_record.created_at_ms == record.created_at_ms;
+            if !same_stage_request {
                 return Err(OrsError::DuplicateConflict);
             }
             let snapshot = Self::admission_reservation_snapshot(&existing)?;
