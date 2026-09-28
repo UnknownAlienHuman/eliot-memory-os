@@ -25,8 +25,8 @@ use eliot_kernel_core::UserAutomationOperation;
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
     AutomationWorkClass, ConfigPolicySnapshot, ProviderFingerprintPolicy,
-    UserAutomationConfigurationState, UserAutomationExecutionMode, UserAutomationInvocation,
-    UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
+    UserAutomationInvocation, UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
@@ -3986,6 +3986,17 @@ impl KernelStoreGateway {
         }
     }
 
+    fn run_now_defer_reason(
+        state: UserAutomationConfigurationState,
+    ) -> Option<UserAutomationDeferReason> {
+        match state {
+            UserAutomationConfigurationState::Paused => Some(UserAutomationDeferReason::Paused),
+            UserAutomationConfigurationState::Retired => Some(UserAutomationDeferReason::Retired),
+            UserAutomationConfigurationState::Active
+            | UserAutomationConfigurationState::BlockedConfig => None,
+        }
+    }
+
     /// Completes the `RunNow` handoff: exact committed/replayed invocation
     /// readback, current owner projection, and the owner readback of the wake
     /// for that exact occurrence over the authenticated runtime channel.
@@ -4017,19 +4028,24 @@ impl KernelStoreGateway {
                 &occurrence_id,
             )
             .await?;
-        // The current configuration state is the owner's admission fact. It is
-        // joined into the preflight projection below rather than short-circuit
-        // here, so a paused or retired owner reports its deterministic deferral
-        // and an active owner reports its exact missing evidence; the committed
-        // configuration phase stays visible either way, never as a failed
-        // commit.
+        // The canonical owner can decide paused and retired admissions without
+        // a Host wake or provider observation. Report that real disposition
+        // even when no runtime channel is composed, and leave an admitted job
+        // and its history untouched.
+        let defer_reason = Self::run_now_defer_reason(owner.current_configuration_state);
+        // An active or blocked revision still needs the remaining owner
+        // preflight evidence. The committed configuration phase stays visible
+        // beside that disposition, never as a failed commit.
         let Some(runtime) = runtime else {
             return Ok((
                 UserAutomationWakePhase::Unavailable {
                     reason: unproven_wake_channel_reason(),
                 },
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unproven_execution_channel_reason(),
+                match defer_reason {
+                    Some(reason) => UserAutomationExecutionPhase::Deferred { reason },
+                    None => UserAutomationExecutionPhase::Unavailable {
+                        reason: unproven_execution_channel_reason(),
+                    },
                 },
             ));
         };
@@ -4045,6 +4061,9 @@ impl KernelStoreGateway {
                 reason: error.to_string(),
             },
         };
+        if let Some(reason) = defer_reason {
+            return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
+        }
         // The committed occurrence joins the existing Durable Job execution
         // path through deterministic preflight: the complete projection is
         // assembled from the live owners, the service runs the model-free
