@@ -618,6 +618,7 @@ pub fn exclusion_reason_class(reason: &ExclusionReason) -> String {
         ExclusionReason::Rejected => "REJECTED".to_owned(),
         ExclusionReason::EpistemicallyUnknown => "EPISTEMICALLY_UNKNOWN".to_owned(),
         ExclusionReason::Protected => "PROTECTED".to_owned(),
+        ExclusionReason::InfluenceIneligible => "INFLUENCE_INELIGIBLE".to_owned(),
         ExclusionReason::NegativeMemory => "NEGATIVE_MEMORY".to_owned(),
         ExclusionReason::PreconditionFailed { id } => format!("PRECONDITION_FAILED:{id}"),
         ExclusionReason::PreconditionUnassessed { id } => {
