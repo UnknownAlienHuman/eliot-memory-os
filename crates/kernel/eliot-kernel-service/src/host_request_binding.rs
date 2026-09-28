@@ -554,6 +554,10 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
                 &envelope.envelope_sha256,
                 &digest,
                 &body,
+                // Issue #1853 W2: this leg dispatches in-process and submits
+                // no executor evidence and no result lineage, so it retains
+                // neither. Absence means nothing was observed or claimed here.
+                None,
                 None,
             )
             .map_err(|error| ors_failure(&error))?
@@ -998,6 +1002,7 @@ fn requested_host_request_record(
         result_digest: None,
         result_response: None,
         result_evidence: None,
+        result_lineage: None,
         commit_order: 0,
     })
 }
@@ -1634,6 +1639,7 @@ mod local_read_result_tests {
             result_digest: None,
             result_response: None,
             result_evidence: None,
+            result_lineage: None,
             commit_order: 0,
         };
         assert!(

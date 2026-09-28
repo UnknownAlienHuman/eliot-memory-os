@@ -19,7 +19,9 @@ use eliot_runtime_contracts::{
     SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
-use eliot_security_contracts::{InstructionTaint, PrivacyClass};
+use eliot_security_contracts::{
+    InfluenceState, InstructionTaint, PolicyFence, PrivacyClass, TransformationLineage,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
@@ -5735,6 +5737,217 @@ impl HostRequestEffectEvidence {
     }
 }
 
+/// Default for a retained result lineage that omits its influence state.
+///
+/// Fail-closed, exactly as on the wire contract: a lineage that does not name
+/// its influence is `Unknown`, never `Active`.
+const fn unknown_retained_influence() -> InfluenceState {
+    InfluenceState::Unknown
+}
+
+/// ORS-retained source revision head observed for one local read.
+///
+/// Mirrors the wire contract's source-revision shape field for field. It exists
+/// only because `eliot-ors` deliberately holds no edge to the wire crate, so it
+/// changes no field's type or meaning: `revision` is the same non-zero observed
+/// revision, `state_fence` is the same [`eliot_contracts::StateFence`], and
+/// `key` is the same opaque source revision key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestRetainedSourceRevision {
+    /// Exact opaque source revision key.
+    pub key: String,
+    /// Nonzero revision observed for `key`.
+    pub revision: u64,
+    /// Fence attached to this particular revision head.
+    pub state_fence: StateFence,
+}
+
+/// ORS-retained result lineage for one completed host request (issue #1853 W2).
+///
+/// This is the durable retention envelope for the result-side lineage the
+/// read owner submitted with the result. It carries claims and references
+/// only, with the wire contract's own meaning unchanged: it does not
+/// authenticate an origin, establish semantic truth, or promote a model
+/// result, and ORS never interprets any field. Every optional field keeps the
+/// wire meaning of `None` — **unknown or unavailable, never clean** — which is
+/// why `influence_state` defaults to [`InfluenceState::Unknown`] instead of an
+/// active or cleared state.
+///
+/// Retaining it beside the result is what lets a replayer read the result's
+/// provenance back off the row instead of losing it at the authority boundary.
+/// See [`Self::validate`] for the binding that makes the retained lineage
+/// attributable to one operation rather than merely present.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestRetainedLineage {
+    /// Optional immutable artifact handle for the exact output bytes.
+    pub output_artifact_ref: Option<String>,
+    /// SHA-256 of the exact parent response bytes. Bound to this row's own
+    /// `result_digest` by [`Self::validate`].
+    pub output_digest: String,
+    /// Authenticated producer principal/service reference, when available.
+    pub producer_ref: Option<String>,
+    /// Exact source revision heads. `None` means source revision coverage is
+    /// unknown; each known head retains its own fence.
+    pub source_revisions: Option<Vec<HostRequestRetainedSourceRevision>>,
+    /// Fence bound to the named read itself, distinct from per-head fences.
+    pub source_state_fence: Option<StateFence>,
+    /// Exact source or intermediate input references, when available.
+    pub input_refs: Option<Vec<String>>,
+    /// Existing typed transformation/taint lineage, in source-to-output order.
+    pub transformation_lineage: Option<Vec<TransformationLineage>>,
+    /// Inherited disclosure/taint closure references, when available.
+    pub closure_refs: Option<Vec<String>>,
+    /// Applicable policy snapshot and its exact fence, when available.
+    pub policy_fence: Option<PolicyFence>,
+    /// References to origin-authentication evidence; presence is not itself
+    /// authentication because the referenced evidence must be verified by its
+    /// owner.
+    pub origin_evidence_refs: Option<Vec<String>>,
+    /// Maximum receipt interpretation, not a semantic truth/admission status.
+    pub proof_ceiling: Option<ProofCeiling>,
+    /// Influence is fail-closed when omitted.
+    #[serde(default = "unknown_retained_influence")]
+    pub influence_state: InfluenceState,
+    /// Instruction/data taint. `None` means unknown, not cleared.
+    pub instruction_taint: Option<InstructionTaint>,
+}
+
+impl HostRequestRetainedLineage {
+    /// Binds this retained lineage to the one result it describes.
+    ///
+    /// `result_digest` is read back from the durable row. The comparison below
+    /// uses the ORIGINALLY RECORDED `output_digest` and nothing is re-derived
+    /// here, so a reader cannot pass this check with a fresh checksum taken
+    /// over whatever it happens to be holding.
+    ///
+    /// Scope of the binding, stated exactly: `output_digest` is the only
+    /// lineage field with a counterpart recorded on
+    /// [`HostRequestRecord`]. Every other retained field describes content the
+    /// row does not record — a source revision head, a policy snapshot, a
+    /// transformation — so binding it would require either inventing a value on
+    /// the row or re-deriving one. Both are forbidden, so neither is done; those
+    /// fields are retained and bounded, and their meaning stays owned by
+    /// [`eliot_security_contracts::TransformationLineage::validate`] and the
+    /// wire contract's own lineage validation at the submission boundary.
+    pub(crate) fn validate(&self, result_digest: &str) -> Result<(), OrsError> {
+        validate_digest(
+            &self.output_digest,
+            "host_request_retained_lineage_output_digest",
+        )?;
+        if self.output_digest != result_digest {
+            return Err(OrsError::InvalidField {
+                field: "host_request_retained_lineage_output_digest",
+                reason: "retained lineage does not bind the retained result digest",
+            });
+        }
+        for (reference, field) in [
+            (
+                &self.output_artifact_ref,
+                "host_request_retained_lineage_output_artifact_ref",
+            ),
+            (
+                &self.producer_ref,
+                "host_request_retained_lineage_producer_ref",
+            ),
+        ] {
+            if let Some(reference) = reference {
+                validate_text(reference, field)?;
+            }
+        }
+        for (references, field) in [
+            (&self.input_refs, "host_request_retained_lineage_input_refs"),
+            (
+                &self.closure_refs,
+                "host_request_retained_lineage_closure_refs",
+            ),
+            (
+                &self.origin_evidence_refs,
+                "host_request_retained_lineage_origin_evidence_refs",
+            ),
+        ] {
+            if let Some(references) = references {
+                validate_unique_texts(references, field)?;
+            }
+        }
+        if let Some(fence) = &self.source_state_fence {
+            fence.validate().map_err(|_| OrsError::InvalidField {
+                field: "host_request_retained_lineage_source_state_fence",
+                reason: "retained source fence is not a valid state fence",
+            })?;
+        }
+        if let Some(revisions) = &self.source_revisions {
+            let mut keys = BTreeSet::new();
+            for revision in revisions {
+                validate_text(
+                    &revision.key,
+                    "host_request_retained_lineage_source_revision_key",
+                )?;
+                if !keys.insert(&revision.key) {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_retained_lineage_source_revision_keys",
+                        reason: "retained source revision keys must be unique",
+                    });
+                }
+                if revision.revision == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_retained_lineage_source_revision",
+                        reason: "retained source revision must be non-zero",
+                    });
+                }
+                revision
+                    .state_fence
+                    .validate()
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "host_request_retained_lineage_source_revision_state_fence",
+                        reason: "retained source revision fence is not a valid state fence",
+                    })?;
+            }
+        }
+        if let Some(policy_fence) = &self.policy_fence {
+            validate_text(
+                &policy_fence.policy_snapshot_id,
+                "host_request_retained_lineage_policy_snapshot_id",
+            )?;
+            policy_fence
+                .state_fence
+                .validate()
+                .map_err(|_| OrsError::InvalidField {
+                    field: "host_request_retained_lineage_policy_state_fence",
+                    reason: "retained policy fence is not a valid state fence",
+                })?;
+        }
+        if let Some(transformations) = &self.transformation_lineage {
+            for transformation in transformations {
+                transformation
+                    .validate()
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "host_request_retained_lineage_transformation",
+                        reason: "retained transformation lineage did not validate",
+                    })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates a retained bounded reference list: non-blank, control-free,
+/// length-bounded, and free of duplicates.
+fn validate_unique_texts(values: &[String], field: &'static str) -> Result<(), OrsError> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        validate_text(value, field)?;
+        if !seen.insert(value) {
+            return Err(OrsError::InvalidField {
+                field,
+                reason: "retained references must not contain duplicates",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Durable P-04 host-request operation record.
 ///
 /// Every identity is opaque to ORS: Session, task, scope, capability, fence,
@@ -5821,6 +6034,22 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_evidence: Option<HostRequestEffectEvidence>,
+    /// Result-side lineage retained with the completion (issue #1853 W2).
+    ///
+    /// The claims and references the read owner submitted alongside the result,
+    /// written in the same owner transaction as
+    /// [`Self::result_digest`] and [`Self::result_response`] so provenance can
+    /// never be separated from the result it describes. Once written it is
+    /// never cleared or replaced, exactly like [`Self::result_evidence`].
+    ///
+    /// `None` for rows that carry no completion, and for stored rows written
+    /// before this field existed. Absence means the lineage is unknown or
+    /// unavailable, never clean: ORS records no lineage of its own and never
+    /// infers one, so an absent field grants no provenance and no influence.
+    /// Every present field is re-bound to this row by [`Self::validate`].
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_lineage: Option<HostRequestRetainedLineage>,
     /// Monotonic ORS order assigned atomically when the operation first
     /// reaches a terminal state. Zero while non-terminal.
     #[serde(default)]
@@ -5952,6 +6181,20 @@ impl HostRequestRecord {
                     reason: "retained evidence must observe a retained result",
                 })?;
             evidence.validate(&self.operation_id, &self.request_digest, result_digest)?;
+        }
+        // Issue #1853 W2: retained lineage describes the result, so it is bound
+        // to the same retained result. Same discipline as the effect evidence
+        // above: the originally recorded `output_digest` is compared with this
+        // row's own recorded `result_digest`, and nothing is re-derived.
+        if let Some(lineage) = &self.result_lineage {
+            let result_digest = self
+                .result_digest
+                .as_deref()
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_result_lineage",
+                    reason: "retained lineage must describe a retained result",
+                })?;
+            lineage.validate(result_digest)?;
         }
         if !self.state.is_terminal() && self.commit_order != 0 {
             return Err(OrsError::InvalidField {

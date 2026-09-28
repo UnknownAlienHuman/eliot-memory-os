@@ -1659,6 +1659,10 @@ impl KernelStoreGateway {
             &obligation.request_digest,
             &result_digest,
             &result_response,
+            // Issue #1853 W2: a retained owner answer is not an executor
+            // observation and carries no result lineage, so neither is
+            // retained. Absence means nothing was observed or claimed here.
+            None,
             None,
         )
         .map_err(|error| {
@@ -2036,6 +2040,7 @@ impl KernelStoreGateway {
             result_digest: None,
             result_response: None,
             result_evidence: None,
+            result_lineage: None,
             commit_order: 0,
         })
     }
