@@ -3596,23 +3596,33 @@ impl RedbRecoveryStore {
 
     /// Reconciles quarantined per-entry outcomes into one import receipt.
     ///
-    /// Pure receipt binding over already-triaged outcomes; emits no store
-    /// writes. A new empty target never means old effects are resolved:
-    /// `unresolved_count` is counted from the outcomes, and
-    /// `known_zero_unresolved` must attest complete current-owner validation
-    /// before zero is trusted.
+    /// Emits no store writes, but it is NOT a pure receipt binding any more: it
+    /// reads the store's own live recovery rows through `&self.database` to
+    /// establish what the CURRENT owner of ORS recovery effects still holds
+    /// unresolved for the members being imported, and it records that answer on
+    /// the receipt together with the typed verdict of the known-zero gate.
+    ///
+    /// A new empty target never means old effects are resolved: `unresolved_count`
+    /// is counted from the outcomes, and a zero is trusted only when
+    /// `current_owner_validation` covers this receipt's members completely, is
+    /// bound to this snapshot, was read from the live recovery families, and
+    /// reports no still-unresolved identity.
     pub fn reconcile_backup_import(
+        &self,
         import: &crate::backup_snapshot::OrsBackupImportRequest,
         per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
         import_at_ms: i64,
     ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
-        backup_snapshot::reconcile_import_receipt(import, per_entry, import_at_ms)
+        backup_snapshot::reconcile_import_receipt(&self.database, import, per_entry, import_at_ms)
     }
 
     /// Replays a lost import response without any duplicate effect.
     ///
     /// Idempotent clone of the prior receipt: no store read, no store write,
     /// no re-triage, so a retried response can never double-apply outcomes.
+    /// The known-zero gate is re-evaluated from the validation recorded on the
+    /// receipt rather than from the verdict recorded beside it, so a stale or
+    /// disagreeing verdict is corrected on replay instead of carried forward.
     /// Unknown import outcomes stay quarantined for the existing canonical
     /// reconciliation owner; never blindly retried here.
     pub fn reconcile_lost_backup_import_response(

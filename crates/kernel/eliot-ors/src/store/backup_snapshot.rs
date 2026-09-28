@@ -238,7 +238,26 @@
 //! token re-derived from page content. The lineage, canonical cursor and
 //! pending-operation-hash fields I05-13 describes are cross-store material this
 //! crate does not hold, and are NOT approximated by a lookalike struct.
+//!
+//! Issue #953 A17 gives the import receipt a real current owner. A quarantined
+//! entry comes back `Unresolved` because nothing durable was written, so a
+//! brand-new empty destination produces a `unresolved_count` of zero while
+//! holding no evidence whatsoever about the effects those members describe —
+//! "no row to collide with" is not "no effect pending". `reconcile_import_receipt`
+//! therefore no longer builds a receipt out of the import vector alone: it
+//! opens the store's OWN live recovery rows in one read transaction —
+//! `RECOVERY_INBOX` and `RECOVERY_PROBLEMS`, the two tables this crate already
+//! owns and writes — asks the current owner about every member of the receipt,
+//! and records the answer as a `CurrentOwnerValidation` beside the typed verdict
+//! of `OrsBackupImportReceipt::known_zero_unresolved`. That gate then refuses
+//! unless the validation is bound to this snapshot, covers exactly this
+//! receipt's members, read both live recovery families, and reports no
+//! still-unresolved identity. The completeness comparison is deliberately NOT
+//! derived from the untrusted import vector's own length: a validation whose
+//! asked-about roster is built from the vector it is meant to police can never
+//! disagree with it, and its gate could then never fire.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -246,20 +265,22 @@ use std::sync::Arc;
 use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableHandle};
 
 use super::persistence_codec::{decode, decode_named, encode};
-use super::persistence_models::DurableOperationalRecord;
+use super::persistence_models::{DurableInboxRecord, DurableOperationalRecord};
 use super::storage;
 use crate::backup_snapshot::{
-    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
-    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt,
-    OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot,
-    OrsFamilyContinuation, OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity,
-    OrsOperationalContinuation, OrsOperationalCursor, OrsOperationalSnapshotIdentity,
-    PerEntryOutcome, RowDisposition, RowFamilyDisposition, RowFamilyKind, RowPayloadState,
-    StoredEffectClass, check_canonical_frozen, validate_import_binding,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason,
+    CurrentOwnerValidation, KnownZeroVerdict, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES,
+    MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest,
+    OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor,
+    OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
+    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
+    RowFamilyKind, RowPayloadState, StoredEffectClass, check_canonical_frozen,
+    validate_import_binding,
 };
 use crate::{
     ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryWriteOutcome, StreamRecoveryActivation, VersionedArtifactEntry,
+    ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
+    VersionedArtifactEntry,
 };
 
 impl super::RedbRecoveryStore {
@@ -3375,14 +3396,139 @@ fn triage_entry(
     }))
 }
 
+/// Observes the CURRENT owner of ORS recovery effects for one import's member
+/// set, inside the caller's read transaction (issue #953, A17).
+///
+/// The current owner is the ORS store itself, read through its own live durable
+/// rows: `RECOVERY_INBOX` (`DurableInboxRecord`, keyed by `item_id`) and
+/// `RECOVERY_PROBLEMS` (`RecoveryProblem`, keyed by
+/// `operation_or_checkpoint_id`). A member is STILL UNRESOLVED when the current
+/// owner holds a live inbox row for it — present, with no terminal receipt yet
+/// written, which is the durable shape `import_recovery_inbox` writes on
+/// arrival and the only shape `record_recovery_inbox_disposition` closes — or
+/// when it holds a recovery problem for it that
+/// [`RecoveryProblem::is_resolved`] reports unresolved. The problem test is the
+/// crate's own: unresolved problems never expire automatically, so absence of a
+/// terminal receipt is a live obligation rather than a cleanup horizon.
+///
+/// Takes `&ReadTransaction` and never calls `load_recovery_problem` or
+/// `list_recovery_problems`, because each of those opens its OWN `begin_read()`
+/// and would therefore observe a different moment than the transaction this
+/// validation is about. Both tables are read here, in the one transaction, so
+/// the recorded answer describes a single instant.
+///
+/// Both scans are bounded by the existing [`IMPORT_SCAN_ROW_CAP`] and return the
+/// existing [`OrsError::ProjectionLimitExceeded`] when it is exceeded, exactly as
+/// [`triage_entry`] does. No new cap, timeout or field is introduced.
+fn observe_current_owner_validation(
+    read: &ReadTransaction,
+    snapshot_digest: &str,
+    per_entry: &[(String, PerEntryOutcome)],
+    validated_at_ms: i64,
+) -> Result<CurrentOwnerValidation, OrsError> {
+    // The roster the current owner is being asked about, indexed once so the two
+    // bounded scans below are a membership test per row rather than a linear
+    // search per row against the whole member list. Sorted and de-duplicated
+    // because the record states the COMPLETE set that was asked about, and a
+    // repeated ask of one member is not a second member.
+    let mut validated_record_ids: Vec<String> = per_entry
+        .iter()
+        .map(|(record_id, _)| record_id.clone())
+        .collect();
+    validated_record_ids.sort();
+    validated_record_ids.dedup();
+    let asked: BTreeSet<&str> = validated_record_ids.iter().map(String::as_str).collect();
+    let mut unresolved_effect_identities: Vec<String> = Vec::new();
+
+    let mut scanned: u64 = 0;
+    let inbox = read.open_table(super::RECOVERY_INBOX).map_err(storage)?;
+    for row in inbox.iter().map_err(storage)? {
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if scanned > IMPORT_SCAN_ROW_CAP {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let (_, value) = row.map_err(storage)?;
+        let record: DurableInboxRecord = decode_named(value.value(), "recovery_inbox")?;
+        // A terminal receipt is what closes an inbox row; without one the
+        // current owner still holds the staged effect, whatever disposition
+        // marker the row carries.
+        if record.terminal_receipt_id.is_some() {
+            continue;
+        }
+        if asked.contains(record.item.item_id.as_str())
+            && !unresolved_effect_identities
+                .iter()
+                .any(|identity| identity == record.item.item_id.as_str())
+        {
+            unresolved_effect_identities.push(record.item.item_id.as_str().to_owned());
+        }
+    }
+    drop(inbox);
+
+    let mut scanned: u64 = 0;
+    let problems = read.open_table(super::RECOVERY_PROBLEMS).map_err(storage)?;
+    for row in problems.iter().map_err(storage)? {
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if scanned > IMPORT_SCAN_ROW_CAP {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let (_, value) = row.map_err(storage)?;
+        let problem: RecoveryProblem = decode_named(value.value(), "recovery_problems")?;
+        if problem.is_resolved() {
+            continue;
+        }
+        let identity = problem.operation_or_checkpoint_id.as_str();
+        if asked.contains(identity)
+            && !unresolved_effect_identities
+                .iter()
+                .any(|held| held == identity)
+        {
+            unresolved_effect_identities.push(identity.to_owned());
+        }
+    }
+    drop(problems);
+    unresolved_effect_identities.sort();
+
+    let validation = CurrentOwnerValidation {
+        snapshot_digest: snapshot_digest.to_owned(),
+        validated_record_ids,
+        unresolved_effect_identities,
+        // Both families, unconditionally: both were read above, and a validation
+        // that omitted one would be refused by the gate anyway, so recording
+        // what was actually read is both true and necessary.
+        consulted_families: vec![
+            RowFamilyKind::RecoveryInbox,
+            RowFamilyKind::RecoveryProblems,
+        ],
+        validated_at_ms,
+    };
+    // Rejected here rather than carried: a record that does not pass its own
+    // shape check can never satisfy the gate, so failing the builder is honest
+    // and failing the gate later would only hide it.
+    validation.validate()?;
+    Ok(validation)
+}
+
 /// Reconciles per-entry quarantine outcomes into one import receipt.
 ///
 /// Binds `import.snapshot_digest` with the source/destination installations
 /// and the full per-entry outcome vector via
 /// [`OrsBackupImportReceipt::new`], which validates every shape. Emits no
 /// store writes: receipt building is a pure function over already-triaged
-/// outcomes.
+/// outcomes, and the one store read it performs is the read that observes the
+/// current owner for [`CurrentOwnerValidation`].
+///
+/// It opens that read ITSELF (rather than taking a `&ReadTransaction`) and hands
+/// it to [`observe_current_owner_validation`], so the current owner's answer and
+/// the receipt it lands on describe one instant. `import_page_quarantined` opens
+/// its own read the same way, for the same reason: a validation assembled from
+/// reads taken at different moments would not be an answer to any question.
 pub(super) fn reconcile_import_receipt(
+    database: &Database,
     import: &OrsBackupImportRequest,
     per_entry: &[(String, PerEntryOutcome)],
     import_at_ms: i64,
@@ -3393,6 +3539,12 @@ pub(super) fn reconcile_import_receipt(
         .count();
     let unresolved_count =
         u64::try_from(unresolved_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+    let read = database.begin_read().map_err(storage)?;
+    let current_owner_validation =
+        observe_current_owner_validation(&read, &import.snapshot_digest, per_entry, import_at_ms)?;
+    drop(read);
+    // `new` is the receipt builder and it runs the known-zero gate against this
+    // freshly observed validation, recording the typed verdict on the receipt.
     OrsBackupImportReceipt::new(
         import.snapshot_digest.clone(),
         import.source.installation_id.clone(),
@@ -3400,16 +3552,34 @@ pub(super) fn reconcile_import_receipt(
         per_entry.to_vec(),
         unresolved_count,
         import_at_ms,
+        current_owner_validation,
     )
 }
 
 /// Replays a lost import response without any duplicate effect.
 ///
-/// Returns an idempotent clone of the prior receipt: pure value copy, no
-/// store read, no store write, no re-triage, so a retried response can never
-/// double-apply quarantine outcomes.
+/// An idempotent clone of the prior receipt: no store write, no re-triage, so a
+/// retried response can never double-apply quarantine outcomes.
+///
+/// It does NOT carry the prior verdict forward. The gate is RE-EVALUATED from
+/// the validation RECORDED ON THE RECEIPT, so a verdict that is stale, or that
+/// disagrees with the validation it was recorded beside, is corrected on replay
+/// instead of being trusted. That re-evaluation is the whole point: the verdict
+/// is a report of the gate, never the gate's input, so a caller cannot replay a
+/// receipt into a satisfied gate by writing a satisfied verdict into it. No
+/// store read happens here either — the recorded validation is the record, and
+/// re-reading live state would make a replay's answer depend on when it was
+/// replayed rather than on what it attests.
 pub(super) fn reconcile_lost_import_response(
     prior: &OrsBackupImportReceipt,
 ) -> OrsBackupImportReceipt {
-    prior.clone()
+    let mut replayed = prior.clone();
+    replayed.known_zero_verdict =
+        match replayed.known_zero_unresolved(&replayed.current_owner_validation) {
+            Ok(()) => KnownZeroVerdict::Satisfied,
+            Err(error) => KnownZeroVerdict::Refused {
+                reason: error.to_string(),
+            },
+        };
+    replayed
 }
