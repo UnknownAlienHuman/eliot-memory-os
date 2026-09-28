@@ -1208,6 +1208,17 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let (descriptor, _) = self.host_request_connection_gate_under_transition(envelope)?;
+        // Recovery queries carry the caller's semantic session in the
+        // envelope, so authenticate it against this connection's retained
+        // activation and current owner before any resolver form can read ORS.
+        // This shared gate covers logical-key, legacy-presence, and
+        // operation-handle lookup alike.
+        let session = envelope
+            .identity
+            .session_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        self.host_request_application_binding_gate_under_transition(envelope)?;
         self.host_request_service_gate(&descriptor, envelope)?;
         {
             let profile = self
@@ -1222,11 +1233,6 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
-        let session = envelope
-            .identity
-            .session_id
-            .clone()
-            .ok_or(TransportError::SessionFenced)?;
         let object = query.as_object().ok_or(TransportError::SessionFenced)?;
         match object.get("form").and_then(serde_json::Value::as_str) {
             Some("logical-key") => {
