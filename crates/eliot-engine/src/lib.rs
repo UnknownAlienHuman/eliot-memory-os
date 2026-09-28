@@ -264,11 +264,12 @@ pub use ul::{
     weekly_exam_route,
 };
 pub use verification::{
-    FlakeDetectionService, GovernedProfileReport, GovernedProfileService, GovernedStageReport,
-    ISOLATED_PROCESS_CLASS, ProfileResolutionBindings, ProfileResolutionRequest,
-    ResolvedBindingReport, StatefulDbTestIsolationService, TestCostService, TestInventoryService,
-    VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
-    VerificationRunnerService, VerificationVerdictService,
+    DevFastEvidenceCommit, DevFastGovernedService, FlakeDetectionService, GovernedProfileReport,
+    GovernedProfileService, GovernedStageReport, ISOLATED_PROCESS_CLASS, ProfileResolutionBindings,
+    ProfileResolutionRequest, ResolvedBindingReport, StatefulDbTestIsolationService,
+    TestCostService, TestInventoryService, VerificationDoctorIntegration,
+    VerificationPlannerService, VerificationProfileService, VerificationRunnerService,
+    VerificationVerdictService,
 };
 pub use work::{
     AgentSessionService, WorkClaimRequest, WorkConflictService, WorkCreateRequest,

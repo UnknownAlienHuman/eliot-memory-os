@@ -19,6 +19,7 @@ use eliot_contracts::{ArtifactId, sha256_hex};
 use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentKind, VerificationOutcome};
 use eliot_process::ProcessExecutor;
 use eliot_test_selection::{FrozenDisposition, FrozenSelection, TestSelectionReceipt};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::InstrumentRunner;
@@ -688,6 +689,22 @@ pub(crate) fn dev_fast_profile() -> Result<InstrumentProfile, ProfileError> {
     )
 }
 
+/// Surfaces every run the aggregate did not count as success (issue #1802
+/// A5).
+///
+/// Failed, partial, cancelled, blocked, unknown, omitted, and missing runs
+/// stay in the aggregate by construction; this accessor returns exactly those
+/// runs in plan order so reporters and the evidence commit persist them
+/// visibly instead of re-deriving success. An empty result means every
+/// planned stage succeeded.
+pub fn dev_fast_unresolved_runs(aggregate: &ProfileAggregate) -> Vec<&InstrumentRun> {
+    aggregate
+        .runs
+        .iter()
+        .filter(|run| !run.is_success())
+        .collect()
+}
+
 /// Refuses an expected-nonzero selection that executed zero tests.
 ///
 /// A complete known expected-nonzero selection with zero execution is
@@ -1114,6 +1131,32 @@ pub fn require_dev_fast_parity(
     }
 }
 
+/// Executes the candidate-bound `dev-fast` plan and aggregates its canonical
+/// stages (issue #1802 step 5).
+///
+/// The plan must be the admitted `dev-fast` revision, normally compiled by
+/// [`dev_fast_caller_plan`], which binds the complete candidate/configuration
+/// identity the aggregate inherits. Launching walks the existing total
+/// orchestrator: admitted stages launch through the executing composition
+/// root's [`StageLauncher`] provisions, and every refusal, failure, or
+/// unlaunched dependency becomes an explicit missing run the aggregate keeps
+/// visible. The executor behind `runner` belongs to the owning supervision
+/// lane (Kernel/`testd`); this entry supplies orchestration only and invents
+/// no invocation, process, or verdict.
+pub async fn dev_fast_execute<E: ProcessExecutor + 'static>(
+    runner: &InstrumentRunner<E>,
+    plan: &StagePlan,
+    launcher: &dyn StageLauncher,
+) -> Result<ProfileAggregate, DevFastError> {
+    if plan.profile != DEV_FAST_PROFILE || plan.revision != DEV_FAST_PROFILE_REVISION {
+        return Err(DevFastError::Admission(
+            "stage plan is not the admitted dev-fast revision".to_owned(),
+        ));
+    }
+    let runs = StageOrchestrator::launch_plan(runner, plan, launcher).await;
+    Ok(ProfileAggregate::assemble(plan, runs))
+}
+
 /// One persisted dev-fast profile run bound to its aggregate, receipt,
 /// and retained raw outputs (I18.6 step 9).
 ///
@@ -1122,7 +1165,12 @@ pub fn require_dev_fast_parity(
 /// evidence while only `FinishService` decides completion. A lost
 /// acknowledgement resolves through [`VerificationProfileRun::resolve_lost_ack`]
 /// against the retained inputs; it never reruns build/test effects.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The record serializes to the evidence owner (I18.6 step 9) as canonical
+/// JSON. Unknown fields are refused on readback, so a record written by a
+/// newer semantics version fails closed instead of decoding as this version.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationProfileRun {
     /// Record semantics version.
     pub version: String,
@@ -1241,6 +1289,20 @@ impl VerificationProfileRun {
         sha256_hex(material.as_bytes())
     }
 
+    /// Verifies the record still binds every field it carries.
+    ///
+    /// Readback calls this before trusting a deserialized record: a digest
+    /// that no longer matches the fields fails here instead of travelling
+    /// on as retained evidence.
+    pub fn check_digest(&self) -> Result<(), DevFastError> {
+        if self.compute_digest() != self.run_digest {
+            return Err(DevFastError::ReceiptMismatch(
+                "profile run record digest does not bind its fields".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolves a lost acknowledgement against retained inputs without
     /// rerunning effects.
     ///
@@ -1294,6 +1356,26 @@ impl VerificationProfileRun {
         }
         Ok(())
     }
+}
+
+/// Replays the retained profile run without starting any process (issue
+/// #1802 A5).
+///
+/// The retained record resolves against the retained candidate, aggregate,
+/// and receipt through [`VerificationProfileRun::resolve_lost_ack`]; when
+/// they name this exact record, the retained record itself is the answer.
+/// The signature takes no executor, launcher, or process handle, so replay
+/// cannot rerun build/test effects to reconstruct an answer: a renamed
+/// candidate, changed configuration, different aggregate, or rebound receipt
+/// fails instead.
+pub fn dev_fast_replay(
+    retained: &VerificationProfileRun,
+    candidate: &DevFastCandidate,
+    aggregate: &ProfileAggregate,
+    receipt: &TestSelectionReceipt,
+) -> Result<VerificationProfileRun, DevFastError> {
+    retained.resolve_lost_ack(candidate, aggregate, receipt)?;
+    Ok(retained.clone())
 }
 
 /// Deterministic profile-run identity over candidate/configuration identity,
