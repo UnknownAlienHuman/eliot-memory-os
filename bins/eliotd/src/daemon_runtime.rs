@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
+use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
@@ -3912,16 +3913,32 @@ enum ImprovementIntakeFlight {
     InFlight(ImprovementIntakeFlightState),
 }
 
-/// Evaluates one real maintenance observation and assembles the
-/// owner-actionable improvement artifact over it, under the composition
-/// guard. Pure reads plus pure `eliot-improvement` assembly: no exchange
-/// happens under the lock.
+/// Evaluates one real maintenance observation, assembles the
+/// owner-actionable improvement artifact over it, and admits it into the
+/// bounded backlog through the GOVERNED path, under the composition guard.
+///
+/// Three reads and one pure assembly plus one governed admission, all under
+/// the lock:
+///
+/// - the maintenance trigger decision, from the live observation;
+/// - the admitted Kernel fence for this pass;
+/// - the maintenance (`G-19`) improvement admission policy record, read from
+///   the live `GovernorOwners::maintenance` owner — this is where the
+///   per-surface bound numbers and the owning authority come from
+///   (`eliotd::improvement_intake_dispatch::maintenance_bound`), so the
+///   daemon spells none of them;
+/// - the live `Governor` handle, which mints and re-verifies the learning
+///   admission permit the bound is checked against.
+///
+/// The guarded phase performs no exchange: assembling, reading the policy and
+/// issuing a permit are all pure with respect to the Kernel.
 fn improvement_intake_artifact(
     composition: &DaemonComposition,
     observation: MaintenanceObservation,
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
+        eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
         eliot_contracts::StateFence,
     ),
     String,
@@ -3935,11 +3952,37 @@ fn improvement_intake_artifact(
     let artifact =
         eliotd::improvement_intake_dispatch::assemble_improvement_artifact(&decision, &fence)
             .map_err(|error| error.to_string())?;
-    Ok((artifact, fence))
+    // The G-19 decision record, read through the EXISTING maintenance owner.
+    // The operation and idempotency key bind this exact observation, so the
+    // policy a candidate is admitted under names the observation it belongs to.
+    let policy = composition
+        .maintenance_improvement_admission_policy(
+            &eliotd::improvement_intake_dispatch::improvement_bound_operation(&decision),
+            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(&decision),
+        )
+        .map_err(|error| error.to_string())?;
+    // The dedup registry. Its bound comes from the owner record above, and it
+    // is deliberately per-pass: the durable artifact is the committed learning
+    // record, and nothing here claims the registry itself is durable.
+    let mut backlog = BoundedBacklog::new(vec![
+        eliotd::improvement_intake_dispatch::maintenance_bound(&policy)
+            .map_err(|error| error.to_string())?,
+    ])
+    .map_err(|error| error.to_string())?;
+    let admitted = eliotd::improvement_intake_dispatch::admit_improvement_artifact(
+        composition.improvement_governor(),
+        &policy,
+        &mut backlog,
+        &artifact,
+        &fence,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((artifact, admitted, fence))
 }
 
-/// Runs one improvement-intake step: assemble the artifact over a real
-/// observation under the composition guard, then commit it durably through
+/// Runs one improvement-intake step: evaluate, assemble, and admit the
+/// artifact over a real observation under the composition guard, then commit
+/// it — and every archive receipt the admission produced — durably through
 /// the Governor `RecordLearningRecord` seam with the guard released.
 ///
 /// No kernel handle is carried: this step's durable write is owned entirely by
@@ -3959,7 +4002,7 @@ async fn run_improvement_intake(
         let guard = composition.lock().await;
         improvement_intake_artifact(&guard, observation)
     };
-    let (artifact, fence) = match prepared {
+    let (artifact, admitted, fence) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
@@ -3974,7 +4017,7 @@ async fn run_improvement_intake(
     let committed = {
         let mut guard = composition.lock().await;
         eliotd::improvement_intake_dispatch::commit_improvement_artifact(
-            &mut guard, &artifact, &fence,
+            &mut guard, &artifact, &admitted, &fence,
         )
         .await
     };
@@ -3987,7 +4030,29 @@ async fn run_improvement_intake(
                 brief_id = %artifact.brief.brief_id,
                 operation_id = %receipt.operation_id,
                 effective,
+                // The owner-decided bound and the owner-issued admission that
+                // enforced it, so the diagnostic names the bound rather than
+                // implying one.
+                bound_max_active = admitted.bound.max_active,
+                bound_min_value = admitted.bound.min_value,
+                governor_authority_ref = %admitted.bound.governor_authority_ref,
+                governed_admission_digest = %admitted.admission_digest,
             );
+            for archived in &admitted.report.archived {
+                // Every archive receipt is a recorded disposition, and the
+                // commit above has already made it durable. This line makes
+                // the disposition observable in the daemon's own operational
+                // surface so an archival is never process-local (W3).
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.improvement_candidate_archived",
+                    candidate_id = %archived.candidate_id,
+                    target_surface = ?archived.target_surface,
+                    cause = ?archived.cause,
+                    archived_lifecycle = ?archived.archived_lifecycle,
+                    archived_revision = archived.archived_revision,
+                );
+            }
         }
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(

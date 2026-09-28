@@ -1360,6 +1360,56 @@ impl DaemonComposition {
         self.governor.kernel_snapshot()
     }
 
+    /// Returns the live Governor owner handle.
+    ///
+    /// This is the owner that mints and re-verifies learning admission permits,
+    /// cross-task admissions, and learning-record admission receipts, and it is
+    /// the reason an improvement candidate's bounded admission can be checked
+    /// against a real issuance instead of a constant. It is a borrow of the
+    /// composition's own Governor, not a second Governor and not a re-export of
+    /// a projection: [`Self::commit_learning_record`] already reaches the same
+    /// owner for the durable leg, so this exposes no new authority path.
+    #[must_use]
+    pub fn improvement_governor(&self) -> &eliot_governor::Governor {
+        self.governor.governor()
+    }
+
+    /// The maintenance (`G-19`) improvement admission policy record for one
+    /// exact operation, read from the live maintenance owner.
+    ///
+    /// This is the EXISTING maintenance admission path: the record comes from
+    /// `GovernorOwners::maintenance` — the `G-19` owner that
+    /// `crates/meta/eliot-improvement/module.toml:35` names as the sole
+    /// admission owner for improvement candidates — and it carries the
+    /// per-surface active-candidate bounds I12.24:297 requires. The daemon
+    /// therefore reads its bound from the decision owner instead of choosing a
+    /// number, and no scheduler, root record, or second policy source is
+    /// introduced (I12.24:314).
+    ///
+    /// `operation_ref` and `idempotency_key` bind the exact observation the
+    /// record is issued for, so two observations never share a policy record.
+    /// Pure with respect to the Kernel: no exchange happens here.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Composition`] with
+    /// [`CompositionError::NotReady`] when the Governor is not ready; no
+    /// other failure is possible, because the owner record is a pure value.
+    pub fn maintenance_improvement_admission_policy(
+        &self,
+        operation_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<eliot_maintenance::ImprovementAdmissionPolicy, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(self
+            .governor
+            .owners()
+            .maintenance
+            .improvement_admission_policy(operation_ref, idempotency_key, SERVICE_NAME))
+    }
+
     /// Commits the durable learning-closure edge for one consequential attempt.
     ///
     /// This is the production caller of
