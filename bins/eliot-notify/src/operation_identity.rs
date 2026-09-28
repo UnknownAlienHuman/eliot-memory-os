@@ -20,6 +20,22 @@
 //! mirroring I5.5 `identity conflict` and the Kernel `IDENTITY_CONFLICT`
 //! disposition.
 //!
+//! Derivation is split in two. [`NotifyIdentityIssuer::mint`] is the first
+//! issuance of one child: it observes the clock once, freezes that instant as
+//! the child's `metadata.clock` and deadline anchor, and retains the exact
+//! resulting [`RequestIdentity`] in the [`ChildLineageEntry`] projection
+//! before the caller sends the step. [`NotifyIdentityIssuer::restore_issued`]
+//! is reconstruction: it installs the ORIGINAL retained value and compares it
+//! field by field against the live parent, operation, canonical payload, prior
+//! receipt and the other retained fields. A recovery clock may validate
+//! freshness and report expiry; it never rewrites an already-issued child's
+//! clock or deadline, and a record without a complete original identity is
+//! refused with a typed disposition rather than manufactured (I5.27, I7.4).
+//!
+//! #78 STITCH: the durable owner of that retained per-step record does not
+//! exist yet. A recreation of this issuer without a retained record is a FIRST
+//! ISSUANCE, not a restoration, and this module does not present it as one.
+//!
 //! Digest ownership: this module mints no hash. Payload digests reuse the
 //! shared workspace helpers [`eliot_contracts::canonical_json_bytes`] plus
 //! [`eliot_contracts::sha256_hex`] — the exact helpers owned by the shared
@@ -170,6 +186,18 @@ impl NotifyOperation {
             Self::UserAutomationPreflightRead,
         ]
     }
+
+    /// Returns the closed step that owns an exact Kernel operation selector.
+    ///
+    /// An unknown selector resolves to no step, so a retained record naming an
+    /// operation outside this vocabulary is refused rather than mapped onto a
+    /// step that never issued it.
+    #[must_use]
+    pub fn from_selector(selector: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|operation| operation.selector() == selector)
+    }
 }
 
 /// One freshly issued (or exactly retried) child identity.
@@ -193,7 +221,9 @@ pub struct IssuedIdentity {
 ///
 /// Recorded, never collapsed: the parent intent, the child transport identity
 /// and the consumed prior receipt keep distinct identities linked by explicit
-/// parent references (issue #64 pattern).
+/// parent references (issue #64 pattern). `identity` is the ORIGINAL
+/// [`RequestIdentity`] retained at first issuance, before the step was sent;
+/// reconstruction replays that exact value and never a recomputed one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildLineageEntry {
     /// Stable parent notification request id.
@@ -212,6 +242,9 @@ pub struct ChildLineageEntry {
     pub cancellation_id: String,
     /// Prior receipt digest consumed by this step, when applicable.
     pub prior_receipt_digest: Option<String>,
+    /// The complete original child identity this step was first issued with,
+    /// including its issuance clock and absolute deadline.
+    pub identity: RequestIdentity,
 }
 
 /// Typed fail-closed issuance failures. No stub or default identity exists.
@@ -229,6 +262,14 @@ pub enum OperationIdentityError {
     /// (or a different step). No Kernel call was made. Mirrors the Kernel
     /// `IDENTITY_CONFLICT` disposition.
     IdentityConflict(String),
+    /// A retained historical record carries no complete original identity
+    /// (missing issuance clock, deadline, or transport fields). The step needs
+    /// exact result reconciliation, which this process cannot fabricate.
+    IncompleteRecord(String),
+    /// The retained original identity's absolute deadline has already passed.
+    /// The step is reconciled against its recorded result; it is never
+    /// silently renewed with a fresh deadline under the same identifiers.
+    ExpiredIdentity(String),
 }
 
 impl fmt::Display for OperationIdentityError {
@@ -243,6 +284,12 @@ impl fmt::Display for OperationIdentityError {
                 write!(f, "minted child identity is invalid: {detail}")
             }
             Self::IdentityConflict(detail) => write!(f, "idempotency identity conflict: {detail}"),
+            Self::IncompleteRecord(detail) => {
+                write!(f, "retained child identity is incomplete: {detail}")
+            }
+            Self::ExpiredIdentity(detail) => {
+                write!(f, "retained child identity is expired: {detail}")
+            }
         }
     }
 }
@@ -262,11 +309,19 @@ struct LedgerEntry {
 }
 
 /// Issues fresh per-step child [`RequestIdentity`] values with exact-retry and
-/// identity-conflict semantics. All state is notify-process-local: a restart
-/// starts from an empty ledger. Deterministic derivation binds the same
-/// parent plus step plus payload to the same byte-level identity, so a
-/// crash after reserve, provider delivery, delivery verification or commit
-/// reconciles at the exact step by re-deriving and replaying that step only.
+/// identity-conflict semantics.
+///
+/// All live state is notify-process-local: `new()` starts empty. Deterministic
+/// derivation binds the same parent plus step plus payload plus prior receipt
+/// to the same transport strings, but those strings alone are NOT the identity:
+/// the child clock and absolute deadline are frozen at first issuance. A crash
+/// after reserve, provider delivery, delivery verification or commit therefore
+/// reconciles at the exact step by restoring the retained original
+/// [`ChildLineageEntry`] through [`Self::restore_issued`], which reproduces the
+/// original identity field for field. Re-deriving a step on a recreated issuer
+/// without its retained record is a FIRST ISSUANCE, not a restoration: it mints
+/// a new anchor under the same transport strings and is never presented as a
+/// replay of the lost step.
 pub struct NotifyIdentityIssuer {
     ledger: BTreeMap<LedgerKey, LedgerEntry>,
     by_idempotency: BTreeMap<String, LedgerKey>,
@@ -602,6 +657,10 @@ impl NotifyIdentityIssuer {
                 owner.1
             )));
         }
+        // First issuance only: the observed clock is frozen into this child's
+        // metadata and deadline exactly once. Every later exact retry or
+        // restored replay returns the retained value, so a new recovery clock
+        // can never rewrite an already-issued operation.
         let identity = build_identity(
             parent,
             &child_request_id,
@@ -634,6 +693,9 @@ impl NotifyIdentityIssuer {
             idempotency_key: idempotency_key.to_owned(),
             cancellation_id,
             prior_receipt_digest: prior,
+            // Retained before the caller sends this step: this is the exact
+            // original identity a later replay must reproduce field for field.
+            identity: identity.clone(),
         });
         Ok(IssuedIdentity {
             identity,
@@ -642,6 +704,162 @@ impl NotifyIdentityIssuer {
             request_id: child_request_id,
             parent_request_id: parent_request_id.to_owned(),
             parent_hash: parent_hash.to_owned(),
+        })
+    }
+
+    /// Reconstruction entrypoint: re-seeds one retained original child identity
+    /// into this issuer so an exact replay resolves to that same value.
+    ///
+    /// The retained [`ChildLineageEntry`] is the recovery material: it already
+    /// carries the complete original [`RequestIdentity`] that the step was
+    /// first issued with. This method never re-derives that identity from the
+    /// live payload and never synthesizes a clock or deadline anchor from
+    /// `now_unix_ms`; the recovery clock only validates the parent and reports
+    /// expiry. Before any map is populated, the retained record is checked
+    /// field by field against the live parent (request id and canonical hash),
+    /// the closed operation that owns the selector, the canonical digest of the
+    /// exact payload being replayed, the consumed prior receipt, and every
+    /// retained identity field.
+    ///
+    /// A record that cannot pass those checks is refused with
+    /// [`OperationIdentityError::IncompleteRecord`],
+    /// [`OperationIdentityError::InvalidIdentity`], or
+    /// [`OperationIdentityError::IdentityConflict`]. An already-expired
+    /// original is refused with [`OperationIdentityError::ExpiredIdentity`]
+    /// so it can be reconciled against its recorded result instead of being
+    /// silently renewed. A genuinely new authorized step is not a restore: it
+    /// is a first issuance through `issue*`, which mints its own identity and
+    /// keeps its lineage link to the earlier step.
+    pub fn restore_issued(
+        &mut self,
+        parent: &NotificationRequest,
+        operation: NotifyOperation,
+        payload: &Value,
+        prior_receipt_digest: Option<&str>,
+        retained: &ChildLineageEntry,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        validate_parent(parent, now_unix_ms)?;
+        let canonical_digest = canonical_digest_of(payload)?;
+        let prior = normalize_prior(prior_receipt_digest)?;
+        // The retained record must describe exactly this step: same parent,
+        // same operation, same canonical bytes, same consumed prior receipt,
+        // and a complete original identity.
+        check_retained_step(
+            parent,
+            operation,
+            &canonical_digest,
+            prior.as_deref(),
+            retained,
+        )?;
+        let original = validate_retained_identity(parent, retained)?;
+        if original.deadline_unix_ms <= now_unix_ms {
+            // Expiry is reported, never repaired: this identity is reconciled
+            // against its recorded result, and a fresh deadline is only ever
+            // minted by a first issuance of a new authorized step.
+            return Err(OperationIdentityError::ExpiredIdentity(format!(
+                "{} expired at {} and is not renewed",
+                retained.operation, original.deadline_unix_ms
+            )));
+        }
+        self.adopt_restored(
+            ledger_key(
+                &retained.parent_hash,
+                operation,
+                &canonical_digest,
+                prior.as_deref(),
+            ),
+            &canonical_digest,
+            operation,
+            retained,
+            original,
+        )
+    }
+
+    /// Installs one already-validated original identity into this issuer's
+    /// maps, refusing any retained transport identifier another step owns.
+    fn adopt_restored(
+        &mut self,
+        key: LedgerKey,
+        canonical_digest: &str,
+        operation: NotifyOperation,
+        retained: &ChildLineageEntry,
+        original: RequestIdentity,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        if let Some(live) = self.ledger.get(&key) {
+            if live.identity != original {
+                return Err(OperationIdentityError::IdentityConflict(format!(
+                    "{} retained record contradicts the identity already issued",
+                    retained.operation
+                )));
+            }
+            return Ok(IssuedIdentity {
+                identity: live.identity.clone(),
+                operation,
+                canonical_digest: canonical_digest.to_owned(),
+                request_id: live.request_id.clone(),
+                parent_request_id: live.parent_request_id.clone(),
+                parent_hash: live.parent_hash.clone(),
+            });
+        }
+        // Every retained transport identifier must be free, or already owned
+        // by this same record: another step's request, cancellation or
+        // idempotency key is never adopted by a reconstruction.
+        if self
+            .by_request
+            .get(original.request.metadata.request_id.as_str())
+            .is_some_and(|owner| owner != &key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "{} retained request id is already bound to another step",
+                retained.operation
+            )));
+        }
+        if self
+            .by_cancellation
+            .get(&original.cancellation_id)
+            .is_some_and(|owner| owner != &key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "{} retained cancellation id is already bound to another step",
+                retained.operation
+            )));
+        }
+        if self
+            .by_idempotency
+            .get(&original.idempotency_key)
+            .is_some_and(|owner| owner != &key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "{} retained idempotency key is already bound to another step",
+                retained.operation
+            )));
+        }
+        self.by_idempotency
+            .insert(original.idempotency_key.clone(), key.clone());
+        self.by_request.insert(
+            original.request.metadata.request_id.clone().into_string(),
+            key.clone(),
+        );
+        self.by_cancellation
+            .insert(original.cancellation_id.clone(), key.clone());
+        self.ledger.insert(
+            key,
+            LedgerEntry {
+                identity: original.clone(),
+                request_id: retained.child_request_id.clone(),
+                parent_request_id: retained.parent_request_id.clone(),
+                parent_hash: retained.parent_hash.clone(),
+            },
+        );
+        self.lineage.push(retained.clone());
+        Ok(IssuedIdentity {
+            identity: original,
+            operation,
+            canonical_digest: canonical_digest.to_owned(),
+            request_id: retained.child_request_id.clone(),
+            parent_request_id: retained.parent_request_id.clone(),
+            parent_hash: retained.parent_hash.clone(),
         })
     }
 }
@@ -678,6 +896,139 @@ fn normalize_prior(prior: Option<&str>) -> Result<Option<String>, OperationIdent
             Ok(Some(digest.to_owned()))
         }
     }
+}
+
+/// Checks one retained record against the live parent, the closed step, the
+/// canonical payload bytes and the consumed prior receipt.
+///
+/// A record bound to another parent or another step is
+/// [`OperationIdentityError::IncompleteRecord`]: it does not describe this
+/// replay. A record bound to different canonical bytes or a different prior
+/// receipt is [`OperationIdentityError::IdentityConflict`], mirroring the
+/// Kernel `IDENTITY_CONFLICT` disposition: changed evidence may never reuse an
+/// existing identity.
+fn check_retained_step(
+    parent: &NotificationRequest,
+    operation: NotifyOperation,
+    canonical_digest: &str,
+    prior: Option<&str>,
+    retained: &ChildLineageEntry,
+) -> Result<(), OperationIdentityError> {
+    if retained.parent_request_id != parent.context.request_id.as_str()
+        || retained.parent_hash != parent.canonical_request_hash.as_str()
+    {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained record is bound to a different parent request",
+            retained.operation
+        )));
+    }
+    if retained.operation != operation.selector() {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained record is not this step",
+            retained.operation
+        )));
+    }
+    if retained.canonical_digest != canonical_digest {
+        return Err(OperationIdentityError::IdentityConflict(format!(
+            "{} retained record is bound to different canonical bytes",
+            retained.operation
+        )));
+    }
+    if retained.prior_receipt_digest.as_deref() != prior {
+        return Err(OperationIdentityError::IdentityConflict(format!(
+            "{} retained record consumed a different prior receipt",
+            retained.operation
+        )));
+    }
+    Ok(())
+}
+
+/// Checks one retained record against the closed step vocabulary and against
+/// the original identity it claims, and returns that original identity.
+///
+/// A record without a complete original issuance clock, absolute deadline or
+/// transport identifier is [`OperationIdentityError::IncompleteRecord`]: the
+/// process cannot manufacture a historical replay for it, and the step is left
+/// to exact result reconciliation instead. `parent` supplies the live context
+/// and State Fence the restored identity must still be bound to.
+fn validate_retained_identity(
+    parent: &NotificationRequest,
+    retained: &ChildLineageEntry,
+) -> Result<RequestIdentity, OperationIdentityError> {
+    let operation = NotifyOperation::from_selector(&retained.operation).ok_or_else(|| {
+        OperationIdentityError::IncompleteRecord(format!(
+            "{} is not a closed notification step",
+            retained.operation
+        ))
+    })?;
+    for value in [
+        retained.parent_request_id.as_str(),
+        retained.parent_hash.as_str(),
+        retained.child_request_id.as_str(),
+        retained.canonical_digest.as_str(),
+        retained.idempotency_key.as_str(),
+        retained.cancellation_id.as_str(),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(OperationIdentityError::IncompleteRecord(format!(
+                "{} retained identity field is blank",
+                retained.operation
+            )));
+        }
+    }
+    let original = &retained.identity;
+    if original.deadline_unix_ms == 0 {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained identity has no absolute deadline",
+            retained.operation
+        )));
+    }
+    if original.request.metadata.clock.valid_time_ms.is_none()
+        || original.request.metadata.clock.known_time_ms.is_none()
+    {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained identity has no original issuance clock",
+            retained.operation
+        )));
+    }
+    original
+        .validate()
+        .map_err(|error| OperationIdentityError::InvalidIdentity(error.to_string()))?;
+    // The retained transport half must be the identity that was actually
+    // issued for this exact step, derived by the same closed rules.
+    let (child_request_id, cancellation_id) = derive_transport_ids(
+        &retained.parent_hash,
+        operation,
+        &retained.canonical_digest,
+        retained.prior_receipt_digest.as_deref(),
+    );
+    if child_request_id != retained.child_request_id
+        || original.request.metadata.request_id.as_str() != child_request_id
+        || original.cancellation_id != cancellation_id
+        || original.idempotency_key != retained.idempotency_key
+    {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained identity fields disagree with its derived child",
+            retained.operation
+        )));
+    }
+    // The retained child was issued under this parent: its own parent context
+    // and State Fence must still be the live ones, so a record re-seeded into a
+    // later epoch or a different session context is refused instead of being
+    // replayed under another authority.
+    if original.request.state_fence != parent.context.state_fence
+        || original.request.metadata.state_fence != parent.context.state_fence
+        || original.request.metadata.product_id != parent.context.product_id
+        || original.request.metadata.source_id != parent.context.source_id
+        || original.request.metadata.session_id != parent.context.session_id
+        || original.request.metadata.task_id != parent.context.task_id
+    {
+        return Err(OperationIdentityError::IncompleteRecord(format!(
+            "{} retained identity carries another parent context or State Fence",
+            retained.operation
+        )));
+    }
+    Ok(original.clone())
 }
 
 /// Computes the lowercase SHA-256 of the canonical payload bytes using the
@@ -777,6 +1128,13 @@ fn validate_parent(
     Ok(())
 }
 
+/// Builds the complete child identity for a FIRST issuance.
+///
+/// The observed `now_unix_ms` is the issuance instant and is the only clock
+/// this child ever adopts: it is written into `metadata.clock` and anchored as
+/// the absolute deadline here, once. Reconstruction never calls this with a
+/// later clock; it installs the retained original value instead
+/// ([`NotifyIdentityIssuer::restore_issued`]).
 fn build_identity(
     parent: &NotificationRequest,
     child_request_id: &str,
