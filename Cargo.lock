@@ -2769,6 +2769,7 @@ dependencies = [
 name = "eliot-ors"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "eliot-contracts",
  "eliot-ors",
  "eliot-platform",
@@ -2783,6 +2784,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

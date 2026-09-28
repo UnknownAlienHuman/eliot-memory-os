@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    AuthorityEpoch, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
-    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, EpochId, EpochRelation,
-    EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
-    canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
+    AuthorityEpoch, BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeRecoveryPageCommitment,
+    BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition,
+    EpochId, EpochRelation, EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId,
+    HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
+    host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
@@ -25,6 +26,7 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[path = "persistence_codec.rs"]
 mod persistence_codec;
@@ -315,6 +317,8 @@ const MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE: usize = 4096;
 // 15 fixed bytes (field name, quotes, colon, and object delimiters).
 const MAX_BRIDGE_POSITION_RECORD_BYTES: usize = 15 + 6 * 1_024;
 const MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE: usize = 4;
+const BRIDGE_RECOVERY_PROOF_SENTINEL: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_BRIDGE_RECOVERY_WINDOWS: usize = 64;
 const MAX_BRIDGE_RECOVERY_CUTS: usize = 4096;
 const MAX_BRIDGE_RECOVERY_REPLY_BYTES: usize = 256 * 1024;
@@ -1644,6 +1648,10 @@ fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsErr
 struct BridgeEventRecoveryWindowRow {
     version: u16,
     window_key: String,
+    /// Per-window secret used only to authenticate owner-issued continuation
+    /// selectors. It is intentionally excluded from `key_for` and replies.
+    #[serde(default)]
+    continuation_secret: Option<String>,
     authority_lineage: String,
     principal: String,
     owner_scope_digest: String,
@@ -1673,6 +1681,9 @@ impl BridgeEventRecoveryWindowRow {
             });
         }
         crate::model::validate_digest(&self.window_key, "window_key")?;
+        if let Some(secret) = &self.continuation_secret {
+            crate::model::validate_digest(secret, "recovery_window.continuation_secret")?;
+        }
         bridge_owner_component(&self.authority_lineage, "owner_authority_lineage")?;
         bridge_owner_component(&self.principal, "owner_principal")?;
         crate::model::validate_digest(&self.owner_scope_digest, "owner_scope_digest")?;
@@ -10403,6 +10414,7 @@ impl RedbRecoveryStore {
         let reusable = existing.into_iter().find(|row| row.expires_at_ms > now_ms);
         if let Some(window) = &reusable {
             if window.version != 2
+                || window.continuation_secret.is_none()
                 || window.live_generation != live_generation
                 || window.presenting_connection != presenting_connection
             {
@@ -10454,6 +10466,11 @@ impl RedbRecoveryStore {
         let mut row = BridgeEventRecoveryWindowRow {
             version: 2,
             window_key: String::new(),
+            continuation_secret: Some(format!(
+                "{}{}",
+                Uuid::new_v4().simple(),
+                Uuid::new_v4().simple()
+            )),
             authority_lineage: lineage.to_owned(),
             principal: principal.to_owned(),
             owner_scope_digest: scope,
@@ -10644,6 +10661,7 @@ impl RedbRecoveryStore {
                 after_stream,
                 stream_limit,
                 version: _,
+                ..
             } => Ok(BridgeRecoveryScopeSelector::Streams {
                 window_key: window_key.clone(),
                 // The outer cursor is a decimal owner list position, not an
@@ -10669,6 +10687,7 @@ impl RedbRecoveryStore {
                 gap_offset,
                 gap_limit,
                 version: _,
+                ..
             } => Ok(BridgeRecoveryScopeSelector::Stream {
                 window_key: window_key.clone(),
                 stream_id: stream_id.clone(),
@@ -10689,6 +10708,7 @@ impl RedbRecoveryStore {
                 gap_offset,
                 gap_limit,
                 version: _,
+                ..
             } => Ok(BridgeRecoveryScopeSelector::UnscopedGaps {
                 window_key: window_key.clone(),
                 after_gap_scope: after_gap_scope.clone(),
@@ -10697,6 +10717,131 @@ impl RedbRecoveryStore {
                 gap_limit: page_bound(*gap_limit, MAX_BRIDGE_EVENT_GAPS_PER_STREAM)?,
             }),
         }
+    }
+
+    fn bridge_recovery_secret_key(
+        window: &BridgeEventRecoveryWindowRow,
+    ) -> Result<[u8; 32], OrsError> {
+        let secret = window
+            .continuation_secret
+            .as_deref()
+            .ok_or(OrsError::RecoveryOwnerMismatch)?;
+        let hash = blake3::Hash::from_hex(secret).map_err(|_| OrsError::IntegrityProblem {
+            record_type: "bridge_event_recovery_window",
+            reason: "continuation secret is not a 32-byte lowercase hexadecimal key".to_owned(),
+        })?;
+        Ok(*hash.as_bytes())
+    }
+
+    fn bridge_recovery_selector_proof(
+        window: &BridgeEventRecoveryWindowRow,
+        selector: &BridgeRecoverySelector,
+    ) -> Result<String, OrsError> {
+        let key = Self::bridge_recovery_secret_key(window)?;
+        let preimage = selector
+            .continuation_bytes()
+            .map_err(|_| OrsError::InvalidField {
+                field: "recovery_scope",
+                reason: "continuation selector failed its canonical preimage contract",
+            })?;
+        Ok(blake3::keyed_hash(&key, &preimage).to_hex().to_string())
+    }
+
+    fn verify_bridge_recovery_selector_proof(
+        window: &BridgeEventRecoveryWindowRow,
+        selector: &BridgeRecoverySelector,
+    ) -> Result<(), OrsError> {
+        let provided = match selector {
+            BridgeRecoverySelector::Resume { .. } => return Err(OrsError::RecoveryOwnerMismatch),
+            BridgeRecoverySelector::Streams {
+                continuation_proof, ..
+            }
+            | BridgeRecoverySelector::Stream {
+                continuation_proof, ..
+            }
+            | BridgeRecoverySelector::UnscopedGaps {
+                continuation_proof, ..
+            } => continuation_proof.as_bytes(),
+        };
+        let expected = Self::bridge_recovery_selector_proof(window, selector)?;
+        let expected = expected.as_bytes();
+        if provided.len() != expected.len() {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let difference = provided
+            .iter()
+            .zip(expected)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (*left ^ *right)
+            });
+        if difference != 0 {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        Ok(())
+    }
+
+    fn bridge_recovery_streams_proof(
+        window: &BridgeEventRecoveryWindowRow,
+        after_stream: String,
+        stream_limit: usize,
+    ) -> Result<String, OrsError> {
+        let selector = BridgeRecoverySelector::Streams {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: window.window_key.clone(),
+            continuation_proof: BRIDGE_RECOVERY_PROOF_SENTINEL.to_owned(),
+            after_stream,
+            stream_limit: u64::try_from(stream_limit).map_err(|_| OrsError::InvalidCursorLimit)?,
+        };
+        Self::bridge_recovery_selector_proof(window, &selector)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bridge_recovery_stream_proof(
+        window: &BridgeEventRecoveryWindowRow,
+        stream_id: String,
+        owner_incarnation: u64,
+        owner_revision: u64,
+        expected_revision: u64,
+        after_sequence: u64,
+        upper_sequence: u64,
+        retention_floor: u64,
+        event_limit: usize,
+        gap_offset: usize,
+        gap_limit: usize,
+    ) -> Result<String, OrsError> {
+        let selector = BridgeRecoverySelector::Stream {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: window.window_key.clone(),
+            continuation_proof: BRIDGE_RECOVERY_PROOF_SENTINEL.to_owned(),
+            stream_id,
+            owner_incarnation,
+            owner_revision,
+            expected_revision,
+            after_sequence,
+            upper_sequence,
+            retention_floor,
+            event_limit: u64::try_from(event_limit).map_err(|_| OrsError::InvalidCursorLimit)?,
+            gap_offset: u64::try_from(gap_offset).map_err(|_| OrsError::InvalidCursorLimit)?,
+            gap_limit: u64::try_from(gap_limit).map_err(|_| OrsError::InvalidCursorLimit)?,
+        };
+        Self::bridge_recovery_selector_proof(window, &selector)
+    }
+
+    fn bridge_recovery_unscoped_gaps_proof(
+        window: &BridgeEventRecoveryWindowRow,
+        after_gap_scope: String,
+        gap_offset: usize,
+        gap_limit: usize,
+    ) -> Result<String, OrsError> {
+        let selector = BridgeRecoverySelector::UnscopedGaps {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: window.window_key.clone(),
+            continuation_proof: BRIDGE_RECOVERY_PROOF_SENTINEL.to_owned(),
+            after_gap_scope,
+            gap_offset: u64::try_from(gap_offset).map_err(|_| OrsError::InvalidCursorLimit)?,
+            gap_limit: u64::try_from(gap_limit).map_err(|_| OrsError::InvalidCursorLimit)?,
+        };
+        Self::bridge_recovery_selector_proof(window, &selector)
     }
 
     #[allow(
@@ -11353,6 +11498,13 @@ impl RedbRecoveryStore {
             stream_pages_pending: true,
             unproven_scope_present,
         };
+        let mut stream_pages = streams.to_vec();
+        for page in &mut stream_pages {
+            let object = page
+                .as_object_mut()
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
+            object.insert("stream_proof".to_owned(), serde_json::Value::Null);
+        }
         let mut response = json!({
             "window_key": window.window_key,
             "window_identity_version": window.version,
@@ -11367,12 +11519,14 @@ impl RedbRecoveryStore {
             "selected_scope": selected_scope,
             "stream_list_complete": false,
             "stream_list_continuation": window.stream_list_continuation,
+            "stream_list_proof": serde_json::Value::Null,
             "stream_list_total": window.stream_list_total,
             "unscoped_gaps_complete": false,
             "unscoped_gaps_continuation": serde_json::Value::Null,
+            "unscoped_gaps_proof": serde_json::Value::Null,
             "unscoped_gap_total": window.unscoped_gap_total,
             "unresolved_frontier": unresolved,
-            "streams": streams,
+            "streams": stream_pages,
             "unscoped_gaps": unscoped_gaps,
             "unproven_scope_present": unproven_scope_present,
         });
@@ -15242,6 +15396,7 @@ impl RedbRecoveryStore {
                     } else {
                         let incompatible = window.live_generation != live_generation
                             || window.presenting_connection != presenting_connection
+                            || window.continuation_secret.is_none()
                             || window.source_revision
                                 != Self::bridge_recovery_source_revision_in(
                                     &write,
@@ -15302,11 +15457,37 @@ impl RedbRecoveryStore {
         {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
+        if matches!(
+            selector,
+            BridgeRecoveryScopeSelector::Streams { .. }
+                | BridgeRecoveryScopeSelector::Stream { .. }
+                | BridgeRecoveryScopeSelector::UnscopedGaps { .. }
+        ) {
+            let recovery_scope = recovery_scope.ok_or(OrsError::RecoveryOwnerMismatch)?;
+            // Check owner issuance before any cut creation or pagination work.
+            // Continuations are authenticated statelessly; the window row is
+            // the only persisted signing authority and no cursor ledger exists.
+            Self::verify_bridge_recovery_selector_proof(&window, recovery_scope)?;
+        }
         if window.expires_at_ms <= now_ms {
             drop(write);
             return Self::bridge_recovery_typed_reply(
                 &window,
                 BridgeRecoveryWindowDisposition::Expired,
+                recovery_scope,
+                &selected_scope,
+                None,
+                &[],
+                &[],
+            );
+        }
+        if matches!(selector, BridgeRecoveryScopeSelector::Resume)
+            && window.continuation_secret.is_none()
+        {
+            drop(write);
+            return Self::bridge_recovery_typed_reply(
+                &window,
+                BridgeRecoveryWindowDisposition::Moved,
                 recovery_scope,
                 &selected_scope,
                 None,
@@ -15482,7 +15663,7 @@ impl RedbRecoveryStore {
                 let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
             }
         }
-        if opening || matches!(selector, BridgeRecoveryScopeSelector::Streams { .. }) {
+        if opening {
             Self::save_bridge_recovery_window_in(&write, &window)?;
         }
         write.commit().map_err(storage)?;
@@ -15525,11 +15706,14 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
-            // Resume re-derives the deterministic first outer page. The
-            // persisted window may carry a later page's mutable list cursor;
-            // project this first-page cursor only in memory and never advance
-            // the persisted window or any producer/consumer cursor.
+        if matches!(
+            selector,
+            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::Streams { .. }
+        ) {
+            // Resume re-derives the deterministic first outer page, while a
+            // Streams reply projects only that selector's page frontier. Both
+            // are response-local: the persisted window keeps its immutable
+            // first-page metadata for replay on Stream and UnscopedGaps reads.
             read_window
                 .stream_list_continuation
                 .clone_from(&window.stream_list_continuation);
@@ -15633,10 +15817,48 @@ impl RedbRecoveryStore {
                     gap_byte_limit,
                 },
             )?;
+            let event_continuation = page
+                .get("pending_first_page")
+                .and_then(|first| first.get("continuation"))
+                .and_then(serde_json::Value::as_u64);
+            let gap_continuation = page
+                .get("gap_continuation")
+                .and_then(serde_json::Value::as_u64);
+            let last_returned_sequence = page
+                .get("pending_first_page")
+                .and_then(|first| first.get("items"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.last())
+                .and_then(|item| item.get("sequence"))
+                .and_then(serde_json::Value::as_u64);
+            let stream_proof = if event_continuation.is_some() || gap_continuation.is_some() {
+                let next_gap_offset = match gap_continuation {
+                    Some(offset) => {
+                        usize::try_from(offset).map_err(|_| OrsError::InvalidCursorLimit)?
+                    }
+                    None => gap_offset,
+                };
+                Some(Self::bridge_recovery_stream_proof(
+                    &read_window,
+                    owner.local_stream.clone(),
+                    owner.incarnation,
+                    owner.revision,
+                    cut.expected_revision,
+                    last_returned_sequence.unwrap_or(after_sequence),
+                    cut.upper_sequence,
+                    cut.retention_floor,
+                    event_limit,
+                    next_gap_offset,
+                    gap_limit,
+                )?)
+            } else {
+                None
+            };
             // The rows and accounting are validated facts even when the
             // suffix itself cannot be proven; preserve them beside the
             // unresolved frontier in a typed Moved answer.
             page["capacity"] = Self::bridge_capacity_accounting_for(&read, &owner)?;
+            page["stream_proof"] = json!(stream_proof);
             stream_pages.push(page);
             if !suffix_proven {
                 moved = true;
@@ -15729,6 +15951,36 @@ impl RedbRecoveryStore {
                 &unscoped_gaps,
             );
         }
+        let stream_list_limit = match &selector {
+            BridgeRecoveryScopeSelector::Streams { stream_limit, .. } => *stream_limit,
+            _ => MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE,
+        };
+        let stream_list_proof = read_window
+            .stream_list_continuation
+            .as_ref()
+            .map(|after_stream| {
+                Self::bridge_recovery_streams_proof(
+                    &read_window,
+                    after_stream.clone(),
+                    stream_list_limit,
+                )
+            })
+            .transpose()?;
+        let unscoped_gap_limit = match &selector {
+            BridgeRecoveryScopeSelector::UnscopedGaps { gap_limit, .. } => *gap_limit,
+            _ => MAX_BRIDGE_EVENT_GAPS_PER_STREAM,
+        };
+        let unscoped_gaps_proof = unscoped_gap_cursor
+            .as_ref()
+            .map(|(after_gap_scope, gap_offset)| {
+                Self::bridge_recovery_unscoped_gaps_proof(
+                    &read_window,
+                    after_gap_scope.clone(),
+                    usize::try_from(*gap_offset).map_err(|_| OrsError::InvalidCursorLimit)?,
+                    unscoped_gap_limit,
+                )
+            })
+            .transpose()?;
         let gap_continuation = unscoped_gap_cursor.map(|(after_gap_scope, gap_offset)| {
             json!({ "after_gap_scope": after_gap_scope, "gap_offset": gap_offset })
         });
@@ -15764,9 +16016,11 @@ impl RedbRecoveryStore {
             "selected_scope": selected_scope,
             "stream_list_complete": read_window.stream_list_complete,
             "stream_list_continuation": read_window.stream_list_continuation,
+            "stream_list_proof": stream_list_proof,
             "stream_list_total": read_window.stream_list_total,
             "unscoped_gaps_complete": unscoped_gaps_complete,
             "unscoped_gaps_continuation": gap_continuation,
+            "unscoped_gaps_proof": unscoped_gaps_proof,
             "unscoped_gap_total": read_window.unscoped_gap_total,
             "unresolved_frontier": unresolved,
             "streams": stream_pages,

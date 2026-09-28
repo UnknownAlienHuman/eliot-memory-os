@@ -19,8 +19,9 @@ use eliot_agent_bridge_core::{
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
     RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective,
-    RecoveryProjectionPage, RecoveryReadRequest, RecoveryStreamCut, RecoveryUnscopedGapCursor,
-    RecoveryView, RecoveryWindowStatus, TerminalReductionInputs, TransportEdge,
+    RecoveryProjectionPage, RecoveryReadRequest, RecoveryResponseSelector, RecoveryStreamCut,
+    RecoveryUnscopedGapCursor, RecoveryView, RecoveryWindowStatus, TerminalReductionInputs,
+    TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -883,6 +884,19 @@ fn recovery_digest(
     Ok(text.to_owned())
 }
 
+fn recovery_optional_digest(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<String>, ProviderFailure> {
+    match value.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(_)) => recovery_digest(value, field).map(Some),
+        _ => Err(event_shape_failure(
+            "reconciliation refused: owner continuation proof is absent or malformed",
+        )),
+    }
+}
+
 /// Extracts an owner cursor leg, which may be zero for a fresh stream.
 fn recovery_cursor(value: &serde_json::Value, field: &'static str) -> Result<u64, ProviderFailure> {
     value
@@ -977,21 +991,25 @@ struct RecoveryDecodeBudget {
 struct RecoveryReplyCoverage {
     unproven_scope_present: bool,
     stream_list_total: u64,
+    stream_list_proof: Option<String>,
     stream_list_complete: bool,
     stream_list_continuation: Option<String>,
     unscoped_gap_total: u64,
+    unscoped_gaps_proof: Option<String>,
     unscoped_gaps_complete: bool,
     unscoped_gaps_continuation: Option<RecoveryUnscopedGapCursor>,
 }
 
 fn decode_recovery_reply_coverage(
     reconciliation: &serde_json::Value,
+    window_status: RecoveryWindowStatus,
 ) -> Result<RecoveryReplyCoverage, ProviderFailure> {
     let unproven_scope_present = reconciliation
         .get("unproven_scope_present")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| event_shape_failure("reconciliation refused: scope provenance absent"))?;
     let stream_list_total = recovery_cursor(reconciliation, "stream_list_total")?;
+    let stream_list_proof = recovery_optional_digest(reconciliation, "stream_list_proof")?;
     let stream_list_complete = reconciliation
         .get("stream_list_complete")
         .and_then(serde_json::Value::as_bool)
@@ -1016,6 +1034,13 @@ fn decode_recovery_reply_coverage(
             "reconciliation refused: empty stream denominator has a continuation",
         ));
     }
+    if window_status == RecoveryWindowStatus::Active
+        && stream_list_proof.is_some() != stream_list_continuation.is_some()
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream-list continuation proof does not match its cursor",
+        ));
+    }
     let streams = reconciliation
         .get("streams")
         .and_then(serde_json::Value::as_array)
@@ -1026,6 +1051,7 @@ fn decode_recovery_reply_coverage(
         ));
     }
     let unscoped_gap_total = recovery_cursor(reconciliation, "unscoped_gap_total")?;
+    let unscoped_gaps_proof = recovery_optional_digest(reconciliation, "unscoped_gaps_proof")?;
     let unscoped_gaps_complete = reconciliation
         .get("unscoped_gaps_complete")
         .and_then(serde_json::Value::as_bool)
@@ -1061,6 +1087,13 @@ fn decode_recovery_reply_coverage(
         .get("unscoped_gaps")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
+    if window_status == RecoveryWindowStatus::Active
+        && unscoped_gaps_proof.is_some() != unscoped_gaps_continuation.is_some()
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: unscoped-gap continuation proof does not match its cursor",
+        ));
+    }
     if unscoped_gap_total == 0
         && (!unscoped_gaps.is_empty() || unscoped_gaps_continuation.is_some())
     {
@@ -1071,9 +1104,11 @@ fn decode_recovery_reply_coverage(
     Ok(RecoveryReplyCoverage {
         unproven_scope_present,
         stream_list_total,
+        stream_list_proof,
         stream_list_complete,
         stream_list_continuation,
         unscoped_gap_total,
+        unscoped_gaps_proof,
         unscoped_gaps_complete,
         unscoped_gaps_continuation,
     })
@@ -1162,6 +1197,7 @@ fn decode_recovery_window_identity_version(
 fn decode_recovery_stream(
     stream: &serde_json::Value,
     live_generation: u64,
+    window_status: RecoveryWindowStatus,
     budget: &mut RecoveryDecodeBudget,
 ) -> Result<(RecoveredStreamFacts, u64), ProviderFailure> {
     let (stream_id, durable_cursor, acked_cursor, page) =
@@ -1197,6 +1233,14 @@ fn decode_recovery_stream(
         }
     };
     let page_continuation = decode_page_continuation(page, cut.upper_sequence())?;
+    let stream_proof = recovery_optional_digest(stream, "stream_proof")?;
+    if window_status == RecoveryWindowStatus::Active
+        && stream_proof.is_some() != (page_continuation.is_some() || gap_continuation.is_some())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream continuation proof does not match its cursors",
+        ));
+    }
     let page_complete = page_continuation.is_none();
     let facts = RecoveredStreamFacts::checked(
         stream_id,
@@ -1217,7 +1261,11 @@ fn decode_recovery_stream(
     .with_recovery_cut(cut)
     .map_err(|_| event_shape_failure("reconciliation refused: page exceeds finite owner cut"))?
     .with_gap_continuation(gap_continuation)
-    .map_err(|_| event_shape_failure("reconciliation refused: invalid gap continuation"))?;
+    .map_err(|_| event_shape_failure("reconciliation refused: invalid gap continuation"))?
+    .with_stream_proof(stream_proof)
+    .map_err(|_| {
+        event_shape_failure("reconciliation refused: invalid stream continuation proof")
+    })?;
     Ok((facts, acked_cursor))
 }
 
@@ -1553,10 +1601,14 @@ fn decode_reconciliation_outcome(
     }
 
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
-    let stream_facts =
-        decode_reconciliation_streams(reconciliation, identity.live_generation, &mut budget)?;
+    let stream_facts = decode_reconciliation_streams(
+        reconciliation,
+        identity.live_generation,
+        window_status,
+        &mut budget,
+    )?;
     let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
-    let coverage = decode_recovery_reply_coverage(reconciliation)?;
+    let coverage = decode_recovery_reply_coverage(reconciliation, window_status)?;
     let key = verify_reconcile_key(reconciliation)?;
     decode_handoff_maintenance_pressure(reconciliation)?;
     let handoffs_reconciled = reconciliation
@@ -1585,6 +1637,13 @@ fn decode_reconciliation_outcome(
         identity.window_key,
         identity.expires_at_ms,
         window_status,
+        expected.map_or(
+            RecoveryResponseSelector::Open,
+            RecoveryReadRequest::response_selector,
+        ),
+        expected
+            .and_then(RecoveryReadRequest::continuation_proof)
+            .map(str::to_owned),
         live,
         presenting_connection,
         coverage.unproven_scope_present,
@@ -1592,9 +1651,11 @@ fn decode_reconciliation_outcome(
         stream_facts,
         unscoped_gaps,
         coverage.stream_list_total,
+        coverage.stream_list_proof,
         coverage.stream_list_complete,
         coverage.stream_list_continuation,
         coverage.unscoped_gap_total,
+        coverage.unscoped_gaps_proof,
         coverage.unscoped_gaps_complete,
         coverage.unscoped_gaps_continuation,
     )
@@ -1657,6 +1718,7 @@ fn decode_handoff_maintenance_pressure(
 fn decode_reconciliation_streams(
     reconciliation: &serde_json::Value,
     live_generation: u64,
+    window_status: RecoveryWindowStatus,
     budget: &mut RecoveryDecodeBudget,
 ) -> Result<Vec<RecoveredStreamFacts>, ProviderFailure> {
     let streams = reconciliation
@@ -1671,7 +1733,7 @@ fn decode_reconciliation_streams(
     let mut stream_facts = Vec::with_capacity(streams.len().min(64));
     let mut seen_streams = BTreeSet::new();
     for stream in streams {
-        let (page, _) = decode_recovery_stream(stream, live_generation, budget)?;
+        let (page, _) = decode_recovery_stream(stream, live_generation, window_status, budget)?;
         if !seen_streams.insert(page.stream_id().to_owned()) {
             return Err(event_shape_failure(
                 "reconciliation refused: duplicate stream identity in owner answer",
@@ -1737,6 +1799,12 @@ fn recovery_scope_value(
         Ok(BridgeRecoverySelector::Stream {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
             window_key: window_key.to_owned(),
+            continuation_proof: request
+                .continuation_proof()
+                .ok_or_else(|| {
+                    event_shape_failure("recovery continuation has no owner-issued proof")
+                })?
+                .to_owned(),
             stream_id: stream_id.to_owned(),
             owner_incarnation: cut.owner_incarnation(),
             owner_revision: cut.owner_revision(),
@@ -1752,6 +1820,12 @@ fn recovery_scope_value(
         Ok(BridgeRecoverySelector::Streams {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
             window_key: window_key.to_owned(),
+            continuation_proof: request
+                .continuation_proof()
+                .ok_or_else(|| {
+                    event_shape_failure("recovery continuation has no owner-issued proof")
+                })?
+                .to_owned(),
             after_stream: after_stream.to_owned(),
             stream_limit,
         })
@@ -1759,6 +1833,12 @@ fn recovery_scope_value(
         Ok(BridgeRecoverySelector::UnscopedGaps {
             version: BRIDGE_RECOVERY_SELECTOR_VERSION,
             window_key: window_key.to_owned(),
+            continuation_proof: request
+                .continuation_proof()
+                .ok_or_else(|| {
+                    event_shape_failure("recovery continuation has no owner-issued proof")
+                })?
+                .to_owned(),
             after_gap_scope: after_gap_scope.to_owned(),
             gap_offset,
             gap_limit,
