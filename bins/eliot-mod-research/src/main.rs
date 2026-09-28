@@ -168,22 +168,49 @@ fn run() -> Result<String, Failure> {
         .map_err(|error| Failure::NoAdmission(format!("evidence custody: {error}")))?;
     let (bridge, _exchange) = researcher.into_exchange().into_parts();
 
+    // A `submit` that returned `Ok` proves only that the Rust call finished:
+    // `ProviderBridge::execute` returns `Ok` for every terminal state it could
+    // classify, including a crash, a cancellation, a timeout and an unknown
+    // outcome. The outcome that was computed inside the bridge is therefore
+    // read back here and carried verbatim; nothing on this path is allowed to
+    // relabel a run as a completed acquisition.
     if let Ok(job) = submitted {
+        let outcome = bridge.last_outcome().map_or(
+            eliot_mod_research::ProviderOutcome::Unknown,
+            eliot_mod_research::SubmittedOutcome::provider_outcome,
+        );
+        let cancellation = bridge.last_cancellation();
+        // A positive terminal outcome needs no owner reconciliation; anything
+        // else is reconciled by the stable operation identity before it is
+        // reported, so the receipt distinguishes an owner-attested
+        // classification from a local one.
+        let reconciliation = if outcome == eliot_mod_research::ProviderOutcome::Completed {
+            ReconciliationEvidence::not_required()
+        } else {
+            reconcile_with_owner(&client, &admitted, cancellation, outcome)
+        };
+        let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
+        // The retained terminal classification is absent on this path because
+        // `execute` left no `BridgeError` behind; the crate's own typed
+        // conversion still produces both the reason code the receipt carries
+        // and the degraded disposition this run exits with, so neither is a
+        // second, privately chosen classification of the same run.
+        let degradation = acquisition_coverage_degradation(Some(
+            &eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation),
+        ));
         let receipt = terminal_receipt(
             &admitted,
             &client_receipt,
             &admission,
             bridge.last_evidence().cloned(),
-            bridge.last_cancellation().cloned(),
+            cancellation.cloned(),
             bridge.last_submission(),
             bridge.last_provider_job_ref().cloned(),
             Some(job.job_id),
-            eliot_mod_research::ProviderOutcome::Completed,
-            eliot_kernel_service::REASON_RUNTIME_FAILED,
+            outcome,
+            reason_code,
             records,
-            // A positive terminal outcome needs no owner reconciliation, and the
-            // empty attempt list records that fact rather than hiding it.
-            ReconciliationEvidence::not_required(),
+            reconciliation,
         );
         report_admitted_inquiry(
             &admitted.request,
@@ -191,7 +218,14 @@ fn run() -> Result<String, Failure> {
             &receipt,
             bridge.last_failure(),
         );
-        return Ok(receipt.to_string());
+        // A terminal state that is not a completed acquisition degrades
+        // acquisition coverage and exits with the degraded disposition. A
+        // crashed, cancelled, timed-out or unclassifiable provider is never
+        // receipted as a completed acquisition and never exits zero.
+        return match outcome {
+            eliot_mod_research::ProviderOutcome::Completed => Ok(receipt.to_string()),
+            _ => Err(Failure::Degraded(degradation, Box::new(receipt))),
+        };
     }
     // The bridge retains the typed terminal classification, the raw evidence
     // materialized before the failure, and the cancellation receipt. A failure
@@ -211,19 +245,9 @@ fn run() -> Result<String, Failure> {
     // the operation before it is reported, so the receipt distinguishes an
     // owner-attested classification from a local guess.
     let outcome = degradation.outcome;
-    let reconciliation =
-        reconcile_with_owner(&client, &admitted, bridge.last_cancellation(), outcome);
-    let no_effect_proven = bridge
-        .last_cancellation()
-        .is_some_and(|receipt| receipt.no_effect_proven);
-    let reason_code = if reconciliation.leaves_cancellation_unconfirmed(no_effect_proven) {
-        // The provider's own vocabulary names this state and nothing else
-        // produced it: a cancellation whose no-effect is unproven and which the
-        // owner did not confirm is not the same fact as a plain unknown.
-        eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED
-    } else {
-        degradation.reason_code
-    };
+    let cancellation = bridge.last_cancellation();
+    let reconciliation = reconcile_with_owner(&client, &admitted, cancellation, outcome);
+    let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
     let receipt = terminal_receipt(
         &admitted,
         &client_receipt,
@@ -433,6 +457,33 @@ fn reconcile_with_owner(
         );
     }
     ReconciliationEvidence { attempts }
+}
+
+/// Returns the exact I7.20 reason code one terminal outcome is reported with.
+///
+/// `CANCELLATION_UNCONFIRMED` is reachable only when a cancellation WAS issued
+/// whose no-effect is unproven and whose owner confirmation is absent: that is
+/// the single condition the research-provider vocabulary's own code names, and
+/// `leaves_cancellation_unconfirmed` is what proves it. A run that never
+/// cancelled anything — a plain unknown outcome, a crash, a protocol
+/// violation, a policy refusal — therefore keeps the reason code its own
+/// classification already produced, instead of having its real cause
+/// overwritten with a cancellation that never happened.
+fn terminal_reason_code(
+    outcome: eliot_mod_research::ProviderOutcome,
+    reconciliation: &ReconciliationEvidence,
+    cancellation: Option<&CancellationEvidence>,
+) -> &'static str {
+    if reconciliation.leaves_cancellation_unconfirmed(cancellation) {
+        return eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED;
+    }
+    let terminal = eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation);
+    match outcome {
+        eliot_mod_research::ProviderOutcome::Completed => {
+            eliot_kernel_service::REASON_RUNTIME_FAILED
+        }
+        _ => acquisition_coverage_degradation(Some(&terminal)).reason_code,
+    }
 }
 
 /// Sends one control operation and records the owner's answer verbatim.
