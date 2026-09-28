@@ -1608,98 +1608,52 @@ fn admit_locator(
 
 /// Applies the I21.7 reference gate of one delivered `ExactCitation::anchor`.
 ///
-/// # Why an anchor is a reference, and what therefore gates it
+/// A citation is the pair I21.7 names - a source identity *and* a pointer a
+/// reader follows - and only the identity half was gated: the `source_handle`
+/// was checked against [`AllowedReferenceManifest::allows`] and the anchor was
+/// read with [`text`], which is a blank/control predicate and not a reference
+/// check. A syntactically valid URL the manifest does not list therefore became
+/// a genuinely supported citation, the sentence A1 forbids.
 ///
-/// A citation is the pair I21.7 names — a source identity *and* a pointer a
-/// reader follows — and only the identity half was gated: `validate_against`
-/// admitted `citation.source_handle` against
-/// [`AllowedReferenceManifest::allows`] and then read `citation.anchor` with
-/// nothing but [`text`], which is a blank/control-character predicate. A
-/// syntactically valid URL the manifest does not list therefore became a
-/// genuinely SUPPORTED citation, which is the sentence A1 forbids. The anchor is
-/// now gated here, on the same terms and by the same classifier the source
-/// locator already uses, so the two reference surfaces of one bundle can no
-/// longer disagree about what a reference is.
+/// The verdict is [`admit_locator`]'s, delegated rather than repeated: this
+/// crate exports one closed classifier and both reference surfaces of a bundle
+/// must read it, since a boundary deciding "is this a URL?" on its own terms is
+/// how `https://attacker.example/x` became citable. So an
+/// [`LocatorClass::ExternalUri`] anchor must be admitted by
+/// [`AllowedReferenceManifest::admits_url`], and a spelling the classifier
+/// cannot read is refused by name.
 ///
-/// # The decision, and why the verdict is `admit_locator`'s unchanged
+/// [`LocatorClass::InternalUri`] and [`LocatorClass::OpaqueHandle`] stay
+/// allowed, and that is safe because neither carries authority: they are
+/// coordinates into the source whose identity the `source_handle` gate admitted
+/// immediately before this call. This arm is also what keeps human anchors
+/// working - `section-2`, `Introduction`, `3.1` and `Ch. 4: Overview` all
+/// classify opaque (`Ch. 4` is not an RFC 3986 scheme token, the space fails).
+/// Refusing them would make the gate stricter than A1, which gates references,
+/// not prose.
 ///
-/// The classification is [`admit_locator`]'s, deliberately delegated rather than
-/// repeated: the owning crate already exports one closed classifier and both
-/// boundaries must read it, because a boundary that decided "is this a URL?" on
-/// its own terms is exactly how `https://attacker.example/x` became citable.
-/// There is no second spelling of the rule here and no way for the two surfaces
-/// to drift.
+/// A1's line-range spelling needs no separate rule: `README.md` is a valid
+/// scheme token, so `README.md:12-40` reads as an external URI and is refused
+/// here. Re-typing it as a line range first, the way the Researcher does for a
+/// *candidate handle*, would move the refusal off the URL allowlist onto the
+/// handle allowlist for a string this surface already refuses - the two
+/// surfaces differ because a candidate handle has no admitted source behind it
+/// while this anchor does. The precision half needs no rule at all:
+/// `allowed_anchor_precision.permits` already refuses a line claim against a
+/// coarser ceiling independently of the anchor text.
 ///
-/// The verdict is [`admit_locator`]'s unchanged, and the reason that is safe for
-/// an anchor is the same reason it is safe for a locator: an
-/// [`LocatorClass::InternalUri`] or [`LocatorClass::OpaqueHandle`] is *not* an
-/// admission, it is the classification of something that carries no authority —
-/// a coordinate into a reference whose identity is gated elsewhere. For a source
-/// locator that identity is `sources[].source_handle`, applied at the top of the
-/// same loop. For a citation anchor it is `claims[].citations[].source_handle`,
-/// applied immediately before this call. So:
-///
-/// - **Authority-bearing anchor** — an [`LocatorClass::ExternalUri`], one that
-///   carries a real RFC 3986 scheme and is not an owned internal handle — must
-///   be admitted by [`AllowedReferenceManifest::admits_url`], or the bundle is
-///   refused with [`ResearchContractError::UrlNotAdmitted`]. An anchor is the one
-///   field a reader treats as a citable pointer, so an unlisted authority inside
-///   it is precisely the minted-citation path A1 names. The comparison is against
-///   the exact original text, so no fold of case, path or query can widen it, and
-///   a case variant of an owned scheme stays
-///   [`LocatorClass::MalformedOrAmbiguous`] rather than becoming a URL an exact
-///   `url_handles` entry could admit.
-/// - **Non-authority anchor** — an owned internal URI or an opaque handle — stays
-///   allowed, because it names nothing that can be resolved outside the source
-///   the citation already points at. This is the arm that keeps ordinary human
-///   anchors working: `section-2`, `Introduction`, `§3.2`, `3.1` and
-///   `Ch. 4: Overview` all classify [`LocatorClass::OpaqueHandle`] (the last one
-///   because `Ch. 4` is not an RFC 3986 scheme token — the space fails
-///   `scheme_token`) and are coordinates, not addresses. Refusing them would be
-///   the gate being stricter than A1, which gates references, not prose.
-/// - **Unclassifiable anchor** — refused with
-///   [`ResearchContractError::LocatorNotClassifiable`], naming the closed rule
-///   that failed and never the text.
-///
-/// # The line-range reading, and why it needs no second pass here
-///
-/// A1 names a line range beside a URL, and `README.md:12-40` is the spelling it
-/// means. That spelling is decided here, by the arm above and not by a line-range
-/// recogniser: `README.md` *is* a valid RFC 3986 scheme token, so
-/// `classify_locator` reads the whole anchor as an [`LocatorClass::ExternalUri`]
-/// and it is refused `UrlNotAdmitted`. That is the fail-closed direction, and the
-/// alternative — re-typing it as a line range first, the way
-/// `reference_firewall` in `eliot-researcher` does for a *candidate handle* — is
-/// not repeated here for two reasons. A candidate handle and a citation anchor
-/// are different surfaces: the Researcher's candidate has no already-admitted
-/// source behind it, whereas this anchor does, because the `source_handle` gate
-/// ran first. And re-typing would move the refusal from a manifest list that
-/// admits URLs to the handle allowlist, i.e. a second gate over the same string
-/// for the same verdict. The precision half of A1's line-range sentence needs no
-/// rule here at all: `citation.precision` is a declared rung on the
-/// [`AnchorPrecision`] ladder and
-/// `allowed_anchor_precision.permits(citation.precision)` already refuses a line
-/// claim against a coarser ceiling, independently of what the anchor text says.
-///
-/// # Why a blank anchor is not re-typed
-///
-/// The caller runs [`text`] first, so a blank or control-bearing anchor is
-/// refused as [`ResearchContractError::InvalidText`] exactly as before this gate
-/// existed. That is deliberate and mirrors the blank-locator guard at
-/// `sources[].locator`: asking the classifier about an anchor with no content in
-/// it would report a classification verdict for what is a missing-lineage
-/// diagnosis. This helper is therefore only ever asked about an anchor that
-/// carries a reference.
+/// The caller runs [`text`] first, so a blank anchor is still
+/// [`ResearchContractError::InvalidText`] rather than a classification verdict -
+/// mirroring the blank-locator guard at `sources[].locator`.
 ///
 /// # Errors
 ///
 /// [`ResearchContractError::UrlNotAdmitted`] for an authority-bearing anchor
 /// outside `url_handles`, or [`ResearchContractError::LocatorNotClassifiable`]
-/// for a spelling the shared classifier cannot read. No other variant is
-/// reachable, and no variant is introduced here: the wording of
-/// `UrlNotAdmitted` says "delivered locator URL" because it was written for the
-/// locator surface, and the same rule answering the anchor surface is the point
-/// rather than a reason to fork the error.
+/// for an unreadable spelling. Neither is introduced here: `UrlNotAdmitted`
+/// says "delivered locator URL" because it was written for the locator surface,
+/// and one rule answering both surfaces is the point rather than a reason to
+/// fork the error.
 fn admit_citation_anchor(
     anchor: &str,
     manifest: &AllowedReferenceManifest,
