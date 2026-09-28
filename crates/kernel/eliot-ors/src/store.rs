@@ -11140,7 +11140,7 @@ impl RedbRecoveryStore {
                 .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
                 .map_err(storage)?;
             if cuts.len().map_err(storage)? >= MAX_BRIDGE_RECOVERY_CUTS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeRecoveryCutCapacityExceeded);
             }
         }
         let key = Self::bridge_recovery_cut_key(window_key, &owner.namespace);
