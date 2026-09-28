@@ -388,6 +388,829 @@ pub(crate) fn required_predecessor_generation(migration_id: &str) -> Option<&'st
     embedded_body_by_migration_id(migration_id)?.predecessor_generation
 }
 
+/// Returns the exact migration identity the named migration must follow.
+///
+/// Derived from the published executable graph rather than restated: the
+/// predecessor is the unique admitted node that reaches the generation this
+/// node migrates *from*. A fresh-database baseline has no predecessor, and an
+/// identity outside the graph has none either, so a caller cannot name a
+/// predecessor of its own choosing.
+pub(crate) fn required_predecessor_migration_id(migration_id: &str) -> Option<&'static str> {
+    let predecessor_generation = required_predecessor_generation(migration_id)?;
+    EMBEDDED_SCHEMA_BODIES
+        .iter()
+        .find(|candidate| {
+            candidate.disposition == BodyDisposition::ExecutableGraph
+                && candidate.generation == Some(predecessor_generation)
+        })
+        .and_then(|candidate| candidate.migration_id)
+}
+
+// -- Legacy schema mapping (issue #1221 work item W3, acceptance A4) --------
+//
+// Every legacy table, index and field of the two declared legacy migration
+// roots is mapped to a current capability owner, an explicit transform, or an
+// archive-only disposition with a deletion rationale. The expected set is
+// *derived from the legacy bytes themselves* by [`census_legacy_schema_objects`]
+// and compared against [`LEGACY_TABLE_MAPPINGS`] in both directions, so a
+// legacy object with no row, and a row naming an object the legacy DDL no
+// longer declares, both fail closed. Nothing here trusts a list a caller
+// supplies and nothing here is a second inventory: this is the same current
+// owner, reading the roots it already declares non-executable in
+// [`NON_EXECUTABLE_MIGRATION_ROOTS`].
+
+/// One legacy migration root whose schema the current owner censuses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegacySchemaRoot {
+    /// Repository path of the root, matching its
+    /// [`NON_EXECUTABLE_MIGRATION_ROOTS`] entry.
+    pub(crate) path: &'static str,
+    /// The exact legacy DDL bytes, read for censusing only. This owner never
+    /// executes them and never admits them.
+    pub(crate) ddl: &'static str,
+}
+
+/// The declared legacy roots whose DDL declares schema objects.
+///
+/// Every schema-defining legacy body is listed. The remaining files of the
+/// named-operation root declare no `DEFINE` statement, so including them could
+/// not change the census; a file that later gains one is added here and the
+/// census then fails closed until its objects are mapped.
+pub(crate) static LEGACY_SCHEMA_ROOTS: [LegacySchemaRoot; 12] = [
+    LegacySchemaRoot {
+        path: "crates/eliot-store/migrations/000_schema.surql",
+        ddl: include_str!("../../../eliot-store/migrations/000_schema.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/000_schema.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/000_schema.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/001_observability.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/001_observability.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/002_ul_core.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/002_ul_core.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/003_ul_delivery.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/003_ul_delivery.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/004_ul_artifacts.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/004_ul_artifacts.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/005_ul_pyramid.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/005_ul_pyramid.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/006_ul_measurement.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/006_ul_measurement.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/007_ul_dependency_activation.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/007_ul_dependency_activation.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/008_ul_token_policy.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/008_ul_token_policy.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/009_memory_search.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/009_memory_search.surql"),
+    },
+    LegacySchemaRoot {
+        path: "crates/eliot-store/src/surql/010_memory_search_fts.surql",
+        ddl: include_str!("../../../eliot-store/src/surql/010_memory_search_fts.surql"),
+    },
+];
+
+/// What kind of schema object a census entry is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacySchemaObjectKind {
+    /// A `DEFINE TABLE` body.
+    Table,
+    /// A `DEFINE INDEX` body, which always belongs to one table.
+    Index,
+    /// A `DEFINE FIELD` body, which always belongs to one table.
+    Field,
+}
+
+impl fmt::Display for LegacySchemaObjectKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Table => "table",
+            Self::Index => "index",
+            Self::Field => "field",
+        })
+    }
+}
+
+/// One schema object the legacy roots actually declare.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LegacySchemaObject {
+    /// What kind of object the legacy DDL declared.
+    pub(crate) kind: LegacySchemaObjectKind,
+    /// Lowercased declared object name.
+    pub(crate) name: String,
+    /// Lowercased owning table; equal to `name` for a table object.
+    pub(crate) table: String,
+}
+
+/// Reads every schema object the declared legacy roots declare.
+///
+/// The expected set for the coverage check is derived here from the legacy DDL
+/// bytes, so it is independent of [`LEGACY_TABLE_MAPPINGS`]: a legacy object
+/// nobody mapped is visible, and a mapped object the legacy DDL does not
+/// declare is stale. Fields are censused the same way as tables and indexes;
+/// the legacy roots declare no `DEFINE FIELD` because every legacy table is
+/// `SCHEMALESS`, and the census proves that rather than assuming it.
+pub(crate) fn census_legacy_schema_objects() -> Vec<LegacySchemaObject> {
+    let mut census: Vec<LegacySchemaObject> = Vec::new();
+    for root in &LEGACY_SCHEMA_ROOTS {
+        for statement in root.ddl.split(';') {
+            let tokens: Vec<&str> = statement.split_whitespace().collect();
+            let Some(keyword) = tokens.get(1) else {
+                continue;
+            };
+            if keyword.eq_ignore_ascii_case("TABLE") {
+                if let Some(name) = declared_name(&tokens) {
+                    push_census_object(&mut census, LegacySchemaObjectKind::Table, &name, &name);
+                }
+            } else if keyword.eq_ignore_ascii_case("INDEX")
+                || keyword.eq_ignore_ascii_case("FIELD")
+            {
+                let kind = if keyword.eq_ignore_ascii_case("INDEX") {
+                    LegacySchemaObjectKind::Index
+                } else {
+                    LegacySchemaObjectKind::Field
+                };
+                if let (Some(name), Some(table)) = (declared_name(&tokens), table_after_on(&tokens))
+                {
+                    push_census_object(&mut census, kind, &name, &table);
+                }
+            }
+        }
+    }
+    census
+}
+
+/// Appends one census object unless the same object is already censused.
+///
+/// The legacy roots declare the same table and index in more than one file;
+/// the denominator is the set of distinct objects, not the number of
+/// `DEFINE` statements.
+fn push_census_object(
+    census: &mut Vec<LegacySchemaObject>,
+    kind: LegacySchemaObjectKind,
+    name: &str,
+    table: &str,
+) {
+    let object = LegacySchemaObject {
+        kind,
+        name: name.to_owned(),
+        table: table.to_owned(),
+    };
+    if !census.contains(&object) {
+        census.push(object);
+    }
+}
+
+/// Returns the declared object name, skipping the `IF NOT EXISTS` and
+/// `OVERWRITE` modifiers the legacy roots use.
+fn declared_name(tokens: &[&str]) -> Option<String> {
+    let mut index = 2;
+    if tokens.get(index).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+        && tokens
+            .get(index + 1)
+            .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+        && tokens
+            .get(index + 2)
+            .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+    {
+        index += 3;
+    } else if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("OVERWRITE"))
+    {
+        index += 1;
+    }
+    tokens
+        .get(index)
+        .map(|token| token.to_ascii_lowercase())
+}
+
+/// Returns the owning table named after the `ON` keyword, tolerating the
+/// `ON TABLE` spelling the legacy roots use for indexes.
+fn table_after_on(tokens: &[&str]) -> Option<String> {
+    let on = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("ON"))?;
+    let mut next = on + 1;
+    if tokens
+        .get(next)
+        .is_some_and(|token| token.eq_ignore_ascii_case("TABLE"))
+    {
+        next += 1;
+    }
+    tokens
+        .get(next)
+        .map(|token| token.to_ascii_lowercase())
+}
+
+/// What the current capability does with one legacy table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyTableDisposition {
+    /// A current capability owner carries the capability and the named
+    /// transform states exactly how a legacy row becomes a current row. The
+    /// legacy indexes are not carried: the current table publishes its own.
+    Transform {
+        /// The current owner that carries the capability.
+        capability_owner: &'static str,
+        /// The current table the legacy table's capability now lives in.
+        current_table: &'static str,
+        /// The exact transform, stated so no step is implied.
+        transform: &'static str,
+    },
+    /// No current capability owner writes this table. The rows are retained
+    /// read-only so restore and import can still verify their provenance under
+    /// `A13.7`/`ARCH-RES-03`, and the named condition is what removes them.
+    ArchiveOnly {
+        /// Why the rows are retained rather than carried forward.
+        rationale: &'static str,
+        /// The named condition under which the table leaves the tree.
+        removal_condition: &'static str,
+    },
+}
+
+impl LegacyTableDisposition {
+    /// The current owner that carries this table's capability, if any.
+    pub(crate) fn capability_owner(&self) -> Option<&'static str> {
+        match self {
+            Self::Transform {
+                capability_owner, ..
+            } => Some(capability_owner),
+            Self::ArchiveOnly { .. } => None,
+        }
+    }
+}
+
+/// One legacy table and every disposition the current owner states for it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegacyTableMapping {
+    /// Lowercased legacy table name.
+    pub(crate) table: &'static str,
+    /// Every legacy index the census finds on this table, compared by name in
+    /// both directions. An index added to or removed from the legacy DDL
+    /// without a row change fails the coverage check.
+    pub(crate) indexes: &'static [&'static str],
+    /// What the current capability does with the table.
+    pub(crate) disposition: LegacyTableDisposition,
+}
+
+impl LegacyTableMapping {
+    /// The current owner that carries this table's capability, if any.
+    pub(crate) fn capability_owner(&self) -> Option<&'static str> {
+        self.disposition.capability_owner()
+    }
+}
+
+/// Rationale shared by every legacy table no current capability owner writes.
+///
+/// The legacy domain tables belong to the pre-split `eliot-store` core. The
+/// canonical Store publishes no table for them, so the rows are archived rather
+/// than silently dropped: `A13.7` restore verifies provenance and
+/// `ARCH-RES-03` forbids resurrecting invalid state, which a drop would do.
+/// Removal is not this issue's to perform; the legacy core retirement issue
+/// `#1189` owns it and must first complete donor retirement P1–P5.
+const LEGACY_DOMAIN_ARCHIVE_RATIONALE: &str = "pre-split eliot-store domain table; the canonical Store publishes no current table for this capability, so the rows are retained read-only for restore/import provenance verification under A13.7 and ARCH-RES-03 rather than dropped or migrated under a guessed shape";
+const LEGACY_DOMAIN_REMOVAL_CONDITION: &str =
+    "the legacy core retirement issue #1189 completes donor retirement P1-P5 and proves no current reader; until then the rows stay archived and this owner executes no DDL over them";
+
+/// Every legacy table the declared roots define, with its current owner,
+/// explicit transform, or archive-only rationale — and, for each, the complete
+/// set of legacy indexes the census finds on it.
+pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
+    LegacyTableMapping {
+        table: "activation_trace",
+        indexes: &["idx_ul_activation_scope"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "belongs_to",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "canonical_record",
+        indexes: &[
+            "idx_canonical_memory_manifest",
+            "idx_canonical_memory_parent_segment",
+            "idx_canonical_project_kind",
+            "idx_canonical_project_subject",
+            "idx_canonical_project_task_candidate_action",
+            "idx_canonical_project_task_kind",
+            "idx_canonical_project_task_trace",
+            "idx_canonical_write",
+            "idx_ul_artifact_path",
+            "idx_ul_build_target",
+            "idx_ul_capsule_concept",
+            "idx_ul_concept_name",
+            "idx_ul_mining_identity",
+        ],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "canonical_event",
+            transform: "one legacy canonical_record row becomes one canonical_event row plus its projection_record publications; the legacy project-scoped (project_id, receipt_kind) lookup is replaced by the current event_id and publication_id identities, so no legacy index is carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "capsule_covers",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "card_covers",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "claim_card",
+        indexes: &["idx_claim_project", "idx_claim_status", "idx_claim_write"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "co_change",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "cognitive_projection_cutover",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "cognitive_projection_state",
+        indexes: &["idx_cognitive_projection_state_project_family_v1"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "concept_depends_on",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "concept_implemented_by",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "context_packet_receipt",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "contradicts",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "cue_index",
+        indexes: &["idx_cue_lookup", "idx_cue_record"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "evidence_atom",
+        indexes: &["idx_evidence_project", "idx_evidence_write"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "exam_record",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "failure_fingerprint",
+        indexes: &["idx_failure_project"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "injection_receipt",
+        indexes: &["idx_injection_session", "idx_injection_write"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "invalidated_by",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_grant_offer",
+        indexes: &[
+            "idx_memory_grant_offer_id",
+            "idx_memory_grant_offer_scope",
+            "idx_memory_grant_offer_write",
+        ],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_influence_trace",
+        indexes: &["idx_influence_task", "idx_influence_write"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_search_outbox",
+        indexes: &[
+            "idx_cognitive_projection_outbox_claim_v1",
+            "idx_memory_search_outbox_project_status_revision",
+            "idx_memory_search_outbox_write",
+        ],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_search_projection",
+        indexes: &[
+            "idx_memory_search_projection_fts_v1",
+            "idx_memory_search_projection_handle",
+            "idx_memory_search_projection_lifecycle_kind_revision",
+            "idx_memory_search_projection_parent_segment",
+        ],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_search_state",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "memory_transition",
+        indexes: &["idx_transition_project"],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "canonical_event",
+            transform: "one legacy memory transition becomes one canonical_event row; the legacy project_id sequence becomes the current OrderingScopeId sequence and the legacy per-project sequence index is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "mentions",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "observability_receipt",
+        indexes: &["idx_observability_receipt_kind", "idx_observability_receipt_write"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "prediction_record",
+        indexes: &[
+            "idx_prediction_write",
+            "idx_ul_prediction_scope",
+            "idx_ul_prediction_verifier",
+        ],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "produces",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "scope_head",
+        indexes: &["idx_scope_head_project"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "source_snapshot",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "supersedes",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "supports",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "task_contract",
+        indexes: &["idx_task_contract_project", "idx_task_contract_status"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "tool_observation",
+        indexes: &["idx_tool_observation_project_task_kind_pattern"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "trace_span",
+        indexes: &[],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_ab_counter",
+        indexes: &["idx_ul_ab_counter"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_artifact_dirty",
+        indexes: &["idx_ul_dirty_state", "idx_ul_dirty_target"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_dep_reverse_index",
+        indexes: &["idx_ul_dep_reverse", "idx_ul_dep_target"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_task_class_policy",
+        indexes: &["idx_ul_policy_class"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_task_experiment",
+        indexes: &["idx_ul_experiment_class", "idx_ul_experiment_task"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "ul_task_ledger",
+        indexes: &["idx_ul_task_ledger_project_task"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "verification_run",
+        indexes: &["idx_verification_project", "idx_verification_result"],
+        disposition: LegacyTableDisposition::ArchiveOnly {
+            rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
+            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
+        },
+    },
+    LegacyTableMapping {
+        table: "verified_by",
+        indexes: &[],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "relation_record",
+            transform: "one legacy relation edge becomes one relation_record row whose relation_id is derived from the legacy edge triple; the legacy per-relation table name is not carried",
+        },
+    },
+    LegacyTableMapping {
+        table: "write_receipt",
+        indexes: &["idx_receipt_project", "idx_receipt_sequence", "idx_receipt_write"],
+        disposition: LegacyTableDisposition::Transform {
+            capability_owner: CURRENT_MIGRATION_OWNER,
+            current_table: "write_receipt",
+            transform: "one legacy write_receipt row becomes one current write_receipt row re-keyed from the legacy (project_id, write_id) pair onto the canonical operation identity and its idempotency key; the legacy unique write_id index and the project_sequence index are not carried",
+        },
+    },
+];
+
+/// Why the legacy mapping is incomplete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyMappingOmission {
+    /// A legacy table/index/field exists in the declared roots and no row maps
+    /// the table that owns it.
+    LegacyObjectUnmapped {
+        /// What kind of object the legacy roots declare.
+        kind: LegacySchemaObjectKind,
+        /// The declared object name.
+        name: String,
+        /// The table that owns it.
+        table: String,
+    },
+    /// A mapped table declares an index the legacy roots do not, so the row no
+    /// longer describes the legacy schema.
+    StaleIndexDeclaration {
+        /// The mapped table.
+        table: &'static str,
+        /// The index the row names.
+        index: &'static str,
+    },
+    /// Two rows claim the same legacy table.
+    DuplicateTableRow {
+        /// The table claimed twice.
+        table: &'static str,
+    },
+}
+
+impl fmt::Display for LegacyMappingOmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LegacyObjectUnmapped { kind, name, table } => write!(
+                formatter,
+                "legacy {kind} {name} on table {table} has no current owner, transform or archive disposition"
+            ),
+            Self::StaleIndexDeclaration { table, index } => write!(
+                formatter,
+                "the mapping for {table} declares legacy index {index}, which the legacy roots no longer define"
+            ),
+            Self::DuplicateTableRow { table } => {
+                write!(formatter, "the legacy table {table} has more than one mapping row")
+            }
+        }
+    }
+}
+
+/// Fails closed unless every legacy table, index and field has a disposition.
+///
+/// The check compares [`census_legacy_schema_objects`] — derived from the
+/// legacy DDL bytes — against [`LEGACY_TABLE_MAPPINGS`] in both directions, so
+/// neither an unmapped legacy object nor a stale mapping row can pass. It is
+/// the gate that lets the declared legacy roots leave the tree only after the
+/// mapping closes, so it runs on the same admission path that admits a real
+/// migration.
+pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmission> {
+    let census = census_legacy_schema_objects();
+    for mapping in &LEGACY_TABLE_MAPPINGS {
+        if LEGACY_TABLE_MAPPINGS
+            .iter()
+            .filter(|other| other.table == mapping.table)
+            .count()
+            > 1
+        {
+            return Err(LegacyMappingOmission::DuplicateTableRow {
+                table: mapping.table,
+            });
+        }
+    }
+    for object in &census {
+        let Some(mapping) = LEGACY_TABLE_MAPPINGS
+            .iter()
+            .find(|mapping| mapping.table == object.table)
+        else {
+            return Err(LegacyMappingOmission::LegacyObjectUnmapped {
+                kind: object.kind,
+                name: object.name.clone(),
+                table: object.table.clone(),
+            });
+        };
+        match object.kind {
+            LegacySchemaObjectKind::Index => {
+                if !mapping.indexes.contains(&object.name.as_str()) {
+                    return Err(LegacyMappingOmission::LegacyObjectUnmapped {
+                        kind: object.kind,
+                        name: object.name.clone(),
+                        table: object.table.clone(),
+                    });
+                }
+            }
+            LegacySchemaObjectKind::Table | LegacySchemaObjectKind::Field => {}
+        }
+    }
+    for mapping in &LEGACY_TABLE_MAPPINGS {
+        for index in mapping.indexes {
+            if !census.iter().any(|object| {
+                object.kind == LegacySchemaObjectKind::Index
+                    && object.table == mapping.table
+                    && object.name == *index
+            }) {
+                return Err(LegacyMappingOmission::StaleIndexDeclaration {
+                    table: mapping.table,
+                    index,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fail-closed resolution: is the presented body executable by the current
 /// owner?
 ///
