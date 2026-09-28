@@ -16,7 +16,10 @@ mod contracts;
 mod error;
 pub mod overlay_display_1864;
 
-pub use assessment::{AssessmentInput, AssessmentResultOrIncomplete, assess_learning_activation};
+pub use assessment::{
+    AssessmentInput, AssessmentResultOrIncomplete, ObservedAdherence, ObservedDelivery,
+    ObservedRetrieval, ObservedUse, assess_learning_activation,
+};
 pub use contracts::{
     AssessmentPolicy, AssessmentResult, IncompleteAssessment, MAX_DIMENSIONS, MAX_INPUT_BYTES,
     MAX_METRICS, MAX_OUTPUT_BYTES, MAX_REFERENCES, MAX_STAGES, MissingAssessmentField,
