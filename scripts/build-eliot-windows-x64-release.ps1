@@ -2391,6 +2391,119 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
     }
 }
 
+function Get-LegacyEntrypointDispositions {
+    $notObserved = [ordered]@{
+        status = 'NOT_PERFORMED'
+        detail = 'No installed Windows runtime invocation was performed by the release builder.'
+    }
+    $consumers = @(
+        [ordered]@{
+            entrypoint = 'Claude Code MCP stdio --host claude'
+            source_config = 'integrations/claude/eliot/.mcp.json'
+            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
+            packaged_config = $null
+            command = '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe'
+            args = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
+            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
+            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, emit the stderr REDIRECT receipt and delegate this Claude edge to the Bridge; success exits with the child status, and resolution/launch failure emits structured ERROR. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = 'Claude Code agent-bridge declaration and Kernel canonical configuration route.'
+        },
+        [ordered]@{
+            entrypoint = 'Claude Desktop MCP stdio --host claude-desktop'
+            source_config = 'integrations/claude/claude-desktop/mcpb/manifest.json'
+            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
+            packaged_config = $null
+            command = '${__dirname}/server/eliot-governor.exe'
+            args = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
+            configured_environment = [ordered]@{}
+            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not in env)'
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio; do not delegate this host to the Bridge. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = $null
+        },
+        [ordered]@{
+            entrypoint = 'OpenCode MCP stdio --host opencode'
+            source_config = 'integrations/opencode/opencode.json'
+            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
+            packaged_config = $null
+            command = @('{env:ELIOT_GOVERNOR_EXE}', 'mcp', 'stdio', '--host', 'opencode', '--instance', 'default')
+            configured_environment = 'No MCP env member; command resolves the executable through ELIOT_GOVERNOR_EXE.'
+            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not declared)'
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio; do not delegate this host to the Bridge. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = $null
+        },
+        [ordered]@{
+            entrypoint = 'Codex MCP stdio profile codex_controller'
+            source_config = 'plugin/eliot-governor/.mcp.json'
+            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
+            packaged_config = 'integrations/codex/plugins/eliot-governor/.mcp.json'
+            command = 'bin/eliot-governor.exe'
+            cwd = '.'
+            args = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
+            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio; do not delegate this host to the Bridge. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = $null
+        }
+    )
+    $dispositions = @(
+        foreach ($consumer in $consumers) {
+            [ordered]@{
+                entrypoint = $consumer.entrypoint
+                behavior = $consumer.behavior
+                canonical_route = $consumer.canonical_route
+                launch_configuration = $consumer
+                source_behavior_status = 'SOURCE_DECLARED'
+                observed_behavior = $notObserved
+            }
+        }
+        [ordered]@{
+            entrypoint = 'eliot-governor.exe daemon run'
+            behavior = 'With the selected agent-bridge flag, refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before DbClientSet/CanonicalStore start or ControlWal/WriterActor construction; otherwise preserve the legacy path.'
+            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
+            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('daemon', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
+            source_behavior_status = 'SOURCE_DECLARED'
+            observed_behavior = $notObserved
+        }
+        [ordered]@{
+            entrypoint = 'eliot-governor.exe service run'
+            behavior = 'With the selected agent-bridge flag, refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy service handling; otherwise preserve the legacy path.'
+            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
+            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('service', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
+            source_behavior_status = 'SOURCE_DECLARED'
+            observed_behavior = $notObserved
+        }
+        [ordered]@{
+            entrypoint = 'eliot-governor.exe hook <event>'
+            behavior = 'With the selected agent-bridge flag, refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before hook handling; otherwise preserve the legacy path.'
+            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
+            launch_configuration = [ordered]@{
+                source_config = 'plugin/eliot-governor/hooks/hooks.json'
+                commands = @(
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook session-start',
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-tool-use',
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-tool-use',
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-compact',
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-compact',
+                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook stop'
+                )
+                environment = 'No cutover flag declared; effective value NOT_OBSERVED.'
+            }
+            source_behavior_status = 'SOURCE_DECLARED'
+            observed_behavior = $notObserved
+        }
+        [ordered]@{
+            entrypoint = 'eliot.exe setup/canary legacy-owner checks'
+            behavior = 'When governor.toml exists, the Governor process is running, or the OS observation is unknown, fail closed with the corresponding legacy cutover code and canonical-route receipt.'
+            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
+            launch_configuration = [ordered]@{ command = 'eliot.exe'; args = @('setup'); environment = 'Legacy-owner check; installed invocation NOT_OBSERVED.' }
+            source_behavior_status = 'SOURCE_DECLARED'
+            observed_behavior = $notObserved
+        }
+    )
+    return $dispositions
+}
+
 function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
@@ -2462,8 +2575,9 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
             gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
-            entrypoint_disposition = 'retained-legacy-entrypoint (#1858: with ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, every non-stdio command arm refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical-route receipt before its handler (including daemon/service/hook, writer smoke, maintenance run, and import execute); mcp stdio emits that receipt to stderr and redirects to the approved Bridge on every host; flag absent preserves the legacy path)'
-            cutover_behavior = 'every non-stdio command arm refuses with code before its handler once flagged; mcp stdio writes a stderr redirect receipt and delegates to Bridge, returning child status on success and structured ERROR on resolution/launch failure; no legacy store or writer starts; legacy path preserved while the flag is absent'
+            entrypoint_disposition = 'retained-legacy-entrypoints; selected agent-bridge redirects only Claude MCP stdio, returns structured ERROR for other MCP stdio hosts and non-stdio arms; absent or legacy selection preserves legacy paths'
+            cutover_behavior = 'source-declared conditional behavior; source launch configs do not select ELIOT_CLAUDE_FRONT_DOOR, and effective inherited selection is NOT_OBSERVED'
+            entrypoint_behaviors = @(Get-LegacyEntrypointDispositions)
         }
     }
     if ($FrontDoorBridge) {
@@ -3505,7 +3619,7 @@ $plan = [ordered]@{
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
         other_hosts = if ($legacyGovernorPresent) {
-            'flag-gated (codex/opencode/claude-desktop non-stdio command entries refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical-route receipt before their handlers; mcp stdio on all hosts writes a stderr redirect receipt and delegates to the approved Bridge; legacy entries only while the flag is absent)'
+            'source-declared conditional: ELIOT_CLAUDE_FRONT_DOOR=agent-bridge redirects only MCP stdio --host claude through the existing Claude declaration; MCP stdio --host codex/opencode/claude-desktop returns structured ERROR before legacy mcp stdio, and selected non-stdio legacy arms refuse before their handlers; absent/legacy selection preserves legacy routes. Source configs do not declare the flag and effective inherited values are NOT_OBSERVED.'
         }
         else {
             "retired (no legacy entrypoint exists on any host under detached owner approval $($governorApprovalReference.content_sha256) for candidate $sourceCommit; per-consumer replacement or explicit product-removal decision is admitted by that approval; installer and runtime role requirements stay separate)"
@@ -3976,7 +4090,7 @@ try {
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
     $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
-    $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
+    $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     $release = [ordered]@{
         component = 'eliot_windows_x64_release'
@@ -3996,34 +4110,7 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
-            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(
-                [ordered]@{
-                    entrypoint = 'eliot-governor.exe mcp stdio --host <any> --instance default'
-                    behavior = 'redirect-to-approved-Bridge on every host edge (claude, codex, opencode, claude-desktop) once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack: write LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical route receipt to stderr, then delegate; successful delegation exits with child status, resolution/launch failure emits structured ERROR after the redirect receipt; legacy path otherwise'
-                    canonical_route = 'eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)'
-                }
-                [ordered]@{
-                    entrypoint = 'eliot-governor.exe daemon run'
-                    behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once the flag selects the new stack, before any DbClientSet/CanonicalStore start or ControlWal/WriterActor construction; legacy path otherwise'
-                    canonical_route = 'same canonical route as above'
-                }
-                [ordered]@{
-                    entrypoint = 'eliot-governor.exe service run'
-                    behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once the flag selects the new stack, on the same terms as daemon run; legacy path otherwise'
-                    canonical_route = 'same canonical route as above'
-                }
-                [ordered]@{
-                    entrypoint = 'eliot-governor.exe hook <event>'
-                    behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt on every hook event once the flag selects the new stack, before hook processing; legacy path otherwise'
-                    canonical_route = 'same canonical route as above'
-                }
-                [ordered]@{
-                    entrypoint = 'eliot.exe setup/canary with a present legacy governor.toml, a running eliot-governor.exe, or an unknown OS observation'
-                    behavior = 'unconditional fail-closed refusal with LEGACY_GOVERNOR_CONFIG_RETIRED / LEGACY_GOVERNOR_PROCESS_RUNNING / LEGACY_GOVERNOR_OBSERVATION_UNKNOWN plus the canonical-route receipt'
-                    canonical_route = 'same canonical route as above'
-                }
-            )
-            }
+            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions) }
             else {
                 @(
                     [ordered]@{
@@ -4033,7 +4120,7 @@ try {
                 )
             }
             source_declared_behavior = if ($legacyGovernorPresent) {
-                'source-derived from crates/eliot-app/src/main.rs::dispatch_command: once the flag selects the new stack, every non-stdio command arm returns a structured cutover refusal before its handler (including daemon/service/hook, writer smoke, maintenance run, and import execute); mcp stdio on every host writes LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical_route to stderr and delegates to the approved Bridge; successful delegation exits with child status, while bridge resolution/launch failure emits structured ERROR after the redirect receipt; no legacy handler starts a daemon/store or constructs ControlWal/WriterActor; flag absent preserves the legacy path'
+                'source-derived from crates/eliot-app/src/main.rs::dispatch_command: ELIOT_CLAUDE_FRONT_DOOR=agent-bridge redirects only MCP stdio --host claude to the approved Bridge; other MCP stdio hosts return structured LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER ERROR before legacy mcp stdio. Selected non-stdio arms refuse before their handlers. An absent or legacy flag preserves legacy behavior. Source consumer configs do not select the flag; effective inherited selection is NOT_OBSERVED.'
             }
             else {
                 'no legacy entrypoint exists on any host under the accepted owner receipt; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'

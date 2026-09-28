@@ -2238,10 +2238,10 @@ async fn dispatch_command(
     // #1858 (I19.10): single front-door entry gate. Once the flag selects the
     // new stack, every legacy entrypoint except `mcp stdio` refuses here with
     // the stable cutover code plus canonical-route receipt, before any arm
-    // handler runs. MCP stdio falls through to its own arm; only the exact
-    // Claude host branch delegates to Bridge when the flag is selected, while
-    // other hosts retain their existing MCP route. Absent or unknown flag
-    // values preserve today's behavior on every arm.
+    // handler runs. MCP stdio falls through to its host-aware arm: only the
+    // exact `--host claude` branch delegates to Bridge; every other host is
+    // rejected there with host evidence before `mcp_stdio::run`. Absent or
+    // unknown flag values preserve today's behavior on every arm.
     if front_door_cutover::front_door_cutover_selected()
         && !matches!(
             command,
@@ -2660,10 +2660,11 @@ async fn dispatch_command(
             // `--host claude` value delegates to the approved Bridge. Its
             // redirect receipt goes to stderr, keeping stdout available for
             // the delegated JSON-RPC session. Every other host, including
-            // Claude Desktop, follows its existing MCP route even when the
-            // flag is selected; an absent or unknown flag also preserves the
-            // existing route. The selected Claude path returns before legacy
-            // daemon, store, ControlWal, or WriterActor initialization.
+            // Claude Desktop, receives a structured cutover rejection with
+            // its supplied host evidence before `mcp_stdio::run`; an absent
+            // or unknown flag preserves the existing route. The selected
+            // Claude path returns before legacy daemon, store, ControlWal, or
+            // WriterActor initialization.
             //
             // #2562: on the selected path this process additionally delegates
             // to the approved Bridge instead of stopping at the refusal. A
@@ -2671,6 +2672,18 @@ async fn dispatch_command(
             // owns the stdio session from here. Resolution or launch failures
             // keep the refusal receipt and return fail-closed with no legacy
             // fallback.
+            if host.as_deref() != Some("claude")
+                && let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
+                    "eliot-governor mcp stdio",
+                    host.as_deref(),
+                )
+            {
+                front_door_cutover::write_cutover_rejection(
+                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                    &detail,
+                );
+                return Err(anyhow::anyhow!(detail));
+            }
             if host.as_deref() == Some("claude")
                 && let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
                     "eliot-governor mcp stdio",
