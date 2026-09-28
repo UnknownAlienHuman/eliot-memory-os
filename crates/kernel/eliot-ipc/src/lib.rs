@@ -590,6 +590,16 @@ pub const BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS: BackpressureSignal = Backpressur
     "only the new recovery-window open shed and deferred; existing live windows and recovery retained",
 );
 
+/// A new recovery cut was refused at the bounded cut capacity. Wait for
+/// expired-window cleanup to reclaim cut slots before reissuing the exact
+/// authenticated selector. The refused transaction retains every existing
+/// recovery window and cut.
+pub const BACKPRESSURE_BRIDGE_RECOVERY_CUTS: BackpressureSignal = BackpressureSignal::new(
+    "bridge-recovery-cuts",
+    "wait for expired recovery-window cut cleanup, then reissue the exact authenticated recovery selector",
+    "only the requested new recovery cut deferred; all existing recovery windows and cuts retained",
+);
+
 impl TransportError {
     /// Reports the backpressure dimension attributable at the transport
     /// seam: [`BACKPRESSURE_BRIDGE_DISPATCH`] for [`TransportError::Backpressure`],

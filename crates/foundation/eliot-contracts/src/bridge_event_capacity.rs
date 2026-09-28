@@ -57,6 +57,8 @@ pub enum BridgeTransportBackpressureDimension {
     BridgeHostRequestDispatch,
     #[serde(rename = "bridge-recovery-windows")]
     BridgeRecoveryWindows,
+    #[serde(rename = "bridge-recovery-cuts")]
+    BridgeRecoveryCuts,
 }
 
 /// Closed recovery actions allowed for front-door transport backpressure.
@@ -88,6 +90,10 @@ pub enum BridgeTransportBackpressureRecoveryAction {
         rename = "reuse an exact live matching recovery window, or wait for expiry then reissue the authenticated open"
     )]
     ReuseExactLiveRecoveryWindowOrWaitForExpiry,
+    #[serde(
+        rename = "wait for expired recovery-window cut cleanup, then reissue the exact authenticated recovery selector"
+    )]
+    WaitForExpiredRecoveryWindowCutCleanupThenRetryAuthenticatedSelector,
 }
 
 /// Closed descriptions of work shed or deferred by the front door.
@@ -113,6 +119,10 @@ pub enum BridgeTransportBackpressureShedWork {
         rename = "only the new recovery-window open shed and deferred; existing live windows and recovery retained"
     )]
     DeferredNewRecoveryWindowOpenExistingRecoveryRetained,
+    #[serde(
+        rename = "only the requested new recovery cut deferred; all existing recovery windows and cuts retained"
+    )]
+    DeferredNewRecoveryCutExistingRecoveryRetained,
 }
 
 /// The only generic transport outcome currently emitted by the front door.
@@ -174,6 +184,10 @@ impl BridgeTransportBackpressure {
                     BridgeTransportBackpressureDimension::BridgeRecoveryWindows,
                     BridgeTransportBackpressureRecoveryAction::ReuseExactLiveRecoveryWindowOrWaitForExpiry,
                     BridgeTransportBackpressureShedWork::DeferredNewRecoveryWindowOpenExistingRecoveryRetained,
+                ) | (
+                    BridgeTransportBackpressureDimension::BridgeRecoveryCuts,
+                    BridgeTransportBackpressureRecoveryAction::WaitForExpiredRecoveryWindowCutCleanupThenRetryAuthenticatedSelector,
+                    BridgeTransportBackpressureShedWork::DeferredNewRecoveryCutExistingRecoveryRetained,
                 )
             )
     }
