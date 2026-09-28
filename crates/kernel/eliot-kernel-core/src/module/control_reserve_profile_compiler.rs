@@ -29,12 +29,25 @@
 //! - it never reuses another owner's counter. A `CLAIMED` record must name
 //!   the owner the frozen owner map binds to that exact dimension.
 //!
-//! The owner record publishers are the owner-wave migration (issue #1679 W3):
-//! until an owner adapter publishes a record, its dimension stays `UNKNOWN`
-//! here rather than being described from a neighbouring owner's numbers. That
-//! also means this crate holds no in-tree call site yet: the first production
-//! caller is the Kernel composition that joins owner evidence, and that edge
-//! is filed separately from this compiler.
+//! Two limits of what this step can decide, stated so no reader infers more
+//! coverage than exists:
+//!
+//! - Owner-generation staleness is not checked here. The frozen
+//!   [`frozen_bottleneck_owner_map`] binding carries no owner-generation
+//!   value, and [`ControlReserveProfile`] carries no expected-generation
+//!   field, so the compiler has no current generation to compare an owner's
+//!   `owner_generation_ref` against. It binds the reference the owner
+//!   published; detecting that the owner has since changed generation
+//!   requires the owner adapters (issue #1679 W3).
+//! - The owner record publishers are that same owner-wave migration. Until an
+//!   owner adapter publishes a record, its dimension stays `UNKNOWN` here
+//!   rather than being described from a neighbouring owner's numbers.
+//!
+//! Consequently this compiler currently has no in-tree call site. The
+//! production caller the contract names is the Kernel composition that joins
+//! owner evidence, and that edge does not exist in this tree. `STITCH`: the
+//! compiler is landed without a caller rather than given a manufactured one
+//! (no startup hook, no `fn main` call, no discarded-result statement).
 
 use eliot_contracts::EpochId;
 use eliot_runtime_contracts::{
@@ -61,13 +74,20 @@ pub struct BottleneckOwnerEvidence {
     pub row: BottleneckCapacityProfile,
 }
 
-/// Composition-bound identity of one compiled control-reserve profile.
+/// Composition-supplied identity of one compiled control-reserve profile.
 ///
-/// Every field is bound from a real owner input; none is a default.
-/// `compiled_at_ms` is the reading of the current clock the composition
-/// already uses for its other stamps: the compiler never reads a clock
-/// itself, so no caller can substitute a literal or a second, locally
-/// invented time source.
+/// The composition owns every field here and the compiler reads none of them
+/// from a default: product identity, generation references, configuration
+/// snapshot, profile revision, Authority Epoch, evidence references and
+/// invalidation set are exactly the values the composition resolved. The
+/// compiler itself opens no clock and consults no environment, so
+/// `compiled_at_ms` can only be the composition's own existing clock reading.
+///
+/// The frozen [`ControlReserveProfile::validate`] checks the denominator, every
+/// row, and the canonicity of the set-like fields. It does not police the
+/// scalar identity strings, so supplying a real resolved configuration
+/// snapshot, product identity, profile revision, and clock reading is the
+/// composition's obligation; this step neither re-derives nor defaults them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlReserveProfileIdentity {
     /// Stable profile identity.
