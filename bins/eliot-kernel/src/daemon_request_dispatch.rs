@@ -37,8 +37,9 @@ use eliot_process::{
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
-    HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt, RequestIdentity,
-    TaskControllerResultBody, host_request_operation_id,
+    HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt,
+    LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
+    host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -7139,10 +7140,26 @@ impl KernelComposition {
             wire_version: HostRequestResultBody::CONTRACT_VERSION,
             operation_id: operation_id.clone(),
             request_sha256: envelope.envelope_sha256.clone(),
-            result_digest: digest,
+            result_digest: digest.clone(),
             response: body,
             attempt: Some(attempt),
             lineage: Some(lineage),
+            // Issue #1838: this leg executed the read, so it reports its own
+            // execution evidence for the sealed trace manifest. The read-only
+            // leg produces no external effect; the executor has no stable
+            // self-identity at this site, so that slot stays honestly absent.
+            evidence: Some(LocalReadExecutionEvidence {
+                wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
+                wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
+                operation_id: operation_id.clone(),
+                invoked_operation: Some("local_read".to_owned()),
+                actual_route: Some(receipt.receipt_sha256.clone()),
+                adapter_identity: Some(session.connection_id.clone()),
+                executor_identity: None,
+                input_handle: Some(envelope.envelope_sha256.clone()),
+                output_handle: Some(digest),
+                side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
+            }),
         };
         submission
             .validate_local_read_submission()

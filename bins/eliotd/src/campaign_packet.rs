@@ -1450,6 +1450,10 @@ fn campaign_packet_result_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: the packet flight wires execution evidence
+        // for compiled packets; until then the sealed manifest honestly lists
+        // the absent evidence as missing parts.
+        evidence: None,
     };
     body.validate()
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;

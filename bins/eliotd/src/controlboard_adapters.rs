@@ -462,6 +462,10 @@ pub fn controlboard_result_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: the board owner wires execution evidence for
+        // locally served reads; until then the sealed manifest honestly lists
+        // the absent evidence as missing parts.
+        evidence: None,
     };
     body.validate().map_err(|error| {
         ControlBoardError::Provider(format!("controlboard result body shape: {error}"))
@@ -528,6 +532,9 @@ fn controlboard_unbound_refusal_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: no execution evidence on the unbound refusal
+        // body; the sealed manifest lists it as missing parts.
+        evidence: None,
     };
     // The gate is run, not assumed; its verdict is the one already observed
     // above and is adjudicated by the submit leg, not by this arm.

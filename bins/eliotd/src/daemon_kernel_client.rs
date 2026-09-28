@@ -25,9 +25,9 @@ use eliot_protocol::{
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
-    host_request_operation_id,
+    HostRequestResultBody, LocalReadAttempt, LocalReadExecutionEvidence, MessageType,
+    ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
+    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
@@ -2217,6 +2217,9 @@ impl DaemonKernelClient {
     /// design) or fails its own digest binding; `NotAdmitted` / `Unknown` for
     /// transport outcomes via [`kernel_port_error`].
     ///
+    /// The rebuilt body carries the daemon-observed execution evidence
+    /// (issue #1838) built by [`Self::forward_local_read_evidence`].
+    ///
     /// Production caller:
     /// [`forward_admitted_local_read`](super::forward_admitted_local_read),
     /// driven per claimed pair by the daemon runtime poller.
@@ -2271,6 +2274,50 @@ impl DaemonKernelClient {
                 "Kernel local read answer is not an admission".to_owned(),
             ));
         }
+        let (operation_id, body_digest, body_response) =
+            Self::admitted_local_read_halves(admitted, &pair.envelope)?;
+        // Rebuilt, never decoded: the ORS record carries the digest-bound
+        // response halves, while the operation handle, envelope binding, and
+        // attempt capability are proven here from the admitted answer. The
+        // body carries the presented attempt verbatim so submit completes
+        // under the generation the read ran under.
+        let body = HostRequestResultBody {
+            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: operation_id.to_owned(),
+            request_sha256: pair.envelope.envelope_sha256.clone(),
+            result_digest: body_digest.to_owned(),
+            response: body_response,
+            attempt: Some(attempt),
+            lineage: None,
+            evidence: Some(Self::forward_local_read_evidence(
+                admitted,
+                operation_id,
+                &self.connection_id,
+                &self.kernel_binding.daemon_artifact_sha256,
+                &pair.envelope.envelope_sha256,
+                body_digest,
+            )),
+        };
+        body.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if body.request_sha256 != pair.envelope.envelope_sha256
+            || body.operation_id != host_request_operation_id(&pair.envelope)
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel local read result does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Reads the operation handle plus the digest-bound response halves from
+    /// one admitted `local_read` answer, proving the admission binds the
+    /// admitted envelope.
+    fn admitted_local_read_halves<'a>(
+        admitted: &'a serde_json::Map<String, serde_json::Value>,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(&'a str, &'a str, serde_json::Value), KernelPortError> {
         let operation_id = admitted
             .get("operation_id")
             .and_then(serde_json::Value::as_str)
@@ -2279,7 +2326,7 @@ impl DaemonKernelClient {
                     "Kernel local read admission omits the operation handle".to_owned(),
                 )
             })?;
-        if operation_id != host_request_operation_id(&pair.envelope) {
+        if operation_id != host_request_operation_id(envelope) {
             return Err(KernelPortError::Contract(
                 "Kernel local read admission does not bind the admitted envelope".to_owned(),
             ));
@@ -2304,31 +2351,43 @@ impl DaemonKernelClient {
                         .to_owned(),
                 )
             })?;
-        // Rebuilt, never decoded: the ORS record carries the digest-bound
-        // response halves, while the operation handle, envelope binding, and
-        // attempt capability are proven here from the admitted answer. The
-        // body carries the presented attempt verbatim so submit completes
-        // under the generation the read ran under.
-        let body = HostRequestResultBody {
-            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
-            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        Ok((operation_id, body_digest, body_response))
+    }
+
+    /// Builds the daemon-observed execution evidence for one forwarded
+    /// local read (issue #1838).
+    ///
+    /// Reports the invoked `local_read` operation, the actual-route receipt
+    /// digest from the admission answer, the presenting connection and daemon
+    /// artifact identities, the immutable input/output handles, and the
+    /// observed side-effect declaration for the sealed trace manifest. A
+    /// missing admission receipt leaves the actual route honestly absent
+    /// instead of inventing one.
+    fn forward_local_read_evidence(
+        admitted: &serde_json::Map<String, serde_json::Value>,
+        operation_id: &str,
+        connection_id: &str,
+        daemon_artifact: &str,
+        envelope_digest: &str,
+        result_digest: &str,
+    ) -> LocalReadExecutionEvidence {
+        let actual_route = admitted
+            .get("receipt")
+            .and_then(|receipt| receipt.get("receipt_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        LocalReadExecutionEvidence {
+            wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
+            wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
             operation_id: operation_id.to_owned(),
-            request_sha256: pair.envelope.envelope_sha256.clone(),
-            result_digest: body_digest.to_owned(),
-            response: body_response,
-            attempt: Some(attempt),
-            lineage: None,
-        };
-        body.validate()
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-        if body.request_sha256 != pair.envelope.envelope_sha256
-            || body.operation_id != host_request_operation_id(&pair.envelope)
-        {
-            return Err(KernelPortError::Contract(
-                "Kernel local read result does not bind the admitted envelope".to_owned(),
-            ));
+            invoked_operation: Some("local_read".to_owned()),
+            actual_route,
+            adapter_identity: Some(connection_id.to_owned()),
+            executor_identity: Some(daemon_artifact.to_owned()),
+            input_handle: Some(envelope_digest.to_owned()),
+            output_handle: Some(result_digest.to_owned()),
+            side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
         }
-        Ok(body)
     }
 
     fn clone_for_future(&self) -> Arc<Self> {
