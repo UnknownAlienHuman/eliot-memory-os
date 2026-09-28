@@ -21,10 +21,11 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, bind_act_owner_inputs,
-    bind_list_surface_budget, canonical_tool_schemas, classify_tool_request,
-    decode_protected_request_bytes, is_act_request, published_mcp_tool_surface,
-    reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
+    McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, ToolRequest, ToolSchema,
+    TypedRejection, bind_act_owner_inputs, bind_list_surface_budget, canonical_tool_schemas,
+    classify_tool_request, decode_protected_request_bytes, is_act_request,
+    published_mcp_tool_surface, reject_duplicate_keys, validate_proof_ceiling,
+    validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -2276,14 +2277,39 @@ pub fn initialize_result(version: NegotiatedWireVersion, server_version: &str) -
     })
 }
 
-/// Builds the `tools/list` result from the generated canonical schemas.
+/// Builds the no-task discovery `tools/list` result from the generated schemas.
 ///
 /// Every entry comes from `canonical_tool_schemas`, generated from the same
 /// `serde`/`schemars` contract types EBP clients use. A method with no
 /// registered semantic owner is absent here, so the listing follows the
 /// owner and never advertises an unimplemented tool.
+///
+/// Discovery carries no owner-supplied task conditions, so no task-relative
+/// narrowing applies here: the bridge never mints task, role, grant, or
+/// capability facts. Task-bound publication compiles a decision from real
+/// owner facts (#1745) and renders through
+/// [`tools_list_result_for_permitted_surface`], which shares the single
+/// projection below, so discovery and task-relative listings cannot drift.
 pub fn tools_list_result() -> Result<Value, WireRejection> {
-    canonical_tool_schemas_for_list()
+    let schemas = published_mcp_tool_surface().map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "generated tool schemas are unavailable",
+        )
+    })?;
+    render_tool_list_surface(&schemas)
+}
+
+/// Builds a task-relative `tools/list` result from a #1745 permitted subset.
+///
+/// The subset arrives already derived from a decision compiled over
+/// owner-supplied task conditions; this entry only projects it through the
+/// same envelopes, identity `_meta`, dialect record, and budget binding as
+/// discovery, so withheld methods stay absent without a second projection.
+pub fn tools_list_result_for_permitted_surface(
+    surface: &PermittedTaskSurface,
+) -> Result<Value, WireRejection> {
+    render_tool_list_surface(&surface.permitted)
 }
 
 /// Rejects a blank string wire identity before typed projection.
@@ -2789,14 +2815,18 @@ fn bound_wire_text(value: &str) -> String {
     }
 }
 
-fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
-    let schemas = published_mcp_tool_surface().map_err(|_| {
-        WireRejection::new(
-            WIRE_INTERNAL_ERROR,
-            "generated tool schemas are unavailable",
-        )
-    })?;
-    let tools: Vec<Value> = schemas
+/// Projects generated descriptors onto the single advertised list shape.
+///
+/// Presentation translates only the `tools/list` envelope keys: each
+/// descriptor's input and output schemas move verbatim, preserving
+/// referenced definitions, nested discriminators, and semantic constraints.
+/// Identity travels in the additive per-entry `_meta` (schema digest plus
+/// the definition version owned by the canonical version owner), and the
+/// list `_meta` records the one schema dialect every rendered schema
+/// declares, so a host that cannot represent it can withhold the surface
+/// instead of silently dropping constraints.
+fn render_tool_list_surface(descriptors: &[ToolSchema]) -> Result<Value, WireRejection> {
+    let tools: Vec<Value> = descriptors
         .iter()
         .map(|schema| {
             json!({
@@ -2811,6 +2841,7 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
             })
         })
         .collect();
+    let dialect = list_schema_dialect(descriptors)?;
     // I7.24 host catalogue projection: bind the actual rendered surface to
     // its generated budget. The budget measures these exact entries; the
     // additive `_meta` object carries the evidence without changing the
@@ -2821,12 +2852,52 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
     let budget_value = serde_json::to_value(&budget).map_err(|_| {
         WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface budget is unavailable")
     })?;
+    let mut meta = Map::new();
+    meta.insert("eliot/surfaceBudget".to_owned(), budget_value);
+    if let Some(dialect) = dialect {
+        meta.insert("eliot/schemaDialect".to_owned(), Value::String(dialect));
+    }
     Ok(json!({
         "tools": tools,
-        "_meta": {
-            "eliot/surfaceBudget": budget_value,
-        },
+        "_meta": Value::Object(meta),
     }))
+}
+
+/// Reads the one schema dialect declared by every rendered schema.
+///
+/// The value comes from the generator's own `$schema` output, never from a
+/// second configuration, so the record cannot drift from what is served. An
+/// empty surface records no dialect; disagreement fails closed.
+fn list_schema_dialect(descriptors: &[ToolSchema]) -> Result<Option<String>, WireRejection> {
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+    let mut expected: Option<&str> = None;
+    for descriptor in descriptors {
+        for schema in [&descriptor.input_schema, &descriptor.output_schema] {
+            let Some(dialect) = schema
+                .get("$schema")
+                .and_then(Value::as_str)
+                .filter(|dialect| !dialect.is_empty())
+            else {
+                return Err(WireRejection::new(
+                    WIRE_INTERNAL_ERROR,
+                    "generated tool schemas disagree on schema dialect",
+                ));
+            };
+            match expected {
+                None => expected = Some(dialect),
+                Some(known) if known == dialect => {}
+                Some(_) => {
+                    return Err(WireRejection::new(
+                        WIRE_INTERNAL_ERROR,
+                        "generated tool schemas disagree on schema dialect",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(expected.map(str::to_owned))
 }
 
 #[cfg(test)]
