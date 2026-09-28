@@ -42,6 +42,10 @@ pub const DESCRIBE_FUNC: &str = "describe";
 
 const MAX_TYPED_FIELD_BYTES: usize = 512;
 const MAX_TYPED_IDENTITY_BYTES: usize = 128;
+/// Ceiling on one provider-reported import or export name list. The bound
+/// keeps a provider's observation from becoming an unbounded error or
+/// comparison input; the actual identity set is whatever the provider saw.
+const MAX_OBSERVED_NAMES: usize = 256;
 /// Decode-only allocation guard. Admission bounds always come from Governor
 /// limits; this cap only bounds the envelope parser itself.
 const MAX_TYPED_ENVELOPE_BYTES: usize = 1_048_576;
