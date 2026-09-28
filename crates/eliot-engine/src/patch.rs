@@ -1298,8 +1298,10 @@ fn truncate_lossy(bytes: &[u8]) -> String {
 /// Acceptance-eligibility quarantine for the legacy command lane (issue
 /// #1852 W3): a run executed through the private command map carries
 /// [`QUARANTINED_LEGACY_LANE`] as its summary prefix, and no such run may
-/// satisfy a required verifier, no matter its status.
-fn is_quarantined_legacy_run(run: &VerifierRun) -> bool {
+/// satisfy a required verifier, no matter its status. Shared with the
+/// work-queue selection point so a quarantined run cannot be selected by an
+/// authority-facing caller either.
+pub(crate) fn is_quarantined_legacy_run(run: &VerifierRun) -> bool {
     run.summary.starts_with(QUARANTINED_LEGACY_LANE)
 }
 
