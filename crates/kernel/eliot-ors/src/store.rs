@@ -3065,6 +3065,8 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// `Unknown`/`Reconciling` and terminal rows are returned unchanged.
     fn cancel_host_request_parent(
         &self,
+        cancellation_operation_id: &crate::OperationIdentity,
+        cancellation_request_digest: &str,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
@@ -7962,12 +7964,23 @@ impl RedbRecoveryStore {
     /// `Cancelled` edge, so it is conservatively fenced as `Unknown`.
     pub fn cancel_host_request_parent(
         &self,
+        cancellation_operation_id: &crate::OperationIdentity,
+        cancellation_request_digest: &str,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(
+            cancellation_request_digest,
+            "host_request_cancellation_request_digest",
+        )?;
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let write = self.database.begin_write().map_err(storage)?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let cancellation_key = format!(
+            "{}::{}",
+            cancellation_operation_id.as_str(),
+            cancellation_request_digest
+        );
         let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
@@ -7985,6 +7998,49 @@ impl RedbRecoveryStore {
                 operation_id: operation_id.as_str().to_owned(),
                 request_digest: request_digest.to_owned(),
             });
+        }
+
+        let mut cancellation: crate::HostRequestRecord = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(cancellation_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or(OrsError::HostRequestIdentityConflict {
+                    operation_id: cancellation_operation_id.as_str().to_owned(),
+                    request_digest: cancellation_request_digest.to_owned(),
+                })?
+        };
+        cancellation.validate()?;
+        if cancellation.operation_id != *cancellation_operation_id
+            || cancellation.request_digest != cancellation_request_digest
+            || cancellation.kind != crate::HostRequestKind::Cancellation
+            || cancellation
+                .parent_operation_id
+                .as_ref()
+                .map(crate::OpaqueLabel::as_str)
+                != Some(operation_id.as_str())
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: cancellation_operation_id.as_str().to_owned(),
+                request_digest: cancellation_request_digest.to_owned(),
+            });
+        }
+
+        if let Some(bound) = cancellation.cancellation_target.as_ref() {
+            if bound.parent_operation_id != *operation_id
+                || bound.parent_request_digest != request_digest
+            {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: cancellation_operation_id.as_str().to_owned(),
+                    request_digest: cancellation_request_digest.to_owned(),
+                });
+            }
+            // A replay observes the current parent but never applies its
+            // original intent to a later attempt.
+            write.commit().map_err(storage)?;
+            return Ok(Some(existing));
         }
 
         let target = match existing.state {
@@ -8010,23 +8066,38 @@ impl RedbRecoveryStore {
                 }
             }
         };
-        if target == existing.state {
-            write.commit().map_err(storage)?;
-            return Ok(Some(existing));
+        if target != existing.state {
+            existing.state.transition_to(target)?;
         }
-
-        existing.state.transition_to(target)?;
         let mut next = existing.clone();
         next.state = target;
         if target.is_terminal() && next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
         next.validate()?;
-        let payload = encode(&next)?;
+        cancellation.cancellation_target = Some(crate::HostRequestCancellationTarget {
+            parent_operation_id: operation_id.clone(),
+            parent_request_digest: request_digest.to_owned(),
+            attempt: existing.attempt.as_ref().map(|attempt| {
+                crate::HostRequestCancellationAttempt {
+                    attempt_id: attempt.attempt_id.clone(),
+                    generation: attempt.generation,
+                }
+            }),
+            parent_disposition: target,
+        });
+        cancellation.validate()?;
+        let parent_payload = encode(&next)?;
+        let cancellation_payload = encode(&cancellation)?;
         {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            if next != existing {
+                table
+                    .insert(key.as_str(), parent_payload.as_str())
+                    .map_err(storage)?;
+            }
             table
-                .insert(key.as_str(), payload.as_str())
+                .insert(cancellation_key.as_str(), cancellation_payload.as_str())
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
@@ -25980,10 +26051,18 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
 
     fn cancel_host_request_parent(
         &self,
+        cancellation_operation_id: &crate::OperationIdentity,
+        cancellation_request_digest: &str,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
-        RedbRecoveryStore::cancel_host_request_parent(self, operation_id, request_digest)
+        RedbRecoveryStore::cancel_host_request_parent(
+            self,
+            cancellation_operation_id,
+            cancellation_request_digest,
+            operation_id,
+            request_digest,
+        )
     }
 
     fn claim_host_request_attempt(
@@ -26551,11 +26630,17 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     /// Atomically classifies cancellation using the current durable attempt.
     pub fn cancel_host_request_parent(
         &self,
+        cancellation_operation_id: &crate::OperationIdentity,
+        cancellation_request_digest: &str,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
-        self.store
-            .cancel_host_request_parent(operation_id, request_digest)
+        self.store.cancel_host_request_parent(
+            cancellation_operation_id,
+            cancellation_request_digest,
+            operation_id,
+            request_digest,
+        )
     }
 
     /// Persists a daemon attempt before returning its executable claim.
@@ -27399,6 +27484,7 @@ mod host_request_result_tests {
             deadline_unix_ms: 9_999_999,
             state: HostRequestState::Requested,
             attempt: None,
+            cancellation_target: None,
             result_digest: None,
             result_response: None,
             result_evidence: None,
