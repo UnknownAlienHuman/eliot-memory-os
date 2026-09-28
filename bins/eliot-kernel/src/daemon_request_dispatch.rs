@@ -20,8 +20,10 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
-    StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
+    AuthenticatedUserAutomationHostExecutionTransport, MaintenanceTriggerCommitOutcome,
+    MaintenanceTriggerIntakeFailure, MaintenanceTriggerLifecycleFailure, NamedReadGatewayError,
+    PreStageRejection, StoreApplyRefusal, UserAutomationDueWakeRejection,
+    UserAutomationDueWakeResolution,
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
@@ -31,6 +33,8 @@ use eliot_kernel_service::{
     UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
     horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
+#[cfg(windows)]
+use eliot_ors::{MaintenanceTriggerDownstreamRetentionProof, MaintenanceTriggerLifecycleRecord};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
@@ -40,6 +44,16 @@ use eliot_protocol::{
     HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt,
     LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
     host_request_operation_id,
+};
+#[cfg(windows)]
+use eliot_protocol::{
+    MAINTENANCE_TRIGGER_CLAIM_WIRE_ID, MAINTENANCE_TRIGGER_CLAIM_WIRE_VERSION,
+    MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_ID, MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_VERSION,
+    MAX_MAINTENANCE_TRIGGER_PAGE_GAPS, MAX_MAINTENANCE_TRIGGER_PAGE_MEMBERS, MaintenanceTriggerAck,
+    MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGap,
+    MaintenanceTriggerIntakeOutcome, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage,
+    MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerTerminalDisposition,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -85,6 +99,46 @@ pub(crate) const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_
 /// open handshake supplies the channel evidence and the Host owner supplies
 /// the Durable Job/Wake effects.
 pub(crate) const USER_AUTOMATION_RUNTIME_OPERATION: &str = "user_automation_runtime";
+/// Identity-bearing route for one durable ordinary maintenance-trigger intake.
+/// The producer cursor remains producer-owned; this operation answers only
+/// after Kernel has read the exact intake back from ORS.
+pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
+/// Authenticated bounded page of retained ordinary maintenance triggers.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_PAGE_OPERATION: &str = "maintenance_trigger_page";
+/// Authenticated claim for one retained maintenance trigger.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_CLAIM_OPERATION: &str = "maintenance_trigger_claim";
+/// Authenticated commit-receipt recording or reconciliation for one trigger.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_DECISION_OPERATION: &str =
+    "maintenance_trigger_decision_receipt";
+/// Authenticated recovery lookup for a lost decision-receipt response.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_DECISION_RECONCILE_OPERATION: &str =
+    "maintenance_trigger_decision_receipt_reconcile";
+/// Authenticated acknowledgement of one exact trigger decision receipt.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_ACK_OPERATION: &str = "maintenance_trigger_ack";
+/// Authenticated expiry or explicit supersession of one retained trigger.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_TERMINAL_OPERATION: &str =
+    "maintenance_trigger_terminal_disposition";
+/// Authenticated recording of one explicit maintenance-trigger recovery gap.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_GAP_RECORD_OPERATION: &str = "maintenance_trigger_gap_record";
+/// Authenticated bounded read of visible maintenance-trigger recovery gaps.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_GAP_PAGE_OPERATION: &str = "maintenance_trigger_gap_page";
+/// Authenticated downstream-retention proof recording for one terminal trigger.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_RETENTION_OPERATION: &str = "maintenance_trigger_retention";
+/// Authenticated request to compact one trigger after retention is satisfied.
+#[cfg(windows)]
+pub(crate) const MAINTENANCE_TRIGGER_COMPACT_OPERATION: &str = "maintenance_trigger_compact";
+/// Maximum Kernel-issued claim lifetime before expiry or owner-mediated replay.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_CLAIM_MAX_LEASE_MS: u64 = 30_000;
 /// Authenticated owner route carrying one canonical notification lifecycle
 /// transition (issue #1780, I11.5/I11.7).
 ///
@@ -109,6 +163,39 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 /// Response `kind` of the bounded notification inbox projection.
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
+/// Response kind for an ORS-committed maintenance-trigger intake receipt.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_INTAKE_RESPONSE_KIND: &str = "maintenance_trigger_intake_receipt";
+/// Response kind for an unacknowledged intake failure retaining the same retry identity.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_INTAKE_FAILURE_KIND: &str = "maintenance_trigger_intake_failure";
+/// Response kind for one bounded maintenance-trigger page.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND: &str = "maintenance_trigger_page";
+/// Response kind for one session-bound maintenance-trigger claim.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND: &str = "maintenance_trigger_claim";
+/// Response kind for a recorded or reconciled canonical trigger decision.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND: &str = "maintenance_trigger_decision_receipt";
+/// Response kind for one committed maintenance-trigger acknowledgement.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND: &str = "maintenance_trigger_ack";
+/// Response kind for one terminal maintenance-trigger disposition.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND: &str = "maintenance_trigger_terminal_disposition";
+/// Response kind for one explicit recovery gap.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND: &str = "maintenance_trigger_gap";
+/// Response kind for a bounded visible-gap page.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND: &str = "maintenance_trigger_gap_page";
+/// Response kind for a durable downstream-retention proof.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND: &str = "maintenance_trigger_retention";
+/// Response kind for a payload-compaction disposition.
+#[cfg(windows)]
+const MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND: &str = "maintenance_trigger_compact";
 
 /// Response `kind` of the ORS process-stream recovery view (issue #269, I14.26).
 ///
@@ -483,6 +570,29 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
+        MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_PAGE_OPERATION => MAINTENANCE_TRIGGER_PAGE_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_CLAIM_OPERATION => MAINTENANCE_TRIGGER_CLAIM_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_DECISION_OPERATION => MAINTENANCE_TRIGGER_DECISION_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_DECISION_RECONCILE_OPERATION => {
+            MAINTENANCE_TRIGGER_DECISION_RECONCILE_OPERATION
+        }
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_ACK_OPERATION => MAINTENANCE_TRIGGER_ACK_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_TERMINAL_OPERATION => MAINTENANCE_TRIGGER_TERMINAL_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_GAP_RECORD_OPERATION => MAINTENANCE_TRIGGER_GAP_RECORD_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_GAP_PAGE_OPERATION => MAINTENANCE_TRIGGER_GAP_PAGE_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_RETENTION_OPERATION => MAINTENANCE_TRIGGER_RETENTION_OPERATION,
+        #[cfg(windows)]
+        MAINTENANCE_TRIGGER_COMPACT_OPERATION => MAINTENANCE_TRIGGER_COMPACT_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
@@ -604,6 +714,82 @@ struct StoreRecoveryOperation {
     /// a real ORS operation identity before the durable read.
     #[serde(default)]
     process_stream_recovery_operations: Option<Vec<String>>,
+}
+
+/// Cursor and page bound for one retained maintenance-trigger scan.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerPageOperation {
+    #[serde(default)]
+    continuation: Option<String>,
+    limit: u16,
+}
+
+/// Stable trigger revision selected for a session-bound Kernel claim.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerClaimOperation {
+    trigger_id: String,
+    revision: u64,
+    /// Copy of the page-summary eligibility bound. The gateway checks this
+    /// against the retained trigger before it commits the claim.
+    applicable_until_unix_ms: u64,
+}
+
+/// Full decision receipt; the exact canonical receipt bytes retain its intent
+/// references after the gateway verifies the canonical Store commit.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerDecisionOperation {
+    receipt: MaintenanceTriggerDecisionReceipt,
+}
+
+/// Stable trigger identity queried after a lost decision-receipt response.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerDecisionReconcileOperation {
+    trigger_id: String,
+}
+
+/// Explicit durable gap and affected ORS sequence interval.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerGapRecordOperation {
+    gap: MaintenanceTriggerGap,
+    first_sequence: u64,
+    last_sequence: u64,
+}
+
+/// Opaque stable continuation for a bounded visible-gap page.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerGapPageOperation {
+    #[serde(default)]
+    after_identity: Option<String>,
+    limit: u16,
+}
+
+/// Downstream owner proof permitting later trigger payload compaction.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerRetentionOperation {
+    trigger_id: String,
+    proof: MaintenanceTriggerDownstreamRetentionProof,
+}
+
+/// Trigger identity whose already-authorized payload may be compacted.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerCompactOperation {
+    trigger_id: String,
 }
 
 /// Closed Governor owner-bundle publish operation (`#2100`).
@@ -2153,13 +2339,70 @@ impl KernelComposition {
                 ))
                 .await
             }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_INTAKE_OPERATION => {
+                self.maintenance_trigger_intake_operation(session, payload, request_identity)
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_PAGE_OPERATION => self.maintenance_trigger_page_operation(
+                session,
+                &request_id,
+                payload,
+                request_identity,
+            ),
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_CLAIM_OPERATION => self.maintenance_trigger_claim_operation(
+                session,
+                &request_id,
+                payload,
+                request_identity,
+            ),
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_DECISION_OPERATION => {
+                self.maintenance_trigger_decision_operation(session, payload, request_identity)
+                    .await
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_DECISION_RECONCILE_OPERATION => {
+                self.maintenance_trigger_decision_reconcile_operation(
+                    session,
+                    payload,
+                    request_identity,
+                )
+                .await
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_ACK_OPERATION => {
+                self.maintenance_trigger_ack_operation(session, payload, request_identity)
+                    .await
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_TERMINAL_OPERATION => {
+                self.maintenance_trigger_terminal_operation(session, payload, request_identity)
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_GAP_RECORD_OPERATION => {
+                self.maintenance_trigger_gap_record_operation(session, payload, request_identity)
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_GAP_PAGE_OPERATION => {
+                self.maintenance_trigger_gap_page_operation(session, payload, request_identity)
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_RETENTION_OPERATION => {
+                self.maintenance_trigger_retention_operation(session, payload, request_identity)
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_COMPACT_OPERATION => {
+                self.maintenance_trigger_compact_operation(session, payload, request_identity)
+            }
             "health" => self
                 .daemon_health()
                 .await
                 .map_err(|_| TransportError::SessionFenced)
                 .map(|health| Self::daemon_health_response(&health)),
             "store_recovery" => {
-                self.store_recovery_operation(session, payload.clone())
+                self.store_recovery_operation(session, &request_id, payload.clone())
                     .await
             }
             "store_initialize_genesis" => {
@@ -3333,6 +3576,1182 @@ impl KernelComposition {
             "value": { "accepted": true },
             "recovery": null,
         })
+    }
+
+    /// Validates one ordinary protocol record and serves an intake receipt
+    /// only after ORS returns its committed read-back projection. The caller
+    /// identity is mandatory even though the compatibility dispatch method
+    /// remains available for other daemon lifecycle operations.
+    #[cfg(windows)]
+    fn maintenance_trigger_lifecycle_failure_response(
+        kind: &'static str,
+        failure: &MaintenanceTriggerLifecycleFailure,
+    ) -> serde_json::Value {
+        let commit_outcome = failure.commit_outcome();
+        serde_json::json!({
+            "status": if commit_outcome == MaintenanceTriggerCommitOutcome::Unknown {
+                "unknown"
+            } else {
+                "error"
+            },
+            "value": {
+                "kind": kind,
+                "accepted": false,
+                "failure_code": Self::maintenance_trigger_lifecycle_failure_code(failure),
+                "commit_outcome": Self::maintenance_trigger_commit_outcome_code(commit_outcome),
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Maps each closed lifecycle failure to a stable response code while its
+    /// typed cause and commit phase stay intact inside Kernel and the gateway.
+    #[cfg(windows)]
+    fn maintenance_trigger_lifecycle_failure_code(
+        failure: &MaintenanceTriggerLifecycleFailure,
+    ) -> &'static str {
+        match failure {
+            MaintenanceTriggerLifecycleFailure::GatewayFenced => {
+                "MAINTENANCE_TRIGGER_GATEWAY_FENCED"
+            }
+            MaintenanceTriggerLifecycleFailure::ShadowMutationRefused => {
+                "MAINTENANCE_TRIGGER_SHADOW_MUTATION_REFUSED"
+            }
+            MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch => {
+                "MAINTENANCE_TRIGGER_ACTIVE_ROUTE_MISMATCH"
+            }
+            MaintenanceTriggerLifecycleFailure::AuthenticatedSessionMismatch => {
+                "MAINTENANCE_TRIGGER_AUTHENTICATED_SESSION_MISMATCH"
+            }
+            MaintenanceTriggerLifecycleFailure::OrsUnavailable => {
+                "MAINTENANCE_TRIGGER_ORS_UNAVAILABLE"
+            }
+            MaintenanceTriggerLifecycleFailure::TriggerNotRetained => {
+                "MAINTENANCE_TRIGGER_NOT_RETAINED"
+            }
+            MaintenanceTriggerLifecycleFailure::LifecycleNotRetained => {
+                "MAINTENANCE_TRIGGER_LIFECYCLE_NOT_RETAINED"
+            }
+            MaintenanceTriggerLifecycleFailure::CanonicalDeserialization(_) => {
+                "MAINTENANCE_TRIGGER_CANONICAL_DESERIALIZATION"
+            }
+            MaintenanceTriggerLifecycleFailure::CanonicalSerialization(_) => {
+                "MAINTENANCE_TRIGGER_CANONICAL_SERIALIZATION"
+            }
+            MaintenanceTriggerLifecycleFailure::Protocol { error, .. } => {
+                Self::maintenance_trigger_protocol_error_code(error)
+            }
+            MaintenanceTriggerLifecycleFailure::Ors { error, .. } => {
+                Self::maintenance_trigger_ors_error_code(error)
+            }
+            MaintenanceTriggerLifecycleFailure::Store { error, .. } => {
+                Self::maintenance_trigger_store_error_code(error)
+            }
+            MaintenanceTriggerLifecycleFailure::DecisionReceiptUnavailable => {
+                "MAINTENANCE_TRIGGER_DECISION_RECEIPT_UNAVAILABLE"
+            }
+            MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound => {
+                "MAINTENANCE_TRIGGER_DOWNSTREAM_INTENT_NOT_BOUND"
+            }
+            MaintenanceTriggerLifecycleFailure::CanonicalReceiptNotCommitted => {
+                "MAINTENANCE_TRIGGER_CANONICAL_RECEIPT_NOT_COMMITTED"
+            }
+            MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch => {
+                "MAINTENANCE_TRIGGER_CANONICAL_RECEIPT_BINDING_MISMATCH"
+            }
+            MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable => {
+                "MAINTENANCE_TRIGGER_PREPARED_TRANSITION_BINDING_UNAVAILABLE"
+            }
+            MaintenanceTriggerLifecycleFailure::DownstreamRetentionOwnerBindingUnavailable => {
+                "MAINTENANCE_TRIGGER_DOWNSTREAM_RETENTION_OWNER_BINDING_UNAVAILABLE"
+            }
+            MaintenanceTriggerLifecycleFailure::ReconciliationPersistFailed { .. } => {
+                "MAINTENANCE_TRIGGER_RECONCILIATION_PERSIST_FAILED"
+            }
+            MaintenanceTriggerLifecycleFailure::RecordBindingMismatch => {
+                "MAINTENANCE_TRIGGER_RECORD_BINDING_MISMATCH"
+            }
+            MaintenanceTriggerLifecycleFailure::ClaimNotCurrent => {
+                "MAINTENANCE_TRIGGER_CLAIM_NOT_CURRENT"
+            }
+            MaintenanceTriggerLifecycleFailure::PageLimitExceeded => {
+                "MAINTENANCE_TRIGGER_PAGE_LIMIT_EXCEEDED"
+            }
+            MaintenanceTriggerLifecycleFailure::ClockUnavailable => {
+                "MAINTENANCE_TRIGGER_CLOCK_UNAVAILABLE"
+            }
+            MaintenanceTriggerLifecycleFailure::ProtectedRoutingUnsupported => {
+                "MAINTENANCE_TRIGGER_PROTECTED_ROUTING_UNSUPPORTED"
+            }
+            MaintenanceTriggerLifecycleFailure::ContinuationNotRetained => {
+                "MAINTENANCE_TRIGGER_CONTINUATION_NOT_RETAINED"
+            }
+            MaintenanceTriggerLifecycleFailure::EnvelopeNotRetained => {
+                "MAINTENANCE_TRIGGER_ENVELOPE_NOT_RETAINED"
+            }
+            MaintenanceTriggerLifecycleFailure::EnvelopeBindingMismatch => {
+                "MAINTENANCE_TRIGGER_ENVELOPE_BINDING_MISMATCH"
+            }
+            MaintenanceTriggerLifecycleFailure::EmptyPageWithoutGap => {
+                "MAINTENANCE_TRIGGER_EMPTY_PAGE_WITHOUT_GAP"
+            }
+        }
+    }
+
+    /// Stable top-level Store error codes; provider text is never serialized.
+    #[cfg(windows)]
+    fn maintenance_trigger_store_error_code(error: &StoreError) -> &'static str {
+        match error {
+            StoreError::InvalidField { .. } => "STORE_INVALID_FIELD",
+            StoreError::Empty { .. } => "STORE_EMPTY",
+            StoreError::Duplicate { .. } => "STORE_DUPLICATE",
+            StoreError::Foundation(_) => "STORE_FOUNDATION",
+            StoreError::Security(_) => "STORE_SECURITY",
+            StoreError::Receipt(_) => "STORE_RECEIPT",
+            StoreError::UnknownOperation => "STORE_UNKNOWN_OPERATION",
+            StoreError::ManifestMismatch => "STORE_MANIFEST_MISMATCH",
+            StoreError::TransitionClassExceeded => "STORE_TRANSITION_CLASS_EXCEEDED",
+            StoreError::EffectCeilingExceeded => "STORE_EFFECT_CEILING_EXCEEDED",
+            StoreError::FenceMismatch => "STORE_FENCE_MISMATCH",
+            StoreError::RevisionConflict => "STORE_REVISION_CONFLICT",
+            StoreError::OrderingConflict => "STORE_ORDERING_CONFLICT",
+            StoreError::AutomationContinuation(_) => "STORE_AUTOMATION_CONTINUATION",
+            StoreError::InvalidProjection => "STORE_INVALID_PROJECTION",
+            StoreError::InvalidOutbox => "STORE_INVALID_OUTBOX",
+            StoreError::InvalidReceipt => "STORE_INVALID_RECEIPT",
+            StoreError::IdentityConflict => "STORE_IDENTITY_CONFLICT",
+            StoreError::TransitionDigestMismatch { .. } => "STORE_TRANSITION_DIGEST_MISMATCH",
+            StoreError::ReceiptNotFound => "STORE_RECEIPT_NOT_FOUND",
+            StoreError::SnapshotClosePending { .. } => "STORE_SNAPSHOT_CLOSE_PENDING",
+            StoreError::MissingReceiptEnvelope => "STORE_MISSING_RECEIPT_ENVELOPE",
+            StoreError::PayloadTooLarge => "STORE_PAYLOAD_TOO_LARGE",
+            StoreError::Unavailable => "STORE_UNAVAILABLE",
+            StoreError::Serialization(_) => "STORE_SERIALIZATION",
+        }
+    }
+
+    /// Projects only bounded trigger metadata. Canonical lifecycle bytes are
+    /// intentionally absent from every response.
+    #[cfg(windows)]
+    fn maintenance_trigger_lifecycle_status(
+        record: &MaintenanceTriggerLifecycleRecord,
+    ) -> serde_json::Value {
+        let phase = match record.phase {
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Pending => "PENDING",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Claimed => "CLAIMED",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::DecisionRecorded => "DECISION_RECORDED",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Acknowledged => "ACKNOWLEDGED",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Reconciling => "RECONCILING",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Expired => "EXPIRED",
+            eliot_ors::MaintenanceTriggerLifecyclePhase::Superseded => "SUPERSEDED",
+        };
+        serde_json::json!({
+            "trigger_id": record.trigger_id,
+            "phase": phase,
+            "state_revision": record.state_revision,
+            "updated_at_unix_ms": record.updated_at_ms,
+            "downstream_retained_until_unix_ms": record.downstream_retention
+                .as_ref()
+                .map(|proof| proof.retained_until_ms),
+            "payload_compacted_at_unix_ms": record.payload_compacted_at_ms,
+        })
+    }
+
+    /// Projects a gap locator as a one-way digest so free-form caller text is
+    /// never reflected as possible plaintext in a daemon response.
+    #[cfg(windows)]
+    fn maintenance_trigger_gap_summary(gap: &MaintenanceTriggerGap) -> serde_json::Value {
+        serde_json::json!({
+            "gap_id": gap.gap_id,
+            "trigger_id": gap.trigger_id,
+            "kind": gap.kind,
+            "detail_ref": sha256_hex(gap.detail.as_bytes()),
+            "recorded_at_unix_ms": gap.recorded_at_unix_ms,
+        })
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_session_recovery_view(
+        revoked_claims: u64,
+        gaps: &[MaintenanceTriggerGap],
+        gaps_truncated: bool,
+        pages_scanned: u64,
+        pending_members: &[MaintenanceTriggerPendingSummary],
+        pending_has_more: bool,
+        pending_continuation: Option<&str>,
+        empty_membership_proven: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": "maintenance_trigger_session_recovery",
+                "revoked_claims": revoked_claims,
+                "pages_scanned": pages_scanned,
+                "claim_recovery_complete": true,
+                "reconciliation_complete": !gaps_truncated
+                    && !pending_has_more
+                    && pending_continuation.is_none(),
+                "members": pending_members.iter().map(|member| serde_json::json!({
+                    "trigger_id": member.trigger_id,
+                    "operation_hash": member.operation_hash,
+                    "revision": member.revision,
+                    "disposition": member.disposition,
+                    "applicable_until_unix_ms": member.applicable_until_unix_ms,
+                })).collect::<Vec<_>>(),
+                "has_more": pending_has_more,
+                "continuation": pending_continuation,
+                "empty_membership_proven": empty_membership_proven,
+                "gaps_truncated": gaps_truncated,
+                "gaps": gaps.iter().map(Self::maintenance_trigger_gap_summary)
+                    .collect::<Vec<_>>(),
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Preserves the lower layer's stable failure code while accounting for
+    /// claims that earlier pages durably revoked during this same startup
+    /// recovery request. The aggregate result is unknown until every page is
+    /// read back.
+    #[cfg(windows)]
+    fn maintenance_trigger_recovery_failure_response(
+        failure: &MaintenanceTriggerLifecycleFailure,
+        prior_revocations: u64,
+    ) -> serde_json::Value {
+        let mut response = Self::maintenance_trigger_lifecycle_failure_response(
+            "maintenance_trigger_session_recovery",
+            failure,
+        );
+        if prior_revocations > 0 {
+            response["status"] = serde_json::Value::String("unknown".to_owned());
+            response["value"]["commit_outcome"] = serde_json::Value::String("UNKNOWN".to_owned());
+        }
+        response
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_lifecycle_unavailable_response(kind: &'static str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "value": {
+                "kind": kind,
+                "accepted": false,
+                "failure_code": "KERNEL_STORE_GATEWAY_UNAVAILABLE",
+                "commit_outcome": "NOT_ATTEMPTED",
+            },
+            "recovery": null,
+        })
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_input_failure_response(
+        kind: &'static str,
+        failure_code: &'static str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "value": {
+                "kind": kind,
+                "accepted": false,
+                "failure_code": failure_code,
+                "commit_outcome": "NOT_ATTEMPTED",
+            },
+            "recovery": null,
+        })
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_page_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerPageOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if operation.limit == 0 || operation.limit as usize > MAX_MAINTENANCE_TRIGGER_PAGE_MEMBERS {
+            return Ok(Self::maintenance_trigger_input_failure_response(
+                MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+                "MAINTENANCE_TRIGGER_PAGE_LIMIT_EXCEEDED",
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+                ));
+            }
+        };
+        let page = match gateway.maintenance_trigger_page(
+            &session.module_generation.state_fence,
+            &session.connection_id,
+            request_id.as_str(),
+            operation.continuation.as_deref(),
+            operation.limit,
+        ) {
+            Ok(page) => page,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if let Err(error) = page.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND,
+                "members": page.members.iter().map(|member| serde_json::json!({
+                    "trigger_id": member.trigger_id,
+                    "operation_hash": member.operation_hash,
+                    "revision": member.revision,
+                    "disposition": member.disposition,
+                    "applicable_until_unix_ms": member.applicable_until_unix_ms,
+                })).collect::<Vec<_>>(),
+                "continuation": page.continuation,
+                "has_more": page.has_more,
+                "gaps": page.gaps.iter().map(Self::maintenance_trigger_gap_summary)
+                    .collect::<Vec<_>>(),
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_claim_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerClaimOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        let Some(maximum_deadline) = now.checked_add(MAINTENANCE_TRIGGER_CLAIM_MAX_LEASE_MS) else {
+            return Ok(Self::maintenance_trigger_input_failure_response(
+                MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                "MAINTENANCE_TRIGGER_CLAIM_CLOCK_INVALID",
+            ));
+        };
+        if now == 0 || now == u64::MAX || operation.revision == 0 {
+            return Ok(Self::maintenance_trigger_input_failure_response(
+                MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                "MAINTENANCE_TRIGGER_CLAIM_IDENTITY_INVALID",
+            ));
+        }
+        let claim_deadline_unix_ms = maximum_deadline.min(operation.applicable_until_unix_ms);
+        if claim_deadline_unix_ms <= now {
+            return Ok(Self::maintenance_trigger_input_failure_response(
+                MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                "MAINTENANCE_TRIGGER_CLAIM_EXPIRED",
+            ));
+        }
+        let claim = MaintenanceTriggerClaim {
+            wire_id: MAINTENANCE_TRIGGER_CLAIM_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_CLAIM_WIRE_VERSION,
+            trigger_id: operation.trigger_id,
+            revision: operation.revision,
+            delivery_id: request_id.as_str().to_owned(),
+            daemon_fence: session.module_generation.state_fence.clone(),
+            daemon_session: session.connection_id.clone(),
+            claim_deadline_unix_ms,
+        };
+        if let Err(error) = claim.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                ));
+            }
+        };
+        let retained = match gateway.claim_maintenance_trigger(
+            &session.module_generation.state_fence,
+            &session.connection_id,
+            &claim,
+        ) {
+            Ok(claim) => claim,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if retained.validate().is_err()
+            || !retained.is_exact_retry_of(&claim)
+            || retained.daemon_session != session.connection_id
+            || retained.daemon_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND,
+                "claim": retained,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    async fn maintenance_trigger_decision_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerDecisionOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.receipt.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                ));
+            }
+        };
+        let retained = match gateway
+            .record_maintenance_trigger_decision(
+                &session.module_generation.state_fence,
+                &session.connection_id,
+                &operation.receipt,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if retained != operation.receipt || retained.validate().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                "receipt": retained,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    async fn maintenance_trigger_decision_reconcile_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerDecisionReconcileOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if operation.trigger_id.trim().is_empty()
+            || operation.trigger_id.chars().any(char::is_control)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                ));
+            }
+        };
+        let receipt = match gateway
+            .load_maintenance_trigger_decision_receipt(
+                &session.module_generation.state_fence,
+                &session.connection_id,
+                &operation.trigger_id,
+            )
+            .await
+        {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                return Ok(serde_json::json!({
+                    "status": "unknown",
+                    "value": {
+                        "kind": MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                        "accepted": false,
+                        "failure_code": "MAINTENANCE_TRIGGER_DECISION_RECEIPT_UNAVAILABLE",
+                        "commit_outcome": "UNKNOWN",
+                    },
+                    "recovery": null,
+                }));
+            }
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if receipt.trigger_id != operation.trigger_id || receipt.validate().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND,
+                "receipt": receipt,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    async fn maintenance_trigger_ack_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let ack: MaintenanceTriggerAck =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = ack.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        if ack.daemon_session != session.connection_id
+            || ack.daemon_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
+                ));
+            }
+        };
+        let retained = match gateway
+            .acknowledge_maintenance_trigger(
+                &session.module_generation.state_fence,
+                &session.connection_id,
+                &ack,
+            )
+            .await
+        {
+            Ok(ack) => ack,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if retained != ack || retained.validate().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_ACK_RESPONSE_KIND,
+                "ack": retained,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_terminal_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let terminal: MaintenanceTriggerTerminalDisposition =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = terminal.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
+                ));
+            }
+        };
+        let retained = match gateway
+            .terminalize_maintenance_trigger(&session.module_generation.state_fence, &terminal)
+        {
+            Ok(terminal) => terminal,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if retained != terminal || retained.validate().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_TERMINAL_RESPONSE_KIND,
+                "trigger_id": retained.trigger_id,
+                "operation_hash": retained.operation_hash,
+                "terminal_kind": retained.kind,
+                "successor_trigger_id": retained.successor_trigger_id,
+                "reason_ref": sha256_hex(retained.reason.as_bytes()),
+                "recorded_at_unix_ms": retained.recorded_at_unix_ms,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_gap_record_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerGapRecordOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.gap.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
+                ));
+            }
+        };
+        let retained = match gateway.record_maintenance_trigger_gap(
+            &session.module_generation.state_fence,
+            &operation.gap,
+            operation.first_sequence,
+            operation.last_sequence,
+        ) {
+            Ok(gap) => gap,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        if retained != operation.gap || retained.validate().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_GAP_RESPONSE_KIND,
+                "gap": Self::maintenance_trigger_gap_summary(&retained),
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_gap_page_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerGapPageOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if operation.limit == 0 || operation.limit as usize > MAX_MAINTENANCE_TRIGGER_PAGE_GAPS {
+            return Ok(Self::maintenance_trigger_input_failure_response(
+                MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
+                "MAINTENANCE_TRIGGER_PAGE_LIMIT_EXCEEDED",
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
+                ));
+            }
+        };
+        let gaps = match gateway.list_maintenance_trigger_gaps(
+            &session.module_generation.state_fence,
+            operation.after_identity.as_deref(),
+            operation.limit,
+        ) {
+            Ok(gaps) => gaps,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        let has_more = gaps.len() == operation.limit as usize;
+        let continuation = if has_more {
+            gaps.last().map(|gap| gap.gap_id.as_str())
+        } else {
+            None
+        };
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_GAP_PAGE_RESPONSE_KIND,
+                "gaps": gaps.iter().map(Self::maintenance_trigger_gap_summary)
+                    .collect::<Vec<_>>(),
+                "continuation": continuation,
+                "has_more": has_more,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_retention_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerRetentionOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.proof.validate() {
+            return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
+                &MaintenanceTriggerLifecycleFailure::Ors {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
+                ));
+            }
+        };
+        let record = match gateway.record_maintenance_trigger_retention(
+            &session.module_generation.state_fence,
+            &operation.trigger_id,
+            &operation.proof,
+        ) {
+            Ok(record) => record,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_RETENTION_RESPONSE_KIND,
+                "lifecycle": Self::maintenance_trigger_lifecycle_status(&record),
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_compact_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let operation: MaintenanceTriggerCompactOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_lifecycle_unavailable_response(
+                    MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
+                ));
+            }
+        };
+        let record = match gateway.compact_maintenance_trigger_payload(
+            &session.module_generation.state_fence,
+            &operation.trigger_id,
+        ) {
+            Ok(record) => record,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_lifecycle_failure_response(
+                    MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
+                    &failure,
+                ));
+            }
+        };
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_COMPACT_RESPONSE_KIND,
+                "lifecycle": Self::maintenance_trigger_lifecycle_status(&record),
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn maintenance_trigger_intake_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::validate_activation_submitter(session, request_identity)?;
+        let record: MaintenanceTriggerRecord =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let retry_identity = record.source_event_identity().canonical_hex();
+        // Shape-check first. The gateway checks applicability and source-fence
+        // equality only after an exact retained replay lookup, so a lost intake
+        // receipt remains answerable after expiry or generation replacement.
+        if let Err(error) = record.validate() {
+            return Ok(Self::maintenance_trigger_intake_failure_response(
+                &retry_identity,
+                MaintenanceTriggerIntakeFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::NotAttempted,
+                },
+            ));
+        }
+        if record.routing_class != MaintenanceTriggerRoutingClass::Ordinary
+            || record.route_grant.is_some()
+        {
+            return Ok(Self::maintenance_trigger_intake_failure_response(
+                &retry_identity,
+                MaintenanceTriggerIntakeFailure::ProtectedRoutingUnsupported,
+            ));
+        }
+
+        let gateway = match self.retained_store_gateway() {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return Ok(Self::maintenance_trigger_intake_failure_response(
+                    &retry_identity,
+                    MaintenanceTriggerIntakeFailure::OrsUnavailable,
+                ));
+            }
+        };
+        let projection = match gateway
+            .stage_maintenance_trigger_intake(&session.module_generation.state_fence, &record)
+        {
+            Ok(projection) => projection,
+            Err(failure) => {
+                return Ok(Self::maintenance_trigger_intake_failure_response(
+                    &retry_identity,
+                    failure,
+                ));
+            }
+        };
+        let receipt = MaintenanceTriggerIntakeReceipt {
+            wire_id: MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_VERSION,
+            trigger_id: projection.record.trigger_id,
+            operation_hash: projection.record.operation_hash,
+            envelope_reference: projection.record.envelope_operation_id.as_str().to_owned(),
+            payload_hash: projection.record.envelope_payload_sha256,
+            outcome: if projection.replayed {
+                MaintenanceTriggerIntakeOutcome::ReplaySame
+            } else {
+                MaintenanceTriggerIntakeOutcome::StagedNew
+            },
+        };
+        if let Err(error) = receipt.validate_for(&record) {
+            return Ok(Self::maintenance_trigger_intake_failure_response(
+                &retry_identity,
+                MaintenanceTriggerIntakeFailure::Protocol {
+                    error,
+                    commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
+                },
+            ));
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_INTAKE_RESPONSE_KIND,
+                "accepted": true,
+                "receipt": receipt,
+            },
+            "recovery": null,
+        }))
+    }
+
+    /// Returns a bounded non-acceptance answer without issuing an intake
+    /// receipt. `retry_identity` is the protocol's canonical source-event key;
+    /// even an ambiguous ORS write therefore remains tied to the exact replay.
+    #[cfg(windows)]
+    fn maintenance_trigger_intake_failure_response(
+        retry_identity: &str,
+        failure: MaintenanceTriggerIntakeFailure,
+    ) -> serde_json::Value {
+        let commit_outcome = failure.commit_outcome();
+        let status = match commit_outcome {
+            MaintenanceTriggerCommitOutcome::Unknown => "unknown",
+            MaintenanceTriggerCommitOutcome::NotAttempted
+            | MaintenanceTriggerCommitOutcome::NotCommitted
+            | MaintenanceTriggerCommitOutcome::Committed => "error",
+        };
+        serde_json::json!({
+            "status": status,
+            "value": {
+                "kind": MAINTENANCE_TRIGGER_INTAKE_FAILURE_KIND,
+                "accepted": false,
+                "retry_identity": retry_identity,
+                "failure_code": Self::maintenance_trigger_intake_failure_code(&failure),
+                "commit_outcome": Self::maintenance_trigger_commit_outcome_code(commit_outcome),
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Maps a typed intake error to a stable code without exposing its detail.
+    #[cfg(windows)]
+    fn maintenance_trigger_intake_failure_code(
+        failure: &MaintenanceTriggerIntakeFailure,
+    ) -> &'static str {
+        match failure {
+            MaintenanceTriggerIntakeFailure::GatewayFenced => "MAINTENANCE_TRIGGER_GATEWAY_FENCED",
+            MaintenanceTriggerIntakeFailure::ShadowMutationRefused => {
+                "MAINTENANCE_TRIGGER_SHADOW_MUTATION_REFUSED"
+            }
+            MaintenanceTriggerIntakeFailure::ActiveRouteMismatch => {
+                "MAINTENANCE_TRIGGER_ACTIVE_ROUTE_MISMATCH"
+            }
+            MaintenanceTriggerIntakeFailure::InvalidRecord => "MAINTENANCE_TRIGGER_INVALID_RECORD",
+            MaintenanceTriggerIntakeFailure::CanonicalSerialization(_) => {
+                "MAINTENANCE_TRIGGER_CANONICAL_SERIALIZATION"
+            }
+            MaintenanceTriggerIntakeFailure::Protocol { error, .. } => {
+                Self::maintenance_trigger_protocol_error_code(error)
+            }
+            MaintenanceTriggerIntakeFailure::ProtectedRoutingUnsupported => {
+                "MAINTENANCE_TRIGGER_PROTECTED_ROUTING_UNSUPPORTED"
+            }
+            MaintenanceTriggerIntakeFailure::SourceFenceMismatch => {
+                "MAINTENANCE_TRIGGER_SOURCE_FENCE_MISMATCH"
+            }
+            MaintenanceTriggerIntakeFailure::OrsUnavailable => {
+                "MAINTENANCE_TRIGGER_ORS_UNAVAILABLE"
+            }
+            MaintenanceTriggerIntakeFailure::EnvelopeNotRetained => {
+                "MAINTENANCE_TRIGGER_ENVELOPE_NOT_RETAINED"
+            }
+            MaintenanceTriggerIntakeFailure::EnvelopeIdentityMismatch => {
+                "MAINTENANCE_TRIGGER_ENVELOPE_IDENTITY_MISMATCH"
+            }
+            MaintenanceTriggerIntakeFailure::PayloadHashMismatch => {
+                "MAINTENANCE_TRIGGER_PAYLOAD_HASH_MISMATCH"
+            }
+            MaintenanceTriggerIntakeFailure::EnvelopeFenceMismatch => {
+                "MAINTENANCE_TRIGGER_ENVELOPE_FENCE_MISMATCH"
+            }
+            MaintenanceTriggerIntakeFailure::Ors { error, .. } => {
+                Self::maintenance_trigger_ors_error_code(error)
+            }
+        }
+    }
+
+    /// Exhaustive stable codes for the closed protocol error enum. Detailed
+    /// validation reasons and provider text remain private to the typed error.
+    #[cfg(windows)]
+    fn maintenance_trigger_protocol_error_code(
+        error: &eliot_protocol::ProtocolError,
+    ) -> &'static str {
+        use eliot_protocol::ProtocolError;
+
+        match error {
+            ProtocolError::Foundation(_) => "PROTOCOL_FOUNDATION",
+            ProtocolError::Provider { .. } => "PROTOCOL_PROVIDER",
+            ProtocolError::InvalidField { .. } => "PROTOCOL_INVALID_FIELD",
+            ProtocolError::IncompatibleMajor => "PROTOCOL_INCOMPATIBLE_MAJOR",
+            ProtocolError::IncompatibleMinor => "PROTOCOL_INCOMPATIBLE_MINOR",
+            ProtocolError::UnknownMessageType => "PROTOCOL_UNKNOWN_MESSAGE_TYPE",
+            ProtocolError::UnknownEventPayloadType => "PROTOCOL_UNKNOWN_EVENT_PAYLOAD_TYPE",
+            ProtocolError::UnsupportedEncoding(_) => "PROTOCOL_UNSUPPORTED_ENCODING",
+            ProtocolError::ZeroLengthFrame => "PROTOCOL_ZERO_LENGTH_FRAME",
+            ProtocolError::OversizeFrame { .. } => "PROTOCOL_OVERSIZE_FRAME",
+            ProtocolError::PartialFrame { .. } => "PROTOCOL_PARTIAL_FRAME",
+            ProtocolError::TrailingBytes => "PROTOCOL_TRAILING_BYTES",
+            ProtocolError::InvalidUtf8 => "PROTOCOL_INVALID_UTF8",
+            ProtocolError::Json(_) => "PROTOCOL_JSON",
+            ProtocolError::Io(_) => "PROTOCOL_IO",
+            ProtocolError::ReplayConflict => "PROTOCOL_REPLAY_CONFLICT",
+            ProtocolError::InvalidAckTransition { .. } => "PROTOCOL_INVALID_ACK_TRANSITION",
+        }
+    }
+
+    /// Exhaustive, one-to-one stable codes for the closed ORS error enum.
+    /// The final wire boundary never serializes provider, storage, or model
+    /// details carried by `OrsError`.
+    #[cfg(windows)]
+    fn maintenance_trigger_ors_error_code(error: &eliot_ors::OrsError) -> &'static str {
+        use eliot_ors::OrsError;
+
+        match error {
+            OrsError::BridgeEventCapacityExceeded(_) => "ORS_BRIDGE_EVENT_CAPACITY_EXCEEDED",
+            OrsError::InvalidField { .. } => "ORS_INVALID_FIELD",
+            OrsError::Contract(_) => "ORS_CONTRACT",
+            OrsError::UnsupportedContractVersion(_) => "ORS_UNSUPPORTED_CONTRACT_VERSION",
+            OrsError::PayloadTooLarge => "ORS_PAYLOAD_TOO_LARGE",
+            OrsError::PayloadIntegrityMismatch => "ORS_PAYLOAD_INTEGRITY_MISMATCH",
+            OrsError::FenceMismatch => "ORS_FENCE_MISMATCH",
+            OrsError::EpochMismatch => "ORS_EPOCH_MISMATCH",
+            OrsError::InvalidEpochLineage => "ORS_INVALID_EPOCH_LINEAGE",
+            OrsError::InvalidExpiry => "ORS_INVALID_EXPIRY",
+            OrsError::AuthorityHandoffNotFresh => "ORS_AUTHORITY_HANDOFF_NOT_FRESH",
+            OrsError::EmptyScopeSet => "ORS_EMPTY_SCOPE_SET",
+            OrsError::DuplicateScope => "ORS_DUPLICATE_SCOPE",
+            OrsError::InvalidCursorLimit => "ORS_INVALID_CURSOR_LIMIT",
+            OrsError::DuplicateConflict => "ORS_DUPLICATE_CONFLICT",
+            OrsError::ReservationNotFound => "ORS_RESERVATION_NOT_FOUND",
+            OrsError::InvalidTransition => "ORS_INVALID_TRANSITION",
+            OrsError::StaleWriterEpoch => "ORS_STALE_WRITER_EPOCH",
+            OrsError::PredecessorPending => "ORS_PREDECESSOR_PENDING",
+            OrsError::ScopeRecoveryRequired => "ORS_SCOPE_RECOVERY_REQUIRED",
+            OrsError::RecoveryOwnerMismatch => "ORS_RECOVERY_OWNER_MISMATCH",
+            OrsError::UnsafeExpiry => "ORS_UNSAFE_EXPIRY",
+            OrsError::ReconciliationMismatch => "ORS_RECONCILIATION_MISMATCH",
+            OrsError::UnknownReceiptCannotResolve => "ORS_UNKNOWN_RECEIPT_CANNOT_RESOLVE",
+            OrsError::CanonicalEvidence(_) => "ORS_CANONICAL_EVIDENCE",
+            OrsError::OrderingHeadMismatch => "ORS_ORDERING_HEAD_MISMATCH",
+            OrsError::InboxIntegrityMismatch => "ORS_INBOX_INTEGRITY_MISMATCH",
+            OrsError::AuthoritySnapshotUnavailable => "ORS_AUTHORITY_SNAPSHOT_UNAVAILABLE",
+            OrsError::ProjectionLimitExceeded => "ORS_PROJECTION_LIMIT_EXCEEDED",
+            OrsError::ProcessStreamRecoveryFamilyMoved { .. } => {
+                "ORS_PROCESS_STREAM_RECOVERY_FAMILY_MOVED"
+            }
+            OrsError::ProcessStreamRecoveryFamilyCursorMismatch { .. } => {
+                "ORS_PROCESS_STREAM_RECOVERY_FAMILY_CURSOR_MISMATCH"
+            }
+            OrsError::SupervisionLeaseStaleRevision => "ORS_SUPERVISION_LEASE_STALE_REVISION",
+            OrsError::SupervisionLeaseTicketConflict => "ORS_SUPERVISION_LEASE_TICKET_CONFLICT",
+            OrsError::SupervisionLeaseBindingMismatch => "ORS_SUPERVISION_LEASE_BINDING_MISMATCH",
+            OrsError::SupervisionLeaseTicketNotStaged => "ORS_SUPERVISION_LEASE_TICKET_NOT_STAGED",
+            OrsError::SupervisionLeaseTicketResolved => "ORS_SUPERVISION_LEASE_TICKET_RESOLVED",
+            OrsError::SupervisionLeaseTicketNotExpired => {
+                "ORS_SUPERVISION_LEASE_TICKET_NOT_EXPIRED"
+            }
+            OrsError::SupervisionLeaseTicketExpired => "ORS_SUPERVISION_LEASE_TICKET_EXPIRED",
+            OrsError::SupervisionLeaseTicketAlreadyCommitted => {
+                "ORS_SUPERVISION_LEASE_TICKET_ALREADY_COMMITTED"
+            }
+            OrsError::InvalidSupervisionLeaseHistoryLimit => {
+                "ORS_INVALID_SUPERVISION_LEASE_HISTORY_LIMIT"
+            }
+            OrsError::MigrationRequired { .. } => "ORS_MIGRATION_REQUIRED",
+            OrsError::IntegrityProblem { .. } => "ORS_INTEGRITY_PROBLEM",
+            OrsError::HostRequestIdentityConflict { .. } => "ORS_HOST_REQUEST_IDENTITY_CONFLICT",
+            OrsError::HostRequestLegacyCorrelationUnresolved => {
+                "ORS_HOST_REQUEST_LEGACY_CORRELATION_UNRESOLVED"
+            }
+            OrsError::CampaignLearningStateViewConflict { .. } => {
+                "ORS_CAMPAIGN_LEARNING_STATE_VIEW_CONFLICT"
+            }
+            OrsError::CampaignSourcePublicationConflict { .. } => {
+                "ORS_CAMPAIGN_SOURCE_PUBLICATION_CONFLICT"
+            }
+            OrsError::ActivationResultRetentionIdentityConflict { .. } => {
+                "ORS_ACTIVATION_RESULT_RETENTION_IDENTITY_CONFLICT"
+            }
+            OrsError::ActivationLifecycleIdentityConflict { .. } => {
+                "ORS_ACTIVATION_LIFECYCLE_IDENTITY_CONFLICT"
+            }
+            OrsError::ActivationLifecycleExpired { .. } => "ORS_ACTIVATION_LIFECYCLE_EXPIRED",
+            OrsError::ActivationLifecycleStateConflict { .. } => {
+                "ORS_ACTIVATION_LIFECYCLE_STATE_CONFLICT"
+            }
+            OrsError::NativeWorkerClaimIdentityConflict { .. } => {
+                "ORS_NATIVE_WORKER_CLAIM_IDENTITY_CONFLICT"
+            }
+            OrsError::WorkerReplayIdentityConflict { .. } => "ORS_WORKER_REPLAY_IDENTITY_CONFLICT",
+            OrsError::WorkerReplayStaleStream { .. } => "ORS_WORKER_REPLAY_STALE_STREAM",
+            OrsError::WorkerReplayAckMismatch { .. } => "ORS_WORKER_REPLAY_ACK_MISMATCH",
+            OrsError::WorkerReplayIncomplete { .. } => "ORS_WORKER_REPLAY_INCOMPLETE",
+            OrsError::VersionedArtifactConflict => "ORS_VERSIONED_ARTIFACT_CONFLICT",
+            OrsError::ActiveExecutableReplacement => "ORS_ACTIVE_EXECUTABLE_REPLACEMENT",
+            OrsError::VersionedArtifactNotFound => "ORS_VERSIONED_ARTIFACT_NOT_FOUND",
+            OrsError::VersionedArtifactNotDrained => "ORS_VERSIONED_ARTIFACT_NOT_DRAINED",
+            OrsError::IncompatibleArtifact => "ORS_INCOMPATIBLE_ARTIFACT",
+            OrsError::Storage(_) => "ORS_STORAGE",
+            OrsError::Encoding(_) => "ORS_ENCODING",
+            OrsError::StagingNotDurable(_) => "ORS_STAGING_NOT_DURABLE",
+            OrsError::RecoveryProblemRetained { .. } => "ORS_RECOVERY_PROBLEM_RETAINED",
+        }
+    }
+
+    #[cfg(windows)]
+    const fn maintenance_trigger_commit_outcome_code(
+        outcome: MaintenanceTriggerCommitOutcome,
+    ) -> &'static str {
+        match outcome {
+            MaintenanceTriggerCommitOutcome::NotAttempted => "NOT_ATTEMPTED",
+            MaintenanceTriggerCommitOutcome::NotCommitted => "NOT_COMMITTED",
+            MaintenanceTriggerCommitOutcome::Committed => "COMMITTED",
+            MaintenanceTriggerCommitOutcome::Unknown => "UNKNOWN",
+        }
     }
 
     /// Builds the exact durable predecessor proof for one ORS head. The proof
@@ -6145,6 +7564,7 @@ impl KernelComposition {
     async fn store_recovery_operation(
         &self,
         session: &Session,
+        request_id: &RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreRecoveryOperation =
@@ -6192,7 +7612,206 @@ impl KernelComposition {
                         return Ok(Self::store_error_response_text("store_recovery", &error));
                     }
                 };
-                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready {
+                let maintenance_trigger_recovery = match super::caller_binding(session) {
+                    Ok((owner, _)) if owner.module_id() == ACTIVE_DAEMON_CALLER => {
+                        let mut continuation: Option<String> = None;
+                        let mut seen_continuations = BTreeSet::new();
+                        let mut revoked_claims = 0_u64;
+                        let mut pages_scanned = 0_u64;
+                        let mut recovery_gaps = Vec::new();
+                        let mut gaps_truncated = false;
+                        loop {
+                            let recovery = match gateway.recover_maintenance_trigger_session(
+                                &recovery_fence,
+                                &session.connection_id,
+                                owner.principal_digest(),
+                                request_id.as_str(),
+                                continuation.as_deref(),
+                                eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
+                            ) {
+                                Ok(recovery) => recovery,
+                                Err(failure) => {
+                                    break Self::maintenance_trigger_recovery_failure_response(
+                                        &failure,
+                                        revoked_claims,
+                                    );
+                                }
+                            };
+                            let Some(next_page_count) = pages_scanned.checked_add(1) else {
+                                break serde_json::json!({
+                                    "status": "unknown",
+                                    "value": {
+                                        "kind": "maintenance_trigger_session_recovery",
+                                        "accepted": false,
+                                        "failure_code": "MAINTENANCE_TRIGGER_RECOVERY_COUNT_OVERFLOW",
+                                        "commit_outcome": "UNKNOWN",
+                                    },
+                                    "recovery": null,
+                                });
+                            };
+                            pages_scanned = next_page_count;
+                            let Some(total_revoked_claims) =
+                                revoked_claims.checked_add(u64::from(recovery.revoked_claims))
+                            else {
+                                break serde_json::json!({
+                                    "status": "unknown",
+                                    "value": {
+                                        "kind": "maintenance_trigger_session_recovery",
+                                        "accepted": false,
+                                        "failure_code": "MAINTENANCE_TRIGGER_RECOVERY_COUNT_OVERFLOW",
+                                        "commit_outcome": "UNKNOWN",
+                                    },
+                                    "recovery": null,
+                                });
+                            };
+                            revoked_claims = total_revoked_claims;
+                            for gap in recovery.gaps {
+                                if recovery_gaps
+                                    .iter()
+                                    .any(|retained: &MaintenanceTriggerGap| {
+                                        retained.gap_id == gap.gap_id
+                                    })
+                                {
+                                    continue;
+                                }
+                                if recovery_gaps.len() < MAX_MAINTENANCE_TRIGGER_PAGE_GAPS as usize
+                                {
+                                    recovery_gaps.push(gap);
+                                } else {
+                                    gaps_truncated = true;
+                                }
+                            }
+                            if !recovery.has_more {
+                                let pending_page = match gateway.maintenance_trigger_page(
+                                    &recovery_fence,
+                                    &session.connection_id,
+                                    request_id.as_str(),
+                                    None,
+                                    eliot_ors::MAX_MAINTENANCE_TRIGGER_PAGE,
+                                ) {
+                                    Ok(page) => match page.validate() {
+                                        Ok(()) => Some(page),
+                                        Err(error) => {
+                                            let failure =
+                                                MaintenanceTriggerLifecycleFailure::Protocol {
+                                                    error,
+                                                    commit_outcome:
+                                                        MaintenanceTriggerCommitOutcome::NotAttempted,
+                                                };
+                                            break Self::maintenance_trigger_recovery_failure_response(
+                                                &failure,
+                                                revoked_claims,
+                                            );
+                                        }
+                                    },
+                                    // The gateway emits this exact failure only
+                                    // when ORS proves the frozen high-water window
+                                    // is empty. Other empty-looking failures stay
+                                    // unknown or incomplete.
+                                    Err(
+                                        MaintenanceTriggerLifecycleFailure::EmptyPageWithoutGap,
+                                    ) => None,
+                                    Err(failure) => {
+                                        break Self::maintenance_trigger_recovery_failure_response(
+                                            &failure,
+                                            revoked_claims,
+                                        );
+                                    }
+                                };
+                                let mut pending_members = Vec::new();
+                                let mut pending_has_more = false;
+                                let mut pending_continuation = None;
+                                let empty_membership_proven = pending_page.is_none();
+                                if let Some(page) = pending_page {
+                                    for gap in &page.gaps {
+                                        if recovery_gaps.iter().any(
+                                            |retained: &MaintenanceTriggerGap| {
+                                                retained.gap_id == gap.gap_id
+                                            },
+                                        ) {
+                                            continue;
+                                        }
+                                        if recovery_gaps.len()
+                                            < MAX_MAINTENANCE_TRIGGER_PAGE_GAPS as usize
+                                        {
+                                            recovery_gaps.push(gap.clone());
+                                        } else {
+                                            gaps_truncated = true;
+                                        }
+                                    }
+                                    pending_members = page.members;
+                                    pending_has_more = page.has_more;
+                                    pending_continuation = page.continuation;
+                                }
+                                break Self::maintenance_trigger_session_recovery_view(
+                                    revoked_claims,
+                                    &recovery_gaps,
+                                    gaps_truncated,
+                                    pages_scanned,
+                                    &pending_members,
+                                    pending_has_more,
+                                    pending_continuation.as_deref(),
+                                    empty_membership_proven,
+                                );
+                            }
+                            let Some(next_continuation) = recovery.continuation else {
+                                let failure =
+                                    MaintenanceTriggerLifecycleFailure::ContinuationNotRetained;
+                                break Self::maintenance_trigger_recovery_failure_response(
+                                    &failure,
+                                    revoked_claims,
+                                );
+                            };
+                            if !seen_continuations.insert(next_continuation.clone()) {
+                                let failure =
+                                    MaintenanceTriggerLifecycleFailure::ContinuationNotRetained;
+                                break Self::maintenance_trigger_recovery_failure_response(
+                                    &failure,
+                                    revoked_claims,
+                                );
+                            }
+                            continuation = Some(next_continuation);
+                        }
+                    }
+                    _ => Self::maintenance_trigger_input_failure_response(
+                        "maintenance_trigger_session_recovery",
+                        "MAINTENANCE_TRIGGER_AUTHENTICATED_OWNER_UNAVAILABLE",
+                    ),
+                };
+                let maintenance_trigger_recovery_complete = maintenance_trigger_recovery
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("known")
+                    && maintenance_trigger_recovery
+                        .pointer("/value/reconciliation_complete")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && maintenance_trigger_recovery
+                        .pointer("/value/claim_recovery_complete")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && maintenance_trigger_recovery
+                        .pointer("/value/gaps_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    && maintenance_trigger_recovery
+                        .pointer("/value/members")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some()
+                    && maintenance_trigger_recovery
+                        .pointer("/value/has_more")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    && maintenance_trigger_recovery
+                        .pointer("/value/continuation")
+                        .is_some_and(serde_json::Value::is_null)
+                    && maintenance_trigger_recovery
+                        .pointer("/value/empty_membership_proven")
+                        .and_then(serde_json::Value::as_bool)
+                        .is_some();
+                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready
+                    && maintenance_trigger_recovery_complete
+                {
                     // The Store snapshot is same-fence validated above and the
                     // staged envelopes are reconciled under that same fence, so
                     // both halves of step 6 now hold.
@@ -6203,6 +7822,7 @@ impl KernelComposition {
                     &snapshot,
                     &self.process_stream_recovery_status_view(&stream_identities),
                     &staged_write_recovery_view(&staged),
+                    &maintenance_trigger_recovery,
                 ))
             }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
@@ -6311,6 +7931,7 @@ impl KernelComposition {
     async fn store_recovery_operation(
         &self,
         _session: &Session,
+        _request_id: &RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
@@ -9008,6 +10629,7 @@ fn store_recovery_response(
     snapshot: &StoreRecoverySnapshot,
     process_stream_recovery: &serde_json::Value,
     staged_write_recovery: &serde_json::Value,
+    maintenance_trigger_recovery: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
@@ -9016,6 +10638,7 @@ fn store_recovery_response(
             "value": snapshot,
             "process_stream_recovery": process_stream_recovery,
             "staged_write_recovery": staged_write_recovery,
+            "maintenance_trigger_recovery": maintenance_trigger_recovery,
         },
         "recovery": null,
     })

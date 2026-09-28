@@ -50,6 +50,11 @@ mod storage_replacement;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+#[cfg(windows)]
+pub use store_gateway::{
+    MaintenanceTriggerCommitOutcome, MaintenanceTriggerIntakeFailure,
+    MaintenanceTriggerLifecycleFailure, MaintenanceTriggerSessionRecovery,
+};
 mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
