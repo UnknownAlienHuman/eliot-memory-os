@@ -800,8 +800,12 @@ impl KernelRecord {
         self.one_time_nonce.validate()
     }
 
+    /// Revalidates this recorded Kernel entry against the journal admission
+    /// laws (fence, approval, nonce/state agreement and process/Job
+    /// binding). The Host restart gate calls this on the original recorded
+    /// record; it never recomputes a checksum over a held copy.
     #[allow(clippy::too_many_lines)]
-    fn validate(&self) -> Result<(), JournalError> {
+    pub fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
         handle(&self.activation_identity, "kernel.activation_identity")?;
