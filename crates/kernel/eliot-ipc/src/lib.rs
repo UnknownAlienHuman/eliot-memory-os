@@ -25,8 +25,9 @@ mod session_lifecycle;
 pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
 pub use host_conformance::{
     AdmissionCoverage, AttemptGate, AttemptPhase, AttemptRouteOutcome, CapabilityEvidence,
-    ConformanceError, EvidenceTier, FingerprintQuarantine, HostFingerprint,
-    RouteMismatchDisposition, admit_coverage, reconcile_attempt_route, require_verified_capability,
+    ConformanceError, EvidenceTier, FingerprintQuarantine, HostFingerprint, RouteFinding,
+    RouteMismatchDisposition, admit_coverage, admit_coverage_for_claim, reconcile_attempt_route,
+    require_verified_capability, require_verified_capability_for_claim,
 };
 pub use role_lease::{
     AgentRole, CapabilityContext, CapabilityToken, DelegatedAuthority, IndependenceDowngrade,
