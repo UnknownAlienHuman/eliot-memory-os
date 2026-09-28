@@ -135,6 +135,21 @@ pub struct UserAutomationDurableJobMaterial {
     pub mode: UserAutomationExecutionMode,
     /// Capability profile certified by the qualified owner for this material.
     pub capability_profile: AutomationCapabilityProfile,
+    /// Exact Skill package revisions certified by the qualified owner for the
+    /// dependency closure this material submits.
+    ///
+    /// The revision the deterministic preflight approved declares the admitted
+    /// closure; the material repeats it so a substituted artifact with an
+    /// equal top-level profile but a different transitive closure fails closed
+    /// instead of reaching a model/provider route. Older material without the
+    /// closure still decodes and is refused at revision binding, never admitted.
+    #[serde(default)]
+    pub skill_package_revision_refs: Vec<String>,
+    /// Exact Tool Definition revisions certified by the qualified owner for the
+    /// dependency closure this material submits, with the same binding rule as
+    /// the Skill revisions above.
+    #[serde(default)]
+    pub tool_definition_refs: Vec<String>,
     /// Complete owner-issued Durable Job submission request.
     pub request: DurableJobRequest,
 }
@@ -159,6 +174,13 @@ impl UserAutomationDurableJobMaterial {
     ) -> Result<(), UserAutomationExecutionError> {
         validate_text(&self.occurrence_id, "runtime.durable_job.occurrence_id")?;
         validate_text(&self.qualified_ref, "runtime.durable_job.qualified_ref")?;
+        for reference in self
+            .skill_package_revision_refs
+            .iter()
+            .chain(self.tool_definition_refs.iter())
+        {
+            validate_text(reference, "runtime.durable_job.dependency_closure")?;
+        }
         self.request.validate().map_err(|_| {
             UserAutomationExecutionError::RuntimeResponseMismatch("durable job material shape")
         })?;
@@ -234,6 +256,23 @@ impl UserAutomationDurableJobMaterial {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "durable job material qualified binding",
             ));
+        }
+        // Transitive provider/tool reachability is bound through the admitted
+        // dependency closure, not through the top-level profile alone: the
+        // material must repeat exactly the Skill revisions the revision admits,
+        // and its Tool Definitions must be a non-empty exact set. A substituted
+        // artifact whose closure reaches a provider the revision never admitted
+        // cannot satisfy this equality, so indirect provider access fails closed
+        // here instead of reaching the Durable Job owner.
+        if self.skill_package_revision_refs != revision.portable_skill_package_revision_refs
+            || self.tool_definition_refs.is_empty()
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material dependency closure",
+            ));
+        }
+        for reference in &self.tool_definition_refs {
+            validate_text(reference, "runtime.durable_job.tool_definition")?;
         }
         if self.mode == UserAutomationExecutionMode::DeterministicProcess
             && (revision.work_class == AutomationWorkClass::ModelJobs
