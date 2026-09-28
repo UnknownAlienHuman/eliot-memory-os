@@ -923,34 +923,43 @@ impl OutboundFileRequest {
     }
 }
 
-/// Owner port that resolves a local path to an authorized immutable handle.
+/// Owner port that resolves a requested outbound value to an authorized
+/// immutable handle.
 ///
-/// The bridge never touches the filesystem or the blob store; the owning
-/// artifact contract implements this port.
+/// The bridge never touches the filesystem or the blob store, and it never
+/// authorizes a handle itself; the owning artifact contract applies the
+/// disclosure closure and recipient policy before confirming any value.
 pub trait ArtifactResolutionPort {
-    /// Resolves a local path to an authorized handle, or nothing.
-    fn resolve_local_path(&self, path: &str) -> Option<DisclosedArtifactHandle>;
+    /// Resolves the requested value to an authorized handle, or nothing.
+    ///
+    /// The owner returns a handle only when the requested value — a local
+    /// path or an opaque handle text — with the claimed disclosure digest
+    /// denotes an authorized immutable artifact under disclosure closure
+    /// and recipient policy.
+    fn resolve_outbound(
+        &self,
+        requested: &str,
+        disclosure_digest: &str,
+    ) -> Option<DisclosedArtifactHandle>;
 }
 
 /// Resolves one outbound file request to an authorized immutable handle.
 ///
-/// A value that is recognizably a local path is sent only when the owning
-/// port resolves it to an authorized handle; otherwise it is rejected with
-/// [`BridgeError::LocalPathNotDisclosed`].
+/// Every requested value is resolved through the owning port: the bridge
+/// cannot tell an opaque handle from a local path by shape, so a value the
+/// owner does not confirm is rejected with
+/// [`BridgeError::LocalPathNotDisclosed`] and never sent as if it were the
+/// artifact.
 pub fn resolve_outbound_file(
     request: &OutboundFileRequest,
     owner: &dyn ArtifactResolutionPort,
 ) -> Result<DisclosedArtifactHandle, BridgeError> {
-    if looks_like_local_path(&request.requested) {
-        match owner.resolve_local_path(&request.requested) {
-            Some(handle) => {
-                handle.validate()?;
-                Ok(handle)
-            }
-            None => Err(BridgeError::LocalPathNotDisclosed),
+    match owner.resolve_outbound(&request.requested, &request.disclosure_digest) {
+        Some(handle) => {
+            handle.validate()?;
+            Ok(handle)
         }
-    } else {
-        DisclosedArtifactHandle::new(request.requested.clone(), request.disclosure_digest.clone())
+        None => Err(BridgeError::LocalPathNotDisclosed),
     }
 }
 
