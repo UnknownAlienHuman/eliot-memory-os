@@ -53,6 +53,7 @@ pub use effect_operation_lease::{
     ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
     EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
     EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics, authorize_effect_replay,
+    deny_unleased_effect_replay,
 };
 pub use execution_manifest::{
     AdmittedModuleGeneration, BoundKernelExecutionManifest, CatalogPolicyView,
