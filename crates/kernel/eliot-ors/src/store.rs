@@ -15718,7 +15718,7 @@ impl RedbRecoveryStore {
         };
         let (positions, continuation) =
             Self::bridge_handoff_position_page_in(write, &access, &scan, budget)?;
-        let next_scan = if continuation {
+        let mut next_scan = if continuation {
             let after_sequence = positions.last().map(|(sequence, _)| *sequence).ok_or(
                 OrsError::IntegrityProblem {
                     record_type: "bridge_event_position",
@@ -17170,7 +17170,7 @@ impl RedbRecoveryStore {
                 return Err(OrsError::ProjectionLimitExceeded);
             }
             count += 1;
-            bytes += (key.value().len() + value.value().len()) as u64;
+            bytes += (key.len() + value.value().len()) as u64;
         }
         Ok((count, bytes))
     }
