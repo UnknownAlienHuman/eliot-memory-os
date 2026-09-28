@@ -2936,10 +2936,21 @@ impl DaemonComposition {
     /// the already-defined quarantined capture route
     /// ([`task_binding_admission::admit_capture`]), never a task-bound write.
     ///
+    /// # Scope-revision limit
+    ///
+    /// The current retained snapshot exposes `owner_revision`, while its
+    /// `ScopeBinding` and guard receipt carry no `WorkScopeDescriptor` revision;
+    /// `ObservedScopeResources` likewise has no observed descriptor revision.
+    /// This entry therefore revalidates actual instance, lineage, resource
+    /// generation, privacy, source closure, and the current Kernel fence, but
+    /// cannot compare expected and observed scope revisions. It does not
+    /// reinterpret `owner_revision` as a descriptor revision.
+    ///
     /// # Live status
     ///
-    /// `caller: STITCH`. The admission boundary itself is implemented and
-    /// reachable; the attach/launch/write ingresses that would supply an
+    /// `caller: STITCH`. The admission boundary implementation is present but
+    /// has no production callers. The attach/resume, launch, and write
+    /// ingresses that would supply an
     /// explicit workspace root, the admitted privacy class, the retained source
     /// generation, and the source closure are owned by the attach-transport and
     /// operation-wiring issues, so nothing in `eliotd` can call this yet. A
@@ -3078,8 +3089,13 @@ impl DaemonComposition {
     /// supplies its own `TaskSelectionEvidence` is never read.
     ///
     /// The typed answer is preserved exactly: `Current` with the exact
-    /// evidence, `Absent` when no task is selected, or `Ambiguous` with the
-    /// owner-issued bounded candidate handles when several survived selection.
+    /// evidence, `Absent` with the retained scope's task-intake shape when no
+    /// task is selected, `Exploratory` with the exact read-only binding,
+    /// `Stale` with the exact old task/revision for owner refresh/rebind, or
+    /// `Ambiguous` with the owner-issued bounded candidate handles when
+    /// several survived task selection. Task-candidate ambiguity remains
+    /// distinct from active-work scope ambiguity, which the Governor's
+    /// activation route returns through its existing typed error.
     /// No task is created to remove ambiguity and no cold capture is attached
     /// retroactively here; that remains a separate admitted binding
     /// transition.
@@ -3102,7 +3118,7 @@ impl DaemonComposition {
         workspace_instance_candidate_ref: &str,
         privacy_class: eliot_security_contracts::PrivacyClass,
         governing_source_generation: u64,
-    ) -> Result<task_binding_admission::TaskSelectionDisposition, DaemonError> {
+    ) -> Result<task_binding_admission::TaskSelectionResponse, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
@@ -3114,8 +3130,45 @@ impl DaemonComposition {
             governing_source_generation,
         )?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
-        task_binding_admission::bind_current_task_selection(&activation, &receipt, &live_fence)
-            .map_err(DaemonError::from)
+        match task_binding_admission::bind_current_task_selection(
+            activation.as_ref(),
+            &receipt,
+            &live_fence,
+        )
+        .map_err(DaemonError::from)?
+        {
+            task_binding_admission::TaskSelectionDisposition::Absent => {
+                let intake = GovernorComposition::task_selection_intake_shape(
+                    receipt.scope.scope_ref.as_str(),
+                )
+                .map_err(DaemonError::Composition)?;
+                Ok(task_binding_admission::TaskSelectionResponse::Absent(intake))
+            }
+            task_binding_admission::TaskSelectionDisposition::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => Ok(task_binding_admission::TaskSelectionResponse::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            }),
+            task_binding_admission::TaskSelectionDisposition::Ambiguous(candidate_handles) => {
+                Ok(task_binding_admission::TaskSelectionResponse::Ambiguous(
+                    candidate_handles,
+                ))
+            }
+            task_binding_admission::TaskSelectionDisposition::Stale {
+                task_ref,
+                task_revision,
+            } => Ok(task_binding_admission::TaskSelectionResponse::Stale {
+                task_ref,
+                task_revision,
+            }),
+            task_binding_admission::TaskSelectionDisposition::Current(evidence) => {
+                Ok(task_binding_admission::TaskSelectionResponse::Current(evidence))
+            }
+        }
     }
 
     /// Compiles and retains the reconciliation receipt for one attach of an
