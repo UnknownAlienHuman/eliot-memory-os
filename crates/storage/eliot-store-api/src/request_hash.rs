@@ -232,6 +232,35 @@ pub fn verify_canonical_request_hash(
     }
 }
 
+/// Domain separator for the corrected operation identity (issue #1796, I6.8).
+const CORRECTED_OPERATION_ID_DOMAIN: &str = "eliot.contract_rejection.corrected_operation_id.v1";
+
+/// Derives the corrected operation identity one refusal issues (issue #1796, I6.8).
+///
+/// `I6.8` requires the corrected request to receive a new operation ID while
+/// `corrected_from_operation_id` preserves lineage, and requires an exact
+/// retry of the same request hash to return the same rejection. Both inputs
+/// here are already fixed by the refusal being returned: the rejected
+/// operation identity, and the rejection identity, which is itself derived
+/// only from the idempotency key and the canonical request hash. The same
+/// refusal therefore always derives the same corrected identity, and a
+/// different refusal always derives a different one. No nonce, clock,
+/// counter, or new input participates.
+///
+/// This is the ONE shared derivation behind both the Governor owner
+/// (`eliot-canonical::derive_corrected_operation_id`) and the Kernel
+/// mechanical gate (`eliot-kernel-service` pre-stage rejection), so the
+/// identity the live path stamps is exactly the identity the owner issues:
+/// there is no second issuer to diverge from it.
+#[must_use]
+pub fn derive_corrected_operation_id(rejected_operation_id: &str, rejection_id: &str) -> String {
+    let digest = sha256_hex(
+        format!("{CORRECTED_OPERATION_ID_DOMAIN}:{rejected_operation_id}:{rejection_id}")
+            .as_bytes(),
+    );
+    format!("corrected-{digest}")
+}
+
 /// Verifies that the transition-carried ordering scopes are the exact
 /// execution of the hashed expected ordering heads (issue #63).
 ///

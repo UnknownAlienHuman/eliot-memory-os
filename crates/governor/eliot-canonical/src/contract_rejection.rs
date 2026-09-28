@@ -28,11 +28,14 @@
 //! refusal is already fixed by, [`RetainedRejections`] keeps the operation
 //! identity each refusal rejected, and
 //! [`RetainedRejections::verify_correction_lineage`] believes a lineage claim
-//! only when that own record proves it. The Kernel pre-stage gate
-//! (`eliot-kernel-service::contract_rejection_gate`) enforces the identity
-//! half it can see on the wire - a resubmission still wearing a refused
-//! operation identity - and deliberately issues no identity of its own, so the
-//! issuance and the lineage proof stay here.
+//! only when that own record proves it. The derivation itself is the one
+//! shared primitive the Kernel pre-stage gate
+//! (`eliot-kernel-service::contract_rejection_gate`) also calls, so the
+//! identity stamped on the live path is exactly the identity issued here and
+//! there is no second issuer. The gate mechanically mirrors what it can see
+//! on the wire - refusing a resubmission still wearing a refused operation
+//! identity and verifying a presented correction against its own retained
+//! refusals - but the semantic admission decision stays here.
 
 use std::collections::BTreeMap;
 
@@ -361,9 +364,6 @@ pub fn derive_rejection_id(idempotency_key: &str, canonical_request_hash: &str) 
     sha256_hex(format!("{idempotency_key}:{canonical_request_hash}").as_bytes())
 }
 
-/// Domain separator for the owner-issued corrected operation identity.
-const CORRECTED_OPERATION_ID_DOMAIN: &str = "eliot.contract_rejection.corrected_operation_id.v1";
-
 /// Defect code for a caller-asserted correction lineage the owner never
 /// rejected.
 pub const UNPROVEN_CORRECTION_LINEAGE: &str = "UNPROVEN_CORRECTION_LINEAGE";
@@ -379,13 +379,13 @@ pub const UNPROVEN_CORRECTION_LINEAGE: &str = "UNPROVEN_CORRECTION_LINEAGE";
 /// rejection therefore always issues the same corrected identity, and a
 /// different rejection always issues a different one. No nonce, clock,
 /// counter, or new input participates.
+///
+/// The derivation itself is the one shared primitive also used by the Kernel
+/// mechanical gate, so the identity the live path stamps is exactly the
+/// identity issued here: there is no second issuer to diverge from it.
 #[must_use]
 pub fn derive_corrected_operation_id(rejected_operation_id: &str, rejection_id: &str) -> String {
-    let digest = sha256_hex(
-        format!("{CORRECTED_OPERATION_ID_DOMAIN}:{rejected_operation_id}:{rejection_id}")
-            .as_bytes(),
-    );
-    format!("corrected-{digest}")
+    eliot_store_api::derive_corrected_operation_id(rejected_operation_id, rejection_id)
 }
 
 /// One refusal this owner kept, bound to the operation identity it refused.
