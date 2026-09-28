@@ -1236,10 +1236,7 @@ impl KernelStoreGateway {
         })?;
         let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
         crate::store_write_reservation::reconcile_staged_writes_at_startup(
-            &owner,
-            fence,
-            &self.store,
-            limit,
+            &owner, fence, self, limit,
         )
         .await
         .map_err(|error| error.to_string())
@@ -4187,6 +4184,38 @@ impl KernelStoreGateway {
             .map_err(|error| error.to_string())?;
         health.validate().map_err(|error| error.to_string())?;
         Ok(health)
+    }
+}
+
+/// The startup ORS scan reads canonical receipts through this gateway, not
+/// through the raw `CanonicalStoreClient` trait call (issue #1713, item 6).
+///
+/// The one named path is [`KernelStoreGateway::receipt`], so the scan keeps the
+/// flight slot, the fenced-rebind refusal, the fence validation and the
+/// active-route checks before and after the query, and the receipt's own
+/// operation/fence binding check. This impl only names that method and
+/// translates a refusal; it repeats none of those checks. A refusal stays a
+/// failed check, so the scan reports an error rather than an absent receipt or
+/// a safely absent operation.
+impl crate::store_write_reservation::StartupReceiptRoute for KernelStoreGateway {
+    fn observe_receipt<'a>(
+        &'a self,
+        state_fence: &'a StateFence,
+        operation_id: OperationId,
+    ) -> crate::store_write_reservation::StartupReceiptObservation<'a> {
+        Box::pin(async move {
+            self.receipt(state_fence, operation_id.clone())
+                .await
+                .map_err(
+                    |refusal| crate::store_write_reservation::ReservationWriteError::Binding {
+                        operation_id: operation_id.as_str().to_owned(),
+                        detail: format!(
+                            "named authenticated canonical-Store receipt gateway refused the \
+                         observation: {refusal}"
+                        ),
+                    },
+                )
+        })
     }
 }
 
