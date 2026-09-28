@@ -1,11 +1,12 @@
-//! Startup attach of canonical notification records into the daemon board (#1780).
+//! Canonical notification reads for the daemon board (#1780).
 //!
 //! Attach-site wiring mirroring the owner-session pattern in
 //! `daemon_runtime::run`: the single place holding both the concrete
-//! [`DaemonKernelClient`] and the [`DaemonComposition`] fetches one bounded
-//! canonical page through the retained [`KernelContextReadClient`] and notes
-//! the verified records into the composition. No new thread, no new
-//! handshake, no stored client.
+//! [`DaemonKernelClient`] and the [`DaemonComposition`] fetches the complete
+//! canonical set through the retained [`KernelContextReadClient`] and notes
+//! verified records into the composition. The read stays outside the
+//! composition lock, and the observed fence is checked again before
+//! attachment. No new thread, no new handshake, no stored client.
 //!
 //! Cold or unbound state stays a typed unavailable gap: transport
 //! `Unknown`/`Unavailable`, fence mismatch, decode failure, or a missing
@@ -17,11 +18,13 @@
 use std::sync::Arc;
 
 use eliot_contracts::StateFence;
+use eliot_controlboard::CanonicalNotificationMetrics;
 use eliot_governor::KernelGenerationSnapshotProvider;
 use eliot_kernel_core::Notification;
 use eliot_store_api::{
-    CanonicalReadClient, MAX_NOTIFICATION_PAGE_LIMIT, NOTIFY_PAGE_RECORDS, NamedReadRequest,
-    StoreError, notification_read_request,
+    CanonicalReadClient, MAX_NOTIFICATION_PAGE_LIMIT, NOTIFY_PAGE_METRICS, NOTIFY_PAGE_RECORDS,
+    NOTIFY_PAGE_REVISION, NOTIFY_PAGE_STATE_FENCE, NamedReadRequest, StoreError,
+    notification_read_request,
 };
 
 use super::DaemonComposition;
@@ -31,21 +34,46 @@ use super::kernel_context_read_client::KernelContextReadClient;
 /// Typed outcome of the startup notification attach.
 pub enum NotificationBoardAttach {
     /// Verified canonical records at the admitted fence, ready to note.
-    Ready(Vec<Notification>),
+    Ready(NotificationBoardSnapshot),
     /// Cold/unbound/failed read: explicit gap, never success-empty.
     Unavailable { reason: String },
+}
+
+/// Complete verified canonical inbox and the fence it was read against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationBoardSnapshot {
+    /// Every canonical record returned across the owner's cursor pages.
+    pub records: Vec<Notification>,
+    /// Fence echoed consistently by the owner and observed before/after fetch.
+    pub state_fence: StateFence,
+}
+
+/// One authenticated canonical page and its owner-supplied read metadata.
+struct NotificationBoardPage {
+    records: Vec<Notification>,
+    metrics: CanonicalNotificationMetrics,
+    revision: u64,
 }
 
 /// Builds the closed board read: every scope, resolved records included
 /// (closure evidence stays visible), one bounded page at the contract max.
 pub fn build_closed_board_read(state_fence: StateFence) -> Result<NamedReadRequest, StoreError> {
+    build_closed_board_page_read(state_fence, None)
+}
+
+/// Builds one bounded page at the exact admitted fence and optional opaque
+/// dedup-key continuation cursor.
+fn build_closed_board_page_read(
+    state_fence: StateFence,
+    cursor: Option<String>,
+) -> Result<NamedReadRequest, StoreError> {
     notification_read_request(
         None,
         None,
         None,
         true,
         MAX_NOTIFICATION_PAGE_LIMIT,
-        None,
+        cursor,
         state_fence,
     )
 }
@@ -75,6 +103,10 @@ pub fn decode_board_records(
                 field: "notification.records",
                 reason: "record payload is not a canonical notification",
             })?;
+        record.validate().map_err(|_| StoreError::InvalidField {
+            field: "notification.records",
+            reason: "record payload fails canonical notification validation",
+        })?;
         if record.state_fence != *fence {
             return Err(StoreError::FenceMismatch);
         }
@@ -83,19 +115,198 @@ pub fn decode_board_records(
     Ok(decoded)
 }
 
-/// Fetches one bounded canonical page through the retained read client.
+/// Decodes one page and its metadata without promoting an empty or partial
+/// response to a complete inbox.
+fn decode_board_page(
+    payload: &serde_json::Value,
+    expected_fence: &StateFence,
+) -> Result<NotificationBoardPage, StoreError> {
+    let field = |name: &'static str| {
+        payload.get(name).cloned().ok_or(StoreError::InvalidField {
+            field: name,
+            reason: "canonical notification read metadata is missing",
+        })
+    };
+    let state_fence: StateFence =
+        serde_json::from_value(field(NOTIFY_PAGE_STATE_FENCE)?).map_err(|_| {
+            StoreError::InvalidField {
+                field: NOTIFY_PAGE_STATE_FENCE,
+                reason: "canonical notification read fence is invalid",
+            }
+        })?;
+    if state_fence != *expected_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let revision = payload
+        .get(NOTIFY_PAGE_REVISION)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StoreError::InvalidField {
+            field: NOTIFY_PAGE_REVISION,
+            reason: "canonical notification read revision is invalid",
+        })?;
+    let metrics: CanonicalNotificationMetrics = serde_json::from_value(field(NOTIFY_PAGE_METRICS)?)
+        .map_err(|_| StoreError::InvalidField {
+            field: NOTIFY_PAGE_METRICS,
+            reason: "canonical notification read metrics are invalid",
+        })?;
+    let records = decode_board_records(payload, expected_fence)?;
+    Ok(NotificationBoardPage {
+        records,
+        metrics,
+        revision,
+    })
+}
+
+/// Fetches every bounded canonical page through the retained read client.
 ///
 /// The capability gate inside `execute_named` admits only the closed
 /// `GetNotificationState` selector set; operation/fence echo is enforced by
-/// the shared response check. Transport failures surface as
-/// [`StoreError::Unavailable`], never as success-empty.
+/// the shared response check. The backend's opaque cursor is the last returned
+/// dedup key. Pages must advance strictly and retain identical revision and
+/// fence. The owner metrics can be partial on a full intermediate page; the
+/// terminal page scans the complete selected set, so its metrics are reconciled
+/// with all collected records before the inbox is accepted.
 pub async fn fetch_board_records(
     reads: &KernelContextReadClient,
     fence: StateFence,
 ) -> Result<Vec<Notification>, StoreError> {
-    let request = build_closed_board_read(fence.clone())?;
-    let response = reads.execute_named(request).await?;
-    decode_board_records(&response.payload, &fence)
+    let page_limit = usize::from(MAX_NOTIFICATION_PAGE_LIMIT);
+    let mut cursor: Option<String> = None;
+    let mut previous_key: Option<String> = None;
+    let mut expected_revision: Option<u64> = None;
+    let mut records = Vec::new();
+
+    loop {
+        let request = build_closed_board_page_read(fence.clone(), cursor.clone())?;
+        let response = reads.execute_named(request).await?;
+        let page = decode_board_page(&response.payload, &fence)?;
+        if page.records.len() > page_limit {
+            return Err(StoreError::InvalidField {
+                field: "notification.records",
+                reason: "canonical notification page exceeds its requested limit",
+            });
+        }
+        match expected_revision {
+            Some(revision) if revision != page.revision => {
+                return Err(StoreError::InvalidField {
+                    field: "notification.page",
+                    reason: "canonical notification revision changed during pagination",
+                });
+            }
+            Some(_) => {}
+            None => expected_revision = Some(page.revision),
+        }
+
+        let page_len = page.records.len();
+        for record in &page.records {
+            if previous_key
+                .as_deref()
+                .is_some_and(|previous| record.dedup_key.as_str() <= previous)
+            {
+                return Err(StoreError::InvalidField {
+                    field: "notification.cursor",
+                    reason: "canonical notification page did not advance its dedup-key cursor",
+                });
+            }
+            previous_key = Some(record.dedup_key.clone());
+        }
+        records.extend(page.records);
+        if page_len < page_limit {
+            validate_complete_notification_metrics(&records, page.metrics)?;
+            return Ok(records);
+        }
+
+        let next_cursor = previous_key.clone().ok_or(StoreError::InvalidField {
+            field: "notification.cursor",
+            reason: "full canonical notification page has no continuation key",
+        })?;
+        if cursor
+            .as_deref()
+            .is_some_and(|previous| next_cursor.as_str() <= previous)
+        {
+            return Err(StoreError::InvalidField {
+                field: "notification.cursor",
+                reason: "canonical notification continuation cursor did not advance",
+            });
+        }
+        cursor = Some(next_cursor);
+    }
+}
+
+/// Verifies that the terminal page's full-scope owner metrics reconcile with
+/// every fetched record, including resolved records.
+fn validate_complete_notification_metrics(
+    records: &[Notification],
+    owner_metrics: CanonicalNotificationMetrics,
+) -> Result<(), StoreError> {
+    let count = |predicate: fn(&&Notification) -> bool| {
+        checked_notification_count(records.iter().filter(predicate).count())
+    };
+    let observed = CanonicalNotificationMetrics {
+        unresolved_total: count(|record| record.is_unresolved())?,
+        critical_unresolved: count(|record| {
+            record.is_unresolved()
+                && record.severity == eliot_kernel_core::NotificationSeverity::Critical
+        })?,
+        action_required_unresolved: count(|record| {
+            record.is_unresolved()
+                && record.severity == eliot_kernel_core::NotificationSeverity::ActionRequired
+        })?,
+        failed_delivery_unresolved: count(|record| {
+            record.is_unresolved() && record.is_failed_delivery()
+        })?,
+        acknowledged_unresolved: count(|record| {
+            record.is_unresolved() && record.acknowledgement.is_some()
+        })?,
+        resolved_total: count(|record| !record.is_unresolved())?,
+    };
+    let owner_total = owner_metrics
+        .unresolved_total
+        .checked_add(owner_metrics.resolved_total)
+        .ok_or(StoreError::InvalidField {
+            field: "notification.metrics",
+            reason: "canonical notification metric total overflows",
+        })?;
+    let record_total = u64::try_from(records.len()).map_err(|_| StoreError::InvalidField {
+        field: "notification.records",
+        reason: "canonical notification record count exceeds metric range",
+    })?;
+    if owner_total != record_total || owner_metrics != observed {
+        return Err(StoreError::InvalidField {
+            field: "notification.metrics",
+            reason: "terminal canonical notification metrics do not match the complete record set",
+        });
+    }
+    Ok(())
+}
+
+/// Converts a complete fetched-row count to the owner's metric width.
+fn checked_notification_count(count: usize) -> Result<u64, StoreError> {
+    u64::try_from(count).map_err(|_| StoreError::InvalidField {
+        field: "notification.metrics",
+        reason: "canonical notification record count exceeds metric range",
+    })
+}
+
+/// Fetches a fresh canonical inbox at the daemon's admitted fence.
+///
+/// The caller performs this before acquiring the composition lock, then notes
+/// the completed snapshot only after every page and metadata check succeeds.
+pub async fn fetch_notification_snapshot(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<NotificationBoardSnapshot, String> {
+    let fence = kernel.snapshot().state_fence();
+    let reads = KernelContextReadClient::new(Arc::clone(kernel));
+    let records = fetch_board_records(&reads, fence.clone())
+        .await
+        .map_err(|error| format!("notification attach read failed: {error}"))?;
+    if kernel.snapshot().state_fence() != fence {
+        return Err("Kernel state fence rotated during canonical notification read".to_owned());
+    }
+    Ok(NotificationBoardSnapshot {
+        records,
+        state_fence: fence,
+    })
 }
 
 /// Attaches canonical notification records into the board composition.
@@ -110,37 +321,35 @@ pub fn attach_notification_snapshot(
     kernel: &Arc<DaemonKernelClient>,
     composition: &mut DaemonComposition,
 ) -> NotificationBoardAttach {
-    let fence = kernel.snapshot().state_fence();
-    let reads = KernelContextReadClient::new(Arc::clone(kernel));
-    let outcome = block_on_fetch(&reads, fence);
+    let outcome = block_on_fetch(kernel);
     match outcome {
-        Ok(records) => {
-            composition.note_notification_snapshot(records.clone());
-            NotificationBoardAttach::Ready(records)
+        Ok(snapshot) => {
+            let kernel_fence = kernel.snapshot().state_fence();
+            let composition_fence = composition.kernel_snapshot().state_fence();
+            if snapshot.state_fence != kernel_fence || snapshot.state_fence != composition_fence {
+                return NotificationBoardAttach::Unavailable {
+                    reason: "Kernel or composition state fence changed before notification attach"
+                        .to_owned(),
+                };
+            }
+            composition.note_notification_snapshot(snapshot.records.clone());
+            NotificationBoardAttach::Ready(snapshot)
         }
         Err(reason) => NotificationBoardAttach::Unavailable { reason },
     }
 }
 
 #[cfg(windows)]
-fn block_on_fetch(
-    reads: &KernelContextReadClient,
-    fence: StateFence,
-) -> Result<Vec<Notification>, String> {
+fn block_on_fetch(kernel: &Arc<DaemonKernelClient>) -> Result<NotificationBoardSnapshot, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("notification attach runtime unavailable: {error}"))?;
-    runtime
-        .block_on(fetch_board_records(reads, fence))
-        .map_err(|error| format!("notification attach read failed: {error}"))
+    runtime.block_on(fetch_notification_snapshot(kernel))
 }
 
 #[cfg(not(windows))]
-fn block_on_fetch(
-    _reads: &KernelContextReadClient,
-    _fence: StateFence,
-) -> Result<Vec<Notification>, String> {
+fn block_on_fetch(_kernel: &Arc<DaemonKernelClient>) -> Result<NotificationBoardSnapshot, String> {
     Err("notification attach is not admitted off Windows".to_owned())
 }
 

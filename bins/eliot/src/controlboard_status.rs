@@ -108,6 +108,7 @@ pub fn render_status_json(
         "expiry": board.expiry,
         "invalidation": board.invalidation,
         "rows": rows?,
+        "notifications": board.notifications,
     }))
 }
 
@@ -188,6 +189,18 @@ mod tests {
                 ),
                 row("ghost-component", ControlBoardRowDisposition::Missing, None),
             ],
+            notifications: serde_json::from_value(serde_json::json!({
+                "rows": [],
+                "metrics": {
+                    "total": 0,
+                    "unresolved": 0,
+                    "critical_unresolved": 0,
+                    "action_required_unresolved": 0,
+                    "failed_delivery": 0,
+                    "acknowledged_unresolved": 0
+                }
+            }))
+            .expect("notification fixture"),
             observed_count: 1,
             missing_count: 1,
             unexpected_observed: vec!["extra-entry".to_owned()],

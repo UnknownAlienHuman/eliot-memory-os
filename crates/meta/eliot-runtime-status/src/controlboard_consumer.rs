@@ -69,7 +69,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::StateFence;
-use eliot_controlboard::{ControlBoard, ReadRequest};
+use eliot_controlboard::{ControlBoard, NotificationInbox, ReadRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -520,6 +520,8 @@ pub struct RenderedControlBoard {
     pub contour_digest: String,
     /// One row per frozen denominator entry, in frozen order.
     pub rows: Vec<RenderedControlBoardRow>,
+    /// Canonical notification inbox section, preserved from the board view.
+    pub notifications: NotificationInbox,
     /// Count of rows actually observed in the contour.
     pub observed_count: usize,
     /// Count of expected-but-unobserved rows.
@@ -667,6 +669,7 @@ pub fn render_controlboard_status(
         view_fence: contour.view_fence.clone(),
         contour_digest: contour.contour_digest.clone(),
         rows,
+        notifications: contour.notifications.clone(),
         observed_count,
         missing_count,
         unexpected_observed,

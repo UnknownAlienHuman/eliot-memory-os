@@ -44,7 +44,7 @@
 
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_controlboard::{
-    BoardItemKind, ControlBoard, ControlBoardView, ReadRequest, ReviewLifecycle,
+    BoardItemKind, ControlBoard, ControlBoardView, NotificationInbox, ReadRequest, ReviewLifecycle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -164,6 +164,8 @@ pub struct ControlBoardContour {
     pub view_fence: StateFence,
     /// One row per visible board item and review, in view order.
     pub rows: Vec<ControlBoardStatusRow>,
+    /// Canonical notification inbox section from the exact board view.
+    pub notifications: NotificationInbox,
     /// Count of board items in the exact view.
     pub item_count: usize,
     /// Count of reviews in the exact view.
@@ -343,6 +345,7 @@ pub fn project_controlboard_contour(
         revision,
         &view.fence,
         &rows,
+        &view.notifications,
         &evidence_refs,
     ))
     .map_err(|error| ControlBoardProjectionError::EncodingFailed {
@@ -353,6 +356,7 @@ pub fn project_controlboard_contour(
         view_revision: revision,
         view_fence: view.fence.clone(),
         rows,
+        notifications: view.notifications.clone(),
         item_count: view.items.len(),
         review_count: view.reviews.len(),
         provenance_edge_count: view.provenance.len(),

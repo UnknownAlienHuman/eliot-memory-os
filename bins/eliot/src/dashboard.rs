@@ -29,13 +29,14 @@
 //!   offset and refresh are local UI state, discarded on exit.
 //!
 //! Truthfulness of the sections: the served `RenderedControlBoard` carries one
-//! un-sectioned, denominator-reconciled row projection and no I11.2 section
-//! field. Every I11.2 section is therefore rendered as an explicit
-//! `UNAVAILABLE` marker with its owner limitation — never as an empty list
-//! that could read as healthy — and the served rows are shown in their own
-//! clearly separate section that claims no I11.2 semantics. Section rows stay
-//! their owning producer's work (#1213 and the semantic owners); this layout
-//! cannot manufacture them.
+//! un-sectioned, denominator-reconciled row projection and the typed canonical
+//! notification inbox. Notifications are rendered from that inbox, including
+//! its board-derived metrics and owner-reported lifecycle/delivery state. Every
+//! other I11.2 section is an explicit `UNAVAILABLE` marker with its owner
+//! limitation — never an empty list that could read as healthy — and the
+//! served rows are shown in their own clearly separate section. Section rows
+//! stay their owning producer's work (#1213 and the semantic owners); this
+//! layout cannot manufacture them.
 //!
 //! Terminal ownership: raw mode and the alternate screen are entered only
 //! after a board is already in hand and are released by a scoped guard on
@@ -84,7 +85,7 @@ const REFRESH_WORKER_PANICKED: &str = "the refresh read did not return an answer
 const KEYS_LINE: &str = "keys: Left/Right section, Up/Down scroll, r refresh, q/Esc/Ctrl-C quit";
 
 /// One navigable I11.2 section plus the exact reason the currently served
-/// `controlboard.status` projection cannot supply it.
+/// `controlboard.status` projection cannot supply it, when unavailable.
 struct Section {
     /// I11.2 section name, reproduced from the normative section list.
     name: &'static str,
@@ -102,13 +103,10 @@ const SERVED_ROWS_SECTION_NAME: &str = "Board rows";
 
 /// The I11.2 named sections, in the normative order.
 ///
-/// Every one of them is unavailable in the current projection. The upstream
-/// `eliot-controlboard` `ControlBoardView` supplies reviews, provenance and a
-/// notification inbox, but the `controlboard.status` consumer flattens items
-/// and reviews into one un-sectioned row set and carries neither provenance
-/// nor notifications, and no accepted producer exists for the remaining
-/// sections. The residual section projection is named per section; the
-/// semantic data stays with its owner.
+/// Notifications are carried as a typed canonical inbox. Review and
+/// change-lineage data are not sectioned by the served projection, and no
+/// accepted producer exists for the remaining sections. The residual section
+/// projection is named per section; the semantic data stays with its owner.
 const SECTIONS: &[Section] = &[
     Section {
         name: "Product",
@@ -164,7 +162,7 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         name: "Notifications",
-        limitation: "eliot-controlboard ControlBoardView.notifications exists (I11.5), but the controlboard.status transport carries no notification section; the section projection is residual work of #1213",
+        limitation: "the served board includes the canonical notification inbox and its locally derived metrics",
     },
 ];
 
@@ -698,12 +696,105 @@ fn body_lines(view: &View) -> Vec<String> {
         return served_row_lines(view);
     }
     let section = &SECTIONS[view.section - 1];
+    if section.name == "Notifications" {
+        return notification_section_lines(view);
+    }
     vec![
         format!("section: {}", section.name),
-        "UNAVAILABLE: the served controlboard.status projection carries no I11.2 section field; it serves only the un-sectioned row projection shown under \"Board rows\"".to_owned(),
+        "UNAVAILABLE: the served controlboard.status projection carries no section data here; it serves the un-sectioned row projection shown under \"Board rows\" and the typed Notifications section".to_owned(),
         "this is an explicit owner limitation, not an empty list; it is never evidence of health, readiness, support or absence".to_owned(),
         format!("owner limitation: {}", display_text(section.limitation)),
     ]
+}
+
+/// Renders every canonical notification row and the metrics derived from the
+/// complete fetched set. Acknowledgement remains distinct from resolution,
+/// critical unresolved items stay explicit, and delivery failures retain the
+/// owner's failure reason.
+fn notification_section_lines(view: &View) -> Vec<String> {
+    let inbox = &view.snapshot.board.notifications;
+    let metrics = inbox.metrics;
+    let mut lines = vec![
+        "section: Notifications".to_owned(),
+        "canonical ControlBoard inbox; popup and quiet-hours policy do not alter these rows"
+            .to_owned(),
+        format!(
+            "metrics: total={} unresolved={} critical_unresolved={} action_required_unresolved={} failed_delivery={} acknowledged_unresolved={}",
+            metrics.total,
+            metrics.unresolved,
+            metrics.critical_unresolved,
+            metrics.action_required_unresolved,
+            metrics.failed_delivery,
+            metrics.acknowledged_unresolved,
+        ),
+    ];
+    if inbox.rows.is_empty() {
+        lines.push("no canonical notification records were returned".to_owned());
+        return lines;
+    }
+
+    for row in &inbox.rows {
+        let mut markers = Vec::new();
+        if row.is_unresolved() {
+            markers.push("UNRESOLVED");
+            if row.acknowledged {
+                markers.push("ACKNOWLEDGED; STILL UNRESOLVED");
+            }
+        } else {
+            markers.push("RESOLVED");
+        }
+        if row.delivery_failed {
+            markers.push("DELIVERY FAILED");
+        }
+        lines.push(format!(
+            "- {} [{}] {} dedup_key={}",
+            display_text(&row.notification_id),
+            format!("{:?}", row.severity).to_uppercase(),
+            markers.join(" | "),
+            display_text(&row.dedup_key),
+        ));
+        lines.push(format!("    subject: {}", display_text(&row.subject)));
+        lines.push(format!("    summary: {}", display_text(&row.summary)));
+        lines.push(format!(
+            "    owner={} affected_scope={} required_action={}",
+            display_text(&row.owner),
+            display_text(&row.affected_scope),
+            display_text(&row.required_action),
+        ));
+        lines.push(format!(
+            "    delivery_failed={} failure_reason={} channels={}",
+            row.delivery_failed,
+            row.failure_reason
+                .as_deref()
+                .map_or("(none reported)".to_owned(), display_text),
+            display_text(&format!("{:?}", row.delivery_channels)),
+        ));
+        lines.push(format!(
+            "    occurrences={} revision={} evidence_handles={} deadline_or_review={}",
+            row.occurrences,
+            row.revision,
+            display_text(&row.evidence_handles.join(", ")),
+            notification_deadline_or_review(row.deadline_or_review.as_ref()),
+        ));
+    }
+    lines
+}
+
+/// Renders only the deadline/review facts the canonical row supplied.
+fn notification_deadline_or_review(
+    boundary: Option<&eliot_kernel_core::DeadlineOrReview>,
+) -> String {
+    let Some(boundary) = boundary else {
+        return "(none supplied)".to_owned();
+    };
+    let deadline = boundary
+        .deadline_unix_ms
+        .map_or("(none)".to_owned(), |value| value.to_string());
+    let review = boundary
+        .review_ref
+        .as_deref()
+        .map_or("(none)".to_owned(), display_text);
+    format!("deadline_unix_ms={deadline} review_ref={review}")
 }
 
 /// Composes the served, role-filtered row projection.
