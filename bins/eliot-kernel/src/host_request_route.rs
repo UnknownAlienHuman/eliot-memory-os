@@ -1667,11 +1667,10 @@ impl KernelComposition {
 
     /// Advances the exact parent of a Cancellation envelope toward cancellation.
     ///
-    /// The parent must be a known current-generation operation. Cancellation
-    /// is attempted first; when the parent already passed the cancellable
-    /// window the parent is fenced to `Unknown` instead so its outcome is
-    /// reconciled rather than assumed. Store failures are returned so a failed
-    /// durable transition never looks like cancellation succeeded.
+    /// The parent must be a known current-generation operation. ORS observes
+    /// its durable attempt in the same transaction as the cancellation: a
+    /// claimed or possibly effected operation remains Unknown for owner
+    /// reconciliation instead of being reported as safely cancelled.
     fn advance_host_request_parent(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1692,65 +1691,27 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
-        if parent.state.is_terminal() {
-            self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
-            // Issue #1839: durable audit evidence for cancellation confirmation.
-            self.audit_observe(AuditEventDraft::cancel_confirmed(
-                envelope,
-                parent_operation.as_str(),
-                &parent_digest,
-                "already_terminal",
-            ));
-            return Ok(());
-        }
-        match self.generation_gateway.ors.advance_host_request(
-            &parent_operation,
+        let settled = self
+            .generation_gateway
+            .ors
+            .cancel_host_request_parent(&parent_operation, &parent_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let disposition = match settled.state {
+            HostRequestState::Cancelled => "cancelled",
+            HostRequestState::Unknown => "fenced_unknown",
+            HostRequestState::Reconciling => "reconciling",
+            state if state.is_terminal() => "already_terminal",
+            _ => return Err(TransportError::SessionFenced),
+        };
+        self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
+        self.audit_observe(AuditEventDraft::cancel_confirmed(
+            envelope,
+            parent_operation.as_str(),
             &parent_digest,
-            HostRequestState::Cancelled,
-            None,
-        ) {
-            Ok(Some(_)) => {
-                self.retire_observe_pair_under_transition(
-                    parent_operation.as_str(),
-                    &parent_digest,
-                );
-                // Issue #1839: durable audit evidence for cancellation confirmation.
-                self.audit_observe(AuditEventDraft::cancel_confirmed(
-                    envelope,
-                    parent_operation.as_str(),
-                    &parent_digest,
-                    "cancelled",
-                ));
-                Ok(())
-            }
-            Ok(None) => Err(TransportError::UnknownRequest),
-            Err(OrsError::InvalidTransition) => {
-                match self.generation_gateway.ors.advance_host_request(
-                    &parent_operation,
-                    &parent_digest,
-                    HostRequestState::Unknown,
-                    None,
-                ) {
-                    Ok(Some(_)) => {
-                        self.retire_observe_pair_under_transition(
-                            parent_operation.as_str(),
-                            &parent_digest,
-                        );
-                        // Issue #1839: durable audit evidence for cancellation confirmation.
-                        self.audit_observe(AuditEventDraft::cancel_confirmed(
-                            envelope,
-                            parent_operation.as_str(),
-                            &parent_digest,
-                            "fenced_unknown",
-                        ));
-                        Ok(())
-                    }
-                    Ok(None) => Err(TransportError::UnknownRequest),
-                    Err(_) => Err(TransportError::SessionFenced),
-                }
-            }
-            Err(_) => Err(TransportError::SessionFenced),
-        }
+            disposition,
+        ));
+        Ok(())
     }
 
     /// Requires the exact parent of a Status envelope to be known.

@@ -2582,6 +2582,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         target: crate::HostRequestState,
         result_digest: Option<&str>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically classifies cancellation of one exact host-request parent.
+    ///
+    /// A possibly-effected attempt is retained and fenced as `Unknown`; only
+    /// a pre-effect `Admitted`/`Routed` record with no claimed attempt (or an
+    /// explicit `DeferredNoEffect` attempt) may become `Cancelled`. Existing
+    /// `Unknown`/`Reconciling` and terminal rows are returned unchanged.
+    fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically records a daemon attempt before returning the executable
     /// claim. A different owner closes the row as `Unknown` while retaining
     /// the prior attempt for reconciliation.
@@ -7377,6 +7388,86 @@ impl RedbRecoveryStore {
         next.validate()?;
         if next != existing {
             let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Atomically classifies cancellation against the durable attempt phase.
+    ///
+    /// The parent row and its attempt are read and updated in one write
+    /// transaction, so a cancellation cannot mark a claimed request as
+    /// effect-free after a separate caller-side read. The attempt and any
+    /// result evidence are never cleared. `Requested` has no direct
+    /// `Cancelled` edge, so it is conservatively fenced as `Unknown`.
+    pub fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+
+        let target = match existing.state {
+            crate::HostRequestState::ResultReceived
+            | crate::HostRequestState::Cancelled
+            | crate::HostRequestState::Expired
+            | crate::HostRequestState::Conflicted
+            | crate::HostRequestState::Terminal => existing.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling => {
+                existing.state
+            }
+            crate::HostRequestState::Requested
+            | crate::HostRequestState::Submitted
+            | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
+            crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
+                match existing.attempt.as_ref().map(|attempt| attempt.phase) {
+                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
+                        crate::HostRequestState::Cancelled
+                    }
+                    Some(crate::HostRequestAttemptPhase::Claimed) => {
+                        crate::HostRequestState::Unknown
+                    }
+                }
+            }
+        };
+        if target == existing.state {
+            write.commit().map_err(storage)?;
+            return Ok(Some(existing));
+        }
+
+        existing.state.transition_to(target)?;
+        let mut next = existing.clone();
+        next.state = target;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .insert(key.as_str(), payload.as_str())
@@ -23459,6 +23550,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::cancel_host_request_parent(self, operation_id, request_digest)
+    }
+
     fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -23995,6 +24094,16 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Atomically classifies cancellation using the current durable attempt.
+    pub fn cancel_host_request_parent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .cancel_host_request_parent(operation_id, request_digest)
     }
 
     /// Persists a daemon attempt before returning its executable claim.
