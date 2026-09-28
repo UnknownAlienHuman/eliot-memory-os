@@ -376,11 +376,28 @@ impl KernelComposition {
         // service independently fences `Activate` from `Draining`) and must
         // re-establish a fresh generation through the reconcile path.
         if matches!(&request.command, KernelControlCommand::Activate(_)) {
-            // Post-linearization activation cannot reuse the drained
-            // generation; the caller re-establishes a fresh generation
-            // through the reconcile path.
+            // The activation generation this request presents, taken from the
+            // request's own authenticated candidate contour — the same
+            // `SupervisionJournalEpoch` identity the `Broker` family compares
+            // at `resume_broker_is_presented_as_current`, and the same domain
+            // the drain recorded the generation it fenced in. Presenting the
+            // fenced generation is a stale wake (`RejectStale`); presenting a
+            // different one is a new authority being established and is queued
+            // for the next generation (`QueueNextGeneration`). Both fence the
+            // old authority through `fences_old_authority` below, so the
+            // enforcement outcome is unchanged; what the compared value buys is
+            // that the post-linearization verdict is now decided against the
+            // generation the drain actually fenced instead of a local drain
+            // correlation id no request can present.
+            let presented_activation_generation = request
+                .candidate
+                .supervision_incarnation
+                .activation_generation
+                .clone();
             let disposition = coordinator_for(&self.work_root)
-                .and_then(|coordinator| coordinator.on_activate_request())
+                .and_then(|coordinator| {
+                    coordinator.on_activate_request(&presented_activation_generation)
+                })
                 .map_err(|_| TransportError::SessionFenced)?;
             observe_control(
                 "kernel.control.drain_disposition_observed",

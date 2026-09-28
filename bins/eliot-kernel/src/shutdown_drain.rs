@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use eliot_runtime_contracts::SupervisionJournalEpoch;
 use serde::{Deserialize, Serialize};
 
 /// Bounded wait for in-flight receipt reconciliation before drain gives up
@@ -53,7 +54,7 @@ pub(crate) const DRAIN_RECEIPT_DEADLINE: Duration = Duration::from_secs(5);
 /// distinguishes an intentional stop (terminal persisted) from an interrupted
 /// drain (requested without terminal; pending retained).
 const DRAIN_STATE_FILE: &str = "kernel-shutdown-drain.json";
-const DRAIN_STATE_VERSION: u32 = 1;
+const DRAIN_STATE_VERSION: u32 = 2;
 
 /// Poll interval for the bounded receipt-reconciliation wait.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -207,11 +208,23 @@ impl ShutdownTerminal {
 /// `processes_modules_and_store_branches_to_stop`, `wake_disposition` feeds
 /// `wake_during_drain_disposition`, `irreversible_stage` feeds
 /// `irreversible_stage`, and `recovery_owner` feeds `recovery_owner`.
+///
+/// [`Self::activation_generation_fenced`] is deliberately *not* part of that
+/// Host field contract: `generation` above is the `drain_generation`
+/// correlation id this process mints, and it has no wire representation, so it
+/// can never be what a waking `Activate` presents. The activation generation
+/// the linearization point fenced is the identity I1.5 pairs with
+/// `drain_generation` ("a trigger received after `DrainCommitRecord` creates a
+/// new activation generation"), so it is persisted in the same
+/// lineage-plus-sequence domain [`SupervisionJournalEpoch`] defines for the
+/// activation generation the request carries, and it is the value
+/// [`ShutdownDrainCoordinator::classify_wake`] compares against.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DrainCommitDecision {
     pub(crate) generation: String,
     pub(crate) lease_and_pending_snapshot: Vec<String>,
     pub(crate) authority_epochs_fenced: Vec<String>,
+    pub(crate) activation_generation_fenced: SupervisionJournalEpoch,
     pub(crate) branches_to_stop: Vec<String>,
     pub(crate) wake_disposition: DrainWakeDisposition,
     pub(crate) irreversible_stage: String,
@@ -1056,19 +1069,31 @@ impl ShutdownDrainCoordinator {
     /// Classifies one wake/attach request against the linearization point:
     /// pre-linearization cancels the drain (`CancelDrain`); post-linearization
     /// the caller must await a fresh generation (`QueueNextGeneration`);
-    /// a pre-drain lease or handle presented after linearization is stale
-    /// (`RejectStale`). Without an active drain the request proceeds.
+    /// a wake presenting the activation generation the commit fenced is
+    /// reviving that fenced generation and is stale (`RejectStale`). Without
+    /// an active drain the request proceeds.
+    ///
+    /// The discriminator is the *activation generation*, not the drain
+    /// correlation id. `DrainCommitDecision::generation` is minted by
+    /// [`fresh_generation`] in this process and never crosses a wire boundary,
+    /// so a waking `Activate` can never present it; the fenced
+    /// [`DrainCommitDecision::activation_generation_fenced`] is the same
+    /// identity `HostKernelCandidateBinding::supervision_incarnation`
+    /// carries, which is what makes the two comparable. Presenting a different
+    /// activation generation means the caller is establishing a *new*
+    /// authority, so it is queued rather than rejected and no legitimate
+    /// new-generation activation is refused.
     pub(crate) fn classify_wake(
         &self,
-        lease_generation: Option<&str>,
+        presented_activation_generation: Option<&SupervisionJournalEpoch>,
     ) -> Result<DrainWakeDisposition, String> {
         let mut state = self.lock();
         if !state.requested {
             return Ok(DrainWakeDisposition::Proceed);
         }
         if let Some(committed) = state.committed.as_ref() {
-            return Ok(match lease_generation {
-                Some(presented) if presented == committed.generation => {
+            return Ok(match presented_activation_generation {
+                Some(presented) if *presented == committed.activation_generation_fenced => {
                     DrainWakeDisposition::RejectStale
                 }
                 _ => DrainWakeDisposition::QueueNextGeneration,
@@ -1092,8 +1117,16 @@ impl ShutdownDrainCoordinator {
     /// activation so the caller re-establishes a fresh generation. The Kernel
     /// service independently fences `Activate` from `Draining`; this records
     /// the race disposition for evidence.
-    pub(crate) fn on_activate_request(&self) -> Result<DrainWakeDisposition, String> {
-        self.classify_wake(None)
+    ///
+    /// The presented activation generation is the one the request's own
+    /// candidate contour carries, so the post-linearization comparison is
+    /// decided against a value that genuinely reached this call from the
+    /// production `Activate` path.
+    pub(crate) fn on_activate_request(
+        &self,
+        presented_activation_generation: &SupervisionJournalEpoch,
+    ) -> Result<DrainWakeDisposition, String> {
+        self.classify_wake(Some(presented_activation_generation))
     }
 
     /// Records the durable terminal. The first terminal wins; `Incomplete`
@@ -1256,10 +1289,18 @@ mod shutdown_drain_tests {
             generation: generation.to_owned(),
             lease_and_pending_snapshot: Vec::new(),
             authority_epochs_fenced: vec!["authority-epoch:1".to_owned()],
+            activation_generation_fenced: test_activation_generation(),
             branches_to_stop: vec!["daemon".to_owned(), "store-bridge".to_owned()],
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),
             recovery_owner: "kernel-composition".to_owned(),
+        }
+    }
+
+    fn test_activation_generation() -> SupervisionJournalEpoch {
+        SupervisionJournalEpoch {
+            lineage_id: "activation-lineage-1".to_owned(),
+            sequence: 1,
         }
     }
 
@@ -1376,7 +1417,7 @@ mod shutdown_drain_tests {
         // A wake arriving before linearization cancels the drain.
         assert_eq!(
             coordinator
-                .on_activate_request()
+                .on_activate_request(&test_activation_generation())
                 .expect("wake classification persists"),
             DrainWakeDisposition::CancelDrain
         );
@@ -1408,9 +1449,9 @@ mod shutdown_drain_tests {
         assert_eq!(publication.terminal.as_deref(), Some("incomplete-shutdown"));
         assert_eq!(publication.pending, vec!["rebind-op-9".to_owned()]);
 
-        // Post-linearization race on a fresh drain: a pre-drain handle for
-        // the committed generation is stale; anything else awaits a fresh
-        // generation.
+        // Post-linearization race on a fresh drain: a wake carrying the
+        // activation generation the commit fenced is stale; anything else
+        // awaits a fresh generation.
         let root2 = test_work_root("race-committed");
         let committed = coordinator_for(&root2).expect("second drain coordinator loads");
         assert!(committed.request_shutdown().expect("shutdown persists"));
@@ -1421,19 +1462,25 @@ mod shutdown_drain_tests {
             .expect("linearization");
         assert_eq!(
             committed
-                .classify_wake(Some(&generation))
+                .classify_wake(Some(&test_activation_generation()))
                 .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::RejectStale
         );
         assert_eq!(
             committed
-                .classify_wake(Some("drain-foreign-generation"))
+                .classify_wake(Some(&SupervisionJournalEpoch {
+                    lineage_id: "activation-lineage-foreign".to_owned(),
+                    sequence: 9,
+                }))
                 .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::QueueNextGeneration
         );
         assert_eq!(
             committed
-                .on_activate_request()
+                .on_activate_request(&SupervisionJournalEpoch {
+                    lineage_id: "activation-lineage-foreign".to_owned(),
+                    sequence: 9,
+                })
                 .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::QueueNextGeneration
         );

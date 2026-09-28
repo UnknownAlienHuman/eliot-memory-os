@@ -462,7 +462,7 @@ pub use eliot_runtime_contracts::{
 use eliot_runtime_contracts::{
     HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
     ResumeIdentitySnapshot, ResumeProcessIdentity, SupervisionGenerationBinding,
-    revalidate_resume_identities,
+    SupervisionJournalEpoch, revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
 #[cfg(test)]
@@ -4538,6 +4538,15 @@ impl KernelComposition {
             generation: generation.clone(),
             lease_and_pending_snapshot: Vec::new(),
             authority_epochs_fenced,
+            // The activation generation the commit fences is the one the live
+            // admitted candidate contour carried, sampled under the same
+            // cross-owner revalidated read above. It is persisted in the same
+            // lineage-plus-sequence domain a waking `Activate` presents, so the
+            // wake/attach classification after linearization compares two
+            // values that genuinely mean the same generation instead of
+            // comparing a wire identity against this process's local
+            // `drain_generation` correlation id.
+            activation_generation_fenced: revalidated.activation_generation,
             branches_to_stop: quiescence,
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),
@@ -4609,6 +4618,24 @@ impl KernelComposition {
             }
             Err(_) => return Err("authority-fence-unavailable"),
         };
+        // The activation generation of the live admitted candidate contour, in
+        // the same `SupervisionJournalEpoch` domain a waking `Activate`
+        // presents through `candidate.supervision_incarnation`. A Kernel that
+        // has admitted no activation yet has no such contour, which is the
+        // genesis case the I1.5 pairing leaves unfenced rather than a second
+        // opinion about the live one.
+        let activation_generation = match self.service.lock() {
+            Ok(service) => {
+                let candidate = service
+                    .candidate_binding()
+                    .ok_or("activation-contour-unavailable")?;
+                candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .clone()
+            }
+            Err(_) => return Err("activation-contour-unavailable"),
+        };
         let service_state = self
             .service_state()
             .map_err(|_| "service-state-unavailable")?;
@@ -4632,6 +4659,7 @@ impl KernelComposition {
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
+            activation_generation,
             service_state,
             bridge_sessions,
             host_request_operations,
@@ -4719,6 +4747,10 @@ struct DrainAdmissionCoherence {
     drain_generation: String,
     /// The front-door `StateFence` binding (`lineage:sequence@resource`).
     state_fence: String,
+    /// The activation generation of the admitted candidate contour this sample
+    /// observed, in the same `SupervisionJournalEpoch` domain a waking
+    /// activation presents.
+    activation_generation: SupervisionJournalEpoch,
     /// The service admission state the census was taken under.
     service_state: KernelServiceState,
     /// Admitted front-door bridge Session count.
