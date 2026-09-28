@@ -47,15 +47,12 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 /// session without this admitted capability rejects the operation before
 /// dispatch.
 pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
-/// Declared (not advertised) capability for the backup operation
-/// (issue #975).
+/// Capability for the backup operation (issue #975).
 ///
-/// The wire variant selects this capability through
-/// [`StoreRequest::capability`], but it is deliberately absent from
-/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
-/// stays unadvertised until the actual backup backend is accepted. A
-/// session without this admitted capability rejects the operation before
-/// dispatch.
+/// The production Store composition binds this closed wire operation to the
+/// Surreal snapshot and isolated-restore ports. Advertising the operation
+/// does not prove runtime readiness or grant a session its use: the
+/// authenticated handshake and request admission still apply.
 pub const CAPABILITY_STORE_BACKUP: &str = "store.backup";
 pub const CAPABILITY_RECEIPT: &str = "store.receipt";
 pub const CAPABILITY_REVISION_HEADS: &str = "store.revision_heads";
@@ -109,6 +106,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
     CAPABILITY_DREAMER_JOB_RECONCILE,
     CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+    CAPABILITY_STORE_BACKUP,
 ];
 
 /// Returns the exact per-operation capability for one closed Dreamer job
