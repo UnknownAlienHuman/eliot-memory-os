@@ -59,12 +59,35 @@ pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
     PreparedKernelExchange,
 };
+pub use negative_memory_activation::{
+    NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
+    NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
+    NegativeMemoryActivationRequest, commit_negative_memory_activation,
+    negative_memory_activation_mutation_request, validate_negative_memory_activation,
+};
+pub use negative_memory_context::{
+    AdmittedNegativeMemoryRule, MAX_ADMITTED_NEGATIVE_MEMORY_RULES, MAX_NEGATIVE_MEMORY_DIMENSIONS,
+    MAX_NEGATIVE_MEMORY_EXPOSURE_TEXT, MAX_NEGATIVE_MEMORY_LOSSES,
+    NEGATIVE_MEMORY_EXPOSURE_SCHEMA_VERSION, NegativeMemoryApplicability,
+    NegativeMemoryBackingMember, NegativeMemoryComparedDimension, NegativeMemoryDimensionKind,
+    NegativeMemoryEvidenceLoss, NegativeMemoryExposureError, NegativeMemoryPermittedNextAction,
+    NegativeMemoryRuleExposure, NegativeMemoryRuleInvalidation, NegativeMemoryRuleProjection,
+    NegativeMemoryRuleValidity, admitted_rule, apply_negative_memory_coverage,
+    project_negative_memory_rules,
+};
+pub use negative_memory_gate::{
+    NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryGateRefusal,
+    NegativeMemoryProceedWarning, evaluate_negative_memory_gate,
+};
 mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
 mod learning_record_commit;
+mod negative_memory_activation;
+mod negative_memory_context;
+mod negative_memory_gate;
 mod observation_reconciliation;
 mod operator_intent;
 mod operator_reconciliation;

@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::negative_memory_gate::{self, NegativeMemoryGateInput, evaluate_negative_memory_gate};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -5577,6 +5578,47 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .canonical
             .commit(self.kernel.as_ref(), identity, envelope)
             .await
+    }
+
+    /// Applies one Canonical-admitted transition only after the governed
+    /// negative-memory gate admits the effect (issue #1731 W4, I12.19).
+    ///
+    /// This is the mechanical gate application I1.8 names for the semantic
+    /// layer: the Governor — the owner allowed to interpret policy — evaluates
+    /// the bounded pure matcher over the caller-resolved rule snapshot, and a
+    /// refusing decision fails the write **before** any `PreparedTransition` is
+    /// built or handed to Kernel. Nothing here is interpreted downstream: Kernel
+    /// still performs only its own mechanical authority/fence/order checks
+    /// (`crates/kernel/AGENTS.md`), and the store still persists only an already
+    /// prepared transition.
+    ///
+    /// The gate is evaluated through [`evaluate_negative_memory_gate`], which is
+    /// total and pure. Its inputs (`gate`) are the caller's own owner-resolved
+    /// snapshot, dispatch revalidation and admitted policies: this method
+    /// re-reads nothing and invents no rule, but it also **cannot** skip the
+    /// gate, because the gate input is a required parameter rather than an
+    /// option. A caller that has not resolved a rule snapshot therefore cannot
+    /// reach this method at all, and one that resolved an incomplete or
+    /// revision-moved snapshot is refused rather than allowed through.
+    ///
+    /// A `Proceed` decision — including a near-match warning — returns without
+    /// error and lets the ordinary authorization path run unchanged; the warning
+    /// confers nothing and is available to the caller through `gate`'s own
+    /// subject. A `Block`, `RequireCheck` or `Unavailable` decision becomes a
+    /// typed [`CompositionError::Recovery`] carrying the exact rule revision,
+    /// admitted policy identity or required discriminating check, so the refusal
+    /// is never reduced to an opaque failure.
+    pub async fn commit_canonical_gated_by_negative_memory(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        gate: &NegativeMemoryGateInput<'_>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let decision = evaluate_negative_memory_gate(gate);
+        if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
+            return Err(refusal);
+        }
+        self.commit_canonical(identity, envelope).await
     }
 
     /// Admits one scope-sensitive effect under material readiness
