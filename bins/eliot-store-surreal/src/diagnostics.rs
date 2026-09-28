@@ -79,7 +79,7 @@ use eliot_store_api::{
     WriteReceiptStatus,
 };
 
-use crate::{Request, Response, SERVICE_NAME};
+use crate::{CompatibilityVerdict, Request, Response, SERVICE_NAME};
 
 /// Stable contract revision of this diagnostics projection.
 pub const DIAGNOSTICS_CONTRACT_REVISION: &str = "eliot.s03.bridge-diagnostics.v1";
@@ -1052,6 +1052,86 @@ pub fn project_failure_control(
         Some(failure.reason_code.clone()),
         Some(failure.recovery_action),
     )
+}
+
+/// Closed decision vocabulary of the installation-visible I5.9 compatibility
+/// decision (issue #1932).
+///
+/// The two variants are the whole decision: the installation-visible record
+/// qualified a canonical writer, or it did not. No variant claims liveness,
+/// support, or a qualification the gate did not observe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompatibilityDecision {
+    /// The installation-visible record qualifies this installation for
+    /// canonical writes.
+    WriterAdmitted,
+    /// The installation is in explicit maintenance: queryable, running, and
+    /// not a canonical writer.
+    NonWriterMaintenance,
+}
+
+impl CompatibilityDecision {
+    /// Stable machine code for this decision.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WriterAdmitted => "writer_admitted",
+            Self::NonWriterMaintenance => "non_writer_maintenance",
+        }
+    }
+}
+
+/// Bounded, typed projection of one installation-visible compatibility
+/// decision (issue #1932, I5.9).
+///
+/// The decision itself is a fieldless typed value, so nothing about it can be
+/// re-read as prose; the gate's report line travels only as a [`BoundedRef`]
+/// re-validated here for length and control characters, so no unbounded or
+/// unvalidated content reaches a sink through it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompatibilityHealth {
+    decision: CompatibilityDecision,
+    decision_report: Option<BoundedRef>,
+}
+
+impl CompatibilityHealth {
+    /// Returns the projected decision.
+    #[must_use]
+    pub const fn decision(&self) -> CompatibilityDecision {
+        self.decision
+    }
+
+    /// Returns true only for a qualified canonical writer.
+    #[must_use]
+    pub const fn is_writer_admitted(&self) -> bool {
+        matches!(self.decision, CompatibilityDecision::WriterAdmitted)
+    }
+
+    /// Returns the bounded decision report line, when the gate produced one
+    /// that passes the bound. A dropped report never changes the decision.
+    #[must_use]
+    pub fn decision_report(&self) -> Option<&str> {
+        self.decision_report.as_ref().map(BoundedRef::as_str)
+    }
+}
+
+/// Projects one installation-visible I5.9 compatibility verdict.
+///
+/// The projection reads only the typed verdict: the decision reached and the
+/// gate's own bounded report line. It never re-evaluates the record, never
+/// admits, and never upgrades an observation — a maintenance verdict projects
+/// to [`CompatibilityDecision::NonWriterMaintenance`], the visible non-writer
+/// readiness state the acceptance criteria require.
+#[must_use]
+pub fn project_compatibility_health(verdict: &CompatibilityVerdict) -> CompatibilityHealth {
+    CompatibilityHealth {
+        decision: if verdict.is_writer_admitted() {
+            CompatibilityDecision::WriterAdmitted
+        } else {
+            CompatibilityDecision::NonWriterMaintenance
+        },
+        decision_report: BoundedRef::detail(verdict.report()),
+    }
 }
 
 /// Records request/input receipt at one boundary. Infallible and bounded.
