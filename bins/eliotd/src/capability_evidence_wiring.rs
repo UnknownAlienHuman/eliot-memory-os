@@ -79,17 +79,28 @@
 //! production route; it is never treated as a pass, and never as "nothing to
 //! check".
 //!
-//! Staleness is derived, never persisted, and it is applied on the observed
-//! route. A changed runtime hash, adapter hash, provider/model/auth route,
-//! serializer, or feature-flag scope stops admitting on two independent
+//! Staleness is applied on the observed route and it is **durable**, not merely
+//! remembered. A changed runtime hash, adapter hash, provider/model/auth route,
+//! serializer, or feature-flag scope stops admitting on three independent
 //! grounds: [`admit_production_route`](Self::admit_production_route) compares
 //! the observed scope against each record's fingerprint by exact value, so a
-//! record that no longer matches cannot authorize the changed route; and
+//! record that no longer matches cannot authorize the changed route;
 //! [`apply_scope_change`](Self::apply_scope_change), called by
 //! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//! with the caller-observed scope, moves every record that differs from that
-//! observation into the registry's invalidation set. Either way the exact route
-//! must be re-probed before it authorizes production work again.
+//! with the caller-observed scope, writes the owner-issued change reference
+//! into every affected record's own persisted
+//! `limitations_and_negative_evidence` and re-derives the per-`(skill_id,
+//! scope_fingerprint)` invalidation index from those bytes; and
+//! [`hydrate_from_evidence_record_page`](Self::hydrate_from_evidence_record_page)
+//! re-derives the same invalidation from whatever the canonical store served, so
+//! a fresh process cannot re-admit evidence a committed change restricted.
+//! Either way the exact route must be re-probed before it authorizes
+//! production work again.
+//!
+//! [`drain_capability_evidence_records`] is the production rebuild path and it
+//! is atomic: pages are staged and the held view is replaced only after the
+//! last page, so a drain that stops early leaves the view exactly as it was
+//! rather than partially hydrated.
 
 use std::collections::BTreeMap;
 
@@ -155,6 +166,18 @@ impl GovernorCapabilityAdmission {
     #[must_use]
     pub const fn registry(&self) -> &CapabilityRegistry {
         &self.registry
+    }
+
+    /// Replaces the held registry with a completely drained one.
+    ///
+    /// Only [`drain_capability_evidence_records`] calls this, and only after it
+    /// has drained the canonical read to exhaustion. Taking the whole registry
+    /// rather than merging into it is what makes a partial drain harmless: a
+    /// drain that stops early never reaches this method, so the held view keeps
+    /// exactly the records — and exactly the derived invalidation state — it
+    /// had before.
+    fn replace_drained_registry(&mut self, drained: Self) {
+        self.registry = drained.registry;
     }
 
     /// Returns the number of retained evidence records.
@@ -245,8 +268,18 @@ impl GovernorCapabilityAdmission {
     }
 
     /// Stales dependent evidence after a narrowed dependency change, retaining
-    /// the owner-issued cause each invalidated scope must be requalified
-    /// against. Returns the count of newly staled records.
+    /// the owner-issued cause each invalidated key must be requalified
+    /// against. Returns the owner-issued change reference, how many
+    /// `(skill_id, scope_fingerprint)` keys it newly limited, and the mutated
+    /// records carrying the change reference in their own persisted
+    /// `limitations_and_negative_evidence`.
+    ///
+    /// Those mutated records are the durable form of the restriction. Committing
+    /// them through the named `RecordCapabilityEvidenceRecord` leg is what makes
+    /// the restriction survive a restart; until they are committed the
+    /// restriction holds in this process only, which is the fail-closed
+    /// direction. The limitation is also what a later hydration re-derives the
+    /// invalidation from, so a committed restriction is never forgotten.
     ///
     /// # Errors
     ///
@@ -258,7 +291,8 @@ impl GovernorCapabilityAdmission {
         current: &RouteScopeFingerprint,
         changed: ScopeDependencySelector,
         blocking_evidence_ref: &str,
-    ) -> Result<usize, eliot_governor::EvidenceRevisionError> {
+    ) -> Result<eliot_governor::InvalidatedCapabilityEvidence, eliot_governor::EvidenceRevisionError>
+    {
         self.registry
             .apply_scope_change(current, changed, blocking_evidence_ref)
     }
@@ -654,6 +688,14 @@ fn decode_evidence_record_row(
 /// * a store that returns a cursor it already issued is refused, so the loop
 ///   cannot spin forever re-reading the same page.
 ///
+/// **Atomicity.** Pages are applied to a *staging* view and the held view is
+/// replaced only after the last page. A drain that stops early — a capacity
+/// refusal, a transport error, an invalid cursor — therefore leaves the held
+/// view byte-identical to what it was, instead of leaving a partially hydrated
+/// view that could admit the subset it happened to read. This is the difference
+/// between "no coverage" and "wrong coverage", and only the second one is a
+/// safety failure.
+///
 /// A returned report therefore always describes a **complete** drain: the view
 /// either holds every durable evidence record the store serves at this fence, or
 /// the call is an error and the view keeps its previous contents. The view
@@ -665,12 +707,13 @@ pub fn drain_capability_evidence_records(
     fence: &eliot_contracts::StateFence,
     page_records: u16,
 ) -> Result<CapabilityHydrationReport, EvidenceBridgeError> {
+    let mut staging = GovernorCapabilityAdmission::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0_u32;
     let mut minted = 0_usize;
     let mut observed = 0_u64;
     let mut issued: Vec<String> = Vec::new();
-    loop {
+    let drained = loop {
         let request = GovernorCapabilityAdmission::plan_evidence_record_read(
             None,
             page_records,
@@ -681,17 +724,12 @@ pub fn drain_capability_evidence_records(
         let response = kernel
             .store_named_blocking(request.clone())
             .map_err(|error| EvidenceBridgeError::Request(error.to_string()))?;
-        let page = admission.hydrate_from_evidence_record_page(&request, &response)?;
+        let page = staging.hydrate_from_evidence_record_page(&request, &response)?;
         pages = pages.saturating_add(1);
         observed = observed.saturating_add(u64::try_from(page.records_in_page).unwrap_or(u64::MAX));
         minted = minted.saturating_add(page.minted);
         if !page.truncated {
-            return Ok(CapabilityHydrationReport {
-                pages,
-                observed_records: observed,
-                minted_records: minted,
-                retained: admission.len(),
-            });
+            break (pages, observed, minted, staging.len());
         }
         let Some(next) = page.next_cursor else {
             return Err(EvidenceBridgeError::Payload("next_cursor"));
@@ -703,7 +741,15 @@ pub fn drain_capability_evidence_records(
         }
         issued.push(next.clone());
         cursor = Some(next);
-    }
+    };
+    admission.replace_drained_registry(staging);
+    let (pages, observed_records, minted_records, retained) = drained;
+    Ok(CapabilityHydrationReport {
+        pages,
+        observed_records,
+        minted_records,
+        retained,
+    })
 }
 
 /// One applied page of the capability-evidence record read.
@@ -852,7 +898,8 @@ mod tests {
         assert_eq!(
             admission
                 .apply_scope_change(&changed, selector, &test_owner_revision(1).evidence_ref)
-                .expect("fixture change reference is owner-referenced"),
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled,
             1
         );
         assert!(!admission.admit_production_route("skill-demo", &changed, 10));

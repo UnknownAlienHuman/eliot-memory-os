@@ -55,13 +55,35 @@
 //!
 //! Invalidation is cleared only through a fresh requalification that names
 //! the blocking evidence reference and is strictly newer than it. The registry
-//! retains that [`InvalidationCause`] per invalidated scope, so a known
-//! restriction or an applied scope change is not erased by an unrelated
-//! record, by a delayed replay, or by qualifying evidence that does not
-//! reference the failure or change it resolves. The registry never evicts a
-//! key's latest frontier: after the bound is reached, new keys are refused,
-//! and an unretained restriction fails production admission closed. An empty
-//! registry still refuses rather than admits.
+//! retains that [`InvalidationCause`] per invalidated
+//! `(skill_id, scope_fingerprint)` key, so a known restriction or an applied
+//! scope change is not erased by an unrelated record, by a delayed replay, or by
+//! qualifying evidence that does not reference the failure or change it
+//! resolves. A sibling capability's requalification cannot clear another
+//! capability's invalidation on the same fingerprint: the key is the record
+//! identity, not the bare scope.
+//!
+//! **Invalidation is durable, not remembered.** An applied dependency change is
+//! written into the affected record's
+//! [`CapabilityEvidenceRecord::limitations_and_negative_evidence`] — an
+//! already-declared I3.4 field, not a parallel structure — and the canonical
+//! store holds those bytes verbatim. [`ScopeInvalidationSet`] is therefore a
+//! *derived index*, recomputed by
+//! [`CapabilityRegistry::rebuild_invalidation_index`] from the retained
+//! records. A fresh process that hydrates the records the store served
+//! re-derives every restriction that was ever committed, so a restart cannot
+//! re-admit stale evidence; a restriction that was never committed was never an
+//! owner-issued durable fact in the first place. The two admission predicates
+//! additionally read [`CapabilityEvidenceRecord::is_limited`] directly, so the
+//! durable claim does not depend on the index being rebuilt.
+//!
+//! The registry never evicts a key's latest frontier: after the bound is
+//! reached, new keys are refused, and an unretained restriction fails
+//! production admission closed. That fail-closed latch is derived and
+//! process-local, and resetting it across a restart is correct because the
+//! complete paged hydration re-establishes the same capacity condition on
+//! every restart (see [`CapabilityRegistry::restriction_capacity_exhausted`]).
+//! An empty registry still refuses rather than admits.
 
 #![forbid(unsafe_code)]
 
@@ -184,11 +206,18 @@ impl OwnerEvidenceRevision {
     }
 }
 
-/// Why one scope fingerprint is currently invalidated.
+/// Why one `(skill_id, scope_fingerprint)` evidence key is currently
+/// invalidated.
 ///
 /// Retained with the invalidation so a requalification can be required to name
 /// the exact blocking evidence reference and to be strictly newer than it,
 /// instead of any qualifying record clearing the restriction.
+///
+/// The same reference is also written into the affected record's
+/// [`CapabilityEvidenceRecord::limitations_and_negative_evidence`], which is
+/// what makes the invalidation survive a restart: the store holds those bytes,
+/// and hydration re-derives the invalidation from them rather than remembering
+/// it in process memory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvalidationCause {
     /// The owner-issued evidence reference, or owner-issued change reference,
@@ -230,6 +259,50 @@ pub struct RetainedCapabilityEvidence {
     pub record: CapabilityEvidenceRecord,
     /// The owner-issued revision identity that orders this key.
     pub revision: OwnerEvidenceRevision,
+}
+
+/// Retained invalidation state, keyed per `(scope_fingerprint, skill_id)`.
+///
+/// The key is the record identity, not the bare scope. An invalidation is a
+/// statement about one capability's evidence on one route scope, so a
+/// requalification by one skill must not clear an invalidation another skill's
+/// evidence caused on the same fingerprint. The outer map is keyed by scope so
+/// the common "is this scope invalidated at all" question stays answerable
+/// without a scan; the inner map is keyed by skill so the per-capability
+/// question is exact.
+///
+/// This map is a **derived index**, never the owner of the fact. The fact lives
+/// in the retained record's
+/// [`CapabilityEvidenceRecord::limitations_and_negative_evidence`], which the
+/// canonical store holds byte for byte, so the index is rebuilt from the store
+/// on every hydration and cannot be lost by a restart.
+pub type ScopeInvalidationSet =
+    BTreeMap<RouteScopeFingerprint, BTreeMap<String, InvalidationCause>>;
+
+/// Returns the invalidation cause retained for one `(scope, skill)` key.
+#[must_use]
+pub fn invalidation_for<'a>(
+    invalidated: &'a ScopeInvalidationSet,
+    scope: &RouteScopeFingerprint,
+    skill_id: &str,
+) -> Option<&'a InvalidationCause> {
+    invalidated.get(scope)?.get(skill_id)
+}
+
+/// Returns true when any retained skill on this exact scope is invalidated.
+///
+/// This is the scope-level rollup used by operators and the route view. It is
+/// deliberately *not* an admission input: admission consults
+/// [`invalidation_for`] with the exact skill, so a sibling skill's
+/// invalidation never refuses an unrelated capability.
+#[must_use]
+pub fn scope_has_any_invalidation(
+    invalidated: &ScopeInvalidationSet,
+    scope: &RouteScopeFingerprint,
+) -> bool {
+    invalidated
+        .get(scope)
+        .is_some_and(|skills| !skills.is_empty())
 }
 
 /// Claim status for one scoped capability record.
@@ -594,6 +667,61 @@ impl CapabilityEvidenceRecord {
         self
     }
 
+    /// Declares that the dependency change published under
+    /// `blocking_evidence_ref` limits this record.
+    ///
+    /// This is the durable half of an invalidation. The applied-change
+    /// reference is appended to
+    /// [`limitations_and_negative_evidence`](Self::limitations_and_negative_evidence)
+    /// — an already-declared I3.4 field, not a new parallel structure — so the
+    /// canonical store holds the limitation in the record's own bytes and a
+    /// hydration rebuilds the invalidation from what the store served. A
+    /// process that forgets the invalidation in RAM therefore cannot re-admit
+    /// the stale evidence after a restart.
+    ///
+    /// Any prior requalification claim is dropped: this record is now
+    /// restricted, so it cannot also be the record that clears a restriction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceRevisionError::MalformedRequalificationRef`] when the
+    /// reference is not one hex SHA-256 digest.
+    pub fn limited_by(
+        mut self,
+        blocking_evidence_ref: &str,
+    ) -> Result<Self, EvidenceRevisionError> {
+        if !is_evidence_ref(blocking_evidence_ref) {
+            return Err(EvidenceRevisionError::MalformedRequalificationRef);
+        }
+        let reference = blocking_evidence_ref.to_owned();
+        if !self.limitations_and_negative_evidence.contains(&reference) {
+            self.limitations_and_negative_evidence.push(reference);
+        }
+        self.requalification = None;
+        Ok(self)
+    }
+
+    /// Returns the first limitation reference this record carries, which is the
+    /// blocking reference a requalification of this record has to name.
+    #[must_use]
+    pub fn blocking_limitation(&self) -> Option<&str> {
+        self.limitations_and_negative_evidence
+            .first()
+            .map(String::as_str)
+    }
+
+    /// Returns true when this record's own persisted bytes already declare it
+    /// limited by an applied dependency change.
+    ///
+    /// This is the restart-durable invalidation test: it reads only the record
+    /// the canonical store served, so a hydrated record that carries a
+    /// limitation is invalid again in a fresh process without anyone having to
+    /// remember it.
+    #[must_use]
+    pub fn is_limited(&self) -> bool {
+        self.blocking_limitation().is_some_and(is_evidence_ref)
+    }
+
     /// Returns true when this record is time-fresh at `now`: observed
     /// no later than now, with no reached expiry.
     ///
@@ -640,7 +768,7 @@ impl CapabilityEvidenceRecord {
         skill_id: &str,
         scope: &RouteScopeFingerprint,
         now: u64,
-        invalidated: &BTreeMap<RouteScopeFingerprint, InvalidationCause>,
+        invalidated: &ScopeInvalidationSet,
     ) -> bool {
         self.skill_id == skill_id
             && self.scope_fingerprint.exact_match(scope)
@@ -659,11 +787,12 @@ impl CapabilityEvidenceRecord {
         skill_id: &str,
         scope: &RouteScopeFingerprint,
         now: u64,
-        invalidated: &BTreeMap<RouteScopeFingerprint, InvalidationCause>,
+        invalidated: &ScopeInvalidationSet,
     ) -> bool {
         self.skill_id == skill_id
             && self.scope_fingerprint.exact_match(scope)
-            && !invalidated.contains_key(&self.scope_fingerprint)
+            && invalidation_for(invalidated, &self.scope_fingerprint, &self.skill_id).is_none()
+            && !self.is_limited()
             && match self.status {
                 CapabilityStatus::Broken | CapabilityStatus::Unsupported => self.observed_at <= now,
                 CapabilityStatus::Degraded => self.is_time_fresh(now),
@@ -742,7 +871,7 @@ pub struct CapabilityRegistry {
     /// retained blocking reference and is strictly newer than it. Freshness
     /// additionally runs from this map plus `observed_at`/`expires_at` at
     /// admission time.
-    invalidated_scopes: BTreeMap<RouteScopeFingerprint, InvalidationCause>,
+    invalidated_scopes: ScopeInvalidationSet,
     /// Set only when a new restriction could not be retained because the
     /// registry reached its record bound. Since that missing restriction's
     /// scope cannot be represented without growing state, the registry
@@ -756,7 +885,7 @@ impl CapabilityRegistry {
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
-            invalidated_scopes: BTreeMap::new(),
+            invalidated_scopes: ScopeInvalidationSet::new(),
             restriction_capacity_exhausted: false,
         }
     }
@@ -813,6 +942,7 @@ impl CapabilityRegistry {
             }
             self.clear_invalidation_by_requalification(&record, &revision);
             self.records[retained] = RetainedCapabilityEvidence { record, revision };
+            self.rebuild_invalidation_index();
             return true;
         }
         if self.records.len() >= MAX_CAPABILITY_EVIDENCE_RECORDS {
@@ -821,6 +951,7 @@ impl CapabilityRegistry {
         }
         self.records
             .push(RetainedCapabilityEvidence { record, revision });
+        self.rebuild_invalidation_index();
         true
     }
 
@@ -837,6 +968,7 @@ impl CapabilityRegistry {
         let Some(cause) = self
             .invalidated_scopes
             .get(&record.scope_fingerprint)
+            .and_then(|skills| skills.get(&record.skill_id))
             .cloned()
         else {
             return;
@@ -850,7 +982,69 @@ impl CapabilityRegistry {
         {
             return;
         }
-        self.invalidated_scopes.remove(&record.scope_fingerprint);
+        // Cleared for this `(skill_id, scope_fingerprint)` key only. The
+        // invalidation is per-record-identity, so a sibling capability's
+        // invalidation on the same fingerprint is untouched.
+        if let Some(skills) = self.invalidated_scopes.get_mut(&record.scope_fingerprint) {
+            skills.remove(&record.skill_id);
+            if skills.is_empty() {
+                self.invalidated_scopes.remove(&record.scope_fingerprint);
+            }
+        }
+    }
+
+    /// Rebuilds the derived invalidation index from the retained records' own
+    /// persisted limitations.
+    ///
+    /// The canonical store holds `limitations_and_negative_evidence` in the
+    /// record bytes, so a hydrated record that carries a limitation is invalid
+    /// again in a fresh process without anyone having to remember it. This is
+    /// what makes a restart unable to re-admit stale evidence: the index is
+    /// computed from what the store served, never from what this process
+    /// happened to remember.
+    ///
+    /// An entry already present keeps its original cause, so the earliest
+    /// published change remains the reference a requalification has to answer.
+    fn rebuild_invalidation_index(&mut self) {
+        let mut rebuilt: ScopeInvalidationSet = ScopeInvalidationSet::new();
+        for retained in &self.records {
+            let record = &retained.record;
+            let Some(reference) = record.blocking_limitation().filter(|_| record.is_limited())
+            else {
+                continue;
+            };
+            rebuilt
+                .entry(record.scope_fingerprint.clone())
+                .or_default()
+                .entry(record.skill_id.clone())
+                .or_insert_with(|| {
+                    InvalidationCause::new(reference, retained.revision.clone()).unwrap_or_else(
+                        |_| {
+                            // `is_limited()` already proved the reference is a
+                            // published digest, so this arm is unreachable; a
+                            // panic here would be worse than a retained cause
+                            // built from the record's own owner revision.
+                            InvalidationCause {
+                                blocking_evidence_ref: reference.to_owned(),
+                                blocking_revision: retained.revision.clone(),
+                            }
+                        },
+                    )
+                });
+        }
+        // Keep every cause an in-process dependency change recorded even when
+        // the record it limited has since been superseded, so an un-committed
+        // local change is never silently dropped from the index.
+        for (scope, skills) in &self.invalidated_scopes {
+            for (skill, cause) in skills {
+                rebuilt
+                    .entry(scope.clone())
+                    .or_default()
+                    .entry(skill.clone())
+                    .or_insert_with(|| cause.clone());
+            }
+        }
+        self.invalidated_scopes = rebuilt;
     }
 
     /// Returns every retained record with its owner-issued revision, including
@@ -943,25 +1137,53 @@ impl CapabilityRegistry {
         self.records.is_empty()
     }
 
-    /// Returns true when this scope fingerprint was invalidated by an
-    /// applied scope change and not since re-qualified by a record naming the
-    /// retained blocking reference.
+    /// Returns true when this scope fingerprint was invalidated for at least
+    /// one retained skill by an applied scope change and not since
+    /// re-qualified by a record naming the retained blocking reference.
+    ///
+    /// This is the scope-level rollup. It is **not** an admission input:
+    /// admission consults [`invalidation_cause`](Self::invalidation_cause) with
+    /// the exact skill, so one capability's invalidation never refuses an
+    /// unrelated capability on the same fingerprint.
     #[must_use]
     pub fn is_scope_invalidated(&self, scope: &RouteScopeFingerprint) -> bool {
-        self.invalidated_scopes.contains_key(scope)
+        scope_has_any_invalidation(&self.invalidated_scopes, scope)
     }
 
-    /// Returns the retained invalidation cause for one scope, when it is
-    /// currently invalidated.
+    /// Returns the retained invalidation cause for one
+    /// `(skill_id, scope_fingerprint)` key, when it is currently invalidated.
     #[must_use]
-    pub fn invalidation_cause(&self, scope: &RouteScopeFingerprint) -> Option<&InvalidationCause> {
-        self.invalidated_scopes.get(scope)
+    pub fn invalidation_cause(
+        &self,
+        skill_id: &str,
+        scope: &RouteScopeFingerprint,
+    ) -> Option<&InvalidationCause> {
+        invalidation_for(&self.invalidated_scopes, scope, skill_id)
     }
 
-    /// Returns every currently invalidated scope with its retained cause.
+    /// Returns the whole derived invalidation index.
     #[must_use]
-    pub fn invalidated_scopes(&self) -> &BTreeMap<RouteScopeFingerprint, InvalidationCause> {
+    pub const fn invalidated_scopes(&self) -> &ScopeInvalidationSet {
         &self.invalidated_scopes
+    }
+
+    /// Returns true when this registry refused a restrictive record because it
+    /// reached [`MAX_CAPABILITY_EVIDENCE_RECORDS`], and is therefore failing
+    /// production admission closed for its whole lifetime.
+    ///
+    /// This is deliberately **derived, process-local, and not durable**: it
+    /// states that *this* registry could not retain a restriction, so it cannot
+    /// be sure it holds every restriction. A reset across restart is correct
+    /// precisely because the condition is re-established on every restart: the
+    /// canonical store still holds every evidence row, the complete paged
+    /// hydration re-inserts them, and a registry that is still over the bound
+    /// refuses the same restrictive row again and latches the same flag. A
+    /// registry that is no longer over the bound genuinely holds every
+    /// restriction the store serves, so failing closed past that point would be
+    /// refusing on a condition that no longer holds.
+    #[must_use]
+    pub const fn restriction_capacity_exhausted(&self) -> bool {
+        self.restriction_capacity_exhausted
     }
 
     /// Production admission for one skill on one exact route scope at `now`.
@@ -994,24 +1216,41 @@ impl CapabilityRegistry {
         })
     }
 
-    /// Stales the evidence depending on the changed dimensions, recording the
-    /// owner-issued cause every newly invalidated scope must be requalified
-    /// against.
+    /// Stales the evidence depending on the changed dimensions, writing the
+    /// owner-issued cause into every affected record so the restriction is
+    /// durable, and returning the records that must be committed.
     ///
     /// Only records differing from `current` on at least one selected
-    /// dependency dimension join the invalidation set; unrelated
-    /// routes/accounts whose selected fields still match stay admitted. A
-    /// runtime, adapter, provider, serializer, or behavior-affecting profile
-    /// change therefore invalidates dependent positive evidence instead of
-    /// leaving it authorizing production work.
+    /// dependency dimension are staled; unrelated routes/accounts whose
+    /// selected fields still match stay admitted. A runtime, adapter, provider,
+    /// serializer, or behavior-affecting profile change therefore invalidates
+    /// dependent positive evidence instead of leaving it authorizing production
+    /// work.
+    ///
+    /// **Durability.** The change reference is written into each affected
+    /// record's `limitations_and_negative_evidence` through
+    /// [`CapabilityEvidenceRecord::limited_by`], which is an already-declared
+    /// I3.4 field the canonical store holds verbatim. The invalidation index
+    /// ([`ScopeInvalidationSet`]) is then *derived* from those bytes by
+    /// [`rebuild_invalidation_index`](Self::rebuild_invalidation_index), never
+    /// remembered independently. That is what stops a restart from re-admitting
+    /// stale evidence: a fresh process re-derives the restriction from the
+    /// record the store served.
+    ///
+    /// **Committing.** The returned [`InvalidatedCapabilityEvidence`] carries
+    /// the mutated records and the owner-issued reference of the change. The
+    /// caller is responsible for committing them through the named
+    /// `RecordCapabilityEvidenceRecord` leg before the restriction may be
+    /// treated as an owner-issued durable fact. An in-process change that is
+    /// never committed still restricts this process, so the direction of failure
+    /// is always closed.
     ///
     /// `blocking_evidence_ref` is the exact owner-issued reference of the
     /// applied change — the digest of the observed behaviour scope
-    /// ([`RouteScopeFingerprint::reference_digest`]). It is retained per
-    /// invalidated scope, so the invalidation can only be cleared by a record
-    /// that names this exact reference and carries a strictly newer
-    /// owner-issued revision ([`CapabilityEvidenceRecord::requalifying`]). An
-    /// already-invalidated scope keeps its original cause, so the earliest
+    /// ([`RouteScopeFingerprint::reference_digest`]). The invalidation is keyed
+    /// per `(skill_id, scope_fingerprint)`, so one capability's requalification
+    /// cannot clear another capability's invalidation on the same fingerprint.
+    /// An already-invalidated key keeps its original cause, so the earliest
     /// published change remains the reference a requalification has to answer.
     ///
     /// The blocking revision is the highest owner-issued revision among the
@@ -1019,8 +1258,6 @@ impl CapabilityRegistry {
     /// canonical store issued. It is never synthesized from a local clock, so
     /// the "strictly newer than the evidence it invalidated" rule is measured
     /// entirely in owner authority.
-    ///
-    /// Returns the count of newly staled records.
     ///
     /// # Errors
     ///
@@ -1033,39 +1270,74 @@ impl CapabilityRegistry {
         current: &RouteScopeFingerprint,
         changed: ScopeDependencySelector,
         blocking_evidence_ref: &str,
-    ) -> Result<usize, EvidenceRevisionError> {
+    ) -> Result<InvalidatedCapabilityEvidence, EvidenceRevisionError> {
         if !is_evidence_ref(blocking_evidence_ref) {
             return Err(EvidenceRevisionError::MalformedEvidenceRef);
         }
         let mut newly_staled = 0;
-        for retained in &self.records {
-            let scope = &retained.record.scope_fingerprint;
-            if self.invalidated_scopes.contains_key(scope)
-                || !changed.selects_difference(scope, current)
+        let mut mutated: Vec<RetainedCapabilityEvidence> = Vec::new();
+        for index in 0..self.records.len() {
+            let scope = self.records[index].record.scope_fingerprint.clone();
+            if invalidation_for(
+                &self.invalidated_scopes,
+                &scope,
+                &self.records[index].record.skill_id,
+            )
+            .is_some()
+                || !changed.selects_difference(&scope, current)
             {
                 continue;
             }
             // The blocking revision is the newest owner-issued revision this
             // change invalidated, so a requalification must be strictly newer
             // than the evidence it replaced.
-            let blocking_revision = match self.invalidated_scopes.get(scope) {
-                Some(cause) => cause.blocking_revision.clone(),
-                None => self
-                    .records
-                    .iter()
-                    .filter(|other| other.record.scope_fingerprint.exact_match(scope))
-                    .map(|other| other.revision.clone())
-                    .max()
-                    .unwrap_or_else(OwnerEvidenceRevision::legacy_declared),
+            let blocking_revision = self
+                .records
+                .iter()
+                .filter(|other| other.record.scope_fingerprint.exact_match(&scope))
+                .map(|other| other.revision.clone())
+                .max()
+                .unwrap_or_else(OwnerEvidenceRevision::legacy_declared);
+            let limited = self.records[index]
+                .record
+                .clone()
+                .limited_by(blocking_evidence_ref)?;
+            self.records[index] = RetainedCapabilityEvidence {
+                record: limited,
+                revision: self.records[index].revision.clone(),
             };
-            self.invalidated_scopes.insert(
-                scope.clone(),
+            self.invalidated_scopes.entry(scope).or_default().insert(
+                self.records[index].record.skill_id.clone(),
                 InvalidationCause::new(blocking_evidence_ref, blocking_revision)?,
             );
+            mutated.push(self.records[index].clone());
             newly_staled += 1;
         }
-        Ok(newly_staled)
+        Ok(InvalidatedCapabilityEvidence {
+            blocking_evidence_ref: blocking_evidence_ref.to_owned(),
+            newly_staled,
+            records: mutated,
+        })
     }
+}
+
+/// The result of one applied dependency change: the owner-issued change
+/// reference, how many `(skill_id, scope_fingerprint)` keys it newly staled, and
+/// the mutated records carrying the durable limitation.
+///
+/// The records must be committed through the named
+/// `RecordCapabilityEvidenceRecord` leg for the restriction to become an
+/// owner-issued durable fact that survives a restart. Until then it restricts
+/// the current process only, which is the fail-closed direction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidatedCapabilityEvidence {
+    /// The exact owner-issued reference of the applied change.
+    pub blocking_evidence_ref: String,
+    /// How many evidence keys this change newly staled.
+    pub newly_staled: usize,
+    /// The mutated records, each carrying the change reference in its own
+    /// persisted limitations. One entry per newly staled key.
+    pub records: Vec<RetainedCapabilityEvidence>,
 }
 
 #[cfg(test)]
@@ -1186,7 +1458,8 @@ mod tests {
         assert!(
             rotated
                 .apply_scope_change(&changed, adapter_only, &change_ref())
-                .unwrap()
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled
                 >= 1
         );
         assert!(!rotated.admit_production_route("route.execute", &changed, 10));
@@ -1202,7 +1475,8 @@ mod tests {
         assert!(
             rotated_serializer
                 .apply_scope_change(&changed_serializer, serializer_only, &change_ref())
-                .unwrap()
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled
                 >= 1
         );
         assert!(!rotated_serializer.admit_production_route(
@@ -1355,7 +1629,8 @@ mod tests {
         assert_eq!(
             registry
                 .apply_scope_change(&changed, adapter_only, &change_ref())
-                .unwrap(),
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled,
             2
         );
         assert!(registry.is_scope_invalidated(&scope()));
@@ -1370,7 +1645,8 @@ mod tests {
         assert_eq!(
             fresh_registry
                 .apply_scope_change(&changed, provider_only, &change_ref())
-                .unwrap(),
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled,
             0
         );
         assert!(fresh_registry.admit_production_route("skill-a", &scope(), 10));
@@ -1408,7 +1684,8 @@ mod tests {
         assert!(
             registry
                 .apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref())
-                .unwrap()
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled
                 >= 1
         );
         assert!(!registry.admit_production_route("skill-a", &scope(), 10));
@@ -1501,7 +1778,8 @@ mod tests {
         assert!(
             holding
                 .apply_scope_change(&changed, ScopeDependencySelector::all(), &change_ref())
-                .unwrap()
+                .expect("fixture change reference is owner-referenced")
+                .newly_staled
                 >= 1
         );
         assert_eq!(

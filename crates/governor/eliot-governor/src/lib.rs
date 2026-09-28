@@ -100,10 +100,11 @@ pub use canonical_projections::{
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
-    EvidenceRelationError, EvidenceRevisionError, InvalidationCause,
+    EvidenceRelationError, EvidenceRevisionError, InvalidatedCapabilityEvidence, InvalidationCause,
     LEGACY_DECLARED_OWNER_REVISION, MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision,
-    RetainedCapabilityEvidence, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
-    is_evidence_ref,
+    RetainedCapabilityEvidence, RouteScopeFingerprint, ScopeDependencySelector,
+    ScopeInvalidationSet, SkillStanding, invalidation_for, is_evidence_ref,
+    scope_has_any_invalidation,
 };
 pub use capability_evidence_commit::{
     capability_evidence_mutation_request_for_record, commit_capability_evidence_record,

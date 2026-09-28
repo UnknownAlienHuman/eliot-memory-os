@@ -2876,11 +2876,17 @@ impl DaemonComposition {
         now: u64,
     ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
         let view = self.capability_admission_mut()?;
-        // The applied-change invalidation is retained under the exact
-        // owner-issued reference of the observed behaviour scope, so only a
-        // fresh requalification that names that reference — and is strictly
-        // newer than the owner-issued revision of the evidence it staled — can
-        // clear it.
+        // The applied-change restriction is written into each affected record's
+        // own persisted `limitations_and_negative_evidence` under the exact
+        // owner-issued reference of the observed behaviour scope. Two things
+        // follow, and both are load-bearing:
+        //
+        // * only a fresh requalification that names that reference, and is
+        //   strictly newer than the owner-issued revision of the evidence it
+        //   staled, can clear it; and
+        // * the restriction is a property of the record's own bytes, so a
+        //   restart re-derives it from what the canonical store served instead
+        //   of starting from an empty invalidation set.
         let staled = view
             .apply_scope_change(
                 observed_scope,
@@ -2892,12 +2898,13 @@ impl DaemonComposition {
                     "capability evidence scope change is not owner-referenced: {error}"
                 )))
             })?;
-        if staled > 0 {
+        if staled.newly_staled > 0 {
             tracing::warn!(
                 target: "eliotd::capability_evidence",
                 event = "eliotd.capability_evidence_staled",
-                staled_records = staled,
-                "an observed runtime/adapter/provider/serializer change staled dependent capability evidence; the exact route must requalify before production work"
+                staled_records = staled.newly_staled,
+                change_reference = %staled.blocking_evidence_ref,
+                "an observed runtime/adapter/provider/serializer change limited dependent capability evidence; the exact route must requalify, naming this change reference, before production work"
             );
         }
         Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)

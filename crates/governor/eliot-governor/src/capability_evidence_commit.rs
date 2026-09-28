@@ -59,6 +59,24 @@
 //! Fail-closed checks before any commit: the named-operation guard, closed
 //! parameter decode, request-identity validity, and idempotency agreement
 //! between the caller identity and the named request key.
+//!
+//! Production caller status: **none, and that is a measured fact rather than an
+//! oversight.** This repository contains no capability-probe producer. A whole-
+//! tree search for `RouteScopeFingerprint {` outside `#[cfg(test)]` returns
+//! exactly two sites: the legacy importer (which yields an all-`None` scope and
+//! a `declared` status) and `ActualRouteReceipt::current_scope`, which itself
+//! needs an `ActualRouteReceipt` that no production path supplies. The single
+//! missing producer is therefore a route/capability observation yielding a
+//! `RouteScopeFingerprint`, a probed status, and the owner-issued evidence
+//! reference — and the same absence is why
+//! [`CapabilityRegistry::apply_scope_change`](crate::CapabilityRegistry::apply_scope_change)
+//! has no reachable caller yet. The write leg and the change leg are committed
+//! here and become reachable together, at that one producer; wiring either one
+//! earlier would mean fabricating a probe result that no probe produced.
+//!
+//! The readback half of this path is live today: the daemon's complete paged
+//! drain runs at startup and rebuilds the registry from whatever the store
+//! actually holds.
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
