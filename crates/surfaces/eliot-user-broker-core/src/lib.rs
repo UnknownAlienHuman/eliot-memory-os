@@ -4015,6 +4015,141 @@ struct BootstrapTicketState {
     consumed: bool,
 }
 
+/// Physical User Broker secret boundary for one `OpenCode` route
+/// (issue #2898, step 3).
+///
+/// The broker — and only the broker process that owns the physical launch —
+/// implements this: it resolves the introduction's opaque [`SecretRef`] to its
+/// short-lived bytes. The registry hands the resolved value to exactly one
+/// approved consumer, the bound `OpenCode` process, and never places the raw
+/// bytes in a durable registration, command line, log, route profile, model
+/// context or ordinary non-secret launch map.
+pub trait OpenCodeSecretBoundary {
+    /// Resolution failure. Carries no secret material.
+    type Error: std::error::Error + Send + 'static;
+
+    /// Resolves one opaque handle to the current short-lived secret bytes.
+    fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, Self::Error>;
+}
+
+/// The User Broker's current `OpenCode` bridge introductions and their
+/// generation/revocation state (issue #2898, steps 3 and 14).
+///
+/// Installing a new introduction retires the previous one's revocation id
+/// and its credential handle *together*, so restart/rotation mints a new
+/// generation and the old material stops resolving the moment the new one is
+/// installed. A revoked introduction is refused even while it is still
+/// installed and inside its window; [`OpenCodeBridgeIntroductionRegistry::revoke`]
+/// and [`OpenCodeBridgeIntroductionRegistry::clear`] cover logout, listener
+/// death and bridge restart.
+#[derive(Clone, Debug, Default)]
+pub struct OpenCodeBridgeIntroductionRegistry {
+    current: Option<OpenCodeBridgeIntroduction>,
+    retired_revocation_ids: BTreeSet<String>,
+    retired_credentials: BTreeSet<(String, String)>,
+}
+
+impl OpenCodeBridgeIntroductionRegistry {
+    /// Creates an empty registry: no route is introduced until
+    /// [`OpenCodeBridgeIntroductionRegistry::install`] runs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs the current introduction, retiring the replaced entry.
+    ///
+    /// The replaced introduction's revocation id and its credential handle are
+    /// retired in the same step, so the old generation can neither be admitted
+    /// nor have its secret resolved after the rotation. Revoking by
+    /// `revocation_id` is a *name* match, so it is performed only against the
+    /// introduction this registry actually held — a caller-supplied id that
+    /// was never installed is never "revoked" on the basis of its name.
+    pub fn install(&mut self, introduction: OpenCodeBridgeIntroduction) {
+        if let Some(previous) = self.current.replace(introduction) {
+            self.retire(&previous);
+        }
+    }
+
+    /// Retires the current introduction's material without installing a
+    /// replacement (logout, listener death, bridge restart).
+    pub fn clear(&mut self) {
+        if let Some(previous) = self.current.take() {
+            self.retire(&previous);
+        }
+    }
+
+    /// Retires one named introduction. An id this registry never installed
+    /// has no material to retire and is recorded as already retired, so a
+    /// later install of that same generation still fails closed.
+    pub fn revoke(&mut self, revocation_id: &str) {
+        // The named introduction is taken only when it is the one this
+        // registry actually holds, so a revocation never retires material by
+        // name alone.
+        if let Some(previous) = self.current.as_ref()
+            && previous.revocation_id == revocation_id
+        {
+            if let Some(previous) = self.current.take() {
+                self.retire(&previous);
+            }
+            return;
+        }
+        self.retired_revocation_ids.insert(revocation_id.to_owned());
+    }
+
+    /// Returns the current introduction, or `None` when the route is not
+    /// presently introduced (fail closed).
+    #[must_use]
+    pub fn current(&self) -> Option<&OpenCodeBridgeIntroduction> {
+        self.current.as_ref()
+    }
+
+    /// Returns whether one revocation id is retired.
+    #[must_use]
+    pub fn is_revoked(&self, revocation_id: &str) -> bool {
+        self.retired_revocation_ids.contains(revocation_id)
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|introduction| introduction.revocation_id == revocation_id)
+    }
+
+    /// Resolves the current introduction's credential handle through the
+    /// broker's own secret boundary.
+    ///
+    /// Refuses when the route is unintroduced or the handle belongs to a
+    /// retired generation, so a rotated credential never resolves even if a
+    /// stale introduction is still in hand. The returned bytes go only to the
+    /// exact approved `OpenCode` process.
+    pub fn resolve_current_credential<S>(&self, boundary: &S) -> Result<Box<str>, BrokerError>
+    where
+        S: OpenCodeSecretBoundary<Error = BrokerError>,
+    {
+        let introduction = self
+            .current
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        let key = (
+            introduction.credential.provider().to_owned(),
+            introduction.credential.key().to_owned(),
+        );
+        if self.retired_credentials.contains(&key) {
+            return Err(BrokerError::StaleLease);
+        }
+        boundary.resolve_secret(&introduction.credential)
+    }
+
+    /// Retires the introduction's revocation id and its credential handle.
+    fn retire(&mut self, introduction: &OpenCodeBridgeIntroduction) {
+        self.retired_revocation_ids
+            .insert(introduction.revocation_id.clone());
+        self.retired_credentials.insert((
+            introduction.credential.provider().to_owned(),
+            introduction.credential.key().to_owned(),
+        ));
+    }
+}
+
 /// One-shot User Broker bootstrap authority for the `OpenCode` bridge route.
 ///
 /// Mirrors [`OperatorHandoffAuthority`]: owner-issued, generation-bound,
@@ -4034,6 +4169,7 @@ pub struct OpenCodeBootstrapAuthority {
     bridge_generation: u64,
     interactive_session_id: String,
     process_binding: OpenCodeProcessBinding,
+    credential: SecretRef,
     tickets: BTreeMap<String, BootstrapTicketState>,
 }
 
@@ -4073,6 +4209,7 @@ impl OpenCodeBootstrapAuthority {
             bridge_generation: introduction.bridge_generation.get(),
             interactive_session_id: introduction.interactive_session_id.clone(),
             process_binding: introduction.process_binding.clone(),
+            credential: introduction.credential.clone(),
             tickets: BTreeMap::new(),
         })
     }
@@ -4135,6 +4272,49 @@ impl OpenCodeBootstrapAuthority {
         ticket: &OpenCodeBootstrapTicket,
         now: u64,
     ) -> Result<OpenCodeBootstrapGrant, BrokerError> {
+        self.redeem_once(ticket, now)
+    }
+
+    /// Redeems one ticket exactly once and yields the current HTTP endpoint
+    /// plus the one-use request credential (issue #2898, step 4).
+    ///
+    /// The credential is resolved through the broker's own secret boundary
+    /// only *after* the ticket is consumed exactly once, so the protected
+    /// named-pipe transport has already authenticated the peer SID, process,
+    /// image and generation against the bound [`OpenCodeProcessBinding`]
+    /// before any protected byte is disclosed. A replayed, mismatched or
+    /// expired ticket never reaches the boundary. The yielded credential is
+    /// the current generation's short-lived secret and travels on the
+    /// protected channel only; it is never written to a durable registration,
+    /// command line, log, route profile or non-secret launch map.
+    pub fn consume_with_credential<S>(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+        boundary: &S,
+    ) -> Result<OpenCodeOneUseIntroduction, BrokerError>
+    where
+        S: OpenCodeSecretBoundary<Error = BrokerError>,
+    {
+        let grant = self.redeem_once(ticket, now)?;
+        let credential = boundary.resolve_secret(&self.credential)?;
+        Ok(OpenCodeOneUseIntroduction {
+            introduction_digest: grant.introduction_digest,
+            endpoint: grant.endpoint,
+            server_identity: grant.server_identity,
+            process_binding: grant.process_binding,
+            credential,
+        })
+    }
+
+    /// Performs the exactly-once redemption and returns the bound grant. The
+    /// ticket is validated against the issued row, marked consumed, and only
+    /// then are the bound facts released.
+    fn redeem_once(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+    ) -> Result<OpenCodeBootstrapGrant, BrokerError> {
         ticket.validate()?;
         {
             let state = self
@@ -4157,6 +4337,28 @@ impl OpenCodeBootstrapAuthority {
             process_binding: self.process_binding.clone(),
         })
     }
+}
+
+/// The one-use client introduction released by exactly-once bootstrap
+/// redemption (issue #2898, step 4).
+///
+/// The first protected contact yields the current HTTP endpoint and the
+/// current generation's request credential, released only after the pipe
+/// transport authenticated the peer against the bound
+/// [`OpenCodeProcessBinding`]. The credential is a short-lived generation
+/// value: rotation replaces it, and the previous one is revoked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeOneUseIntroduction {
+    /// Introduction digest this grant belongs to.
+    pub introduction_digest: String,
+    /// Current pinned loopback endpoint.
+    pub endpoint: String,
+    /// Owner-minted server identity digest of that bridge incarnation.
+    pub server_identity: String,
+    /// Exact approved `OpenCode` process the peer was authenticated as.
+    pub process_binding: OpenCodeProcessBinding,
+    /// The current short-lived request credential. Never logged or persisted.
+    pub credential: Box<str>,
 }
 
 // ---------------------------------------------------------------------------

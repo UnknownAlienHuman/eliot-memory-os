@@ -658,6 +658,13 @@ pub struct HostEventAdmissionReceipt {
     pub fence_id: String,
     /// Bridge generation bound from current owner state.
     pub bridge_generation: u64,
+    /// Stored effect decision when the route answered this operation identity
+    /// as an already-admitted replay (issue #2898, step 10). `Some` only when
+    /// the route's own ORS idempotency proved this exact operation identity
+    /// already holds a persisted decision; the returned value is that stored
+    /// record, which the handler compares by content against the decision this
+    /// request would produce.
+    pub replayed_decision: Option<EffectDecisionRecord>,
 }
 
 /// Explicit coverage gap for dropped passive pressure (step 13).
@@ -780,6 +787,22 @@ pub trait HostEventAdmission {
         submission: &HostEventSubmission,
     ) -> Result<HostEventAdmissionReceipt, HostEventAdmissionError>;
 
+    /// Persists one evaluated effect decision under its exact decision
+    /// identity, through the same durable bridge-event route
+    /// (issue #2898, step 10).
+    ///
+    /// The route's own ORS idempotency answers: the same operation identity
+    /// carrying the same decision content replays the stored record
+    /// (`replayed_decision` set to that stored value), and the same identity
+    /// carrying changed content is a determined conflict
+    /// ([`HostEventAdmissionFailure::Conflict`]) that performs no transition.
+    /// An exact retry or a lost response therefore produces one durable event
+    /// and one decision, never a second policy evaluation.
+    fn commit_decision(
+        &mut self,
+        record: &EffectDecisionRecord,
+    ) -> Result<HostEventAdmissionReceipt, HostEventAdmissionError>;
+
     /// Records one explicit coverage gap for dropped passive pressure.
     fn report_gap(
         &mut self,
@@ -890,16 +913,115 @@ impl ActionGate for UnconfiguredActionGate {
     }
 }
 
-/// Exact decision identity binding one logical operation to one canonical
-/// request hash (issue #2898, step 10; I5.27).
+/// One persisted effect decision bound to its exact decision identity
+/// (issue #2898, step 10).
+///
+/// Every field W10 names is carried here and is covered by the canonical
+/// decision digest: the stable logical operation/event identity, the exact
+/// request/effect digest, the task hint, the bridge and `OpenCode`
+/// generations, the fence, the policy/authority revision, the decision
+/// itself, the expiry, the receipt/result commitment, and the reconciliation
+/// owner. The record is admitted through the existing bridge-event route
+/// together with the retained event, so ORS owns its durability, idempotency
+/// and reconciliation — there is no second decision journal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EffectDecisionIdentity {
+pub struct EffectDecisionRecord {
     /// Stable logical operation/event identity.
     pub operation_id: String,
     /// Canonical request hash over the exact bound fields.
     pub request_hash: String,
+    /// Recomputed effect digest the decision binds to.
+    pub effect_digest: String,
+    /// Exact mutating tool identity.
+    pub tool: String,
+    /// Attached task hint bound from current owner state.
+    pub task_id: Option<String>,
+    /// Bridge generation the decision was made under.
+    pub bridge_generation: u64,
+    /// `OpenCode` generation (introduction digest) the decision was made
+    /// under.
+    pub opencode_generation: String,
+    /// State fence the decision was made under.
+    pub fence_id: String,
+    /// Authority epoch text the decision was made under.
+    pub authority_epoch: String,
+    /// Policy revision the decision was evaluated under.
+    pub policy_revision: String,
+    /// Authority revision the decision was evaluated under.
+    pub authority_revision: String,
+    /// The decision itself (`allow` or `deny`).
+    pub decision: String,
+    /// Closed refusal reason code; empty for an `allow`. Persisted so a
+    /// reconciled retry reproduces the original refusal rather than degrading
+    /// it to an untyped `recorded`.
+    pub reason_code: String,
+    /// Absolute decision expiry in Unix milliseconds; `0` when the decision
+    /// carries no expiry.
+    pub expires_at_ms: u64,
+    /// Durable event commitment (canonical envelope digest of the retained
+    /// event this decision is bound to).
+    pub event_receipt: String,
+    /// Decision/result commitment.
+    pub decision_receipt: String,
+    /// Owner that reconciles this operation when its response is lost.
+    pub reconciliation_owner: String,
 }
+
+impl EffectDecisionRecord {
+    /// Computes the canonical decision-identity content digest: the exact
+    /// content W10's "same identity / same content" and "same identity /
+    /// changed content" rules compare. It covers every bound field above, so
+    /// any change to the effect, scope, fence, generation, policy revision,
+    /// decision, expiry, or commitment changes the digest.
+    #[must_use]
+    pub fn content_digest(&self) -> String {
+        let canonical = serde_json::Value::Array(vec![
+            serde_json::Value::String(HOST_EVENTS_DECISION_VERSION.to_owned()),
+            serde_json::Value::String(self.operation_id.clone()),
+            serde_json::Value::String(self.request_hash.clone()),
+            serde_json::Value::String(self.effect_digest.clone()),
+            serde_json::Value::String(self.tool.clone()),
+            self.task_id
+                .as_deref()
+                .map_or(serde_json::Value::Null, |task| {
+                    serde_json::Value::String(task.to_owned())
+                }),
+            serde_json::Value::Number(self.bridge_generation.into()),
+            serde_json::Value::String(self.opencode_generation.clone()),
+            serde_json::Value::String(self.fence_id.clone()),
+            serde_json::Value::String(self.authority_epoch.clone()),
+            serde_json::Value::String(self.policy_revision.clone()),
+            serde_json::Value::String(self.authority_revision.clone()),
+            serde_json::Value::String(self.decision.clone()),
+            serde_json::Value::String(self.reason_code.clone()),
+            serde_json::Value::Number(self.expires_at_ms.into()),
+            serde_json::Value::String(self.event_receipt.clone()),
+            serde_json::Value::String(self.decision_receipt.clone()),
+            serde_json::Value::String(self.reconciliation_owner.clone()),
+        ]);
+        serde_json::to_vec(&canonical)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .unwrap_or_default()
+    }
+
+    /// Encodes the record as the bounded JSON persisted with the retained
+    /// event. Carries digests and owner identities only: no argument values,
+    /// command text, secrets, or server prose.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Version of the persisted effect-decision record (issue #2898, step 10).
+pub const HOST_EVENTS_DECISION_VERSION: &str = "eliot.opencode.effect-decision.v1";
+
+/// Reconciliation owner of an `OpenCode` effect decision: the existing
+/// bridge-event route / ORS reconciliation owner. A lost response is
+/// reconciled against this owner's stored record, never through the legacy
+/// process transport.
+pub const HOST_EVENTS_DECISION_RECONCILER: &str = HOST_EVENTS_STREAM_ID;
 
 /// Replay classification for a presented decision identity against the
 /// stored one: same identity with same content replays; same identity
@@ -912,22 +1034,27 @@ pub enum DecisionReplay {
     Conflict,
 }
 
-/// Classifies a presented decision identity against the stored original.
+/// Classifies a presented decision record against the stored original.
 ///
-/// Same operation with the same request hash replays the original
-/// decision without re-evaluation; same operation with a different hash
-/// is an `IDENTITY_CONFLICT` that performs no transition. A lost
-/// response reconciles the original operation through this comparison,
-/// never through the legacy process transport or a second decision.
+/// The comparison is on **content**, not on identity existence: the stored
+/// and presented `content_digest` values are computed from the two records'
+/// own bound fields and compared. Equal digests mean every bound field
+/// (effect, task, fence, both generations, policy/authority revision,
+/// decision, expiry, and both receipt commitments) is the same, so the
+/// original decision replays without a second evaluation. A different digest
+/// under the same operation identity is `Conflict` and performs no
+/// transition. A lost response reconciles the original operation through
+/// this comparison, never through the legacy process transport or a second
+/// decision evaluation.
 #[must_use]
 pub fn classify_decision_replay(
-    stored: &EffectDecisionIdentity,
-    presented: &EffectDecisionIdentity,
+    stored: &EffectDecisionRecord,
+    presented: &EffectDecisionRecord,
 ) -> Option<DecisionReplay> {
     if stored.operation_id != presented.operation_id {
         return None;
     }
-    if stored.request_hash == presented.request_hash {
+    if stored.content_digest() == presented.content_digest() {
         Some(DecisionReplay::Replay)
     } else {
         Some(DecisionReplay::Conflict)
@@ -986,9 +1113,9 @@ pub struct HostEventResponseFields {
     /// `allow`, `deny`, or `recorded` (observation only, never a permit).
     pub decision: &'static str,
     /// I7.20 disposition; present only on `deny`.
-    pub disposition: Option<&'static str>,
+    pub disposition: Option<String>,
     /// Closed deny reason code; present only on `deny`.
-    pub reason_code: Option<&'static str>,
+    pub reason_code: Option<String>,
     /// Installation bound from current owner state.
     pub installation_id: String,
     /// Bridge generation bound from current owner state.
@@ -1031,16 +1158,8 @@ pub fn response_commitment_message(fields: &HostEventResponseFields) -> Vec<u8> 
         serde_json::Value::String(fields.event_id.clone()),
         opt(&fields.effect_digest),
         serde_json::Value::String(fields.decision.to_owned()),
-        fields
-            .disposition
-            .map_or(serde_json::Value::Null, |disposition| {
-                serde_json::Value::String(disposition.to_owned())
-            }),
-        fields
-            .reason_code
-            .map_or(serde_json::Value::Null, |reason| {
-                serde_json::Value::String(reason.to_owned())
-            }),
+        opt(&fields.disposition),
+        opt(&fields.reason_code),
         serde_json::Value::String(fields.installation_id.clone()),
         serde_json::Value::Number(fields.bridge_generation.into()),
         serde_json::Value::String(fields.authority_epoch.clone()),
@@ -1137,19 +1256,6 @@ fn insert_opt_text(
     );
 }
 
-fn insert_opt_code(
-    body: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: Option<&'static str>,
-) {
-    body.insert(
-        key.to_owned(),
-        value.map_or(serde_json::Value::Null, |code| {
-            serde_json::Value::String(code.to_owned())
-        }),
-    );
-}
-
 /// Encodes the full versioned response body including its commitment.
 #[must_use]
 pub fn encode_host_event_response(
@@ -1170,8 +1276,8 @@ pub fn encode_host_event_response(
         "decision".to_owned(),
         serde_json::Value::String(fields.decision.to_owned()),
     );
-    insert_opt_code(&mut body, "disposition", fields.disposition);
-    insert_opt_code(&mut body, "reason_code", fields.reason_code);
+    insert_opt_text(&mut body, "disposition", fields.disposition.as_ref());
+    insert_opt_text(&mut body, "reason_code", fields.reason_code.as_ref());
     body.insert(
         "installation_id".to_owned(),
         serde_json::Value::String(fields.installation_id.clone()),
@@ -1227,7 +1333,7 @@ pub fn encode_host_event_response(
     serde_json::Value::Object(body)
 }
 
-/// Composition of the four ingress ports.
+/// Composition of the ingress ports.
 pub struct HostEventPorts<A, G, I, C> {
     /// Existing bridge-event durable route.
     pub admission: A,
@@ -1530,6 +1636,25 @@ fn apply_gate_allow(fields: &mut HostEventResponseFields, decision: ActionGateDe
     fields.decision_receipt = Some(decision.decision_receipt);
 }
 
+/// Applies one evaluated `deny` to the response fields. The owner evaluated
+/// and refused, so the answer carries the typed `DENIED` disposition, the
+/// closed reason code the owner returned (a `POLICY_DENIED` default when it
+/// returned none), and the policy/authority revisions and decision commitment
+/// the refusal was made under — never degraded to an untyped `recorded`.
+fn apply_gate_deny(fields: &mut HostEventResponseFields, decision: ActionGateDecision) {
+    fields.decision = DECISION_DENY;
+    fields.disposition = Some(DISPOSITION_DENIED.to_owned());
+    fields.reason_code = Some(
+        decision
+            .reason_code
+            .unwrap_or(REASON_POLICY_DENIED)
+            .to_owned(),
+    );
+    fields.policy_revision = Some(decision.policy_revision);
+    fields.authority_revision = Some(decision.authority_revision);
+    fields.decision_receipt = Some(decision.decision_receipt);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_gate_event<A, G, I, C>(
     introduction: &OpenCodeBridgeIntroduction,
@@ -1577,6 +1702,11 @@ where
         .argument_keys
         .clone_from(&validated.argument_keys);
     submission.envelope_json = envelope;
+    // First durable admission of the retained event. The route's own ORS
+    // idempotency answers here: `Duplicate` means this exact operation
+    // identity already holds this exact content, and `Conflict` means the
+    // same identity carries changed content. Both are decided from the stored
+    // content, not from the identity's existence.
     let receipt = match ports.admission.admit(introduction, &submission) {
         Ok(receipt) => receipt,
         Err(error) => return HttpOutcome::rejected(error.reject(), Some(event_id)),
@@ -1592,6 +1722,22 @@ where
         &receipt.fence_id,
         &receipt.envelope_digest,
     );
+    if let Some(stored) = receipt.replayed_decision.clone() {
+        // A lost response reconciles the original operation: the stored
+        // decision is compared with the decision this request would produce.
+        // Same content replays the original answer with no second policy
+        // evaluation and no process-bridge fallback; changed content is a
+        // determined conflict that performs no transition.
+        let presented = presented_gate_decision(
+            introduction,
+            event_id,
+            &validated,
+            &submission,
+            &receipt,
+            &stored,
+        );
+        return reconcile_stored_decision(introduction, event_id, credential, &stored, &presented);
+    }
     let request = ActionGateRequest {
         operation_id: event_id.to_owned(),
         request_hash,
@@ -1605,31 +1751,79 @@ where
     };
     let mut fields = base_response_fields(introduction, &receipt, event_id);
     fields.effect_digest = Some(validated.effect_digest.clone());
-    match ports.gate.decide(introduction, &receipt, &request) {
-        Ok(decision) if decision.allow => {
-            if !gate_allow_is_well_bound(&decision, &request.request_hash, now_ms) {
-                return HttpOutcome::ok(encode_host_event_response(&fields, credential));
-            }
-            apply_gate_allow(&mut fields, decision);
-            HttpOutcome::ok(encode_host_event_response(&fields, credential))
+    let decision = match ports.gate.decide(introduction, &receipt, &request) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return gate_failure_outcome(error, &fields, credential, event_id);
         }
-        Ok(decision) => {
-            fields.decision = DECISION_DENY;
-            fields.disposition = Some(DISPOSITION_DENIED);
-            fields.reason_code = Some(decision.reason_code.unwrap_or(REASON_POLICY_DENIED));
-            fields.policy_revision = Some(decision.policy_revision);
-            fields.authority_revision = Some(decision.authority_revision);
-            fields.decision_receipt = Some(decision.decision_receipt);
-            HttpOutcome::ok(encode_host_event_response(&fields, credential))
+    };
+    // Persist the decision with its exact decision identity before answering,
+    // so the durable event and its decision are one reconciled record.
+    let record = gate_decision_record(
+        introduction,
+        event_id,
+        &validated,
+        &submission,
+        &receipt,
+        &decision,
+    );
+    let committed = match ports.admission.commit_decision(&record) {
+        Ok(committed) => committed,
+        Err(error) => return HttpOutcome::rejected(error.reject(), Some(event_id)),
+    };
+    if let Some(stored) = committed.replayed_decision {
+        return reconcile_stored_decision(introduction, event_id, credential, &stored, &record);
+    }
+    if !decision.allow {
+        apply_gate_deny(&mut fields, decision);
+    } else if gate_allow_is_well_bound(&decision, &request.request_hash, now_ms) {
+        apply_gate_allow(&mut fields, decision);
+    }
+    HttpOutcome::ok(encode_host_event_response(&fields, credential))
+}
+
+/// Answers one presented decision against the stored original it was matched
+/// with, by the same content comparison on both reconciliation paths: an exact
+/// content replay reproduces the original answer, and changed content under a
+/// known identity is a determined conflict that performs no transition.
+fn reconcile_stored_decision(
+    introduction: &OpenCodeBridgeIntroduction,
+    event_id: &str,
+    credential: &SecretString,
+    stored: &EffectDecisionRecord,
+    presented: &EffectDecisionRecord,
+) -> HttpOutcome {
+    match classify_decision_replay(stored, presented) {
+        Some(DecisionReplay::Replay) => HttpOutcome::ok(encode_host_event_response(
+            &replayed_response_fields(introduction, stored),
+            credential,
+        )),
+        Some(DecisionReplay::Conflict) | None => HttpOutcome::rejected(
+            HostEventReject::new(409, DISPOSITION_STALE_OR_CONFLICT, REASON_IDENTITY_CONFLICT),
+            Some(event_id),
+        ),
+    }
+}
+
+/// Translates one pre-effect gate failure into its exact outcome. An
+/// unconfigured gate is a durable observation that cannot authorize a mutating
+/// tool; every other failure is a typed rejection. No failure path emits a
+/// permit.
+fn gate_failure_outcome(
+    error: ActionGateError,
+    fields: &HostEventResponseFields,
+    credential: &SecretString,
+    event_id: &str,
+) -> HttpOutcome {
+    match error {
+        ActionGateError::Unconfigured => {
+            HttpOutcome::ok(encode_host_event_response(fields, credential))
         }
-        Err(ActionGateError::Unconfigured) => {
-            HttpOutcome::ok(encode_host_event_response(&fields, credential))
-        }
-        Err(ActionGateError::Backpressure) => HttpOutcome::rejected(
+        ActionGateError::Backpressure => HttpOutcome::rejected(
             HostEventReject::new(429, DISPOSITION_UNAVAILABLE_OR_CAPACITY, REASON_BUSY),
             Some(event_id),
         ),
-        Err(ActionGateError::Unavailable) => HttpOutcome::rejected(
+        ActionGateError::Unavailable => HttpOutcome::rejected(
             HostEventReject::new(
                 503,
                 DISPOSITION_UNAVAILABLE_OR_CAPACITY,
@@ -1637,10 +1831,137 @@ where
             ),
             Some(event_id),
         ),
-        Err(ActionGateError::Fenced) => HttpOutcome::rejected(
+        ActionGateError::Fenced => HttpOutcome::rejected(
             HostEventReject::new(409, DISPOSITION_STALE_OR_CONFLICT, REASON_STALE_STATE_FENCE),
             Some(event_id),
         ),
+    }
+}
+
+/// Projects the decision identity this request presents for the stored
+/// original, without re-evaluating policy.
+///
+/// The request-derived bindings come from **this** request — the recomputed
+/// effect digest, the tool, the task/scope, the live bridge generation, the
+/// `OpenCode` generation, the fence, the authority epoch, the recomputed
+/// request hash and the durable event commitment. The evaluation facts come
+/// from the stored original, because a reconciled retry reuses the decision
+/// that was already made instead of evaluating a second one. The result is
+/// therefore the exact record this request *would* have produced for the same
+/// operation: identical content for an exact retry (`Replay`), and a changed
+/// effect, argument set, scope, fence, generation or event commitment under
+/// the same operation identity yields different content (`Conflict`).
+fn presented_gate_decision(
+    introduction: &OpenCodeBridgeIntroduction,
+    event_id: &str,
+    validated: &ValidatedMutationGate,
+    submission: &HostEventSubmission,
+    receipt: &HostEventAdmissionReceipt,
+    stored: &EffectDecisionRecord,
+) -> EffectDecisionRecord {
+    let request_hash = effect_request_hash(
+        event_id,
+        event_id,
+        &validated.effect_digest,
+        &validated.tool,
+        submission.task_id.as_deref(),
+        receipt.bridge_generation,
+        &receipt.authority_epoch,
+        &receipt.fence_id,
+        &receipt.envelope_digest,
+    );
+    EffectDecisionRecord {
+        operation_id: event_id.to_owned(),
+        request_hash,
+        effect_digest: validated.effect_digest.clone(),
+        tool: validated.tool.clone(),
+        task_id: submission.task_id.clone(),
+        bridge_generation: receipt.bridge_generation,
+        opencode_generation: introduction.introduction_digest.clone(),
+        fence_id: receipt.fence_id.clone(),
+        authority_epoch: authority_epoch_text(&receipt.authority_epoch),
+        policy_revision: stored.policy_revision.clone(),
+        authority_revision: stored.authority_revision.clone(),
+        decision: stored.decision.clone(),
+        reason_code: stored.reason_code.clone(),
+        expires_at_ms: stored.expires_at_ms,
+        event_receipt: receipt.envelope_digest.clone(),
+        decision_receipt: stored.decision_receipt.clone(),
+        reconciliation_owner: HOST_EVENTS_DECISION_RECONCILER.to_owned(),
+    }
+}
+
+/// Builds the persisted effect decision for one evaluation, binding every
+/// field W10 names.
+fn gate_decision_record(
+    introduction: &OpenCodeBridgeIntroduction,
+    event_id: &str,
+    validated: &ValidatedMutationGate,
+    submission: &HostEventSubmission,
+    receipt: &HostEventAdmissionReceipt,
+    decision: &ActionGateDecision,
+) -> EffectDecisionRecord {
+    EffectDecisionRecord {
+        operation_id: event_id.to_owned(),
+        request_hash: decision.request_hash.clone(),
+        effect_digest: validated.effect_digest.clone(),
+        tool: validated.tool.clone(),
+        task_id: submission.task_id.clone(),
+        bridge_generation: receipt.bridge_generation,
+        opencode_generation: introduction.introduction_digest.clone(),
+        fence_id: receipt.fence_id.clone(),
+        authority_epoch: authority_epoch_text(&receipt.authority_epoch),
+        policy_revision: decision.policy_revision.clone(),
+        authority_revision: decision.authority_revision.clone(),
+        decision: if decision.allow {
+            DECISION_ALLOW.to_owned()
+        } else {
+            DECISION_DENY.to_owned()
+        },
+        reason_code: decision.reason_code.unwrap_or_default().to_owned(),
+        expires_at_ms: decision.expires_at_ms,
+        event_receipt: receipt.envelope_digest.clone(),
+        decision_receipt: decision.decision_receipt.clone(),
+        reconciliation_owner: HOST_EVENTS_DECISION_RECONCILER.to_owned(),
+    }
+}
+
+/// Builds the replayed response from the stored decision, so a reconciled
+/// answer reproduces the original one rather than a fresh evaluation.
+///
+/// Only reached on an exact content match
+/// ([`DecisionReplay::Replay`]), so this is the original decision: an `allow`
+/// replays as the same `allow` with its original expiry and commitments, and a
+/// stored refusal replays as the same typed `deny` with its original closed
+/// reason code, never degraded to an untyped `recorded`.
+fn replayed_response_fields(
+    introduction: &OpenCodeBridgeIntroduction,
+    stored: &EffectDecisionRecord,
+) -> HostEventResponseFields {
+    let allow = stored.decision == DECISION_ALLOW;
+    let denied = !allow;
+    HostEventResponseFields {
+        event_id: stored.operation_id.clone(),
+        effect_digest: Some(stored.effect_digest.clone()),
+        decision: if allow { DECISION_ALLOW } else { DECISION_DENY },
+        disposition: denied.then(|| DISPOSITION_DENIED.to_owned()),
+        reason_code: denied.then(|| {
+            if stored.reason_code.is_empty() {
+                REASON_POLICY_DENIED.to_owned()
+            } else {
+                stored.reason_code.clone()
+            }
+        }),
+        installation_id: introduction.installation_id.clone(),
+        bridge_generation: stored.bridge_generation,
+        authority_epoch: stored.authority_epoch.clone(),
+        state_fence: stored.fence_id.clone(),
+        policy_revision: Some(stored.policy_revision.clone()),
+        authority_revision: Some(stored.authority_revision.clone()),
+        expires_at_ms: (allow && stored.expires_at_ms > 0).then_some(stored.expires_at_ms),
+        event_receipt: stored.event_receipt.clone(),
+        decision_receipt: Some(stored.decision_receipt.clone()),
+        replayed: true,
     }
 }
 
