@@ -80,9 +80,10 @@ use time::OffsetDateTime;
 
 use crate::learning_closure::{
     AdmissionState, AttemptOutcomesAndDeltas, CampaignAndTarget, ClosureAssembly,
-    ClosureDisposition, ClosureDue, ClosureLifecycleEvent, ClosurePolicy, LearningClosureError,
-    OutcomeHarmAndEconomicsEvidence, OverlayAndActivationAssessments, PriorClosureHistory,
-    assemble_campaign_learning_closure, trigger_closure_due,
+    ClosureCompletion, ClosureDisposition, ClosureDue, ClosureLifecycleEvent, ClosurePolicy,
+    ClosureRecordAssembly, LearningClosureError, OutcomeHarmAndEconomicsEvidence,
+    OverlayAndActivationAssessments, PriorClosureHistory, assemble_campaign_learning_closure,
+    assemble_campaign_learning_closure_with_evidence, trigger_closure_due,
 };
 use crate::{CandidateState, ImprovementCandidate, ImprovementSurface};
 
@@ -2245,16 +2246,27 @@ pub fn governed_assemble_campaign_learning_closure(
     )?)
 }
 
-/// Lifecycle-event entry to governed closure assembly (#1866 W1, I12.24).
+/// Lifecycle-event entry to governed closure assembly (#1866 W0, I12.24).
 ///
 /// Classifies `event` through [`trigger_closure_due`] against the closure
-/// policy, then delegates to
-/// [`governed_assemble_campaign_learning_closure`]. Terminalization and
+/// policy, enforces the same governed gates as
+/// [`governed_assemble_campaign_learning_closure`], then completes the
+/// closure as a durable record through
+/// [`assemble_campaign_learning_closure_with_evidence`]. Terminalization and
 /// delayed-outcome/rework/maintenance windows always open closure work; a
 /// major checkpoint opens it only when the policy admits checkpoints, else
 /// [`BoundsError::InvalidPolicy`] is returned and nothing is assembled.
-/// Returns the assembly together with the trigger assessment so the caller
-/// (finish job / checkpoint owner) can record debt when closure stays open.
+///
+/// The record carries exactly one [`ClosureDisposition::allowed`] disposition
+/// and the stored canonical evidence from `completion`, so a consequential
+/// episode assembled here is learning-closed with an explicit disposition
+/// (I12.24: "A consequential episode is not learning-closed until it has a
+/// disposition") rather than as a disposition-less candidate. When the
+/// decision core yields a bounded further-evidence disposition instead of a
+/// candidate, that disposition is returned untouched and `completion` is
+/// unused. Returns the record assembly together with the trigger assessment
+/// so the caller (finish job / checkpoint owner) can record debt when
+/// closure stays open.
 #[allow(clippy::too_many_arguments)]
 pub fn governed_assemble_at_lifecycle_event(
     event: ClosureLifecycleEvent,
@@ -2264,8 +2276,9 @@ pub fn governed_assemble_at_lifecycle_event(
     exact_outcome_harm_and_economics_evidence: OutcomeHarmAndEconomicsEvidence,
     prior_closure_history: PriorClosureHistory,
     closure_policy: ClosurePolicy,
+    completion: ClosureCompletion,
     gate: GovernedRetrieval<'_>,
-) -> Result<(ClosureAssembly, ClosureDue), GovernedClosureError> {
+) -> Result<(ClosureRecordAssembly, ClosureDue), GovernedClosureError> {
     let due = trigger_closure_due(event, &closure_policy);
     if event == ClosureLifecycleEvent::MajorCheckpoint && !due.checkpoint {
         return Err(GovernedClosureError::Bounds(BoundsError::InvalidPolicy(
@@ -2273,15 +2286,29 @@ pub fn governed_assemble_at_lifecycle_event(
         )));
     }
     let assembly = governed_assemble_campaign_learning_closure(
-        exact_campaign_and_target,
-        exact_attempt_outcomes_and_deltas,
-        exact_overlay_and_activation_assessments,
-        exact_outcome_harm_and_economics_evidence,
-        prior_closure_history,
-        closure_policy,
+        exact_campaign_and_target.clone(),
+        exact_attempt_outcomes_and_deltas.clone(),
+        exact_overlay_and_activation_assessments.clone(),
+        exact_outcome_harm_and_economics_evidence.clone(),
+        prior_closure_history.clone(),
+        closure_policy.clone(),
         gate,
     )?;
-    Ok((assembly, due))
+    let record = match assembly {
+        ClosureAssembly::Disposition(disposition) => {
+            ClosureRecordAssembly::Disposition(disposition)
+        }
+        ClosureAssembly::Candidate(_) => assemble_campaign_learning_closure_with_evidence(
+            exact_campaign_and_target,
+            exact_attempt_outcomes_and_deltas,
+            exact_overlay_and_activation_assessments,
+            exact_outcome_harm_and_economics_evidence,
+            prior_closure_history,
+            closure_policy,
+            completion,
+        )?,
+    };
+    Ok((record, due))
 }
 
 // ---------------------------------------------------------------------------
