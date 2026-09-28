@@ -159,7 +159,7 @@ async fn read_capability_evidence_page(
         predicate.push_str(" AND key > $capability_evidence_after_key");
     }
     let sql = format!(
-        "SELECT namespace, key, skill_id, scope_key, record_digest, payload, revision FROM {} WHERE {predicate} ORDER BY key LIMIT {limit};",
+        "SELECT namespace, key, skill_id, scope_key, record_digest, payload, scope_id, revision FROM {} WHERE {predicate} ORDER BY key LIMIT {limit};",
         schema::table::RECOVERY_OWNER
     );
     let mut bindings = Map::new();
@@ -195,70 +195,121 @@ async fn read_capability_evidence_page(
     let rows: Vec<Value> = response.take(0)?;
     rows.into_iter()
         .map(|row| {
-            let object = row
-                .as_object()
-                .ok_or(AdapterError::Store(StoreError::InvalidField {
-                    field: "capability_evidence.row",
-                    reason: "capability evidence row must be an object",
-                }))?;
-            let key = text_row_field(object, "key")?;
-            let decoded = decode_capability_evidence_row(&key, object)?;
+            // Same acceptance boundary as the sibling recovery read: a row that
+            // does not project the closed column set is a decode failure, not a
+            // row to half-read.
+            let projected: CapabilityEvidenceRow = serde_json::from_value(row)
+                .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+            let key = projected.key.clone();
+            let decoded = decode_capability_evidence_row(scope_id, &key, projected)?;
             Ok((key, decoded))
         })
         .collect()
 }
 
+/// One projected `recovery_owner` row for the capability-evidence leg.
+///
+/// The column set and the field types are the ones the write path actually
+/// produces, read back the way the established recovery path reads the same
+/// table:
+///
+/// * the write binds `json!(payload)` where `payload: &[u8]`
+///   ([`super::append_capability_evidence_owner_statements`](super::atomic_write)),
+///   and the column is declared `DEFINE FIELD payload ON recovery_owner TYPE
+///   bytes;` ([`crate::schema`]), so the projected value is the byte sequence
+///   serde renders as a JSON array of integers — not a string;
+/// * [`eliot_store_api::RecoveryRecord::payload`] is `pub payload: Vec<u8>`
+///   ("Exact canonical payload bytes; the store does not interpret them"),
+///   and the working recovery and genesis reads satisfy that field from the same
+///   projection by deserializing the row wholesale
+///   ([`RecoveryRecord`](eliot_store_api::RecoveryRecord) via
+///   `response.take::<Vec<RecoveryRecord>>(…)` in
+///   [`super::super::genesis`](super::super::genesis) and
+///   [`take_vec`](super::take_vec) in this module's sibling read). This row
+///   deserializes the same way, so it needs no tolerant second branch for a
+///   string shape.
+///
+/// `deny_unknown_fields` matches [`eliot_store_api::RecoveryRecord`]: a row
+/// carrying an unexpected column is refused rather than half-read.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityEvidenceRow {
+    namespace: String,
+    key: String,
+    payload: Vec<u8>,
+    record_digest: String,
+    skill_id: String,
+    scope_key: String,
+    scope_id: String,
+    revision: u64,
+}
+
 /// Decodes one projected capability-evidence row.
 ///
-/// The row must name the exact `capability-evidence-v1` namespace and carry the
-/// presented `record_digest` of its own payload bytes. That re-proof is the
-/// adapter's structural acceptance boundary: the store must never echo a
-/// document under a reference it does not match, so a hydration can never mint a
-/// record under an evidence reference the store never issued for those bytes.
+/// Four refusals, all structural, and none of them interprets the document:
+///
+/// * the row must name the exact `capability-evidence-v1` namespace;
+/// * the row's own `scope_id` must equal the scope the read was planned for, so
+///   a row cannot be served into another scope's answer;
+/// * the row address must be reproducible from the row's own
+///   `(skill_id, scope_key)` identity, so a row cannot be projected under a key
+///   the write path could not have produced; and
+/// * `sha256_hex(payload) == record_digest`, the **owner-issued reference of the
+///   original committed bytes**. This re-proof validates the value the store
+///   committed, not a freshly derived substitute, so a hydration can never mint a
+///   record under an evidence reference the store never issued for those bytes.
+///
+/// The revision must be at least `1`, because the store's fenced compare-and-set
+/// only ever issues `expected + 1` from a `0` floor.
 fn decode_capability_evidence_row(
+    requested_scope: &str,
     key: &str,
-    object: &Map<String, Value>,
+    row: CapabilityEvidenceRow,
 ) -> Result<StoredCapabilityEvidence, AdapterError> {
-    let namespace = text_row_field(object, "namespace")?;
-    if namespace != CAPABILITY_EVIDENCE_RECORD_NAMESPACE {
+    if row.namespace != CAPABILITY_EVIDENCE_RECORD_NAMESPACE {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.namespace",
             reason: "capability evidence row is in a foreign namespace",
         }));
     }
-    let skill_id = text_row_field(object, "skill_id")?;
-    let scope_key = text_row_field(object, "scope_key")?;
-    // The address is derived from exactly the two identity parts, so a row whose
-    // address disagrees with its own identity fields is refused rather than
-    // projected under a key the write path could not have produced.
-    if row_id(&skill_id, &scope_key)? != key {
+    if row.scope_id != requested_scope {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "capability_evidence.scope_id",
+            reason: "capability evidence row is in a foreign scope",
+        }));
+    }
+    if row_id(&row.skill_id, &row.scope_key)? != key {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.key",
             reason: "capability evidence row address does not match its identity",
         }));
     }
-    let record_digest = text_row_field(object, "record_digest")?;
-    let record_json = record_json_field(object, "payload")?;
-    if sha256_hex(record_json.as_bytes()) != record_digest {
+    // The owner-issued reference is re-proved against the ORIGINAL recorded
+    // bytes, taken from the `TYPE bytes` column exactly as committed.
+    let record_json = String::from_utf8(row.payload).map_err(|_| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "capability_evidence.payload",
+            reason: "capability evidence payload bytes are not valid UTF-8",
+        })
+    })?;
+    if sha256_hex(record_json.as_bytes()) != row.record_digest {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.record_digest",
             reason: "capability evidence digest does not match its record bytes",
         }));
     }
-    let revision = object
-        .get("revision")
-        .and_then(Value::as_u64)
-        .filter(|revision| *revision >= 1)
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
+    if row.revision < 1 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
             field: "capability_evidence.revision",
             reason: "capability evidence revision must be at least 1",
-        }))?;
+        }));
+    }
     Ok(StoredCapabilityEvidence {
-        skill_id,
-        scope_key,
-        record_digest,
+        skill_id: row.skill_id,
+        scope_key: row.scope_key,
+        record_digest: row.record_digest,
         record_json,
-        revision,
+        revision: row.revision,
     })
 }
 
@@ -270,39 +321,4 @@ fn missing_recovery_table(errors: &[String]) -> bool {
         && errors.iter().all(|error| {
             error.contains("does not exist") && error.contains(schema::table::RECOVERY_OWNER)
         })
-}
-
-fn text_row_field(
-    object: &Map<String, Value>,
-    field: &'static str,
-) -> Result<String, AdapterError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field,
-            reason: "capability evidence row field must be present text",
-        }))
-}
-
-/// Decodes the stored evidence document, which the provider persists verbatim.
-///
-/// `payload` is the canonical `RecoveryRecord` byte column: the owner stored the
-/// record document as a JSON string, so the projected value is that string and
-/// the document is carried through unchanged. A non-text projection is refused
-/// rather than re-serialized, so the bytes the Governor re-proves are the exact
-/// bytes that were committed.
-fn record_json_field(
-    object: &Map<String, Value>,
-    field: &'static str,
-) -> Result<String, AdapterError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field,
-            reason: "capability evidence payload must be present text",
-        }))
 }

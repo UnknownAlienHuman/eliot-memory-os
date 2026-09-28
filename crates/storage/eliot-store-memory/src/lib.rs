@@ -1633,7 +1633,7 @@ fn capability_evidence_record_range_payload(
     let mut records = Vec::new();
     let mut truncated = false;
     let mut ordinal: u64 = 0;
-    for row in state.capability_evidence_rows.values() {
+    for (key, row) in &state.capability_evidence_rows {
         if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
             continue;
         }
@@ -1651,6 +1651,33 @@ fn capability_evidence_record_range_payload(
         if records.len() >= limit {
             truncated = true;
             break;
+        }
+        // The same structural re-proofs the Surreal provider applies, so the two
+        // providers accept exactly the same rows and serve exactly the same
+        // payload shape. `record_json` is served as a JSON **string** here and in
+        // Surreal (`String::from_utf8` of the `TYPE bytes` column), so the
+        // consumer's decode is provider-independent.
+        //
+        // The digest re-proof validates the ORIGINAL recorded bytes, not a
+        // derived substitute, so a row can never be served under an
+        // owner-issued reference the store never issued for those bytes.
+        if eliot_store_api::capability_evidence_row_key(&row.skill_id, &row.scope_key) != *key {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.key",
+                reason: "capability evidence row address does not match its identity",
+            });
+        }
+        if sha256_hex(row.record_json.as_bytes()) != row.record_digest {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.record_digest",
+                reason: "capability evidence digest does not match its record bytes",
+            });
+        }
+        if row.revision < 1 {
+            return Err(StoreError::InvalidField {
+                field: "capability_evidence.revision",
+                reason: "capability evidence revision must be at least 1",
+            });
         }
         records.push(json!({
             "skill_id": row.skill_id,

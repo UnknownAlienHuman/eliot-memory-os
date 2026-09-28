@@ -955,8 +955,26 @@ impl CapabilityRegistry {
         true
     }
 
-    /// Clears the scope invalidation only when this record is a qualifying
-    /// requalification of exactly the retained blocking cause.
+    /// Clears the invalidation only when this record is a qualifying
+    /// requalification of exactly the retained blocking cause for the same
+    /// `(skill_id, scope_fingerprint)` key.
+    ///
+    /// **Why the key is per-capability and not per-scope.** I3.4
+    /// ("Promotion to a broader degradation scope requires evidence that the
+    /// broader owner or generation is defective. A call-scoped fallback remains
+    /// visible in the attempt receipt and cannot become a sticky global
+    /// capability flag.") fixes the direction of travel: a narrow observation
+    /// may never be promoted to a broader consequence. A requalification is one
+    /// capability re-observed on one exact fingerprint, so it is narrow evidence
+    /// and may clear exactly that narrow restriction and nothing wider. Clearing
+    /// a *scope-wide* invalidation because one skill re-qualified would be
+    /// promoting a narrow fact to a broad consequence — the forbidden direction.
+    ///
+    /// The converse is not available either: a sibling capability's independent
+    /// restriction must not keep a genuinely re-observed capability blocked
+    /// forever, and `apply_scope_change` applies a change per record rather than
+    /// to a scope as a whole. `ScopeInvalidationSet` is therefore the only key
+    /// that satisfies both halves — no promotion upward, no capture downward.
     fn clear_invalidation_by_requalification(
         &mut self,
         record: &CapabilityEvidenceRecord,
@@ -982,9 +1000,10 @@ impl CapabilityRegistry {
         {
             return;
         }
-        // Cleared for this `(skill_id, scope_fingerprint)` key only. The
-        // invalidation is per-record-identity, so a sibling capability's
-        // invalidation on the same fingerprint is untouched.
+        // Cleared for this `(skill_id, scope_fingerprint)` key only. Narrow
+        // evidence, narrow consequence: a sibling capability's invalidation on
+        // the same fingerprint is untouched (see this method's doc for the I3.4
+        // degradation-scope rule that fixes this direction).
         if let Some(skills) = self.invalidated_scopes.get_mut(&record.scope_fingerprint) {
             skills.remove(&record.skill_id);
             if skills.is_empty() {
