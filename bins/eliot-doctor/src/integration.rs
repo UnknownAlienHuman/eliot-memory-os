@@ -501,7 +501,6 @@ pub fn verify_profile(
     // The record's own installation status is reported beside the evidence,
     // never in place of it, and it gates `installed` on its own.
     report.installation = loaded.install_status.clone();
-    let install_completed = loaded.install_status.as_ref().is_some_and(|status| status.completed);
     // Authority cap, scoped to the axes this front door cannot observe.
     // File hashes come from real readback above. Registrations and hook
     // events have no observation port, so any expectation naming them stays
@@ -512,9 +511,21 @@ pub fn verify_profile(
     report.live = false;
     let static_unverifiable =
         !expected.expected_registrations.is_empty() || !expected.expected_hook_events.is_empty();
-    if static_unverifiable || !report.file_hash_ok {
+    // An install that the delivery itself recorded as not completed is not an
+    // installation, whatever the bytes on disk happen to say. The receipt's
+    // `completed` is the delivery's own claim about the install, and it
+    // withholds `installed` on its own: a receipt recording a not-attempted,
+    // failed, or incomplete install cannot be reported as installed, because
+    // matching target bytes are evidence about files, not about an install
+    // having run. No disposition is invented for this — an install the record
+    // says did not complete is `NOT_INSTALLED`, which is exactly what it is.
+    let install_not_completed = loaded
+        .install_status
+        .as_ref()
+        .is_some_and(|status| !status.completed);
+    if install_not_completed || static_unverifiable || !report.file_hash_ok {
         report.installed = false;
-        if report.file_hash_ok {
+        if report.file_hash_ok && !install_not_completed {
             "UNVERIFIED_PLAN_GAP".clone_into(&mut report.disposition);
         } else {
             "NOT_INSTALLED".clone_into(&mut report.disposition);
