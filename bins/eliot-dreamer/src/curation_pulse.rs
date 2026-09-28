@@ -207,6 +207,33 @@ pub struct CurationProductPulse {
     pub package_proof_ceiling: String,
 }
 
+/// Whether the routed candidate set is the same operation the screen binding
+/// and the admitted batch describe, field for field.
+///
+/// A rehashed or foreign set fails here instead of being narrated into a
+/// receipt: the receipt's whole value is that its denials, findings and
+/// promoted candidates belong to exactly the screened operation.
+fn echoes_binding(
+    set: &CurationCandidateSet,
+    screen: &ScreenBinding,
+    batch: &ValidatedCurationBatch,
+) -> bool {
+    set.screen_result_digest == screen.result_digest
+        && set.screen_item_digest == screen.item_digest
+        && set.request_id == screen.request_id.as_str()
+        && set.task_id == screen.task_id
+        && set.scope_id == screen.scope_id
+        && set.state_fence == screen.state_fence
+        && set.state_fence == batch.state_fence
+        && set.request_id == batch.request_id
+        && set.scope_id == batch.scope_id
+        && set.task_id == batch.task_id
+        && set.attempt == batch.attempt
+        && set.denominator.expected_total == batch.denominator.expected_total
+        && set.denominator.members == batch.denominator.members
+        && set.denominator.mode == batch.denominator.mode
+}
+
 /// Composes the Curation Product Pulse for one completed admitted Curation run.
 ///
 /// Binds the receipt to the operation by CONTENT, never by a second copy of a
@@ -254,21 +281,7 @@ pub(crate) fn compose_curation_pulse(
 
     // The routed set must echo the same operation the binding and the batch
     // describe; a rehashed or foreign set refuses instead of being narrated.
-    if set.screen_result_digest != screen.result_digest
-        || set.screen_item_digest != screen.item_digest
-        || set.request_id != screen.request_id.as_str()
-        || set.task_id != screen.task_id
-        || set.scope_id != screen.scope_id
-        || set.state_fence != screen.state_fence
-        || set.state_fence != batch.state_fence
-        || set.request_id != batch.request_id
-        || set.scope_id != batch.scope_id
-        || set.task_id != batch.task_id
-        || set.attempt != batch.attempt
-        || set.denominator.expected_total != batch.denominator.expected_total
-        || set.denominator.members != batch.denominator.members
-        || set.denominator.mode != batch.denominator.mode
-    {
+    if !echoes_binding(set, screen, batch) {
         return Err(refused());
     }
 
