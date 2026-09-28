@@ -17262,20 +17262,47 @@ impl RedbRecoveryStore {
                             reason: "recovery evidence axes are immutable".to_owned(),
                         });
                     }
-                    if !existing
-                        .activation
-                        .permits_transition_to(projection.activation)
-                    {
-                        return Err(OrsError::InvalidField {
-                            field: "stream_recovery_activation",
-                            reason: "durable activation transition is not permitted",
-                        });
+                    if existing.activation == projection.activation {
+                        // Same durable activation under unchanged evidence axes:
+                        // this is an observation advance, not a lifecycle
+                        // transition (issue #269). Exact replay of the same
+                        // evidence under a later observation timestamp returns
+                        // the retained row without attempting an activation
+                        // transition; a fresh availability/reconciliation
+                        // observation advances only those explicitly mutable
+                        // fields. The original source-observation timestamp is
+                        // preserved (I14.26 never merges by timestamp),
+                        // activation can never move on this path, and changed
+                        // evidence under this key is still a conflict above.
+                        let mut merged = existing.clone();
+                        merged.availability = projection.availability;
+                        merged.reconciliation = projection.reconciliation.clone();
+                        merged.validate()?;
+                        if merged == existing {
+                            ProcessStreamRecoveryWriteOutcome::Unchanged
+                        } else {
+                            let payload = encode(&merged)?;
+                            table
+                                .insert(key.as_str(), payload.as_str())
+                                .map_err(storage)?;
+                            ProcessStreamRecoveryWriteOutcome::Advanced
+                        }
+                    } else {
+                        if !existing
+                            .activation
+                            .permits_transition_to(projection.activation)
+                        {
+                            return Err(OrsError::InvalidField {
+                                field: "stream_recovery_activation",
+                                reason: "durable activation transition is not permitted",
+                            });
+                        }
+                        let payload = encode(projection)?;
+                        table
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                        ProcessStreamRecoveryWriteOutcome::Advanced
                     }
-                    let payload = encode(projection)?;
-                    table
-                        .insert(key.as_str(), payload.as_str())
-                        .map_err(storage)?;
-                    ProcessStreamRecoveryWriteOutcome::Advanced
                 }
                 None => {
                     let payload = encode(projection)?;
