@@ -211,9 +211,24 @@ impl ScreenedValue {
     }
 }
 
+/// Screens one daemon field through the shared `OperationalLog` scrubber.
+///
+/// The screened, judged and emitted strings are one and the same canonical
+/// value: the input trimmed exactly as the compatibility sanitizers trim it
+/// ([`sanitize_identity`] and [`sanitize_detail`] both judge the trimmed
+/// string). The shared scrubber ([`scrub_labels_for_emit`]), the local marker
+/// check ([`local_redaction_reason`]), the compatibility sanitizer, the
+/// fail-closed handle-shape check ([`ScrubbedLabels::is_clean`]) and the
+/// emitted string all observe this canonical value, so a whitespace-only
+/// difference can never screen one string and emit another (issue #1842,
+/// AUDIT-1): a recognisable secret with surrounding whitespace is recognised
+/// by the scrubber too, so it is minted a handle with a redaction status
+/// instead of the bare [`REDACTED`] literal; a handle-shaped value with no
+/// recorded handle fails closed through the existing `is_clean` arm.
 fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> ScreenedValue {
+    let canonical = value.trim().to_owned();
     let mut candidate = BTreeMap::new();
-    candidate.insert(key.to_owned(), value.to_owned());
+    candidate.insert(key.to_owned(), canonical.clone());
     let scrubbed = scrub_labels_for_emit(TelemetryFieldFamily::OperationalLog, &candidate);
 
     if let Some(handle) = scrubbed.handles.first() {
@@ -223,27 +238,31 @@ fn screen_value(key: &str, value: &str, sanitize: fn(&str) -> String) -> Screene
                 redaction: Some(handle.clone()),
             };
         }
-        return screened_handle(key, value, RedactionReason::HandleOnly);
+        return screened_handle(key, &canonical, RedactionReason::HandleOnly);
     }
 
-    if let Some(reason) = local_redaction_reason(value) {
-        let handle =
-            field_policy::mint_handle(TelemetryFieldFamily::OperationalLog, key, value, reason);
+    if let Some(reason) = local_redaction_reason(&canonical) {
+        let handle = field_policy::mint_handle(
+            TelemetryFieldFamily::OperationalLog,
+            key,
+            &canonical,
+            reason,
+        );
         return ScreenedValue {
             value: handle.handle.clone(),
             redaction: Some(handle),
         };
     }
 
-    let Some(scrubbed_value) = scrubbed.labels.get(key) else {
+    if !scrubbed.labels.contains_key(key) {
         return ScreenedValue::unavailable();
-    };
-    let sanitized = sanitize(scrubbed_value);
+    }
+    let sanitized = sanitize(&canonical);
     if sanitized == UNAVAILABLE {
         return ScreenedValue::unavailable();
     }
-    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) && sanitized == value {
-        return screened_handle(key, value, RedactionReason::HandleOnly);
+    if !scrubbed.is_clean(TelemetryFieldFamily::OperationalLog) && sanitized == canonical {
+        return screened_handle(key, &canonical, RedactionReason::HandleOnly);
     }
     ScreenedValue {
         value: sanitized,
