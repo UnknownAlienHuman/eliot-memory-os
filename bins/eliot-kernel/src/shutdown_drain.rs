@@ -54,7 +54,16 @@ pub(crate) const DRAIN_RECEIPT_DEADLINE: Duration = Duration::from_secs(5);
 /// distinguishes an intentional stop (terminal persisted) from an interrupted
 /// drain (requested without terminal; pending retained).
 const DRAIN_STATE_FILE: &str = "kernel-shutdown-drain.json";
-const DRAIN_STATE_VERSION: u32 = 2;
+/// This file lives in the user's work root and outlives a build, so its
+/// version is not a migration boundary but a compatibility boundary: it may
+/// only advance when the on-disk shape stops being readable by the previous
+/// version. `DrainCommitDecision::activation_generation_fenced` is optional
+/// and `#[serde(default)]`, so the shape stayed backward compatible and the
+/// version did not move. Refusing an older version instead would not be a
+/// safe refusal here — `coordinator_for` does not cache a load failure, so one
+/// unrecognized file would make the Kernel permanently unusable for that work
+/// root, with no path back but a hand-deleted file.
+const DRAIN_STATE_VERSION: u32 = 1;
 
 /// Poll interval for the bounded receipt-reconciliation wait.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -219,12 +228,26 @@ impl ShutdownTerminal {
 /// lineage-plus-sequence domain [`SupervisionJournalEpoch`] defines for the
 /// activation generation the request carries, and it is the value
 /// [`ShutdownDrainCoordinator::classify_wake`] compares against.
+///
+/// That value is `Option` and `#[serde(default)]` so the durable format stayed
+/// backward compatible and `DRAIN_STATE_VERSION` did not have to move: a
+/// committed state written by a build that predates the field decodes here as
+/// `None`, meaning "this commit recorded no fenced activation generation"
+/// rather than "any generation is fenced". `classify_wake` reads that `None`
+/// fail-closed — it can never satisfy the equality that yields
+/// `RejectStale`, so such a commit resolves to `QueueNextGeneration` and the
+/// old authority is still fenced through `fences_old_authority`. Refusing the
+/// whole file as an unsupported version instead would be the one genuinely
+/// unsafe option: the file survives the upgrade, `coordinator_for` does not
+/// cache its load failure, and the Kernel would be unusable for that work root
+/// until someone hand-deleted it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DrainCommitDecision {
     pub(crate) generation: String,
     pub(crate) lease_and_pending_snapshot: Vec<String>,
     pub(crate) authority_epochs_fenced: Vec<String>,
-    pub(crate) activation_generation_fenced: SupervisionJournalEpoch,
+    #[serde(default)]
+    pub(crate) activation_generation_fenced: Option<SupervisionJournalEpoch>,
     pub(crate) branches_to_stop: Vec<String>,
     pub(crate) wake_disposition: DrainWakeDisposition,
     pub(crate) irreversible_stage: String,
@@ -1083,6 +1106,18 @@ impl ShutdownDrainCoordinator {
     /// activation generation means the caller is establishing a *new*
     /// authority, so it is queued rather than rejected and no legitimate
     /// new-generation activation is refused.
+    ///
+    /// A committed state whose `activation_generation_fenced` is `None` — a
+    /// state persisted by a build that predates the field — is a commit that
+    /// named no fenced generation, not one that fenced every generation. It
+    /// therefore cannot reach `RejectStale`: the equality below requires a
+    /// recorded value to compare against, so the arms match only on
+    /// `Some(..) == Some(..)`, and this case falls to `QueueNextGeneration`.
+    /// That is fail-closed — both post-linearization dispositions refuse the
+    /// old authority through
+    /// [`DrainWakeDisposition::fences_old_authority`] — so a pre-field commit
+    /// still never admits the authority it linearized against, and it never
+    /// has to be migrated, quarantined, or repaired to be safe.
     pub(crate) fn classify_wake(
         &self,
         presented_activation_generation: Option<&SupervisionJournalEpoch>,
@@ -1092,12 +1127,17 @@ impl ShutdownDrainCoordinator {
             return Ok(DrainWakeDisposition::Proceed);
         }
         if let Some(committed) = state.committed.as_ref() {
-            return Ok(match presented_activation_generation {
-                Some(presented) if *presented == committed.activation_generation_fenced => {
-                    DrainWakeDisposition::RejectStale
-                }
-                _ => DrainWakeDisposition::QueueNextGeneration,
-            });
+            return Ok(
+                match (
+                    presented_activation_generation,
+                    committed.activation_generation_fenced.as_ref(),
+                ) {
+                    (Some(presented), Some(fenced)) if presented == fenced => {
+                        DrainWakeDisposition::RejectStale
+                    }
+                    _ => DrainWakeDisposition::QueueNextGeneration,
+                },
+            );
         }
         if state.terminal.is_some() {
             return Ok(DrainWakeDisposition::QueueNextGeneration);
@@ -1289,7 +1329,7 @@ mod shutdown_drain_tests {
             generation: generation.to_owned(),
             lease_and_pending_snapshot: Vec::new(),
             authority_epochs_fenced: vec!["authority-epoch:1".to_owned()],
-            activation_generation_fenced: test_activation_generation(),
+            activation_generation_fenced: Some(test_activation_generation()),
             branches_to_stop: vec!["daemon".to_owned(), "store-bridge".to_owned()],
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),

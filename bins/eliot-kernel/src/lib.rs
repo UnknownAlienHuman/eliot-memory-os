@@ -4546,7 +4546,7 @@ impl KernelComposition {
             // values that genuinely mean the same generation instead of
             // comparing a wire identity against this process's local
             // `drain_generation` correlation id.
-            activation_generation_fenced: revalidated.activation_generation,
+            activation_generation_fenced: Some(revalidated.activation_generation),
             branches_to_stop: quiescence,
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),
