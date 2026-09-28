@@ -3194,11 +3194,14 @@ impl DaemonComposition {
         .map_err(DaemonError::from)?
         {
             task_binding_admission::TaskSelectionDisposition::Absent => {
-                let intake = GovernorComposition::task_selection_intake_shape(
-                    receipt.scope.scope_ref.as_str(),
-                )
-                .map_err(DaemonError::Composition)?;
-                Ok(task_binding_admission::TaskSelectionResponse::Absent(intake))
+                let intake =
+                    GovernorComposition::<dyn KernelGenerationPort>::task_selection_intake_shape(
+                        receipt.scope.scope_ref.as_str(),
+                    )
+                    .map_err(DaemonError::Composition)?;
+                Ok(task_binding_admission::TaskSelectionResponse::Absent(
+                    Box::new(intake),
+                ))
             }
             task_binding_admission::TaskSelectionDisposition::Exploratory {
                 task_ref,
@@ -3209,11 +3212,9 @@ impl DaemonComposition {
                 task_revision,
                 acceptance_digest,
             }),
-            task_binding_admission::TaskSelectionDisposition::Ambiguous(candidate_handles) => {
-                Ok(task_binding_admission::TaskSelectionResponse::Ambiguous(
-                    candidate_handles,
-                ))
-            }
+            task_binding_admission::TaskSelectionDisposition::Ambiguous(candidate_handles) => Ok(
+                task_binding_admission::TaskSelectionResponse::Ambiguous(candidate_handles),
+            ),
             task_binding_admission::TaskSelectionDisposition::Stale {
                 task_ref,
                 task_revision,
@@ -3221,9 +3222,9 @@ impl DaemonComposition {
                 task_ref,
                 task_revision,
             }),
-            task_binding_admission::TaskSelectionDisposition::Current(evidence) => {
-                Ok(task_binding_admission::TaskSelectionResponse::Current(evidence))
-            }
+            task_binding_admission::TaskSelectionDisposition::Current(evidence) => Ok(
+                task_binding_admission::TaskSelectionResponse::Current(evidence),
+            ),
         }
     }
 

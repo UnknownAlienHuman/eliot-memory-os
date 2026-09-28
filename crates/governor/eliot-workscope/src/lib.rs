@@ -1141,10 +1141,7 @@ impl OnboardingReadinessReceipt {
         text(&self.lease_ref, "lease_ref")?;
         text(&self.principal_ref, "principal_ref")?;
         text(&self.session_ref, "session_ref")?;
-        counter(
-            self.scope_descriptor_revision,
-            "scope_descriptor_revision",
-        )?;
+        counter(self.scope_descriptor_revision, "scope_descriptor_revision")?;
         text(&self.governing_source_set_ref, "governing_source_set_ref")?;
         counter(
             self.governing_source_generation,

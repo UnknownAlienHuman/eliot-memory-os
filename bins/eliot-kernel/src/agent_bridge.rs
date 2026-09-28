@@ -1882,13 +1882,8 @@ impl KernelComposition {
         // Retain the exact Resolved task/scope binding for later dispatch
         // continuity (issue #1746); fails closed here, before any retained
         // state is mutated.
-        let activated_binding = Self::activated_application_binding(
-            binding,
-            pending,
-            result,
-            &receipt,
-            connection_id,
-        )?;
+        let activated_binding =
+            Self::activated_application_binding(binding, pending, result, &receipt, connection_id)?;
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.

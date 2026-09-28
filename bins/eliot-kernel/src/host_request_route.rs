@@ -621,10 +621,7 @@ impl KernelComposition {
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
-        self.host_request_application_binding_gate_under_transition(
-            envelope,
-            task_relative_tool,
-        )?;
+        self.host_request_application_binding_gate_under_transition(envelope, task_relative_tool)?;
         if matches!(
             envelope.kind,
             HostRequestKind::Cancellation
@@ -680,23 +677,7 @@ impl KernelComposition {
                 .admit_host_request(envelope, &descriptor, &binding, resolution.as_ref())
                 .map_err(|_| TransportError::SessionFenced)?
         };
-        let identity_bindings = host_request_identity_binding_records(&requested)?;
-        let stored = self
-            .generation_gateway
-            .ors
-            .resolve_or_stage_host_request_with_identity_bindings(&requested, &identity_bindings)
-            .map_err(|error| match error {
-                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
-                OrsError::HostRequestLegacyCorrelationUnresolved => {
-                    TransportError::LegacyCorrelationUnresolved
-                }
-                // A full logical index sheds fresh stages with typed
-                // backpressure (issue #2571): the agent-facing caller waits
-                // and resubmits the exact bytes instead of observing a stale
-                // fence or a fresh absence.
-                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
-                _ => TransportError::SessionFenced,
-            })?;
+        let stored = self.stage_host_request_record(&requested)?;
 
         // An elapsed absolute deadline is staged honestly, then closed as
         // expired instead of admitted. The caller observes a timeout; the
@@ -776,6 +757,26 @@ impl KernelComposition {
         if envelope.kind == HostRequestKind::Cancellation {
             self.audit_observe(AuditEventDraft::cancel_requested(envelope, admitted));
         }
+    }
+
+    fn stage_host_request_record(
+        &self,
+        requested: &HostRequestRecord,
+    ) -> Result<HostRequestRecord, TransportError> {
+        let identity_bindings = host_request_identity_binding_records(requested)?;
+        self.generation_gateway
+            .ors
+            .resolve_or_stage_host_request_with_identity_bindings(requested, &identity_bindings)
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                OrsError::HostRequestLegacyCorrelationUnresolved => {
+                    TransportError::LegacyCorrelationUnresolved
+                }
+                // A full logical index sheds fresh stages with typed
+                // backpressure (issue #2571): callers resubmit exact bytes.
+                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
+                _ => TransportError::SessionFenced,
+            })
     }
 
     /// Admits one Watchdog spool intent batch through the fenced named Kernel
@@ -1605,7 +1606,7 @@ impl KernelComposition {
                     && retained.resolved_binding.task_id == retained.task_id
                     && retained.resolved_binding.work_scope_id == retained.work_scope_id
                     && retained.resolved_binding.task_revision
-                        == retained.task_revision.to_string()
+                        == retained.task_revision.value().to_string()
                     && record
                         .result
                         .ticket_state_fence
@@ -1654,14 +1655,10 @@ impl KernelComposition {
         {
             return false;
         }
-        let Ok(Some(retained_result)) = self
-            .generation_gateway
-            .ors
-            .load_activation_result(
-                &retained.activation_ticket_id,
-                &retained.resolution_result_sha256,
-            )
-        else {
+        let Ok(Some(retained_result)) = self.generation_gateway.ors.load_activation_result(
+            &retained.activation_ticket_id,
+            &retained.resolution_result_sha256,
+        ) else {
             return false;
         };
         if retained_result.phase != eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
@@ -1733,7 +1730,9 @@ impl KernelComposition {
         let Ok(digest) = self.p07_owner_digest.lock() else {
             return false;
         };
-        owner.as_ref().map(|bound| bound.bound_revision())
+        owner
+            .as_ref()
+            .map(eliot_kernel_core::BoundCanonicalOwner::bound_revision)
             == Some(retained.kernel_owner_revision)
             && digest.as_deref() == Some(retained.kernel_owner_bundle_sha256.as_str())
     }
@@ -1769,7 +1768,7 @@ impl KernelComposition {
     /// the explicitly safe Invocation capabilities may omit task fields after
     /// a `Resolved` activation. A principal is never taken from the envelope
     /// — there is none — and the bridge peer identity is never substituted for
-    /// the activation-resolved principal. There is no preselection HostRequest
+    /// the activation-resolved principal. There is no preselection `HostRequest`
     /// route when activation returns `TaskSelectionRequired`.
     fn host_request_application_binding_gate_under_transition(
         &self,
@@ -1826,42 +1825,7 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        let claimed_session = retained.session_id.as_str();
-        let session_claimed = envelope.identity.session_id.is_some();
-        if envelope.kind == HostRequestKind::Invocation || session_claimed {
-            let now = unix_ms();
-            let sessions = self
-                .agent_application_sessions
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let live = sessions.get(claimed_session).is_some_and(|session| {
-                session.session_id() == retained.session_id
-                    && !session.state().is_terminal()
-                    && (envelope.kind != HostRequestKind::Invocation
-                        || session.state() == eliot_ipc::ApplicationSessionState::Active)
-                    && session
-                        .authority_epoch()
-                        .is_same_authority(&envelope.state_fence.authority_epoch)
-                    && session
-                        .transport_bindings()
-                        .iter()
-                        .any(|binding| binding.binding_id == envelope.connection_id)
-                    && session
-                        .bound_leases()
-                        .values()
-                        // Activation creates no session-bound capability
-                        // leases. This rejects expired/revoked records when
-                        // present; per-capability grants remain #1745.
-                        .all(|lease| {
-                            !lease.revoked
-                                && lease.issued_at_unix_ms <= now
-                                && now < lease.expires_at_unix_ms
-                        })
-            });
-            if !live {
-                return Err(TransportError::SessionFenced);
-            }
-        }
+        self.validate_host_request_application_session(envelope, &retained)?;
         if let Some(claimed) = envelope.identity.task_id.as_deref()
             && claimed != retained.task_id
         {
@@ -1909,6 +1873,52 @@ impl KernelComposition {
             }
         }
         Ok(())
+    }
+
+    fn validate_host_request_application_session(
+        &self,
+        envelope: &HostRequestEnvelope,
+        retained: &super::ActivatedApplicationBinding,
+    ) -> Result<(), TransportError> {
+        if envelope.kind != HostRequestKind::Invocation && envelope.identity.session_id.is_none() {
+            return Ok(());
+        }
+        let now = unix_ms();
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let live = sessions
+            .get(retained.session_id.as_str())
+            .is_some_and(|session| {
+                session.session_id() == retained.session_id
+                    && !session.state().is_terminal()
+                    && (envelope.kind != HostRequestKind::Invocation
+                        || session.state() == eliot_ipc::ApplicationSessionState::Active)
+                    && session
+                        .authority_epoch()
+                        .is_same_authority(&envelope.state_fence.authority_epoch)
+                    && session
+                        .transport_bindings()
+                        .iter()
+                        .any(|binding| binding.binding_id == envelope.connection_id)
+                    && session
+                        .bound_leases()
+                        .values()
+                        // Activation creates no session-bound capability
+                        // leases. This rejects expired/revoked records when
+                        // present; per-capability grants remain #1745.
+                        .all(|lease| {
+                            !lease.revoked
+                                && lease.issued_at_unix_ms <= now
+                                && now < lease.expires_at_unix_ms
+                        })
+            });
+        if live {
+            Ok(())
+        } else {
+            Err(TransportError::SessionFenced)
+        }
     }
 
     /// Applies the service-state rule that mirrors the admission gate: full
@@ -1983,11 +1993,7 @@ impl KernelComposition {
         retained: &super::ActivatedApplicationBinding,
         pending: &super::AgentActivationPendingState,
     ) -> Result<(), TransportError> {
-        if !self.activation_result_still_retained(
-            pending,
-            retained,
-            &envelope.connection_id,
-        ) {
+        if !self.activation_result_still_retained(pending, retained, &envelope.connection_id) {
             return Err(TransportError::SessionFenced);
         }
         if envelope
@@ -2007,18 +2013,15 @@ impl KernelComposition {
         if !same_application_owner {
             return Err(host_request_parent_owner_mismatch(envelope));
         }
-        if envelope
+        if envelope.identity.task_id.as_deref().is_some_and(|claimed| {
+            parent.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+        }) || envelope
             .identity
-            .task_id
+            .work_scope_id
             .as_deref()
-            .is_some_and(|claimed| parent.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed))
-            || envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .is_some_and(|claimed| {
-                    parent.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
-                })
+            .is_some_and(|claimed| {
+                parent.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+            })
         {
             return Err(host_request_parent_owner_mismatch(envelope));
         }
@@ -2045,12 +2048,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_host_request_parent_generation(envelope, &parent, descriptor)?;
-        self.require_host_request_parent_owner(
-            envelope,
-            &parent,
-            &retained,
-            &admission_owner,
-        )
+        self.require_host_request_parent_owner(envelope, &parent, &retained, &admission_owner)
     }
 
     /// Verifies descriptor, candidate, and generation continuity without
@@ -2195,12 +2193,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_host_request_parent_generation(envelope, &parent, descriptor)?;
-        self.require_host_request_parent_owner(
-            envelope,
-            &parent,
-            &retained,
-            &admission_owner,
-        )?;
+        self.require_host_request_parent_owner(envelope, &parent, &retained, &admission_owner)?;
         let settled = self
             .generation_gateway
             .ors
@@ -2251,12 +2244,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_host_request_parent_generation(envelope, &parent, descriptor)?;
-        self.require_host_request_parent_owner(
-            envelope,
-            &parent,
-            &retained,
-            &admission_owner,
-        )
+        self.require_host_request_parent_owner(envelope, &parent, &retained, &admission_owner)
     }
 
     /// Moves an `Unknown` parent of a Reconciliation envelope to `Reconciling`.
@@ -2281,12 +2269,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_host_request_parent_generation(envelope, &parent, descriptor)?;
-        self.require_host_request_parent_owner(
-            envelope,
-            &parent,
-            &retained,
-            &admission_owner,
-        )?;
+        self.require_host_request_parent_owner(envelope, &parent, &retained, &admission_owner)?;
         if parent.state == HostRequestState::Unknown {
             let _ = self.generation_gateway.ors.advance_host_request(
                 &parent_operation,
@@ -2534,15 +2517,9 @@ impl KernelComposition {
         };
         let task_relative = envelope.kind == HostRequestKind::Invocation
             && (task_relative_tool
-                || host_request_capability_is_task_relative(
-                    envelope.identity.capability.as_str(),
-                ));
+                || host_request_capability_is_task_relative(envelope.identity.capability.as_str()));
         let session_id = if let Some(retained) = retained.as_ref() {
-            if !self.activation_result_still_retained(
-                pending,
-                retained,
-                &envelope.connection_id,
-            ) {
+            if !self.activation_result_still_retained(pending, retained, &envelope.connection_id) {
                 return Ok(false);
             }
             if envelope
@@ -2628,14 +2605,11 @@ impl KernelComposition {
                     .transport_bindings()
                     .iter()
                     .any(|binding| binding.binding_id == envelope.connection_id)
-                && session
-                    .bound_leases()
-                    .values()
-                    .all(|lease| {
-                        !lease.revoked
-                            && lease.issued_at_unix_ms <= now
-                            && now < lease.expires_at_unix_ms
-                    })
+                && session.bound_leases().values().all(|lease| {
+                    !lease.revoked
+                        && lease.issued_at_unix_ms <= now
+                        && now < lease.expires_at_unix_ms
+                })
         }))
     }
 
@@ -2838,28 +2812,45 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.live_local_read_attempt_under_transition(operation_id, request_digest)
+        self.live_local_read_attempt_under_transition(
+            operation_id,
+            request_digest,
+            &admission_owner,
+        )
     }
 
     fn live_local_read_attempt_under_transition(
         &self,
         operation_id: &str,
         request_digest: &str,
+        pending: &super::AgentActivationPendingState,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
-        let index = self
-            .host_request_connection_index
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Ok(index
-            .values()
-            .flatten()
-            .find(|candidate| {
-                candidate.operation_id == operation_id
-                    && candidate.request_digest == request_digest
-                    && candidate.local_read_envelope.is_some()
-            })
-            .map(|candidate| candidate.local_read_attempt.clone())
-            .filter(LocalReadAttemptState::is_live))
+        let candidate = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == request_digest
+                        && candidate.local_read_envelope.is_some()
+                })
+                .cloned()
+        };
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let Some(envelope) = candidate.local_read_envelope.as_ref() else {
+            return Ok(None);
+        };
+        if !self.application_binding_live_for_claim(envelope, pending, false)? {
+            return Ok(None);
+        }
+        let attempt = candidate.local_read_attempt.clone();
+        Ok(attempt.is_live().then_some(attempt))
     }
 
     /// Retires one queued local-read pair without failing.
@@ -3022,7 +3013,7 @@ impl KernelComposition {
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -3103,6 +3094,7 @@ impl KernelComposition {
             DaemonReadQueue::LocalRead => self.live_local_read_attempt_under_transition(
                 &body.operation_id,
                 &body.request_sha256,
+                &admission_owner,
             )?,
             DaemonReadQueue::CampaignPacket => self.live_campaign_packet_attempt_under_transition(
                 &body.operation_id,
@@ -3407,7 +3399,7 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 ///   the Watchdog intent route is a parentless observation submission; and
 /// - every other capability, including an unclassified future name, remains
 ///   task-relative until an explicit safe classification exists. The current
-///   HostRequest route does not provide preselection access when activation
+///   `HostRequest` route does not provide preselection access when activation
 ///   returns `TaskSelectionRequired`.
 fn host_request_capability_is_task_relative(capability: &str) -> bool {
     !matches!(
@@ -3585,11 +3577,10 @@ impl KernelComposition {
                         | HostRequestState::Reconciling
                 )
         }) {
-            let admitted = self
-                .admit_host_request_envelope_with_tool_binding_under_transition(
-                    envelope,
-                    task_relative_tool,
-                )?;
+            let admitted = self.admit_host_request_envelope_with_tool_binding_under_transition(
+                envelope,
+                task_relative_tool,
+            )?;
             self.remove_observe_pair_if_not_executable(
                 admitted.1.operation_id.as_str(),
                 &envelope.envelope_sha256,
@@ -3601,12 +3592,10 @@ impl KernelComposition {
         let operation_id = operation.as_str().to_owned();
         let reservation = self.reserve_observe_queue_slot(envelope, &operation_id)?;
 
-        let admitted = match self
-            .admit_host_request_envelope_with_tool_binding_under_transition(
-                envelope,
-                task_relative_tool,
-            )
-        {
+        let admitted = match self.admit_host_request_envelope_with_tool_binding_under_transition(
+            envelope,
+            task_relative_tool,
+        ) {
             Ok(admitted) => admitted,
             Err(error) => {
                 if let ObserveQueueReservation::Reserved {

@@ -858,7 +858,7 @@ fn bounded_list(values: &[String], field: &'static str, max: usize) -> Result<()
     Ok(())
 }
 
-/// Checks the two GovernanceProfile authorization axes against the derivation
+/// Checks the two `GovernanceProfile` authorization axes against the derivation
 /// contract. Freshness inputs remain owner-supplied fields in the typed
 /// profile; this consistency check does not authenticate their origin.
 fn validate_governance_axes(
@@ -897,8 +897,7 @@ fn validate_governance(governance: &GovernanceEvidence) -> Result<(), BootstrapE
     })?;
     let profile = &governance.governance_profile;
     let coverage = &governance.coverage_profile;
-    if governance.profile_ref != coverage.fingerprint
-        || profile.fingerprint != coverage.fingerprint
+    if governance.profile_ref != coverage.fingerprint || profile.fingerprint != coverage.fingerprint
     {
         return Err(BootstrapError::new(
             "GOVERNANCE_FINGERPRINT_MISMATCH",
@@ -937,12 +936,12 @@ fn validate_governance(governance: &GovernanceEvidence) -> Result<(), BootstrapE
         .cloned()
         .collect();
     if governance.limiting_integration_evidence != expected_preview {
-        let code = if governance.limiting_integration_evidence.is_empty() && !coverage.gaps.is_empty()
-        {
-            "GOVERNANCE_EVIDENCE_MISSING"
-        } else {
-            "GOVERNANCE_EVIDENCE_MISMATCH"
-        };
+        let code =
+            if governance.limiting_integration_evidence.is_empty() && !coverage.gaps.is_empty() {
+                "GOVERNANCE_EVIDENCE_MISSING"
+            } else {
+                "GOVERNANCE_EVIDENCE_MISMATCH"
+            };
         return Err(BootstrapError::new(
             code,
             "limiting integration evidence does not preserve the owner coverage gaps",
@@ -1402,7 +1401,7 @@ impl BootstrapSession {
 mod tests {
     use super::*;
     use eliot_integration_coverage::{
-        DispatchOrdering, EventCoverage, GovernorCoverageDerivation, ALL_EVENTS,
+        ALL_EVENTS, DispatchOrdering, EventCoverage, GovernorCoverageDerivation,
     };
 
     fn fixture_governance() -> GovernanceEvidence {

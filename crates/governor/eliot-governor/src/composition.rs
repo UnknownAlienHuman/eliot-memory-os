@@ -49,8 +49,8 @@ use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
-    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
-    fences_match_exact,
+    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
+    sha256_hex,
 };
 use eliot_coordination::{
     ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
@@ -5810,13 +5810,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             let scope = owner
                 .read_current(&live_fence)
                 .map_err(map_activation_scope_error)?;
-            ensure_snapshot_fresh(&scope, "cold-start surface WorkScope is not freshly matched")?;
+            ensure_snapshot_fresh(
+                &scope,
+                "cold-start surface WorkScope is not freshly matched",
+            )?;
             if receipt.scope != scope.binding.scope
                 || receipt.instance.instance_ref != scope.binding.scope.instance_ref
                 || receipt.instance.root_identity != scope.binding.scope.root_identity
                 || receipt.instance.generation != scope.binding.scope.generation
-                || receipt.governing_source_generation
-                    != scope.binding.governing_source_generation
+                || receipt.governing_source_generation != scope.binding.governing_source_generation
             {
                 return Err(CompositionError::ActivationStaleFence);
             }

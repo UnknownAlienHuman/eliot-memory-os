@@ -145,8 +145,8 @@ use std::path::{Path, PathBuf};
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
-    CanonicalWriteEnvelope, GoverningSourceSet, PrivacyProfile, ScopeBinding,
-    WorkScopeDescriptor, derive_observed_resources,
+    CanonicalWriteEnvelope, GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeDescriptor,
+    derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
@@ -310,7 +310,7 @@ pub enum TaskSelectionDisposition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSelectionResponse {
     /// No current selection; caller can answer with this scope's intake shape.
-    Absent(eliot_workscope::TaskSelectionRequired),
+    Absent(Box<eliot_workscope::TaskSelectionRequired>),
     /// Exploratory binding stays explicitly read-only, not material task work.
     Exploratory {
         task_ref: String,
@@ -324,7 +324,7 @@ pub enum TaskSelectionResponse {
         task_ref: String,
         task_revision: u64,
     },
-    /// One exact current TaskContract revision with its owner evidence.
+    /// One exact current `TaskContract` revision with its owner evidence.
     Current(TaskSelectionEvidence),
 }
 
@@ -468,7 +468,7 @@ pub fn admit_task_bound_with_observed_scope(
     expected_fence: &StateFence,
     compatibility: CompatibilityDisposition,
 ) -> Result<(), TaskBindingError> {
-    let Some(evidence) = selection else {
+    if selection.is_none() {
         return admit_task_bound(
             None,
             expected_task_ref,
@@ -476,7 +476,7 @@ pub fn admit_task_bound_with_observed_scope(
             expected_fence,
             compatibility,
         );
-    };
+    }
     let observed_binding = eliot_workscope::observed_scope_binding(
         expected,
         observed,
@@ -541,16 +541,13 @@ pub fn admit_task_bound_with_observed_scope(
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
 /// ambiguity is reported, never resolved. The task-intake owner producer is
 /// absent pending issue #8.
-#[must_use]
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
     match &receipt.task_binding {
-        TaskBindingState::CurrentTaskContract { .. } => Err(
-            TaskBindingError::selection_required(
-                "current task has no owner-proven selection source/evidence",
-            ),
-        ),
+        TaskBindingState::CurrentTaskContract { .. } => Err(TaskBindingError::selection_required(
+            "current task has no owner-proven selection source/evidence",
+        )),
         TaskBindingState::Exploratory {
             task_ref,
             task_revision,
@@ -560,9 +557,9 @@ pub fn resolve_task_selection(
             task_revision: *task_revision,
             acceptance_digest: acceptance_digest.clone(),
         }),
-        TaskBindingState::Ambiguous { candidate_handles } => {
-            Ok(TaskSelectionDisposition::Ambiguous(candidate_handles.clone()))
-        }
+        TaskBindingState::Ambiguous { candidate_handles } => Ok(
+            TaskSelectionDisposition::Ambiguous(candidate_handles.clone()),
+        ),
         TaskBindingState::Stale {
             task_ref,
             task_revision,
@@ -744,9 +741,11 @@ pub fn admit_canonical_write(
         || carries(NamedMutationOperation::RecordFinishEvidence);
     let selection_resolution = resolve_task_selection(receipt);
     let (selection, candidate_count) = match selection_resolution {
-        Ok(TaskSelectionDisposition::Absent)
-        | Ok(TaskSelectionDisposition::Exploratory { .. })
-        | Ok(TaskSelectionDisposition::Stale { .. }) => (None, 0_usize),
+        Ok(
+            TaskSelectionDisposition::Absent
+            | TaskSelectionDisposition::Exploratory { .. }
+            | TaskSelectionDisposition::Stale { .. },
+        ) => (None, 0_usize),
         Ok(TaskSelectionDisposition::Ambiguous(candidate_handles)) => {
             (None, candidate_handles.len())
         }
@@ -766,7 +765,7 @@ pub fn admit_canonical_write(
         return match admit_capture(
             candidate_id,
             context.state_fence.clone(),
-            selection,
+            selection.as_ref(),
             candidate_count,
             compatibility,
         )? {
@@ -827,7 +826,7 @@ pub fn admit_canonical_write(
             ));
         }
         admit_task_bound(
-            selection,
+            selection.as_ref(),
             expected_task_ref,
             envelope.scope_id.as_str(),
             write_fence,
