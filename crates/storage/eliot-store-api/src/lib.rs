@@ -863,6 +863,13 @@ pub enum TransitionClass {
     /// maximum store-allowed reversible effect; existing class maxima are
     /// unchanged.
     UserAutomation,
+    /// Canonical instrument-registry snapshot persistence with transition
+    /// revision-head compare-and-set (issue #1814).
+    ///
+    /// The registry owner supplies its versioned snapshot bytes. The store
+    /// only arbitrates the canonical state key and the prepared transition's
+    /// expected revision head; it does not interpret instrument admission.
+    InstrumentRegistry,
 }
 
 impl TransitionClass {
@@ -876,7 +883,8 @@ impl TransitionClass {
             | Self::Erasure
             | Self::NotificationState
             | Self::ReactiveState
-            | Self::UserAutomation => EffectClass::ReversibleMutation,
+            | Self::UserAutomation
+            | Self::InstrumentRegistry => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -3689,6 +3697,10 @@ pub enum NamedReadOperation {
     GetCampaignLearningStateView,
     /// Canonical user-automation read (issue #1779).
     GetUserAutomationState,
+    /// Read the opaque, versioned canonical instrument-registry snapshot
+    /// under the requested state fence (issue #1814). The exact store
+    /// revision is returned in `NamedReadResponse::revision_heads`.
+    GetInstrumentRegistryState,
     /// Canonical experience-bank range read (issue #223).
     ///
     /// Durable same-scope bank-record rows with owner revisions, driven
@@ -3784,6 +3796,11 @@ pub enum NamedMutationOperation {
     /// persists documents verbatim and arbitrates keys and pointers; it
     /// never derives lineage, transitions, or invocation semantics.
     ApplyUserAutomationState,
+    /// Persist the versioned instrument-registry snapshot under the
+    /// prepared transition's revision-head compare-and-set (issue #1814).
+    /// This operation remains known-but-unsupported until store adapters
+    /// provide the canonical handler.
+    ApplyInstrumentRegistryState,
     /// Canonical experience-bank commit (issue #223).
     ///
     /// Durable bank-record persistence only: the prepared transition must
@@ -3838,6 +3855,7 @@ impl NamedMutationOperation {
                 TransitionClass::ReactiveState
             }
             Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
+            Self::ApplyInstrumentRegistryState => TransitionClass::InstrumentRegistry,
         }
     }
 }
@@ -5426,6 +5444,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::NotificationState => "store.apply.notification_state",
         TransitionClass::ReactiveState => "store.apply.reactive_state",
         TransitionClass::UserAutomation => "store.apply.user_automation",
+        TransitionClass::InstrumentRegistry => "store.apply.instrument_registry",
     }
 }
 
