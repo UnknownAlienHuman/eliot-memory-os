@@ -4205,8 +4205,8 @@ impl WindowsInstallationEffectPort {
                     Ok(_) | Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
                 }
             }
-            Ok(HostCredentialControlResponse::Unknown { .. }) => {
-                PortOutcome::Unknown(UnknownReason::Indeterminate)
+            Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
+                PortOutcome::Error(phase_b_unknown_port_error(request, &pending_ref))
             }
             Ok(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
             Err(PortError::Provider(provider)) if provider.retryable => {
@@ -5347,7 +5347,7 @@ impl WindowsInstallationEffectPort {
                 Err(PortError::IdentityConflict)
             }
             HostCredentialControlResponse::Unknown { pending_ref } => {
-                Ok(InstallationEffectObservation::Mismatch { pending_ref })
+                Err(credential_unknown_port_error(request, &pending_ref))
             }
         }
     }
@@ -5483,6 +5483,9 @@ impl WindowsInstallationEffectPort {
                     service_start_disposition: None,
                     service_runtime_lineage: None,
                 })
+            }
+            Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
+                PortOutcome::Error(credential_unknown_port_error(request, &pending_ref))
             }
             Ok(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
             Err(error) => PortOutcome::Error(error),
@@ -6965,6 +6968,425 @@ fn installer_root_unknown_reference(
         });
     }
     PlatformHandle::new(reference)
+}
+
+/// Prefix for a request-correlated credential unknown reference.
+///
+/// Issue #1352 (X1/X2): the per-class extension of the service-registration
+/// unknown scheme to `ProvisionStoreCredential`. The Host mints its unknown
+/// as `credential-control:operation=<operation>:transaction_id=<id>:
+/// effect_id=<id>:request_digest=<digest>:reason=<label>`, which names the
+/// Host cause but carries no initiating
+/// [`InstallationEffectRequest::intent_digest`]. This reference carries that
+/// digest ahead of the verbatim Host cause
+/// (`<host_request_digest>:<operation>:<reason>`), so a post-effect credential
+/// unknown stays reconcilable under its original operation and its cause
+/// survives instead of becoming a known mismatch.
+const CREDENTIAL_UNKNOWN_REFERENCE_PREFIX: &str = "credential-unknown-v1:";
+
+/// The exact Host credential operations a `credential-control` unknown can
+/// name: the `{:?}` vocabulary of `HostCredentialControlOperation`.
+fn is_credential_unknown_operation(value: &str) -> bool {
+    matches!(
+        value,
+        "Inspect"
+            | "Provision"
+            | "Reconcile"
+            | "Delete"
+            | "MaterializePhaseB"
+            | "ReconcilePhaseB"
+            | "FinalizePhaseB"
+    )
+}
+
+/// The exact reason labels the Host credential endpoint can mint: the closed
+/// `unknown(request, "<label>")` producer set of
+/// `bins/eliot-host/src/credential_control.rs`. A label outside it is never
+/// rewritten into a representable reference.
+fn is_credential_unknown_reason(value: &str) -> bool {
+    matches!(
+        value,
+        "phase-b-request-validation"
+            | "phase-b-request-intent"
+            | "phase-b-request-credential-receipt"
+            | "phase-b-queue-lock"
+            | "phase-b-queue-full"
+            | "phase-b-queue-response"
+            | "credential-control-admission"
+            | "phase-b-dispatch"
+            | "credential-host-root"
+            | "credential-marker-absence"
+            | "credential-target-absence"
+            | "credential-preexisting-marker-or-target"
+            | "credential-marker-path"
+            | "credential-inspect-digest"
+            | "credential-marker-mac"
+            | "credential-target-before-marker-read"
+            | "credential-target-without-marker"
+            | "credential-target-without-marker-delete"
+            | "credential-target-before-marker"
+            | "credential-marker-create"
+            | "credential-marker-created-identity"
+            | "credential-marker-flush-readback"
+            | "credential-marker-created-mac"
+            | "credential-reconcile-receipt-binding"
+            | "credential-target-read"
+            | "credential-target-binding"
+            | "credential-reconcile-envelope-digest"
+            | "credential-reconcile-marker-delete"
+            | "credential-final-marker-without-target"
+            | "credential-csprng"
+            | "credential-envelope"
+            | "credential-write-mismatch"
+            | "credential-envelope-digest"
+            | "credential-final-marker"
+            | "credential-final-marker-write"
+            | "credential-response-digest"
+            | "credential-delete-marker"
+            | "credential-delete-marker-mac"
+            | "credential-delete-receipt"
+            | "credential-delete-receipt-binding"
+            | "credential-delete-readback"
+            | "credential-delete-digest"
+    )
+}
+
+/// One Host-minted credential unknown cause, borrowed verbatim.
+struct CredentialHostUnknown<'a> {
+    operation: &'a str,
+    transaction_id: &'a str,
+    effect_id: &'a str,
+    request_digest: &'a str,
+    reason: &'a str,
+}
+
+/// Strictly parses one Host-minted `credential-control` unknown reference.
+///
+/// Fields are cut at their fixed `key=` markers — from the right where a
+/// handle value could itself contain `:` — so a value can never shift the
+/// parse. Anything else is not this operation's Host cause.
+fn parse_credential_host_unknown(value: &str) -> Option<CredentialHostUnknown<'_>> {
+    let rest = value.strip_prefix("credential-control:")?;
+    let (rest, reason) = rest.rsplit_once(':')?;
+    let reason = reason.strip_prefix("reason=")?;
+    let (rest, request_digest) = rest.rsplit_once(':')?;
+    let request_digest = request_digest.strip_prefix("request_digest=")?;
+    let (rest, effect_id) = rest.rsplit_once(':')?;
+    let effect_id = effect_id.strip_prefix("effect_id=")?;
+    let (operation_field, transaction_field) = rest.split_once(':')?;
+    let operation = operation_field.strip_prefix("operation=")?;
+    let transaction_id = transaction_field.strip_prefix("transaction_id=")?;
+    if operation.is_empty()
+        || transaction_id.is_empty()
+        || effect_id.is_empty()
+        || request_digest.is_empty()
+        || reason.is_empty()
+    {
+        return None;
+    }
+    Some(CredentialHostUnknown {
+        operation,
+        transaction_id,
+        effect_id,
+        request_digest,
+        reason,
+    })
+}
+
+/// Accepts only the exact request-correlated credential unknown grammar: the
+/// request identity digest, then the verbatim Host cause.
+fn is_typed_credential_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(CREDENTIAL_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(host_digest) = parts.next() else {
+        return false;
+    };
+    let Some(operation) = parts.next() else {
+        return false;
+    };
+    let Some(reason) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && is_lower_sha256(digest)
+        && is_lower_sha256(host_digest)
+        && is_credential_unknown_operation(operation)
+        && is_credential_unknown_reason(reason)
+}
+
+/// Whether `reference` is the typed credential unknown reference that was
+/// published for exactly `intent_digest`.
+///
+/// Same binding shape as
+/// [`is_request_correlated_service_registration_unknown`]: the grammar check
+/// alone proves only well-formedness; the embedded request-identity field
+/// must equal the intent digest the durable transaction holds. The digest is
+/// compared, never recomputed.
+fn is_request_correlated_credential_unknown(
+    reference: &str,
+    intent_digest: &PlatformHandle,
+) -> bool {
+    is_typed_credential_unknown_reference(reference)
+        && reference
+            .strip_prefix(CREDENTIAL_UNKNOWN_REFERENCE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            == Some(intent_digest.as_str())
+}
+
+/// Projects one Host-minted credential unknown into the request-correlated
+/// unknown reference.
+///
+/// The mint runs in the immediate continuation of this operation's own
+/// credential readback. The Host cause must parse strictly and must name this
+/// request's own transaction/effect identity; anything else — a sibling
+/// effect's unknown, a bare crash-window literal, an unparsable token — is a
+/// deterministic contract rejection, never a synthesized digest and never a
+/// published mismatch.
+fn credential_unknown_reference(
+    request: &InstallationEffectRequest,
+    host_pending_ref: &PlatformHandle,
+) -> Result<PlatformHandle, PortError> {
+    let cause =
+        parse_credential_host_unknown(host_pending_ref.as_str()).ok_or(PortError::InvalidText {
+            field: CREDENTIAL_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        })?;
+    if cause.transaction_id != request.transaction_id.as_str()
+        || cause.effect_id != request.effect_id.as_str()
+        || !is_credential_unknown_operation(cause.operation)
+        || !is_lower_sha256(cause.request_digest)
+        || !is_credential_unknown_reason(cause.reason)
+    {
+        return Err(PortError::InvalidText {
+            field: CREDENTIAL_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let reference = format!(
+        "{CREDENTIAL_UNKNOWN_REFERENCE_PREFIX}{}:{}:{}:{}",
+        intent_digest.as_str(),
+        cause.request_digest,
+        cause.operation,
+        cause.reason,
+    );
+    if !is_typed_credential_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: CREDENTIAL_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// Maps one Host credential unknown to its port error.
+///
+/// Issue #1352 (X2): an indeterminate or failed credential read is not an
+/// established configuration mismatch. The exact Host cause is preserved
+/// through the existing `PortError::ProviderReference` owner so the
+/// coordinator retains it as `InstallationEffectProgressState::Unknown`
+/// instead of publishing a known `Mismatch`. A cause that cannot form its own
+/// bounded reference is a typed `PortError` contract rejection, propagated
+/// unchanged.
+fn credential_unknown_port_error(
+    request: &InstallationEffectRequest,
+    host_pending_ref: &PlatformHandle,
+) -> PortError {
+    match credential_unknown_reference(request, host_pending_ref) {
+        Ok(reference) => PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference,
+        },
+        Err(error) => error,
+    }
+}
+
+/// Prefix for a request-correlated Phase-B unknown reference.
+///
+/// Issue #1352 (X1/X2): the per-class extension of the service-registration
+/// unknown scheme to `MaterializePhaseB`. The Host mints its Phase-B unknown
+/// as `<origin>:operation=<operation>:transaction_id=<id>:effect_id=<id>:
+/// request_digest=<digest>`, which names the Host cause but carries no
+/// initiating [`InstallationEffectRequest::intent_digest`]. This reference
+/// carries that digest ahead of the verbatim Host cause
+/// (`<origin>:<operation>:<host_request_digest>`), so a post-effect Phase-B
+/// unknown stays reconcilable under its original operation and its cause
+/// survives instead of dissolving into an unlabeled indeterminate.
+const PHASE_B_UNKNOWN_REFERENCE_PREFIX: &str = "phase-b-unknown-v1:";
+
+/// The exact Phase-B unknown origins the Host can mint: the closed
+/// `phase_b_unknown_ref` prefix set of `bins/eliot-host/src/lib.rs`.
+fn is_phase_b_unknown_origin(value: &str) -> bool {
+    matches!(
+        value,
+        "phase-b" | "phase-b-finalize" | "store-recovery-fence" | "phase-b-query"
+    )
+}
+
+/// The exact Phase-B unknown operations the Host can mint: the closed
+/// `phase_b_unknown_ref` operation set of `bins/eliot-host/src/lib.rs`.
+fn is_phase_b_unknown_operation(value: &str) -> bool {
+    matches!(
+        value,
+        "MaterializePhaseB" | "FinalizePhaseB" | "ReconcilePhaseB"
+    )
+}
+
+/// One Host-minted Phase-B unknown cause, borrowed verbatim.
+struct PhaseBHostUnknown<'a> {
+    origin: &'a str,
+    operation: &'a str,
+    transaction_id: &'a str,
+    effect_id: &'a str,
+    request_digest: &'a str,
+}
+
+/// Strictly parses one Host-minted Phase-B unknown reference.
+///
+/// The origin carries no `:` by construction so it is cut first; the
+/// remaining fields are cut at their fixed `key=` markers from the right, as
+/// for [`parse_credential_host_unknown`]. Anything else is not this
+/// operation's Host cause.
+fn parse_phase_b_host_unknown(value: &str) -> Option<PhaseBHostUnknown<'_>> {
+    let (origin, rest) = value.split_once(':')?;
+    if !is_phase_b_unknown_origin(origin) {
+        return None;
+    }
+    let (rest, request_digest) = rest.rsplit_once(':')?;
+    let request_digest = request_digest.strip_prefix("request_digest=")?;
+    let (rest, effect_id) = rest.rsplit_once(':')?;
+    let effect_id = effect_id.strip_prefix("effect_id=")?;
+    let (operation_field, transaction_field) = rest.split_once(':')?;
+    let operation = operation_field.strip_prefix("operation=")?;
+    let transaction_id = transaction_field.strip_prefix("transaction_id=")?;
+    if operation.is_empty()
+        || transaction_id.is_empty()
+        || effect_id.is_empty()
+        || request_digest.is_empty()
+    {
+        return None;
+    }
+    Some(PhaseBHostUnknown {
+        origin,
+        operation,
+        transaction_id,
+        effect_id,
+        request_digest,
+    })
+}
+
+/// Accepts only the exact request-correlated Phase-B unknown grammar: the
+/// request identity digest, then the verbatim Host cause.
+fn is_typed_phase_b_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(PHASE_B_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(origin) = parts.next() else {
+        return false;
+    };
+    let Some(operation) = parts.next() else {
+        return false;
+    };
+    let Some(host_digest) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && is_lower_sha256(digest)
+        && is_phase_b_unknown_origin(origin)
+        && is_phase_b_unknown_operation(operation)
+        && is_lower_sha256(host_digest)
+}
+
+/// Whether `reference` is the typed Phase-B unknown reference that was
+/// published for exactly `intent_digest`.
+///
+/// Same binding shape as
+/// [`is_request_correlated_service_registration_unknown`]: the grammar check
+/// alone proves only well-formedness; the embedded request-identity field
+/// must equal the intent digest the durable transaction holds. The digest is
+/// compared, never recomputed.
+fn is_request_correlated_phase_b_unknown(reference: &str, intent_digest: &PlatformHandle) -> bool {
+    is_typed_phase_b_unknown_reference(reference)
+        && reference
+            .strip_prefix(PHASE_B_UNKNOWN_REFERENCE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            == Some(intent_digest.as_str())
+}
+
+/// Projects one Host-minted Phase-B unknown into the request-correlated
+/// unknown reference.
+///
+/// The mint runs in the immediate continuation of this operation's own
+/// Phase-B readback. The Host cause must parse strictly and must name this
+/// request's own transaction/effect identity; anything else is a
+/// deterministic contract rejection, never a synthesized digest and never an
+/// unlabeled indeterminate.
+fn phase_b_unknown_reference(
+    request: &InstallationEffectRequest,
+    host_pending_ref: &PlatformHandle,
+) -> Result<PlatformHandle, PortError> {
+    let cause =
+        parse_phase_b_host_unknown(host_pending_ref.as_str()).ok_or(PortError::InvalidText {
+            field: PHASE_B_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        })?;
+    if cause.transaction_id != request.transaction_id.as_str()
+        || cause.effect_id != request.effect_id.as_str()
+        || !is_phase_b_unknown_operation(cause.operation)
+        || !is_lower_sha256(cause.request_digest)
+    {
+        return Err(PortError::InvalidText {
+            field: PHASE_B_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let reference = format!(
+        "{PHASE_B_UNKNOWN_REFERENCE_PREFIX}{}:{}:{}:{}",
+        intent_digest.as_str(),
+        cause.origin,
+        cause.operation,
+        cause.request_digest,
+    );
+    if !is_typed_phase_b_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: PHASE_B_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// Maps one Host Phase-B unknown to its port error.
+///
+/// Issue #1352 (X2): an indeterminate Phase-B read is not an established
+/// outcome of any kind. The exact Host cause is preserved through the
+/// existing `PortError::ProviderReference` owner instead of dissolving into
+/// an unlabeled indeterminate that records no cause to reconcile.
+fn phase_b_unknown_port_error(
+    request: &InstallationEffectRequest,
+    host_pending_ref: &PlatformHandle,
+) -> PortError {
+    match phase_b_unknown_reference(request, host_pending_ref) {
+        Ok(reference) => PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference,
+        },
+        Err(error) => error,
+    }
 }
 
 /// Maps one installer-root reconcile readback failure to its port error.
@@ -9294,7 +9716,8 @@ where
     /// the identity of an operation that already committed its intent. When
     /// [`has_reconcilable_service_registration_intent`] proves that this exact
     /// observation is the request-correlated unknown of that committed intent —
-    /// service-registration, installer-root or package-staging — the intent is
+    /// service-registration, installer-root, package-staging, credential or
+    /// Phase-B — the intent is
     /// preserved: the typed cause is recorded in `pending_external_changes`,
     /// the transaction stays `RollbackRequired`, and the effect keeps the
     /// `attempt`/`intent_digest` that authorized the external object, so
@@ -10289,16 +10712,18 @@ fn is_request_correlated_service_registration_unknown(
 /// Whether `reference` is a request-correlated unknown reference of any
 /// effect class for exactly `intent_digest`.
 ///
-/// Issue #1352 (X1): per-class composition of the three request-correlated
-/// unknown grammars — service-registration, installer-root and
-/// package-staging. Each arm keeps its own grammar and its own exact digest
-/// binding; this only shares the disjunction between the persist guard and
-/// the rollback scan so the two can never disagree on what counts as this
-/// operation's own cause.
+/// Issue #1352 (X1): per-class composition of the five request-correlated
+/// unknown grammars — service-registration, installer-root,
+/// package-staging, credential and Phase-B. Each arm keeps its own grammar
+/// and its own exact digest binding; this only shares the disjunction between
+/// the persist guard and the rollback scan so the two can never disagree on
+/// what counts as this operation's own cause.
 fn is_request_correlated_unknown(reference: &str, intent_digest: &PlatformHandle) -> bool {
     is_request_correlated_service_registration_unknown(reference, intent_digest)
         || is_request_correlated_installer_root_unknown(reference, intent_digest)
         || is_request_correlated_package_staging_unknown(reference, intent_digest)
+        || is_request_correlated_credential_unknown(reference, intent_digest)
+        || is_request_correlated_phase_b_unknown(reference, intent_digest)
 }
 
 /// Whether `index` still holds the committed intent that `pending_ref` names as
@@ -10317,8 +10742,9 @@ fn is_request_correlated_unknown(reference: &str, intent_digest: &PlatformHandle
 /// 1. the effect is in `IntentCommitted` with a non-zero attempt (any other
 ///    state has no committed operation to preserve);
 /// 2. `pending_ref` is a well-formed request-correlated unknown reference of
-///    any effect class — service-registration, installer-root or
-///    package-staging — whose embedded request identity equals that
+///    any effect class — service-registration, installer-root,
+///    package-staging, credential or Phase-B — whose embedded request identity
+///    equals that
 ///    `intent_digest`, so the observation is provably this operation's own
 ///    cause and not a sibling effect's or a bare crash window's;
 /// 3. [`effect_request`] still rebuilds a request for the persisted attempt
@@ -10435,6 +10861,8 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
                 || is_typed_service_registration_unknown_reference(reference.as_str())
                 || is_typed_installer_root_unknown_reference(reference.as_str())
                 || is_typed_package_staging_unknown_reference(reference.as_str())
+                || is_typed_credential_unknown_reference(reference.as_str())
+                || is_typed_phase_b_unknown_reference(reference.as_str())
             {
                 return reference;
             }
