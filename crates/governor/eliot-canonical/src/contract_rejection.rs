@@ -25,19 +25,22 @@
 //!
 //! The corrected operation identity is an owner-issued fact, not advisory
 //! prose: [`derive_corrected_operation_id`] derives it from the inputs the
-//! refusal is already fixed by, [`RetainedRejections`] keeps the operation
-//! identity each refusal rejected, and
-//! [`RetainedRejections::verify_correction_lineage`] believes a lineage claim
-//! only when that own record proves it. The derivation itself is the one
-//! shared primitive the Kernel pre-stage gate
+//! refusal is already fixed by, [`RetainedRejections`] keeps every refusal it
+//! issued, and [`RetainedRejections::verify_correction_lineage`] believes a
+//! lineage claim only when that own record proves it. The derivation itself
+//! is the one shared primitive the Kernel pre-stage gate
 //! (`eliot-kernel-service::contract_rejection_gate`) also calls, so the
 //! identity stamped on the live path is exactly the identity issued here and
 //! there is no second issuer. The gate mechanically mirrors what it can see
 //! on the wire - refusing a resubmission still wearing a refused operation
 //! identity and verifying a presented correction against its own retained
 //! refusals - but the semantic admission decision stays here.
+//!
+//! Retention policy is every refusal on both layers: this owner retains the
+//! correction each refusal issued, and the Kernel gate retains every refusal
+//! the same way, so the two layers never hold divergent policies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{OperationId, sha256_hex};
 use schemars::JsonSchema;
@@ -422,32 +425,51 @@ pub enum CorrectionLineageError {
     },
 }
 
-/// Owner-retained refusals, keyed by the rejected operation identity.
+/// Owner-retained refusals, keyed by the corrected operation identity each
+/// refusal issued.
 ///
 /// This is the owner's own record, not a caller assertion: a lineage claim is
-/// believed only when this record proves it. The first refusal of an
-/// operation identity is the one retained, so the corrected identity issued
-/// for that operation never changes.
+/// believed only when this record proves it. Every refusal retains its own
+/// correction, not only the first per operation identity: each corrected
+/// identity is derived from the rejected operation identity together with
+/// that refusal's own rejection identity, so a second refusal of the same
+/// operation identity issues a distinct corrected identity, and retaining
+/// only the first would leave every later corrected identity unprovable.
+/// This is the same every-refusal policy the Kernel pre-stage gate
+/// (`eliot-kernel-service::contract_rejection_gate`) keeps, so the two
+/// layers never hold divergent retention policies.
 #[derive(Clone, Debug, Default)]
 pub struct RetainedRejections {
-    entries: BTreeMap<String, RetainedRejection>,
+    refused_operations: BTreeSet<String>,
+    issued_corrections: BTreeMap<String, RetainedRejection>,
 }
 
 impl RetainedRejections {
-    /// Retains one refusal under the operation identity it refused.
+    /// Retains one refusal under the operation identity it refused and under
+    /// the corrected identity it issued.
+    ///
+    /// The refused-identity set is the owner's own record that this operation
+    /// identity never admitted a write, so corrected bytes still wearing it
+    /// are refused. The correction map keeps every refusal's own record
+    /// keyed by the corrected identity it issued, so any of them verifies.
+    /// Re-retaining the identical refusal is idempotent: the corrected
+    /// identity is a pure function of the same pair, so the record written
+    /// is byte-identical.
     pub fn retain(&mut self, rejected_operation_id: &OperationId, rejection: &AdmissionRejection) {
-        self.entries
-            .entry(rejected_operation_id.as_str().to_owned())
-            .or_insert_with(|| RetainedRejection {
+        self.refused_operations
+            .insert(rejected_operation_id.as_str().to_owned());
+        let corrected_operation_id =
+            derive_corrected_operation_id(rejected_operation_id.as_str(), &rejection.rejection_id);
+        self.issued_corrections.insert(
+            corrected_operation_id.clone(),
+            RetainedRejection {
                 rejected_operation_id: rejected_operation_id.as_str().to_owned(),
                 rejection_id: rejection.rejection_id.clone(),
                 canonical_request_hash: rejection.canonical_request_hash.clone(),
                 idempotency_key: rejection.idempotency_key.clone(),
-                corrected_operation_id: derive_corrected_operation_id(
-                    rejected_operation_id.as_str(),
-                    &rejection.rejection_id,
-                ),
-            });
+                corrected_operation_id,
+            },
+        );
     }
 
     /// Verifies a correction lineage claim against this owner's own record.
@@ -464,25 +486,29 @@ impl RetainedRejections {
         presented_operation_id: &OperationId,
         asserted_corrected_from: Option<&OperationId>,
     ) -> Result<Option<&RetainedRejection>, CorrectionLineageError> {
-        if self.entries.contains_key(presented_operation_id.as_str()) {
+        if self
+            .refused_operations
+            .contains(presented_operation_id.as_str())
+        {
             return Err(CorrectionLineageError::RejectedOperationIdentityReuse {
                 presented: presented_operation_id.clone(),
             });
         }
         if let Some(asserted) = asserted_corrected_from {
-            return self.entries.get(asserted.as_str()).map_or_else(
-                || {
-                    Err(CorrectionLineageError::UnprovenLineage {
-                        asserted: asserted.clone(),
-                    })
-                },
-                |record| Ok(Some(record)),
-            );
+            return self
+                .issued_corrections
+                .values()
+                .find(|record| record.rejected_operation_id == asserted.as_str())
+                .map_or_else(
+                    || {
+                        Err(CorrectionLineageError::UnprovenLineage {
+                            asserted: asserted.clone(),
+                        })
+                    },
+                    |record| Ok(Some(record)),
+                );
         }
-        Ok(self
-            .entries
-            .values()
-            .find(|record| record.corrected_operation_id == presented_operation_id.as_str()))
+        Ok(self.issued_corrections.get(presented_operation_id.as_str()))
     }
 }
 

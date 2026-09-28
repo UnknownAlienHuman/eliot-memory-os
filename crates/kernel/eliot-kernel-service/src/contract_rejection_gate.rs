@@ -32,6 +32,18 @@
 //! the committed write to the rejected operation it corrects. The rule
 //! string below stays as the stated rule; it is no longer the only
 //! statement of the rule.
+//!
+//! Retention policy is every refusal on both layers: this gate retains the
+//! corrected identity each refusal issued, and the Governor owner
+//! (`RetainedRejections`) retains every refusal the same way, so the two
+//! layers never hold divergent policies. The retained record is also the
+//! Kernel-owned durable pre-stage journal: [`PreStageIdentityCache`] exports
+//! a [`PreStageIdentitySnapshot`] the daemon persists write-ahead of the
+//! commit it authorizes and restores after a restart, so the correction
+//! lineage on the commit response survives the process. The response stays a
+//! projection of that record, never a second decision ledger (I06-11:7): no
+//! lineage is stamped without the verified link, and the link is believed
+//! only against the retained refusals.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -252,7 +264,7 @@ pub struct VerifiedCorrectionLink {
 }
 
 /// One refusal this gate kept, bound to the operation identity it refused.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct IssuedCorrection {
     /// Operation identity this gate refused.
     rejected_operation_id: String,
@@ -271,11 +283,93 @@ struct IssuedCorrection {
 /// corrected identity itself is the one shared `eliot-store-api` derivation
 /// the Governor owner also issues: this cache retains it, it never invents a
 /// divergent one.
+///
+/// The retention policy is every refusal, matching the Governor owner's
+/// `RetainedRejections`: each refusal keeps its own correction, never only
+/// the first per operation identity.
+///
+/// The cache is also the Kernel-owned durable pre-stage journal. It exports
+/// a [`PreStageIdentitySnapshot`] the daemon persists write-ahead of the
+/// commit a retained refusal authorizes, and merges it back with
+/// [`PreStageIdentityCache::restore`] after a restart, so a committed
+/// correction still replays its lineage. Merging is a union over
+/// deterministic records, so a concurrent retain can never be lost by a
+/// restore. The transport response stays a projection of this record, never
+/// a second decision ledger (I06-11:7).
 #[derive(Clone, Debug, Default)]
 pub struct PreStageIdentityCache {
     entries: BTreeMap<String, (String, PreStageRejection)>,
     refused_operations: BTreeSet<String>,
     issued_corrections: BTreeMap<String, IssuedCorrection>,
+    journal_dirty: bool,
+}
+
+/// Durable snapshot of the pre-stage identity cache (issue #1796, I6.8).
+///
+/// The Kernel-owned durable pre-stage journal: the daemon persists this
+/// write-ahead of the commit a retained refusal authorizes and restores it
+/// after a restart, so correction lineage survives the process without a
+/// store-protocol or receipt-format change. Every record in it is a pure
+/// function of the refusal it was retained for, so merging a snapshot is
+/// idempotent.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreStageIdentitySnapshot {
+    entries: BTreeMap<String, (String, PreStageRejection)>,
+    refused_operations: BTreeSet<String>,
+    issued_corrections: BTreeMap<String, IssuedCorrection>,
+}
+
+impl PreStageIdentityCache {
+    /// Reports whether this cache holds no retained refusal at all.
+    ///
+    /// A freshly constructed cache is empty; the cache never removes a
+    /// retained refusal, so an empty cache is one that was never fed, which
+    /// is exactly when the daemon attempts the one durable-journal restore.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+            && self.refused_operations.is_empty()
+            && self.issued_corrections.is_empty()
+    }
+
+    /// Exports the durable journal snapshot of every retained refusal.
+    #[must_use]
+    pub fn snapshot(&self) -> PreStageIdentitySnapshot {
+        PreStageIdentitySnapshot {
+            entries: self.entries.clone(),
+            refused_operations: self.refused_operations.clone(),
+            issued_corrections: self.issued_corrections.clone(),
+        }
+    }
+
+    /// Merges one durable journal snapshot into this cache.
+    ///
+    /// Union over deterministic records: re-merging the same snapshot is
+    /// idempotent, and a retain that landed after the snapshot was read is
+    /// never lost. Merging never marks the journal dirty, so a bare restore
+    /// schedules no write-back.
+    pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) {
+        self.entries.extend(snapshot.entries);
+        self.refused_operations.extend(snapshot.refused_operations);
+        self.issued_corrections.extend(snapshot.issued_corrections);
+    }
+
+    /// Takes the durable journal snapshot when a retain landed since the
+    /// last take, and clears the mark.
+    ///
+    /// The daemon persists the returned snapshot write-ahead of the commit
+    /// the retain authorizes; `None` means nothing changed and no write is
+    /// owed.
+    #[must_use]
+    pub fn take_journal_snapshot(&mut self) -> Option<PreStageIdentitySnapshot> {
+        if self.journal_dirty {
+            self.journal_dirty = false;
+            Some(self.snapshot())
+        } else {
+            None
+        }
+    }
 }
 
 impl PreStageIdentityCache {
@@ -329,6 +423,10 @@ impl PreStageIdentityCache {
                 rejection_id: rejection.rejection_id.clone(),
             },
         );
+        // Every retain lands in the durable journal: the daemon persists the
+        // snapshot write-ahead of the commit this refusal authorizes, so the
+        // lineage survives a restart (issue #1796 F1).
+        self.journal_dirty = true;
     }
 
     /// Verifies a presented operation identity against this cache's own record.
