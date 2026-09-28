@@ -10660,7 +10660,6 @@ impl RedbRecoveryStore {
                 window_key,
                 after_stream,
                 stream_limit,
-                version: _,
                 ..
             } => Ok(BridgeRecoveryScopeSelector::Streams {
                 window_key: window_key.clone(),
@@ -10686,7 +10685,6 @@ impl RedbRecoveryStore {
                 event_limit,
                 gap_offset,
                 gap_limit,
-                version: _,
                 ..
             } => Ok(BridgeRecoveryScopeSelector::Stream {
                 window_key: window_key.clone(),
@@ -10707,7 +10705,6 @@ impl RedbRecoveryStore {
                 after_gap_scope,
                 gap_offset,
                 gap_limit,
-                version: _,
                 ..
             } => Ok(BridgeRecoveryScopeSelector::UnscopedGaps {
                 window_key: window_key.clone(),

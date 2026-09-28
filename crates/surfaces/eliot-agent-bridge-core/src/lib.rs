@@ -1588,6 +1588,7 @@ fn advance_recovery_projection_stream(
         next_after: progress.next_after,
         recovered_events: progress.events.len() as u64,
         recovered_gaps: progress.gaps.len() as u64,
+        stream_proof: progress.stream_proof.clone(),
         page_complete: progress.page_complete,
     });
     if !page.push(record)? {
@@ -1963,6 +1964,8 @@ struct ReconciliationPermit {
     task_binding: TaskBinding,
     receipt_ref: ReconciliationReceiptRef,
     window: Option<Box<RecoveryWindowFacts>>,
+    response_selector: RecoveryResponseSelector,
+    request_continuation_proof: Option<String>,
 }
 
 impl ReconciliationPermit {
@@ -1979,6 +1982,8 @@ impl ReconciliationPermit {
             task_binding: *result.task_binding,
             receipt_ref: result.receipt_ref,
             window: result.window,
+            response_selector: result.response_selector,
+            request_continuation_proof: result.request_continuation_proof,
         })
     }
 }
@@ -3903,8 +3908,8 @@ impl AgentBridgeCore {
                 &active.binding,
                 &mut candidate,
                 false,
-                result.response_selector,
-                result.request_continuation_proof.as_deref(),
+                permit.response_selector,
+                permit.request_continuation_proof.as_deref(),
                 window,
             )?;
             (candidate, disposition)
