@@ -350,10 +350,14 @@ impl fmt::Display for ExecutableBodyRefusal {
             Self::LegacyTableNotExecutable { table, disposition } => {
                 let disposition = match disposition {
                     LegacyTableDisposition::Transform {
-                        current_table, ..
-                    } => format!("an explicit transform into {current_table}"),
-                    LegacyTableDisposition::ArchiveOnly { .. } => {
-                        "an archive-only disposition".to_owned()
+                        capability_owner,
+                        current_table,
+                        transform,
+                    } => format!(
+                        "an explicit transform into {current_table} owned by {capability_owner}: {transform}"
+                    ),
+                    LegacyTableDisposition::ArchiveOnly { rationale } => {
+                        format!("an archive-only disposition: {rationale}")
                     }
                 };
                 write!(
@@ -509,37 +513,26 @@ pub(crate) static LEGACY_SCHEMA_ROOTS: [LegacySchemaRoot; 12] = [
     },
 ];
 
-/// What kind of schema object a census entry is.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LegacySchemaObjectKind {
-    /// A `DEFINE TABLE` body.
-    Table,
-    /// A `DEFINE INDEX` body, which always belongs to one table.
-    Index,
-    /// A `DEFINE FIELD` body, which always belongs to one table.
-    Field,
-}
-
-impl fmt::Display for LegacySchemaObjectKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Table => "table",
-            Self::Index => "index",
-            Self::Field => "field",
-        })
-    }
-}
-
 /// One schema object the legacy roots actually declare.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LegacySchemaObject {
-    /// What kind of object the legacy DDL declared.
-    pub(crate) kind: LegacySchemaObjectKind,
+    /// The `DEFINE` keyword that declared it: `TABLE`, `INDEX` or `FIELD`.
+    pub(crate) keyword: &'static str,
     /// Lowercased declared object name.
     pub(crate) name: String,
-    /// Lowercased owning table; equal to `name` for a table object.
+    /// Lowercased owning table; equal to `name` for a `TABLE` object.
     pub(crate) table: String,
+    /// Repository path of the legacy root that declared it, so an omission
+    /// names the file an operator must map rather than only the object.
+    pub(crate) root: &'static str,
 }
+
+/// The `DEFINE INDEX` census keyword.
+///
+/// An index carries a name independent of its table, so it is the one object
+/// kind checked against the per-table index list rather than only against the
+/// table's own existence.
+const LEGACY_INDEX_KEYWORD: &str = "INDEX";
 
 /// Reads every schema object the declared legacy roots declare.
 ///
@@ -555,26 +548,33 @@ pub(crate) fn census_legacy_schema_objects() -> Vec<LegacySchemaObject> {
     for root in &LEGACY_SCHEMA_ROOTS {
         for statement in root.ddl.split(';') {
             let tokens: Vec<&str> = statement.split_whitespace().collect();
+            if !tokens
+                .first()
+                .is_some_and(|token| token.eq_ignore_ascii_case("DEFINE"))
+            {
+                continue;
+            }
             let Some(keyword) = tokens.get(1) else {
                 continue;
             };
-            if keyword.eq_ignore_ascii_case("TABLE") {
-                if let Some(name) = declared_name(&tokens) {
-                    push_census_object(&mut census, LegacySchemaObjectKind::Table, &name, &name);
-                }
-            } else if keyword.eq_ignore_ascii_case("INDEX")
-                || keyword.eq_ignore_ascii_case("FIELD")
-            {
-                let kind = if keyword.eq_ignore_ascii_case("INDEX") {
-                    LegacySchemaObjectKind::Index
-                } else {
-                    LegacySchemaObjectKind::Field
+            let keyword: &'static str = match keyword.to_ascii_uppercase().as_str() {
+                "TABLE" => "TABLE",
+                "INDEX" => LEGACY_INDEX_KEYWORD,
+                "FIELD" => "FIELD",
+                _ => continue,
+            };
+            let Some(name) = declared_name(&tokens) else {
+                continue;
+            };
+            let table = if keyword == "TABLE" {
+                name.clone()
+            } else {
+                let Some(table) = table_after_on(&tokens) else {
+                    continue;
                 };
-                if let (Some(name), Some(table)) = (declared_name(&tokens), table_after_on(&tokens))
-                {
-                    push_census_object(&mut census, kind, &name, &table);
-                }
-            }
+                table
+            };
+            push_census_object(&mut census, root.path, keyword, &name, &table);
         }
     }
     census
@@ -584,17 +584,20 @@ pub(crate) fn census_legacy_schema_objects() -> Vec<LegacySchemaObject> {
 ///
 /// The legacy roots declare the same table and index in more than one file;
 /// the denominator is the set of distinct objects, not the number of
-/// `DEFINE` statements.
+/// `DEFINE` statements. The first root that declares an object is the one
+/// reported, so the message is stable.
 fn push_census_object(
     census: &mut Vec<LegacySchemaObject>,
-    kind: LegacySchemaObjectKind,
+    root: &'static str,
+    keyword: &'static str,
     name: &str,
     table: &str,
 ) {
     let object = LegacySchemaObject {
-        kind,
+        keyword,
         name: name.to_owned(),
         table: table.to_owned(),
+        root,
     };
     if !census.contains(&object) {
         census.push(object);
@@ -659,33 +662,13 @@ pub(crate) enum LegacyTableDisposition {
     },
     /// No current capability owner writes this table. The rows are retained
     /// read-only so restore and import can still verify their provenance under
-    /// `A13.7`/`ARCH-RES-03`, and the named condition is what removes them.
+    /// `A13.7`/`ARCH-RES-03`. The condition that removes the table is the
+    /// removal condition of the root in [`NON_EXECUTABLE_MIGRATION_ROOTS`],
+    /// stated once per root rather than restated per row.
     ArchiveOnly {
         /// Why the rows are retained rather than carried forward.
         rationale: &'static str,
-        /// The named condition under which the table leaves the tree.
-        removal_condition: &'static str,
     },
-}
-
-impl LegacyTableDisposition {
-    /// The current owner that carries this table's capability, if any.
-    #[must_use]
-    pub(crate) fn capability_owner(&self) -> Option<&'static str> {
-        match self {
-            Self::Transform {
-                capability_owner, ..
-            } => Some(capability_owner),
-            Self::ArchiveOnly { .. } => None,
-        }
-    }
-
-    /// Whether this disposition names an explicit transform into a current
-    /// table rather than an archive-only rationale.
-    #[must_use]
-    pub(crate) const fn is_transform(&self) -> bool {
-        matches!(self, Self::Transform { .. })
-    }
 }
 
 /// One legacy table and every disposition the current owner states for it.
@@ -709,10 +692,9 @@ pub(crate) struct LegacyTableMapping {
 /// than silently dropped: `A13.7` restore verifies provenance and
 /// `ARCH-RES-03` forbids resurrecting invalid state, which a drop would do.
 /// Removal is not this issue's to perform; the legacy core retirement issue
-/// `#1189` owns it and must first complete donor retirement P1–P5.
+/// `#1189` owns it and must first complete donor retirement P1–P5, which is the
+/// removal condition stated on the roots in [`NON_EXECUTABLE_MIGRATION_ROOTS`].
 const LEGACY_DOMAIN_ARCHIVE_RATIONALE: &str = "pre-split eliot-store domain table; the canonical Store publishes no current table for this capability, so the rows are retained read-only for restore/import provenance verification under A13.7 and ARCH-RES-03 rather than dropped or migrated under a guessed shape";
-const LEGACY_DOMAIN_REMOVAL_CONDITION: &str =
-    "the legacy core retirement issue #1189 completes donor retirement P1-P5 and proves no current reader; until then the rows stay archived and this owner executes no DDL over them";
 
 /// Every legacy table the declared roots define, with its current owner,
 /// explicit transform, or archive-only rationale — and, for each, the complete
@@ -723,7 +705,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_activation_scope"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -781,7 +762,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_claim_project", "idx_claim_status", "idx_claim_write"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -798,7 +778,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -806,7 +785,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_cognitive_projection_state_project_family_v1"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -832,7 +810,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -849,7 +826,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_cue_lookup", "idx_cue_record"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -857,7 +833,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_evidence_project", "idx_evidence_write"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -865,7 +840,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -873,7 +847,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_failure_project"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -881,7 +854,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_injection_session", "idx_injection_write"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -902,7 +874,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         ],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -910,7 +881,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_influence_task", "idx_influence_write"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -922,7 +892,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         ],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -935,7 +904,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         ],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -943,7 +911,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -969,7 +936,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_observability_receipt_kind", "idx_observability_receipt_write"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -981,7 +947,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         ],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -998,7 +963,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_scope_head_project"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1006,7 +970,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1032,7 +995,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_task_contract_project", "idx_task_contract_status"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1040,7 +1002,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_tool_observation_project_task_kind_pattern"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1048,7 +1009,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &[],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1056,7 +1016,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_ab_counter"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1064,7 +1023,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_dirty_state", "idx_ul_dirty_target"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1072,7 +1030,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_dep_reverse", "idx_ul_dep_target"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1080,7 +1037,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_policy_class"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1088,7 +1044,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_experiment_class", "idx_ul_experiment_task"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1096,7 +1051,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_ul_task_ledger_project_task"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1104,7 +1058,6 @@ pub(crate) static LEGACY_TABLE_MAPPINGS: [LegacyTableMapping; 45] = [
         indexes: &["idx_verification_project", "idx_verification_result"],
         disposition: LegacyTableDisposition::ArchiveOnly {
             rationale: LEGACY_DOMAIN_ARCHIVE_RATIONALE,
-            removal_condition: LEGACY_DOMAIN_REMOVAL_CONDITION,
         },
     },
     LegacyTableMapping {
@@ -1133,12 +1086,14 @@ pub(crate) enum LegacyMappingOmission {
     /// A legacy table/index/field exists in the declared roots and no row maps
     /// the table that owns it.
     LegacyObjectUnmapped {
-        /// What kind of object the legacy roots declare.
-        kind: LegacySchemaObjectKind,
+        /// The `DEFINE` keyword that declared the object.
+        keyword: &'static str,
         /// The declared object name.
         name: String,
         /// The table that owns it.
         table: String,
+        /// The legacy root file that declares it.
+        root: &'static str,
     },
     /// A mapped table declares an index the legacy roots do not, so the row no
     /// longer describes the legacy schema.
@@ -1158,9 +1113,14 @@ pub(crate) enum LegacyMappingOmission {
 impl fmt::Display for LegacyMappingOmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyObjectUnmapped { kind, name, table } => write!(
+            Self::LegacyObjectUnmapped {
+                keyword,
+                name,
+                table,
+                root,
+            } => write!(
                 formatter,
-                "legacy {kind} {name} on table {table} has no current owner, transform or archive disposition"
+                "legacy {keyword} {name} on table {table}, declared by {root}, has no current owner, transform or archive disposition"
             ),
             Self::StaleIndexDeclaration { table, index } => write!(
                 formatter,
@@ -1201,28 +1161,27 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
             .find(|mapping| mapping.table == object.table)
         else {
             return Err(LegacyMappingOmission::LegacyObjectUnmapped {
-                kind: object.kind,
+                keyword: object.keyword,
                 name: object.name.clone(),
                 table: object.table.clone(),
+                root: object.root,
             });
         };
-        match object.kind {
-            LegacySchemaObjectKind::Index => {
-                if !mapping.indexes.contains(&object.name.as_str()) {
-                    return Err(LegacyMappingOmission::LegacyObjectUnmapped {
-                        kind: object.kind,
-                        name: object.name.clone(),
-                        table: object.table.clone(),
-                    });
-                }
-            }
-            LegacySchemaObjectKind::Table | LegacySchemaObjectKind::Field => {}
+        if object.keyword == LEGACY_INDEX_KEYWORD
+            && !mapping.indexes.contains(&object.name.as_str())
+        {
+            return Err(LegacyMappingOmission::LegacyObjectUnmapped {
+                keyword: object.keyword,
+                name: object.name.clone(),
+                table: object.table.clone(),
+                root: object.root,
+            });
         }
     }
     for mapping in &LEGACY_TABLE_MAPPINGS {
         for index in mapping.indexes {
             if !census.iter().any(|object| {
-                object.kind == LegacySchemaObjectKind::Index
+                object.keyword == LEGACY_INDEX_KEYWORD
                     && object.table == mapping.table
                     && object.name == *index
             }) {
