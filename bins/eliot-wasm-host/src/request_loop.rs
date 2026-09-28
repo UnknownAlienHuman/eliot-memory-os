@@ -3902,6 +3902,15 @@ pub enum OrdinaryDriveError {
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
+    /// The owner has not published this exact generation as a ready,
+    /// recoverable delivery: its generation slot records a pending or
+    /// failed publication, or names another delivery. Nothing executes
+    /// and nothing is deleted — the staged set stays for the owner.
+    Publication {
+        /// Stable owner publication code: `DELIVERY_PENDING`,
+        /// `DELIVERY_FAILED`, or `DELIVERY_IDENTITY_MISMATCH`.
+        code: &'static str,
+    },
     /// The bounded request loop failed closed.
     Loop(LoopError),
 }
@@ -3912,6 +3921,7 @@ impl fmt::Display for OrdinaryDriveError {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
+            Self::Publication { code } => write!(formatter, "ORDINARY_{code}"),
             Self::Loop(error) => write!(formatter, "{error}"),
         }
     }
@@ -4073,7 +4083,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         let inflight_marker = crate::dispatch_material::read_inflight_marker(&directory)
             .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
         match crate::dispatch_material::classify_staged_delivery(
-            &material,
+            claim.identity(),
             served.as_slice(),
             served_marker.as_ref(),
             inflight_marker.as_ref(),
@@ -4123,6 +4133,12 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 let _admitted_operation = identity.operation_id.len();
             }
         }
+        // Owner publication state gate (#2786 steps 3/7/8): the claim may
+        // execute only against the generation the owner itself published
+        // as ready. A staged set with no owner record at all is the
+        // explicit legacy v1 compatibility state the classifier above
+        // admitted; anything the owner did record must name this claim.
+        require_ready_publication(&directory, &claim)?;
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
         seal_inflight_claim(&directory, &claim, edge_now_ms())?;
@@ -4227,6 +4243,44 @@ fn consume_delivery_set(
         };
     };
     crate::dispatch_material::reclaim_claimed_delivery(claim, &directory)
+}
+
+/// Requires the owner's own publication state to name this exact
+/// generation as ready before the claim executes (#2786 steps 3/7/8).
+///
+/// The owner slot is located by the claim's own generation and
+/// material-set digest, and every owner-recorded field is compared against
+/// the claim: a matching pathname, a well-formed token, or a matching
+/// grant digest is not a match. A pending or failed owner publication, and
+/// a ready record naming another delivery, both fail closed here — nothing
+/// executes and nothing is deleted, so the staged set stays for the owner
+/// under its exact identity. No owner record at all is the legacy v1
+/// fixed-name compatibility state, which stays admissible under full
+/// admission with the staged identity verbatim.
+///
+/// # Errors
+///
+/// Returns [`OrdinaryDriveError::Publication`] when the owner recorded a
+/// state that is not a ready publication of this claim, and
+/// [`OrdinaryDriveError::Drive`] when the owner marker is unreadable,
+/// malformed, or carries an unsupported identity version.
+fn require_ready_publication(
+    directory: &Path,
+    claim: &crate::dispatch_material::DeliveryClaim,
+) -> Result<(), OrdinaryDriveError> {
+    let identity = claim.identity();
+    match crate::dispatch_material::read_delivery_publication(directory, identity)
+        .map_err(OrdinaryDriveError::Drive)?
+    {
+        Some(state) if state.is_ready() && state.names(identity) => Ok(()),
+        Some(state) if !state.is_ready() => {
+            Err(OrdinaryDriveError::Publication { code: state.code() })
+        }
+        Some(_) => Err(OrdinaryDriveError::Publication {
+            code: "DELIVERY_IDENTITY_MISMATCH",
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Reads the owner-staged delivery set beside this installation,
