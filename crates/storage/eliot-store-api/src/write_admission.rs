@@ -221,6 +221,7 @@
 //! | `ApplyNotificationState` | F6 | `NotificationState` | `ReversibleMutation` | 4 |
 //! | `ApplyReactiveInjectionState` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |
 //! | `ApplyResourceSnapshot` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |
+//! | `RecordCapabilityEvidenceRecord` | F6 | `CaptureCandidate` | `Candidate` | 4 |
 //!
 //! The transition-class and effect-ceiling columns are not judgment: they are the
 //! declared transition classes and maximum effect of the activated entry. The
@@ -243,9 +244,9 @@
 //! Issue #1874's body describes seven reachable mutations and names
 //! `RecordAuthorityRevocation` among them. That list is a subset, not the
 //! activated set, and `RecordAuthorityRevocation` is not reachable at all; the
-//! activated set is the seventeen rows above. I5.15's own initial executable set
+//! activated set is the eighteen rows above. I5.15's own initial executable set
 //! is a contract-denomination list and does not enumerate named mutations, so
-//! the seventeen rows activate under I5.17 against this crate's proven
+//! the eighteen rows activate under I5.17 against this crate's proven
 //! handler, schema, and consumer triple.
 //!
 //! # Non-goals
