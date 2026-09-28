@@ -44,8 +44,7 @@ use eliot_ors::{
     MaintenanceTriggerIntakeStorageRecord, MaintenanceTriggerLifecyclePageProjection,
     MaintenanceTriggerLifecyclePhase, MaintenanceTriggerLifecycleRecord,
     OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, OrsError,
-    RecoveryPayloadEnvelope,
-    StateFenceSnapshot,
+    RecoveryPayloadEnvelope, StateFenceSnapshot,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 #[cfg(windows)]
@@ -296,9 +295,6 @@ pub enum MaintenanceTriggerLifecycleFailure {
     /// The exact operation receipt exists, but its content, scope, or fence
     /// does not prove the requested decision; the effect remains unknown.
     CanonicalReceiptBindingMismatch,
-    /// The exact canonical receipt cannot prove which prepared transition
-    /// and named mutation operation belong to this trigger revision.
-    PreparedTransitionBindingUnavailable,
     /// This composition has no downstream owner contract that can authenticate
     /// the retention evidence and bind its horizon to the exact retained effect.
     DownstreamRetentionOwnerBindingUnavailable,
@@ -611,6 +607,23 @@ fn maintenance_trigger_downstream_intent_origin_claim(
 }
 
 #[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerDecisionOwnerPayload {
+    operation_id: String,
+    trigger_id: String,
+    operation_hash: String,
+    trigger_revision: u64,
+    evaluation_revision: String,
+    policy_revision: String,
+    scope_ref: String,
+    job_ref: Option<String>,
+    recommendation_ref: Option<String>,
+    wake_ref: Option<String>,
+    decision_json: String,
+}
+
+#[cfg(windows)]
 fn maintenance_trigger_decision_record(
     receipt: &MaintenanceTriggerDecisionReceipt,
 ) -> Result<MaintenanceTriggerCanonicalRecord, MaintenanceTriggerLifecycleFailure> {
@@ -774,7 +787,6 @@ impl MaintenanceTriggerLifecycleFailure {
             | Self::Store { commit_outcome, .. } => *commit_outcome,
             Self::DecisionReceiptUnavailable
             | Self::DownstreamIntentNotBound
-            | Self::PreparedTransitionBindingUnavailable
             | Self::CanonicalReceiptBindingMismatch
             | Self::ReconciliationPersistFailed { .. } => MaintenanceTriggerCommitOutcome::Unknown,
             Self::CanonicalReceiptNotCommitted => MaintenanceTriggerCommitOutcome::NotCommitted,
@@ -2899,6 +2911,12 @@ impl KernelStoreGateway {
         if !maintenance_trigger_receipt_contains_intents(&receipt, decision) {
             return Err(MaintenanceTriggerLifecycleFailure::DownstreamIntentNotBound);
         }
+        self.validate_maintenance_trigger_store_decision_owner(
+            active_state_fence,
+            decision,
+            &receipt,
+        )
+        .await?;
 
         // A replacement claim may recover an older committed effect. Bind
         // receipt recovery to the immutable claim captured with first intent
@@ -2914,10 +2932,97 @@ impl KernelStoreGateway {
         Ok(receipt)
     }
 
+    /// Proves that the canonical receipt was emitted by the named maintenance
+    /// decision mutation with the exact trigger, policy, scope, and intent
+    /// fields presented for acknowledgement. The Store owner row is written in
+    /// the same canonical transaction as its receipt; this same-fence recovery
+    /// read is the binding between that receipt and the trigger revision.
+    #[cfg(windows)]
+    async fn validate_maintenance_trigger_store_decision_owner(
+        &self,
+        active_state_fence: &StateFence,
+        decision: &MaintenanceTriggerDecisionReceipt,
+        receipt: &WriteReceipt,
+    ) -> Result<(), MaintenanceTriggerLifecycleFailure> {
+        let key_bytes = canonical_json_bytes(&(&decision.trigger_id, decision.revision))
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
+        let key = String::from_utf8(key_bytes)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::RecordBindingMismatch)?;
+        let record_key = RecoveryRecordKey::new(
+            eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE,
+            key,
+        )
+        .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+            error,
+            commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+        })?;
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: receipt.state_fence.clone(),
+            records: vec![record_key.clone()],
+            include_receipts: false,
+            include_jobs: false,
+        };
+        request
+            .validate()
+            .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+            })?;
+        let snapshot = self.store.recovery(request).await.map_err(|error| {
+            MaintenanceTriggerLifecycleFailure::Store {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+            }
+        })?;
+        if self.is_fenced() {
+            return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
+        }
+        self.validate_active_route(active_state_fence)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        snapshot
+            .validate()
+            .map_err(|error| MaintenanceTriggerLifecycleFailure::Store {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+            })?;
+        if snapshot.state_fence != receipt.state_fence || snapshot.owner_records.len() != 1 {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        let record = &snapshot.owner_records[0];
+        if record.record_key() != record_key
+            || record.state_fence != receipt.state_fence
+            || record.revision != 1
+            || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        let owner: MaintenanceTriggerDecisionOwnerPayload = serde_json::from_slice(&record.payload)
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalDeserialization)?;
+        let canonical_payload = canonical_json_bytes(&owner)
+            .map_err(MaintenanceTriggerLifecycleFailure::CanonicalSerialization)?;
+        if canonical_payload != record.payload
+            || owner.operation_id != receipt.operation_id.to_string()
+            || owner.trigger_id != decision.trigger_id
+            || owner.operation_hash != decision.operation_hash
+            || owner.trigger_revision != decision.revision
+            || owner.evaluation_revision != decision.evaluation_revision
+            || owner.policy_revision != decision.policy_revision
+            || owner.scope_ref != decision.scope_ref
+            || owner.job_ref != decision.job_ref
+            || owner.recommendation_ref != decision.recommendation_ref
+            || owner.wake_ref != decision.wake_ref
+            || owner.decision_json.trim().is_empty()
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch);
+        }
+        Ok(())
+    }
+
     /// Looks up the exact committed Store receipt retained for one active
     /// delivery. A Store receipt is returned only after canonical digest,
-    /// scope, and every declared intent reference match; it does not by itself
-    /// certify the missing PreparedTransition-to-trigger owner binding.
+    /// scope, every declared intent reference, and the same-transaction named
+    /// decision owner record match the exact trigger revision.
     #[cfg(windows)]
     pub async fn load_maintenance_trigger_decision_receipt(
         &self,
@@ -2984,10 +3089,9 @@ impl KernelStoreGateway {
         Ok(Some(decision))
     }
 
-    /// Validates and reconciles a caller-presented decision receipt. Until a
-    /// named Store operation proves its `PreparedTransition` and trigger-revision
-    /// binding, the exact receipt bytes are retained as downstream intent in
-    /// `Reconciling` and this method reports the closed blocker.
+    /// Validates the caller-presented decision receipt against the committed
+    /// named Store owner row, then records the decision and downstream handoff
+    /// in ORS before returning the receipt for acknowledgement.
     #[cfg(windows)]
     pub async fn record_maintenance_trigger_decision(
         &self,
@@ -3069,8 +3173,13 @@ impl KernelStoreGateway {
             return Err(error);
         }
 
-        if context.lifecycle.phase == MaintenanceTriggerLifecyclePhase::DecisionRecorded {
-            if context.lifecycle.decision_record.as_ref() != Some(&context.record)
+        let decision_record = maintenance_trigger_decision_record(decision)?;
+        if matches!(
+            context.lifecycle.phase,
+            MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                | MaintenanceTriggerLifecyclePhase::Acknowledged
+        ) {
+            if context.lifecycle.decision_record.as_ref() != Some(&decision_record)
                 || context.lifecycle.downstream_intent_record.as_ref() != Some(&intent)
             {
                 return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
@@ -3084,17 +3193,31 @@ impl KernelStoreGateway {
             self.validate_active_route(active_state_fence)
                 .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
             let now_ms = maintenance_trigger_now_ms()?;
-            mark_maintenance_trigger_reconciling_checked(
-                ors,
-                &context.trigger.trigger_id,
-                &context.lifecycle,
-                &context.binding,
-                &intent,
-                now_ms,
-            )
-            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+            let stored = ors
+                .record_maintenance_trigger_decision(
+                    &context.trigger.trigger_id,
+                    context.lifecycle.state_revision,
+                    &context.binding,
+                    decision_record.clone(),
+                    intent.clone(),
+                    now_ms,
+                )
+                .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+            stored
+                .validate()
+                .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
+            if !matches!(
+                stored.phase,
+                MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                    | MaintenanceTriggerLifecyclePhase::Acknowledged
+            ) || stored.decision_record.as_ref() != Some(&decision_record)
+                || stored.downstream_intent_record.as_ref() != Some(&intent)
+                || stored.claim.as_ref() != Some(&context.binding)
+            {
+                return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+            }
         }
-        Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable)
+        Ok(decision.clone())
     }
 
     /// Acknowledges only a previously retained, fully validated decision
@@ -3185,7 +3308,37 @@ impl KernelStoreGateway {
             acknowledgement,
         )
         .await?;
-        Err(MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable)
+        if self.is_fenced() {
+            return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
+        }
+        self.refuse_shadow_mutation()
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ShadowMutationRefused)?;
+        self.validate_active_route(active_state_fence)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        let now_ms = maintenance_trigger_now_ms()?;
+        let stored = ors
+            .acknowledge_maintenance_trigger(
+                &trigger.trigger_id,
+                lifecycle.state_revision,
+                &binding,
+                ack_record.clone(),
+                now_ms,
+            )
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_mutation_error)?;
+        stored
+            .validate()
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
+        let expected_decision_record =
+            maintenance_trigger_decision_record(&acknowledgement.decision_receipt)?;
+        if stored.phase != MaintenanceTriggerLifecyclePhase::Acknowledged
+            || stored.claim.as_ref() != Some(&binding)
+            || stored.decision_record.as_ref() != Some(&expected_decision_record)
+            || stored.downstream_intent_record.as_ref() != Some(&expected_decision_record)
+            || stored.acknowledgement_record.as_ref() != Some(&ack_record)
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        Ok(acknowledgement.clone())
     }
 
     #[cfg(windows)]

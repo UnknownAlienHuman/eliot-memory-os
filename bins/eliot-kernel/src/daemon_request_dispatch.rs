@@ -181,8 +181,7 @@ const MAINTENANCE_TRIGGER_PAGE_RESPONSE_KIND: &str = "maintenance_trigger_page";
 const MAINTENANCE_TRIGGER_CLAIM_RESPONSE_KIND: &str = "maintenance_trigger_claim";
 /// Response kind for one claim-bound retained trigger read.
 #[cfg(windows)]
-const MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND: &str =
-    "maintenance_trigger_delivery_read";
+const MAINTENANCE_TRIGGER_DELIVERY_READ_RESPONSE_KIND: &str = "maintenance_trigger_delivery_read";
 /// Response kind for a recorded or reconciled canonical trigger decision.
 #[cfg(windows)]
 const MAINTENANCE_TRIGGER_DECISION_RESPONSE_KIND: &str = "maintenance_trigger_decision_receipt";
@@ -3665,9 +3664,6 @@ impl KernelComposition {
             }
             MaintenanceTriggerLifecycleFailure::CanonicalReceiptBindingMismatch => {
                 "MAINTENANCE_TRIGGER_CANONICAL_RECEIPT_BINDING_MISMATCH"
-            }
-            MaintenanceTriggerLifecycleFailure::PreparedTransitionBindingUnavailable => {
-                "MAINTENANCE_TRIGGER_PREPARED_TRANSITION_BINDING_UNAVAILABLE"
             }
             MaintenanceTriggerLifecycleFailure::DownstreamRetentionOwnerBindingUnavailable => {
                 "MAINTENANCE_TRIGGER_DOWNSTREAM_RETENTION_OWNER_BINDING_UNAVAILABLE"
