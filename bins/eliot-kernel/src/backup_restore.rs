@@ -30,8 +30,12 @@
 //! ```text
 //! prepare/finalize ......... kernel-restore-owner (destination staging,
 //!                              fence gate, observed evidence);
-//! purge .................... purge owner (`apply_purge_ledger`, staged
-//!                              purge-first before any import);
+//! purge .................... purge owner (`apply_purge_ledger`: every ledger
+//!                              entry is applied through the ORS purge-ledger
+//!                              owner, which issues the revision, and the
+//!                              entries with the revisions they consumed are
+//!                              staged as this phase's evidence, purge-first
+//!                              before any import);
 //! canonical/receipt/
 //! projection/rebuild/verify . canonical owner (`import_*`, chain + count
 //!                              verification over observed destination state);
@@ -102,7 +106,7 @@ use super::backup_restore_ports::{
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
     RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
-    backup_to_kernel, check_kernel_effect_fence, require_production_admitted,
+    backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -152,6 +156,12 @@ mod owners {
     /// a ledger `subject_ref` to archive member identities, so per-member
     /// suppression cannot be computed here. Backlog to M2.
     pub const PURGE_MEMBER_SUPPRESSION: &str = "purge-member-suppression";
+    /// Absent live purge-ledger owner route (#960). The ORS owner is the only
+    /// writer of the purge-ledger revision, so a restore that carries purge
+    /// entries and holds no such owner cannot apply the ledger and refuses
+    /// here rather than staging a ledger that names a revision no owner ever
+    /// issued.
+    pub const PURGE_LEDGER_OWNER: &str = "purge-ledger-owner";
 }
 
 /// Purge owner client: validates the purge ledger through the owner's
@@ -793,6 +803,13 @@ impl KernelBackupRestore {
     /// [`restore`](Self::restore) stays available with its injected `J` seam
     /// unchanged: this method is an additional production entry over the same
     /// single phase engine, not a second engine and not a fallback.
+    ///
+    /// The same `ors` handle is also the purge phase's owner route: it applies
+    /// the archive's purge ledger through
+    /// [`RedbRecoveryStore::apply_purge_ledger_entry`], so the purge-ledger
+    /// revision this restore reports is issued by the one owner that writes it
+    /// (I5.13:44, A13.7) rather than recomputed here, and the ledger is
+    /// applied before any import.
     pub fn restore_with_ors_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -818,7 +835,7 @@ impl KernelBackupRestore {
                 .join(".eliot")
                 .join(RESTORE_JOURNAL_PAYLOAD_AREA),
         )?;
-        self.restore(bundle, target, &admitted, &mut journal)
+        self.restore_with_owner(bundle, target, &admitted, &mut journal, Some(ors))
     }
 
     /// Compiles the governed plan for one archive and target context.
@@ -866,17 +883,47 @@ impl KernelBackupRestore {
     /// replaced, and a resume, a foreign admission, a destination that left
     /// the isolated area, and every path this execution did not write are
     /// preserved rather than removed.
-    #[allow(clippy::too_many_lines)]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "RestoreContext is moved into compile_plan and the isolated destination; the by-value seam keeps the single audited validation gate"
-    )]
+    ///
+    /// This entry holds no ORS owner handle, so it runs the same engine with
+    /// the purge-ledger owner route absent. An archive that carries purge
+    /// entries then refuses in the purge phase with
+    /// [`BackupError::RestoreCapabilityUnsupported`] naming
+    /// `owners::PURGE_LEDGER_OWNER` — see
+    /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
+    /// ledger whose revision no owner ever issued. Production composition runs
+    /// [`restore_with_ors_journal`](Self::restore_with_ors_journal), which
+    /// always supplies that owner.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
         target: RestoreContext,
         ports: &RestorePorts<'_>,
         journal: &mut J,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        self.restore_with_owner(bundle, target, ports, journal, None)
+    }
+
+    /// The single execution body, with the purge ledger's owner route named.
+    ///
+    /// `ors` is the composition-owned [`RedbRecoveryStore`] the purge phase
+    /// applies the archive's purge ledger through. Both public entries reach
+    /// this one body — [`restore_with_ors_journal`](Self::restore_with_ors_journal)
+    /// with the same handle it admits and journals through, and
+    /// [`restore`](Self::restore) with `None` — so there is no second engine,
+    /// no second phase order, and no path that applies a purge ledger without
+    /// the owner that issues its revision.
+    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "RestoreContext is moved into compile_plan and the isolated destination; the by-value seam keeps the single audited validation gate"
+    )]
+    fn restore_with_owner<J: RestoreJournalPort>(
+        &self,
+        bundle: &BackupBundle,
+        target: RestoreContext,
+        ports: &RestorePorts<'_>,
+        journal: &mut J,
+        ors: Option<&std::sync::Arc<RedbRecoveryStore>>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         bundle
             .validate()
@@ -949,7 +996,7 @@ impl KernelBackupRestore {
             None => Vec::new(),
         };
         let mut target_impl =
-            KernelRestoreTarget::new(&self.work_root, &destination, bundle, ports, receipts)
+            KernelRestoreTarget::new(&self.work_root, &destination, bundle, ports, receipts, ors)
                 .map_err(KernelRestoreError::TargetFailed)?;
         let receipt = match plan.execute_with_journal(bundle, &mut target_impl, journal) {
             Ok(receipt) => receipt,
@@ -1381,6 +1428,32 @@ struct ObservedBlobRestore {
     source_plaintext_sha256: String,
 }
 
+/// One purge-ledger revision the ORS owner issued while this restore applied
+/// the entry. The value is the owner's, read from the same transaction that
+/// made the purge durable; it is never recomputed over the entry or over any
+/// count of entries here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AppliedPurgeRevision {
+    purge_id: String,
+    revision: u64,
+}
+
+/// Kernel-observed purge application: the exact ledger entries the archive
+/// carried, each bound to the ledger revision its owner issued.
+///
+/// This is the purge phase's evidence document. It is staged as
+/// `purge_ledger.json` and is the byte string
+/// [`KernelRestoreTarget::effect_receipt`] digests into the phase receipt, so
+/// the owner-issued revisions are carried by the same effect evidence every
+/// other phase already uses — and, through
+/// [`KernelRestoreTarget::group_ref`], by the purge obligation the finalize
+/// evidence publishes.
+#[derive(Serialize)]
+struct ObservedPurgeApplication {
+    entries: Vec<PurgeLedgerEntry>,
+    applied: Vec<AppliedPurgeRevision>,
+}
+
 /// Reconcile observation for one intent: exact applied receipt, proven
 /// non-attempt, or undecidable bytes. Undecidable never becomes success.
 enum ObservedEffect {
@@ -1434,6 +1507,22 @@ struct KernelRestoreTarget<'a> {
     /// rehearsal-prepared root is never continued by a production run and can
     /// never reach cutover qualification.
     rehearsal: bool,
+    /// Composition-owned ORS owner the purge phase applies the archive's
+    /// purge ledger through, when this execution was handed one.
+    ///
+    /// `None` is a real, declared posture — the injected-journal seam
+    /// [`KernelBackupRestore::restore`] has no composition owner to name — and
+    /// the purge phase refuses on it rather than degrading (see
+    /// [`KernelRestoreTarget::apply_purge_ledger`]). It is never a silent
+    /// skip and never a locally allocated revision.
+    ors: Option<std::sync::Arc<RedbRecoveryStore>>,
+    /// Revisions the purge phase actually consumed from the ORS purge-ledger
+    /// owner, in ledger order, retained even when a later step of the same
+    /// phase fails: the owner has already committed them, so a refusal after
+    /// the application still knows exactly which revisions this execution
+    /// spent. [`KernelRestoreTarget::apply_purge_ledger`] projects them into
+    /// the staged phase evidence.
+    applied_purge_revisions: Vec<AppliedPurgeRevision>,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
     /// Bounded output budget derived from the archive before any write.
@@ -1454,6 +1543,7 @@ impl<'a> KernelRestoreTarget<'a> {
         bundle: &BackupBundle,
         ports: &RestorePorts<'a>,
         receipts: Vec<BlobRestorationReceipt>,
+        ors: Option<&std::sync::Arc<RedbRecoveryStore>>,
     ) -> Result<Self, BackupError> {
         Ok(Self {
             root: destination.root().to_path_buf(),
@@ -1465,6 +1555,8 @@ impl<'a> KernelRestoreTarget<'a> {
             receipts,
             manifest_evidence: ports.manifest_evidence.clone(),
             rehearsal: ports.rehearsal,
+            ors: ors.map(std::sync::Arc::clone),
+            applied_purge_revisions: Vec::new(),
             calls: Vec::new(),
             final_evidence: None,
             budget: StagedOutputBudget::derive(bundle)?,
@@ -1477,6 +1569,61 @@ impl<'a> KernelRestoreTarget<'a> {
     /// Re-checks the Kernel effect fence before an applicable phase.
     fn gate(&self, bundle: &BackupBundle) -> Result<(), BackupError> {
         check_kernel_effect_fence(&self.kernel_fence, bundle)
+    }
+
+    /// Applies every archive purge entry through the ORS purge-ledger owner
+    /// and returns the revision that owner issued for each one.
+    ///
+    /// This is the live route to
+    /// [`RedbRecoveryStore::apply_purge_ledger_entry`], the only writer of the
+    /// purge-ledger revision. The revision is the owner's durable fact, read
+    /// from the same transaction that made the purge durable (I5.13:44, A13.7:
+    /// a backup receipt binds a purge-ledger revision and a restore compares
+    /// against the owner's value — it is never recomputed over caller input),
+    /// so an exact replay returns the same revision and consumes nothing, and a
+    /// `purge_id` re-applied with a different entry is refused as an integrity
+    /// conflict. A refusal is mapped with the same
+    /// [`ors_to_backup`](super::backup_restore_ports::ors_to_backup) this crate
+    /// already uses for every other ORS refusal, so the owner's cause crosses
+    /// the seam typed and is never flattened, swallowed, or turned into a
+    /// success.
+    ///
+    /// ## Absent-owner refusal rule
+    ///
+    /// An archive that carries at least one purge entry, restored without the
+    /// composition-owned ORS handle, REFUSES here with
+    /// [`BackupError::RestoreCapabilityUnsupported`] naming
+    /// `owners::PURGE_LEDGER_OWNER`. It does not stage the ledger, does not
+    /// report a revision, and is not a degraded success: the only writer of
+    /// that revision is absent, so there is nothing this owner could honestly
+    /// publish, and an unapplied ledger must never read as applied purge-first
+    /// (A13.7, A0.3: recovery cannot resurrect invalid state). The absence is
+    /// the injected-journal seam's declared posture, not a fallback.
+    ///
+    /// An archive whose purge ledger is empty has nothing to apply, so the
+    /// absence changes nothing that could have been applied: that case applies
+    /// no entry, reports no revision, and is not a skip of an application.
+    fn apply_purge_entries(
+        &self,
+        entries: &[PurgeLedgerEntry],
+    ) -> Result<Vec<AppliedPurgeRevision>, BackupError> {
+        let Some(ors) = self.ors.as_ref() else {
+            if entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(BackupError::RestoreCapabilityUnsupported {
+                capability: owners::PURGE_LEDGER_OWNER,
+            });
+        };
+        let mut applied = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let revision = ors.apply_purge_ledger_entry(entry).map_err(ors_to_backup)?;
+            applied.push(AppliedPurgeRevision {
+                purge_id: entry.purge_id.clone(),
+                revision,
+            });
+        }
+        Ok(applied)
     }
 
     /// Stages one file, refusing BEFORE the write when the bounded output
@@ -2396,7 +2543,20 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
 
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
         PurgeOwnerClient::bind(entries).validate_entries()?;
-        let bytes = canonical_json_bytes(&entries)
+        let applied = self.apply_purge_entries(entries)?;
+        self.applied_purge_revisions = applied;
+        // The staged document is this phase's evidence, so the owner-issued
+        // revisions ride the SAME effect evidence every other phase already
+        // carries: `apply_purge_phase` digests exactly these bytes into its
+        // phase receipt, and finalize binds that receipt through
+        // `group_ref` into the purge obligation the restore evidence
+        // publishes. Nothing here recomputes a revision or counts entries to
+        // stand in for one.
+        let observed = ObservedPurgeApplication {
+            entries: entries.to_vec(),
+            applied: self.applied_purge_revisions.clone(),
+        };
+        let bytes = canonical_json_bytes(&observed)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("purge_ledger.json", &bytes)?;
         Ok(())
