@@ -4719,6 +4719,77 @@ impl UnknownCommitRecord {
 /// contract instead of by a second copy of the same string.
 pub const BACKUP_VERIFICATION_RESULT_RECORD_TYPE: &str = "backup_verification_result";
 
+/// Durable REFERENCE to the immutable archive handle one verification resolved
+/// through the accepted artifact/publication owner (issue #2862 instruction 1).
+///
+/// It is a reference, not a request and not a second artifact identity: it is
+/// the durable projection of `eliot_protocol::backup::BackupArtifactHandle`
+/// into this store's own owner-text spelling, exactly as
+/// [`BackupVerifyRequestIdentity::archive_owner_contract`] already is for the
+/// handle's contract identity. A path, a URL and an inline `bundle_hex` are
+/// none of them: none of the three can be produced here, and the issue forbids
+/// inventing an in-memory handle to make a route green.
+///
+/// It is DIGEST-BOUND in [`BackupVerifyIdentityPreimage`], which is what makes
+/// "the same operation identity presented with a different retained handle" an
+/// I5.27 identity conflict rather than a second answer — acceptance clause 3's
+/// `handle` term. `content_sha256` is the handle's own recorded content digest
+/// and is NOT recomputed here: a stored row proves which handle was bound, and
+/// proving the handle still resolves to those bytes is the artifact owner's
+/// question, not ORS's.
+///
+/// `None` is the owner's own answer on a path where no artifact owner resolved
+/// a handle — the same absence `capture_receipt` and `target_compatibility`
+/// already record, and never a placeholder.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifyArchiveHandleRef {
+    /// Owner-issued identity of the retained artifact.
+    pub artifact_id: String,
+    /// Exact owner contract identity of the retained artifact, in this store's
+    /// own owner-text spelling (the same spelling as
+    /// [`BackupVerifyRequestIdentity::archive_owner_contract`]).
+    pub owner_contract: String,
+    /// Owner revision of the retained content.
+    pub source_revision: String,
+    /// Canonical content digest recorded by the owner on the handle.
+    pub content_sha256: String,
+    /// Exact byte length recorded by the owner on the handle; nonzero.
+    pub byte_length: u64,
+}
+
+impl BackupVerifyArchiveHandleRef {
+    /// Validates the bounded handle reference.
+    ///
+    /// Deliberately shape-only, like every other owner answer on this record:
+    /// ORS stores the owner's handle and interprets no archive, class or
+    /// provenance meaning. `byte_length` is required nonzero because the
+    /// protocol's own handle bounds it the same way, and a zero-length artifact
+    /// is not a retained archive.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.artifact_id, "backup_verify_artifact_artifact_id")?;
+        validate_text(
+            &self.owner_contract,
+            "backup_verify_artifact_owner_contract",
+        )?;
+        validate_text(
+            &self.source_revision,
+            "backup_verify_artifact_source_revision",
+        )?;
+        validate_digest(
+            &self.content_sha256,
+            "backup_verify_artifact_content_sha256",
+        )?;
+        if self.byte_length == 0 {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_artifact_byte_length",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of staging one durable backup-verification result.
 ///
 /// The disposition names what the durable row says about the request, never a
@@ -4924,6 +4995,116 @@ pub(crate) fn classify_backup_verification_two_value_key(
     LegacyTwoValueRelationBackupVerificationClass::Unreadable
 }
 
+/// What a durable key holds when the row there was written under the PRE-#2862
+/// fence-bound verify profile, which carried NO owner-evidence commitments
+/// (#2862).
+///
+/// This is a SEPARATE type from
+/// [`LegacyTwoValueRelationBackupVerificationClass`] and from
+/// [`LegacyUnscopedBackupVerificationClass`] on purpose. The pre-#2883 class is
+/// about a row keyed by CALLER TEXT; the pre-#2863 class is about the two-value
+/// archived-fence vocabulary; and this one is about a correctly scoped,
+/// isolated, fully replayable row that simply predates the retained-handle,
+/// capture-receipt and validity-attestation references. Collapsing any two of
+/// them would lose a fact the route branches on: which legacy answer it is
+/// refusing, and therefore what the caller must do next.
+///
+/// Three-valued for the same reason both siblings are: only the first may lead
+/// to a new row. `Unreadable` means bytes are present that decode as neither
+/// shape, which is an unreadable durable row and must fail CLOSED rather than
+/// read as "absent" and be staged over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyFenceBoundBackupVerificationClass {
+    /// No bytes at all under the probed `v2` key. The pre-#2862 key is free, and
+    /// the current profile's own key was already found empty by the caller, so
+    /// nothing is quarantined here.
+    Absent,
+    /// Bytes are present and decode as a `v2`-profile row: a properly scoped,
+    /// isolated, replayable structural-candidate verification result with no
+    /// owner-evidence reference of any kind. It is LEGACY UNQUALIFIED EVIDENCE:
+    /// replayable as a legacy answer by its own owner, never upgraded, never
+    /// reinterpreted as provenance-bound, and never a source of a current-profile
+    /// answer. A code upgrade does not and cannot make it provenance-bound —
+    /// there is no receipt or attestation in it to read one from.
+    LegacyUnqualified,
+    /// Bytes are present and decode as neither the current record nor the `v2`
+    /// shape. The durable row is unreadable, so no verification result may be
+    /// answered at all.
+    Unreadable,
+}
+
+/// PRE-#2862 `v2`-profile row shape, read only far enough to recognise it.
+///
+/// It is deliberately NOT a full second copy of the old record, for the same
+/// reason its two siblings are not: its only job is to recognise a shape the
+/// current record cannot decode, and a partial shape cannot drift into a second
+/// source of truth for old fields. It is a partial copy for a second, sharper
+/// reason too: a `v2` row's three owner-evidence fields are ABSENT from it, and
+/// naming them here would create a second claim about what such a row carried.
+///
+/// The discriminator is the NESTED `identity.profile_version == 2` together
+/// with the `v2` idempotency namespace. The version is read from `identity`
+/// rather than from a flat field because that is where
+/// [`BackupVerifyRequestIdentity`] has carried it since #2883 and where the `v2`
+/// profile put it; a flat read would be a guess about a shape this struct does
+/// not model, and a guess that silently never matches is the fail-WRONG answer
+/// the probe exists to avoid.
+///
+/// Unknown fields are TOLERATED on purpose. The `v2` row carried more fields
+/// than these, and denying them would reject a genuine legacy row and turn it
+/// into `Unreadable` — reporting corruption for evidence that is intact and
+/// merely old.
+#[derive(Deserialize)]
+struct LegacyFenceBoundBackupVerificationRow {
+    /// The nested request identity, read only far enough to pin the row to the
+    /// pre-#2862 profile.
+    identity: LegacyFenceBoundBackupVerificationIdentity,
+}
+
+/// Nested identity terms of one pre-#2862 row. See
+/// [`LegacyFenceBoundBackupVerificationRow`].
+#[derive(Deserialize)]
+struct LegacyFenceBoundBackupVerificationIdentity {
+    /// The `v2` profile version the row was written under.
+    profile_version: u16,
+    /// The `v2` row's idempotency namespace, which pins the row to the old
+    /// profile independently of the version number.
+    idempotency_namespace: String,
+}
+
+/// Returns whether stored bytes are a pre-#2862 fence-bound scoped row.
+///
+/// It is the recogniser half of
+/// [`classify_backup_verification_fence_bound_key`], which is its only caller,
+/// so there is exactly one place that decides this legacy shape.
+fn is_legacy_fence_bound_backup_verification_row(bytes: &str) -> bool {
+    let Ok(row) = serde_json::from_str::<LegacyFenceBoundBackupVerificationRow>(bytes) else {
+        return false;
+    };
+    row.identity.profile_version == 2
+        && row.identity.idempotency_namespace
+            == PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE
+}
+
+/// Classifies stored bytes at a probed pre-#2862 key as absent, a recognised
+/// legacy fence-bound row, or bytes that are neither shape (#2862).
+///
+/// A current-contract row cannot appear at a `v2` key, and a `v2` row cannot
+/// decode as a current record — its three owner-evidence fields are absent and
+/// the current shape requires them — so this classifier is disjoint from the
+/// current one by construction rather than by convention.
+pub(crate) fn classify_backup_verification_fence_bound_key(
+    bytes: &str,
+) -> LegacyFenceBoundBackupVerificationClass {
+    if serde_json::from_str::<BackupVerificationResultRecord>(bytes).is_ok() {
+        return LegacyFenceBoundBackupVerificationClass::Unreadable;
+    }
+    if is_legacy_fence_bound_backup_verification_row(bytes) {
+        return LegacyFenceBoundBackupVerificationClass::LegacyUnqualified;
+    }
+    LegacyFenceBoundBackupVerificationClass::Unreadable
+}
+
 /// Returns whether stored bytes are a pre-#2883 unscoped row occupying `raw_key`.
 ///
 /// It is the recogniser half of [`classify_backup_verification_key`], which is its
@@ -5091,6 +5272,28 @@ pub struct BackupVerificationResultRecord {
     /// answer on a path where no retained-artifact owner issues one; an absent
     /// receipt is never replaced by a placeholder identity.
     pub capture_receipt: Option<String>,
+    /// #2862: the retained immutable archive handle this answer was produced
+    /// against, retained BOTH flat here and nested in
+    /// [`Self::identity::archive_handle`](BackupVerifyRequestIdentity::archive_handle)
+    /// and cross-checked in [`Self::validate`], for the same reason the other
+    /// four duplicated fields are: without the check a bit-rotted row could
+    /// project a handle the accepted request identity never vouched for.
+    ///
+    /// `None` on every row this owner writes today, because no production
+    /// artifact/publication owner resolves a handle on this path. That absence
+    /// is the owner's own answer and is never a placeholder.
+    pub archive_handle: Option<BackupVerifyArchiveHandleRef>,
+    /// #2862: canonical digest of the owner-issued capture receipt this answer
+    /// relied on, cross-checked against the nested identity. `None` wherever
+    /// `capture_receipt` is `None`: a free-text receipt identity and the
+    /// receipt's own recorded digest are two different values, and the digest is
+    /// the one that is digest-bound and therefore conflict-detecting.
+    pub capture_receipt_digest: Option<String>,
+    /// #2862: canonical digest of the verifier-issued archive validity
+    /// attestation this answer relied on, cross-checked against the nested
+    /// identity. `None` on every row this owner writes today, because no
+    /// `BackupRole::Verifier` session issues one on this product.
+    pub validity_attestation_digest: Option<String>,
     /// Digest over the exact reply body this operation projects. A replay
     /// recomputes it, so a row that cannot rebuild the answer it claims to hold
     /// fails closed instead of projecting one it never produced.
@@ -5182,14 +5385,21 @@ impl BackupVerificationResultRecord {
     /// declared counts and carry no presence flag, because a real count of zero
     /// is a real answer and an absent one is not representable.
     ///
-    /// Four fields are retained BOTH flat on the row and inside the nested
-    /// identity, and all four are cross-checked here. `request_digest` against
+    /// Seven fields are retained BOTH flat on the row and inside the nested
+    /// identity, and all seven are cross-checked here. `request_digest` against
     /// `identity.identity_digest` existed from the start; `archive_sha256`
     /// against `identity.archive_sha256`, `class` against
     /// `identity.evidenced_class`, and `capture_receipt` against
     /// `identity.capture_receipt` are checked for the same reason and were the
-    /// gap this closes. Without them a bit-rotted row could carry
-    /// `identity.archive_sha256 = X` next to `archive_sha256 = Y`, pass every
+    /// gap this closes. #2862 added the fourth group the same way:
+    /// `archive_handle` against `identity.archive_handle`, and
+    /// `capture_receipt_digest` / `validity_attestation_digest` against their
+    /// identity siblings, because those three are the owner-evidence references
+    /// a provenance-qualified answer would rest on and a row that carried a
+    /// different reference flat than nested would project one the accepted
+    /// request identity never vouched for. Without these checks a bit-rotted row
+    /// could carry `identity.archive_sha256 = X` next to `archive_sha256 = Y`,
+    /// pass every
     /// other check, pass the reconciliation archive comparison — which reads the
     /// IDENTITY side — and then project `integrity_sha256 = Y`, a digest the
     /// accepted request identity never vouched for. These checks strictly
@@ -5201,7 +5411,7 @@ impl BackupVerificationResultRecord {
     /// would hide the shape of each comparison. They share one reason string
     /// naming the field pair, declared before the first of them.
     pub fn validate(&self) -> Result<(), OrsError> {
-        /// One shared reason string for all four drift checks, naming the
+        /// One shared reason string for every drift check, naming the
         /// relationship rather than the values so no stored value can leak.
         const DRIFT: &str = "flat field must equal the same field in the nested request identity";
         if self.contract_version != CONTRACT_VERSION {
@@ -5231,6 +5441,39 @@ impl BackupVerificationResultRecord {
                 field: "backup_verification_capture_receipt",
                 reason: DRIFT,
             });
+        }
+        // #2862: the three owner-evidence references are duplicated for the same
+        // reason as the four above, and the check is against the ORIGINAL
+        // RECORDED value in the nested identity — never a recomputation over
+        // what the flat field happens to hold. `archive_handle` compares by
+        // `PartialEq` on the whole reference, so a row cannot carry one handle
+        // flat and a different one nested.
+        if self.archive_handle != self.identity.archive_handle {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_archive_handle",
+                reason: DRIFT,
+            });
+        }
+        if self.capture_receipt_digest != self.identity.capture_receipt_digest {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_capture_receipt_digest",
+                reason: DRIFT,
+            });
+        }
+        if self.validity_attestation_digest != self.identity.validity_attestation_digest {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_validity_attestation_digest",
+                reason: DRIFT,
+            });
+        }
+        if let Some(handle) = &self.archive_handle {
+            handle.validate()?;
+        }
+        if let Some(digest) = &self.capture_receipt_digest {
+            validate_digest(digest, "backup_verification_capture_receipt_digest")?;
+        }
+        if let Some(digest) = &self.validity_attestation_digest {
+            validate_digest(digest, "backup_verification_validity_attestation_digest")?;
         }
         validate_digest(&self.request_digest, "backup_verification_request_digest")?;
         validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
@@ -5295,7 +5538,7 @@ pub const BACKUP_VERIFY_PROFILE_ID: &str = "eliot.kernel.backup-verify.read-only
 /// two versions can never share a key; what the old version does not get is a
 /// read path. Retention and any migration of old rows belong to the ORS
 /// operational retention owner, not here.
-pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 2;
+pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 3;
 /// I5.27 `idempotency_namespace` the PRE-#2863 (`v1`) verify profile used, and
 /// the ONLY thing #2863 changed about the durable key preimage.
 ///
@@ -5316,6 +5559,38 @@ pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 2;
 /// [`LegacyTwoValueRelationBackupVerificationClass`] for the three-valued answer.
 pub const LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE: &str =
     "eliot.kernel.backup-verify.read-only/v1";
+/// I5.27 `idempotency_namespace` the PRE-#2862 (`v2`) verify profile used.
+///
+/// #2862 bumped [`BACKUP_VERIFY_PROFILE_VERSION`] to 3 because the identity
+/// gained the three OWNER-EVIDENCE commitments — the retained
+/// [`BackupVerifyArchiveHandleRef`], the capture-receipt digest and the
+/// validity-attestation digest — and the stored answer gained the same three
+/// references. Those three are in [`BackupVerifyIdentityPreimage`], so the
+/// canonical request hash of an otherwise identical request MOVED: a `v2` row is
+/// therefore not the same operation as the `v3` row a caller now produces, and
+/// reusing one key for the other is exactly the silent reinterpretation I5.27
+/// forbids. A bump is a new namespace by construction, so the two versions can
+/// never share a key.
+///
+/// A new namespace alone is not enough, for the same reason #2863 stated: a `v2`
+/// row simply becomes unreachable, and an unreachable row read as "absent" is the
+/// fail-OPEN outcome — the caller would re-run a key that already holds a stored
+/// answer and stage a second row beside it. This constant is what lets the route
+/// ADDRESS the row a pre-#2862 install actually wrote, so it can be recognised
+/// and reported as legacy UNQUALIFIED evidence instead. See
+/// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`] and
+/// [`LegacyFenceBoundBackupVerificationClass`].
+///
+/// The migration rule is exactly the one #2863 already established, and it is
+/// deliberately a QUARANTINE rather than a conversion: nothing here re-keys,
+/// rewrites, upgrades, backfills or projects a `v2` row. A `v2` row stays the
+/// exact historical structural-candidate result it was — it does not become
+/// provenance-bound by a code upgrade, because ORS never reads its level as
+/// anything but what its own owner recorded. A caller that wants the stronger
+/// level submits a NEW explicit verification operation, which is a new
+/// `operation_id` and therefore a different legacy key that reads `Absent`.
+pub const PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE: &str =
+    "eliot.kernel.backup-verify.read-only/v2";
 /// Retention/collision window this durable table is now a member of (I5.27
 /// `retention_and_collision_window`).
 ///
@@ -5642,6 +5917,32 @@ pub struct BackupVerifyRequestIdentity {
     /// Owner-issued publication receipt identity, explicitly absent when the owner
     /// issued none. Absence is the owner's own answer, never a placeholder.
     pub capture_receipt: Option<String>,
+    /// #2862: the retained immutable archive handle this verification resolved
+    /// through the accepted artifact/publication owner, or `None` when no such
+    /// owner resolved one on this path.
+    ///
+    /// It is DIGEST-BOUND (it is in [`BackupVerifyIdentityPreimage`]) so a
+    /// different handle under one operation identity is the I5.27 conflict
+    /// acceptance clause 3 names, not a second answer. It is an ANSWER, never a
+    /// key component: a handle is a content reference, and a caller-movable key
+    /// component would be a caller-movable durable namespace. See
+    /// [`BackupVerifyArchiveHandleRef`].
+    pub archive_handle: Option<BackupVerifyArchiveHandleRef>,
+    /// #2862: canonical digest of the owner-issued `BackupCaptureReceipt` that
+    /// proves the retained capture, or `None` when the capture owner issued
+    /// none. DIGEST-BOUND for the same reason.
+    ///
+    /// It is the RECORDED digest of the owner's own receipt, not a digest ORS
+    /// recomputed: the receipt is the capture owner's contract and ORS never
+    /// parses one. It is a reference, and reference equality is what makes
+    /// "a receipt for another archive, class, source, fence or owner" a
+    /// conflict on this key instead of a silently accepted answer.
+    pub capture_receipt_digest: Option<String>,
+    /// #2862: canonical digest of the verifier-issued
+    /// `BackupArchiveValidityAttestation` for this archive, or `None` when no
+    /// `BackupRole::Verifier` session issued one. DIGEST-BOUND for the same
+    /// reason, and it is the RECORDED digest, never a recomputed one.
+    pub validity_attestation_digest: Option<String>,
     /// I5.27 `retention_and_collision_window`: the named ORS operational
     /// retention/export contract this durable row is a member of.
     pub retention_and_collision_window: String,
@@ -5869,6 +6170,48 @@ impl BackupVerifyRequestIdentity {
         Ok(sha256_hex(&bytes))
     }
 
+    /// Computes the durable key a PRE-#2862 install would have written for this
+    /// same operation (#2862).
+    ///
+    /// It is the same construction as
+    /// [`Self::legacy_two_value_namespace_digest`] and changes exactly ONE
+    /// preimage entry: `idempotency_namespace`, forced to
+    /// [`PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE`]. That is sound
+    /// because #2862 changed no KEY component: `domain_separator`,
+    /// `canonical_encoding_version`, `semantic_command_kind`, `principal`, the
+    /// authority LINEAGE, `operation_id` and `retention_and_collision_window`
+    /// are byte-identical across the two profile versions. The three terms #2862
+    /// added (`archive_handle`, `capture_receipt_digest`,
+    /// `validity_attestation_digest`) are ANSWERS and reach neither the key nor
+    /// this reconstruction — which is the whole point: a row stored under `v2`
+    /// carries no owner-evidence commitment at all, and reconstructing its key
+    /// from a `v3` request is a reconstruction of a DIFFERENT request's key for
+    /// the eight components the two profiles share.
+    ///
+    /// It exists so the route can ask a scoped question about a `v2` row rather
+    /// than letting the version bump quietly turn it into "absent". What it may
+    /// be used for is bounded: it locates a row to be CLASSIFIED as legacy
+    /// unqualified evidence. Nothing here re-keys, rewrites, upgrades or projects
+    /// a legacy row, and a caller that wants the owner-evidence level submits a
+    /// NEW operation id, which is a different key that reads `Absent`.
+    pub fn legacy_fence_bound_namespace_digest(&self) -> Result<String, OrsError> {
+        let preimage = serde_json::json!({
+            "authority_lineage_id": self.authority_epoch.lineage_id.as_str(),
+            "canonical_encoding_version": self.canonical_encoding_version,
+            "domain_separator": self.domain_separator.as_str(),
+            "idempotency_namespace": PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE,
+            "operation_id": self.operation_id.as_str(),
+            "principal": self.principal.as_str(),
+            "retention_and_collision_window": self.retention_and_collision_window.as_str(),
+            "semantic_command_kind": self.semantic_command_kind.as_str(),
+        });
+        let bytes = canonical_json_bytes(&preimage).map_err(|_| OrsError::InvalidField {
+            field: "backup_verify_legacy_fence_bound_namespace",
+            reason: "canonical legacy namespace bytes are not serializable",
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validates the profile pins, the owner/authenticated text shapes, the
     /// digest shapes and the self-consistent digest.
     ///
@@ -5973,6 +6316,18 @@ impl BackupVerifyRequestIdentity {
         if let Some(receipt) = &self.capture_receipt {
             validate_text(receipt, "backup_verify_identity_capture_receipt")?;
         }
+        // #2862: the three owner-evidence commitments. Each is shape-checked and
+        // each is DIGEST-BOUND, so a present value cannot be edited in place
+        // without moving `identity_digest` and failing the check below.
+        if let Some(handle) = &self.archive_handle {
+            handle.validate()?;
+        }
+        if let Some(digest) = &self.capture_receipt_digest {
+            validate_digest(digest, "backup_verify_identity_capture_receipt_digest")?;
+        }
+        if let Some(digest) = &self.validity_attestation_digest {
+            validate_digest(digest, "backup_verify_identity_validity_attestation_digest")?;
+        }
         if self.identity_digest != self.compute_digest()? {
             return Err(OrsError::InvalidField {
                 field: "backup_verify_identity_identity_digest",
@@ -6024,6 +6379,13 @@ struct BackupVerifyIdentityPreimage<'a> {
     archived_fence_digest: &'a str,
     evidenced_class: &'a str,
     capture_receipt: &'a Option<String>,
+    /// #2862: the three OWNER-EVIDENCE commitments. All three are digest-bound,
+    /// which is what makes a changed handle, a changed capture receipt and a
+    /// changed validity attestation each an I5.27 identity conflict under one
+    /// operation identity rather than a second answer.
+    archive_handle: &'a Option<BackupVerifyArchiveHandleRef>,
+    capture_receipt_digest: &'a Option<String>,
+    validity_attestation_digest: &'a Option<String>,
     retention_and_collision_window: &'a str,
 }
 
@@ -6052,6 +6414,9 @@ impl<'a> From<&'a BackupVerifyRequestIdentity> for BackupVerifyIdentityPreimage<
             archived_fence_digest: identity.archived_fence_digest.as_str(),
             evidenced_class: identity.evidenced_class.as_str(),
             capture_receipt: &identity.capture_receipt,
+            archive_handle: &identity.archive_handle,
+            capture_receipt_digest: &identity.capture_receipt_digest,
+            validity_attestation_digest: &identity.validity_attestation_digest,
             retention_and_collision_window: identity.retention_and_collision_window.as_str(),
         }
     }
