@@ -1446,33 +1446,23 @@ impl UserAutomationOperatorTransition {
                         let occurrence_id = invocation
                             .occurrence_identity()
                             .map_err(|error| error.to_string())?;
+                        // The execution phase is bound to the committed
+                        // occurrence, not to the wake readback. A manual
+                        // `run-now` nonce owns no scheduler wake, so the Host
+                        // journal legitimately retains none and that read stays
+                        // unresolved; an unresolved wake phase must not be
+                        // mistaken for a missing Durable Job admission. The
+                        // load-bearing binding — the admitted job's own
+                        // occurrence identity against this committed one — is
+                        // the `Admitted` arm's guard below; every other
+                        // disposition carries a reason this same owner produced.
                         match &self.execution {
                             UserAutomationExecutionPhase::Admitted { execution }
-                                if execution.occurrence_id == occurrence_id
-                                    && matches!(
-                                        &self.wake,
-                                        UserAutomationWakePhase::Published { .. }
-                                    ) => {}
-                            UserAutomationExecutionPhase::Deferred { reason }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) || (matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::UnknownOutcome { .. }
-                                        | UserAutomationWakePhase::Unavailable { .. }
-                                ) && matches!(
-                                    reason,
-                                    UserAutomationDeferReason::Paused
-                                        | UserAutomationDeferReason::Retired
-                                )) => {}
-                            UserAutomationExecutionPhase::BlockedConfig { .. }
+                                if execution.occurrence_id == occurrence_id => {}
+                            UserAutomationExecutionPhase::Deferred { .. }
+                            | UserAutomationExecutionPhase::BlockedConfig { .. }
                             | UserAutomationExecutionPhase::UnknownOutcome { .. }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) => {}
-                            UserAutomationExecutionPhase::Unavailable { .. } => {}
+                            | UserAutomationExecutionPhase::Unavailable { .. } => {}
                             _ => {
                                 return Err(
                                     "RunNow execution phase does not join its committed occurrence"
