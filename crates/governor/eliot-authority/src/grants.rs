@@ -1225,7 +1225,11 @@ impl GrantGraph {
                     || (known.operation_id() == evidence.operation_id()
                         && known.canonical_request_digest() != evidence.canonical_request_digest())
             });
-            if duplicate_identity || transitions.insert((parent_id, child_id), evidence).is_some() {
+            if duplicate_identity
+                || transitions
+                    .insert((parent_id, child_id), evidence)
+                    .is_some()
+            {
                 return Err(AuthorityError::IdentityConflict);
             }
         }
