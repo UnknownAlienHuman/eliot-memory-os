@@ -5,6 +5,12 @@
 //! A store bridge supplies already-fenced records and completed blob receipts;
 //! this crate validates their relationship, computes deterministic digests, and
 //! exposes a layout writer for an injected section codec.
+//!
+//! The exchange has both halves. [`EcxfArchive::build`] and
+//! [`EcxfArchive::layout`] write one package, and [`import_ecxf_package`] reads
+//! one back, checking every member against the digest the package itself
+//! recorded. Neither half is a backup or a restore decision: this crate decides
+//! nothing about cutover, revocation or the current Store generation.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
@@ -1113,6 +1119,11 @@ pub struct EcxfImport {
 
 impl EcxfImport {
     /// The recorded blob digests, keyed by residency-keyed entry path.
+    ///
+    /// Issue #1141: the restore owner needs the sealed identity of each
+    /// admitted blob without re-deriving it, and this map is built from the
+    /// digests the package recorded rather than from anything the caller
+    /// supplied.
     pub fn blob_digests(&self) -> BTreeMap<&str, &str> {
         self.blobs
             .iter()
@@ -1162,6 +1173,10 @@ fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError
 /// filesystem, and it decides nothing about cutover, revocation or the current
 /// Store generation. It returns a validated artifact; the owner that admitted
 /// the export decides whether it may become current state.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear admission path: members, recorded digests, ledger, schema, sections, blobs, completeness"
+)]
 pub fn import_ecxf_package(
     files: &BTreeMap<String, Vec<u8>>,
     codec: &dyn SectionCodec,
@@ -1274,7 +1289,16 @@ pub fn import_ecxf_package(
                 "section member {member} exceeds MAX_SECTION_BYTES"
             )));
         }
+        // Bounding the encoded member is not enough: a codec that expands its
+        // input must not be able to hand back an unbounded buffer either, so
+        // the decoded canonical bytes are bounded by the same limit. Archive
+        // extraction stays bounded (issue #1141, mutable scope).
         let canonical_ndjson = codec.decode(encoded)?;
+        if canonical_ndjson.len() > MAX_SECTION_BYTES {
+            return Err(EcxfError::Codec(format!(
+                "decoded section member {member} exceeds MAX_SECTION_BYTES"
+            )));
+        }
         if sha256_hex(&canonical_ndjson) != *recorded_digest {
             return Err(EcxfError::DigestMismatch {
                 subject: member.clone(),
