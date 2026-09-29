@@ -79,7 +79,19 @@ fn parse_legacy_index_row(
             field: "row.strength",
         });
     }
-    let _ = (legacy.negative_memory, legacy.token_estimate);
+    // A legacy index row carrying the negative-memory marker describes a
+    // blocking rule, and that semantic is owned outside this facade (#1731
+    // negative-memory records). `LegacyEliotCuesV1Row` has no field for it,
+    // so accepting the row and dropping the flag would recast a blocking rule
+    // as an ordinary positive cue: the marker would silently vanish and the
+    // row could then reach replay or v1-to-v2 conversion as a plain current
+    // key, bypassing the negative-memory owner entirely. The marker is
+    // therefore refused rather than discarded. `token_estimate` is a size
+    // bound with no semantic standing and stays unread.
+    if legacy.negative_memory {
+        return Err(FacadeError::NegativeMemoryRuleRefused);
+    }
+    let _ = legacy.token_estimate;
     if is_blank_or_control(&legacy.record_kind) || is_blank_or_control(&legacy.lifecycle) {
         return Err(FacadeError::LegacyBytesInvalid {
             field: "row.legacy_metadata",
