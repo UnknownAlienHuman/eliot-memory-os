@@ -24,14 +24,21 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 17039,
+    "source_stu": 21688,
     "test_stu": 22095,
-    "selected_file_count": 5,
+    "selected_file_count": 6,
     "inline_cfg_test_modules": 0,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
   },
   "selected_source_and_tests": {
     "selected_source": [
+      {
+        "path": "crates/smart/eliot-cue-activation/src/derived_stage.rs",
+        "bytes": 3446,
+        "sha256": "a975ff5daa2b88e81e70442c104580a18e4f2a7a765cfb587fb0fe062b66d6b7",
+        "stu": 1149,
+        "inline_cfg_test": false
+      },
       {
         "path": "crates/smart/eliot-cue-activation/src/error.rs",
         "bytes": 791,
@@ -41,16 +48,16 @@
       },
       {
         "path": "crates/smart/eliot-cue-activation/src/evaluate.rs",
-        "bytes": 38874,
-        "sha256": "d17d4d802a7ace1b9d0fb84837ec893828e6227169caa09e7d1f577d0618eef7",
-        "stu": 12958,
+        "bytes": 49351,
+        "sha256": "7e88fbd77be1ab66343775dc7e77e038239b3fe7b1ee0714e865cbcbde410f14",
+        "stu": 16451,
         "inline_cfg_test": false
       },
       {
         "path": "crates/smart/eliot-cue-activation/src/lib.rs",
-        "bytes": 1138,
-        "sha256": "8f58d090abb5e0275558b8eb71b178cc368b14297e622a10f9d085ec58086816",
-        "stu": 380,
+        "bytes": 1161,
+        "sha256": "4aa3abe9fadbcef27bba169d4097d4b27eda7a2f1a569a51946014c39e4050d7",
+        "stu": 387,
         "inline_cfg_test": false
       },
       {
@@ -71,7 +78,7 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "2b7fd3c1e2afc5fbca194f66ea28730334b7e8297f8eb5b68413b291e064f53d"
+    "source_selection_digest": "b9f0d9122f1fcdb0ba7cfa02649c1bcdbd140aca00919c9e99d7f757c06c4ee6"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -114,20 +121,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "c5cbc8edcac6ca52542b5104fcf1d6cc395267ba1ddb3902040ddfee24f11c2a",
+  "bound_contract_digest": "4b4419dc45ec878ecc9fc902a8812bad99bfcdf80a5b76e76221320633a94699",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -139,19 +146,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-cue-activation/module.toml",
-        "sha256": "3bc89577f1ff5d5e303d60dbd7940697540a5636c0eef7328afff378a7c2017f"
+        "sha256": "e96ed1db38a3369bfa2ec3c40276db6c30437271f0bc52abe4f1776d95f7069d"
       },
       "selected_source": {
-        "path_count": 5,
-        "sha256": "2b7fd3c1e2afc5fbca194f66ea28730334b7e8297f8eb5b68413b291e064f53d"
+        "path_count": 6,
+        "sha256": "b9f0d9122f1fcdb0ba7cfa02649c1bcdbd140aca00919c9e99d7f757c06c4ee6"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "4bedd093845a0deb769fe6db1ece29155fcd2992f8563b74582b7e5bc3c388c3",
+  "artifact_digest": "78ef58574ec4eb75ff85acefce38b246e6305033e851a20ab025a103cebffad6",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "4bedd093845a0deb"
+    "value": "78ef58574ec4eb75"
   }
 }

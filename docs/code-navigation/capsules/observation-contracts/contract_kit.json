@@ -205,15 +205,15 @@
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -226,15 +226,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 9,
-        "sha256": "dc13fcd6428900df2e48c49a9527260ae55b6318cb3c7cba173e9840da498702"
+        "sha256": "59d084a080c27e3eff104f3bec134a7a85f138e910c79b7cb7f3299355644bb2"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "70c5e93f8817eeb3fe61699603a2aaaa7e5573b21734e78f6b4a65985d5a5f60",
+  "artifact_digest": "4e8854652102f9cccac264b5c0736075db3e812def6b265b1d4026e505ea4883",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "70c5e93f8817eeb3"
+    "value": "4e8854652102f9cc"
   }
 }

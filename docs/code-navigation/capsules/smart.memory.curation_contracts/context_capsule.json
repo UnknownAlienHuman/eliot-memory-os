@@ -184,20 +184,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "a5fc7dbc1b90741ef0f3a56f6805bbfdf4ee5a87012761bff48dabfd579a7b99",
+  "bound_contract_digest": "609acb7dbf865787150bb5754c6fd0a6eedca73cd0e7edfac7d2c506005425ae",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -209,7 +209,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-memory-curation-contracts/module.toml",
-        "sha256": "c42786d9d834de80347e791c48cc7a581c50a669e029fe85ed2a23d3a29fc839"
+        "sha256": "96fcab9f11bc9178e77b7fe0b02e95298972aba9eb20b73c732bf7abe89954a9"
       },
       "selected_source": {
         "path_count": 14,
@@ -219,9 +219,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "f322297858b6d769e185d27b0650defa54374a6bc810382637e13250868a8a3a",
+  "artifact_digest": "cba6640fa3c8725c52502b45d936287ebb113098b25f79f605ddf9d08d42e184",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "f322297858b6d769"
+    "value": "cba6640fa3c8725c"
   }
 }

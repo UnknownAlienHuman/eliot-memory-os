@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 115126,
+    "source_stu": 117047,
     "test_stu": 0,
     "selected_file_count": 1,
     "inline_cfg_test_modules": 1,
@@ -34,14 +34,14 @@
     "selected_source": [
       {
         "path": "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs",
-        "bytes": 345376,
-        "sha256": "d53aed6674ac7e8181d30683d7eaf168d268466e04e53e1250c23daf60b95316",
-        "stu": 115126,
+        "bytes": 351139,
+        "sha256": "5d065ce07353e6de88a3bf5322568d2f4f2150bcead971280957a6188dda5c2a",
+        "stu": 117047,
         "inline_cfg_test": true
       }
     ],
     "selected_tests": [],
-    "source_selection_digest": "2ee75ccf36942f9a2e67160191651416fbd7b7ffad88703704bcbed6bbd6d2d0"
+    "source_selection_digest": "5958270271aae00e8a384b9fe14f70d53c3183145b4ae425c1d36cc9fb8a240c"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -79,20 +79,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "606c3429ecb96c3fd4474bfa30e25fbe954b0b6c4a0f31c37038c31ef426687e",
+  "bound_contract_digest": "817b9f3bdcfa2ce732fccd12129192a8ad2b298586f3e2300e891b6db4d38057",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -104,19 +104,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-conflict-analysis/module.toml",
-        "sha256": "0c95679c7f73456879325dcb50cdadd7e530eb50678cb090325b1677a7ba6ffd"
+        "sha256": "66b5f47e06ac12c6ba92e37a9ad8b16806313dc52ef9e24c3bf6a28ef5e24962"
       },
       "selected_source": {
         "path_count": 1,
-        "sha256": "2ee75ccf36942f9a2e67160191651416fbd7b7ffad88703704bcbed6bbd6d2d0"
+        "sha256": "5958270271aae00e8a384b9fe14f70d53c3183145b4ae425c1d36cc9fb8a240c"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "8ac74b1b123a5fc9bcf7131dbca1a4495c8849ca7ac49c45edf2e62afcf86b3c",
+  "artifact_digest": "9bcc99529fd20e4b4d7eaa291875eab761ddbf7ca1afbd914260d86c0a12a93e",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "8ac74b1b123a5fc9"
+    "value": "9bcc99529fd20e4b"
   }
 }

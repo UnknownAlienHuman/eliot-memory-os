@@ -89,20 +89,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "a5e3172c808b4ee29b3613726348e9259843048c83bb4bf305886150b932c7d8",
+  "bound_contract_digest": "7c6d721fd8ce8e831c5a7049692dcd59fda4717845737ca4a445c8a5191901d7",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -114,7 +114,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-experience-provider/module.toml",
-        "sha256": "688bf8adbd31c80e0decd438e5e5c3de21f8852720d795f6a2904d70b80068af"
+        "sha256": "1cd58a1aa7370217d368b908a2a9c0ce70c48a09bd159c91e63d730f6a8c6f08"
       },
       "selected_source": {
         "path_count": 1,
@@ -124,9 +124,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "c1d8eedd8e44076afa395bf3af70daf1759c05fbcad0f48dacb2c65cc853b112",
+  "artifact_digest": "b95a992610b4d3be43167d3b80836167d4cd90b0ec01094b784e6fc552b1af6c",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "c1d8eedd8e44076a"
+    "value": "b95a992610b4d3be"
   }
 }

@@ -166,20 +166,20 @@
     "test_stu": 42131,
     "nonzero": true
   },
-  "bound_contract_digest": "e686330617798b2ebea8c3d94d1a79667b50fbf2172a3f7daca1aee2edf7f028",
+  "bound_contract_digest": "9cfb49b7d31b7a92f582ae94a85a5f9b31fa98d9d7aa41881c60012f128b1f14",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -191,7 +191,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-reactive-context-plan/module.toml",
-        "sha256": "55b43daaa62c12e600b41f258649f9d17c63b73f2710e58dc5542fa07de83b55"
+        "sha256": "450e038bb8b5d1a7702c79b4149d87dff68ae84b1eb6dbbb9a50bf8f10d174c5"
       },
       "selected_source": {
         "path_count": 15,
@@ -201,9 +201,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "52394023b981bfa787c85ef0bedeee4a8c40da30329bc12734a58a34f8187f15",
+  "artifact_digest": "34d557dfdec2c0f2b20e18382e8083f1e5d2422f74bc0cdc889c3dd35b7cae2c",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "52394023b981bfa7"
+    "value": "34d557dfdec2c0f2"
   }
 }

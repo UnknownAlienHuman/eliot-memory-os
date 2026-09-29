@@ -20,11 +20,11 @@
     "root_path": "crates/surfaces/eliot-controlboard",
     "manifest_path": "crates/surfaces/eliot-controlboard/Cargo.toml",
     "module_manifest": null,
-    "description": "Provider-neutral role-filtered ELIOT ControlBoard contract (bounded reference fixture; bins/eliotd production daemon composition)"
+    "description": "Provider-neutral role-filtered ELIOT ControlBoard contract (bounded reference fixture; only reverse dependency is source-reachable)"
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 60585,
+    "source_stu": 62029,
     "test_stu": 0,
     "selected_file_count": 4,
     "inline_cfg_test_modules": 4,
@@ -34,16 +34,16 @@
     "selected_source": [
       {
         "path": "crates/surfaces/eliot-controlboard/src/lib.rs",
-        "bytes": 119814,
-        "sha256": "a3b6b8b2d65a58cb76f8a8482994c7d72358fa704af67c043cf174cbd7ef7b11",
-        "stu": 39938,
+        "bytes": 124041,
+        "sha256": "5d0db8a99fae9f223e6a307b4e298a74484d2c4c5235bca5c5825d683000b8cb",
+        "stu": 41347,
         "inline_cfg_test": true
       },
       {
         "path": "crates/surfaces/eliot-controlboard/src/notification_projection.rs",
-        "bytes": 15428,
-        "sha256": "dc5f63f1eb7c1fc54966c11c7bed74ad53306331cd113fdc8c6cb277e1ccec52",
-        "stu": 5143,
+        "bytes": 15533,
+        "sha256": "aed9ba78607af80f4fc27ce52df5ae956daad01cd99c78d1f6d1be035d869e12",
+        "stu": 5178,
         "inline_cfg_test": true
       },
       {
@@ -62,7 +62,7 @@
       }
     ],
     "selected_tests": [],
-    "source_selection_digest": "a91a9c2fa642f5c198a72c53d85e8b694d9b7c2ee44cd65e35996b0cae063d2b"
+    "source_selection_digest": "0e698254084e27f5e0e31011f6cb6f169901361cff5656190ef00a52706f2ae4"
   },
   "one_hop_providers": [
     "eliot-agent-coordinator",
@@ -110,20 +110,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "78016a894be07655c9ade73340f6860402dc804b50b6b55a684691dee16f6e9b",
+  "bound_contract_digest": "1f119d2abff584e536e4b1796f831ce219c49a9453bd05b3078a50e490f921e0",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -131,20 +131,20 @@
       },
       "package_manifest": {
         "path": "crates/surfaces/eliot-controlboard/Cargo.toml",
-        "sha256": "58defd22e87d32c6c6570a83d539715b9309eb27344bae2fcef96e5691e250bc"
+        "sha256": "f11df9fa4f7802dd230b03f20a77b09bece6de44ea46e9aa2fed03db04cc2d01"
       },
       "module_manifest": null,
       "selected_source": {
         "path_count": 4,
-        "sha256": "a91a9c2fa642f5c198a72c53d85e8b694d9b7c2ee44cd65e35996b0cae063d2b"
+        "sha256": "0e698254084e27f5e0e31011f6cb6f169901361cff5656190ef00a52706f2ae4"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "913a71f4335e11b297127ed67a8910afb9d2f55cff76c80716415a747f5350a4",
+  "artifact_digest": "65363b0938cc4f75f2a73e0f9bbe29500821cff72f0cf1c66a3530e6009f9c63",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "913a71f4335e11b2"
+    "value": "65363b0938cc4f75"
   }
 }

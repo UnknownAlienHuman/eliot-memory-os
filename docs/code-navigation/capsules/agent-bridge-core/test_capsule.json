@@ -50,8 +50,8 @@
     "selected_tests": [
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/tests/bridge_contract.rs",
-        "bytes": 60516,
-        "sha256": "afc91245c8e026536c73f640b1204e6d404e095784cea4fc074fdda91b62f004",
+        "bytes": 64054,
+        "sha256": "9888f9e4cce4abe9c771ce21c9e702f5cc8f347962a04442dbf3e2a537faf5e3",
         "test_attributes": 33,
         "inline_cfg_test": false,
         "classes": [
@@ -79,8 +79,8 @@
       },
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/tests/terminal_reconciliation_inputs.rs",
-        "bytes": 15378,
-        "sha256": "a715f9473e869ea5359aba8a3fe63fc95380404e58a8025f8daecdd3d3a22848",
+        "bytes": 19719,
+        "sha256": "cdce38be97787453e1eaa5d337495a0351630b097e4e37af815e09161e1d024c",
         "test_attributes": 2,
         "inline_cfg_test": false,
         "classes": [
@@ -143,23 +143,23 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 63,
-    "test_stu": 34219,
+    "test_stu": 36845,
     "nonzero": true
   },
-  "bound_contract_digest": "a048b00e43be43a79430ee37e22bde0beeb35e3f6f7849cb01ea11b7620548a5",
+  "bound_contract_digest": "0540e54d75603e447d81e31958267818015699630d7be5ce339cb8d90c4a6682",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -172,15 +172,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 9,
-        "sha256": "f8bf7c087c3e475a6f50d8bfb898dbb7534a9608e84a9bacee9904dde4bd8cc8"
+        "sha256": "45cce79be2a437498dce438366e6aa989fba686c736c7b14c36b7371b8f239a4"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "4091a5d53c61a8a20e2db1b836ca8590a60f4758e7bf9d256d6404585fd1a8fd",
+  "artifact_digest": "a47c9b38a6f2d2eab491d89d152a7ca21005f62b7c85f4dbc6afd3a5aa643bfb",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "4091a5d53c61a8a2"
+    "value": "a47c9b38a6f2d2ea"
   }
 }

@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 72521,
+    "source_stu": 82979,
     "test_stu": 1152,
     "selected_file_count": 9,
     "inline_cfg_test_modules": 3,
@@ -34,9 +34,9 @@
     "selected_source": [
       {
         "path": "crates/foundation/eliot-observation-contracts/src/continuity.rs",
-        "bytes": 45448,
-        "sha256": "7182bcc21d647aed79c04ae2067825d047fe335b71bcb8a3c91b5e9eac462dbe",
-        "stu": 15150,
+        "bytes": 52891,
+        "sha256": "301e26f93947f6970f1d6a76a29e39c01e0330d744dc37ae0b9c1e3769ca7ab5",
+        "stu": 17631,
         "inline_cfg_test": true
       },
       {
@@ -69,16 +69,16 @@
       },
       {
         "path": "crates/foundation/eliot-observation-contracts/src/lib.rs",
-        "bytes": 38388,
-        "sha256": "ff0c2d14f946d7f386fcf2506cacd9b7b0b67b866f365350335a49a637f4d646",
-        "stu": 12796,
+        "bytes": 62286,
+        "sha256": "dfe3fc25ed247f091feb0ea1b76dd9b6d3197970acee5073bfe410a834f3ee9f",
+        "stu": 20762,
         "inline_cfg_test": true
       },
       {
         "path": "crates/foundation/eliot-observation-contracts/src/record_family_v2.rs",
-        "bytes": 38229,
-        "sha256": "b18732e3fc80c9b0ac0cdbb5408c42e016ae7307948548214eb58b6ec1e2aba4",
-        "stu": 12743,
+        "bytes": 38263,
+        "sha256": "b7347ac6ce063eeda1ff7b61f895a42fd3a9ebfce83a78baa2e201d107c880bb",
+        "stu": 12755,
         "inline_cfg_test": true
       },
       {
@@ -99,7 +99,7 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "dc13fcd6428900df2e48c49a9527260ae55b6318cb3c7cba173e9840da498702"
+    "source_selection_digest": "59d084a080c27e3eff104f3bec134a7a85f138e910c79b7cb7f3299355644bb2"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -114,6 +114,7 @@
     "bins/eliot-host",
     "bins/eliot-wasm-host",
     "bins/eliotd",
+    "crates/agent/eliot-agent-api",
     "crates/governor/eliot-governor",
     "crates/governor/eliot-memory-projection-provider",
     "crates/governor/eliot-observation",
@@ -164,20 +165,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "70c5e93f8817eeb3fe61699603a2aaaa7e5573b21734e78f6b4a65985d5a5f60",
+  "bound_contract_digest": "4e8854652102f9cccac264b5c0736075db3e812def6b265b1d4026e505ea4883",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -190,15 +191,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 9,
-        "sha256": "dc13fcd6428900df2e48c49a9527260ae55b6318cb3c7cba173e9840da498702"
+        "sha256": "59d084a080c27e3eff104f3bec134a7a85f138e910c79b7cb7f3299355644bb2"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "8c02d37266f2fd51ab4fcfe1ad3df1f3d105cdba3a92ec78d7d1ceb19c368a14",
+  "artifact_digest": "7fc4cf9fb7e641a34a54e374f997f9f439b4e7dbc90b8efd059f1aef7433fd38",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "8c02d37266f2fd51"
+    "value": "7fc4cf9fb7e641a3"
   }
 }
