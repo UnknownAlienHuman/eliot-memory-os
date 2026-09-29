@@ -43,9 +43,9 @@ pub use canonical_store::{
 pub use control_reserve::{
     STORE_BACKPRESSURE_RESPONSE_VERSION, STORE_CONNECTION_BOTTLENECK,
     STORE_PENDING_WRITE_BOTTLENECK, STORE_TRANSACTION_BOTTLENECK, StoreBackpressureResponseV1,
-    StoreDimension, StorePermit, StorePermitOperation, StorePermitRecord, StorePermitRequest,
-    StorePermitState, StoreReconcileDisposition, StoreRecoveryDirectiveV1, StoreReleaseEvidence,
-    StoreReserve, StoreReserveError, StoreScopeReserves,
+    StoreDimension, StoreEmergencyRecord, StorePermit, StorePermitOperation, StorePermitRecord,
+    StorePermitRequest, StorePermitState, StoreReconcileDisposition, StoreRecoveryDirectiveV1,
+    StoreReleaseEvidence, StoreReserve, StoreReserveError, StoreScopeReserves,
 };
 pub use control_wal::{
     ControlWal, WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,
