@@ -1252,10 +1252,10 @@ pub const PROFILE_ALIASES: &[ProfileAlias] = &[
 /// table, and [`ProfileError::UnknownProfile`] or
 /// [`ProfileError::UnknownRevision`] when the table's pinned revision is not
 /// admitted by this registry.
-pub fn admitted_profile_for_alias(
+pub fn admitted_profile_for_alias<'a>(
     alias: &str,
-    registry: &InstrumentRegistry,
-) -> Result<&InstrumentProfile, ProfileError> {
+    registry: &'a InstrumentRegistry,
+) -> Result<&'a InstrumentProfile, ProfileError> {
     let entry = PROFILE_ALIASES
         .iter()
         .find(|entry| entry.alias == alias)
