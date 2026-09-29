@@ -35,6 +35,7 @@ mod lifecycle_admission;
 mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
+mod maintenance_trigger_claim;
 mod maintenance_trigger_delivery;
 mod notification_state;
 #[cfg(test)]
@@ -113,6 +114,11 @@ pub use lifecycle_persist::{
     LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
     LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
     build_persist_transitions, handle_lifecycle_persist_request,
+};
+pub use maintenance_trigger_claim::{
+    MaintenanceTriggerRecoveryRoute, MaintenanceTriggerRedeliveryOutcome,
+    claim_trigger_for_daemon, enumerate_pending_for_reconnect, recover_trigger_for_replacement,
+    redeliver_after_timeout, revoke_consumer_and_surface_pending,
 };
 pub use maintenance_trigger_delivery::{
     AuthenticatedMaintenanceTriggerSession, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS,
