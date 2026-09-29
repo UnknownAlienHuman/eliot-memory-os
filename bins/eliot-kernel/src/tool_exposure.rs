@@ -12,7 +12,10 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::sha256_hex;
-use eliot_receipts::{LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest};
+use eliot_receipts::{
+    LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest,
+    tool_exposure::{AttemptEvidence, detect_repeat_without_progress_with_evidence},
+};
 
 use super::host_request_route::LocalReadAdmission;
 
@@ -138,13 +141,27 @@ pub(crate) fn requires_intent(admission: &LocalReadAdmission) -> bool {
 
 /// Reports a staging-time loop/no-progress signal for a materially repeated call.
 ///
-/// Rebuilds each retained candidate's [`ToolCallRequest`] from its staged
-/// envelope and tool bytes and applies
-/// [`eliot_receipts::detect_repeat_without_progress`] against the staging
-/// candidate. Returns the first [`LoopSignal`] when tool definition, route
-/// fingerprint, and inputs are identical without a new expected delta, and
-/// `None` for non-expensive tools, unreconstructible pairs, or fresh
-/// inputs/routes/deltas. Pure and total: reads only, never stages, never fails.
+/// Each retained candidate is rebuilt into a [`ToolCallRequest`] through the
+/// existing admission owner
+/// ([`super::host_request_route::check_local_read_admission`]), so the
+/// cost/effect class derives from the accepted admission exactly as it does
+/// for the staging candidate; unreconstructible pairs never match. The
+/// retained per-route stage is the existing attempt history — no new loop
+/// ledger — and the comparison is the evidence-bound
+/// [`detect_repeat_without_progress_with_evidence`] join.
+///
+/// No owner-observed evidence is joined at this gate: payloads travel by
+/// digest only, so the source revision, poll cursor, and prior outcome the
+/// issue names are unobserved here rather than invented. An unobserved
+/// dimension is never new evidence, so a reworded `expected_delta` alone
+/// yields [`LoopSignal::NoProgress`] instead of staging as progress. Only
+/// genuinely advanced owner evidence — joined by the evidence owners, never
+/// inferred here — counts as potential progress.
+///
+/// Pure and total: reads only, never stages, never fails. Exact-idempotent
+/// replay, required unknown-effect reconciliation, and admitted polling keep
+/// their own semantics at their owners; the signal only refuses a materially
+/// repeated staging, never permission to execute again.
 pub(crate) fn staged_repeat_without_progress<'a>(
     mut retained: impl Iterator<
         Item = (
@@ -154,8 +171,18 @@ pub(crate) fn staged_repeat_without_progress<'a>(
     >,
     current: &ToolCallRequest,
 ) -> Option<LoopSignal> {
+    // Both sides carry no owner-observed evidence at this gate: the staging
+    // path holds digest-bound pairs only, and inventing a revision, cursor,
+    // or outcome to obtain a valid-looking pass is forbidden.
+    let unobserved = AttemptEvidence {
+        source_revision: None,
+        poll_cursor: None,
+        prior_outcome: None,
+    };
     retained.find_map(|(envelope, tool)| {
-        let previous = build_tool_call_request(envelope, tool)?;
-        eliot_receipts::detect_repeat_without_progress(&previous, current)
+        let admission =
+            super::host_request_route::check_local_read_admission(envelope, tool).ok()?;
+        let previous = build_tool_call_request(envelope, tool, &admission)?;
+        detect_repeat_without_progress_with_evidence(&previous, &unobserved, current, &unobserved)
     })
 }
