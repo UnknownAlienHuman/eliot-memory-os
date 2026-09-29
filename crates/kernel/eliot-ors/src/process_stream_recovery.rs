@@ -66,6 +66,12 @@ pub const MAX_STREAM_RECOVERY_OMITTED_RANGES: usize = 16;
 /// Hard ceiling for retained coverage gaps on one projection.
 pub const MAX_STREAM_RECOVERY_GAPS: usize = 16;
 
+/// Domain separator for the immutable process-stream evidence-axis digest.
+const STREAM_RECOVERY_EVIDENCE_AXES_DIGEST_DOMAIN: &str =
+    "eliot.ors.process-stream-recovery.evidence-axes";
+/// Version of the domain-separated evidence-axis digest preimage.
+const STREAM_RECOVERY_EVIDENCE_AXES_DIGEST_VERSION: u16 = 2;
+
 /// What this projection is allowed to assert.
 ///
 /// A single variant is deliberate: the value makes "bytes and exact coverage
@@ -751,14 +757,28 @@ impl ProcessStreamRecoveryProjection {
         ))
     }
 
-    /// Digest over the immutable evidence axes and projection identity.
+    /// Digest over the immutable observation and projection identity.
     ///
     /// Availability, reconciliation and activation are deliberately excluded:
     /// they are the only fields a revalidation or a retirement may advance, so
-    /// an equal digest proves that no evidence axis was rewritten.
+    /// an equal digest proves that no evidence axis was rewritten. The v2
+    /// preimage is domain separated and includes the complete byte-free
+    /// [`ProcessStreamObservation`], plus the immutable operation, process,
+    /// fence and contract identity. The prior unversioned digest was derived
+    /// on demand and was never persisted; stored projections therefore need no
+    /// digest migration or dual-version comparison. Both sides of every store
+    /// comparison are recomputed from the projection with this version.
+    /// `observed_at_ms` remains outside the preimage, preserving timestamp-only
+    /// replay while every observation or identity change alters the digest.
     pub fn evidence_axes_sha256(&self) -> Result<String, OrsError> {
         self.validate()?;
+        let observation = self.stream_observation();
         let identity = StreamRecoveryEvidenceAxes {
+            domain: STREAM_RECOVERY_EVIDENCE_AXES_DIGEST_DOMAIN,
+            version: STREAM_RECOVERY_EVIDENCE_AXES_DIGEST_VERSION,
+            contract_version: self.contract_version,
+            stream_contract_revision: &self.stream_contract_revision,
+            scope: self.scope,
             operation_id: self.operation_id.as_str(),
             request_digest: &self.request_digest,
             process_tree_id: self.process_tree_id.as_str(),
@@ -768,46 +788,10 @@ impl ProcessStreamRecoveryProjection {
             stream: self.stream,
             authority_epoch: &self.authority_epoch,
             generation: self.generation,
+            writer_epoch: &self.writer_epoch,
             state_fence_digest: &self.state_fence_digest,
             policy_revision: &self.policy_revision,
-            stream_contract_revision: &self.stream_contract_revision,
-            transport: self.transport,
-            observed_sha256: &self.observed_sha256,
-            observed_bytes: self.observed_bytes,
-            persistence: self.persistence,
-            locator: self
-                .source
-                .as_ref()
-                .map(DurableProcessStreamSource::locator),
-            ready_receipt_ref: self
-                .source
-                .as_ref()
-                .map(DurableProcessStreamSource::ready_receipt_ref),
-            source_sha256: self.source.as_ref().map(DurableProcessStreamSource::sha256),
-            source_byte_length: self
-                .source
-                .as_ref()
-                .map(DurableProcessStreamSource::byte_length),
-            coverage_sha256: self
-                .durable_coverage
-                .as_ref()
-                .map(|coverage| coverage.sha256.as_str()),
-            coverage_byte_length: self
-                .durable_coverage
-                .as_ref()
-                .map(|coverage| coverage.byte_length),
-            coverage_start: self
-                .durable_coverage
-                .as_ref()
-                .map(|coverage| coverage.range.start()),
-            coverage_end: self
-                .durable_coverage
-                .as_ref()
-                .map(|coverage| coverage.range.end_exclusive()),
-            preview_sha256: &self.preview.sha256,
-            preview_retained_bytes: self.preview.retained_bytes,
-            preview_represented_bytes: self.preview.represented_bytes,
-            gaps: self.gaps.clone(),
+            observation: &observation,
         };
         let bytes =
             serde_json::to_vec(&identity).map_err(|error| OrsError::Encoding(error.to_string()))?;
@@ -886,6 +870,14 @@ impl ProcessStreamRecoveryProjection {
             "stream_recovery_state_fence_digest",
         )?;
         validate_digest(&self.policy_revision, "stream_recovery_policy_revision")?;
+        let policy_bytes = serde_json::to_vec(&self.policy)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if self.policy_revision != sha256_hex(&policy_bytes) {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_policy_revision",
+                reason: "policy revision must identify the retained stream policy binding",
+            });
+        }
         if self.generation == 0 {
             return Err(OrsError::InvalidField {
                 field: "stream_recovery_generation",
@@ -939,6 +931,11 @@ fn omitted_suffix(
 
 #[derive(Serialize)]
 struct StreamRecoveryEvidenceAxes<'a> {
+    domain: &'static str,
+    version: u16,
+    contract_version: u16,
+    stream_contract_revision: &'a str,
+    scope: StreamRecoveryEvidenceScope,
     operation_id: &'a str,
     request_digest: &'a str,
     process_tree_id: &'a str,
@@ -948,25 +945,10 @@ struct StreamRecoveryEvidenceAxes<'a> {
     stream: ProcessStreamKind,
     authority_epoch: &'a EpochId,
     generation: u64,
+    writer_epoch: &'a EpochLineage,
     state_fence_digest: &'a str,
     policy_revision: &'a str,
-    stream_contract_revision: &'a str,
-    transport: StreamTransportStatus,
-    observed_sha256: &'a str,
-    observed_bytes: u64,
-    persistence: StreamPersistenceStatus,
-    locator: Option<&'a str>,
-    ready_receipt_ref: Option<&'a str>,
-    source_sha256: Option<&'a str>,
-    source_byte_length: Option<u64>,
-    coverage_sha256: Option<&'a str>,
-    coverage_byte_length: Option<u64>,
-    coverage_start: Option<u64>,
-    coverage_end: Option<u64>,
-    preview_sha256: &'a str,
-    preview_retained_bytes: u64,
-    preview_represented_bytes: u64,
-    gaps: Vec<StreamEvidenceGap>,
+    observation: &'a ProcessStreamObservation,
 }
 
 /// Exact content identity of one immutable source, as read back by the
