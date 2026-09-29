@@ -1132,7 +1132,11 @@ pub fn render_backup_outcome_human(outcome: &BackupOperationOutcome) -> String {
     if let Some(identity) = &outcome.result_identity {
         let _ = writeln!(lines, "answer_operation_id: {}", identity.operation_id);
         let _ = writeln!(lines, "request_digest: {}", identity.request_digest);
-        let _ = writeln!(lines, "operation_namespace: {}", identity.operation_namespace);
+        let _ = writeln!(
+            lines,
+            "operation_namespace: {}",
+            identity.operation_namespace
+        );
         let _ = writeln!(lines, "answer_archive_digest: {}", identity.archive_digest);
         if let Some(attestation) = &identity.validity_attestation {
             let _ = writeln!(lines, "validity_attestation: {attestation}");
@@ -1840,8 +1844,8 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
     // string array: a level outside the type is a value this surface cannot
     // bound, and a level inside the type arrives already carrying the
     // capture-evidence relation [`require_proven_claim`] will enforce.
-    let level =
-        VerifyProofLevel::from_wire(level).ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+    let level = VerifyProofLevel::from_wire(level)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     // The class ceiling is echoed rather than derived from the class token:
     // only the owner knows which ceiling its own receipt reached. It is decoded
     // through its own typed owner so the reachability relation is a property of
@@ -1915,8 +1919,7 @@ fn decode_result_identity(
     let request_digest = envelope_text(response, "request_digest")?.to_owned();
     hex64(&request_digest, "backup.request_digest").map_err(BackupClientError::Client)?;
     let operation_namespace = envelope_text(response, "operation_namespace")?.to_owned();
-    hex64(&operation_namespace, "backup.operation_namespace")
-        .map_err(BackupClientError::Client)?;
+    hex64(&operation_namespace, "backup.operation_namespace").map_err(BackupClientError::Client)?;
     let validity_attestation = envelope_optional_text(response, "validity_attestation")?;
     if let Some(attestation) = validity_attestation {
         non_blank(attestation, "backup.validity_attestation").map_err(BackupClientError::Client)?;
@@ -1966,7 +1969,8 @@ fn require_result_identity(
             ),
             reason: format!(
                 "owner answered for operation {} while this request presented operation {}; an outer idempotency echo is a transport correlation and cannot stand for the operation that produced the result",
-                identity.operation_id, request.idempotency_key.as_str()
+                identity.operation_id,
+                request.idempotency_key.as_str()
             ),
         });
     }
@@ -2047,7 +2051,8 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
     // archive says nothing about who produced the archived fence VALUE, so an
     // honest `structural-only` qualifier beside a receipt stays admissible and
     // refusing it would forbid a truthful future answer.
-    if evidence.archive_fence_proof.requires_capture_receipt() && evidence.capture_receipt.is_none() {
+    if evidence.archive_fence_proof.requires_capture_receipt() && evidence.capture_receipt.is_none()
+    {
         return Err(UnprovenClaim {
             obligation: format!(
                 "owner-issued capture receipt backing archive_fence_proof {} for archive {} (absent from the owner's own answer)",
@@ -2089,9 +2094,11 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
             ] {
                 if !present {
                     return Err(UnprovenClaim {
-                        obligation: obligation
-                            .replacen("{}", &evidence.bundle_id, 1)
-                            .replacen("{}", evidence.level.wire_name(), 1),
+                        obligation: obligation.replacen("{}", &evidence.bundle_id, 1).replacen(
+                            "{}",
+                            evidence.level.wire_name(),
+                            1,
+                        ),
                         reason: description
                             .replacen("{}", evidence.level.wire_name(), 1)
                             .replacen("{}", &evidence.bundle_id, 1)
@@ -2115,14 +2122,13 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
                     ),
                 });
             }
-        }
-        // No catch-all arm exists, and that is the guarantee rather than an
-        // omission. `VerifyProofLevel::capture_evidence` is total over every
-        // level, so there is no member this surface can decode but cannot
-        // relate: adding a level forces its relation to be stated here, and the
-        // compiler forces this match to handle it. The old fallible shape needed
-        // a runtime "unrelatable level" refusal; the typed owner makes that
-        // state unrepresentable instead.
+        } // No catch-all arm exists, and that is the guarantee rather than an
+          // omission. `VerifyProofLevel::capture_evidence` is total over every
+          // level, so there is no member this surface can decode but cannot
+          // relate: adding a level forces its relation to be stated here, and the
+          // compiler forces this match to handle it. The old fallible shape needed
+          // a runtime "unrelatable level" refusal; the typed owner makes that
+          // state unrepresentable instead.
     }
     // The class ceiling's REACHABILITY, as distinct from its spelling. A
     // read-only verify holds no authority to declare operational validation or
