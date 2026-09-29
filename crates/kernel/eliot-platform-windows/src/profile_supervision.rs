@@ -805,7 +805,7 @@ fn retain_profile_roots(
         owner_sid = Some(sid.to_owned());
         session_id = Some(anchor.session_id());
     }
-    let role_roots = retain_role_roots(
+    let mut role_roots = retain_role_roots(
         request.profile,
         root_requests,
         local_app_data.as_deref(),

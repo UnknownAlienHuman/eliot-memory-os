@@ -1410,16 +1410,10 @@ fn register_user_mode_profile_task_in_apartment(
 /// the exact requested leaf is absent. Registration is create-only: an existing
 /// object is never adopted or updated here.
 #[cfg(windows)]
-fn open_absent_user_mode_task_folder(
-    spec: &UserModeProfileTaskSpec,
+fn open_absent_user_mode_task_folder<'a>(
+    spec: &'a UserModeProfileTaskSpec,
     empty: &windows::Win32::System::Variant::VARIANT,
-) -> Result<
-    (
-        windows::Win32::System::TaskScheduler::ITaskFolder,
-        &str,
-    ),
-    WindowsAdapterError,
-> {
+) -> Result<(windows::Win32::System::TaskScheduler::ITaskFolder, &'a str), WindowsAdapterError> {
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
     use windows::Win32::System::TaskScheduler::{CLSID_CTaskScheduler, ITaskService};
     use windows::core::BSTR;
