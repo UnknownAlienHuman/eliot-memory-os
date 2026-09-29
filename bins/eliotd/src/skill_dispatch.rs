@@ -923,7 +923,11 @@ async fn read_capability_evidence_records(
 /// stale observation. The subject legs are resolved against owner records,
 /// never against the receipt's own shape: the evidence-owner rows the plan
 /// read contradict a foreign or substituted subject outright, and the
-/// lifecycle owner's stored view binds the fence and the route. A candidate
+/// lifecycle owner's stored view binds the fence and the route, and its own
+/// staleness standing is enforced before either is read: a stale or
+/// quarantined view refuses here (issue #1882 W2/A2, I7.13), so a Skill
+/// whose declared dependencies changed cannot reach Material use through a
+/// stored-status lag. A candidate
 /// whose backing reads never settled, whose subject the owner rows
 /// contradict, whose subject NO owner row names, or whose retained receipt
 /// contradicts the presented bytes never publishes a settled claim: loss of a
@@ -1018,6 +1022,26 @@ fn commit_activation_candidate(
     let Some(view) = read_activation_owner_view(composition, &candidate.receipt.skill_id) else {
         return SkillResultEnvelope::refused(&eliot_skill::SkillError::NotFound);
     };
+    // Bridge Material-use staleness leg (issue #1882 W2/A2, I7.13): the
+    // commit binds the SAME stored view every leg below reads, so the view
+    // is revalidated as observed before any of its fields is trusted, and a
+    // stale or quarantined standing refuses here. A Skill whose declared
+    // host/tool/contract dependencies changed stays blocked from Material
+    // use even when the catalogue entry itself has not been remarked yet;
+    // only revalidation or explicit scoped/provisional admission through the
+    // governed lifecycle path lifts the standing. The owner admits the same
+    // standing again at admission time; this leg keeps the commit's fence,
+    // route and retained-receipt legs consistent on one observation instead
+    // of trusting fields of an unvalidated or stale record.
+    if let Err(error) = view.validate() {
+        return SkillResultEnvelope::refused(&error);
+    }
+    if !eliot_skill::material_use_allowed(view.status) {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+            field: "view.status",
+            reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
+        });
+    }
     if candidate.receipt.state_fence != view.state_fence {
         return SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch);
     }
