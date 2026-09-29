@@ -996,6 +996,12 @@ fn maintenance_trigger_page_from_projection(
         // The v1 wire contract has no complete-empty representation. Do not
         // manufacture an `IncompleteEnumeration` gap when ORS proved that the
         // frozen high-water window itself is empty.
+        if projection.has_more || projection.continuation.is_some() {
+            // The window is still open, so this empty window proves nothing
+            // about membership: further rows may follow. Fail closed instead
+            // of reporting a guessed complete-empty set to the recovery scan.
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
         return Err(MaintenanceTriggerLifecycleFailure::EmptyPageWithoutGap);
     }
     let page = MaintenanceTriggerPage {
