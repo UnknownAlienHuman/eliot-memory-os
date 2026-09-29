@@ -54,6 +54,7 @@ mod controlboard_status;
 mod dashboard;
 mod dev_crate_check;
 mod first_run_flow;
+mod opencode_cutover;
 mod plugin_preview;
 mod release_surface;
 mod scope_observe;
@@ -136,6 +137,23 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    /// OpenCode MCP cutover front door (#18 W11). Accepts the exact
+    /// `mcp stdio --host opencode` consumer argv and always answers the
+    /// cutover receipt: MCP serving is owned by `bins/eliot-agent-bridge`,
+    /// which admits no OpenCode host/profile, so nothing is served here.
+    Mcp {
+        #[command(subcommand)]
+        command: opencode_cutover::McpCommand,
+    },
+    /// OpenCode host cutover front door (#18 W11). Carries only the
+    /// `host event/install/uninstall --host opencode` caller protocol the
+    /// OpenCode route needs. `event` degrades plugin-parseably without
+    /// dispatch; `install`/`uninstall` are refused until the
+    /// host-lifecycle owner (#14) admits them.
+    Host {
+        #[command(subcommand)]
+        command: opencode_cutover::HostCommand,
     },
     /// Release-generation surfaces owned by the installation front door.
     Release {
@@ -852,6 +870,8 @@ fn run() -> Result<i32> {
         Command::Setup { command } => run_setup(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
+        Command::Mcp { command } => opencode_cutover::run_mcp(command),
+        Command::Host { command } => opencode_cutover::run_host(command),
         Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Dashboard => dashboard::run_dashboard(),

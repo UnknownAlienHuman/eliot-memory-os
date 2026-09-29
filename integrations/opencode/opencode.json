@@ -5,7 +5,7 @@
     "eliot": {
       "type": "local",
       "command": [
-        "{env:ELIOT_GOVERNOR_EXE}",
+        "{env:ELIOT_CLI_EXE}",
         "mcp",
         "stdio",
         "--host",

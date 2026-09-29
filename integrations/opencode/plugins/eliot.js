@@ -35,7 +35,7 @@ const BRIDGE_ENV_KEYS = [
   "USERPROFILE",
   "WINDIR",
   "ELIOT_AUTHORITY_EPOCH",
-  "ELIOT_GOVERNOR_EXE",
+  "ELIOT_CLI_EXE",
   "ELIOT_HOST_PROFILE",
   "ELIOT_INSTALLATION_ID",
   "ELIOT_SESSION_ID",
@@ -91,9 +91,9 @@ function attachedTask() {
 }
 
 function bridgeExecutable() {
-  if (process.env.ELIOT_GOVERNOR_EXE) return process.env.ELIOT_GOVERNOR_EXE
+  if (process.env.ELIOT_CLI_EXE) return process.env.ELIOT_CLI_EXE
   if (!process.env.LOCALAPPDATA) return null
-  return `${process.env.LOCALAPPDATA}/Eliot/host-integrations/opencode/bin/eliot-governor.exe`
+  return `${process.env.LOCALAPPDATA}/Eliot/host-integrations/opencode/bin/eliot.exe`
 }
 
 function bridgeEnvironment() {

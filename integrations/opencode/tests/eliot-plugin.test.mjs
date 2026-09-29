@@ -16,7 +16,7 @@ const ENV_KEYS = [
   "ELIOT_OPENCODE_BRIDGE_TOKEN",
   "ELIOT_OPENCODE_BRIDGE_TIMEOUT_MS",
   "ELIOT_OPENCODE_BRIDGE_OUTPUT_LIMIT",
-  "ELIOT_GOVERNOR_EXE",
+  "ELIOT_CLI_EXE",
 ]
 const nativeFetch = globalThis.fetch
 
@@ -559,7 +559,7 @@ test("configured HTTP outage never crosses transport into the legacy process bri
   process.env.ELIOT_OPENCODE_BRIDGE_URL = "http://127.0.0.1:1/"
   process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
   process.env.ELIOT_OPENCODE_BRIDGE_TIMEOUT_MS = "500"
-  process.env.ELIOT_GOVERNOR_EXE = "C:/eliot-governor.exe"
+  process.env.ELIOT_CLI_EXE = "C:/eliot.exe"
   const plugin = await hooks()
   await assert.rejects(
     plugin["tool.execute.before"]({ tool: "edit", callID: "call-outage", args: {} }, {}),
