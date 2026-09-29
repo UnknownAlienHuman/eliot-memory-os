@@ -1950,12 +1950,7 @@ mod lifecycle_proof_tests {
     #[test]
     fn rollback_seal_covers_dispositions_and_strategy() {
         let base = RollbackRouteRequest {
-            cutover_id: "cutover-seal".to_owned(),
-            route_scope: "component-seal".to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 6,
+            cutover: cutover_record("cutover-seal", "component-seal", 3, 2, 5, 6),
             in_flight: vec![("op-1".to_owned(), InFlightDisposition::DrainRead)],
             snapshot_strategy: SnapshotStrategy::PriorCompatibleSnapshot,
             state_compatible: true,
