@@ -194,11 +194,7 @@ pub(super) fn require_journal_kernel_restart_record(
                 .to_owned(),
         ));
     }
-    if !journal_record_binds_approved_config(
-        current,
-        readiness_observations,
-        approved_config,
-    ) {
+    if !journal_record_binds_approved_config(current, readiness_observations, approved_config) {
         return Err(HostError::RecoveryRequired(
             "Kernel restart refused: no valid HostStateJournal record binds the approved config to the authorizing Kernel record; manual recovery required"
                 .to_owned(),
