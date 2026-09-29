@@ -1026,7 +1026,8 @@ impl ModuleCatalog {
         let previous = self.entries.get(&request.module_id).cloned();
         let applied = self.apply_mutation(&request.module_id, previous, &request.mutation)?;
         self.revision += 1;
-        self.entries.insert(request.module_id.clone(), applied.entry);
+        self.entries
+            .insert(request.module_id.clone(), applied.entry);
         let after = self.snapshot()?;
         let prepared = PreparedCatalogTransition {
             operation_id: request.operation_id.clone(),
@@ -1055,7 +1056,8 @@ impl ModuleCatalog {
         // between two derivations and not the selection with itself.
         let mut expected_dependents = Vec::new();
         if let Some(trigger) = prepared.invalidation_trigger {
-            expected_dependents = self.select_invalidation_dependents(&request.module_id, trigger)?;
+            expected_dependents =
+                self.select_invalidation_dependents(&request.module_id, trigger)?;
         }
         prepared.verify_invalidation_dependents(&expected_dependents)?;
         Ok(prepared)
