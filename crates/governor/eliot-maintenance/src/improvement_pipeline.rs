@@ -1884,8 +1884,7 @@ pub fn reconcile_unknown_activation(
         // formatted message happened to land in rather than on any owner
         // outcome.
         ImprovementAdmissionDecision::AdmitForExperiment {
-            rollback_owner_id,
-            ..
+            rollback_owner_id, ..
         } => ImprovementTerminalDisposition::UnknownRequiresReconciliation {
             obligation: Box::new(unknown_effect_of(current, rollback, rollback_owner_id)),
         },
