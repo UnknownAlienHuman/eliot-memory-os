@@ -203,6 +203,61 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
 }
 
 // ============================================================================
+// Daemon-loss retained-claim disposition (issue #1694, W6).
+//
+// Pending maintenance-trigger claims survive daemon loss: the rows stay
+// retained in ORS and the lost generation's consumer authority is revoked
+// through the existing Kernel owner. This seam fixes that disposition
+// exactly; enforcement belongs to the existing session-recovery route
+// (`daemon_request_dispatch::store_recovery_operation` →
+// `StoreGateway::recover_maintenance_trigger_session`), which revokes stale
+// claims, retains every pending row, and surfaces the bounded pending set.
+// Nothing here drops a row, mints a consumer identity, or evaluates a
+// trigger: there is no second supervisor, database, or evaluator.
+
+/// Daemon-loss disposition for retained maintenance-trigger claims (#1694 W6).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonLossTriggerClaimDisposition {
+    /// A supervised consumer was bound and is now lost: the Kernel owner
+    /// must retain every pending claim and revoke the old consumer
+    /// authority through the existing session-recovery route.
+    RetainPendingAndRevokeConsumer,
+    /// No supervised consumer was ever bound, or the bound consumer is
+    /// still live: supervision raises no retention/revocation directive.
+    NoSupervisedConsumerLoss,
+}
+
+/// Classifies the retained-claim disposition for one daemon-loss observation.
+///
+/// A consumer counts as bound when supervision bound a contour, published a
+/// live-ready receipt, or recorded a supervision renewal. The progress
+/// tracker survives `record_daemon_failed` — which clears only the contour
+/// and the live receipt — so a lost generation that once held authority is
+/// still recognized after its state is fenced. Loss is a `Failed` status or
+/// a terminally expired supervision lease. The positive arm carries the one
+/// subordinate observation; the owning session-recovery route emits the
+/// terminal. Enforcement stays with that existing Kernel owner.
+#[cfg(windows)]
+#[allow(dead_code, reason = "STITCH: wired by the Kernel replacement-startup lane; seam first")]
+pub(crate) fn classify_daemon_loss_trigger_claims(
+    state: &DaemonRuntimeState,
+) -> DaemonLossTriggerClaimDisposition {
+    let consumer_was_bound = state.supervision.is_some()
+        || state.live_ready.is_some()
+        || state.supervision_progress.last_request_id.is_some()
+        || state.supervision_progress.last_successor_revision.is_some();
+    let consumer_is_lost = matches!(state.status, DaemonRuntimeStatus::Failed(_))
+        || state.supervision_expired;
+    if consumer_was_bound && consumer_is_lost {
+        observe_supervision("kernel.supervision.trigger_consumer_revoked", "retained");
+        DaemonLossTriggerClaimDisposition::RetainPendingAndRevokeConsumer
+    } else {
+        DaemonLossTriggerClaimDisposition::NoSupervisedConsumerLoss
+    }
+}
+
+// ============================================================================
 // Kernel-owned daemon progress continuity (issue #88, wave 2).
 //
 // The Kernel retains per-channel accepted cursors, the last accepted monotonic
