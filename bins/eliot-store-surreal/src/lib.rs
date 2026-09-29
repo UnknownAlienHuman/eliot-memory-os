@@ -1925,6 +1925,18 @@ mod tests {
         roots
     }
 
+    fn system_profile_roots(roots: &RuntimeStateRoots) -> eliot_installation::InstallationRoots {
+        let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        eliot_installation::InstallationRoots {
+            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+            durable_data: roots.installation_root.as_str().to_owned(),
+            user_config: installer_user_root.to_owned(),
+            user_cache: installer_user_root.to_owned(),
+            runtime_state_roots: roots.clone(),
+        }
+    }
+
     fn reseal_runtime_launch(descriptor: &mut RuntimeLaunchDescriptor) {
         *descriptor = descriptor
             .clone()
@@ -1939,6 +1951,12 @@ mod tests {
         let authority_state_fence = StateFence::new(test_epoch(1), authority_generation);
         let mut descriptor = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
+            profile_component: handle("eliot"),
+            profile_version: handle("test-version"),
+            profile_installation_key: Some(handle(
+                roots.installation_root.as_str().rsplit('\\').next().unwrap().to_owned(),
+            )),
+            profile_governed_roots: system_profile_roots(&roots),
             portable_root: None,
             installation_epoch: InstallationEpoch {
                 installation: handle("installation-test"),

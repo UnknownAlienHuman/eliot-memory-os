@@ -368,7 +368,10 @@ impl StagePackageAuthorization {
             || self.source_snapshot_digest.len() != 64
             || !super::valid_sha256_hex(&self.source_snapshot_digest)
             || !self.staging_root.is_absolute()
-            || self.destination_root.as_ref().is_some_and(|path| !path.is_absolute())
+            || self
+                .destination_root
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
             || self.generation.is_empty()
             || self.manifest_sha256.len() != 64
             || !super::valid_sha256_hex(&self.manifest_sha256)
@@ -1842,12 +1845,8 @@ impl PackageInstallationLease {
 
     fn canonical_path(&self) -> Result<PathBuf, PackageStagingError> {
         match self {
-            Self::SystemService(lease) => lease
-                .canonical_path()
-                .map_err(map_protected_path_error),
-            Self::UserOwned(lease) => lease
-                .canonical_path()
-                .map_err(map_protected_path_error),
+            Self::SystemService(lease) => lease.canonical_path().map_err(map_protected_path_error),
+            Self::UserOwned(lease) => lease.canonical_path().map_err(map_protected_path_error),
         }
     }
 }
@@ -2001,14 +2000,11 @@ fn reconcile_receipt_at_destination(
             PackageStagingError::TreeMismatch,
         ));
     }
-    let actual_directories = match PackageStager::read_current_directories(
-        &root_path,
-        &manifest,
-        profile,
-    ) {
-        Ok(directories) => directories,
-        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-    };
+    let actual_directories =
+        match PackageStager::read_current_directories(&root_path, &manifest, profile) {
+            Ok(directories) => directories,
+            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+        };
     if actual_directories != receipt.directories {
         let error = if actual_directories
             .iter()
@@ -2027,15 +2023,11 @@ fn reconcile_receipt_at_destination(
         };
         return Ok(PackageStagingObservation::Mismatch(error));
     }
-    let actual = match PackageStager::read_current_files(
-        &root_path,
-        &manifest,
-        &receipt.files,
-        profile,
-    ) {
-        Ok(files) => files,
-        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-    };
+    let actual =
+        match PackageStager::read_current_files(&root_path, &manifest, &receipt.files, profile) {
+            Ok(files) => files,
+            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+        };
     if actual != receipt.files {
         return Ok(PackageStagingObservation::Mismatch(
             PackageStagingError::HashMismatch,
@@ -2394,9 +2386,7 @@ impl PackageStager {
             authorization.destination_root.as_deref(),
             self.destination_root.as_deref(),
         ) {
-            (Some(authorized), Some(retained)) => {
-                super::windows_paths_equal(authorized, retained)
-            }
+            (Some(authorized), Some(retained)) => super::windows_paths_equal(authorized, retained),
             (None, None) => true,
             _ => false,
         };
@@ -2540,12 +2530,8 @@ impl PackageStager {
             directories: Vec::new(),
             files: Vec::with_capacity(manifest.files.len()),
         };
-        let result = self.copy_and_measure(
-            &manifest,
-            &generation_root,
-            &mut created,
-            expected_sources,
-        );
+        let result =
+            self.copy_and_measure(&manifest, &generation_root, &mut created, expected_sources);
         match result {
             Ok(files) => {
                 let finalized = (|| {
@@ -2800,7 +2786,13 @@ impl PackageStager {
         }
         #[cfg(not(windows))]
         {
-            let _ = (installation_root, manifest, marker_root_identity, marker, profile);
+            let _ = (
+                installation_root,
+                manifest,
+                marker_root_identity,
+                marker,
+                profile,
+            );
             Err(PackageStagingError::UnsupportedPlatform)
         }
     }
@@ -3150,9 +3142,9 @@ impl PackageStager {
                 {
                     let retained = created_parent_handle(created, destination_root, &path)
                         .ok_or(PackageStagingError::IdentityMismatch)?;
-                    create_destination_directory_at(retained, &path, self.profile).map_err(|error| {
-                        error.with_site(STAGING_SITE_DESTINATION_DIRECTORY_CREATE)
-                    })?
+                    create_destination_directory_at(retained, &path, self.profile).map_err(
+                        |error| error.with_site(STAGING_SITE_DESTINATION_DIRECTORY_CREATE),
+                    )?
                 }
                 #[cfg(not(windows))]
                 {
@@ -3858,11 +3850,7 @@ fn retain_destination_parent(
     anchor: &Path,
     path: &Path,
 ) -> Result<RetainedDestinationParent, PackageStagingError> {
-    retain_destination_parent_for_profile(
-        anchor,
-        path,
-        super::InstallerRootProfile::SystemService,
-    )
+    retain_destination_parent_for_profile(anchor, path, super::InstallerRootProfile::SystemService)
 }
 
 #[cfg(windows)]
@@ -4306,7 +4294,9 @@ fn verify_profile_security(
     }
     let sid = super::current_process_sid().map_err(map_protected_path_error)?;
     let expected = super::OwnedSecurityDescriptor::for_user_owned_storage(&sid, directory)
-        .map_err(|error| map_installer_descriptor_error(error, PackageStagingStage::GetSecurityInfo))?;
+        .map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::GetSecurityInfo)
+        })?;
     if super::verify_exact_file_security(file, &expected, &sid).is_err() {
         return match security_descriptor_digest(file) {
             Err(
@@ -4894,11 +4884,8 @@ fn create_destination_file_for_profile(
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     };
 
-    let descriptor = staging_security_descriptor(
-        profile,
-        false,
-        PackageStagingStage::SetSecurityInfo,
-    )?;
+    let descriptor =
+        staging_security_descriptor(profile, false, PackageStagingStage::SetSecurityInfo)?;
     // Absolute-path create-only entry point for callers with no retained
     // parent in scope (the preparation marker) and for fixtures. Staged file
     // bytes below a retained generation tree never use this path: production
@@ -6547,10 +6534,10 @@ mod tests {
         let source = include_str!("package_staging.rs");
         assert!(source.contains("with_system_restore_privilege_mapped"));
         assert!(source.contains("InstallerRootProfile::SystemService"));
-        assert!(source.contains(
-            "if self.profile != super::InstallerRootProfile::SystemService"
-        ));
-        assert!(source.contains("with_system_restore_privilege_mapped(\n            self.profile,"));
+        assert!(source.contains("if self.profile != super::InstallerRootProfile::SystemService"));
+        assert!(
+            source.contains("with_system_restore_privilege_mapped(\n            self.profile,")
+        );
         assert!(source.contains(
             "write_or_validate_prepared_marker(authorization, ownership_key, self.profile)"
         ));
