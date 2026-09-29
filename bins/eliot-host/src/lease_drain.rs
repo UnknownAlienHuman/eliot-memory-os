@@ -18,11 +18,27 @@ use super::*;
 
 /// Complete identity of the Host activation generation whose retirement is
 /// being admitted.
+///
+/// The fields are crate-private on purpose. Outside `eliot_host` there is no
+/// constructor and no field a caller can name, so a fence can only originate
+/// from [`HostComposition::owner_generation_retirement_fence`], which reads it
+/// from the durable Host activation and the approved-launch authority
+/// generation. `require_generation_retirement_barrier` compares this value
+/// against those same owner facts, so a fence a caller could simply state
+/// would turn that comparison into a shape check over the caller's own words
+/// instead of an owner-vs-owner agreement; keeping the fields out of reach is
+/// what keeps it the latter. There is deliberately no `Deserialize`: a fence
+/// never crosses a wire, a command line or any other caller-supplied value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationRetirementFence {
-    pub activation_id: PlatformHandle,
-    pub activation_generation: eliot_contracts::EpochTransition,
-    pub state_fence: StateFence,
+    /// Durable Host journal activation identity of the generation being retired.
+    pub(crate) activation_id: PlatformHandle,
+    /// Durable Host journal activation generation of the retired generation.
+    pub(crate) activation_generation: eliot_contracts::EpochTransition,
+    /// `StateFence::new(activation lineage kernel epoch, approved-launch
+    /// authority generation)` for exactly this activation - the same value
+    /// `require_generation_retirement_barrier` recomputes from the same owners.
+    pub(crate) state_fence: StateFence,
 }
 
 /// Opaque owner-produced proof that the exact committed Host drain has no
@@ -448,6 +464,85 @@ impl HostComposition {
             runtime_lease_census: census,
             kernel_process_id: kernel_process.process_id,
             kernel_process_start_time_100ns: kernel_process.start_time_100ns,
+        })
+    }
+
+    /// Produces the exact [`GenerationRetirementFence`] for the activation
+    /// generation this Host composition is running, from the owners it already
+    /// holds (#961).
+    ///
+    /// Both facts are owner reads; nothing here is supplied by a caller:
+    ///
+    /// * `activation_id` and `activation_generation` are the durable Host
+    ///   activation the journal owner resolves, through the same
+    ///   `HostStateJournal::snapshot` read `require_generation_retirement_barrier`
+    ///   validates against; and
+    /// * `state_fence` is `StateFence::new(activation.lineage.kernel_epoch,
+    ///   launch.authority_generation)` over that activation's durable lineage
+    ///   and the authority generation of this composition's current approved
+    ///   launch.
+    ///
+    /// `require_generation_retirement_barrier` recomputes exactly that
+    /// `StateFence` from the same two owner records, so its comparison is an
+    /// owner-vs-owner agreement rather than a caller-stated shape. The
+    /// cross-checks below are what make that hold instead of assuming it. The
+    /// composition's own activation identity and generation are the pair this
+    /// composition hands `complete_kernel_control`, which re-checks it against
+    /// the durable activation record before admitting a Kernel (`lib.rs:2900`),
+    /// and the pair the readiness contour requires the journal's current
+    /// activation to carry (`lib.rs:9763`). Through the Kernel candidate
+    /// binding `require_generation_retirement_barrier` re-checks against
+    /// `expected.activation_id`, the identity check below is therefore already
+    /// implied by the barrier's own admission: a fence that disagreed with this
+    /// composition could never have been admitted. The generation check
+    /// restates the requirement the readiness contour already places on the
+    /// journal's current activation, so it grants nothing new - it only refuses
+    /// earlier and with a named cause instead of letting a fence that pairs two
+    /// generations reach the barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::OwnerLeaseRecovery`] when the journal owner holds
+    /// no durable activation, [`HostError::ProcessContour`] when this
+    /// composition has no current approved Kernel launch or the journal's
+    /// activation identity is not the activation this composition is running,
+    /// and [`HostError::RecoveryRequired`] when the journal's activation
+    /// generation is not the generation this composition is running. The fence
+    /// is constructed only after every read and every check has succeeded, so a
+    /// partially-filled fence is never returned.
+    pub fn owner_generation_retirement_fence(
+        &self,
+    ) -> Result<GenerationRetirementFence, HostError> {
+        let state = self.journal.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "generation retirement has no durable Host activation".to_owned(),
+            )
+        })?;
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "generation retirement has no current approved Kernel launch".to_owned(),
+            )
+        })?;
+        if activation.activation_id != self.activation_id {
+            return Err(HostError::ProcessContour(
+                "durable Host activation is not the activation this Host composition is running"
+                    .to_owned(),
+            ));
+        }
+        if activation.fence.activation_generation != self.activation_generation {
+            return Err(HostError::RecoveryRequired(
+                "durable Host activation generation is not the generation this Host composition is running"
+                    .to_owned(),
+            ));
+        }
+        Ok(GenerationRetirementFence {
+            activation_id: activation.activation_id.clone(),
+            activation_generation: activation.fence.activation_generation.clone(),
+            state_fence: StateFence::new(
+                activation.lineage.kernel_epoch.clone(),
+                launch.authority_generation,
+            ),
         })
     }
 }

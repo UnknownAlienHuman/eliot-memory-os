@@ -6033,9 +6033,12 @@ impl HostComposition {
     /// [`RedbInstallationRegistry::load`] feeding
     /// [`crate::backup_cutover::validate_cutover_request`] (the same
     /// fail-closed gate set the owner runs, never a local boolean); the
-    /// durable Host activation identity read from the journal owner, so the
-    /// activation bound by the cutover is the Host's own committed
-    /// generation and not a caller-supplied copy; then
+    /// durable Host activation identity and the owner-derived generation
+    /// retirement fence, read from the journal owner and this composition's
+    /// current approved launch, so the activation bound by the cutover and the
+    /// fence its retirement barrier is compared against are the Host's own
+    /// committed generation and authority generation and never caller-supplied
+    /// copies; then
     /// [`crate::backup_cutover::execute_cutover`], which re-reads the
     /// registry owner (TOCTOU fence), re-proves the retained cutover body
     /// against the admitted envelope at the effect boundary, live-verifies
@@ -6077,10 +6080,12 @@ impl HostComposition {
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
     /// separately supplied operation does not match the operation the admitted
-    /// cutover payload authorizes, the Host activation is absent, the owner
-    /// gate set, retirement barrier, or registry CAS refuses, or the
-    /// post-commit owner readback does not show the committed target
-    /// generation.
+    /// cutover payload authorizes, the owner-derived generation retirement
+    /// fence cannot be produced (no durable Host activation, no current
+    /// approved launch, or a durable activation that is not the generation this
+    /// composition is running), the owner gate set, retirement barrier, or
+    /// registry CAS refuses, or the post-commit owner readback does not show
+    /// the committed target generation.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -6091,7 +6096,6 @@ impl HostComposition {
         operation: eliot_protocol::backup::BackupOperationKind,
         request: &crate::backup_cutover::CutoverRequest,
         evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
-        retirement: &GenerationRetirementFence,
     ) -> Result<
         (
             crate::backup_cutover::CutoverOutcome,
@@ -6151,23 +6155,31 @@ impl HostComposition {
         let validated =
             validate_cutover_request(request, evidence, &registry, plan.predecessor_gate())?;
         drop(registry);
-        // The activation bound to the cutover is the Host journal owner's
-        // committed generation, never a caller-supplied copy.
-        let state = self.journal.snapshot().map_err(|error| {
-            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
-        })?;
-        let activation = state
-            .activation
-            .as_ref()
-            .ok_or(CutoverError::HostTransition(HostError::OwnerLeaseRecovery(
-                "cutover dispatch has no durable Host activation".to_owned(),
-            )))?;
-        let activation_id = activation.activation_id.clone();
-        let activation_generation = activation.fence.activation_generation.clone();
+        // The retirement fence AND the activation the cutover is bound to both
+        // come from ONE owner read: this composition's own durable Host
+        // activation plus the authority generation of its current approved
+        // launch, through `self.journal.snapshot()` - the same journal-owner
+        // read path the retirement barrier and the disposition port already
+        // use. No second store is opened and nothing is cached.
+        //
+        // The fence is deliberately NOT a parameter. A caller-stated fence
+        // would make every comparison below - including
+        // `require_generation_retirement_barrier`'s own fence comparison - a
+        // shape check over the caller's own words instead of an owner-vs-owner
+        // agreement, which is the exact substitution the retirement barrier
+        // exists to prevent. `HostComposition::owner_generation_retirement_fence`
+        // is the only producer of this type outside its defining module, and
+        // `require_generation_retirement_barrier` independently re-reads the
+        // journal and the live launch before admitting anything, so the
+        // agreement is proved at the effect boundary on a fresh owner read
+        // rather than restated from the value produced here.
+        let fence = self.owner_generation_retirement_fence()?;
+        let activation_id = fence.activation_id.clone();
+        let activation_generation = fence.activation_generation.clone();
         let (committed, barrier) = execute_cutover(
             self,
             &validated,
-            retirement,
+            &fence,
             &activation_id,
             &activation_generation,
         )?;
