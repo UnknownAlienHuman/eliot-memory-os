@@ -3604,7 +3604,13 @@ fn drive_user_owned_profile_phase_b(
         &phase_b,
         Ok(InstallationStepOutcome::Applied { .. })
     ) {
-        observe_pending_profile_host_exit(&host)
+        observe_pending_profile_host_exit(&host).and_then(|()| {
+            verify_pending_profile_host_activation_terminal(
+                &host,
+                &transaction,
+                original_selection,
+            )
+        })
     } else {
         Ok(())
     };
@@ -3661,6 +3667,102 @@ fn observe_pending_profile_host_exit(
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn verify_pending_profile_host_activation_terminal(
+    host: &eliot_host::ProfileSupervisorJob,
+    transaction: &InstallationTransaction,
+    original_selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+) -> std::result::Result<(), InstallationError> {
+    let live_selection = host.profile_selection().map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "retained pending Host root leases could not be verified before terminal readback: {error}"
+        ))
+    })?;
+    if !eliot_installation::profile_selection_receipts_match_retained_roots(
+        original_selection,
+        live_selection,
+    )? {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let selected_host_root = live_selection
+        .roots
+        .iter()
+        .find(|root| root.role == "runtime_state_roots.host_state_root")
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "pending Host root lease receipt omitted the Host state root".to_owned(),
+            )
+        })?;
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let host_root = UserOwnedRootLease::open_existing(host_state_root).map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host root could not be reopened for terminal readback: {error}"
+        ))
+    })?;
+    let canonical_root = host_root.canonical_path().map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host root could not be canonicalized for terminal readback: {error}"
+        ))
+    })?;
+    if host_root.identity() != selected_host_root.identity
+        || !eliot_platform_windows::windows_paths_equal(
+            &canonical_root,
+            &selected_host_root.canonical_path,
+        )
+        || !eliot_platform_windows::windows_paths_equal(&canonical_root, host_state_root)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    host_root
+        .verify_stable_identity()
+        .and_then(|()| host_root.verify_path_identity())
+        .map_err(|error| {
+            InstallationError::IncompleteObservation(format!(
+                "current-user Host root identity changed during terminal readback: {error}"
+            ))
+        })?;
+    let registry = RedbInstallationRegistry::inspect_existing_user_owned_at(
+        host_root,
+        transaction.profile,
+    )
+    .map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host activation registry could not be read back: {error}"
+        ))
+    })?
+    .ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "pending Host exited successfully but its current-user activation registry is absent"
+                .to_owned(),
+        )
+    })?;
+    let receipt = registry
+        .read_optional_committed_activation_receipt(
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+        )
+        .map_err(|error| {
+            InstallationError::IncompleteObservation(format!(
+                "exact Host activation terminal readback failed: {error}"
+            ))
+        })?;
+    if receipt.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "pending Host exited successfully without its exact committed activation terminal"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
