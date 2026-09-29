@@ -1,13 +1,12 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     FileIdentity, PackageManifest, PackageSourceObservation, PackageStagingError,
     TrustedSourceBundle, UserModeSupervisionAuthorityCredentialRequest,
-    UserModeSupervisionAuthorityCredentialTargetObservation,
-    WindowsInstallerSecretProvider, WindowsUserModeSupervisionAuthorityCredentialProvider,
-    validate_package_relative_path,
+    UserModeSupervisionAuthorityCredentialTargetObservation, WindowsInstallerSecretProvider,
+    WindowsUserModeSupervisionAuthorityCredentialProvider, validate_package_relative_path,
 };
 
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
@@ -18,12 +17,11 @@ use crate::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
     InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
-    PackageArtifactDigest, PlannedChange, ProfileGovernanceReport, ProfileRootAnchors,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, NoServiceProfileAuthorityProof,
+    PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange, ProfileGovernanceReport,
+    ProfileRootAnchors, ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    SupervisionAuthorityProvisionPlan, NoServiceProfileAuthorityProof,
-    UserModeSupervisionAuthorityProvisionPlan,
+    SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, prove_no_service_profile_authority_dependency,
     provider_bootstrap_credential_target_for_store_target, select_profile_roots,
@@ -1229,16 +1227,10 @@ impl GenerationPackagePlanner {
                 Some(input.profile_anchor_root.clone()),
                 None,
             ),
-            InstallationProfile::UserMode => (
-                None,
-                None,
-                None,
-            ),
-            InstallationProfile::PortableDev => (
-                None,
-                None,
-                Some(input.profile_anchor_root.clone()),
-            ),
+            InstallationProfile::UserMode => (None, None, None),
+            InstallationProfile::PortableDev => {
+                (None, None, Some(input.profile_anchor_root.clone()))
+            }
         };
         Ok(ProfileSelectionInput {
             profile: input.profile,
@@ -1531,8 +1523,7 @@ impl GenerationPackagePlanner {
         let roots = Self::planner_runtime_roots(&input)?;
         if roots != profile_resolution.roots.runtime_state_roots {
             return Err(InstallationError::ProfileViolation(
-                "resolved I3.1 binding differs from the planner runtime-root projection"
-                    .to_owned(),
+                "resolved I3.1 binding differs from the planner runtime-root projection".to_owned(),
             ));
         }
         if let Some(expected_staging_root) = roots.expected_staging_root()?
@@ -1586,7 +1577,7 @@ impl GenerationPackagePlanner {
                 lease,
                 validate_source_store_config(
                     &bytes,
-                    Path::new(&profile_resolution.roots.immutable_binaries)
+                    &Path::new(&profile_resolution.roots.immutable_binaries)
                         .join("generation.json"),
                 )?,
             ))
@@ -2153,7 +2144,7 @@ impl GenerationPackagePlanner {
                     })?,
                     target,
                     owner_sid,
-                    profile_roots: roots.clone(),
+                    profile_roots: profile_resolution.roots.clone(),
                 }),
             });
         }
@@ -2378,7 +2369,8 @@ impl GenerationPackagePlanner {
                         provision.target.clone()
                     }
                     InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
-                        provision, ..
+                        provision,
+                        ..
                     } => provision.target.clone(),
                     InstallerEffectPlan::MaterializePhaseB {
                         static_template, ..

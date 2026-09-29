@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode, UnknownReason};
 use eliot_platform_windows::{
-    AuthenticodeVerdict, FileIdentity, PackageManifest, PackageStager, PackageStagingError,
-    PackageStagingObservation, PackageStagingStage, StagePackageAuthorization,
-    StagePackageExpectedFile, StagingReceipt, TrustedSourceBundle, InstallerRootProfile,
+    AuthenticodeVerdict, FileIdentity, InstallerRootProfile, PackageManifest, PackageStager,
+    PackageStagingError, PackageStagingObservation, PackageStagingStage, StagePackageAuthorization,
+    StagePackageExpectedFile, StagingReceipt, TrustedSourceBundle,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -461,11 +461,7 @@ fn package_stager(
             Path::new(destination_root.as_str()),
             profile,
         )?,
-        None => PackageStager::open_for_profile(
-            source,
-            Path::new(staging_root.as_str()),
-            profile,
-        )?,
+        None => PackageStager::open_for_profile(source, Path::new(staging_root.as_str()), profile)?,
     };
     Ok((stager, manifest.clone()))
 }
@@ -481,6 +477,7 @@ fn stage_package_authorization(
         manifest,
         staging_root,
         destination_root,
+        ..
     } = &request.plan
     else {
         return Err(PackageStagingError::Io);
@@ -1204,13 +1201,11 @@ pub(super) fn execute_package(
             if snapshot.source_bundle_identity != stager.source().identity() {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
-            let Ok(authorization) =
-                stage_package_authorization(
-                    request,
-                    Some(stager.installation_root_identity()),
-                    stager.destination_parent_identity(),
-                )
-            else {
+            let Ok(authorization) = stage_package_authorization(
+                request,
+                Some(stager.installation_root_identity()),
+                stager.destination_parent_identity(),
+            ) else {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             };
             match stager.stage_authorized(manifest, &authorization, ownership_key) {

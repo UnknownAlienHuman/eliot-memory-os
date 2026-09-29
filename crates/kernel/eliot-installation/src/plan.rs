@@ -279,7 +279,10 @@ impl InstallerEffectPlan {
                 Ok(())
             }
             Self::ProvisionStoreCredential { provision, .. } => provision.validate(),
-            Self::ProvisionUserModeSupervisionAuthority { effect_id, provision } => {
+            Self::ProvisionUserModeSupervisionAuthority {
+                effect_id,
+                provision,
+            } => {
                 provision.validate()?;
                 if provision.effect_id != *effect_id {
                     return Err(InstallationError::IdentityConflict);

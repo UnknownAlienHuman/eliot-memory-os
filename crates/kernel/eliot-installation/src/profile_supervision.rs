@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use super::profile_governed_roots::ProfileGovernedRoots;
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
 use super::{
-    InstallationError, PlatformHandle, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
+    InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
     joined_windows_path, text,
 };
 
@@ -268,10 +268,7 @@ pub fn prove_no_service_profile_authority_dependency(
                     "immutable_binaries",
                     joined_windows_path(
                         &joined_windows_path(
-                            &joined_windows_path(
-                                &joined_windows_path(anchor, "Programs"),
-                                "Eliot",
-                            ),
+                            &joined_windows_path(&joined_windows_path(anchor, "Programs"), "Eliot"),
                             component,
                         ),
                         version,
