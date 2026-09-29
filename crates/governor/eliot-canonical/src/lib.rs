@@ -550,12 +550,11 @@ impl CanonicalWriteEnvelope {
         // instruction/data separation before any diagnosis is read, so a
         // tainted source carried by this envelope cannot become a standing
         // instruction, tool definition, policy, credential, or effect grant.
-        self.security
-            .resolve_source_use(
-                self.operation_id.as_str(),
-                self.transition_class,
-                self.requested_effect_ceiling,
-            )?;
+        self.security.resolve_source_use(
+            self.operation_id.as_str(),
+            self.transition_class,
+            self.requested_effect_ceiling,
+        )?;
         Ok(())
     }
 

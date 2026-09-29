@@ -30,7 +30,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EpistemicUse, EffectCeiling, InstructionTaint, ObservationDomainKind, SecurityContractError,
+    EffectCeiling, EpistemicUse, InstructionTaint, ObservationDomainKind, SecurityContractError,
     SourceAssurance, TransformationLineage,
 };
 
@@ -329,7 +329,11 @@ impl BoundedAnalysisRequest {
                 MAX_ANALYSIS_OUTPUT_BYTES,
                 "analysis.max_output_bytes",
             ),
-            (self.max_wall_ms, MAX_ANALYSIS_WALL_MS, "analysis.max_wall_ms"),
+            (
+                self.max_wall_ms,
+                MAX_ANALYSIS_WALL_MS,
+                "analysis.max_wall_ms",
+            ),
         ] {
             if value == 0 || value > ceiling {
                 return Err(SecurityContractError::InvalidText { field });
