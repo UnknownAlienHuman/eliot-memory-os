@@ -33,7 +33,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.storage.ecxf";
-pub const FORMAT_VERSION: &str = "ECXF/1";
+
+/// `ECXF/2` adds a required `installation_id` to [`ExportFence`] and [`EcxfManifest`], so the
+/// preimage an import validates genuinely changed. A `ECXF/1` package recorded no installation
+/// identity at all, and it is refused here at the version check rather than deserialised with a
+/// blank one: a default would turn a loud "wrong format" into a silent "identity absent", and a
+/// missing identity claim must never read as a satisfied one. The same reasoning that moved
+/// `BACKUP_VERIFY_PROFILE_VERSION` from 2 to 3 in #2862.
+pub const FORMAT_VERSION: &str = "ECXF/2";
 pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SECTION_BYTES: usize = 1024 * 1024 * 1024;
 
