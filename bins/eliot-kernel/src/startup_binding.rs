@@ -18,11 +18,14 @@ use eliot_kernel::AuthorityDescriptorContour;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
 #[cfg(windows)]
+use eliot_platform_windows::profile_supervision::{
+    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+    open_profile_root_leases,
+};
+#[cfg(windows)]
 use eliot_platform_windows::{
-    FileIdentity, NamedPipePeerProcessBinding, ProfileRootLeaseSet, ProfileRootRequest,
-    ProfileSelection, ProfileSelectionReceipt, ProtectedRuntimePathLease, UserOwnedPathLease,
-    UserOwnedRootLease, observe_named_pipe_peer_process, open_profile_root_leases,
-    windows_paths_equal,
+    FileIdentity, NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease,
+    UserOwnedRootLease, observe_named_pipe_peer_process, windows_paths_equal,
 };
 
 #[cfg(windows)]
