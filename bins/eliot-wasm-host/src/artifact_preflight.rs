@@ -2,20 +2,29 @@
 //!
 //! Performs pre-open reparse-component checks, then reads one opened regular-file
 //! handle into a bounded buffer and checks its length and WebAssembly preamble/core
-//! marker. The digest describes that same buffer. Path checks are subject to races
+//! marker. The digest describes that same buffer. `..` escape components are
+//! rejected before resolution, and [`verify_preflight_source`] rejects
+//! source/hash/length mismatch against the admission-claimed identity.
+//! Raw typed-input fixtures use the same single take-bounded read discipline
+//! through [`read_bounded_raw_input`]. Path checks are subject to races
 //! and do not establish retained-root, source, or signature authorization. No
 //! network, registry, discovery, URL, credential, provider, or Kernel access.
 
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use eliot_wasm_runtime::Sha256Digest;
 
 /// Maximum artifact bytes accepted on the local-experimental path.
 /// Guards raw acquisition before any allocation or compilation.
 pub const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum raw typed-input fixture bytes accepted before any JSON/string/tree
+/// allocation. Matches the established guest input envelope so serialized
+/// fixtures cannot widen the input ceiling.
+pub const MAX_RAW_INPUT_BYTES: u64 = 65_536;
 
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 const CORE_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
@@ -39,6 +48,12 @@ pub enum PreflightError {
     TooLarge { actual: u64, max: u64 },
     /// Path names a symbolic link or reparse point.
     ReparsePoint,
+    /// Path escapes the invocation directory through a `..` component.
+    PathEscape,
+    /// Buffer digest disagrees with the admission-claimed source digest.
+    HashMismatch,
+    /// Buffer length disagrees with the admission-claimed source length.
+    LengthMismatch { actual: u64, expected: u64 },
     /// Path does not name a regular file.
     NotAFile,
     /// File length changed after its opened-handle metadata was observed.
@@ -59,6 +74,14 @@ impl fmt::Display for PreflightError {
                 write!(formatter, "PREFLIGHT_TOO_LARGE:actual={actual}:max={max}")
             }
             Self::ReparsePoint => formatter.write_str("PREFLIGHT_REPARSE_POINT"),
+            Self::PathEscape => formatter.write_str("PREFLIGHT_PATH_ESCAPE"),
+            Self::HashMismatch => formatter.write_str("PREFLIGHT_HASH_MISMATCH"),
+            Self::LengthMismatch { actual, expected } => {
+                write!(
+                    formatter,
+                    "PREFLIGHT_LENGTH_MISMATCH:actual={actual}:expected={expected}"
+                )
+            }
             Self::NotAFile => formatter.write_str("PREFLIGHT_NOT_A_FILE"),
             Self::LengthChanged => formatter.write_str("PREFLIGHT_LENGTH_CHANGED"),
             Self::MalformedPreamble => formatter.write_str("PREFLIGHT_MALFORMED_PREAMBLE"),
@@ -98,10 +121,32 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Preflight, PreflightError> {
     })
 }
 
+/// Rejects the buffer's admission-claimed source identity on mismatch.
+/// The digest and length describe the exact bytes that will be compiled;
+/// a substituted source fails here before compile/instantiate, never by
+/// rereading a path. No payload, path, or secret is echoed.
+pub fn verify_preflight_source(
+    preflight: &Preflight,
+    expected_digest: &Sha256Digest,
+    expected_len: u64,
+) -> Result<(), PreflightError> {
+    if preflight.byte_len != expected_len {
+        return Err(PreflightError::LengthMismatch {
+            actual: preflight.byte_len,
+            expected: expected_len,
+        });
+    }
+    if preflight.digest != *expected_digest {
+        return Err(PreflightError::HashMismatch);
+    }
+    Ok(())
+}
+
 /// Reads one explicit local artifact path once into a bounded buffer.
 /// No environment, registry, discovery, URL, or credential lookup.
 /// The returned bytes and [`Preflight`] digest describe the same buffer.
 pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), PreflightError> {
+    reject_path_escape(path)?;
     let path = absolute_artifact_path(path)?;
     reject_reparse_components(&path)?;
     let file = open_artifact_file(&path)
@@ -151,6 +196,33 @@ pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), Prefli
     Ok((bytes, preflight))
 }
 
+/// Reads one explicit local raw typed-input fixture into a bounded buffer
+/// before any JSON/string/tree allocation. The handle is the only source of
+/// input bytes and `take` bounds allocation even if the file grows after it
+/// is opened. An over-ceiling file is denied, never truncated. Empty input
+/// is a legitimate empty vector, not a malformed artifact. No environment,
+/// registry, discovery, URL, or credential lookup.
+pub fn read_bounded_raw_input(path: &Path) -> Result<Vec<u8>, PreflightError> {
+    reject_path_escape(path)?;
+    let path = absolute_artifact_path(path)?;
+    reject_reparse_components(&path)?;
+    let file = open_artifact_file(&path)
+        .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    reject_final_reparse_point(&path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RAW_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_RAW_INPUT_BYTES {
+        return Err(PreflightError::TooLarge {
+            actual,
+            max: MAX_RAW_INPUT_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
 fn absolute_artifact_path(path: &Path) -> Result<PathBuf, PreflightError> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -159,6 +231,18 @@ fn absolute_artifact_path(path: &Path) -> Result<PathBuf, PreflightError> {
             .map(|current| current.join(path))
             .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))
     }
+}
+
+/// Rejects `..` components before resolution so a supplied relative path
+/// cannot escape the invocation directory it is resolved against.
+fn reject_path_escape(path: &Path) -> Result<(), PreflightError> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PreflightError::PathEscape);
+    }
+    Ok(())
 }
 
 fn reject_reparse_components(path: &Path) -> Result<(), PreflightError> {
