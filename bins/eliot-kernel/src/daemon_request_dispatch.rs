@@ -25,11 +25,12 @@ use eliot_kernel_service::{
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
-    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -3757,6 +3758,15 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -3793,6 +3803,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3853,6 +3870,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3936,7 +3960,92 @@ impl KernelComposition {
                     Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
                 }
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
+                let answer = match Box::pin(client.publish_wake_horizon(request.clone())).await {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        return Ok(Self::user_automation_runtime_error_response(error));
+                    }
+                };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_published",
+                    request.as_ref(),
+                    &answer,
+                ))
+            }
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                let answer =
+                    match Box::pin(client.read_wake_horizon_publication(request.clone())).await {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            return Ok(Self::user_automation_runtime_error_response(error));
+                        }
+                    };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_publication_readback",
+                    request.as_ref(),
+                    &answer,
+                ))
+            }
         }
+    }
+
+    #[cfg(windows)]
+    /// Projects one schedule owner's horizon answer against the exact request it
+    /// was asked for (issue #2806 items 4 and 9).
+    ///
+    /// The owner's acknowledgement is validated against the exact publication
+    /// through `UserAutomationWakePublication::validate_for`, which requires the
+    /// acknowledged and remaining sets to partition the requested set exactly.
+    /// An answer that does not account for the request is reported as unknown
+    /// rather than as a partial success, because a mismatched remainder is not
+    /// evidence about any occurrence.
+    ///
+    /// A remainder is never projected as completion. When the owner leaves
+    /// occurrences unacknowledged, the exact remaining set and the owner's own
+    /// replay handle are returned as the recovery directive, which forces
+    /// `status: "unknown"`; only an answer that acknowledged the whole requested
+    /// set settles the route.
+    ///
+    /// The answer is borrowed rather than taken by value: it is read twice — once
+    /// to validate it against the request and once to project it — and
+    /// `serde_json::json!` borrows every interpolated expression, so a by-value
+    /// parameter would be copied in and never consumed.
+    #[cfg(windows)]
+    fn user_automation_horizon_publication_response(
+        outcome: &str,
+        request: &UserAutomationWakeHorizonPublication,
+        answer: &UserAutomationWakePublication,
+    ) -> serde_json::Value {
+        if let Err(error) = answer.validate_for(request) {
+            return Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "the schedule owner answer does not account for the requested horizon: {error}"
+                )),
+            );
+        }
+        let recovery = if answer.acknowledged_all() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "kind": "partial_horizon",
+                "reason": "the schedule owner did not acknowledge every requested occurrence, so \
+                           the exact remaining set is retained and must be replayed under its \
+                           handle",
+                "automation_id": &answer.automation_id,
+                "automation_revision": &answer.automation_revision,
+                "remaining_occurrence_ids": &answer.remaining_occurrence_ids,
+                "retry_handle": &answer.retry_handle,
+            }))
+        };
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": outcome,
+                "publication": answer,
+            },
+            "recovery": recovery,
+        })
     }
 
     #[cfg(windows)]
@@ -4944,11 +5053,14 @@ impl KernelComposition {
     /// Every refusal happens before the effect owner is contacted, and a refusal
     /// returns the closed cause and the existing operation rather than prose.
     ///
-    /// After the Durable Job owner acknowledges the admission, the next bounded
-    /// recurring horizon slice is requested through the same schedule owner
-    /// (item 6). The advance recompiles the denominator from the immutable
-    /// revision the wake resolved against, so it never mutates that revision and
-    /// never produces a time outside its normalized contract.
+    /// After the Durable Job owner issues an owner-acknowledged disposition —
+    /// an admission, or a refusal it answered before any owner effect — the
+    /// next bounded recurring horizon slice is requested through the same
+    /// schedule owner (item 6). The advance recompiles the denominator from the
+    /// immutable revision the wake resolved against, so it never mutates that
+    /// revision and never produces a time outside its normalized contract. A
+    /// disposition the owner could not issue, or could not confirm, advances
+    /// nothing.
     #[cfg(windows)]
     async fn user_automation_due_wake_operation(
         &self,
@@ -5000,15 +5112,67 @@ impl KernelComposition {
         // Durable Job owner's own operation identity is the at-most-once
         // boundary; the revalidation above already refused any occurrence that
         // the complete owner projection shows as already admitted.
-        let execution = match client.admit_occurrence(request.clone()).await {
-            Ok(execution) => execution,
-            Err(error) => {
-                // No owner acknowledged a disposition, so the recurring horizon
-                // does not advance: this wake is still unconsumed and a later
-                // owner-issued submission can admit it.
-                return Ok(Self::user_automation_runtime_error_response(error));
-            }
-        };
+        //
+        // The admission is assembled from what the owners proved on this very
+        // delivery rather than forwarded from the caller's asserted carrier: the
+        // current canonical revision, the invocation `scheduled_invocation`
+        // re-derived from that revision for this occurrence, and the WakeIntent
+        // the schedule owner read back from its own journal. Nothing here is
+        // recomputed or re-derived by spelling.
+        //
+        // It is then submitted through the existing runtime execution join,
+        // `UserAutomationOperatorRuntime` — the production
+        // `UserAutomationRuntimePort` over this already-authenticated Host
+        // channel, the same join `run-now` composes in
+        // `dispatch_user_automation_operator_transition`. That join revalidates
+        // the exact admission, resolves the complete owner-issued
+        // `UserAutomationDurableJobMaterial` through
+        // `UserAutomationDurableJobMaterial::from_admitted_occurrence` when this
+        // ingress carries none, and validates the owner's answer. Calling
+        // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
+        // as this contour did, reached the Durable Job owner with no
+        // `UserAutomationDurableJobMaterial` at all and so could never reach
+        // `HostDurableJobOwner::dreamer_job`.
+        let execution =
+            match Self::user_automation_due_wake_join(client, &request, &resolution, &readback)
+                .await
+            {
+                Ok(execution) => execution,
+                // Item 6, terminal leg. A refusal the Durable Job owner answered
+                // before any owner effect is a decided disposition about this
+                // occurrence, exactly as an admission is: the occurrence will not be
+                // admitted now, so leaving the recurring horizon pinned to it would
+                // wedge every later occurrence of the revision behind one
+                // permanently-refused wake. It advances through the same
+                // owner-acknowledged path the admitted branch uses, and it is
+                // reported as its own disposition rather than as a success.
+                //
+                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+                // `OutcomeSettled` deliberately do not reach this arm: none of them
+                // is an owner-acknowledged disposition about this occurrence. They
+                // respectively mean the owner could not answer, it answered about
+                // another record, it cannot say whether the effect landed, and the
+                // effect provably landed. Those keep the pre-existing fail-closed
+                // projection and do not advance.
+                Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
+                    return Self::user_automation_due_wake_terminal_response(
+                        session,
+                        &resolution,
+                        &occurrence_id,
+                        &request,
+                        &readback,
+                        client,
+                        error,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // No owner acknowledged a disposition, so the recurring horizon
+                    // does not advance: this wake is still unconsumed and a later
+                    // owner-issued submission can admit it.
+                    return Ok(Self::user_automation_runtime_error_response(error));
+                }
+            };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -5019,11 +5183,163 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
-        let horizon = Self::user_automation_due_wake_horizon(
+        Ok(Self::user_automation_due_wake_admitted_value(
             session,
             &resolution,
             &occurrence_id,
             &request,
+            &readback,
+            client,
+            execution,
+        )
+        .await)
+    }
+
+    /// Advances the recurring horizon after an owner-acknowledged admission and
+    /// reports the occurrence as admitted (issue #2806 item 6).
+    ///
+    /// The `status`/`recovery` pair is derived from the horizon alone, exactly as
+    /// before: only a fully acknowledged published horizon reports a settled
+    /// answer, and every partial, unknown or unavailable remainder keeps its
+    /// exact remaining occurrence set and replay handle.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_admitted_value(
+        session: &Session,
+        resolution: &UserAutomationDueWakeResolution,
+        occurrence_id: &str,
+        request: &UserAutomationRuntimeAdmission,
+        readback: &UserAutomationWakeReadback,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        execution: eliot_kernel_core::user_automation::AutomationExecutionReference,
+    ) -> serde_json::Value {
+        let horizon = Self::user_automation_due_wake_horizon(
+            session,
+            resolution,
+            occurrence_id,
+            request,
+            client,
+        )
+        .await;
+        let recovery = Self::user_automation_horizon_recovery(&horizon);
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": "admitted",
+                "execution": execution,
+                "resolution": resolution,
+                "wake_readback": readback,
+                "horizon": horizon,
+            },
+            "recovery": recovery,
+        })
+    }
+
+    /// Assembles the admission this delivery submits to the runtime join.
+    ///
+    /// Every member is the owner-proven value from this delivery, not a field
+    /// forwarded from the caller's asserted carrier: the current canonical
+    /// revision and the occurrence `scheduled_invocation` re-derived from it,
+    /// plus the `WakeIntent` the schedule owner read back from its own journal.
+    /// `preflight` and any owner-issued Durable Job material are carried across
+    /// unchanged when the ingress supplies them, and the join resolves the
+    /// material itself when it does not.
+    #[cfg(windows)]
+    fn user_automation_due_wake_admission(
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+    ) -> UserAutomationRuntimeAdmission {
+        UserAutomationRuntimeAdmission {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            revision: resolution.revision.clone(),
+            invocation: resolution.invocation.clone(),
+            preflight: request.preflight.clone(),
+            wake_intent: readback.intent.clone(),
+            durable_job: request.durable_job.clone(),
+        }
+    }
+
+    /// Submits one due occurrence to the runtime execution join and returns the
+    /// owner's answer (issue #2806 items 5 and 6).
+    ///
+    /// The admission is assembled and the join is awaited entirely inside this
+    /// contour, so `user_automation_due_wake_operation` never holds the join's
+    /// own state across its awaits. The join resolves the complete owner-issued
+    /// `UserAutomationDurableJobMaterial` through
+    /// `UserAutomationDurableJobMaterial::from_admitted_occurrence` whenever the
+    /// ingress carries none, and that compiler holds a whole canonical-JSON K0
+    /// `JobSubmission` and its digest inputs on the stack. Awaiting it inline
+    /// made the calling contour's future exceed the bounded size even though the
+    /// caller only ever reads the returned reference, so the join's future is
+    /// polled through one box: the transient allocation is released as soon as
+    /// the answer is back, and the caller's future stays bounded.
+    ///
+    /// The transport is already authenticated and bound to the current State
+    /// Fence by the caller, so this adds no channel, no retry and no second
+    /// admission: it is exactly the `UserAutomationOperatorRuntime` over that one
+    /// channel.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_join(
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+    ) -> Result<
+        eliot_kernel_core::user_automation::AutomationExecutionReference,
+        UserAutomationRuntimeError,
+    > {
+        let runtime = UserAutomationOperatorRuntime::new(client);
+        Box::pin(
+            runtime.admit_occurrence(Self::user_automation_due_wake_admission(
+                request, resolution, readback,
+            )),
+        )
+        .await
+    }
+
+    /// Advances the recurring horizon after an owner-acknowledged terminal
+    /// refusal and reports the occurrence as terminal (issue #2806 item 6).
+    ///
+    /// The Durable Job owner refused this occurrence before any owner effect, so
+    /// it issued a decided answer about it rather than a lost one. The horizon
+    /// therefore advances exactly as it does after an admission, through the
+    /// same `user_automation_due_wake_horizon` slice request, and its outcome
+    /// and replay handle travel beside the refusal.
+    ///
+    /// The occurrence is reported as `accepted: false` with the owner's own
+    /// closed reason. It is not published, not admitted, and it carries no
+    /// Durable Job reference, so nothing here can be read as a success. The
+    /// route-level `recovery` stays derived from the horizon alone and is never
+    /// fabricated: a decided refusal with a fully acknowledged horizon owes the
+    /// caller nothing, which is the same convention
+    /// `user_automation_runtime_error_response` already uses for
+    /// `UserAutomationRuntimeError::Rejected`.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_terminal_response(
+        session: &Session,
+        resolution: &UserAutomationDueWakeResolution,
+        occurrence_id: &str,
+        request: &UserAutomationRuntimeAdmission,
+        readback: &UserAutomationWakeReadback,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        error: UserAutomationRuntimeError,
+    ) -> Result<serde_json::Value, TransportError> {
+        let UserAutomationRuntimeError::Rejected(reason) = error else {
+            return Ok(Self::user_automation_runtime_error_response(error));
+        };
+        let horizon = Self::user_automation_due_wake_horizon(
+            session,
+            resolution,
+            occurrence_id,
+            request,
             client,
         )
         .await;
@@ -5031,8 +5347,10 @@ impl KernelComposition {
         Ok(serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
-                "outcome": "admitted",
-                "execution": execution,
+                "accepted": false,
+                "outcome": "rejected",
+                "reason": reason,
+                "occurrence_id": occurrence_id,
                 "resolution": resolution,
                 "wake_readback": readback,
                 "horizon": horizon,
@@ -5574,6 +5892,86 @@ impl KernelComposition {
                 .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
                 != request.revision_digest
             || owner_denominator != request.denominator
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates one bounded recurring wake horizon against the authenticated
+    /// owner and the canonical parent operation receipt before Host.
+    ///
+    /// A horizon publication belongs to the read/observation family, not the
+    /// occurrence family: it names an immutable revision and a State Fence but
+    /// no occurrence. `revalidate_user_automation_enumeration` is therefore its
+    /// exact analogue — the same `UserAutomationOwnerLookup`, the same canonical
+    /// owner readback, the same owner-recompiled occurrence denominator, and the
+    /// same parent Store receipt proof. `revalidate_user_automation_wake_read` is
+    /// not usable here because it keys on a `UserAutomationWakeReadRequest` and
+    /// its invocation.
+    ///
+    /// The caller-carried publication is never an authority source. The
+    /// automation identity, the revision, the owner principal and the complete
+    /// occurrence denominator are all recompiled from the canonical current
+    /// revision, and the carried `revision_digest` must equal that revision's
+    /// own `digest()` — a digest a caller could compute for itself would
+    /// otherwise name another revision's cursor. This is issue #2806 item 2's
+    /// "revalidate principal, revision, State Fence and owner denominator
+    /// before each owner call", applied to the publish leg and the read-back leg
+    /// alike.
+    async fn revalidate_user_automation_horizon(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let owner_occurrence_ids = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != authenticated_principal
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
+            || owner_occurrence_ids != request.denominator_occurrence_ids
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }

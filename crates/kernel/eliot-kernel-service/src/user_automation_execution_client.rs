@@ -25,7 +25,8 @@ use super::{
     UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback,
 };
 
@@ -540,6 +541,16 @@ pub enum UserAutomationHostExecutionOperation {
         /// Original same-fence cancellation request and complete target set.
         request: Box<UserAutomationWakeCancellation>,
     },
+    /// Publish one bounded recurring horizon to the existing `WakeIntent` owner.
+    PublishWakeHorizon {
+        /// Immutable revision, bounded slice, publication identity, and fence.
+        request: Box<UserAutomationWakeHorizonPublication>,
+    },
+    /// Reconcile one exact horizon publication with its schedule owner.
+    ReadWakeHorizonPublication {
+        /// The original typed publication whose retained answer is read.
+        request: Box<UserAutomationWakeHorizonPublication>,
+    },
 }
 
 /// Typed Kernel-to-Host request carrier for one UserAutomation execution
@@ -620,6 +631,32 @@ impl UserAutomationHostExecutionRequest {
         Self::new(
             channel,
             UserAutomationHostExecutionOperation::ReadCancellationBatch {
+                request: request.into(),
+            },
+        )
+    }
+
+    /// Builds and hashes one typed wake-horizon publication carrier.
+    pub fn publish_wake_horizon(
+        channel: UserAutomationHostChannelBinding,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::PublishWakeHorizon {
+                request: request.into(),
+            },
+        )
+    }
+
+    /// Builds and hashes one typed wake-horizon publication readback carrier.
+    pub fn read_wake_horizon_publication(
+        channel: UserAutomationHostChannelBinding,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication {
                 request: request.into(),
             },
         )
@@ -740,6 +777,26 @@ impl UserAutomationHostExecutionRequest {
                     ));
                 }
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("wake horizon publication: {error}")))?;
+                if request.context.state_fence != self.channel.state_fence
+                    || request.state_fence != self.channel.state_fence
+                {
+                    return Err(rejected("wake horizon publication channel fence mismatch"));
+                }
+            }
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("wake horizon readback: {error}")))?;
+                if request.context.state_fence != self.channel.state_fence
+                    || request.state_fence != self.channel.state_fence
+                {
+                    return Err(rejected("wake horizon readback channel fence mismatch"));
+                }
+            }
         }
         Ok(())
     }
@@ -796,6 +853,19 @@ pub enum UserAutomationHostExecutionResponse {
         /// The exact retained Host batch record and append receipt projection.
         readback: Box<UserAutomationWakeCancellationReadback>,
     },
+    /// Owner's acknowledgement of one bounded recurring wake horizon.
+    ///
+    /// The same variant answers a publication and its readback: both carry the
+    /// owner's own acknowledgement over the exact requested occurrence set, and
+    /// only such an acknowledgement makes a horizon published.
+    WakeHorizonPublication {
+        /// Digest of the exact request carrier answered.
+        request_sha256: String,
+        /// Fence observed by the Host owner.
+        state_fence: StateFence,
+        /// Owner's answer over the exact requested occurrence set.
+        publication: Box<UserAutomationWakePublication>,
+    },
     /// Closed Host-owner failure projection.
     Failed {
         /// Digest of the exact request carrier answered.
@@ -849,6 +919,11 @@ impl UserAutomationHostExecutionResponse {
                 ..
             }
             | Self::WakeCancellationBatchReadback {
+                request_sha256,
+                state_fence,
+                ..
+            }
+            | Self::WakeHorizonPublication {
                 request_sha256,
                 state_fence,
                 ..
@@ -949,6 +1024,19 @@ impl UserAutomationHostExecutionResponse {
                 }
                 Ok(())
             }
+            // The owner acknowledgement is the only thing that makes a horizon
+            // published, so it is checked here against the exact request: the
+            // acknowledged and remaining sets must together be exactly the
+            // requested occurrences, and the owner must echo the publication
+            // identity. A response that does not account for the request is a
+            // foreign answer, never a partial success.
+            (
+                UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+                | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request },
+                Self::WakeHorizonPublication { publication, .. },
+            ) => publication
+                .validate_for(request)
+                .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
             (_, Self::Failed { .. }) => Ok(()),
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
@@ -1029,6 +1117,27 @@ impl UserAutomationHostExecutionResponse {
             | (
                 UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
                 Self::WakeRead { .. },
+            )
+            // A horizon publication and its readback answer only a horizon
+            // acknowledgement. Every other result for either operation is a
+            // response for a different owner effect, and an acknowledgement
+            // for another operation is a response for another request.
+            | (
+                UserAutomationHostExecutionOperation::PublishWakeHorizon { .. }
+                | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { .. },
+                Self::Admitted { .. }
+                | Self::Cancelled { .. }
+                | Self::WakeRead { .. }
+                | Self::WakeEnumeration { .. }
+                | Self::WakeCancellationBatchReadback { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::AdmitOccurrence { .. }
+                | UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+                | UserAutomationHostExecutionOperation::ReadPendingWake { .. }
+                | UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. }
+                | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. },
+                Self::WakeHorizonPublication { .. },
             ) => Err(UserAutomationRuntimeError::IdentityConflict),
         }
     }
@@ -1044,6 +1153,10 @@ fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMeta
         }
         UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
         UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
+        UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+        | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+            &request.context
+        }
     }
 }
 
@@ -1671,7 +1784,8 @@ where
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
-            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1695,6 +1809,67 @@ where
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
+    /// Publishes one bounded recurring wake horizon through the authenticated
+    /// Host execution transport. Only the schedule owner's own acknowledgement
+    /// is returned. A `WakeIntent` published by this path schedules work and
+    /// grants no task, route, tool, effect, or delivery authority, and a
+    /// published horizon is never permission to pre-admit a Durable Job.
+    pub async fn publish_wake_horizon(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        let carrier = UserAutomationHostExecutionRequest::publish_wake_horizon(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeHorizonPublication { publication, .. } => {
+                Ok(*publication)
+            }
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
+    /// Reconciles one exact horizon publication with its schedule owner after a
+    /// lost response. This path issues no owner effect: it reads what the owner
+    /// still retains under the original publication identity, so a caller that
+    /// crossed an unknown boundary re-presents the same request instead of
+    /// publishing the slice a second time.
+    pub async fn read_wake_horizon_publication(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        let carrier = UserAutomationHostExecutionRequest::read_wake_horizon_publication(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeHorizonPublication { publication, .. } => {
+                Ok(*publication)
+            }
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
             | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
@@ -1728,7 +1903,8 @@ where
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
-            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1755,7 +1931,8 @@ where
             UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
             | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
-            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1769,6 +1946,27 @@ impl<T> UserAutomationWakePort for UserAutomationHostExecutionClient<T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    /// Publishes one bounded recurring horizon over the authenticated Host
+    /// execution transport. This is the durable owner effect the operator route
+    /// reaches: only the owner's acknowledgement, checked against the exact
+    /// requested occurrence set, makes a horizon published.
+    async fn publish_wake_horizon(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationHostExecutionClient::publish_wake_horizon(self, request).await
+    }
+
+    /// Reconciles one exact horizon publication with its schedule owner. It
+    /// issues no owner effect, so a lost publication response resumes the same
+    /// original publication identity instead of publishing a second wake.
+    async fn read_wake_horizon_publication(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationHostExecutionClient::read_wake_horizon_publication(self, request).await
+    }
+
     async fn cancel_pending_wakes(
         &self,
         _request: impl Into<Box<UserAutomationWakeCancellation>>,
@@ -1800,7 +1998,8 @@ where
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
             | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
-            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
