@@ -4494,20 +4494,14 @@ impl KernelComposition {
                     refs.remove(position);
                     continue;
                 }
-                // Issue #1739 W2: execution consumes the exact typed bytes
-                // off the durable #1713 row, never the digest alone and never
-                // an out-of-band body. The bound body governs the claim: a
-                // queue body that is not the admitted bytes conflicts instead
-                // of replacing the admitted operation. Absence stays readable
-                // for rows staged before this binding existed, which keep
-                // serving their linkage-checked pair.
+                // Issue #1739 W2: execution consumes the exact typed bytes off
+                // the durable #1713 row; a queue body that is not the admitted
+                // bytes conflicts instead of replacing the admitted operation.
+                // Rows staged before this binding existed keep serving their
+                // linkage-checked pair.
                 let tool = match stored.payload_body.as_ref() {
-                    Some(durable) => {
-                        if tool != durable {
-                            return Err(TransportError::IdentityConflict);
-                        }
-                        durable.clone()
-                    }
+                    Some(durable) if tool == durable => durable.clone(),
+                    Some(_) => return Err(TransportError::IdentityConflict),
                     None => tool.clone(),
                 };
                 let envelope = envelope.clone();
