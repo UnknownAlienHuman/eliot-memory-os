@@ -67,8 +67,27 @@
 //! wave that adds the contracts edge tightens the epoch-adjacent spellings
 //! without changing the partition discipline.
 //!
+//! Exhausted normal partitions render as a versioned
+//! [`StoreBackpressureResponseV1`] with disposition `BUSY` naming exactly the
+//! saturated Store bottleneck in its exact unit: connections via
+//! [`StoreReserve::normal_connection_exhaustion_response`], transactions via
+//! [`StoreReserve::normal_transaction_exhaustion_response`] and pending-write
+//! bytes via [`StoreReserve::normal_pending_bytes_exhaustion_response`]. The
+//! response is the closed W6 successor the issue asks for: it reuses the
+//! seven [`eliot_runtime_contracts::BackpressureDisposition`] values and
+//! [`eliot_runtime_contracts::RecoveryCommitStatus`] and carries the complete
+//! [`StoreRecoveryDirectiveV1`] shape, validated by the existing owner check
+//! ([`StoreBackpressureResponseV1::validate`]) before return, so an
+//! inconsistent observation fails closed instead of emitting a
+//! disposition-only or generic queue-full answer. Each response method reads
+//! the live reserve it reports and refuses while that reserve still admits
+//! the request, so pressure evidence is never manufactured, and no method
+//! reads or claims the protected partition. `STORAGE_BACKPRESSURE` is never
+//! emitted here: the closed rule reserves it for ORS durable queue bytes.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
-//! evidence the Kernel profile composition will join. Wiring needs one line
+//! evidence the Kernel profile composition will join, and the backpressure
+//! responses share that status. Wiring needs one line
 //! in `crates/eliot-store/src/lib.rs` (`pub mod control_reserve;` plus the
 //! re-export), owned by the integration wave.
 //! DISCLOSED LIMIT: `owner_generation`, `requester_generation`,
@@ -83,8 +102,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_runtime_contracts::{
-    BottleneckCapacityProfile, BottleneckCoverageState, CapacityBottleneck, CapacityClass,
-    CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass, NormalWorkClass,
+    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14AlternativeRoute, I14BackpressureCause, I14_BACKPRESSURE_RESPONSE_VERSION,
+    I14CurrentnessState, I14EscalationCondition,
+    I14ForbiddenAction, I14RecoveryAction, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
     frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
@@ -160,7 +185,8 @@ pub enum StoreReserveError {
         /// Why the re-hold is impossible.
         detail: String,
     },
-    /// The existing contract rejected an assembled Store reserve row.
+    /// The existing contract rejected an assembled Store reserve row or
+    /// backpressure response.
     #[error("runtime contract rejected Store reserve row: {0}")]
     Contract(String),
     /// The scope registry is unavailable; no scope reserve was created or
@@ -525,6 +551,628 @@ impl StoreReleaseEvidence {
             && self.class == permit.class
             && self.amount == permit.amount
     }
+}
+
+/// Wire version of the Store backpressure successor.
+///
+/// Derived field by field from the exact `I14_BACKPRESSURE_RESPONSE_VERSION`
+/// value without naming its owner type: this crate has no `eliot-contracts`
+/// edge, so the triple is carried as plain version numbers and checked by
+/// [`StoreBackpressureResponseV1::validate`]. A contract version move fails
+/// the check here instead of emitting a stale-versioned response.
+pub const STORE_BACKPRESSURE_RESPONSE_VERSION: (u16, u16, u16) = (
+    I14_BACKPRESSURE_RESPONSE_VERSION.major,
+    I14_BACKPRESSURE_RESPONSE_VERSION.minor,
+    I14_BACKPRESSURE_RESPONSE_VERSION.patch,
+);
+
+/// Versioned complete Store recovery directive (issue #1679, W6 Store wave).
+///
+/// This is the closed successor the issue permits where wire compatibility
+/// requires it: every closed vocabulary shape is reused verbatim from the
+/// contract owner (the seven [`BackpressureDisposition`] values,
+/// [`RecoveryCommitStatus`], cause, work outcome, preservation, recovery
+/// action, earliest condition, forbidden actions, fallback route, required
+/// authority, human-action requirement, evidence coverage, escalation,
+/// resolution and currentness states, and [`BottleneckObservationV1`]), while
+/// the identity-bearing handles the Store owner cannot name without an
+/// `eliot-contracts` edge (`OperationId`, `ReceiptId`, `ArtifactId`) are
+/// carried as bounded non-blank [`String`] references validated by the
+/// existing owner rule ([`validate_label`]). There is no second backpressure
+/// scheme: the disposition/cause/outcome/commit validation below mirrors the
+/// existing `I14RecoveryDirectiveV1` rules arm for arm, including the rule
+/// that `STORAGE_BACKPRESSURE` must name ORS durable queue bytes, which a
+/// Store bottleneck can never satisfy and which therefore fails closed here.
+/// The typed `StateFence`/Authority Epoch bindings are absent exactly as the
+/// wired responses leave them unbound: the epoch binds indirectly through the
+/// issuing bridge generation plus the exact profile revision, the same
+/// indirect binding the [`StorePermit`] carries, and the wiring wave that adds
+/// the contracts edge promotes these references to the typed spellings
+/// without changing the partition or validation discipline. No conversion
+/// into or out of the contract directive exists and none is added here.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRecoveryDirectiveV1 {
+    /// Cause category; must match the selected disposition.
+    pub cause: I14BackpressureCause,
+    /// Closed work/operation class affected by this response.
+    pub affected_operation_class: AffectedOperationClass,
+    /// One or more exact bottleneck observations; units remain heterogeneous.
+    pub bottlenecks: Vec<BottleneckObservationV1>,
+    /// Whether work was accepted, staged, deferred, shed, quarantined or unknown.
+    pub work_outcome: I14WorkOutcome,
+    /// Durable commit status from the existing I14 vocabulary.
+    pub commit_status: RecoveryCommitStatus,
+    /// Whether state and the operation identity were preserved.
+    pub state_preservation: StatePreservationStatus,
+    /// Existing operation identity, if one was admitted or created.
+    pub operation_id: Option<String>,
+    /// Explicitly directs receivers to retain/reuse that operation identity.
+    pub preserve_operation_id: bool,
+    /// Durable stage receipt; valid only while `commit_status` is staged.
+    pub stage_receipt: Option<String>,
+    /// Receipt proving a known rollback before a same-identity retry.
+    pub rollback_receipt: Option<String>,
+    /// Typed next action.
+    pub retry_strategy: I14RecoveryAction,
+    /// Earliest condition that permits the next action.
+    pub earliest_permitted_condition: EarliestRecoveryCondition,
+    /// Optional earliest UTC Unix time in milliseconds, when the owner supplies one.
+    pub earliest_permitted_unix_millis: Option<u64>,
+    /// Closed actions forbidden while this directive is current.
+    pub actions_temporarily_forbidden: Vec<I14ForbiddenAction>,
+    /// Exact safe alternative route, or `None` when absent.
+    pub safe_fallback: Option<I14AlternativeRoute>,
+    /// Authority required to perform the next action; this is not a grant.
+    pub required_authority: I14RequiredAuthority,
+    /// Explicit Human/Doctor action requirement.
+    pub human_action_required: HumanActionRequirement,
+    /// Exact durable receipt/evidence references supporting the directive.
+    pub evidence_refs: Vec<String>,
+    /// Explicit evidence-reference coverage state.
+    pub evidence_coverage: EvidenceCoverageState,
+    /// Escalation condition when automated recovery cannot proceed.
+    pub escalation_condition: I14EscalationCondition,
+    /// Current recovery resolution state.
+    pub resolution_state: I14ResolutionState,
+    /// Currentness of the owner observation.
+    pub currentness: I14CurrentnessState,
+    /// Composition-supplied immutable reference for the exact compiled
+    /// profile revision the observation was taken under.
+    pub profile_revision: String,
+}
+
+impl StoreRecoveryDirectiveV1 {
+    /// Validates the complete directive and disposition-dependent safety
+    /// rules, mirroring the existing contract validation arm for arm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] naming the failing field
+    /// when any closed rule is violated; an inconsistent observation fails
+    /// closed here instead of emitting a disposition-only answer.
+    pub fn validate(&self, disposition: BackpressureDisposition) -> Result<(), StoreReserveError> {
+        self.validate_identity_refs()?;
+        self.validate_bottlenecks(disposition)?;
+        self.validate_evidence()?;
+        self.validate_disposition_cause_state(disposition)?;
+        self.validate_effect_safety()?;
+        Ok(())
+    }
+
+    /// Validates every identity-bearing reference with the existing bounded
+    /// non-blank owner rule.
+    fn validate_identity_refs(&self) -> Result<(), StoreReserveError> {
+        validate_label(&self.profile_revision, "store_backpressure.profile_revision")?;
+        if let Some(operation_id) = &self.operation_id {
+            validate_label(operation_id, "store_backpressure.operation_id")?;
+        }
+        if let Some(stage_receipt) = &self.stage_receipt {
+            validate_label(stage_receipt, "store_backpressure.stage_receipt")?;
+        }
+        if let Some(rollback_receipt) = &self.rollback_receipt {
+            validate_label(rollback_receipt, "store_backpressure.rollback_receipt")?;
+        }
+        for receipt in &self.evidence_refs {
+            validate_label(receipt, "store_backpressure.evidence_refs")?;
+        }
+        Ok(())
+    }
+
+    /// Validates the bottleneck inventory: non-empty, no repeats, exact
+    /// units, positive requests and coverage/availability coherence.
+    fn validate_bottlenecks(
+        &self,
+        disposition: BackpressureDisposition,
+    ) -> Result<(), StoreReserveError> {
+        if self.bottlenecks.is_empty() {
+            return Err(invalid(
+                "bottlenecks",
+                "must identify at least one dimension",
+            ));
+        }
+        let mut has_exhausted_dimension = false;
+        for (index, observation) in self.bottlenecks.iter().enumerate() {
+            if self.bottlenecks[..index]
+                .iter()
+                .any(|previous| previous.bottleneck == observation.bottleneck)
+            {
+                return Err(invalid("bottlenecks", "must not repeat a bottleneck"));
+            }
+            has_exhausted_dimension |= Self::validate_bottleneck_observation(observation)?;
+        }
+        if matches!(
+            disposition,
+            BackpressureDisposition::Busy | BackpressureDisposition::StorageBackpressure
+        ) && !has_exhausted_dimension
+        {
+            return Err(invalid(
+                "bottlenecks",
+                "BUSY and STORAGE_BACKPRESSURE require a claimed, observed exhausted dimension",
+            ));
+        }
+        if disposition == BackpressureDisposition::StorageBackpressure
+            && !self.bottlenecks.iter().any(|observation| {
+                observation.bottleneck == CapacityBottleneck::OrsDurableQueueBytes
+                    && observation.coverage_state == BottleneckCoverageState::Claimed
+                    && matches!(
+                        observation.availability,
+                        BottleneckAvailability::Exhausted { available_amount }
+                            if available_amount < observation.requested_amount
+                    )
+            })
+        {
+            return Err(invalid(
+                "bottlenecks",
+                "STORAGE_BACKPRESSURE must name ORS durable queue bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates one bottleneck observation and reports whether it names a
+    /// claimed, observed exhausted dimension.
+    fn validate_bottleneck_observation(
+        observation: &BottleneckObservationV1,
+    ) -> Result<bool, StoreReserveError> {
+        if observation.requested_amount == 0 {
+            return Err(invalid("bottlenecks.requested_amount", "must be positive"));
+        }
+        if observation.unit != observation.bottleneck.unit() {
+            return Err(invalid(
+                "bottlenecks.unit",
+                "must match the exact bottleneck unit",
+            ));
+        }
+        match (observation.coverage_state, observation.availability) {
+            (BottleneckCoverageState::Unsupported, BottleneckAvailability::Unsupported)
+            | (
+                BottleneckCoverageState::Unknown,
+                BottleneckAvailability::Unknown | BottleneckAvailability::Unsupported,
+            )
+            | (BottleneckCoverageState::Claimed, BottleneckAvailability::Unknown) => {}
+            (BottleneckCoverageState::Claimed, BottleneckAvailability::Unsupported) => {
+                return Err(invalid(
+                    "bottlenecks.availability",
+                    "claimed coverage cannot report unsupported availability",
+                ));
+            }
+            (
+                BottleneckCoverageState::Claimed,
+                BottleneckAvailability::Exhausted { available_amount },
+            ) if available_amount < observation.requested_amount => {
+                return Ok(true);
+            }
+            (
+                BottleneckCoverageState::Claimed,
+                BottleneckAvailability::Available { available_amount },
+            ) if available_amount >= observation.requested_amount => {}
+            (BottleneckCoverageState::Claimed, BottleneckAvailability::Exhausted { .. }) => {
+                return Err(invalid(
+                    "bottlenecks.availability",
+                    "exhausted availability must be below the requested amount",
+                ));
+            }
+            (BottleneckCoverageState::Claimed, BottleneckAvailability::Available { .. }) => {
+                return Err(invalid(
+                    "bottlenecks.availability",
+                    "available capacity must satisfy the requested amount",
+                ));
+            }
+            (BottleneckCoverageState::Unsupported, _) => {
+                return Err(invalid(
+                    "bottlenecks.availability",
+                    "unsupported coverage must remain unsupported",
+                ));
+            }
+            (BottleneckCoverageState::Unknown, _) => {
+                return Err(invalid(
+                    "bottlenecks.availability",
+                    "unknown coverage must not claim a measured amount",
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Validates receipt membership, gating and duplicate rules.
+    fn validate_evidence(&self) -> Result<(), StoreReserveError> {
+        if self
+            .evidence_refs
+            .iter()
+            .enumerate()
+            .any(|(index, receipt)| self.evidence_refs[..index].contains(receipt))
+        {
+            return Err(invalid("evidence_refs", "must not repeat a receipt"));
+        }
+        if matches!(
+            self.evidence_coverage,
+            EvidenceCoverageState::Complete | EvidenceCoverageState::Partial
+        ) && self.evidence_refs.is_empty()
+        {
+            return Err(invalid(
+                "evidence_refs",
+                "complete or partial coverage requires exact receipt references",
+            ));
+        }
+        if let Some(stage_receipt) = &self.stage_receipt {
+            if self.commit_status != RecoveryCommitStatus::Staged {
+                return Err(invalid(
+                    "stage_receipt",
+                    "is valid only while commit status is staged",
+                ));
+            }
+            if !self.evidence_refs.contains(stage_receipt) {
+                return Err(invalid(
+                    "stage_receipt",
+                    "must also be included in evidence_refs",
+                ));
+            }
+        }
+        if let Some(rollback_receipt) = &self.rollback_receipt {
+            if self.retry_strategy != I14RecoveryAction::RetryAfterKnownRollback {
+                return Err(invalid(
+                    "rollback_receipt",
+                    "is valid only for a retry after known rollback",
+                ));
+            }
+            if !self.evidence_refs.contains(rollback_receipt) {
+                return Err(invalid(
+                    "rollback_receipt",
+                    "must also be included in evidence_refs",
+                ));
+            }
+        }
+        if self
+            .actions_temporarily_forbidden
+            .iter()
+            .enumerate()
+            .any(|(index, action)| self.actions_temporarily_forbidden[..index].contains(action))
+        {
+            return Err(invalid(
+                "actions_temporarily_forbidden",
+                "must not repeat an action",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates that the cause, work outcome and commit status agree with
+    /// the selected disposition.
+    fn validate_disposition_cause_state(
+        &self,
+        disposition: BackpressureDisposition,
+    ) -> Result<(), StoreReserveError> {
+        let expected_cause = match disposition {
+            BackpressureDisposition::Busy | BackpressureDisposition::StorageBackpressure => {
+                I14BackpressureCause::CapacityExhaustion
+            }
+            BackpressureDisposition::AcceptedPending => I14BackpressureCause::DurableStagePending,
+            BackpressureDisposition::DbUnavailable => {
+                I14BackpressureCause::CanonicalStoreUnavailable
+            }
+            BackpressureDisposition::BudgetExhausted => I14BackpressureCause::BudgetExhausted,
+            BackpressureDisposition::StateChurn => I14BackpressureCause::StateChurn,
+            BackpressureDisposition::CapabilityDegraded => {
+                I14BackpressureCause::CapabilityUnavailable
+            }
+        };
+        if self.cause != expected_cause {
+            return Err(invalid(
+                "cause",
+                "cause must match the selected I14.4 disposition",
+            ));
+        }
+        if matches!(
+            disposition,
+            BackpressureDisposition::Busy | BackpressureDisposition::StorageBackpressure
+        ) && (self.work_outcome != I14WorkOutcome::NotAccepted
+            || self.commit_status != RecoveryCommitStatus::None)
+        {
+            return Err(invalid(
+                "work_outcome",
+                "BUSY and STORAGE_BACKPRESSURE describe work not accepted for staging",
+            ));
+        }
+        if disposition == BackpressureDisposition::AcceptedPending
+            && (self.work_outcome != I14WorkOutcome::Staged
+                || self.commit_status != RecoveryCommitStatus::Staged
+                || self.stage_receipt.is_none()
+                || !matches!(
+                    self.retry_strategy,
+                    I14RecoveryAction::PollOperation | I14RecoveryAction::ReconcileByReceipt
+                ))
+        {
+            return Err(invalid(
+                "disposition",
+                "ACCEPTED_PENDING requires durable staged work and poll/reconcile",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates commit/operation-identity agreement, poll/reconcile/manual
+    /// identity requirements, unknown-effect reconciliation and retry safety.
+    fn validate_effect_safety(&self) -> Result<(), StoreReserveError> {
+        self.validate_commit_identity()?;
+        self.validate_recovery_action_identity()?;
+        self.validate_unknown_effect()?;
+        self.validate_retry_safety()?;
+        if self.work_outcome == I14WorkOutcome::Unknown
+            && self.resolution_state == I14ResolutionState::Resolved
+        {
+            return Err(invalid(
+                "resolution_state",
+                "an unknown outcome cannot be reported as resolved",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates poll/reconcile identity preservation and the manual-recovery
+    /// authority/escalation boundary.
+    fn validate_recovery_action_identity(&self) -> Result<(), StoreReserveError> {
+        if matches!(
+            self.retry_strategy,
+            I14RecoveryAction::PollOperation | I14RecoveryAction::ReconcileByReceipt
+        ) && (self.operation_id.is_none() || !self.preserve_operation_id)
+        {
+            return Err(invalid(
+                "operation_id",
+                "poll and reconciliation require the existing preserved operation identity",
+            ));
+        }
+        if self.retry_strategy == I14RecoveryAction::ManualRecovery
+            && (self.required_authority != I14RequiredAuthority::HumanOrPlatformRecovery
+                || self.human_action_required != HumanActionRequirement::HumanOrPlatformRecovery
+                || self.escalation_condition != I14EscalationCondition::ManualPlatformRecovery)
+        {
+            return Err(invalid(
+                "retry_strategy",
+                "manual recovery requires the human/platform authority and escalation boundary",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates staged/committed/unknown identity preservation and the
+    /// staged-work/commit-status agreement.
+    fn validate_commit_identity(&self) -> Result<(), StoreReserveError> {
+        let identity_required = matches!(
+            self.commit_status,
+            RecoveryCommitStatus::Staged
+                | RecoveryCommitStatus::Committed
+                | RecoveryCommitStatus::Unknown
+        );
+        if identity_required && (self.operation_id.is_none() || !self.preserve_operation_id) {
+            return Err(invalid(
+                "operation_id",
+                "staged, committed, or unknown outcomes must preserve the exact operation identity",
+            ));
+        }
+        if (self.commit_status == RecoveryCommitStatus::Staged)
+            != (self.work_outcome == I14WorkOutcome::Staged)
+            || (self.commit_status == RecoveryCommitStatus::Staged && self.stage_receipt.is_none())
+        {
+            return Err(invalid(
+                "commit_status",
+                "staged work and commit status must agree and include the durable stage receipt",
+            ));
+        }
+        if self.commit_status == RecoveryCommitStatus::Unknown
+            && self.work_outcome != I14WorkOutcome::Unknown
+        {
+            return Err(invalid(
+                "work_outcome",
+                "unknown commit status must preserve the unknown outcome",
+            ));
+        }
+        if self.work_outcome == I14WorkOutcome::Unknown
+            && self.commit_status != RecoveryCommitStatus::Unknown
+        {
+            return Err(invalid(
+                "commit_status",
+                "unknown work/effect outcome must remain an unknown commit status",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates that possible effects forbid blind retry and that unknown
+    /// outcomes reconcile by receipt or enter manual recovery.
+    fn validate_unknown_effect(&self) -> Result<(), StoreReserveError> {
+        if matches!(
+            self.commit_status,
+            RecoveryCommitStatus::Staged
+                | RecoveryCommitStatus::Committed
+                | RecoveryCommitStatus::Unknown
+        ) && !self
+            .actions_temporarily_forbidden
+            .contains(&I14ForbiddenAction::BlindRetryAfterPossibleEffect)
+        {
+            return Err(invalid(
+                "actions_temporarily_forbidden",
+                "possible effects must forbid blind retry",
+            ));
+        }
+        if self.commit_status == RecoveryCommitStatus::Unknown
+            && !matches!(
+                self.retry_strategy,
+                I14RecoveryAction::ReconcileByReceipt | I14RecoveryAction::ManualRecovery
+            )
+        {
+            return Err(invalid(
+                "retry_strategy",
+                "unknown outcomes require receipt reconciliation or manual recovery",
+            ));
+        }
+        if self.commit_status == RecoveryCommitStatus::Unknown
+            && ((self.retry_strategy == I14RecoveryAction::ReconcileByReceipt
+                && self.earliest_permitted_condition
+                    != EarliestRecoveryCondition::ReconciliationEvidenceAvailable)
+                || (self.retry_strategy == I14RecoveryAction::ManualRecovery
+                    && self.earliest_permitted_condition
+                        != EarliestRecoveryCondition::ManualRecoveryComplete))
+        {
+            return Err(invalid(
+                "earliest_permitted_condition",
+                "unknown outcomes require reconciliation evidence or completed manual recovery",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates known-rollback retry gating and committed-status evidence.
+    fn validate_retry_safety(&self) -> Result<(), StoreReserveError> {
+        if self.retry_strategy == I14RecoveryAction::RetryAfterKnownRollback
+            && (self.commit_status != RecoveryCommitStatus::None
+                || self.work_outcome != I14WorkOutcome::NotAccepted
+                || self.operation_id.is_none()
+                || !self.preserve_operation_id
+                || self.rollback_receipt.is_none()
+                || self.earliest_permitted_condition
+                    != EarliestRecoveryCondition::RollbackReceiptVerified)
+        {
+            return Err(invalid(
+                "retry_strategy",
+                "retry requires a known non-staged rollback outcome",
+            ));
+        }
+        if self.commit_status == RecoveryCommitStatus::Committed && self.evidence_refs.is_empty() {
+            return Err(invalid(
+                "evidence_refs",
+                "committed status requires an exact receipt reference",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Complete versioned Store backpressure response carrying one of the seven
+/// I14.4 dispositions with its [`StoreRecoveryDirectiveV1`].
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreBackpressureResponseV1 {
+    /// Exact version of this response schema.
+    pub contract_version: (u16, u16, u16),
+    /// One of the seven existing I14.4 dispositions.
+    pub disposition: BackpressureDisposition,
+    /// Complete recovery instruction for this operation.
+    pub directive: StoreRecoveryDirectiveV1,
+}
+
+impl StoreBackpressureResponseV1 {
+    /// Validates the response schema version and all recovery invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when the version moved or
+    /// any directive rule fails.
+    pub fn validate(&self) -> Result<(), StoreReserveError> {
+        if self.contract_version != STORE_BACKPRESSURE_RESPONSE_VERSION {
+            return Err(invalid(
+                "contract_version",
+                "does not match StoreBackpressureResponseV1",
+            ));
+        }
+        self.directive.validate(self.disposition)
+    }
+}
+
+/// Exact parts of one Store rejection directive shared by every constructor.
+struct StoreRejectionParts {
+    affected: AffectedOperationClass,
+    observation: BottleneckObservationV1,
+    operation_id: String,
+    profile_revision: String,
+}
+
+impl StoreRejectionParts {
+    /// Assembles the versioned response from any of the seven dispositions
+    /// with its [`RecoveryCommitStatus`] and validates it with the existing
+    /// owner check; an inconsistent observation fails closed here.
+    fn into_response(
+        self,
+        disposition: BackpressureDisposition,
+        work_outcome: I14WorkOutcome,
+        commit_status: RecoveryCommitStatus,
+    ) -> Result<StoreBackpressureResponseV1, StoreReserveError> {
+        let response = StoreBackpressureResponseV1 {
+            contract_version: STORE_BACKPRESSURE_RESPONSE_VERSION,
+            disposition,
+            directive: StoreRecoveryDirectiveV1 {
+                cause: match disposition {
+                    BackpressureDisposition::Busy | BackpressureDisposition::StorageBackpressure => {
+                        I14BackpressureCause::CapacityExhaustion
+                    }
+                    BackpressureDisposition::AcceptedPending => {
+                        I14BackpressureCause::DurableStagePending
+                    }
+                    BackpressureDisposition::DbUnavailable => {
+                        I14BackpressureCause::CanonicalStoreUnavailable
+                    }
+                    BackpressureDisposition::BudgetExhausted => I14BackpressureCause::BudgetExhausted,
+                    BackpressureDisposition::StateChurn => I14BackpressureCause::StateChurn,
+                    BackpressureDisposition::CapabilityDegraded => {
+                        I14BackpressureCause::CapabilityUnavailable
+                    }
+                },
+                affected_operation_class: self.affected,
+                bottlenecks: vec![self.observation],
+                work_outcome,
+                commit_status,
+                state_preservation: StatePreservationStatus::Preserved,
+                operation_id: Some(self.operation_id),
+                preserve_operation_id: true,
+                stage_receipt: None,
+                rollback_receipt: None,
+                retry_strategy: I14RecoveryAction::AwaitCondition,
+                earliest_permitted_condition: EarliestRecoveryCondition::CapacityAvailable,
+                earliest_permitted_unix_millis: None,
+                actions_temporarily_forbidden: Vec::new(),
+                safe_fallback: None,
+                required_authority: I14RequiredAuthority::NoneRequired,
+                human_action_required: HumanActionRequirement::NoneRequired,
+                evidence_refs: Vec::new(),
+                evidence_coverage: EvidenceCoverageState::Unavailable,
+                escalation_condition: I14EscalationCondition::None,
+                resolution_state: I14ResolutionState::Pending,
+                currentness: I14CurrentnessState::Current,
+                profile_revision: self.profile_revision,
+            },
+        };
+        response
+            .validate()
+            .map_err(|error| StoreReserveError::Contract(error.to_string()))?;
+        Ok(response)
+    }
+}
+
+/// Builds an [`StoreReserveError::InvalidField`] for one closed-rule refusal.
+/// Single refusal constructor for the backpressure validation, mirroring the
+/// existing contract helper without duplicating its type.
+fn invalid(field: &'static str, reason: &'static str) -> StoreReserveError {
+    StoreReserveError::InvalidField { field, reason }
 }
 
 #[derive(Debug)]
@@ -1320,6 +1968,157 @@ impl StoreReserve {
             StorePermitOperation::Protected(operation),
             &request,
         ))
+    }
+
+    /// Reports exhausted normal connection slots as a `BUSY` versioned
+    /// response naming exactly [`STORE_CONNECTION_BOTTLENECK`].
+    ///
+    /// The response is built only while the normal connection partition
+    /// admits nothing: pressure evidence is never manufactured for a
+    /// partition that still admits the request. The protected partition is
+    /// not read and not claimed, so an admitted cancellation/recovery record
+    /// keeps its path while this response is live. There is no emergency
+    /// cell here; reserve-loss recording stays with the front-door
+    /// last-resort slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when the normal connection
+    /// partition still admits work or an identity reference is malformed, or
+    /// [`StoreReserveError::Contract`] when the assembled directive fails the
+    /// existing owner validation.
+    pub fn normal_connection_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: &str,
+    ) -> Result<StoreBackpressureResponseV1, StoreReserveError> {
+        if self.available_normal_connections() > 0 {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_connection_slots",
+                reason: "normal connection partition is not saturated; no pressure evidence to report",
+            });
+        }
+        validate_label(operation_id, "store_rejection.operation_id")?;
+        validate_label(profile_revision, "store_rejection.profile_revision")?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_CONNECTION_BOTTLENECK,
+                unit: STORE_CONNECTION_BOTTLENECK.unit(),
+                requested_amount: 1,
+                availability: BottleneckAvailability::Exhausted { available_amount: 0 },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: operation_id.to_owned(),
+            profile_revision: profile_revision.to_owned(),
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
+    }
+
+    /// Reports exhausted normal transaction slots as a `BUSY` versioned
+    /// response naming exactly [`STORE_TRANSACTION_BOTTLENECK`].
+    ///
+    /// The response is built only while
+    /// [`Self::available_normal_transactions`] is zero: pressure evidence is
+    /// never manufactured for a partition that still admits work. The
+    /// protected partition is not read and not claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when normal transaction
+    /// capacity remains or an identity reference is malformed, or
+    /// [`StoreReserveError::Contract`] when the assembled directive fails the
+    /// existing owner validation.
+    pub fn normal_transaction_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: &str,
+    ) -> Result<StoreBackpressureResponseV1, StoreReserveError> {
+        if self.available_normal_transactions() > 0 {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_transaction_slots",
+                reason: "normal transaction partition is not saturated; no pressure evidence to report",
+            });
+        }
+        validate_label(operation_id, "store_rejection.operation_id")?;
+        validate_label(profile_revision, "store_rejection.profile_revision")?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_TRANSACTION_BOTTLENECK,
+                unit: STORE_TRANSACTION_BOTTLENECK.unit(),
+                requested_amount: 1,
+                availability: BottleneckAvailability::Exhausted { available_amount: 0 },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: operation_id.to_owned(),
+            profile_revision: profile_revision.to_owned(),
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
+    }
+
+    /// Reports exhausted normal pending-write bytes as a `BUSY` versioned
+    /// response naming exactly [`STORE_PENDING_WRITE_BOTTLENECK`].
+    ///
+    /// The pending-write partition reports `BUSY`, never
+    /// `STORAGE_BACKPRESSURE`: the closed contract rule reserves that
+    /// disposition for ORS durable queue bytes, so a Store byte exhaustion
+    /// that claimed it would fail the owner validation instead of emitting a
+    /// miscategorized answer. The response is built only while the normal
+    /// pending-write partition cannot satisfy `requested_bytes`. The
+    /// protected partition is not read and not claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when the normal
+    /// pending-write partition still satisfies the request or an identity
+    /// reference is malformed, or [`StoreReserveError::Contract`] when the
+    /// assembled directive fails the existing owner validation.
+    pub fn normal_pending_bytes_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: &str,
+        requested_bytes: NonZeroU64,
+    ) -> Result<StoreBackpressureResponseV1, StoreReserveError> {
+        let available = self.available_normal_pending_bytes();
+        if available >= requested_bytes.get() {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_pending_write_bytes",
+                reason: "normal pending-write partition still admits the request; no pressure evidence to report",
+            });
+        }
+        validate_label(operation_id, "store_rejection.operation_id")?;
+        validate_label(profile_revision, "store_rejection.profile_revision")?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_PENDING_WRITE_BOTTLENECK,
+                unit: STORE_PENDING_WRITE_BOTTLENECK.unit(),
+                requested_amount: requested_bytes.get(),
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: available,
+                },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: operation_id.to_owned(),
+            profile_revision: profile_revision.to_owned(),
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
     }
 
     /// Re-applies one persisted record after a restart without resetting held
