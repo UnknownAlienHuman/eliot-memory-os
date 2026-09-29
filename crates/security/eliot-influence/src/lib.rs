@@ -8,7 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ClockReading, ReceiptId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+};
 use eliot_security_contracts::{
     EpistemicUse, FreshnessStatus, IndependenceLevel, InfluenceDependencyClosure, InfluenceState,
     QuarantineState, RevocationReason, SourceAssurance,
@@ -619,18 +621,26 @@ pub struct RevocationOmission {
 
 /// Bounded revocation request over an explicit qualified edge set.
 ///
-/// The identities this request actually freezes are the ones
+/// The identities this request freezes are the ones
 /// [`digest`](Self::digest) hashes: the request id, the origin grant the closure
 /// is rooted at (`root_ref`), the revocation reason, the state fence, the
-/// declared completeness, and the exact qualified-edge multiset digest. The
-/// authority epoch is frozen inside `state_fence.authority_epoch`, so it travels
-/// with the same canonical bytes rather than as a separate field.
+/// declared completeness, the exact qualified-edge multiset digest, and the four
+/// admitted identities below. The authority epoch is frozen inside
+/// `state_fence.authority_epoch`, so it travels with the same canonical bytes
+/// rather than as a separate field.
 ///
-/// The principal, the admitted task, the admitted work scope and the observing
-/// receipt are NOT frozen on this type. There is no field for them here and no
-/// owner in the repository that produces an admitted value for the authority
-/// recovery recheck; `digest` states the same residual. Do not read this
-/// paragraph as proof that they are bound.
+/// A revocation that computes a dependent closure is an authority operation, and
+/// an authority operation is attributable to someone, to admitted work, to an
+/// admitted scope, and to the receipt that observed it. Freezing the graph alone
+/// made the closure reproducible while leaving every question of "who revoked
+/// this, under which task, inside which scope, and on the strength of which
+/// observation" answerable by re-typing the request: the same edge set under a
+/// different principal produced the same digest, and a resumed page compared only
+/// that digest. I5.27 forbids a field that affects authority, scope or effect
+/// from being omitted, and A12.5 keeps a derived item's ceiling tied to its
+/// source; both are decided on the principal and the scope, not on the edges.
+/// So the four identities and the time coordinate are required, non-defaulted
+/// members of the request and of everything derived from its digest.
 ///
 /// `resumed_visited` remains on the wire for source compatibility only.  A
 /// nonempty value is refused: a visited list cannot identify unexpanded
@@ -642,6 +652,44 @@ pub struct RevocationOmission {
 pub struct BoundedRevocationRequest {
     pub request_id: String,
     pub root_ref: String,
+    /// Authenticated principal on whose authority this revocation is computed.
+    ///
+    /// The dependent closure is an authority effect, so it inherits the ceiling
+    /// of the principal that asked for it (A12.5). Without it the same graph
+    /// would yield the same operation digest for two different principals, and
+    /// the recheck on the recovery path could not refuse a recheck that a
+    /// broader principal had performed.
+    pub principal_ref: String,
+    /// The admitted task this revocation answers.
+    ///
+    /// A revocation that is not attributable to admitted work cannot be
+    /// replayed against a different task plan, and a task-plan change that the
+    /// caller forgot to reflect here would otherwise be invisible to the
+    /// operation's own identity.
+    pub admitted_task: TaskId,
+    /// The admitted work scope the traversal is allowed to reach inside.
+    ///
+    /// A12.5 requires a dependent to inherit the minimum allowed influence of its
+    /// material sources; a scope is the boundary that minimum is expressed
+    /// against, so it has to travel with the edges rather than be inferred from
+    /// them.
+    pub work_scope_ref: String,
+    /// The receipt of the observation this revocation acts on.
+    ///
+    /// The recheck is performed against committed evidence. Naming the observing
+    /// receipt is what distinguishes "recomputed the same closure" from
+    /// "re-derived it from the same committed observation", which is the
+    /// difference between a provable restoration and a fresh blind retry.
+    pub observing_receipt: ReceiptId,
+    /// The caller's time coordinate for this one operation, as data.
+    ///
+    /// Supplied by the caller, never read: this crate reads no clock, so the same
+    /// request and continuation sequence always reaches the same verdict. The
+    /// Governor-assigned causal `transaction_sequence` is required, because a
+    /// host wall-clock reading is exactly the external timestamp that cannot
+    /// become causal order; `valid_time_ms`/`known_time_ms`/`monotonic_ns` carry
+    /// the rest of the reading and are validated against it.
+    pub operation_clock: ClockReading,
     pub reason: RevocationReason,
     pub state_fence: StateFence,
     pub edges: Vec<QualifiedInfluenceEdge>,
@@ -684,11 +732,13 @@ pub struct BoundedRevocationPendingEdge {
 /// The continuation is the authority-bearing position of the original
 /// operation.  It is not a visited-only hint: admitted nodes, fully expanded
 /// nodes, unexpanded queue entries, and unexamined edge positions are kept
-/// separately.  Every identity this crate actually freezes — the request
-/// digest, the bounds digest, the graph snapshot digest and the state fence —
-/// is re-checked by [`resume_bounded_revocation`] before traversal resumes; the
-/// principal, task, work-scope and observing-receipt identities are not bound
-/// on this type at all.
+/// separately.  Every identity this crate freezes — the request digest, the
+/// bounds digest, the graph snapshot digest, the state fence, and through
+/// `request_digest` the admitted principal, task, work scope, observing receipt
+/// and operation time coordinate — is re-checked by
+/// [`resume_bounded_revocation`] before traversal resumes, so a continuation
+/// cannot be resumed under a different admitted identity than the one the
+/// operation started under.
 ///
 /// `admitted_nodes` is the depth-bearing form of `admitted_refs`.  The
 /// separate `examined_edges` and `pending_edges` vectors make the edge
@@ -1066,6 +1116,11 @@ struct BoundedRequestIdentity<'a> {
     schema_version: &'static str,
     request_id: &'a str,
     root_ref: &'a str,
+    principal_ref: &'a str,
+    admitted_task: &'a TaskId,
+    work_scope_ref: &'a str,
+    observing_receipt: &'a ReceiptId,
+    operation_clock: &'a ClockReading,
     reason: &'a RevocationReason,
     state_fence: &'a StateFence,
     completeness: &'a ClosureCompleteness,
@@ -1087,19 +1142,25 @@ impl BoundedRevocationRequest {
     /// against this request before any resumed page runs. The authority epoch
     /// is inside the hashed `state_fence`.
     ///
-    /// The principal, origin-grant, task, scope, authority-epoch and receipt
-    /// identities are deliberately NOT frozen here yet. No owner in the
-    /// repository produces an admitted task, an admitted work scope or an
-    /// observing receipt for the authority recovery recheck, and freezing
-    /// fields nobody can supply would either break restoration or force a
-    /// fabricated value into product code. #686 carries the measurement and the
-    /// exact blocking boundary for that half.
+    /// The admitted principal, task, work scope, observing receipt and the
+    /// operation's time coordinate are part of the same digest. I5.27 requires
+    /// that a field which affects authority, scope or effect cannot be omitted
+    /// from the canonical operation identity, and a dependent closure is
+    /// precisely an authority effect evaluated inside a scope: hashing them here
+    /// is what makes a resumed page refuse a continuation whose principal, task,
+    /// scope, receipt or time coordinate differs, instead of resuming one
+    /// operation under another operation's admitted identity.
     pub fn digest(&self) -> Result<String, InfluenceError> {
         let graph_snapshot_digest = self.graph_snapshot_digest()?;
         canonical_digest(&BoundedRequestIdentity {
             schema_version: BOUNDED_REVOCATION_REQUEST_IDENTITY_SCHEMA,
             request_id: &self.request_id,
             root_ref: &self.root_ref,
+            principal_ref: &self.principal_ref,
+            admitted_task: &self.admitted_task,
+            work_scope_ref: &self.work_scope_ref,
+            observing_receipt: &self.observing_receipt,
+            operation_clock: &self.operation_clock,
             reason: &self.reason,
             state_fence: &self.state_fence,
             completeness: &self.completeness,
@@ -1900,6 +1961,7 @@ fn check_bounded_header(
     text(&request.request_id, "request_id")
         .map_err(|_| InfluenceError::InvalidRequest("request_id"))?;
     text(&request.root_ref, "root_ref").map_err(|_| InfluenceError::InvalidRequest("root_ref"))?;
+    check_bounded_identities(request)?;
     request
         .state_fence
         .validate()
@@ -1910,6 +1972,43 @@ fn check_bounded_header(
     }
     if !request.resumed_visited.is_empty() {
         return Err(InfluenceError::LegacyResumedVisited);
+    }
+    Ok(())
+}
+
+/// Refuse a bounded request whose admitted principal, task, work scope,
+/// observing receipt or time coordinate is not usable.
+///
+/// Every one of these is an identity the operation's own digest freezes, so an
+/// unusable one would either be silently read as a default — a request that
+/// revokes under nobody, under no task, or on no observed evidence — or would
+/// make two different operations share one `request_digest`. A0.3 names
+/// "restoration of revoked influence after recovery" a hard boundary, which is
+/// exactly the decision these fields decide, so this runs before any graph work
+/// and fails closed rather than repairing the value.
+fn check_bounded_identities(request: &BoundedRevocationRequest) -> Result<(), InfluenceError> {
+    text(&request.principal_ref, "principal_ref")
+        .map_err(|_| InfluenceError::InvalidRequest("principal_ref"))?;
+    text(&request.work_scope_ref, "work_scope_ref")
+        .map_err(|_| InfluenceError::InvalidRequest("work_scope_ref"))?;
+    // `TaskId` and `ReceiptId` already refuse blank and control-character text
+    // in their constructors, so a value that reached this point is canonical by
+    // construction; the checks below cover what their own invariants do not.
+    text(request.admitted_task.as_str(), "admitted_task")
+        .map_err(|_| InfluenceError::InvalidRequest("admitted_task"))?;
+    text(request.observing_receipt.as_str(), "observing_receipt")
+        .map_err(|_| InfluenceError::InvalidRequest("observing_receipt"))?;
+    // The clock is caller-supplied data, never read here, so its only obligation
+    // is to be an ordered reading that names a causal position. A reading with no
+    // `transaction_sequence` is a host wall-clock observation, and the
+    // `ClockReading` owner keeps those apart precisely so an external timestamp
+    // cannot become causal order.
+    request
+        .operation_clock
+        .validate()
+        .map_err(|_| InfluenceError::InvalidRequest("operation_clock"))?;
+    if request.operation_clock.transaction_sequence.is_none() {
+        return Err(InfluenceError::InvalidRequest("operation_clock"));
     }
     Ok(())
 }
