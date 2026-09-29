@@ -61,7 +61,7 @@ fn validate_window(
     Ok(())
 }
 
-fn validate_unique_texts(
+pub(crate) fn validate_unique_texts(
     values: &[String],
     field: &'static str,
     allow_empty: bool,

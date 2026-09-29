@@ -270,6 +270,7 @@ fn route(name: &str) -> RouteFingerprint {
 
 fn route_evidence(route: RouteFingerprint, rank: u16) -> RouteCandidateEvidence {
     RouteCandidateEvidence {
+        route_classes: vec![route.provider.clone()],
         route,
         preference_rank: rank,
         capacity_identity: "capacity-a".to_owned(),
@@ -281,6 +282,9 @@ fn route_evidence(route: RouteFingerprint, rank: u16) -> RouteCandidateEvidence 
             wall_time_ms: 100,
             ..BudgetEvidence::default()
         },
+        route_class_evidence_refs: vec![format!("route-class-evidence-{rank}")],
+        privacy_classes: vec![PrivacyClass::Private],
+        privacy_evidence_refs: vec![format!("privacy-evidence-{rank}")],
         evidence_refs: vec![format!("route-evidence-{rank}")],
     }
 }
@@ -420,6 +424,10 @@ fn request(
         task_revision: "task-rev-1".to_owned(),
         plan_revision: rev(&format!("plan-rev-{tag}")),
         state_fence: fence(),
+        human_staffing_intent: crate::HumanStaffingIntent {
+            preset: crate::StaffingPreset::Balanced,
+            per_job_budget: budget(),
+        },
         privacy_class: PrivacyClass::Private,
         work_class: "swarm".parse()?,
         lanes: specs

@@ -207,6 +207,10 @@ fn route_evidence(tag: &str) -> RouteCandidateEvidence {
             wall_time_ms: 100,
             ..BudgetEvidence::default()
         },
+        route_classes: vec![format!("provider-{tag}")],
+        route_class_evidence_refs: vec![format!("route-class-evidence-{tag}")],
+        privacy_classes: vec![PrivacyClass::Private],
+        privacy_evidence_refs: vec![format!("privacy-evidence-{tag}")],
         evidence_refs: vec![format!("evidence-{tag}")],
     }
 }
@@ -301,6 +305,10 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
         task_revision: "task-normalization-v1".to_owned(),
         plan_revision: rev("plan-normalization-v1"),
         state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
+        human_staffing_intent: crate::HumanStaffingIntent {
+            preset: crate::StaffingPreset::Balanced,
+            per_job_budget: budget(),
+        },
         privacy_class: PrivacyClass::Private,
         work_class: "swarm".parse()?,
         lanes: vec![
