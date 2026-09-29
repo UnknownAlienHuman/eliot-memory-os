@@ -2182,7 +2182,8 @@ fn materialize_with_resolved_selection(
 }
 
 /// Materialize one exact fourteen-role Phase-A source bundle.
-pub fn materialize_canary_source_bundle(
+#[cfg(all(test, windows))]
+fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
     let (anchor_identity, anchor_handle) = open_no_follow_directory(Path::new(
