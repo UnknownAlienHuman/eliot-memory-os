@@ -2409,10 +2409,10 @@ impl KernelComposition {
                         && candidate.request_digest == envelope.envelope_sha256
                 })
                 .map(|_| connection_id.as_str())
-        }) {
-            if existing_connection != envelope.connection_id {
-                return Err(TransportError::IdentityConflict);
-            }
+        })
+            && existing_connection != envelope.connection_id
+        {
+            return Err(TransportError::IdentityConflict);
         }
         let refs = index.entry(envelope.connection_id.clone()).or_default();
         if !refs.iter().any(|candidate| {
