@@ -1227,7 +1227,9 @@ fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot>
     NON_EXECUTABLE_MIGRATION_ROOTS.iter().find(|root| {
         root.identity == identity
             || root.path == identity
-            || identity.strip_prefix(root.path).is_some_and(|rest| rest.starts_with('/'))
+            || identity
+                .strip_prefix(root.path)
+                .is_some_and(|rest| rest.starts_with('/'))
     })
 }
 
