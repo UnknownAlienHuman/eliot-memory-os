@@ -5955,7 +5955,10 @@ impl ClaimVerdict {
     #[must_use]
     pub fn dimensions_complete(&self) -> bool {
         self.dimension_results.len() == AuditDimension::ALL.len()
-            && self.dimension_results.iter().all(|result| result.is_established())
+            && self
+                .dimension_results
+                .iter()
+                .all(|result| result.is_established())
     }
 
     /// What the audit decided about one named dimension.
@@ -6677,28 +6680,60 @@ fn standing_decision(standing: HandleStanding) -> StandingDecision {
 /// original dimensions a restatement of the precedence chain they were supposed
 /// to replace.
 struct ClaimAuditFindings<'a> {
+    /// What the run-bound authorization and the cited handles established.
+    authorization: AuthorizationFindings,
+    /// What the citing records' own weight established.
+    weight: CitationWeightFindings,
+    /// What the frozen claim identity established about the wording under audit.
+    identity: ClaimIdentityFindings,
+    /// What the claim accounts for on its own.
+    accounting: AccountingFindings,
+    /// One disposition per alleged counterclaim identity, in canonical order.
+    resolutions: &'a [CounterclaimResolution],
+    /// The one standing derived for every handle this audit examined.
+    handle_resolutions: &'a [HandleResolution],
+}
+
+/// The authorization facts [`AuditDimension::ReferenceVerification`] and the
+/// scope-compliance dimensions read.
+///
+/// Grouped rather than flattened because `manifest_intact` is not one finding
+/// among many: it is the ceiling under which three separate dimensions are
+/// `Unestablished` rather than `Failed`, so it travels with the one defect that
+/// can actually decide it.
+struct AuthorizationFindings {
     /// The authorization this claim was judged under re-proves itself.
     manifest_intact: bool,
     /// A citation was decided and did not hold: outside, revoked, or unprovable.
     citation_defect: bool,
+}
+
+/// What the records a claim cites carried, as [`AuditDimension::ValueVerification`]
+/// reads it: the three are one dimension's worth of weight, not three findings.
+struct CitationWeightFindings {
     /// A citing record carried no evidentiary weight.
     support_gap: bool,
     /// The claim asserted more precision than the evidence carries.
     precision_gap: bool,
     /// A cited record was past its frozen freshness boundary.
     stale_hit: bool,
+}
+
+/// The two identity facts, kept apart because they answer different questions:
+/// whether the wording still stands, and whether a frozen identity re-proves it.
+struct ClaimIdentityFindings {
     /// Every relation that names this claim still names its current wording.
     identity_current: bool,
     /// The claim carries a frozen identity that re-proves against its wording.
     claim_identity_verified: bool,
+}
+
+/// What the claim accounts for without help from any cited record.
+struct AccountingFindings {
     /// A material claim is released with no citation and no alleged counterclaim.
     material_without_accounting: bool,
     /// Unknown references remain open on this claim.
     has_unknowns: bool,
-    /// One disposition per alleged counterclaim identity, in canonical order.
-    resolutions: &'a [CounterclaimResolution],
-    /// The one standing derived for every handle this audit examined.
-    handle_resolutions: &'a [HandleResolution],
 }
 
 /// What the two partitions of one audit agree about every handle.
@@ -6776,14 +6811,19 @@ fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionRes
             AuditDimension::ReferenceVerification,
             // Every cited handle resolved inside the frozen manifest and bound a
             // record that still hashes to the commitment frozen for it.
-            status(findings.citation_defect, !findings.manifest_intact),
+            status(
+                findings.authorization.citation_defect,
+                !findings.authorization.manifest_intact,
+            ),
         ),
         (
             AuditDimension::ValueVerification,
             // The citing records carry weight, assert nothing wider than the
             // evidence supports, and are inside their freshness boundary.
             status(
-                findings.support_gap || findings.precision_gap || findings.stale_hit,
+                findings.weight.support_gap
+                    || findings.weight.precision_gap
+                    || findings.weight.stale_hit,
                 false,
             ),
         ),
@@ -6793,7 +6833,7 @@ fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionRes
             // and under its conditions, and nothing about it was left undecided.
             status(
                 findings.resolutions.iter().any(incompatible),
-                !findings.manifest_intact
+                !findings.authorization.manifest_intact
                     || findings.resolutions.iter().any(undecided),
             ),
         ),
@@ -6801,13 +6841,13 @@ fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionRes
             AuditDimension::MethodArtifactAlignment,
             // A material claim can only be released as supported against a frozen
             // identity that re-proves against the wording actually under audit.
-            status(false, !findings.claim_identity_verified),
+            status(false, !findings.identity.claim_identity_verified),
         ),
         (
             AuditDimension::ClaimIdentityCurrent,
             // No relation names this claim under wording or a revision it no
             // longer has.
-            status(!findings.identity_current, false),
+            status(!findings.identity.identity_current, false),
         ),
         (
             AuditDimension::CounterevidenceExamined,
@@ -6821,7 +6861,7 @@ fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionRes
                     .resolutions
                     .iter()
                     .any(|entry| entry.disposition.refuses_examination()),
-                !findings.manifest_intact,
+                !findings.authorization.manifest_intact,
             ),
         ),
         (
@@ -6829,7 +6869,7 @@ fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionRes
             // No unknown reference is open and no material claim is released with
             // nothing released behind it.
             status(
-                findings.has_unknowns || findings.material_without_accounting,
+                findings.accounting.has_unknowns || findings.accounting.material_without_accounting,
                 false,
             ),
         ),
@@ -7310,8 +7350,14 @@ pub fn audit_claim(
             .get(counterclaim_id.as_str())
             .copied()
             .unwrap_or(HandleStanding::Unresolved);
-        let disposition =
-            resolve_counterclaim(counterclaim_id, standing, claim, portfolio, now_ms, &mut residue);
+        let disposition = resolve_counterclaim(
+            counterclaim_id,
+            standing,
+            claim,
+            portfolio,
+            now_ms,
+            &mut residue,
+        );
         resolutions.push(CounterclaimResolution {
             counterclaim_id: counterclaim_id.clone(),
             disposition,
@@ -7385,21 +7431,29 @@ pub fn audit_claim(
     // eight names for every verdict and therefore could not distinguish "checked
     // and passed" from "never checked" while its doc comment claimed it could.
     let audited_dimensions = dimension_results(&ClaimAuditFindings {
-        manifest_intact,
-        citation_defect: outside_citation || revoked_citation || lineage_gap,
-        support_gap,
-        precision_gap,
-        stale_hit,
-        identity_current,
-        claim_identity_verified,
-        // Accounting, not identity: an unfrozen claim is already
-        // `MethodArtifactAlignment`'s finding, and counting it here too would
-        // make one defect show up as two dimensions and hide a real accounting
-        // gap behind it.
-        material_without_accounting: claim.material
-            && claim.citations.is_empty()
-            && counterevidence.is_empty(),
-        has_unknowns: !unknowns.is_empty(),
+        authorization: AuthorizationFindings {
+            manifest_intact,
+            citation_defect: outside_citation || revoked_citation || lineage_gap,
+        },
+        weight: CitationWeightFindings {
+            support_gap,
+            precision_gap,
+            stale_hit,
+        },
+        identity: ClaimIdentityFindings {
+            identity_current,
+            claim_identity_verified,
+        },
+        accounting: AccountingFindings {
+            // Accounting, not identity: an unfrozen claim is already
+            // `MethodArtifactAlignment`'s finding, and counting it here too would
+            // make one defect show up as two dimensions and hide a real accounting
+            // gap behind it.
+            material_without_accounting: claim.material
+                && claim.citations.is_empty()
+                && counterevidence.is_empty(),
+            has_unknowns: !unknowns.is_empty(),
+        },
         resolutions: &resolutions,
         handle_resolutions: &handle_resolutions,
     });

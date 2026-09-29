@@ -2175,6 +2175,95 @@ impl InquiryProtocolProfile {
     }
 }
 
+/// Commits the EVIDENCE behind a verdict, not only the verdict's class.
+///
+/// I21.8: a `claim-audit-record/v2` preimage named the word `CONTRADICTED` and
+/// nothing that established it, so changing the frozen claim identity, the
+/// opposition relation's evaluator result, a counterclaim's disposition or any
+/// audit dimension left this record byte-for-byte identical. That is the exact
+/// opposite of what a release binding is for: the verdict's evidence is the part
+/// that can change under a later run, and it is the part a reader has to be able
+/// to see move.
+///
+/// Split out of [`ClaimAuditRecord::compute_digest`] because the identity half
+/// and the evidence half are two different commitments: the first says which run
+/// and which claim this is, the second says what was actually examined. Keeping
+/// them in one function had pushed it past the length at which the order of the
+/// `push_field` calls stops being readable, and that order is the preimage.
+fn push_verdict_evidence(preimage: &mut String, record: &ClaimAuditRecord) {
+    let verdict = &record.verdict;
+    push_field(
+        preimage,
+        "verdict_claim_identity_digest",
+        &verdict.claim_identity_digest,
+    );
+    push_count(
+        preimage,
+        "verdict_relation_digests",
+        verdict.relation_digests.len(),
+    );
+    for digest in &verdict.relation_digests {
+        push_field(preimage, "verdict_relation_digest", digest);
+    }
+    push_count(
+        preimage,
+        "verdict_counterclaim_resolutions",
+        verdict.counterclaim_resolutions.len(),
+    );
+    for entry in &verdict.counterclaim_resolutions {
+        push_field(preimage, "verdict_counterclaim_id", &entry.counterclaim_id);
+        push_field(
+            preimage,
+            "verdict_counterclaim_disposition",
+            entry.disposition.wire_name(),
+        );
+    }
+    push_count(
+        preimage,
+        "verdict_handle_resolutions",
+        verdict.handle_resolutions.len(),
+    );
+    for resolution in &verdict.handle_resolutions {
+        push_field(preimage, "verdict_handle", &resolution.handle);
+        push_field(
+            preimage,
+            "verdict_handle_standing",
+            resolution.standing.wire_name(),
+        );
+    }
+    // Every dimension and its recorded status, not only the ones that failed: a
+    // binding that named only the failures could not tell a dimension that was
+    // examined and passed from one that was never examined at all.
+    push_count(
+        preimage,
+        "verdict_dimensions",
+        verdict.dimension_results.len(),
+    );
+    for result in &verdict.dimension_results {
+        push_field(preimage, "verdict_dimension", result.dimension.wire_name());
+        push_field(
+            preimage,
+            "verdict_dimension_status",
+            result.status.wire_name(),
+        );
+    }
+    push_field(
+        preimage,
+        "verdict_public_class",
+        verdict.public_class().wire_name(),
+    );
+    // I21.7: the over-precision residue is bound as the typed items it is, so a
+    // binding that covers this record cannot be re-pointed at a different
+    // asserted coordinate by changing only the rendered prose.
+    for line in verdict.unsupported_precision_lines() {
+        push_field(preimage, "unsupported_precision", &line);
+    }
+    push_count(
+        preimage,
+        "unsupported_precision",
+        verdict.unsupported_precision.len(),
+    );
+}
 /// Validates the admitted material one profile revision is resolved from.
 ///
 /// # Errors
@@ -4009,98 +4098,7 @@ impl ClaimAuditRecord {
                 push_field(&mut preimage, tag, value);
             }
         }
-        // I21.8: the binding must commit to the EVIDENCE behind the class, not
-        // only to the class. A `claim-audit-record/v2` preimage named the word
-        // `CONTRADICTED` and nothing that established it, so changing the frozen
-        // claim identity, the opposition relation's evaluator result, a
-        // counterclaim's disposition or any audit dimension left this record
-        // byte-for-byte identical. That is the exact opposite of what a release
-        // binding is for: the verdict's evidence is the part that can change
-        // under a later run, and it is the part a reader has to be able to see
-        // move.
-        push_field(
-            &mut preimage,
-            "verdict_claim_identity_digest",
-            &self.verdict.claim_identity_digest,
-        );
-        push_count(
-            &mut preimage,
-            "verdict_relation_digests",
-            self.verdict.relation_digests.len(),
-        );
-        for digest in &self.verdict.relation_digests {
-            push_field(&mut preimage, "verdict_relation_digest", digest);
-        }
-        push_count(
-            &mut preimage,
-            "verdict_counterclaim_resolutions",
-            self.verdict.counterclaim_resolutions.len(),
-        );
-        for entry in &self.verdict.counterclaim_resolutions {
-            push_field(
-                &mut preimage,
-                "verdict_counterclaim_id",
-                &entry.counterclaim_id,
-            );
-            push_field(
-                &mut preimage,
-                "verdict_counterclaim_disposition",
-                entry.disposition.wire_name(),
-            );
-        }
-        push_count(
-            &mut preimage,
-            "verdict_handle_resolutions",
-            self.verdict.handle_resolutions.len(),
-        );
-        for resolution in &self.verdict.handle_resolutions {
-            push_field(
-                &mut preimage,
-                "verdict_handle",
-                &resolution.handle,
-            );
-            push_field(
-                &mut preimage,
-                "verdict_handle_standing",
-                resolution.standing.wire_name(),
-            );
-        }
-        // Every dimension and its recorded status, not only the ones that failed:
-        // a binding that named only the failures could not tell a dimension that
-        // was examined and passed from one that was never examined at all.
-        push_count(
-            &mut preimage,
-            "verdict_dimensions",
-            self.verdict.dimension_results.len(),
-        );
-        for result in &self.verdict.dimension_results {
-            push_field(
-                &mut preimage,
-                "verdict_dimension",
-                result.dimension.wire_name(),
-            );
-            push_field(
-                &mut preimage,
-                "verdict_dimension_status",
-                result.status.wire_name(),
-            );
-        }
-        push_field(
-            &mut preimage,
-            "verdict_public_class",
-            self.verdict.public_class().wire_name(),
-        );
-        // I21.7: the over-precision residue is bound as the typed items it is,
-        // so a binding that covers this record cannot be re-pointed at a
-        // different asserted coordinate by changing only the rendered prose.
-        for line in self.verdict.unsupported_precision_lines() {
-            push_field(&mut preimage, "unsupported_precision", &line);
-        }
-        push_count(
-            &mut preimage,
-            "unsupported_precision",
-            self.verdict.unsupported_precision.len(),
-        );
+        push_verdict_evidence(&mut preimage, self);
         freeze(&preimage)
     }
 
