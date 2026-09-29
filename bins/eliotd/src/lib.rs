@@ -87,6 +87,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
+pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
 pub mod notification_state_emit;
 mod observation_adapters;
@@ -247,6 +248,7 @@ pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionRead
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
+pub use notification_acknowledge_emit::emit_notification_acknowledgement;
 pub use notification_state_emit::{
     AutomationFailureKey, NotificationStateEmit, automation_failure_key,
     emit_blocked_automation_notification, notification_already_recorded,
