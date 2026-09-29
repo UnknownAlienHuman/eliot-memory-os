@@ -60,13 +60,12 @@ pub(crate) fn call_class(admission: &LocalReadAdmission) -> ToolCallClass {
 /// owner-observed evidence advanced.
 fn inputs_digest(tool: &serde_json::Value) -> Result<String, serde_json::Error> {
     let mut canonical = tool.clone();
-    if let Some(object) = canonical.as_object_mut() {
-        if let Some(arguments) = object
+    if let Some(object) = canonical.as_object_mut()
+        && let Some(arguments) = object
             .get_mut("arguments")
             .and_then(serde_json::Value::as_object_mut)
-        {
-            arguments.remove("intent");
-        }
+    {
+        arguments.remove("intent");
     }
     let bytes = serde_json::to_vec(&canonical)?;
     Ok(sha256_hex(&bytes))
