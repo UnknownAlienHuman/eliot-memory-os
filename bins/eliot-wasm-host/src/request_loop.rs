@@ -24,9 +24,11 @@
 //! - **The engine worker owns the runner.** Synchronous guest work never
 //!   runs on the control loop, and no untracked timer or detached thread is
 //!   introduced: exactly one worker is spawned, every return path joins it
-//!   (the containment path joins a worker its drain bound expired on, so an
-//!   expiry can never leave the guest-executing thread detached), and the
-//!   control loop talks to it over a bounded command channel.
+//!   (the containment path joins a worker its drain bound expired on under a
+//!   bound of its own — the same admitted window — so an expiry can neither
+//!   leave the guest-executing thread detached into a running process nor
+//!   hang the process on a join that can never return), and the control loop
+//!   talks to it over a bounded command channel.
 //! - **Authority is re-checked, never inherited.** The admitted grant is a
 //!   window ([`LiveAuthority`]); the control loop refreshes the observed
 //!   clock on every tick and the local owner proxies inside the worker
@@ -249,12 +251,16 @@ enum WorkerState {
     Terminated,
     /// A bound expired with the worker still alive: the operation is
     /// contained, not terminated, and no clean shutdown may be claimed. The
-    /// thread itself is then joined into `Reaped`, which changes no verdict.
+    /// thread itself is then joined into `Reaped` when the bounded reap finds
+    /// it finished, which changes no verdict.
     Contained,
-    /// A bound expired and the worker thread was then joined, so the thread
-    /// itself is reaped rather than detached. This is a thread fact only: the
-    /// operation is still contained, `Contained` is not upgraded to
-    /// `Terminated`, and no process termination is claimed from it.
+    /// A bound expired and the bounded reap then observed the worker thread
+    /// finished and joined it, so the thread itself is reaped rather than
+    /// dropped. This is a thread fact only: the operation is still contained,
+    /// `Contained` is not upgraded to `Terminated`, and no process
+    /// termination is claimed from it. A reap whose own bound expired first
+    /// stays `Contained` — that thread was never joined and this state is not
+    /// claimed for it.
     Reaped,
 }
 
@@ -3051,6 +3057,13 @@ pub struct BoundedRequestLoop {
     /// same wall limit inside the guest child, so this never shortens a
     /// healthy run.
     drain_deadline: Instant,
+    /// The same admitted window as a duration, retained beside its absolute
+    /// [`Self::drain_deadline`]. The containment reap is a second phase that
+    /// starts after that instant has already been spent — spending it a second
+    /// time is what leaves the reap no bound at all — so it anchors on the
+    /// admitted ceiling this loop was constructed with. Same owner, same
+    /// ceiling, no new timing policy and no new constant.
+    drain_window: Duration,
     phase: LoopPhase,
     admission: AdmissionState,
     /// The terminal execution evidence for this operation. A failed
@@ -3101,6 +3114,7 @@ impl BoundedRequestLoop {
             worker: WorkerState::Alive,
             guest_child_exited: None,
             drain_deadline: Instant::now() + drain_deadline,
+            drain_window: drain_deadline,
             phase: LoopPhase::Running,
             admission: AdmissionState {
                 gate: AdmissionGate::Open,
@@ -3817,6 +3831,12 @@ impl RequestLoopReport {
 ///    read the operation's containment disposition back from the outer
 ///    process-containment owner.
 ///
+/// The containment edge is the one place the worker may still be running when
+/// the deadline arrives, and its join is bounded by the same admitted window
+/// rather than left open: the report returns either way, and what differs is
+/// only whether the thread was additionally reaped before this process hands
+/// the unresolved operation to that owner.
+///
 /// Every disposition — success, denial, drain failure, and the
 /// process-level containment path — runs all three steps, so no path can
 /// leave a live join handle unreported.
@@ -3926,11 +3946,16 @@ fn drain_and_shutdown_request_worker(
         let contained = contained_failure(state, channel);
         // The bound that expired is this loop's own drain accounting, not the
         // worker's lifetime. The handle is still owned here, and no return
-        // path may drop it: dropping a live `JoinHandle` detaches the
-        // guest-executing thread, which is precisely the untracked worker
-        // this issue forbids. Joining is the tracked termination, and it
-        // changes no verdict — the report below is still the unresolved
-        // containment failure whatever the join returns.
+        // path may leave it unaccounted: a live `JoinHandle` dropped while the
+        // thread still runs is precisely the untracked worker this issue
+        // forbids, and a join with no bound of its own is precisely the hang.
+        // The reap is therefore bounded by the same admitted window the drain
+        // used and changes no verdict either way — whether the thread was
+        // reaped inside that bound or the bound expired first, the report
+        // below is the unresolved containment failure and the process
+        // terminates through the outer process-containment owner. Only the
+        // reaped/contained thread fact differs, and it is recorded on the loop
+        // state rather than in the verdict.
         join_contained_worker(state, channel, &worker.outcomes, worker.handle);
         return failed_loop_report(state, contained);
     }
@@ -4068,7 +4093,8 @@ fn request_tracked_shutdown(
 }
 
 /// Joins the worker the drain bound expired on, so no return path can drop a
-/// live handle (issue #2785 A6).
+/// live handle, and gives that join a bound so the containment hand-off itself
+/// cannot become the hang (issue #2785 A6/I5).
 ///
 /// `JoinHandle::drop` detaches, and a detached guest-executing thread is the
 /// untracked worker the issue goal forbids: the guest child it started would
@@ -4078,20 +4104,58 @@ fn request_tracked_shutdown(
 /// joined here rather than abandoned, and the wait keeps consuming any late
 /// bounded outcome so a producer is never left blocked on a full channel.
 ///
+/// The wait is bounded, because the branch that reaches this function is
+/// entered precisely when `handle.is_finished()` was just observed false: a
+/// wait whose only exit is that predicate can never leave it, so the caller's
+/// report would never be returned and the process would hang instead of
+/// terminating through the outer process-containment owner. The bound is not a
+/// new timeout. It is [`BoundedRequestLoop::drain_window`] — the admitted
+/// grant wall deadline plus this file's control-poll cadence, the same window
+/// [`drain_bound`] derives from the same owner (`material.ceilings`) the loop
+/// already receives — anchored at the moment the reap starts. The drain's
+/// absolute deadline cannot be reused here because it has already been spent
+/// by the very expiry that selected this branch; re-spending that same
+/// admitted ceiling from here is what keeps this the reap of a worker admitted
+/// under that ceiling rather than an open-ended wait.
+///
+/// On expiry the handle goes out of scope unjoined, and that is the
+/// termination rather than an abandonment: the bound expiring is the last
+/// thing this loop does, because the caller's containment residual makes the
+/// drive return `Err(OrdinaryDriveError::Loop(..))` and `main` then ends the
+/// process, so the outer process-containment owner terminates the thread with
+/// the process instead of the process hanging on a join that can never
+/// return. The thread is never a live worker outliving its owner, the
+/// unresolved operation/effect state is retained in the report the owner
+/// reads, and the loop reports an explicit unresolved result rather than a
+/// false clean drain. It never claims the thread was reaped when it was not:
+/// `WorkerState::Reaped` is set only on the joined path.
+///
 /// This join proves thread termination only. It is deliberately NOT process
 /// termination evidence: the caller keeps its unresolved containment report
-/// whatever this returns, and the worker state is set to
-/// [`WorkerState::Reaped`], never [`WorkerState::Terminated`]. Child
+/// whatever this returns, and the worker state reaches [`WorkerState::Reaped`]
+/// only on the joined path, never [`WorkerState::Terminated`]. Child
 /// termination is still read solely from the P-03 owner's evidence by the
 /// caller, so a joined thread can never turn an unknown guest effect into a
 /// no-effect claim or authorise reclaiming its recovery evidence (issue #2785
 /// I6).
+///
+/// # Returns
+///
+/// Nothing directly, and deliberately so: this whole branch is already the
+/// containment edge, and the caller holds its unresolved residual from
+/// [`contained_failure`]. What the bounded wait changes is only whether the
+/// thread is additionally joined — a thread fact that never changes the
+/// verdict, exactly as the joined path below shows. The reaped/contained
+/// distinction stays in [`BoundedRequestLoop::worker`]; the reported residual
+/// stays the containment either way, so a reap that expired can never be
+/// reported as joined and can never be reported as a clean drain.
 fn join_contained_worker(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
     outcomes: &Receiver<WorkerOutcome>,
     handle: std::thread::JoinHandle<()>,
 ) {
+    let reap_deadline = Instant::now() + state.drain_window;
     while !handle.is_finished() {
         match outcomes.recv_timeout(CONTROL_POLL) {
             Ok(outcome) => observe_residual_outcome(state, channel, outcome),
@@ -4101,34 +4165,54 @@ fn join_contained_worker(
             // the thread finishes.
             Err(RecvTimeoutError::Disconnected) => std::thread::yield_now(),
         }
+        // The reap bound is checked on the same cadence the wait itself runs
+        // on, so an outcome that keeps arriving can never postpone the expiry
+        // either. The deadline is read after the receive, never before it, so
+        // the last admitted poll is always serviced.
+        if Instant::now() >= reap_deadline {
+            break;
+        }
     }
-    while let Ok(outcome) = outcomes.try_recv() {
-        observe_residual_outcome(state, channel, outcome);
+    if handle.is_finished() {
+        while let Ok(outcome) = outcomes.try_recv() {
+            observe_residual_outcome(state, channel, outcome);
+        }
+        // A command this worker never acknowledged has no outcome and will
+        // never get one now that the thread is gone. The loss is recorded
+        // beside the containment failure rather than replacing it: the
+        // unresolved disposition is the containment, and this only says the
+        // reply is owed to no one.
+        if let Some(delivery) = state.delivery {
+            let command = match delivery {
+                CommandDelivery::Requested { command, .. }
+                | CommandDelivery::Accepted { command, .. } => command,
+            };
+            state.record_residual(LoopError::WorkerTerminatedWithoutOutcome {
+                command: command_name(command),
+            });
+        }
+        // The thread is reaped, so the worker state is a real observation
+        // rather than the containment placeholder. It never reaches
+        // `Terminated` here: that state is reserved for the ordinary path
+        // where the tracked `Shutdown` reply was observed first. A panic
+        // inside the worker is the thread's own fact and changes no verdict
+        // either — the unresolved report already recorded above stands.
+        state.worker = WorkerState::Reaped;
+        if handle.join().is_err() {
+            state.record_residual(denied("worker-panicked"));
+        }
     }
-    // A command this worker never acknowledged has no outcome and will never
-    // get one now that the thread is gone. The loss is recorded beside the
-    // containment failure rather than replacing it: the unresolved
-    // disposition is the containment, and this only says the reply is owed
-    // to no one.
-    if let Some(delivery) = state.delivery {
-        let command = match delivery {
-            CommandDelivery::Requested { command, .. }
-            | CommandDelivery::Accepted { command, .. } => command,
-        };
-        state.record_residual(LoopError::WorkerTerminatedWithoutOutcome {
-            command: command_name(command),
-        });
-    }
-    // The thread is reaped, so the worker state is a real observation rather
-    // than the containment placeholder. It never reaches `Terminated` here:
-    // that state is reserved for the ordinary path where the tracked
-    // `Shutdown` reply was observed first. A panic inside the worker is the
-    // thread's own fact and changes no verdict either — the unresolved
-    // report already recorded above stands.
-    state.worker = WorkerState::Reaped;
-    if handle.join().is_err() {
-        state.record_residual(denied("worker-panicked"));
-    }
+    // Reaching here with the thread still live means the reap bound expired.
+    // Nothing on that path may claim the thread ended: `WorkerState::Contained`
+    // stays exactly as `contained_failure` set it, and the accepted command's
+    // outcome is still owed rather than lost — so no
+    // `WorkerTerminatedWithoutOutcome` is invented for a worker that has not
+    // exited, and no `Reaped` is claimed for a thread that was not joined. The
+    // caller's containment residual, which names the command still executing
+    // inside the worker, is the result this process hands to the outer
+    // process-containment owner. `is_finished` is re-read rather than
+    // remembered, so a thread that finished inside the last admitted poll is
+    // still joined instead of being reported as unreaped.
 }
 
 /// Joins the terminated worker and confirms its observed Shutdown outcome.
