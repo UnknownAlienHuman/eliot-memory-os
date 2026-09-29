@@ -704,7 +704,7 @@ struct BridgeEventRow {
     staging_connection: String,
     staged_at_ms: u64,
     phase: String,
-    /// Validated delivery policy from the canonical staged EventEnvelope.
+    /// Validated delivery policy from the canonical staged `EventEnvelope`.
     /// Missing only on legacy rows written before this owner datum existed.
     #[serde(default)]
     delivery_class: Option<String>,
