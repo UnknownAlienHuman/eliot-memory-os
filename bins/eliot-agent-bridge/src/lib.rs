@@ -50,14 +50,15 @@ use eliot_contracts::{
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
-    CapabilityRouteRegistry, ExecutionIdentity, RouteBehaviorFingerprint, RouteInstallationIdentity,
-    RuntimeRoute,
+    CapabilityRouteRegistry, ExecutionIdentity, RouteBehaviorFingerprint,
+    RouteInstallationIdentity, RuntimeRoute,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
-    AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, ContinuityKind, EncodingProfile, EventEnvelope, Frame, FrameKind,
-    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
+    AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration,
+    AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, ContinuityKind, EncodingProfile,
+    EventEnvelope, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+    RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
@@ -83,7 +84,6 @@ pub use bridge_contract::{
 };
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
-use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_resume};
 use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
@@ -97,6 +97,7 @@ pub use reactive_injection_receipts::{
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
+use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_resume};
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
