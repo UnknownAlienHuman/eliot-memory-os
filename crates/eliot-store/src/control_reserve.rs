@@ -1246,7 +1246,7 @@ impl StoreReserve {
             if !cas_add(slot, capacity, record.amount) {
                 return Err(StoreReserveError::RestartReconcileContradiction {
                     permit_id: record.permit_id.clone(),
-                    detail: "persisted hold no longer fits its partition cell",
+                    detail: "persisted hold no longer fits its partition cell".to_owned(),
                 });
             }
         }
