@@ -26,7 +26,7 @@
 //! second unbounded wait. Once the deadline is reached, both entry points refuse
 //! to drive any further effect and return the untouched durable projection: the
 //! non-terminal stage, the blocking effect and the unresolved
-//! `CanaryRemovalEffectState::Unknown { pending_ref }` row all stay exactly as
+//! `CanaryRemovalEffectState::Unknown { pending_ref }` row stays exactly as
 //! observed. Expiry therefore produces visible incomplete recovery state and
 //! can never author a green `Completed`; only a per-row authoritative readback
 //! can.
@@ -57,7 +57,7 @@ use super::{
 /// wait mandatory. Version 3 adds the `UserMode` supervision-authority credential
 /// as a typed resource in the frozen removal graph. Version 4 gives the
 /// repository-local `PortableDev` supervision authority its own removal
-/// category. PortableDev authority, current-user Task registration, and
+/// category. `PortableDev` authority, current-user Task registration, and
 /// current-user Store credentials are removable only when the original typed
 /// receipt reconstructs an exact rollback request and independent readback.
 /// Older records require explicit migration; neither deadlines nor resource
@@ -649,9 +649,10 @@ pub enum CanaryRemovalStage {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CanaryRemovalEffectDisposition {
-    /// The exact previously admitted object is authoritatively absent.
+    /// The exact previously admitted object is authoritatively absent, with no
+    /// successful delete result retained on this row.
     Absent,
-    /// The removal mutation was issued and its postcondition was read back.
+    /// The removal mutation completed and its postcondition was read back.
     Removed,
     /// The resource was intentionally left intact with its admitted identity.
     Retained,
@@ -850,7 +851,9 @@ impl CanaryRemovalOperation {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        self.expected_stage()?;
+        if self.stage != self.derived_stage()? {
+            return Err(InstallationError::IdentityConflict);
+        }
         Ok(())
     }
 
@@ -874,15 +877,13 @@ impl CanaryRemovalOperation {
     /// The other two dispositions are the row's own postcondition read back
     /// from the resource's own owner, and each is accounted for deliberately:
     ///
-    /// * `Absent` is the idempotent-resume outcome. `resolve_row` writes it when
-    ///   the row was still `Pending`, meaning the reconcile-before-execute pass
-    ///   already proved the exact admitted object authoritatively absent and no
-    ///   mutation was ever issued under this operation identity. The row's
-    ///   declared postcondition (`CanaryRemovalPostcondition::Absent`) is
-    ///   therefore satisfied, so it is closed and contributes nothing to
-    ///   `open`; and because this identity never issued a mutation for it, it is
-    ///   not evidence that this operation drove work, so it contributes nothing
-    ///   to `started` either.
+    /// * `Absent` is the exact owner-proven outcome without a successful delete
+    ///   result recorded for the row. It may be observed before execution or
+    ///   after recovery from an unknown mutation; the row's declared
+    ///   postcondition (`CanaryRemovalPostcondition::Absent`) is satisfied, so
+    ///   it is closed and contributes nothing to `open`. It contributes nothing
+    ///   to `started` because this disposition does not claim that this
+    ///   operation completed the delete.
     /// * `Removed` is closed for the same reason, but it *is* evidence that this
     ///   operation executed, so it keeps the stage at `Executing` while the
     ///   terminal registry row is still open. Counting a resolved row as open
@@ -900,7 +901,7 @@ impl CanaryRemovalOperation {
     /// `Remove` row's exact postcondition was observed from its own owner and
     /// that no `Remove` row is still open - never that a retained resource was
     /// removed.
-    fn expected_stage(&self) -> Result<(), InstallationError> {
+    fn derived_stage(&self) -> Result<CanaryRemovalStage, InstallationError> {
         let mut open = 0_usize;
         let mut unknown = 0_usize;
         let mut started = 0_usize;
@@ -960,10 +961,7 @@ impl CanaryRemovalOperation {
         } else {
             CanaryRemovalStage::Admitted
         };
-        if self.stage != expected {
-            return Err(InstallationError::IdentityConflict);
-        }
-        Ok(())
+        Ok(expected)
     }
 
     fn project(&self) -> CanaryRemovalStatus {
@@ -1992,10 +1990,10 @@ fn receipt_backed_removal_supported(
     }
 }
 
-/// Binds a CurrentUser Store rollback to the receipt and precondition admitted
+/// Binds a `CurrentUser` Store rollback to the receipt and precondition admitted
 /// by the original effect, including the exact Host Provision or Reconcile
 /// request and the identity persisted as Applied. This deliberately does not
-/// admit a LocalService receipt for a CurrentUser effect.
+/// admit a `LocalService` receipt for a `CurrentUser` effect.
 fn current_user_store_receipt_matches(
     request: &InstallationEffectRequest,
     identity: &PlatformHandle,
@@ -2443,6 +2441,20 @@ where
         .ok_or(InstallationError::IncompleteObservation(
             "the frozen plan lost its terminal registry record".to_owned(),
         ))?;
+    let terminal_unknown = matches!(
+        operation.effect_progress[registry_row].state,
+        CanaryRemovalEffectState::Unknown { .. }
+    );
+    if terminal_unknown
+        && operation.effect_progress[..registry_row]
+            .iter()
+            .any(|progress| matches!(progress.state, CanaryRemovalEffectState::Pending))
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "terminal registry retirement is uncertain while a removal row has no admitted intent; bounded manual recovery is required"
+                .to_owned(),
+        ));
+    }
     for _ in 0..operation.plan.effects.len() {
         let Some(position) = (0..registry_row).find(|position| {
             !matches!(
@@ -2452,30 +2464,19 @@ where
         }) else {
             break;
         };
+        advance_row(coordinator, registry, operation, install, position)?;
         if matches!(
             operation.effect_progress[position].state,
             CanaryRemovalEffectState::Unknown { .. }
         ) {
             break;
         }
-        advance_row(coordinator, registry, operation, install, position)?;
     }
-    if operation
-        .effect_progress
+    if let Some(progress) = operation.effect_progress[..registry_row]
         .iter()
-        .any(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }))
+        .find(|progress| effect_state_is_unknown(&progress.state))
     {
-        operation.blocking_effect_id = Some(
-            operation
-                .effect_progress
-                .iter()
-                .find(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }))
-                .ok_or(InstallationError::IncompleteObservation(
-                    "blocking effect is absent from durable progress".to_owned(),
-                ))?
-                .effect_id
-                .clone(),
-        );
+        operation.blocking_effect_id = Some(progress.effect_id.clone());
         operation.validate()?;
         return Ok(());
     }
@@ -2486,7 +2487,108 @@ where
         operation.validate()?;
         return Ok(());
     }
+    if terminal_unknown {
+        return reconcile_terminal_registry_unknown(
+            coordinator,
+            registry,
+            operation,
+            install,
+            registry_row,
+        );
+    }
     finish_with_readback(coordinator, registry, operation, install, registry_row)
+}
+
+fn effect_state_is_unknown(state: &CanaryRemovalEffectState) -> bool {
+    matches!(
+        state,
+        CanaryRemovalEffectState::Unknown { .. }
+    )
+}
+
+/// Reconciles an uncertain terminal registry retirement by reading the exact
+/// generation record and pinned revision. This path never retries retirement:
+/// it closes only when the target is absent at the one revision the admitted
+/// terminal mutation could have committed.
+fn reconcile_terminal_registry_unknown<P>(
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    registry: &RedbInstallationRegistry,
+    operation: &mut CanaryRemovalOperation,
+    install: &InstallationTransaction,
+    registry_row: usize,
+) -> Result<(), InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let projection = registry.load()?;
+    projection.validate()?;
+    match resolve_approved_generation(&projection, &operation.plan.generation) {
+        Ok(target) => {
+            if target.active
+                || target.last_known_good
+                || projection
+                    .active_generation()
+                    .is_some_and(|active| active == &operation.plan.generation)
+                || projection
+                    .last_known_good_generation()
+                    .is_some_and(|lkg| lkg == &operation.plan.generation)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "the uncertain terminal removal still names a generation serving production or last-known-good"
+                        .to_owned(),
+                ));
+            }
+            operation.validate()?;
+            Ok(())
+        }
+        Err(InstallationError::IncompleteObservation(_))
+            if projection.revision()
+                == operation.plan.registry_revision.saturating_add(1) =>
+        {
+            let Some(readback_evidence) =
+                readback_removal_rows(coordinator, operation, install, registry_row)?
+            else {
+                return Ok(());
+            };
+            resolve_terminal_registry_absence(
+                coordinator.store_mut(),
+                operation,
+                registry_row,
+                projection.revision(),
+                readback_evidence,
+            )
+        }
+        Err(InstallationError::IncompleteObservation(_)) => {
+            // Absence at any other revision could be unrelated registry drift.
+            // Retain the exact unknown row for manual recovery.
+            operation.validate()?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_terminal_registry_absence(
+    store: &mut RedbInstallationTransactionStore,
+    operation: &mut CanaryRemovalOperation,
+    registry_row: usize,
+    observed_revision: u64,
+    mut evidence: Vec<PlatformHandle>,
+) -> Result<(), InstallationError> {
+    let expected = CanaryRemovalOperationVersion::of(operation)?;
+    evidence.push(handle_ref(&format!(
+        "canary-removal/readback/registry-terminal:{}:revision:{observed_revision}",
+        operation.plan.generation.as_str()
+    ))?);
+    operation.effect_progress[registry_row].state = CanaryRemovalEffectState::Resolved {
+        disposition: CanaryRemovalEffectDisposition::Removed,
+        evidence,
+    };
+    operation.blocking_effect_id = None;
+    operation.stage = operation.derived_stage()?;
+    operation.revision = next_revision(expected.revision)?;
+    operation.validate()?;
+    store.compare_and_save_canary_removal_operation(&expected, operation)
 }
 
 /// Re-observes everything that could have changed since the entry-point fence,
@@ -2589,6 +2691,7 @@ where
     let resume = matches!(
         operation.effect_progress[position].state,
         CanaryRemovalEffectState::IntentCommitted { .. }
+            | CanaryRemovalEffectState::Unknown { .. }
     );
     let attempt = row.bound;
     let request = effect_request(
@@ -2634,9 +2737,23 @@ where
     } else {
         attempt
     };
-    commit_intent(store, operation, position, admitted_attempt, &request)?;
-    port.execute(&request);
-    match port.reconcile(&request) {
+    let execution_request = effect_request(
+        install,
+        install_index,
+        admitted_attempt.attempt,
+        InstallationEffectAction::Rollback,
+        Some(row.resource_identity.clone()),
+    )?;
+    require_exact_removal_request(&execution_request, &row)?;
+    commit_intent(
+        store,
+        operation,
+        position,
+        admitted_attempt,
+        &execution_request,
+    )?;
+    port.execute(&execution_request);
+    match port.reconcile(&execution_request) {
         PortOutcome::Known(observed) => match classify_observation(&observed, &row) {
             RowClassification::Absent(evidence) => {
                 if evidence.is_empty() {
@@ -2822,7 +2939,7 @@ fn commit_intent(
         intent_digest,
     };
     operation.plan.effects[position].bound = attempt;
-    operation.stage = CanaryRemovalStage::Executing;
+    operation.stage = operation.derived_stage()?;
     operation.revision = next_revision(expected.revision)?;
     operation.validate()?;
     store.compare_and_save_canary_removal_operation(&expected, operation)
@@ -2835,18 +2952,24 @@ fn resolve_row(
     evidence: Vec<PlatformHandle>,
 ) -> Result<(), InstallationError> {
     let expected = CanaryRemovalOperationVersion::of(operation)?;
-    let removed = matches!(
-        operation.effect_progress[position].state,
-        CanaryRemovalEffectState::IntentCommitted { .. }
-    );
-    operation.effect_progress[position].state = CanaryRemovalEffectState::Resolved {
-        disposition: if removed {
+    let disposition = match &operation.effect_progress[position].state {
+        CanaryRemovalEffectState::IntentCommitted { .. } => {
             CanaryRemovalEffectDisposition::Removed
-        } else {
-            CanaryRemovalEffectDisposition::Absent
-        },
+        }
+        CanaryRemovalEffectState::Resolved { disposition, .. } => *disposition,
+        CanaryRemovalEffectState::Pending
+        | CanaryRemovalEffectState::Unknown { .. } => CanaryRemovalEffectDisposition::Absent,
+    };
+    operation.effect_progress[position].state = CanaryRemovalEffectState::Resolved {
+        disposition,
         evidence,
     };
+    operation.blocking_effect_id = operation
+        .effect_progress
+        .iter()
+        .find(|progress| effect_state_is_unknown(&progress.state))
+        .map(|progress| progress.effect_id.clone());
+    operation.stage = operation.derived_stage()?;
     operation.revision = next_revision(expected.revision)?;
     operation.validate()?;
     store.compare_and_save_canary_removal_operation(&expected, operation)
@@ -2906,20 +3029,15 @@ fn readback_request(
     Ok(Some(request))
 }
 
-/// Finishes by independent readback, then commits the terminal registry
-/// projection under the expected registry revision.
-///
-/// The readback runs against the resource's own owner and is separate from the
-/// mutating call, so a green stage can never come from a lost response. A
-/// readback that cannot prove absence preserves the original identity and the
-/// safe next action instead of reporting a clean removal.
-fn finish_with_readback<P>(
+/// Independently re-reads every removable effect through its owner. Failure to
+/// prove exact absence persists an unknown row and keeps the terminal registry
+/// step open.
+fn readback_removal_rows<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
-    registry: &RedbInstallationRegistry,
     operation: &mut CanaryRemovalOperation,
     install: &InstallationTransaction,
     registry_row: usize,
-) -> Result<(), InstallationError>
+) -> Result<Option<Vec<PlatformHandle>>, InstallationError>
 where
     P: InstallationEffectPort,
 {
@@ -2937,29 +3055,57 @@ where
                 ..
             }) => {
                 if evidence.is_empty() {
-                    return unknown_row(
+                    unknown_row(
                         store,
                         operation,
                         position,
                         readback_ref("unavailable", &row)?,
-                    );
+                    )?;
+                    return Ok(None);
                 }
                 readback_evidence.push(observed_precondition.digest);
                 readback_evidence.extend(evidence);
             }
             PortOutcome::Known(_) => {
-                return unknown_row(
+                unknown_row(
                     store,
                     operation,
                     position,
                     readback_ref("still-present", &row)?,
-                );
+                )?;
+                return Ok(None);
             }
             other => {
-                return unknown_row(store, operation, position, port_pending(other));
+                unknown_row(store, operation, position, port_pending(other))?;
+                return Ok(None);
             }
         }
     }
+    Ok(Some(readback_evidence))
+}
+
+/// Finishes by independent readback, then commits the terminal registry
+/// projection under the expected registry revision.
+///
+/// The readback runs against the resource's own owner and is separate from the
+/// mutating call, so a green stage can never come from a lost response. A
+/// readback that cannot prove absence preserves the original identity and the
+/// safe next action instead of reporting a clean removal.
+fn finish_with_readback<P>(
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    registry: &RedbInstallationRegistry,
+    operation: &mut CanaryRemovalOperation,
+    install: &InstallationTransaction,
+    registry_row: usize,
+) -> Result<(), InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let Some(mut readback_evidence) =
+        readback_removal_rows(coordinator, operation, install, registry_row)?
+    else {
+        return Ok(());
+    };
     // The terminal projection is the last durable step and is idempotent: a
     // retry after a crash between the registry commit and this operation's
     // final save observes the record already absent and only re-commits the
