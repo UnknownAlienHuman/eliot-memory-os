@@ -63,17 +63,21 @@ pub fn cell_declaration_guard() -> Result<(), String> {
     let refs = eliot
         .get("functional_cell_refs")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_refs array".to_owned())?;
+        .ok_or_else(|| {
+            "baked eliotd declaration carries no functional_cell_refs array".to_owned()
+        })?;
     if refs.is_empty() {
         return Err("baked eliotd declaration names no capability cell".to_owned());
     }
     let mut cells: Vec<&str> = Vec::new();
     for cell in refs {
-        let cell = cell
-            .as_str()
-            .ok_or_else(|| "baked eliotd functional_cell_refs carries a non-string cell".to_owned())?;
+        let cell = cell.as_str().ok_or_else(|| {
+            "baked eliotd functional_cell_refs carries a non-string cell".to_owned()
+        })?;
         if cells.contains(&cell) {
-            return Err(format!("baked eliotd declaration names capability cell {cell} twice"));
+            return Err(format!(
+                "baked eliotd declaration names capability cell {cell} twice"
+            ));
         }
         cells.push(cell);
     }
@@ -81,7 +85,9 @@ pub fn cell_declaration_guard() -> Result<(), String> {
     let owner_rows = eliot
         .get("functional_cell_state_owners")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_state_owners array".to_owned())?;
+        .ok_or_else(|| {
+            "baked eliotd declaration carries no functional_cell_state_owners array".to_owned()
+        })?;
     let mut owners: Vec<(&str, &str)> = Vec::new();
     for row in owner_rows {
         let cell = row
@@ -145,7 +151,9 @@ pub fn cell_declaration_guard() -> Result<(), String> {
             ));
         }
         if projected.iter().any(|(known, _, _)| *known == cell) {
-            return Err(format!("baked cell contract projects capability cell {cell} twice"));
+            return Err(format!(
+                "baked cell contract projects capability cell {cell} twice"
+            ));
         }
         projected.push((cell, owner, declared_by));
     }
