@@ -239,7 +239,10 @@ pub(crate) enum DaemonLossTriggerClaimDisposition {
 /// subordinate observation; the owning session-recovery route emits the
 /// terminal. Enforcement stays with that existing Kernel owner.
 #[cfg(windows)]
-#[allow(dead_code, reason = "STITCH: wired by the Kernel replacement-startup lane; seam first")]
+#[allow(
+    dead_code,
+    reason = "STITCH: wired by the Kernel replacement-startup lane; seam first"
+)]
 pub(crate) fn classify_daemon_loss_trigger_claims(
     state: &DaemonRuntimeState,
 ) -> DaemonLossTriggerClaimDisposition {
@@ -247,8 +250,8 @@ pub(crate) fn classify_daemon_loss_trigger_claims(
         || state.live_ready.is_some()
         || state.supervision_progress.last_request_id.is_some()
         || state.supervision_progress.last_successor_revision.is_some();
-    let consumer_is_lost = matches!(state.status, DaemonRuntimeStatus::Failed(_))
-        || state.supervision_expired;
+    let consumer_is_lost =
+        matches!(state.status, DaemonRuntimeStatus::Failed(_)) || state.supervision_expired;
     if consumer_was_bound && consumer_is_lost {
         observe_supervision("kernel.supervision.trigger_consumer_revoked", "retained");
         DaemonLossTriggerClaimDisposition::RetainPendingAndRevokeConsumer
