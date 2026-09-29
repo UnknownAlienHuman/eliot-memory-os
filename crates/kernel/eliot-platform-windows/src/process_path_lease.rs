@@ -13,8 +13,8 @@ use crate::process_identity::{
     inspect_process_identity, same_windows_path,
 };
 use crate::{
-    is_reparse_point, pin_ancestors, pin_directory, provider_failed, provider_from_io, sha256_hex,
-    valid_sha256_hex, validate_containment,
+    is_reparse_point, provider_failed, provider_from_io, sha256_hex, valid_sha256_hex,
+    validate_containment,
 };
 
 /// Retained no-follow launch proof for an executable and its working scope.
@@ -81,7 +81,7 @@ impl WindowsPlatform {
             use std::io::Read;
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
             };
             let mut executable_options = std::fs::OpenOptions::new();
             executable_options
@@ -109,7 +109,12 @@ impl WindowsPlatform {
             let mut directory_options = std::fs::OpenOptions::new();
             directory_options
                 .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                // Reparse metadata can be changed on a directory while its
+                // identity stays the same. Do not allow a second writable
+                // handle to appear while this lease is retained: otherwise
+                // a junction could redirect the later CreateProcess path
+                // lookup after validation has already succeeded.
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(
                     windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
                         | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -126,8 +131,8 @@ impl WindowsPlatform {
             let working_directory_identity = file_identity_from_handle(&working_handle)
                 .map_err(|_| PortError::Provider(provider_failed()))?;
             let parent = executable.parent().ok_or(PortError::InvalidPath)?;
-            let mut ancestor_pins = pin_ancestors(&self.root, parent)?;
-            ancestor_pins.extend(pin_ancestors(&self.root, working_directory)?);
+            let mut ancestor_pins = pin_process_path_ancestors(&self.root, parent)?;
+            ancestor_pins.extend(pin_process_path_ancestors(&self.root, working_directory)?);
             let mut ancestor_identities = Vec::new();
             for path in executable
                 .ancestors()
@@ -139,7 +144,8 @@ impl WindowsPlatform {
                 )
             {
                 if path.is_dir() {
-                    let handle = pin_directory(path).map_err(|_| PortError::InvalidPath)?;
+                    let handle = pin_process_path_directory(path)
+                        .map_err(|_| PortError::InvalidPath)?;
                     let identity = file_identity_from_handle(&handle)
                         .map_err(|_| PortError::Provider(provider_failed()))?;
                     ancestor_identities.push((path.to_path_buf(), identity));
@@ -192,7 +198,6 @@ impl RetainedProcessPathLease {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
                 FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-                FILE_SHARE_WRITE,
             };
             let mut executable_options = std::fs::OpenOptions::new();
             executable_options
@@ -224,7 +229,7 @@ impl RetainedProcessPathLease {
             let mut directory_options = std::fs::OpenOptions::new();
             directory_options
                 .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
             let current_working = directory_options
                 .open(working_directory)
@@ -242,7 +247,8 @@ impl RetainedProcessPathLease {
                 return Err(PortError::InvalidPath);
             }
             for (path, identity) in &self.ancestor_identities {
-                let handle = pin_directory(path).map_err(|_| PortError::InvalidPath)?;
+                let handle =
+                    pin_process_path_directory(path).map_err(|_| PortError::InvalidPath)?;
                 if file_identity_from_handle(&handle)
                     .map_err(|_| PortError::Provider(provider_failed()))?
                     != *identity
@@ -307,4 +313,49 @@ impl RetainedProcessPathLease {
             Err(PortError::Provider(provider_failed()))
         }
     }
+}
+
+/// Opens one directory without following a final reparse point and denies
+/// later writable handles while a process-path lease is retained.
+///
+/// The deny-write sharing mode closes the gap between path validation and
+/// `CreateProcess`: a retained directory identity alone does not prevent an
+/// in-place reparse-point update, which could redirect the executable or
+/// working-directory lookup without renaming the directory.
+#[cfg(windows)]
+fn pin_process_path_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process path directory is not a plain directory",
+        ));
+    }
+    Ok(handle)
+}
+
+/// Retains each directory in a path contour with reparse-changing writes
+/// denied until the process-path lease is dropped.
+#[cfg(windows)]
+fn pin_process_path_ancestors(root: &Path, path: &Path) -> Result<Vec<std::fs::File>, PortError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PortError::InvalidPath)?;
+    let mut current = root.to_path_buf();
+    let mut handles = vec![pin_process_path_directory(root).map_err(|_| PortError::InvalidPath)?];
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        handles.push(pin_process_path_directory(&current).map_err(|_| PortError::InvalidPath)?);
+    }
+    Ok(handles)
 }
