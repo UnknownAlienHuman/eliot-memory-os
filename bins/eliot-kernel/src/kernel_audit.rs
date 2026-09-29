@@ -64,6 +64,8 @@ use eliot_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::shutdown_drain::ShutdownPublication;
+
 /// Canonical audit record/anchor format version (I16.3 normalization version).
 pub const KERNEL_AUDIT_FORMAT_VERSION: u16 = 1;
 /// Directory below the canonical work root holding the chain and anchors.
@@ -2043,16 +2045,30 @@ impl AuditEventDraft {
     }
 
     /// Returns the terminal-published draft for one shutdown outcome.
+    ///
+    /// I14.23/W4/A1: the body carries the whole published drain state, not
+    /// just the terminal name and a count, so Host and Watchdog can tell an
+    /// intentional stop from an incomplete one and from a drain a wake
+    /// cancelled, using the durable audit chain they already read rather than a
+    /// live observation that a stopped process cannot emit. Every field is
+    /// bounded: the phases are the closed [`ShutdownPhase`](super::shutdown_drain::ShutdownPhase)
+    /// vocabulary, `pending_count` is a count, and the three flags are
+    /// booleans — no identity, digest, generation value, or owner error text
+    /// (F-LOG-KERNEL-3, I15.4).
     #[must_use]
-    pub fn shutdown_terminal_published(terminal: &'static str, pending_count: usize) -> Self {
+    pub fn shutdown_terminal_published(publication: &ShutdownPublication) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.controller = Some("kernel".to_owned());
         Self {
             kind: AuditEventKind::SHUTDOWN_TERMINAL_PUBLISHED,
             lineage,
             body: serde_json::json!({
-                "terminal": terminal,
-                "pending_count": pending_count,
+                "terminal": publication.terminal.as_deref().unwrap_or("unterminated"),
+                "phases_completed": &publication.phases_completed,
+                "committed": publication.committed,
+                "cancelled": publication.cancelled,
+                "recovered_interrupted": publication.recovered_interrupted,
+                "pending_count": publication.pending.len(),
             }),
         }
     }

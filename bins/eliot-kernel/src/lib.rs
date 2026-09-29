@@ -4421,9 +4421,13 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Intentional)
                 .map_err(ProcessExecutionError::Unavailable)?;
+            // I14.23/W4: the published terminal reaches Host and Watchdog
+            // through the audit chain they already read. It is read back from
+            // the coordinator AFTER the terminal is durable, so the record
+            // carries the state that was actually persisted rather than the
+            // one this branch intended to persist.
             self.audit_observe(AuditEventDraft::shutdown_terminal_published(
-                "intentional",
-                0,
+                &coordinator.publication(),
             ));
             // Issue #1839 (I16.4 stop): the intentional terminal stopped
             // the supervised daemon process with no pending work.
@@ -4447,9 +4451,11 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Incomplete { pending })
                 .map_err(ProcessExecutionError::Unavailable)?;
+            // The incomplete terminal is published the same way, and it
+            // retains exactly the pending work `complete_terminal` persisted
+            // rather than the count this branch computed before the call.
             self.audit_observe(AuditEventDraft::shutdown_terminal_published(
-                "incomplete",
-                pending_count,
+                &coordinator.publication(),
             ));
             // Issue #1839 (I16.4 stop): the incomplete terminal stopped the
             // supervised daemon process with retained pending work.
@@ -4723,6 +4729,15 @@ impl KernelComposition {
             irreversible_stage: "authority-fenced".to_owned(),
             recovery_owner: "kernel-composition".to_owned(),
         };
+        // I1.5/W5/A3: a wake that arrived before this linearization point
+        // cancels the drain, and a cancelled drain must not be finished by
+        // stopping the process. The durable cancellation is re-read here
+        // rather than inferred from the absence of a commit, so a commit
+        // refused for any other reason is still reported as a refused commit
+        // and still produces the incomplete-shutdown terminal below.
+        if coordinator.cancelled_by_wake() {
+            return Err(DrainHalt::new("drain-cancelled-by-wake"));
+        }
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;
