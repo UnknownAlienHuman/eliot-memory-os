@@ -883,8 +883,9 @@ fn retain_role_roots(
                 ),
                 identity: repository_identity
                     .or_else(|| {
-                        local_app_data_lease
-                            .map(crate::platform_security::CurrentUserLocalAppDataRootLease::identity)
+                        local_app_data_lease.map(
+                            crate::platform_security::CurrentUserLocalAppDataRootLease::identity,
+                        )
                     })
                     .ok_or(WindowsAdapterError::IdentityMismatch)?,
             });

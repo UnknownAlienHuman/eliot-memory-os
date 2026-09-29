@@ -3733,7 +3733,7 @@ where
         if depth > MAX_PACKAGE_PATH_DEPTH {
             return Err(PackageStagingError::BoundExceeded);
         }
-        let pending = read_trusted_source_pending(&directory, &prefix)?;
+        let mut pending = read_trusted_source_pending(&directory, &prefix)?;
         pending.sort_by(|left, right| ordinal_path_cmp(&left.0, &right.0));
         for pair in pending.windows(2) {
             if ordinal_path_eq(&pair[0].0, &pair[1].0) {
