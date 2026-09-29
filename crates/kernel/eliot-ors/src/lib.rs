@@ -15,6 +15,7 @@ mod effect_operation_lease;
 mod execution_manifest;
 mod model;
 mod process_stream_recovery;
+mod purge_ledger;
 mod reservation_model;
 mod restore_journal;
 mod snapshot_model;
@@ -78,6 +79,10 @@ pub use process_stream_recovery::{
     StreamRecoveryCoverage, StreamRecoveryEvidenceScope, StreamRecoveryPreview,
     StreamRecoveryRange, StreamRecoveryReconciliation, StreamRecoveryReconciliationState,
     StreamRecoverySourceFault,
+};
+pub use purge_ledger::{
+    PURGE_LEDGER_RECORD_TYPE, PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE, PurgeLedgerRecord,
+    PurgeLedgerRevisionBinding,
 };
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,

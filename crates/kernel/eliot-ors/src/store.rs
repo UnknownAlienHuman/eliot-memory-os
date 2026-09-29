@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[path = "persistence_codec.rs"]
-mod persistence_codec;
+pub(crate) mod persistence_codec;
 use persistence_codec::{
     LegacyGrantClosureRecord, LegacyGrantClosureState, decode, decode_legacy_grant_closure_record,
     decode_named, encode, is_current_grant_closure_shape,
@@ -247,6 +247,15 @@ const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
 /// family, owned by the same `RedbRecoveryStore` and written through the same
 /// `persistence_codec`; it is not a second ledger or a second table owner.
 const PURGE_LEDGER: TableDefinition<&str, &str> = TableDefinition::new("ors_purge_ledger_v1");
+/// Durable `backup.verify` → owner-observed purge-ledger revision bindings.
+///
+/// Keyed by the verification operation's own `record_key`, so a binding can
+/// only ever be read back for the exact operation that produced it. Written in
+/// the SAME write transaction that reads the purge-ledger counter and stages the
+/// verification row, so the revision it carries is the one the owner held at that
+/// instant and cannot be presented, retried or recomputed by the caller.
+const PURGE_LEDGER_REVISION_BINDINGS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_purge_ledger_revision_bindings_v1");
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -5432,7 +5441,7 @@ impl RedbRecoveryStore {
     /// own `validate()` before anything becomes durable.
     pub fn apply_purge_ledger_entry(
         &self,
-        entry: &crate::PurgeLedgerEntry,
+        entry: &eliot_security_contracts::PurgeLedgerEntry,
     ) -> Result<u64, OrsError> {
         crate::model::validate_text(&entry.purge_id, "purge_ledger_purge_id")?;
         let candidate = crate::PurgeLedgerRecord {
@@ -5982,6 +5991,99 @@ impl RedbRecoveryStore {
         Ok(crate::classify_backup_verification_fence_bound_key(&bytes))
     }
 
+    /// Records the owner-observed purge-ledger revision against one staged
+    /// `backup.verify` operation, inside the transaction that stages it.
+    ///
+    /// This is the production call site of the owner-issued revision. It runs
+    /// in the same write transaction as the verification row, so the revision
+    /// cannot be a value the route presented, retried or recomputed, and it
+    /// cannot be a revision the owner advanced after this answer was produced.
+    ///
+    /// A replay of the same operation is idempotent: an existing binding for the
+    /// same key is left exactly as the first stage recorded it, so the replayed
+    /// answer keeps the purge state that was actually observed instead of
+    /// silently moving to a later one. A binding that disagrees with the
+    /// revision this owner currently holds is an integrity failure rather than
+    /// an answer, because a revision that went backwards is not a fact the
+    /// ledger can have produced.
+    fn bind_purge_ledger_revision(
+        write: &redb::WriteTransaction,
+        record_key: &str,
+    ) -> Result<(), OrsError> {
+        let observed = Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?;
+        if let Some(existing) = write
+            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+            .map_err(storage)?
+            .get(record_key)
+            .map_err(storage)?
+        {
+            let stored: crate::PurgeLedgerRevisionBinding = decode(existing.value())?;
+            stored.validate()?;
+            if stored.record_key != record_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                    reason: "table key does not match the binding's own record key".to_owned(),
+                });
+            }
+            if stored.observed_revision > observed {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                    reason: "a recorded purge-ledger revision is ahead of the owner's own counter"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        let binding = crate::PurgeLedgerRevisionBinding {
+            contract_version: crate::CONTRACT_VERSION,
+            record_key: record_key.to_owned(),
+            observed_revision: observed,
+        };
+        binding.validate()?;
+        let payload = encode(&binding)?;
+        write
+            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+            .map_err(storage)?
+            .insert(record_key, payload.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Returns the owner-observed purge-ledger revision bound to one
+    /// `backup.verify` operation, or `None` when this owner never staged that
+    /// operation.
+    ///
+    /// The value is the revision that was authoritative when the result was
+    /// staged, read back from ORS's own durable binding. It is deliberately not
+    /// the current revision: a replay after a later purge must report the state
+    /// the answer was actually produced under, and
+    /// [`Self::purge_ledger_revision`] is the separate query for the current
+    /// one. `None` is the absence of an operation, not an unknown purge state.
+    pub fn backup_verification_purge_ledger_revision(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<u64>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let Some(bytes) = read
+            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+            .map_err(storage)?
+            .get(record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(None);
+        };
+        let binding: crate::PurgeLedgerRevisionBinding = decode(&bytes)?;
+        binding.validate()?;
+        if binding.record_key != record_key {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                reason: "table key does not match the binding's own record key".to_owned(),
+            });
+        }
+        Ok(Some(binding.observed_revision))
+    }
+
     /// Stages one durable `backup.verify` result under its scoped namespace key.
     ///
     /// Persist-before-answer: the row is committed before the route answers, so a
@@ -6048,6 +6150,7 @@ impl RedbRecoveryStore {
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
                 drop(table);
+                Self::bind_purge_ledger_revision(&write, key.as_str())?;
                 write.commit().map_err(storage)?;
                 return Ok(BackupVerificationDisposition::Stored);
             };

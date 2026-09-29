@@ -21,6 +21,7 @@ use eliot_security_contracts::PurgeLedgerEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::OrsError;
+use crate::store::persistence_codec;
 
 /// Stable ORS record-type name of one durable purge-ledger record.
 ///
@@ -51,6 +52,14 @@ pub struct PurgeLedgerRecord {
     pub applied_revision: u64,
     /// The accepted purge-ledger entry, stored verbatim as applied.
     pub entry: PurgeLedgerEntry,
+}
+
+impl persistence_codec::PersistedValue for PurgeLedgerRecord {
+    const RECORD_TYPE: &'static str = PURGE_LEDGER_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
 }
 
 impl PurgeLedgerRecord {
@@ -85,5 +94,76 @@ impl PurgeLedgerRecord {
     #[must_use]
     pub fn same_applied_purge(&self, other: &Self) -> bool {
         self.entry == other.entry
+    }
+}
+
+/// Stable ORS record-type name of one durable purge-ledger revision binding.
+pub const PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE: &str = "purge_ledger_revision_binding";
+
+/// ORS's own binding of one `backup.verify` operation to the purge-ledger
+/// revision that was authoritative when that result was staged.
+///
+/// `BackupVerificationResultRecord::target_compatibility` records that
+/// A13.7 keeps schema/build/**key/purge**/import/epoch compatibility with the
+/// isolated restore owner, and that on the verify path no such owner issued a
+/// typed result, so the axis is absent on every row. ORS is the owner of the
+/// purge half of that axis, so ORS issues it here rather than receiving it: the
+/// row is written inside the same write transaction that reads the durable
+/// counter, so the revision is what the owner held at that instant and not a
+/// value the verifying route presented.
+///
+/// The binding is HISTORICAL evidence, exactly like the retained
+/// `archive_fence_relation` beside it: a replay after a later purge answers
+/// with the revision that was observed when the answer was produced instead of
+/// re-deriving one against whatever purge state happens to be live. The current
+/// owner-issued revision is [`RedbRecoveryStore::purge_ledger_revision`], and
+/// the two are different facts that are deliberately not conflated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurgeLedgerRevisionBinding {
+    /// ORS wire/storage contract version of this row, for the same reason
+    /// [`PurgeLedgerRecord::contract_version`] carries one.
+    pub contract_version: u16,
+    /// The `backup.verify` operation's own durable key this binds.
+    ///
+    /// Repeated inside the row so a binding cannot be filed under a key that is
+    /// not its own, the way the sibling readers in this crate assert the key of
+    /// the row they decoded.
+    pub record_key: String,
+    /// The owner-observed purge-ledger revision, as allocated by
+    /// [`PurgeLedgerRecord::applied_revision`] in the transaction that made the
+    /// purge durable. Zero means no purge had been applied when this result was
+    /// staged, which is an owner-issued answer and not a missing one.
+    pub observed_revision: u64,
+}
+
+impl persistence_codec::PersistedValue for PurgeLedgerRevisionBinding {
+    const RECORD_TYPE: &'static str = PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PurgeLedgerRevisionBinding {
+    /// Validates the stored binding against the current ORS contract.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_text(&self.record_key, "purge_ledger_record_key")?;
+        Ok(())
+    }
+
+    /// Returns whether two bindings record the same observation of the same
+    /// operation.
+    ///
+    /// Equality is over the whole observation, not the operation alone. A second
+    /// stage of one operation that observed a different revision means a purge
+    /// landed between the two stages, so the binding is no longer replayable as
+    /// the answer the first stage committed.
+    #[must_use]
+    pub fn same_observation(&self, other: &Self) -> bool {
+        self.record_key == other.record_key && self.observed_revision == other.observed_revision
     }
 }
