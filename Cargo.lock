@@ -940,14 +940,17 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-blob-api",
+ "eliot-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
  "eliot-receipts",
+ "eliot-runtime-contracts",
  "eliot-security-contracts",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror",
 ]
 
 [[package]]
