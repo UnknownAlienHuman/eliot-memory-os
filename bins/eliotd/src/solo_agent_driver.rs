@@ -59,12 +59,14 @@
 //! # Pollability and durability
 //!
 //! The production queue poll snapshots its head under a short composition
-//! lock, then performs authenticated Kernel verification with owned inputs
-//! and no composition guard across the await. Until the Kernel owner retains
-//! the executable-binding digest, that check fails closed before admission,
-//! activation, or dispatch. The test-only historical dispatch projection is
-//! persisted under the daemon state root before `emit`; uncertain ownership
-//! is never released without an observed terminal disposition.
+//! lock, reads the full Governor binding and same-row ORS projection through
+//! the authenticated Kernel path without holding that lock across the await,
+//! then revalidates the row with Governor. Route/capacity currentness is not
+//! available from the M1 owner record, so the poll returns a typed pending or
+//! refusal before capability construction, activation, or dispatch. The
+//! test-only historical dispatch projection is persisted under the daemon
+//! state root before `emit`; uncertain ownership is never released without an
+//! observed terminal disposition.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -270,7 +272,7 @@ pub struct SoloDelegateIntake {
 }
 
 impl SoloDelegateIntake {
-    fn validate(&self, now_unix_ms: u64) -> Result<(), FabricError> {
+    fn validate_shape(&self) -> Result<(), FabricError> {
         self.delegate.validate()?;
         self.claimed.validate()?;
         require_text(&self.requirements.role, "route role")?;
@@ -282,6 +284,11 @@ impl SoloDelegateIntake {
         for item in &self.requirements.competence {
             require_text(item, "route competence")?;
         }
+        Ok(())
+    }
+
+    fn validate(&self, now_unix_ms: u64) -> Result<(), FabricError> {
+        self.validate_shape()?;
         if self.deadline_unix_ms == 0 || self.deadline_unix_ms <= now_unix_ms {
             return Err(FabricError::Contract(
                 "solo delegate deadline is not in the future".to_owned(),
@@ -773,6 +780,35 @@ pub enum SoloPollOutcome {
     Idle,
     /// The live slot holds a non-settled attempt; the queue waits.
     SlotBusy,
+    /// The requested Kernel claim exists but its Governor binding has not
+    /// yet been published. The exact queue head remains available for retry.
+    OwnerBindingPending {
+        /// Claim identity selected by the retained queue head.
+        claim_id: String,
+        /// Attempt identity selected by the retained queue head.
+        attempt_id: String,
+        /// Operation identity selected by the retained queue head.
+        operation_id: String,
+        /// Task identity selected by the retained queue head.
+        task_id: String,
+        /// Kernel owner time at which the missing binding was observed.
+        observed_at_unix_ms: u64,
+    },
+    /// Governor confirmed the retained binding, but current provider route
+    /// and capacity revisions are not available from an independent owner.
+    /// The exact queue head remains blocked before capability construction.
+    ProviderRevisionsUnavailable {
+        /// Claim identity selected by the retained queue head.
+        claim_id: String,
+        /// Attempt identity selected by the retained queue head.
+        attempt_id: String,
+        /// Operation identity selected by the retained queue head.
+        operation_id: String,
+        /// Task identity selected by the retained queue head.
+        task_id: String,
+        /// Kernel owner time at which the current binding was observed.
+        observed_at_unix_ms: u64,
+    },
     /// One queued intake drove to a retained dispatch.
     Drove {
         /// Operation identity driven.
@@ -1137,17 +1173,11 @@ pub fn drive_solo_delegate(
     })
 }
 
-/// Performs the authenticated Kernel provider-binding check for one solo
-/// intake without crossing into local admission, activation, or dispatch
-/// substitutes.
-///
-/// Kernel currently has no independently owner-backed executable-binding
-/// digest on its durable provider claim row. Its accepted verifier therefore
-/// cannot yet authorize construction of an `AdmittedProviderCapability` for
-/// this operation. The call below verifies the remaining exact owner tuple,
-/// then returns a typed fail-closed residual before any capability or fabric
-/// effect is created. The native-worker owner must persist and verify the
-/// executable join itself before this path can proceed.
+/// Performs plan-only validation for a direct solo intake. This entry does not
+/// own a Governor composition borrow, so it cannot perform the exact owner
+/// readback/currentness adoption used by the queue path. The legacy client
+/// call is fail-closed and never sends caller-presented digests or revisions
+/// as owner expectations.
 pub async fn drive_solo_delegate_async(
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
@@ -1536,14 +1566,15 @@ pub fn solo_poll_queue(
     })
 }
 
-/// Async runtime poll hook. It leaves the head item queued when Kernel refuses
-/// or the executable-binding owner evidence is absent, preserving the exact
-/// operation for a later fresh evaluation.
+/// Async runtime poll hook. It reads the authenticated Kernel owner record
+/// without a composition guard, revalidates it with Governor under a short
+/// synchronous borrow, then leaves the exact head queued whenever provider
+/// route/capacity currentness is unavailable or an outcome needs reconciliation.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
 ) -> Result<SoloPollOutcome, DaemonError> {
-    let intake = {
+    let (intake, expected_kernel_fence) = {
         let Ok(composition) = composition.try_lock() else {
             return Ok(SoloPollOutcome::SlotBusy);
         };
@@ -1563,30 +1594,110 @@ pub async fn solo_poll_queue_async(
         {
             return Ok(SoloPollOutcome::SlotBusy);
         }
-        head
+        (head, kernel.kernel_fence())
     };
-    // The async owner call operates only on owned intake and Kernel handles.
-    // The Tokio composition guard above is out of scope across this await.
-    let outcome = drive_solo_delegate_async(kernel, intake, crate::unix_ms()).await?;
-    {
+    intake
+        .validate_shape()
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+
+    // Kernel readback performs authenticated IPC with only owned tuple
+    // selectors; the composition guard is intentionally absent across this
+    // await. The returned payload is the full Governor binding and its same-row
+    // ORS projection, never a reconstruction from `SoloClaimedHalves`.
+    let task_id = intake.plan.launch.task_id.as_str();
+    let readback = kernel
+        .read_native_worker_executable_binding_async(
+            &intake.claimed.claim_id,
+            &intake.claimed.attempt_id,
+            &intake.claimed.operation_id,
+            task_id,
+        )
+        .await
+        .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+
+    let observation = {
         let composition = composition.lock().await;
-        let mut state = composition.solo_state.lock().map_err(|_| {
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let live_kernel_fence = kernel.kernel_fence();
+        if !fences_match_exact(&expected_kernel_fence, &live_kernel_fence) {
+            return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+                "Kernel fence changed while the solo binding readback was in flight".to_owned(),
+            )));
+        }
+        let state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
             ))
         })?;
-        if state
-            .queue
-            .front()
-            .is_some_and(|head| head.claimed.operation_id == outcome.operation_id)
+        let Some(head) = state.queue.front() else {
+            return Ok(SoloPollOutcome::SlotBusy);
+        };
+        if head.claimed.claim_id != intake.claimed.claim_id
+            || head.claimed.attempt_id != intake.claimed.attempt_id
+            || head.claimed.operation_id != intake.claimed.operation_id
+            || head.plan.launch.task_id != intake.plan.launch.task_id
         {
-            state.queue.pop_front();
+            return Ok(SoloPollOutcome::SlotBusy);
+        }
+        drop(state);
+        composition.validate_solo_native_worker_binding_readback(
+            kernel,
+            &intake.claimed.claim_id,
+            &intake.claimed.attempt_id,
+            &intake.claimed.operation_id,
+            task_id,
+            readback,
+        )?
+    };
+
+    // The owner validator confirms Governor currentness using Kernel's
+    // observed timestamp. M1 binding has no independently current route or
+    // capacity revision, so both outcomes remain before capability
+    // construction and the queue head is preserved for later reconciliation.
+    match observation {
+        eliot_governor::NativeWorkerBindingObservation::Pending {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        } => Ok(SoloPollOutcome::OwnerBindingPending {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }),
+        eliot_governor::NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+            ..
+        } => Ok(SoloPollOutcome::ProviderRevisionsUnavailable {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }),
+        eliot_governor::NativeWorkerBindingObservation::Revoked { .. } => {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                "Governor reports the native-worker binding is revoked; the retained solo item remains blocked"
+                    .to_owned(),
+            )))
+        }
+        eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. } => {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                "Kernel reports an unknown native-worker binding outcome; exact reconciliation is required before retry"
+                    .to_owned(),
+            )))
         }
     }
-    Ok(SoloPollOutcome::Drove {
-        operation_id: outcome.operation_id,
-        dispatch_id: outcome.dispatch_id,
-    })
 }
 
 /// Synchronous queue polling cannot perform authenticated owner IO. It

@@ -18,8 +18,10 @@ use eliot_contracts::{
     StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
-use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
+use eliot_governor::{
+    GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError,
+    NativeWorkerExecutableBinding as GovernorNativeWorkerExecutableBinding,
+};
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -58,25 +60,266 @@ use super::{
     unix_ms, unix_ms_i64,
 };
 
-const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
+const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION: &str =
+    "native_worker.executable_binding.publish";
+const NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION: &str =
+    "native_worker.executable_binding.read";
+const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLICATION_RECEIPT_VERSION: &str =
+    "eliot-kernel-native-worker-binding-publication/v1";
+const NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND: &str =
+    "native_worker_executable_binding_readback";
 
-#[derive(Deserialize)]
+/// The daemon-side outcome of publishing one exact Governor-owned executable
+/// binding to Kernel. `Pending` means the requested claim has not been staged
+/// yet; callers retain and retry the same binding and operation identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NativeWorkerExecutableBindingPublicationOutcome {
+    /// The authenticated Kernel owner has not staged this claim yet.
+    Pending {
+        claim_id: String,
+        attempt_id: String,
+        operation_id: String,
+    },
+    /// Kernel retained the original Governor-issued digest on the claim row.
+    Published(NativeWorkerExecutableBindingPublicationReceipt),
+}
+
+/// Exact identity projection returned after Kernel records the original
+/// Governor executable binding. The receipt intentionally contains digests
+/// and identity references only, never credential or resource values.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProviderCapabilityReceiptWire {
+pub(super) struct NativeWorkerExecutableBindingPublicationReceipt {
     kind: String,
     wire_version: String,
     claim_id: String,
+    registration_id: String,
     attempt_id: String,
     operation_id: String,
-    proof_kind: String,
-    route_revision: String,
-    capacity_revision: String,
-    governor_route_revision: String,
-    governor_capacity_revision: String,
     worker_generation: u64,
-    fence_digest: String,
-    verified_at_unix_ms: u64,
+    state_fence: StateFence,
+    session_id: String,
+    executable_binding_digest: String,
     receipt_digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeWorkerExecutableBindingPublicationReplyWire {
+    Pending {
+        kind: String,
+        claim_id: String,
+        attempt_id: String,
+        operation_id: String,
+    },
+    Published {
+        kind: String,
+        receipt: NativeWorkerExecutableBindingPublicationReceipt,
+    },
+}
+
+/// Full Governor record and its Kernel-retained claim-row tuple, returned by
+/// the authenticated readback operation. Route and capacity currentness are
+/// deliberately absent: the M1 binding does not carry either revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct NativeWorkerExecutableBindingReadback {
+    claim_id: String,
+    attempt_id: String,
+    operation_id: String,
+    task_id: String,
+    claim_state: String,
+    observed_at_unix_ms: u64,
+    executable_binding_digest: String,
+    binding: GovernorNativeWorkerExecutableBinding,
+    executable_binding_projection: NativeWorkerExecutableBindingProjectionReadback,
+}
+
+impl NativeWorkerExecutableBindingReadback {
+    pub(super) fn claim_id(&self) -> &str {
+        &self.claim_id
+    }
+
+    pub(super) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub(super) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(super) fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub(super) fn claim_state(&self) -> &str {
+        &self.claim_state
+    }
+
+    pub(super) fn observed_at_unix_ms(&self) -> u64 {
+        self.observed_at_unix_ms
+    }
+
+    pub(super) fn executable_binding_digest(&self) -> &str {
+        &self.executable_binding_digest
+    }
+
+    pub(super) fn binding(&self) -> &GovernorNativeWorkerExecutableBinding {
+        &self.binding
+    }
+
+    pub(super) fn executable_binding_projection(
+        &self,
+    ) -> &NativeWorkerExecutableBindingProjectionReadback {
+        &self.executable_binding_projection
+    }
+}
+
+/// Closed daemon-side mirror of the ORS persisted binding projection.
+/// Keeping Governor identity, attempt, and session beside the Kernel M1
+/// projection lets the readback check the full same-row relation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeWorkerExecutableBindingProjectionReadback {
+    claim_id: String,
+    registration_id: String,
+    task_id: String,
+    work_scope_id: String,
+    attempt: u32,
+    operation_id: String,
+    worker_generation: u64,
+    session_id: String,
+    route_ref: String,
+    adapter_id: String,
+    adapter_revision: u64,
+    config_digest: String,
+    facet_manifest_ref: String,
+    capability_cell: eliot_contracts::CapabilityCellId,
+    grant_graph_revision: u64,
+    module_catalog_revision: u64,
+    replay_stream_id: String,
+    launch_nonce: String,
+    process_invocation_digest: String,
+    authority_epoch: eliot_contracts::EpochId,
+    generation: eliot_contracts::ResourceGeneration,
+    state_fence: StateFence,
+    deadline_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    executable_wire_version: u16,
+    executable_binding_digest: String,
+}
+
+/// A claim may not yet have a persisted Governor binding; retry with the same
+/// exact lookup tuple after the owner publication path has run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NativeWorkerExecutableBindingReadbackOutcome {
+    Pending {
+        claim_id: String,
+        attempt_id: String,
+        operation_id: String,
+        task_id: String,
+        observed_at_unix_ms: u64,
+    },
+    Found(NativeWorkerExecutableBindingReadback),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeWorkerExecutableBindingReadbackReplyWire {
+    Pending {
+        kind: String,
+        claim_id: String,
+        attempt_id: String,
+        operation_id: String,
+        task_id: String,
+        observed_at_unix_ms: u64,
+    },
+    Found {
+        kind: String,
+        claim_id: String,
+        attempt_id: String,
+        operation_id: String,
+        task_id: String,
+        binding: GovernorNativeWorkerExecutableBinding,
+        executable_binding_digest: String,
+        executable_binding_projection: NativeWorkerExecutableBindingProjectionReadback,
+        claim_state: String,
+        observed_at_unix_ms: u64,
+    },
+}
+
+fn require_binding_lookup_text(value: &str, field: &'static str) -> Result<(), KernelClientError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > 1024 {
+        return Err(KernelClientError::Contract(format!(
+            "native-worker binding {field} is blank, control-bearing, or overlong"
+        )));
+    }
+    Ok(())
+}
+
+fn binding_publication_receipt_digest_is_valid(
+    receipt: &NativeWorkerExecutableBindingPublicationReceipt,
+) -> Result<bool, KernelClientError> {
+    let mut body = serde_json::to_value(receipt)
+        .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+    let Some(receipt_digest) = body
+        .as_object_mut()
+        .and_then(|object| object.remove("receipt_digest"))
+        .and_then(|digest| digest.as_str().map(str::to_owned))
+    else {
+        return Ok(false);
+    };
+    let bytes = canonical_json_bytes(&body)
+        .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+    Ok(sha256_hex(&bytes) == receipt_digest)
+}
+
+fn valid_native_worker_claim_state(value: &str) -> bool {
+    matches!(
+        value,
+        "REQUESTED"
+            | "ADMITTED"
+            | "READY"
+            | "ACTIVE"
+            | "CANCELLING"
+            | "SUBMITTED"
+            | "UNKNOWN"
+            | "RECONCILING"
+            | "TERMINAL"
+    )
+}
+
+fn native_worker_binding_projection_matches(
+    binding: &GovernorNativeWorkerExecutableBinding,
+    projection: &NativeWorkerExecutableBindingProjectionReadback,
+) -> bool {
+    use eliot_contracts::fences_match_exact;
+
+    projection.claim_id == binding.claim_id
+        && projection.registration_id == binding.registration_id
+        && projection.task_id == binding.task_id
+        && projection.work_scope_id == binding.work_scope_id
+        && projection.attempt == binding.attempt
+        && projection.operation_id == binding.operation_id
+        && projection.worker_generation == binding.worker_generation
+        && projection.session_id == binding.session_id
+        && projection.route_ref == binding.route_ref
+        && projection.adapter_id == binding.adapter_id
+        && projection.adapter_revision == binding.adapter_revision
+        && projection.config_digest == binding.config_digest
+        && projection.facet_manifest_ref == binding.facet_manifest_ref
+        && projection.capability_cell == binding.capability_cell
+        && projection.grant_graph_revision == binding.grant_graph_revision
+        && projection.module_catalog_revision == binding.module_catalog_revision
+        && projection.replay_stream_id == binding.replay_stream_id
+        && projection.launch_nonce == binding.launch_nonce
+        && projection.process_invocation_digest == binding.process_invocation_digest
+        && projection.authority_epoch == binding.authority_epoch
+        && projection.generation == binding.generation
+        && fences_match_exact(&projection.state_fence, &binding.state_fence)
+        && projection.deadline_unix_ms == binding.deadline_unix_ms
+        && projection.expires_at_unix_ms == binding.expires_at_unix_ms
+        && projection.executable_wire_version == binding.wire_version
+        && projection.executable_binding_digest == binding.binding_digest
 }
 
 /// #791 (W4/W17): the typed detail reported when the daemon's shutdown request
@@ -1449,111 +1692,247 @@ impl DaemonKernelClient {
         })
     }
 
-    /// Asks the authenticated Kernel owner to verify one exact provider
-    /// binding before daemon composition may consider constructing an
-    /// admitted capability.
-    ///
-    /// The transport handshake and correlated response are owner-authenticated;
-    /// the response seal and every field it actually echoes are checked here.
-    /// Route and capacity currentness in `material` came from serialized intake
-    /// data, not a live Governor read; the Kernel response echoes those
-    /// presented values and this method does not promote them to owner evidence.
-    /// This is only a provider-binding probe. The current Kernel/ORS claim row
-    /// does not retain an independently verified executable-binding digest,
-    /// so this response must never be treated as admitted execution capability.
-    pub(super) async fn verify_provider_binding_async(
+    /// Publishes the exact full record emitted by the Governor M1 binding
+    /// publisher to the authenticated Kernel claim lifecycle. The full owner
+    /// record is serialized unchanged; the Kernel retains both it and its
+    /// original `binding_digest` on the matching ORS claim row. A pending
+    /// result means the claim has not reached Requested yet, so callers must
+    /// retry the same Governor record and operation identity.
+    pub(super) async fn publish_native_worker_executable_binding_async(
         &self,
-        material: &super::agent_fabric::VerifiedProviderMaterial,
-    ) -> Result<(), KernelClientError> {
-        use eliot_contracts::{canonical_json_bytes, fences_match_exact, sha256_hex};
+        binding: &GovernorNativeWorkerExecutableBinding,
+        expected_attempt_id: &str,
+    ) -> Result<NativeWorkerExecutableBindingPublicationOutcome, KernelClientError> {
+        use eliot_contracts::fences_match_exact;
 
-        material
-            .expectation
-            .validate()
-            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        let owner_session = self.owner_session_facts().ok_or_else(|| {
+        binding.validate().map_err(KernelClientError::Contract)?;
+        require_binding_lookup_text(expected_attempt_id, "attempt_id")?;
+        let session_before = self.owner_session_facts().ok_or_else(|| {
             KernelClientError::Contract(
-                "provider binding requires an already validated Kernel owner session".to_owned(),
+                "native-worker binding publication requires a validated Kernel owner session"
+                    .to_owned(),
             )
         })?;
         let live_fence = self.kernel_fence();
-        if !fences_match_exact(&material.presented_fence, &live_fence)
-            || !material
-                .expectation
-                .live_authority_epoch
-                .is_same_authority(&live_fence.authority_epoch)
-        {
+        if !fences_match_exact(&binding.state_fence, &live_fence) {
             return Err(KernelClientError::Contract(
-                "provider binding presentation is stale under the live Kernel fence".to_owned(),
+                "Governor executable binding is stale under the current Kernel fence".to_owned(),
             ));
         }
-        if material.expectation.revoked {
-            return Err(KernelClientError::Contract(
-                "provider binding presentation is marked revoked".to_owned(),
-            ));
-        }
-        let fence_bytes = canonical_json_bytes(&material.presented_fence)
+
+        let binding_json = serde_json::to_value(binding)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        let fence_digest = sha256_hex(&fence_bytes);
-        let payload = serde_json::json!({
-            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
-            "claim_id": material.claim_id,
-            "attempt_id": material.attempt_id,
-            "operation_id": material.operation_id,
-            "proof_kind": "Binding",
-            "proof_ref": owner_session.session_binding(),
-            "canonical_payload_sha256": fence_digest,
-            "binding_digest": material.binding_digest,
-            "executable_binding_digest": material.executable_digest,
-            "route_revision": material.route_revision,
-            "capacity_revision": material.capacity_revision,
-            "governor_route_revision": material.expectation.current_route_revision,
-            "governor_capacity_revision": material.expectation.current_capacity_revision,
-            "worker_generation": material.worker_generation,
-            "fence_digest": fence_digest,
-        });
         let response = self
-            .transact_async(PROVIDER_CAPABILITY_VERIFY_OPERATION, payload)
+            .transact_async(
+                NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION,
+                serde_json::json!({
+                    "attempt_id": expected_attempt_id,
+                    "binding": binding_json,
+                }),
+            )
             .await?;
-        let mut body = response.clone();
-        let receipt_digest = body
-            .as_object_mut()
-            .and_then(|object| object.remove("receipt_digest"))
-            .and_then(|digest| digest.as_str().map(str::to_owned))
-            .ok_or_else(|| {
-                KernelClientError::Unknown(
-                    "Kernel provider capability reply has no sealed digest".to_owned(),
-                )
-            })?;
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
-        if sha256_hex(&body_bytes) != receipt_digest {
-            return Err(KernelClientError::Unknown(
-                "Kernel provider capability reply digest is invalid".to_owned(),
-            ));
-        }
-        let receipt: ProviderCapabilityReceiptWire = serde_json::from_value(response)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
-        if receipt.kind != "native_worker_provider_capability"
-            || receipt.wire_version != PROVIDER_CAPABILITY_WIRE_VERSION
-            || receipt.receipt_digest != receipt_digest
-            || receipt.claim_id != material.claim_id
-            || receipt.attempt_id != material.attempt_id
-            || receipt.operation_id != material.operation_id
-            || receipt.proof_kind != "Binding"
-            || receipt.route_revision != material.route_revision
-            || receipt.capacity_revision != material.capacity_revision
-            || receipt.governor_route_revision != material.expectation.current_route_revision
-            || receipt.governor_capacity_revision != material.expectation.current_capacity_revision
-            || receipt.worker_generation != material.worker_generation
-            || receipt.fence_digest != fence_digest
-            || receipt.verified_at_unix_ms == 0
+        if self
+            .owner_session_facts()
+            .is_none_or(|current| current.session_binding() != session_before.session_binding())
         {
             return Err(KernelClientError::Unknown(
-                "Kernel provider capability reply does not match the presented binding".to_owned(),
+                "Kernel owner session changed during executable binding publication".to_owned(),
             ));
         }
-        Ok(())
+        let reply: NativeWorkerExecutableBindingPublicationReplyWire =
+            serde_json::from_value(response)
+                .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        match reply {
+            NativeWorkerExecutableBindingPublicationReplyWire::Pending {
+                kind,
+                claim_id,
+                attempt_id,
+                operation_id,
+            } => {
+                if kind != "native_worker_executable_binding_publication"
+                    || claim_id != binding.claim_id
+                    || attempt_id != expected_attempt_id
+                    || operation_id != binding.operation_id
+                {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel pending executable binding reply does not match the requested owner tuple"
+                            .to_owned(),
+                    ));
+                }
+                Ok(NativeWorkerExecutableBindingPublicationOutcome::Pending {
+                    claim_id,
+                    attempt_id,
+                    operation_id,
+                })
+            }
+            NativeWorkerExecutableBindingPublicationReplyWire::Published { kind, receipt } => {
+                if kind != "native_worker_executable_binding_publication"
+                    || receipt.kind != "native_worker_executable_binding_receipt"
+                    || receipt.wire_version
+                        != NATIVE_WORKER_EXECUTABLE_BINDING_PUBLICATION_RECEIPT_VERSION
+                    || receipt.claim_id != binding.claim_id
+                    || receipt.registration_id != binding.registration_id
+                    || receipt.attempt_id != expected_attempt_id
+                    || receipt.operation_id != binding.operation_id
+                    || receipt.worker_generation != binding.worker_generation
+                    || !fences_match_exact(&receipt.state_fence, &binding.state_fence)
+                    || receipt.session_id != binding.session_id
+                    || receipt.executable_binding_digest != binding.binding_digest
+                    || !binding_publication_receipt_digest_is_valid(&receipt)?
+                {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel executable binding publication receipt does not match the Governor record"
+                            .to_owned(),
+                    ));
+                }
+                Ok(NativeWorkerExecutableBindingPublicationOutcome::Published(
+                    receipt,
+                ))
+            }
+        }
+    }
+
+    /// Reads the Governor's full executable binding and its same-row Kernel
+    /// claim projection through the authenticated lifecycle route. The lookup
+    /// tuple is only a selector; every returned tuple field and all shared
+    /// M1/projection fields are checked before this method returns `Found`.
+    /// The M1 binding does not supply route or capacity revisions, so this
+    /// readback cannot by itself admit a provider capability.
+    pub(super) async fn read_native_worker_executable_binding_async(
+        &self,
+        claim_id: &str,
+        attempt_id: &str,
+        operation_id: &str,
+        task_id: &str,
+    ) -> Result<NativeWorkerExecutableBindingReadbackOutcome, KernelClientError> {
+        for (value, field) in [
+            (claim_id, "claim_id"),
+            (attempt_id, "attempt_id"),
+            (operation_id, "operation_id"),
+            (task_id, "task_id"),
+        ] {
+            require_binding_lookup_text(value, field)?;
+        }
+        let session_before = self.owner_session_facts().ok_or_else(|| {
+            KernelClientError::Contract(
+                "native-worker binding readback requires a validated Kernel owner session"
+                    .to_owned(),
+            )
+        })?;
+        let response = self
+            .transact_async(
+                NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION,
+                serde_json::json!({
+                    "claim_id": claim_id,
+                    "attempt_id": attempt_id,
+                    "operation_id": operation_id,
+                    "task_id": task_id,
+                }),
+            )
+            .await?;
+        if self
+            .owner_session_facts()
+            .is_none_or(|current| current.session_binding() != session_before.session_binding())
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel owner session changed during executable binding readback".to_owned(),
+            ));
+        }
+        let reply: NativeWorkerExecutableBindingReadbackReplyWire =
+            serde_json::from_value(response)
+                .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        match reply {
+            NativeWorkerExecutableBindingReadbackReplyWire::Pending {
+                kind,
+                claim_id: observed_claim_id,
+                attempt_id: observed_attempt_id,
+                operation_id: observed_operation_id,
+                task_id: observed_task_id,
+                observed_at_unix_ms,
+            } => {
+                if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
+                    || observed_claim_id != claim_id
+                    || observed_attempt_id != attempt_id
+                    || observed_operation_id != operation_id
+                    || observed_task_id != task_id
+                    || observed_at_unix_ms == 0
+                {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel pending executable binding readback does not match the lookup tuple"
+                            .to_owned(),
+                    ));
+                }
+                Ok(NativeWorkerExecutableBindingReadbackOutcome::Pending {
+                    claim_id: observed_claim_id,
+                    attempt_id: observed_attempt_id,
+                    operation_id: observed_operation_id,
+                    task_id: observed_task_id,
+                    observed_at_unix_ms,
+                })
+            }
+            NativeWorkerExecutableBindingReadbackReplyWire::Found {
+                kind,
+                claim_id: observed_claim_id,
+                attempt_id: observed_attempt_id,
+                operation_id: observed_operation_id,
+                task_id: observed_task_id,
+                binding,
+                executable_binding_digest,
+                executable_binding_projection,
+                claim_state,
+                observed_at_unix_ms,
+            } => {
+                binding.validate().map_err(KernelClientError::Contract)?;
+                if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
+                    || observed_claim_id != claim_id
+                    || observed_attempt_id != attempt_id
+                    || observed_operation_id != operation_id
+                    || observed_task_id != task_id
+                    || binding.claim_id != observed_claim_id
+                    || binding.operation_id != observed_operation_id
+                    || binding.task_id != observed_task_id
+                    || binding.binding_digest != executable_binding_digest
+                    || observed_at_unix_ms == 0
+                    || !valid_native_worker_claim_state(&claim_state)
+                    || !native_worker_binding_projection_matches(
+                        &binding,
+                        &executable_binding_projection,
+                    )
+                {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel executable binding readback does not match its Governor record and claim tuple"
+                            .to_owned(),
+                    ));
+                }
+                Ok(NativeWorkerExecutableBindingReadbackOutcome::Found(
+                    NativeWorkerExecutableBindingReadback {
+                        claim_id: observed_claim_id,
+                        attempt_id: observed_attempt_id,
+                        operation_id: observed_operation_id,
+                        task_id: observed_task_id,
+                        claim_state,
+                        observed_at_unix_ms,
+                        executable_binding_digest,
+                        binding,
+                        executable_binding_projection,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Rejects the presentation-only legacy call. Expected executable
+    /// digest, route revision, and capacity revision must come from separate
+    /// Governor/Kernel owner observations; fields inside `material` are only
+    /// claim presentation and cannot supply their own expectations.
+    pub(super) async fn verify_provider_binding_async(
+        &self,
+        _material: &super::agent_fabric::VerifiedProviderMaterial,
+    ) -> Result<(), KernelClientError> {
+        Err(KernelClientError::Contract(
+            "provider binding verification requires authenticated Governor binding readback and independent route/capacity currentness"
+                .to_owned(),
+        ))
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot
