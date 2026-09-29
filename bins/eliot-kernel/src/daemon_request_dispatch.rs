@@ -6402,7 +6402,8 @@ impl KernelComposition {
         // with an empty cache and persisted write-ahead of the commit they
         // authorize, so a restart replays the same lineage. The response
         // stays a projection of that record, never a second ledger.
-        restore_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache);
+        let restore_outcome =
+            restore_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache);
         let (gate_outcome, pending_journal) = {
             let mut cache = self
                 .pre_stage_identity_cache
@@ -6420,28 +6421,52 @@ impl KernelComposition {
             let pending_journal = cache.take_journal_snapshot();
             (gate_outcome, pending_journal)
         };
-        if let Some(snapshot) = pending_journal {
-            // Write-ahead and best-effort: the helper below acknowledges the
-            // exact saved revision only after the rename commits, so a failed
-            // save stays pending and is offered again by the next take. The
-            // typed outcome is observed here but never fails the write whose
-            // retain it records.
-            let _persist_outcome = persist_pre_stage_corrections(
+        // Write-ahead and best-effort: the helper below acknowledges the
+        // exact saved revision only after the checked durable replacement
+        // commits, so a failed save stays pending and is offered again
+        // by the next take. The typed outcome is consumed below but never
+        // fails the write whose retain it records.
+        let persist_outcome = match pending_journal.as_ref() {
+            Some(snapshot) => Some(persist_pre_stage_corrections(
                 &self.work_root,
                 &self.pre_stage_identity_cache,
-                &snapshot,
-            );
-        }
-        let verified_correction = match gate_outcome {
+                snapshot,
+            )),
+            None => None,
+        };
+        // Consume the restore/save outcomes before admitting a dependent
+        // write (issue #1796, audit 5890973032 defect 2): a failed recovery
+        // or a failed save is reported on the commit response, and the write
+        // carries no correction lineage it cannot prove. Admission itself is
+        // unchanged: the write still proceeds, independent reads and
+        // unrelated subsystems are not stopped.
+        let journal_issue: Option<&'static str> = match restore_outcome {
+            JournalRestoreOutcome::RecoveryRequired => {
+                Some(JournalPersistOutcome::RecoveryRequired.issue_code())
+            }
+            JournalRestoreOutcome::Ready => match persist_outcome {
+                None | Some(JournalPersistOutcome::Persisted) => None,
+                Some(outcome) => Some(outcome.issue_code()),
+            },
+        };
+        let mut verified_correction = match gate_outcome {
             Err(rejection) => {
                 return Ok(Self::pre_stage_rejection_response(&rejection));
             }
             Ok(link) => link,
         };
+        if journal_issue.is_some() {
+            verified_correction = None;
+        }
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
-            .replay_committed_apply_receipt(&gateway, &operation, verified_correction.as_ref())
+            .replay_committed_apply_receipt(
+                &gateway,
+                &operation,
+                verified_correction.as_ref(),
+                journal_issue,
+            )
             .await?
         {
             return Ok(replayed);
@@ -6616,7 +6641,11 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
+                Ok(store_apply_response(
+                    &receipt,
+                    verified_correction.as_ref(),
+                    journal_issue,
+                ))
             }
             Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
@@ -6639,6 +6668,7 @@ impl KernelComposition {
         gateway: &Arc<KernelStoreGateway>,
         operation: &StoreApplyOperation,
         verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+        journal_issue: Option<&str>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
         let Ok(Some(receipt)) = gateway
             .receipt(
@@ -6661,7 +6691,11 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
-        Ok(Some(store_apply_response(&receipt, verified_correction)))
+        Ok(Some(store_apply_response(
+            &receipt,
+            verified_correction,
+            journal_issue,
+        )))
     }
 
     #[cfg(not(windows))]
@@ -9176,39 +9210,150 @@ fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::
         .join(PRE_STAGE_CORRECTION_JOURNAL_FILE)
 }
 
+/// Serializes publication of the Kernel-owned durable pre-stage journal
+/// (issue #1796, audit 5890973032 defect 1): the single publication owner
+/// for this journal, separate from the cache's short state lock.
+///
+/// Held across freshness checking, owned temporary-file creation/write,
+/// checked durable replacement, and exact acknowledgement, so a stale saver
+/// can never replace newer acknowledged content. The cache mutex is still
+/// never held across filesystem I/O: only short state locks are taken while
+/// holding this guard. There is exactly one journal, and this is its one
+/// publication guard.
+#[cfg(windows)]
+static PRE_STAGE_JOURNAL_PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Owned temporary-file sequence for journal publication, mirroring the
+/// shutdown-drain staging owner: every save stages a uniquely named file
+/// created with `create_new`, so two savers never share one temporary path.
+#[cfg(windows)]
+static PRE_STAGE_JOURNAL_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Typed outcome of one durable pre-stage journal restore attempt (issue
+/// #1796, audit 5890973032 defect 2).
+///
+/// Distinguishes genuine first-use absence from failed recovery at the caller
+/// boundary instead of leaving both as an empty cache.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalRestoreOutcome {
+    /// Genuine first-use absent journal or a validated restore: the cache
+    /// is the journal.
+    Ready,
+    /// An existing journal could not be read, decoded, or validated, or the
+    /// cache could not be reached: the cache is unrestored and the old
+    /// journal must be preserved, never overwritten as fresh state.
+    RecoveryRequired,
+}
+
+/// Records what one restore attempt proved about the durable pre-stage
+/// journal on the cache's explicit readiness state, independently of
+/// `is_empty()`, and returns the typed outcome for the caller boundary.
+#[cfg(windows)]
+fn record_journal_restore(
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
+    outcome: JournalRestoreOutcome,
+) -> JournalRestoreOutcome {
+    let readiness = match outcome {
+        JournalRestoreOutcome::Ready => eliot_kernel_service::PreStageJournalReadiness::Ready,
+        JournalRestoreOutcome::RecoveryRequired => {
+            eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired
+        }
+    };
+    match cache.lock() {
+        Ok(mut guard) => {
+            guard.set_journal_readiness(readiness);
+            outcome
+        }
+        // The cache cannot even be reached: nothing is proven, so the
+        // caller must treat the journal as unrecovered.
+        Err(_) => JournalRestoreOutcome::RecoveryRequired,
+    }
+}
+
 /// Restores retained refusals from the Kernel-owned durable pre-stage
-/// journal into a freshly started, still-empty gate cache (issue #1796 F1).
+/// journal into a freshly started gate cache (issue #1796 F1).
 ///
 /// A legitimate first-use absent journal restores nothing, which is exactly
-/// the pre-journal behavior. An existing journal that cannot be read,
-/// decoded, or validated leaves the cache unrestored instead of being
-/// claimed as an empty cache: it is re-read on the next request, and until
-/// then the gate issues no correction lineage at all rather than stamping
-/// an unproven one. A cache that already holds a live refusal is never
-/// overwritten by stale disk state. No store, receipt, or envelope format
-/// is touched.
+/// the pre-journal behavior, and records `Ready`. An existing journal that
+/// cannot be read, decoded, or validated records `RecoveryRequired` and
+/// leaves the cache unrestored instead of being claimed as an empty cache:
+/// it is re-read on the next request while it still holds no live refusal,
+/// and until then the gate issues no correction lineage at all rather than
+/// stamping an unproven one. A cache that already holds a live refusal is
+/// never overwritten by stale disk state. No store, receipt, or envelope
+/// format is touched.
 #[cfg(windows)]
 fn restore_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
-) {
+) -> JournalRestoreOutcome {
+    // A cache that already reports its posture keeps it: `Ready` needs no
+    // re-read, live refusals are never overwritten, and a `RecoveryRequired`
+    // cache that still holds no live refusal re-attempts the read below, so
+    // a repaired journal heals on the next request.
+    if let Ok(guard) = cache.lock() {
+        let settled = match guard.journal_readiness() {
+            eliot_kernel_service::PreStageJournalReadiness::Ready => true,
+            eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired => !guard.is_empty(),
+            eliot_kernel_service::PreStageJournalReadiness::Uninitialized => false,
+        };
+        if settled {
+            return match guard.journal_readiness() {
+                eliot_kernel_service::PreStageJournalReadiness::Ready => {
+                    JournalRestoreOutcome::Ready
+                }
+                _ => JournalRestoreOutcome::RecoveryRequired,
+            };
+        }
+    } else {
+        return JournalRestoreOutcome::RecoveryRequired;
+    }
     let bytes = match std::fs::read(pre_stage_correction_journal_path(work_root)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return record_journal_restore(cache, JournalRestoreOutcome::Ready);
+        }
+        Err(_) => {
+            return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
+        }
         Ok(bytes) => bytes,
     };
-    let Ok(snapshot) =
-        serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
-    else {
-        return;
-    };
-    let Ok(mut guard) = cache.lock() else {
-        return;
-    };
-    if guard.is_empty() {
-        // Validated merge: an inconsistent snapshot is refused without
-        // partial mutation, so the cache stays empty for the next attempt.
-        let _ = guard.restore(snapshot);
+    let snapshot =
+        match serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
+            }
+        };
+    match cache.lock() {
+        Ok(mut guard) => {
+            if guard.is_empty() {
+                // Validated merge: an inconsistent snapshot is refused
+                // without partial mutation, and a successful merge carries
+                // the coherent revision baseline, so the cache stays empty
+                // for the next attempt on failure and continues the sequence
+                // on success.
+                if guard.restore(snapshot).is_err() {
+                    guard.set_journal_readiness(
+                        eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired,
+                    );
+                    return JournalRestoreOutcome::RecoveryRequired;
+                }
+                guard.set_journal_readiness(eliot_kernel_service::PreStageJournalReadiness::Ready);
+                JournalRestoreOutcome::Ready
+            } else {
+                // A retain landed while restoring: keep the live refusals
+                // and keep whatever posture the retain path already proved.
+                match guard.journal_readiness() {
+                    eliot_kernel_service::PreStageJournalReadiness::Ready => {
+                        JournalRestoreOutcome::Ready
+                    }
+                    _ => JournalRestoreOutcome::RecoveryRequired,
+                }
+            }
+        }
+        Err(_) => JournalRestoreOutcome::RecoveryRequired,
     }
 }
 
@@ -9218,7 +9363,8 @@ fn restore_pre_stage_corrections(
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JournalPersistOutcome {
-    /// The rename committed and the exact saved revision was acknowledged.
+    /// The rename committed and the exact saved revision was acknowledged,
+    /// or another saver already made that exact revision durable.
     Persisted,
     /// The snapshot could not be encoded; nothing reached the disk.
     SerializeFailed,
@@ -9231,6 +9377,27 @@ enum JournalPersistOutcome {
     /// A newer retain landed while this save was in flight; the older save
     /// retired nothing and wrote nothing over the newer state.
     Superseded,
+    /// The cache is unrestored (`RecoveryRequired`): the existing journal
+    /// is preserved and nothing was written over it as fresh state.
+    RecoveryRequired,
+}
+
+#[cfg(windows)]
+impl JournalPersistOutcome {
+    /// Stable report code for the commit response: the local
+    /// recovery/persistence failure is reported without claiming durable
+    /// lineage, and carries no path or digest.
+    fn issue_code(self) -> &'static str {
+        match self {
+            JournalPersistOutcome::Persisted => "pre_stage_journal_persisted",
+            JournalPersistOutcome::SerializeFailed => "pre_stage_journal_serialize_failed",
+            JournalPersistOutcome::JournalDirUnreachable => "pre_stage_journal_dir_unreachable",
+            JournalPersistOutcome::JournalWriteFailed => "pre_stage_journal_write_failed",
+            JournalPersistOutcome::JournalCommitFailed => "pre_stage_journal_commit_failed",
+            JournalPersistOutcome::Superseded => "pre_stage_journal_superseded",
+            JournalPersistOutcome::RecoveryRequired => "pre_stage_journal_recovery_required",
+        }
+    }
 }
 
 /// Persists retained refusals to the Kernel-owned durable pre-stage journal
@@ -9240,39 +9407,96 @@ enum JournalPersistOutcome {
 /// between commit and response still replays the lineage. Best-effort: a
 /// failed write keeps the in-memory behavior and never fails the write it
 /// records. The pending journal stays pending until its exact revision is
-/// acknowledged after the rename commits, so a failed save is offered again
-/// instead of being forgotten; the revision comparison also keeps an older
-/// in-flight save from overwriting newer retained refusals. The
-/// tmp-plus-rename keeps a crash from leaving a half-written journal
-/// behind.
+/// acknowledged after the checked durable replacement commits, so a failed
+/// save is offered again instead of being forgotten.
+///
+/// The whole publication serializes under the one journal publication guard:
+/// staleness is checked while holding publication ownership, an obsolete
+/// save is rejected before replacing the destination, every save stages an
+/// owned temporary file, and the exact acknowledgement happens under the
+/// same guard. A delayed older saver therefore cannot replace newer
+/// acknowledged content, and two savers never share one temporary path. The
+/// cache mutex itself is never held across filesystem I/O: only short state
+/// locks are taken while holding the publication guard. The checked durable
+/// replacement mirrors the shutdown-drain owner: the staged file is synced
+/// before the rename, and the replaced destination is synced after it, so a
+/// rename alone is never the durability acknowledgement. The tmp-plus-rename
+/// keeps a crash from leaving a half-written journal behind.
 #[cfg(windows)]
 fn persist_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
     snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
 ) -> JournalPersistOutcome {
-    let pending = match cache.lock() {
-        Ok(guard) => guard.pending_journal_revision(),
+    let Ok(_publication) = PRE_STAGE_JOURNAL_PUBLICATION.lock() else {
+        return JournalPersistOutcome::Superseded;
+    };
+    let (pending, acked, readiness) = match cache.lock() {
+        Ok(guard) => (
+            guard.pending_journal_revision(),
+            guard.acked_journal_revision(),
+            guard.journal_readiness(),
+        ),
         Err(_) => return JournalPersistOutcome::Superseded,
     };
+    if readiness == eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired {
+        // The cache is unrestored: preserve the existing journal and never
+        // overwrite it as fresh state.
+        return JournalPersistOutcome::RecoveryRequired;
+    }
     if pending != Some(snapshot.revision()) {
+        if acked >= snapshot.revision() {
+            // Another saver already made this exact revision durable while
+            // holding publication ownership; there is nothing to replace.
+            return JournalPersistOutcome::Persisted;
+        }
         return JournalPersistOutcome::Superseded;
     }
     let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
         return JournalPersistOutcome::SerializeFailed;
     };
     let path = pre_stage_correction_journal_path(work_root);
-    if path
-        .parent()
-        .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
-    {
+    let Some(dir) = path.parent() else {
+        return JournalPersistOutcome::JournalDirUnreachable;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
         return JournalPersistOutcome::JournalDirUnreachable;
     }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_err() {
+    let (tmp, mut tmp_file) = loop {
+        let sequence =
+            PRE_STAGE_JOURNAL_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            "{}-{}.{}.{sequence}.tmp",
+            PRE_STAGE_CORRECTION_JOURNAL_FILE,
+            std::process::id(),
+            snapshot.revision()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return JournalPersistOutcome::JournalWriteFailed,
+        }
+    };
+    if std::io::Write::write_all(&mut tmp_file, &bytes)
+        .and_then(|()| tmp_file.sync_all())
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
         return JournalPersistOutcome::JournalWriteFailed;
     }
+    drop(tmp_file);
     if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return JournalPersistOutcome::JournalCommitFailed;
+    }
+    if std::fs::File::open(&path)
+        .and_then(|file| file.sync_all())
+        .is_err()
+    {
         return JournalPersistOutcome::JournalCommitFailed;
     }
     let acknowledged = match cache.lock() {
@@ -9288,12 +9512,22 @@ fn persist_pre_stage_corrections(
 fn store_apply_response(
     receipt: &WriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+    journal_issue: Option<&str>,
 ) -> serde_json::Value {
     let mut response = serde_json::json!({
         "status": "known",
         "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
     });
+    // A local recovery/persistence failure is reported here without claiming
+    // durable lineage: the caller already stripped the correction link, so a
+    // commit that cannot prove its lineage carries the stable issue code
+    // instead. Carries no path or digest.
+    if let Some(issue) = journal_issue {
+        response["recovery"] = serde_json::json!({
+            "pre_stage_journal_issue": issue,
+        });
+    }
     if let Some(link) = verified_correction {
         response["correction_lineage"] = serde_json::json!({
             "corrected_operation_id": link.corrected_operation_id,
