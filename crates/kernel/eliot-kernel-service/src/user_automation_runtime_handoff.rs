@@ -1379,10 +1379,33 @@ impl UserAutomationOperatorTransition {
                                 "a revision mutation carries a foreign execution phase".to_owned()
                             );
                         }
+                        // The committed `cancelled_wake_ids` is the canonical
+                        // Store's OWN claim about what it cancelled, and that
+                        // writer issues no wake effect, so it is empty for every
+                        // committed mutation (I11.12: "Configuration state and
+                        // execution state are separate"). The wake phase is the
+                        // WAKE OWNER's answer, and it is the only place the
+                        // owner's exact cancelled set exists. Requiring the two
+                        // to be equal therefore compares the owner answer
+                        // against a field that is structurally always empty,
+                        // which would refuse every proven non-empty
+                        // cancellation and turn it into a route-level unknown.
+                        // What this join must still prove is that the wake
+                        // phase does not CONTRADICT the commit: every wake
+                        // identity the Store itself claims to have cancelled is
+                        // covered by the owner-proven set. The owner set is
+                        // separately bound to independent owner evidence —
+                        // `UserAutomationOrchestrationRecord::validate_answer`
+                        // compares it by exact ordered equality with the target
+                        // batch of the retained Host enumeration receipt — so
+                        // this check adds the commit's own claims to that
+                        // binding instead of replacing it.
                         match &self.wake {
                             UserAutomationWakePhase::Cancelled {
                                 cancelled_wake_ids: observed,
-                            } if observed == cancelled_wake_ids => {}
+                            } if cancelled_wake_ids
+                                .iter()
+                                .all(|claimed| observed.contains(claimed)) => {}
                             UserAutomationWakePhase::NotApplicable { .. }
                                 if cancelled_wake_ids.is_empty() => {}
                             UserAutomationWakePhase::UnknownOutcome { .. }
