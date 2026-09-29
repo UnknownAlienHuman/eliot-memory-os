@@ -1152,7 +1152,9 @@ pub struct ImprovementPipelineInputs<'a> {
 /// substituted, no legacy or empty value is filled in, and the record is not
 /// compared at all.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("checked identity mismatch on {component}: record carries {found}, this build checks {expected}")]
+#[error(
+    "checked identity mismatch on {component}: record carries {found}, this build checks {expected}"
+)]
 pub struct UncheckedRecordIdentity {
     /// Which identity component of the record disagreed.
     pub component: &'static str,
@@ -1448,15 +1450,13 @@ pub(crate) fn assess_improvement_progress(
     retained: Option<&RetainedImprovementProposal>,
     current: &ImprovementCurrentProposal,
 ) -> Result<ImprovementReplayAssessment, UncheckedRecordIdentity> {
-    match retained {
-        Some(retained) => compare_improvement_commitments(retained, current),
-        None => {
-            check_checked_record_identity(current)?;
-            Ok(ImprovementReplayAssessment::NoRetainedPrior {
-                commitment: current.commitment.clone(),
-            })
-        }
+    if let Some(retained) = retained {
+        return compare_improvement_commitments(retained, current);
     }
+    check_checked_record_identity(current)?;
+    Ok(ImprovementReplayAssessment::NoRetainedPrior {
+        commitment: current.commitment.clone(),
+    })
 }
 
 /// Compares a retained prior record with the current checked record.
@@ -1499,15 +1499,17 @@ pub fn compare_improvement_commitments(
     current: &ImprovementCurrentProposal,
 ) -> Result<ImprovementReplayAssessment, UncheckedRecordIdentity> {
     check_checked_record_identity(current)?;
-    Ok(if let Some(assessment) = same_operation_replay(retained, current) {
-        assessment
-    } else if let Some(assessment) = unestablished_projection(retained, current) {
-        assessment
-    } else if let Some(assessment) = material_repeat(retained, current) {
-        assessment
-    } else {
-        changed_discriminator(retained, current)
-    })
+    Ok(
+        if let Some(assessment) = same_operation_replay(retained, current) {
+            assessment
+        } else if let Some(assessment) = unestablished_projection(retained, current) {
+            assessment
+        } else if let Some(assessment) = material_repeat(retained, current) {
+            assessment
+        } else {
+            changed_discriminator(retained, current)
+        },
+    )
 }
 
 /// Decides the outcomes that belong to the retained record's own operation.
@@ -2767,9 +2769,10 @@ fn commitment_of(normalized: &ImprovementProposal) -> Result<ProposalCommitment,
         algorithm: IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM.to_string(),
         proposal: normalized.clone(),
     };
-    let bytes = canonical_json_bytes(&envelope).map_err(|error| PipelineError::CommitmentFailed {
-        detail: error.to_string(),
-    })?;
+    let bytes =
+        canonical_json_bytes(&envelope).map_err(|error| PipelineError::CommitmentFailed {
+            detail: error.to_string(),
+        })?;
     if bytes.len() > IMPROVEMENT_MAX_COMMITMENT_BYTES {
         return Err(PipelineError::InputProfileCeiling(
             "proposal-commitment-bytes",
