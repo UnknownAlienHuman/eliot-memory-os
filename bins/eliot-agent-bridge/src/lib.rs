@@ -5214,8 +5214,14 @@ impl BridgeRunner {
             observed_at,
             vec![
                 format!("bridge-contour-attach:{}", self.bridge_route.route_id),
-                format!("kernel-activation-session:{}", binding.session_id().as_str()),
-                format!("kernel-activation-connection:{}", binding.connection_id().as_str()),
+                format!(
+                    "kernel-activation-session:{}",
+                    binding.session_id().as_str()
+                ),
+                format!(
+                    "kernel-activation-connection:{}",
+                    binding.connection_id().as_str()
+                ),
             ],
         );
         self.route_registry

@@ -134,15 +134,13 @@ pub fn classify_bridge_route_reconnect(
 ) -> ContinuityKind {
     let live_fingerprint = RouteBehaviorFingerprint::of(live_route, live_installation);
     let bound_intact = prior == sealed.fingerprint();
-    let material_moved =
-        classify_bridge_route_resume(sealed.fingerprint(), &live_fingerprint)
-            == ContinuityKind::Rehydrated;
+    let material_moved = classify_bridge_route_resume(sealed.fingerprint(), &live_fingerprint)
+        == ContinuityKind::Rehydrated;
     let live_binding = live.binding();
     let authority_moved = sealed.launch_session() != live_binding.session_id().as_str()
         || sealed.launch_generation() != live_binding.activation_generation();
     let retained_diverged = registry.receipt(sealed.route_id()).is_some_and(|receipt| {
-        receipt.requested_fingerprint != *prior
-            || receipt.requested_fingerprint != live_fingerprint
+        receipt.requested_fingerprint != *prior || receipt.requested_fingerprint != live_fingerprint
     });
     if !bound_intact || material_moved || authority_moved || retained_diverged {
         ContinuityKind::Rehydrated
