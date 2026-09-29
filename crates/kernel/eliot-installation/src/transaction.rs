@@ -2,11 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use eliot_platform::GuardRevertOutcome;
-use eliot_platform_windows::{
-    TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
-    terminal_containment_operation_digest, validate_terminal_containment_readback_for,
-};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +14,8 @@ use super::{
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
-    RetainedGuardRevert, RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt,
-    StoreCredentialLifecycle, StoreCredentialProgress, candidate_manifest_digest, handle, handles,
+    RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
+    StoreCredentialProgress, candidate_manifest_digest, handle, handles,
     ownership_secret_absence_evidence, phase_b_scm_digest, sha256_handle, sha256_hex,
     validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
@@ -473,15 +468,6 @@ pub struct InstallationTransaction {
     pub last_known_good: Option<PlatformHandle>,
     /// No-return boundary evidence, when activation crossed it.
     pub no_return_boundary: Option<PlatformHandle>,
-    /// The exact composite a guard owner returned for a guarded OS-state
-    /// operation performed by this transaction, retained verbatim across
-    /// restart until an independent owner reconciles the exact bounded
-    /// terminal record.
-    ///
-    /// `None` means this transaction retained no guard composite. It is never
-    /// read as a completed cleanup, and it never authorizes retry on its own.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) guard_revert: Option<RetainedGuardRevert>,
     /// Observed postconditions.
     pub observed_postconditions: Vec<PlatformHandle>,
     /// Exact registry terminal that authorized `ActiveVerified`, retained as
@@ -726,7 +712,6 @@ impl InstallationTransaction {
             rollback_plan,
             last_known_good: None,
             no_return_boundary: None,
-            guard_revert: None,
             observed_postconditions: Vec::new(),
             active_verified_receipt: None,
             activation_projection_intent: None,
@@ -1455,22 +1440,6 @@ impl InstallationTransaction {
                 "terminal recovery state requires disposition evidence".to_owned(),
             ));
         }
-        if let Some(retained) = &self.guard_revert {
-            retained.validate()?;
-            if retained.blocks_adoption()
-                && matches!(
-                    self.stage,
-                    InstallationStage::ActiveVerified
-                        | InstallationStage::Cleaning
-                        | InstallationStage::Completed
-                )
-            {
-                return Err(InstallationError::IncompleteObservation(
-                    "an adopted transaction cannot retain an unreconciled guard composite"
-                        .to_owned(),
-                ));
-            }
-        }
         Ok(())
     }
 
@@ -2117,7 +2086,6 @@ impl InstallationTransaction {
             && self.active_verified_receipt.is_none()
             && self.last_known_good.is_none()
             && self.no_return_boundary.is_none()
-            && self.guard_revert.is_none()
             && self
                 .effect_progress
                 .iter()
@@ -2183,12 +2151,6 @@ impl InstallationTransaction {
                 from: self.stage,
                 to: next,
             });
-        }
-        if self.guard_revert_blocks_adoption() {
-            return Err(InstallationError::IncompleteObservation(
-                "a retained unreconciled guard composite blocks adopting the affected object"
-                    .to_owned(),
-            ));
         }
         handles(&evidence, "stage_evidence", true)?;
         self.completed_stage_refs.extend(evidence);
@@ -2388,12 +2350,6 @@ impl InstallationTransaction {
                 to: InstallationStage::ActiveVerified,
             });
         }
-        if self.guard_revert_blocks_adoption() {
-            return Err(InstallationError::IncompleteObservation(
-                "a retained unreconciled guard composite blocks adopting the affected object"
-                    .to_owned(),
-            ));
-        }
         self.validate()?;
         handles(&evidence, "stage_evidence", true)?;
         receipt.validate_against_transaction(self)?;
@@ -2466,162 +2422,6 @@ impl InstallationTransaction {
         self.no_return_boundary = Some(reference);
         self.validate()
     }
-
-    /// The exact guard composite this transaction retained, if any.
-    ///
-    /// A reader that finds `None` learns only that no composite was retained.
-    /// Absence is never a completed cleanup and never authorizes retry.
-    #[must_use]
-    pub fn guard_revert(&self) -> Option<&RetainedGuardRevert> {
-        self.guard_revert.as_ref()
-    }
-
-    /// Whether the object protected by the retained guard composite is still
-    /// blocked pending exact owner reconciliation.
-    ///
-    /// A restarted reader must consult this before adopting or overwriting the
-    /// affected object.
-    #[must_use]
-    pub fn guard_revert_blocks_adoption(&self) -> bool {
-        self.guard_revert
-            .as_ref()
-            .is_some_and(RetainedGuardRevert::blocks_adoption)
-    }
-
-    /// Retains the exact composite a guard owner returned, before any
-    /// dependent retry, rollback, or activation runs.
-    ///
-    /// The composite is stored verbatim: the primary failure slot and every
-    /// explicit and emergency restoration attempt are preserved together, and
-    /// a second, different composite for the same transaction is refused as an
-    /// identity conflict rather than replacing the first.
-    ///
-    /// When the composite's own required next action is not a normal return,
-    /// the transaction also records the exact pending references and moves to
-    /// [`InstallationStage::RollbackRequired`], so the retained uncertainty
-    /// cannot be lost by a later dependent rollback. A persistence failure
-    /// leaves the composite in place; it never discards the original effects.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InstallationError::IdentityConflict`] when a composite is
-    /// already retained, and any error from the composite's own `validate()`
-    /// or the transaction's own invariants.
-    pub(crate) fn record_guard_revert(
-        &mut self,
-        outcome: GuardRevertOutcome,
-    ) -> Result<InstallationStepOutcome, InstallationError> {
-        self.validate()?;
-        if self.guard_revert.is_some() {
-            return Err(InstallationError::IdentityConflict);
-        }
-        let retained = RetainedGuardRevert {
-            outcome,
-            reconciliation: None,
-        };
-        retained.validate()?;
-        let evidence_refs = vec![retained.evidence_ref().clone()];
-        let blocks = retained.blocks_adoption();
-        self.guard_revert = Some(retained);
-        if blocks {
-            // `mark_unknown` owns the single revision step and the exact
-            // pending-reference set for this transaction's rollback
-            // disposition, so it is the only writer of both.
-            match self.mark_unknown(evidence_refs.clone()) {
-                Ok(()) => {}
-                // The stage machine refuses `RollbackRequired` from the
-                // activation boundary. The composite stays retained and the
-                // adoption block still holds; no original effect is lost, and
-                // the retained reference still records the uncertainty.
-                Err(InstallationError::IllegalTransition { .. }) => {
-                    self.pending_external_changes.clone_from(&evidence_refs);
-                    self.revision = self.revision.checked_add(1).ok_or_else(|| {
-                        InstallationError::InvalidField {
-                            field: "revision".to_owned(),
-                            reason: "overflow".to_owned(),
-                        }
-                    })?;
-                    self.validate()?;
-                }
-                Err(error) => return Err(error),
-            }
-            return Ok(InstallationStepOutcome::RollbackRequired {
-                pending_refs: evidence_refs,
-            });
-        }
-        self.revision =
-            self.revision
-                .checked_add(1)
-                .ok_or_else(|| InstallationError::InvalidField {
-                    field: "revision".to_owned(),
-                    reason: "overflow".to_owned(),
-                })?;
-        self.validate()?;
-        Ok(InstallationStepOutcome::Applied {
-            stage: self.stage,
-            evidence_refs,
-        })
-    }
-
-    /// Reconciles the exact retained bounded terminal record against the exact
-    /// operation this transaction's composite names, and releases the block
-    /// only when that record is complete and belongs to that operation.
-    ///
-    /// The retained bytes are validated by the terminal owner's own readback
-    /// validator; this method does not re-encode, re-digest, or reinterpret
-    /// them. The expected operation identity is derived from the retained
-    /// composite's own parent operation through the same rule the writer used,
-    /// so a record from another operation cannot satisfy this call.
-    ///
-    /// An unsupported, stale, foreign, short, torn, missing, or unbound record
-    /// leaves the block in place and reports the owner's own unresolved
-    /// classification. Nothing here synthesizes a receipt, and nothing here
-    /// authorizes a new attempt.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InstallationError::IncompleteObservation`] when this
-    /// transaction retains no composite, and any error from the transaction's
-    /// own invariants.
-    pub(crate) fn reconcile_guard_revert_evidence(
-        &mut self,
-        retained: &[u8],
-    ) -> Result<TerminalContainmentReadback, InstallationError> {
-        self.validate()?;
-        let Some(retained_guard) = &self.guard_revert else {
-            return Err(InstallationError::IncompleteObservation(
-                "transaction retains no guard composite to reconcile".to_owned(),
-            ));
-        };
-        let expected: [u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES] =
-            terminal_containment_operation_digest(&retained_guard.outcome.parent_operation)
-                .map_err(|error| InstallationError::InvalidField {
-                    field: "guard_revert.outcome.parent_operation".to_owned(),
-                    reason: error.to_string(),
-                })?;
-        let readback = validate_terminal_containment_readback_for(retained, expected);
-        if let TerminalContainmentReadback::Complete(_) = readback {
-            let evidence_digest = PlatformHandle::new(sha256_hex(retained)).map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "guard_revert.reconciliation".to_owned(),
-                    reason: error.to_string(),
-                }
-            })?;
-            let Some(retained_guard) = self.guard_revert.as_mut() else {
-                return Err(InstallationError::IdentityConflict);
-            };
-            retained_guard.reconciliation = Some(evidence_digest);
-            self.revision =
-                self.revision
-                    .checked_add(1)
-                    .ok_or_else(|| InstallationError::InvalidField {
-                        field: "revision".to_owned(),
-                        reason: "overflow".to_owned(),
-                    })?;
-            self.validate()?;
-        }
-        Ok(readback)
-    }
 }
 
 /// Private durable decoder shape for [`InstallationTransaction`].  The
@@ -2655,8 +2455,6 @@ struct InstallationTransactionWire {
     rollback_plan: PlatformHandle,
     last_known_good: Option<PlatformHandle>,
     no_return_boundary: Option<PlatformHandle>,
-    #[serde(default)]
-    guard_revert: Option<RetainedGuardRevert>,
     observed_postconditions: Vec<PlatformHandle>,
     active_verified_receipt: Option<ActiveVerifiedReceiptBinding>,
     activation_projection_intent: Option<InstallationActivationProjectionIntent>,
@@ -2688,7 +2486,6 @@ impl InstallationTransactionWire {
             rollback_plan: self.rollback_plan,
             last_known_good: self.last_known_good,
             no_return_boundary: self.no_return_boundary,
-            guard_revert: self.guard_revert,
             observed_postconditions: self.observed_postconditions,
             active_verified_receipt: self.active_verified_receipt,
             activation_projection_intent: self.activation_projection_intent,

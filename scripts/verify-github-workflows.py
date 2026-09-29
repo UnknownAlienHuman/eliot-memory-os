@@ -65,11 +65,9 @@ FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # A YAML `uses` KEY, wherever it appears in a workflow: a step-level `- uses:`,
 # a job-level reusable `uses:` (no dash), the same key in a flow mapping
 # (`- { uses: ... }`), and a block mapping whose value sits on later lines
-# (`- uses:` followed by an indented value). The key accepts every YAML spelling
-# GitHub accepts (optionally single- or double-quoted, any spacing before the
-# `:`), mirroring the `on:`-key handling in _on_block_child_key, so the pin,
-# owner and one-pin rules see all of them.
-USES_KEY_RE = re.compile(r"""(?:^|[{,\s\[])(?:-)?\s*(?:"uses"|'uses'|uses)\s*:(?!:)""")
+# (`- uses:` followed by an indented value). Every spelling GitHub accepts is
+# captured here, so the pin, owner and one-pin rules see all of them.
+USES_KEY_RE = re.compile(r"(?:^|[{,\s\[])(?:-)?\s*uses\s*:(?!:)")
 # A `uses` VALUE: a single-quoted or double-quoted scalar, or a plain scalar,
 # terminated at a comment (`# ...` release annotation) or at a flow mapping
 # separator. The value is never taken across a comment, so a release

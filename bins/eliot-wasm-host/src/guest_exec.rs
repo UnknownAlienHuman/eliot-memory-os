@@ -19,8 +19,7 @@
 //! reference transform.
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::Write;
 
 use eliot_wasm_runtime::{
     ArtifactAccessLimits, CancellationPolicy, EngineTermination, EpochPolicy, InvocationLimits,
@@ -211,14 +210,13 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
     if preflight.digest.as_str() != args.artifact_digest.as_str() {
         return fail("GUEST_EXEC_ARTIFACT_DIGEST_MISMATCH", EXIT_DENIED);
     }
-    let input = match read_bounded_input(&args.input) {
+    let input = match std::fs::read(&args.input) {
         Ok(bytes) => bytes,
-        Err(GuestExecRejection::BadInput(kind)) => {
-            return fail(&format!("GUEST_EXEC_BAD_INPUT:{kind}"), EXIT_DENIED);
-        }
-        Err(other) => {
-            let (code, status) = other.code();
-            return fail(code, status);
+        Err(error) => {
+            return fail(
+                &format!("GUEST_EXEC_BAD_INPUT:{kind}", kind = error.kind()),
+                EXIT_DENIED,
+            );
         }
     };
     let request = match validate_request(args, artifact, input) {
@@ -294,23 +292,6 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
         return fail("GUEST_EXEC_OUTPUT_FAILED", EXIT_NOT_COMPLETED);
     }
     EXIT_COMPLETED
-}
-
-/// Reads one explicit local input file into a bounded buffer: the handle is
-/// the only source of input bytes and `take` bounds allocation even if the
-/// file grows after it is opened. An over-ceiling file is denied before the
-/// bytes are validated or executed, never truncated.
-fn read_bounded_input(path: &Path) -> Result<Vec<u8>, GuestExecRejection> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_GUEST_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?;
-    if bytes.len() as u64 > MAX_GUEST_INPUT_BYTES {
-        return Err(GuestExecRejection::BadInput("over-ceiling".to_owned()));
-    }
-    Ok(bytes)
 }
 
 /// Emits one stderr line; stdout stays empty by construction (this function

@@ -154,16 +154,35 @@ UNKNOWN_PATHS = {
         "Memory-curation donor crate with no module owner record. UNKNOWN: requires owner "
         "experiment/disposition; no retirement inferred.",
     ),
+    # #1146 W2. This row was KEEP_PATHS "KEEP as proof fixtures" while the tree
+    # carries no proof fixture that consumes the plane. The KEEP rationale is
+    # therefore unbacked, and it is recorded as the fail-closed UNKNOWN verb
+    # rather than deleted: deleting the boundary is the superseding
+    # keep/migrate/remove decision, which this row does not own. The
+    # contradiction is stated verbatim so the decision cannot be lost.
+    "crates/foundation/eliot-test-support": (
+        "C0-10 test-support cell (lifecycle_owner C0-10); superseding decision owed by "
+        "the #1860 migration owner and the #13 capability-registry owner",
+        "EXACT CONTRADICTION (#1146 W2): the prior KEEP rationale was 'Test-support "
+        "fixture plane. KEEP as proof fixtures; never production authority.', but a KEEP "
+        "as proof fixtures requires at least one real consumer and the tree has none -- "
+        "zero in-tree Cargo edges of any kind (normal, dev, build, target) reach this "
+        "package, and zero `use eliot_test_support` call sites exist. #1860's KEEP row "
+        "and #13's C0-10 test-support cell record therefore describe a shared fixture "
+        "plane with no shared fixture consumer. Disposition is UNRESOLVED (UNKNOWN, "
+        "fail-closed): the superseding keep/migrate/remove decision against the #1860 "
+        "KEEP row and the #13 cell is required before the boundary is removed. No "
+        "retirement is inferred and no completion is claimed. The production boundary "
+        "is independently enforced: scripts/audit-architecture-boundaries.py rejects any "
+        "normal/build/transitive edge to this package under any declared name, target "
+        "table, or feature activation.",
+    ),
 }
 
 KEEP_PATHS = {
     "crates/agent/eliot-swarm": (
         "A-07 swarm planning cell (lifecycle_owner A-07)",
         "Bounded swarm planning/coordination/review cell. KEEP; production wiring via the future agent path.",
-    ),
-    "crates/foundation/eliot-test-support": (
-        "C0-10 test-support cell (lifecycle_owner C0-10)",
-        "Test-support fixture plane. KEEP as proof fixtures; never production authority.",
     ),
     "crates/meta/eliot-improvement": (
         "meta plane owner #17 (doctor/repair family)",
@@ -530,6 +549,45 @@ def active_reference_scan(corpus: dict[str, str], manifest_dir: str, package_nam
     }
 
 
+def assert_standalone_coverage(
+    standalone: dict[str, str],
+    declared: dict[str, dict[str, str]],
+    members: list[str],
+    exclude: list[str],
+) -> None:
+    """Fail unless the declared #1811 set and the discovered set are equal.
+
+    Completeness is checked in BOTH directions, and the expected side is the
+    declared disposition set, never a value derived from the discovery pass.
+    Discovery deliberately drops any manifest that is also a root workspace
+    member or excluded, so a package that is both a member and declared
+    standalone disappears from `standalone` entirely. A one-way "every
+    discovered package has a row" check cannot see that: the package vanishes
+    from its own output and the stale row survives. Comparing declared rows
+    against the discovered set detects exactly that, and a package that is
+    also a member is named as such rather than silently accepted.
+    """
+    declared_only = sorted(set(declared) - set(standalone))
+    shadowed = [rel for rel in declared_only if rel in set(members) or rel in exclude]
+    if shadowed:
+        raise InventoryError(
+            "SHADOWED_STANDALONE_DECLARATION",
+            "declared standalone package is also a root workspace member/excluded, so "
+            f"discovery drops it and it would vanish from its own output: {shadowed}",
+        )
+    if declared_only:
+        raise InventoryError(
+            "STALE_STANDALONE_DECLARATION",
+            f"declared #1811 standalone rows with no standalone package in the tree: {declared_only}",
+        )
+    undispositioned = sorted(set(standalone) - set(declared))
+    if undispositioned:
+        raise InventoryError(
+            "UNDISPOSITIONED_STANDALONE",
+            f"standalone package without #1811 row: {undispositioned}",
+        )
+
+
 def build_inventory(root: Path) -> dict:
     root = _root(root)
     head = _run(root, ("git", "rev-parse", "HEAD")).decode("ascii").strip()
@@ -573,11 +631,11 @@ def build_inventory(root: Path) -> dict:
             "crate_meta": meta,
         })
 
+    assert_standalone_coverage(standalone, standalone_disp, members, exclude)
+
     excluded_rows: list[dict] = []
     for rel in sorted(standalone):
-        row = standalone_disp.get(rel)
-        if row is None:
-            raise InventoryError("UNDISPOSITIONED_STANDALONE", f"standalone package without #1811 row: {rel}")
+        row = standalone_disp[rel]
         if row["disposition"] not in ALLOWED_DISPOSITIONS:
             raise InventoryError("BAD_DISPOSITION", f"{rel}: {row['disposition']!r}")
         if not row["owner"]:
@@ -732,8 +790,75 @@ def run_self_tests() -> int:
                         ("integrations/agent-skills/a/SKILL.md", "skill"), ("integrations/opencode/x.js", "integration"),
                         ("docs/release/WINDOWS_X64_RELEASE.md", "docs"), ("scripts/build-eliot-windows-x64-release.ps1", "script")]:
         assert _surface_class(probe) == want, f"class {probe}"
+    _self_test_standalone_coverage()
+    _self_test_test_support_disposition()
     print("MIGRATION_INVENTORY_1860_SELF_TEST: PASS")
     return 0
+
+
+def _self_test_standalone_coverage() -> None:
+    """The coverage check must fail on the inputs it exists to detect.
+
+    The load-bearing case is the shadowed declaration: a package that is BOTH a
+    root workspace member and a declared standalone row. Discovery drops it, so
+    a one-way check accepts it silently and the package vanishes from its own
+    output. The expected side here is the declared set, passed in directly, so
+    the control cannot be satisfied by re-deriving anything from `standalone`.
+    """
+    def row() -> dict[str, dict[str, str]]:
+        return {"a": {"disposition": "KEEP", "owner": "o"}, "b": {"disposition": "KEEP", "owner": "o"}}
+
+    # Positive: exact agreement in both directions.
+    assert_standalone_coverage({"a": "pa", "b": "pb"}, row(), [], [])
+
+    # Negative: declared row whose package is also a root workspace member.
+    # `standalone` is empty, exactly as discovery leaves it.
+    try:
+        assert_standalone_coverage({}, row(), ["a", "b"], [])
+    except InventoryError as exc:
+        assert exc.code == "SHADOWED_STANDALONE_DECLARATION", exc.code
+        assert "a" in str(exc) and "b" in str(exc), str(exc)
+    else:
+        raise AssertionError("shadowed standalone declaration was accepted")
+
+    # Negative: the same row with no member overlap is a stale declaration.
+    try:
+        assert_standalone_coverage({}, row(), [], [])
+    except InventoryError as exc:
+        assert exc.code == "STALE_STANDALONE_DECLARATION", exc.code
+    else:
+        raise AssertionError("stale standalone declaration was accepted")
+
+    # Negative: discovered package with no declared row. Only the
+    # discovered-extra direction is triggered, so the code under test is the
+    # one being claimed.
+    try:
+        assert_standalone_coverage({"a": "pa", "b": "pb", "c": "pc"}, row(), [], [])
+    except InventoryError as exc:
+        assert exc.code == "UNDISPOSITIONED_STANDALONE", exc.code
+        assert "c" in str(exc), str(exc)
+    else:
+        raise AssertionError("undispositioned standalone package was accepted")
+
+    # The live tree's declared set must equal what discovery finds, and the
+    # #1811 file must not name a member.
+    repo = _root(Path(__file__).resolve().parents[1])
+    live = _load_standalone_dispositions(repo)
+    live_members, live_exclude = _workspace_sets(repo)
+    assert_standalone_coverage(_discover_standalone(repo), live, live_members, live_exclude)
+
+
+def _self_test_test_support_disposition() -> None:
+    """#1146 W2: the unbacked KEEP must read as unresolved, not as a kept plane."""
+    d, o, r = assign_disposition("crates/foundation/eliot-test-support", {})
+    assert d == "UNKNOWN", d
+    assert "EXACT CONTRADICTION" in r, r
+    assert "#1860" in r and "#13" in r, r
+    assert "C0-10" in o, o
+    # The failure mode this replaces: a KEEP claimed on a plane with no
+    # consumer. Assert the KEEP verb is no longer reachable for this path.
+    assert "crates/foundation/eliot-test-support" not in KEEP_PATHS
+    assert "crates/foundation/eliot-test-support" in UNKNOWN_PATHS
 
 
 def main(argv: list[str] | None = None) -> int:

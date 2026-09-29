@@ -113,13 +113,8 @@
 //!                            context_inputs.rs` retains seven role reads with
 //!                            `ProjectionState` dispositions; `bins/eliotd`
 //!                            retains one bounded evidence read per admitted
-//!                            `eliot.query` pair and routes its
-//!                            `GetCurrentEpistemicPosition` edge read through
-//!                            this owner (`experience_runtime.rs:read_current_position`).
-//!                            All of them consume the resolved [`ReadIdentity`]
-//!                            instead of re-deriving freshness: a direct
-//!                            `CanonicalReadClient::execute_named` call is no
-//!                            longer a second answer to source/fence/coverage.
+//!                            `eliot.query` pair. Both consume the resolved
+//!                            [`ReadIdentity`] instead of re-deriving freshness.
 //! ```
 //!
 //! # Declared edges versus a live read (A1)

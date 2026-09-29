@@ -42,19 +42,6 @@ pub const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\operator\one-shot";
 /// tombstones because they did not retain the original `RequestIdentity`.
 pub const ISSUED_OPERATION_IDENTITY_VERSION: u16 = 2;
 const LEGACY_ISSUED_OPERATION_IDENTITY_VERSION: u16 = 1;
-/// Spent operation identities are retained until the snapshot is fenced; new
-/// issuances fail closed at this bound rather than evicting reuse evidence.
-pub const MAX_ISSUED_OPERATION_IDENTITIES: usize = 4_096;
-/// Serialized spent-identity evidence budget (the file store permits 16 MiB).
-pub const MAX_ISSUED_OPERATION_IDENTITY_BYTES: usize = 4 * 1024 * 1024;
-/// Capacity retained for fence/logoff and other control operation identities.
-pub const ISSUED_OPERATION_CONTROL_ENTRY_RESERVE: usize = 2;
-/// Byte budget retained for fence/logoff and other control operations.
-pub const ISSUED_OPERATION_CONTROL_BYTE_RESERVE: usize = 16 * 1024;
-/// Process lineage is observational, but its durable ledger is bounded too.
-pub const MAX_PROCESS_EFFECT_LINEAGE_ENTRIES: usize = 4_096;
-/// Serialized process-lineage budget, leaving room for cursors and receipts.
-pub const MAX_PROCESS_EFFECT_LINEAGE_BYTES: usize = 2 * 1024 * 1024;
 
 fn legacy_issued_operation_identity_version() -> u16 {
     LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
@@ -298,17 +285,6 @@ fn unique(values: &[String], field: &'static str) -> Result<(), BrokerError> {
 
 fn hex_digest(value: &str, field: &'static str) -> Result<(), BrokerError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(BrokerError::InvalidField(field));
-    }
-    Ok(())
-}
-
-fn lowercase_hex_digest(value: &str, field: &'static str) -> Result<(), BrokerError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
         return Err(BrokerError::InvalidField(field));
     }
     Ok(())
@@ -1273,44 +1249,6 @@ pub trait IssuedOperationIdentityLedger: Send {
     /// Returns every operation identity this process has issued, in a
     /// deterministic order, or an error when the projection is unavailable.
     fn issued_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, String>;
-
-    /// Returns retained process/effect links in deterministic order. An empty
-    /// result means this issuer has retained no confirmed start observations.
-    fn process_effect_lineage(&self) -> Result<Vec<ProcessEffectLineage>, String>;
-}
-
-/// One durable, observation-only join from the caller request and Kernel grant
-/// to the exact sealed process invocation. It grants no process authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessEffectLineage {
-    /// Caller request identity that admitted the operation.
-    pub caller_request_id: String,
-    /// Kernel authorize-launch transport request id, when linked by the issuer.
-    pub authorize_request_id: Option<String>,
-    /// Canonical grant request digest observed for this invocation.
-    pub grant_request_digest: String,
-    /// Exact sealed process invocation digest returned by the process adapter.
-    pub process_request_digest: String,
-}
-
-impl ProcessEffectLineage {
-    /// Validates the immutable relation before it is retained or restored.
-    pub fn validate(&self) -> Result<(), BrokerError> {
-        text(&self.caller_request_id, "process_lineage.caller_request_id")?;
-        if let Some(authorize_request_id) = &self.authorize_request_id {
-            text(authorize_request_id, "process_lineage.authorize_request_id")?;
-        }
-        lowercase_hex_digest(
-            &self.grant_request_digest,
-            "process_lineage.grant_request_digest",
-        )?;
-        lowercase_hex_digest(
-            &self.process_request_digest,
-            "process_lineage.process_request_digest",
-        )?;
-        Ok(())
-    }
 }
 
 /// Durable restart cursor owned by the injected registration provider.
@@ -1330,9 +1268,6 @@ pub struct BrokerSnapshot {
     /// Kernel call can mint.
     #[serde(default)]
     pub operation_identities: Vec<IssuedOperationIdentity>,
-    /// Bounded observation-only joins from grants to process invocations.
-    #[serde(default)]
-    pub process_effect_lineage: Vec<ProcessEffectLineage>,
     /// Durable tombstones of operations fenced by a newer broker generation.
     ///
     /// A new `UserBrokerEpoch` fences the previous registration, so its live
@@ -1463,11 +1398,6 @@ pub struct OperationCursor {
     /// with that process.
     #[serde(default)]
     pub introduction: Option<ResourceIntroduction>,
-    /// A durable recovery obligation when the process effect could not be
-    /// joined to its caller/grant lineage. The operation ID and invocation
-    /// digest above remain the exact handle for reconciliation.
-    #[serde(default)]
-    pub process_lineage_recovery_required: bool,
     pub state: OperationState,
 }
 
@@ -1796,11 +1726,6 @@ pub trait ProcessPort: Send {
         registration: &RegistrationReceipt,
         expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError>;
-    /// Returns whether observation-only process lineage could not be retained
-    /// for the just-returned start outcome. This result is attached to the
-    /// durable cursor for the exact process operation and never changes the
-    /// effect outcome or handle.
-    fn take_process_lineage_recovery_obligation(&mut self) -> Result<bool, PortError>;
     fn inspect(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError>;
     fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError>;
     /// Reconciliation is a distinct provider operation.  The default keeps
@@ -1830,7 +1755,6 @@ pub struct UserBroker {
     operations: BTreeMap<String, OperationRecord>,
     retired_operations: BTreeMap<String, RetiredOperationIdentity>,
     issued_operations: BTreeMap<String, IssuedOperationIdentity>,
-    process_effect_lineage: BTreeMap<(String, String), ProcessEffectLineage>,
     lost_operation: Option<LostOperation>,
     /// The registration this broker's current generation superseded, retained
     /// so a pre-cutover child runtime's broker/epoch lineage outlives the
@@ -1875,7 +1799,6 @@ impl UserBroker {
             operations: BTreeMap::new(),
             retired_operations: BTreeMap::new(),
             issued_operations: BTreeMap::new(),
-            process_effect_lineage: BTreeMap::new(),
             lost_operation: None,
             predecessor_registration: None,
             cutover_receipt: None,
@@ -1937,13 +1860,6 @@ impl UserBroker {
         self.issued_operations.values().cloned().collect()
     }
 
-    /// Returns process/effect relations recovered from the durable snapshot so
-    /// the composition can re-seed its observation ledger before new effects.
-    #[must_use]
-    pub fn recovered_process_effect_lineage(&self) -> Vec<ProcessEffectLineage> {
-        self.process_effect_lineage.values().cloned().collect()
-    }
-
     /// Takes the broker-owned operation whose outcome is currently unproven.
     ///
     /// Set exactly when a lease refresh or a fence lost its acknowledgement
@@ -1976,32 +1892,31 @@ impl UserBroker {
             .load()
             .map_err(|error| map_port(RequiredProvider::DurableRegistration, error))?
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?;
-        let registration = snapshot.registration;
-        let broker_epoch = snapshot.user_broker_epoch;
-        let RestoredIdentityEvidence {
-            issued_operations,
-            process_effect_lineage,
-        } = restore_identity_evidence(
-            snapshot.operation_identities,
-            snapshot.process_effect_lineage,
-        )?;
-        let retired_operations = retired_index(snapshot.retired_operations)?;
+        self.registration = snapshot.registration;
+        self.registration_reconciled = self.registration.is_none();
+        self.broker_epoch = snapshot.user_broker_epoch;
+        let mut issued_operations = BTreeMap::new();
+        for identity in snapshot.operation_identities {
+            identity.validate()?;
+            if issued_operations
+                .insert(identity.request_id.clone(), identity)
+                .is_some()
+            {
+                return Err(BrokerError::Duplicate("operation_identity.request_id"));
+            }
+        }
+        self.issued_operations = issued_operations;
+        self.retired_operations = retired_index(snapshot.retired_operations)?;
         // A receipt is adopted only after it is checked against itself: a
         // corrupt file must not be able to report a binding as transferred, a
         // generation as replaced, or a foreign operation as pinned here.
         if let Some(receipt) = &snapshot.cutover_receipt {
             receipt.validate()?;
         }
-        let Some(registration_ref) = registration.as_ref() else {
+        self.cutover_receipt = snapshot.cutover_receipt;
+        self.predecessor_registration = snapshot.predecessor_registration;
+        let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
-                self.registration = registration;
-                self.registration_reconciled = true;
-                self.broker_epoch = broker_epoch;
-                self.issued_operations = issued_operations;
-                self.process_effect_lineage = process_effect_lineage;
-                self.retired_operations = retired_operations;
-                self.cutover_receipt = snapshot.cutover_receipt;
-                self.predecessor_registration = snapshot.predecessor_registration;
                 self.operations.clear();
                 return Ok(());
             }
@@ -2015,20 +1930,23 @@ impl UserBroker {
             // they fail closed here via exact-tuple is_same_authority and are
             // never promoted. Only an EVIDENCE_BOUND_ACTIVE import with a
             // migration receipt may mint a new EpochId at this owner.
-            if cursor.registration_digest != registration_ref.registration_digest
-                || cursor.user_broker_epoch != registration_ref.user_broker_epoch
+            if cursor.registration_digest != registration.registration_digest
+                || cursor.user_broker_epoch != registration.user_broker_epoch
                 || !cursor
                     .authority_epoch
-                    .is_same_authority(&registration_ref.authority_epoch)
-                || cursor.fence_id != registration_ref.fence_id
-                || cursor.lease_expires_at > registration_ref.expires_at
+                    .is_same_authority(&registration.authority_epoch)
+                || cursor.fence_id != registration.fence_id
+                || cursor.lease_expires_at > registration.expires_at
             {
                 return Err(BrokerError::GrantBindingMismatch);
             }
             if !operation_ids.insert(cursor.operation_id.clone()) {
                 return Err(BrokerError::Duplicate("operation_cursor.operation_id"));
             }
-            if retired_operations.contains_key(cursor.operation_id.as_str()) {
+            if self
+                .retired_operations
+                .contains_key(cursor.operation_id.as_str())
+            {
                 return Err(BrokerError::Duplicate("retired_operation.operation_id"));
             }
             let permit = permit_from_cursor(&cursor);
@@ -2046,14 +1964,6 @@ impl UserBroker {
                 return Err(BrokerError::Duplicate("operation_cursor.idempotency_key"));
             }
         }
-        self.registration = registration;
-        self.registration_reconciled = false;
-        self.broker_epoch = broker_epoch;
-        self.issued_operations = issued_operations;
-        self.process_effect_lineage = process_effect_lineage;
-        self.retired_operations = retired_operations;
-        self.cutover_receipt = snapshot.cutover_receipt;
-        self.predecessor_registration = snapshot.predecessor_registration;
         self.operations = operations;
         Ok(())
     }
@@ -2538,55 +2448,31 @@ impl UserBroker {
             &expected_process_request_digest,
             OperationState::Unknown,
         );
-        let pending_record = OperationRecord {
+        let unknown_record = OperationRecord {
             cursor: cursor.clone(),
             permit: permit.clone(),
             receipt: None,
         };
         self.operations.insert(
             request.approved.idempotency_key.clone(),
-            pending_record.clone(),
+            unknown_record.clone(),
         );
         // This is the last durable boundary before the provider can create a
         // process.  Any save error leaves the exact Unknown cursor in memory
         // and prevents crossing the physical start boundary.
         self.persist()?;
-        let (start_result, lineage_status) = {
-            let process = self
-                .process
-                .as_mut()
-                .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?;
-            let start_result = process.start(&grant, &current, &expected_process_request_digest);
-            let lineage_status = process.take_process_lineage_recovery_obligation();
-            (start_result, lineage_status)
-        };
-        let lineage_recovery_required = lineage_status.unwrap_or(true);
-        let mut observed_unknown_record = pending_record.clone();
-        observed_unknown_record
-            .cursor
-            .process_lineage_recovery_required = lineage_recovery_required;
-        let outcome = match start_result {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.operations.insert(
-                    request.approved.idempotency_key.clone(),
-                    observed_unknown_record,
-                );
-                if self.persist().is_err() {
-                    // Preserve the already-durable pre-effect Unknown cursor
-                    // and its recovery obligation. The process result remains
-                    // the result of the physical start call, never a second
-                    // attempt caused by observation publication failure.
-                    self.operations
-                        .insert(request.approved.idempotency_key.clone(), pending_record);
-                }
-                return Err(if matches!(error, PortError::Unknown) {
+        let outcome = self
+            .process
+            .as_mut()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
+            .start(&grant, &current, &expected_process_request_digest)
+            .map_err(|error| {
+                if matches!(error, PortError::Unknown) {
                     BrokerError::UnknownOutcome
                 } else {
                     map_port(RequiredProvider::P03Process, error)
-                });
-            }
-        };
+                }
+            })?;
         let receipt = match outcome {
             ProcessStartOutcome::Started {
                 request_digest,
@@ -2603,14 +2489,6 @@ impl UserBroker {
                 if request_digest != expected_process_request_digest {
                     return Err(BrokerError::ProcessBindingMismatch);
                 }
-                self.operations.insert(
-                    request.approved.idempotency_key.clone(),
-                    observed_unknown_record.clone(),
-                );
-                if self.persist().is_err() {
-                    self.operations
-                        .insert(request.approved.idempotency_key.clone(), pending_record);
-                }
                 return Err(BrokerError::UnknownOutcome);
             }
         };
@@ -2625,8 +2503,8 @@ impl UserBroker {
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
             .inspect(&process_operation_id)
             .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
-        verify_cursor_lineage(&observed_unknown_record.cursor, &view)?;
-        let mut active_cursor = observed_unknown_record.cursor.clone();
+        verify_cursor_lineage(&unknown_record.cursor, &view)?;
+        let mut active_cursor = unknown_record.cursor.clone();
         active_cursor.state = OperationState::Active;
         let launch_receipt = LaunchReceipt {
             operation_id: process_operation_id,
@@ -2653,7 +2531,7 @@ impl UserBroker {
             // was not durably acknowledged.  Restore the pre-effect Unknown
             // cursor so restart/reconciliation cannot lose the lineage.
             self.operations
-                .insert(request.approved.idempotency_key, pending_record);
+                .insert(request.approved.idempotency_key, unknown_record);
             return Err(error);
         }
         Ok(launch_receipt)
@@ -3306,7 +3184,6 @@ impl UserBroker {
                 .map(|record| record.cursor.clone())
                 .collect(),
             operation_identities: self.projected_operation_identities()?,
-            process_effect_lineage: self.projected_process_effect_lineage()?,
             retired_operations: self.retired_operations.values().cloned().collect(),
             predecessor_registration: self.predecessor_registration.clone(),
             cutover_receipt: self.cutover_receipt.clone(),
@@ -3323,20 +3200,6 @@ impl UserBroker {
     /// carry it, so attaching no ledger never erases durable history.
     fn projected_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, BrokerError> {
         let mut projected = self.issued_operations.clone();
-        let mut projected_bytes = 0_usize;
-        for identity in projected.values() {
-            let row_bytes = serde_json::to_vec(identity)
-                .map_err(|error| BrokerError::Provider(error.to_string()))?
-                .len();
-            projected_bytes = projected_bytes
-                .checked_add(row_bytes)
-                .ok_or(BrokerError::InvalidField("operation_identity.capacity"))?;
-        }
-        if projected.len() > MAX_ISSUED_OPERATION_IDENTITIES
-            || projected_bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES
-        {
-            return Err(BrokerError::InvalidField("operation_identity.capacity"));
-        }
         if let Some(ledger) = self.identity_ledger.as_ref() {
             for identity in ledger.issued_operation_identities().map_err(|error| {
                 BrokerError::Provider(format!("operation identity ledger unavailable: {error}"))
@@ -3349,69 +3212,8 @@ impl UserBroker {
                         ));
                     }
                 } else {
-                    if projected.len() >= MAX_ISSUED_OPERATION_IDENTITIES {
-                        return Err(BrokerError::InvalidField("operation_identity.capacity"));
-                    }
-                    let row_bytes = serde_json::to_vec(&identity)
-                        .map_err(|error| BrokerError::Provider(error.to_string()))?
-                        .len();
-                    projected_bytes = projected_bytes
-                        .checked_add(row_bytes)
-                        .ok_or(BrokerError::InvalidField("operation_identity.capacity"))?;
-                    if projected_bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES {
-                        return Err(BrokerError::InvalidField("operation_identity.capacity"));
-                    }
                     projected.insert(identity.request_id.clone(), identity);
                 }
-            }
-        }
-        Ok(projected.into_values().collect())
-    }
-
-    fn projected_process_effect_lineage(&self) -> Result<Vec<ProcessEffectLineage>, BrokerError> {
-        let mut projected = self.process_effect_lineage.clone();
-        let mut projected_bytes = 0_usize;
-        for row in projected.values() {
-            let row_bytes = serde_json::to_vec(row)
-                .map_err(|error| BrokerError::Provider(error.to_string()))?
-                .len();
-            projected_bytes = projected_bytes
-                .checked_add(row_bytes)
-                .ok_or(BrokerError::InvalidField("process_effect_lineage.capacity"))?;
-        }
-        if projected.len() > MAX_PROCESS_EFFECT_LINEAGE_ENTRIES
-            || projected_bytes > MAX_PROCESS_EFFECT_LINEAGE_BYTES
-        {
-            return Err(BrokerError::InvalidField("process_effect_lineage.capacity"));
-        }
-        if let Some(ledger) = self.identity_ledger.as_ref() {
-            for relation in ledger.process_effect_lineage().map_err(|error| {
-                BrokerError::Provider(format!("process effect lineage unavailable: {error}"))
-            })? {
-                relation.validate()?;
-                let key = (
-                    relation.caller_request_id.clone(),
-                    relation.grant_request_digest.clone(),
-                );
-                if let Some(retained) = projected.get(&key) {
-                    if retained != &relation {
-                        return Err(BrokerError::InvalidField("process_effect_lineage.conflict"));
-                    }
-                    continue;
-                }
-                if projected.len() >= MAX_PROCESS_EFFECT_LINEAGE_ENTRIES {
-                    return Err(BrokerError::InvalidField("process_effect_lineage.capacity"));
-                }
-                let row_bytes = serde_json::to_vec(&relation)
-                    .map_err(|error| BrokerError::Provider(error.to_string()))?
-                    .len();
-                projected_bytes = projected_bytes
-                    .checked_add(row_bytes)
-                    .ok_or(BrokerError::InvalidField("process_effect_lineage.capacity"))?;
-                if projected_bytes > MAX_PROCESS_EFFECT_LINEAGE_BYTES {
-                    return Err(BrokerError::InvalidField("process_effect_lineage.capacity"));
-                }
-                projected.insert(key, relation);
             }
         }
         Ok(projected.into_values().collect())
@@ -3639,78 +3441,8 @@ fn cursor_from_grant(
         // the operation so revocation and restart reconciliation name the
         // exact thing that was introduced, instead of only the child id.
         introduction: Some(grant.approved.introduction.clone()),
-        // Published with the Unknown cursor before physical start. It is
-        // cleared only when the exact process lineage is retained durably.
-        process_lineage_recovery_required: true,
         state,
     }
-}
-
-struct RestoredIdentityEvidence {
-    issued_operations: BTreeMap<String, IssuedOperationIdentity>,
-    process_effect_lineage: BTreeMap<(String, String), ProcessEffectLineage>,
-}
-
-fn restore_identity_evidence(
-    operation_identities: Vec<IssuedOperationIdentity>,
-    process_lineage_rows: Vec<ProcessEffectLineage>,
-) -> Result<RestoredIdentityEvidence, BrokerError> {
-    let mut issued_operations = BTreeMap::new();
-    let mut issued_identity_bytes = 0_usize;
-    for identity in operation_identities {
-        identity.validate()?;
-        if issued_operations.len() >= MAX_ISSUED_OPERATION_IDENTITIES {
-            return Err(BrokerError::InvalidField("operation_identity.capacity"));
-        }
-        let row_bytes = serde_json::to_vec(&identity)
-            .map_err(|error| BrokerError::Provider(error.to_string()))?
-            .len();
-        issued_identity_bytes = issued_identity_bytes
-            .checked_add(row_bytes)
-            .ok_or(BrokerError::InvalidField("operation_identity.capacity"))?;
-        if issued_identity_bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES {
-            return Err(BrokerError::InvalidField("operation_identity.capacity"));
-        }
-        if issued_operations
-            .insert(identity.request_id.clone(), identity)
-            .is_some()
-        {
-            return Err(BrokerError::Duplicate("operation_identity.request_id"));
-        }
-    }
-
-    let mut process_effect_lineage = BTreeMap::new();
-    let mut process_lineage_bytes = 0_usize;
-    for relation in process_lineage_rows {
-        relation.validate()?;
-        let key = (
-            relation.caller_request_id.clone(),
-            relation.grant_request_digest.clone(),
-        );
-        if let Some(retained) = process_effect_lineage.get(&key) {
-            if retained != &relation {
-                return Err(BrokerError::InvalidField("process_effect_lineage.conflict"));
-            }
-            continue;
-        }
-        if process_effect_lineage.len() >= MAX_PROCESS_EFFECT_LINEAGE_ENTRIES {
-            return Err(BrokerError::InvalidField("process_effect_lineage.capacity"));
-        }
-        let row_bytes = serde_json::to_vec(&relation)
-            .map_err(|error| BrokerError::Provider(error.to_string()))?
-            .len();
-        process_lineage_bytes = process_lineage_bytes
-            .checked_add(row_bytes)
-            .ok_or(BrokerError::InvalidField("process_effect_lineage.capacity"))?;
-        if process_lineage_bytes > MAX_PROCESS_EFFECT_LINEAGE_BYTES {
-            return Err(BrokerError::InvalidField("process_effect_lineage.capacity"));
-        }
-        process_effect_lineage.insert(key, relation);
-    }
-    Ok(RestoredIdentityEvidence {
-        issued_operations,
-        process_effect_lineage,
-    })
 }
 
 /// Builds the in-memory index of operations already fenced by a newer broker
@@ -6048,10 +5780,6 @@ mod tests {
                 .ok_or(PortError::Unknown)
         }
 
-        fn take_process_lineage_recovery_obligation(&mut self) -> Result<bool, PortError> {
-            Ok(false)
-        }
-
         fn cancel(
             &mut self,
             _operation_id: &OperationId,
@@ -6112,10 +5840,6 @@ mod tests {
             self.inner.inspect(operation_id)
         }
 
-        fn take_process_lineage_recovery_obligation(&mut self) -> Result<bool, PortError> {
-            self.inner.take_process_lineage_recovery_obligation()
-        }
-
         fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError> {
             self.inner.cancel(operation_id)
         }
@@ -6154,10 +5878,6 @@ mod tests {
                 return Err(PortError::Unknown);
             }
             self.inner.inspect(operation_id)
-        }
-
-        fn take_process_lineage_recovery_obligation(&mut self) -> Result<bool, PortError> {
-            self.inner.take_process_lineage_recovery_obligation()
         }
 
         fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError> {
@@ -6439,7 +6159,6 @@ mod tests {
             user_broker_epoch: first.broker_epoch,
             operation_cursors: Vec::new(),
             operation_identities: Vec::new(),
-            process_effect_lineage: Vec::new(),
             retired_operations: Vec::new(),
             predecessor_registration: None,
             cutover_receipt: None,
@@ -6634,7 +6353,6 @@ mod tests {
                 user_broker_epoch: 0,
                 operation_cursors: Vec::new(),
                 operation_identities: Vec::new(),
-                process_effect_lineage: Vec::new(),
                 retired_operations: Vec::new(),
                 predecessor_registration: None,
                 cutover_receipt: None,
@@ -6801,9 +6519,6 @@ mod tests {
             operation_identities: broker
                 .projected_operation_identities()
                 .expect("identity projection"),
-            process_effect_lineage: broker
-                .projected_process_effect_lineage()
-                .expect("process-lineage projection"),
             retired_operations: broker.retired_operations.values().cloned().collect(),
             predecessor_registration: broker.predecessor_registration.clone(),
             cutover_receipt: broker.cutover_receipt.clone(),

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import sys
 import tempfile
@@ -960,6 +961,68 @@ def _single_edge_path(
     return _finish_typed_path(manifests, (edge,), {"truncated": 0})
 
 
+# --- Test-support production boundary (#1146) ---
+#
+# `eliot-test-support` is a bounded test-only fixture plane. The rule is not
+# "no manifest mentions the crate": it is that no normal or build declaration,
+# however it is named or conditioned, can traverse to it. Package identity is
+# therefore resolved from the directory the declaration points at, not from the
+# key a manifest happens to use, so a renamed (`package = "..."`), path-aliased
+# or workspace-inherited declaration cannot present the plane under another
+# name. A declaration whose package identity is not resolvable at all is
+# unresolved evidence for this rule, never a clean pass.
+TEST_SUPPORT_PACKAGE = "eliot-test-support"
+
+# Declaration states that leave the target package unknown. Only
+# `degraded-metadata` is excluded: it still resolves the package name and
+# differs solely in interpreted feature metadata, which cannot change which
+# package a production build links.
+_IDENTITY_UNKNOWN = (
+    RESOLUTION_UNRESOLVED_WORKSPACE,
+    RESOLUTION_UNSUPPORTED_DECLARATION,
+)
+
+
+def _package_directories(manifests: dict[str, Manifest]) -> dict[str, str]:
+    """In-tree manifest directory to its declared package name."""
+    return {
+        manifest.path.rpartition("/")[0]: manifest.name
+        for manifest in sorted(manifests.values(), key=lambda item: item.path)
+    }
+
+
+def _edge_targets_package(
+    edge: DependencyEdge,
+    directories: dict[str, str],
+    package: str,
+    workspace_dirs: frozenset[str],
+) -> bool:
+    """True when a declaration reaches `package` under any declared name.
+
+    A `package = "..."` rename already resolves to the real name in
+    `DependencyEdge.package`. A path alias does not: `fixtures = { path = ... }`
+    pointing at the test-support crate leaves the identity `fixtures`. The
+    declared path is therefore resolved against every directory Cargo may treat
+    as its base: the consuming manifest, plus each directory owning a
+    `[workspace.dependencies]` table from which `workspace = true` inherits.
+    This scanner runs no resolver and does not claim which base applied, so all
+    of them are tried; resolving against a base that did not apply can only add
+    a rejection, never remove one. An absolute or drive-qualified path names
+    nothing inside this tree and is not an in-tree identity.
+    """
+    if edge.package == package:
+        return True
+    declared = edge.path
+    if declared is None or declared.startswith(("/", "\\")) or ":" in declared:
+        return False
+    declared = declared.replace("\\", "/")
+    bases = (edge.manifest.rpartition("/")[0], *sorted(workspace_dirs))
+    return any(
+        directories.get(posixpath.normpath(posixpath.join(base, declared))) == package
+        for base in bases
+    )
+
+
 def _typed_dependency_path(
     manifests: dict[str, Manifest],
     ambiguous: frozenset[str],
@@ -1162,7 +1225,14 @@ def _witness_suffix(witness: dict[str, Any]) -> str:
 
 def load_manifests(
     root: Path,
-) -> tuple[dict[str, Manifest], list[Finding], frozenset[str]]:
+) -> tuple[dict[str, Manifest], list[Finding], frozenset[str], frozenset[str]]:
+    """Parse every in-tree manifest.
+
+    Returns the manifest set, load findings, ambiguous names, and the
+    directories that own a `[workspace.dependencies]` table. The last set is
+    the set of bases Cargo may resolve a workspace-inherited `path` against,
+    which path-identity checks need because this scanner runs no resolver.
+    """
     manifests: dict[str, Manifest] = {}
     findings: list[Finding] = []
     ambiguous: set[str] = set()
@@ -1262,7 +1332,7 @@ def load_manifests(
             continue
         manifests[manifest.name] = manifest
 
-    return manifests, findings, frozenset(ambiguous)
+    return manifests, findings, frozenset(ambiguous), frozenset(tables)
 
 
 def load_policy(path: Path) -> dict[str, Any]:
@@ -1500,23 +1570,37 @@ def _dependency_path(
     return None
 
 
-def audit_dependencies(
+def _audit_test_support_boundary(
     manifests: dict[str, Manifest],
-    policy: dict[str, Any],
-    ambiguous: frozenset[str] = frozenset(),
-    unresolved_manifests: frozenset[str] = frozenset(),
+    ambiguous: frozenset[str],
+    unresolved_manifests: frozenset[str],
+    workspace_dirs: frozenset[str],
 ) -> list[Finding]:
-    findings: list[Finding] = []
-    ambiguous = frozenset(ambiguous)
-    unresolved_manifests = frozenset(unresolved_manifests)
+    """Reject every normal/build path from any target to the test-support plane.
 
-    # Every non-dev path ends in a normal/build declaration, so scanning each
-    # manifest catches transitive routes at their final edge too.
+    Every non-dev path ends in a normal/build declaration, so scanning each
+    manifest catches a transitive route at its final edge too. Target conditions
+    and optionality never relax the rule: a `cfg(...)` table and a feature-gated
+    dependency are both reachable by a production build, so a dev edge is the
+    only declaration outside it. An uninterpretable table, or a declaration
+    whose package identity is unresolvable, is a hard rejection for this rule
+    and never a clean pass.
+    """
+    findings: list[Finding] = []
+    directories = _package_directories(manifests)
+    unresolved = set(unresolved_manifests)
+
     for manifest in sorted(manifests.values(), key=lambda item: item.name):
         for edge in manifest.dependency_edges:
-            if (
-                edge.package != "eliot-test-support"
-                or edge.kind not in {"normal", "build"}
+            if edge.kind not in {"normal", "build"}:
+                continue
+            if edge.resolution in _IDENTITY_UNKNOWN:
+                # The declaration names no resolvable package, so it cannot be
+                # shown to exclude the test-support plane.
+                unresolved.add(manifest.path)
+                continue
+            if not _edge_targets_package(
+                edge, directories, TEST_SUPPORT_PACKAGE, workspace_dirs
             ):
                 continue
             witness = _dependency_witness(
@@ -1535,19 +1619,18 @@ def audit_dependencies(
                     "test_support_production_dependency",
                     manifest.path,
                     manifest.name,
-                    f"Non-dev {edge.kind} dependency on 'eliot-test-support' "
-                    "violates the test-support boundary. "
+                    f"Non-dev {edge.kind} dependency reaching "
+                    f"'{TEST_SUPPORT_PACKAGE}' under declared alias "
+                    f"{edge.alias!r} (target={edge.target}) violates the "
+                    "test-support boundary. "
                     f"{_witness_suffix(witness)}",
                     1146,
                     witness=witness,
                 )
             )
 
-    # An uninterpretable dependency table can hide a normal/build edge,
-    # so for the test-support boundary an unresolved configuration is a
-    # hard rejection, never a clean pass.
     for manifest in sorted(manifests.values(), key=lambda item: item.name):
-        if manifest.path not in unresolved_manifests:
+        if manifest.path not in unresolved:
             continue
         witness = _dependency_witness(
             rule="test-support-production-boundary",
@@ -1565,14 +1648,32 @@ def audit_dependencies(
                 "test_support_boundary_unresolved",
                 manifest.path,
                 manifest.name,
-                f"Cargo dependency tables for {manifest.name!r} are not "
-                "interpretable, so a normal/build path to "
-                "'eliot-test-support' cannot be excluded. "
+                f"Cargo dependency declarations for {manifest.name!r} are not "
+                f"resolvable, so a normal/build path to '{TEST_SUPPORT_PACKAGE}' "
+                "cannot be excluded. "
                 f"{_witness_suffix(witness)}",
                 1146,
                 witness=witness,
             )
         )
+    return findings
+
+
+def audit_dependencies(
+    manifests: dict[str, Manifest],
+    policy: dict[str, Any],
+    ambiguous: frozenset[str] = frozenset(),
+    unresolved_manifests: frozenset[str] = frozenset(),
+    workspace_dirs: frozenset[str] = frozenset(),
+) -> list[Finding]:
+    findings: list[Finding] = []
+    ambiguous = frozenset(ambiguous)
+
+    findings.extend(
+        _audit_test_support_boundary(
+            manifests, ambiguous, unresolved_manifests, workspace_dirs
+        )
+    )
 
     store_table = policy.get("store_vendor", {})
     allowed_store_packages = set(store_table.get("allowed_packages", []))
@@ -2710,7 +2811,7 @@ def audit_hot_path_manifests(
 
 def audit(root: Path, policy_path: Path) -> list[Finding]:
     policy = load_policy(policy_path)
-    manifests, findings, ambiguous = load_manifests(root)
+    manifests, findings, ambiguous, workspace_dirs = load_manifests(root)
     findings.extend(validate_policy(root, policy))
     findings.extend(_audit_process_lint_config(root))
     unresolved_manifests = frozenset(
@@ -2719,7 +2820,9 @@ def audit(root: Path, policy_path: Path) -> list[Finding]:
         if finding.code == "dependency_resolution_incomplete"
     )
     findings.extend(
-        audit_dependencies(manifests, policy, ambiguous, unresolved_manifests)
+        audit_dependencies(
+            manifests, policy, ambiguous, unresolved_manifests, workspace_dirs
+        )
     )
     findings.extend(audit_source(root, manifests, policy))
     findings.extend(audit_hot_path_manifests(root, manifests))

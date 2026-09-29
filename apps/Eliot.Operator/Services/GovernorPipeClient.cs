@@ -120,17 +120,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             budget).ConfigureAwait(false);
     }
 
-    public async Task<JsonElement> CommandAsync(OperatorIntentEnvelope envelope, CancellationToken cancellationToken = default)
+    public async Task<JsonElement> CommandAsync(object commandEnvelope, CancellationToken cancellationToken = default)
     {
-        // The typed intent envelope is the contract: it is validated before
-        // anything is journaled or sent, and its minted operation identity is
-        // the identity the owner receipts and reconciles. The envelope is
-        // serialized once here; reconciliations resend retained bytes via
-        // ReconcileAsync under the same identity, never a second mutation.
-        ArgumentNullException.ThrowIfNull(envelope);
-        envelope.Validate();
         using var budget = new OperationBudget("command", cancellationToken, _closing.Token);
-        var operationId = envelope.OperationId;
+        var envelope = JsonSerializer.SerializeToElement(commandEnvelope, Json);
+        var operationId = RequireOperationId(envelope);
         await ValidateContractAsync(budget).ConfigureAwait(false);
         // One send; a lost response reconciles the same identity through
         // ReconcileAsync, never a second logical mutation.
