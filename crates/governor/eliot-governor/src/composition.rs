@@ -4611,11 +4611,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Returns [`CompositionError::Recovery`] when the owner is unbound or not
     /// readable at the retained fence, or when a retained record fails its own
     /// existing validation.
-    pub fn last_scope_quarantine(&self) -> Result<Option<&QuarantinedScopeRecord>, CompositionError> {
-        Ok(self
-            .retained_work_scope_quarantine()?
-            .last()
-            .map(|record| record))
+    pub fn last_scope_quarantine(
+        &self,
+    ) -> Result<Option<QuarantinedScopeRecord>, CompositionError> {
+        Ok(self.retained_work_scope_quarantine()?.last().cloned())
     }
 
     /// Returns the owner-issued disposition of one scope-quarantine operation
@@ -4668,7 +4667,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// existing validation.
     pub fn scope_quarantine_history(
         &self,
-    ) -> Result<&[QuarantinedScopeRecord], CompositionError> {
+    ) -> Result<Vec<QuarantinedScopeRecord>, CompositionError> {
         self.retained_work_scope_quarantine()
     }
 
@@ -4688,7 +4687,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// admission uses, so a reader can never see a section the guard would not.
     fn retained_work_scope_quarantine(
         &self,
-    ) -> Result<&[QuarantinedScopeRecord], CompositionError> {
+    ) -> Result<Vec<QuarantinedScopeRecord>, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -4701,7 +4700,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let snapshot = owner
             .read_current(&fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok(&snapshot.unresolved_quarantine)
+        Ok(snapshot.unresolved_quarantine)
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,

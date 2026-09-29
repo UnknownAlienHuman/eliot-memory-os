@@ -350,6 +350,17 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             missing_observed_binding,
             missing_source_closure,
         ),
+        // A retained scope quarantine record that has not reached a disposition
+        // means the guard has an unresolved conflict to answer, not a condition
+        // that a retry can clear. It is a deterministic rejection of the
+        // presented scope and never a selection among candidates.
+        CompositionError::ScopeQuarantineUnresolved { .. } => map_composition_store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "SCOPE_QUARANTINE_UNRESOLVED",
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        ),
     }
 }
 

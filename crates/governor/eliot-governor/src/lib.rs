@@ -234,10 +234,10 @@ pub use route_registry::{
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
-    PrivacyProfile, ProposalSource, RegisteredInstanceEvidence, ResolutionAuthentication,
-    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence,
-    MAX_UNRESOLVED_SCOPE_QUARANTINE, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
+    HostObservedHandles, IdentityEvidence, IdentityLegOutcome, MAX_UNRESOLVED_SCOPE_QUARANTINE,
+    ManifestBoundaryClaim, PrivacyProfile, ProposalSource, RegisteredInstanceEvidence,
+    ResolutionAuthentication, ResolutionOutcome, ResolutionRequest, ResolutionTier,
+    ResumedTaskEvidence, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
     ScopeFingerprint, ScopeQuarantineDisposition, ScopeQuarantineReceipt,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SessionTaskClaim, TaskScopeCheck,
     TaskScopeOutcome, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,

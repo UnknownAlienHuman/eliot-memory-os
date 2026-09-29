@@ -3171,15 +3171,11 @@ impl WorkScopeBindingOwner {
     ) -> Result<ScopeQuarantineReceipt, WorkScopeError> {
         record.validate()?;
         let (operation_id, idempotency_key) = record.operation_identity()?;
-        let already_retained = self
-            .snapshot
-            .unresolved_quarantine
-            .iter()
-            .any(|retained| {
-                retained
-                    .operation_identity()
-                    .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
-            });
+        let already_retained = self.snapshot.unresolved_quarantine.iter().any(|retained| {
+            retained
+                .operation_identity()
+                .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
+        });
         if already_retained {
             let retained = self.snapshot.unresolved_quarantine.len();
             return Ok(ScopeQuarantineReceipt {
@@ -3227,16 +3223,13 @@ impl WorkScopeBindingOwner {
         operation_id: &str,
     ) -> Result<ScopeQuarantineReceipt, WorkScopeError> {
         text(operation_id, "operation_id")?;
-        let snapshot = match self.read_current(state_fence) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                return Ok(ScopeQuarantineReceipt {
-                    operation_id: operation_id.to_owned(),
-                    idempotency_key: String::new(),
-                    disposition: ScopeQuarantineDisposition::PossibleCommit,
-                    retained: 0,
-                });
-            }
+        let Ok(snapshot) = self.read_current(state_fence) else {
+            return Ok(ScopeQuarantineReceipt {
+                operation_id: operation_id.to_owned(),
+                idempotency_key: String::new(),
+                disposition: ScopeQuarantineDisposition::PossibleCommit,
+                retained: 0,
+            });
         };
         let retained = snapshot.unresolved_quarantine.len();
         for record in &snapshot.unresolved_quarantine {
