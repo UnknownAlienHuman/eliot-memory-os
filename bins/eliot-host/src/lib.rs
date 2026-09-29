@@ -9391,8 +9391,7 @@ impl HostComposition {
             // config in the Phase-B live domain, so it is resolved from the
             // committed activation fence bound to this manifest, never from
             // the manifest's Phase-A staged-file digest.
-            let approved_config =
-                self.approved_phase_b_config_for_manifest(&active.manifest)?;
+            let approved_config = self.approved_phase_b_config_for_manifest(&active.manifest)?;
             require_journal_kernel_restart_record(
                 &current,
                 &readiness_observations,
