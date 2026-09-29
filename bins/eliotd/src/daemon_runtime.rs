@@ -2071,7 +2071,7 @@ fn maintenance_observation(
 /// admitted a job and the family catalog admits its execution route.
 fn maintenance_notification_candidate(
     composition: &DaemonComposition,
-    observation: MaintenanceObservation,
+    observation: &MaintenanceObservation,
     failure_guard: &mut RepeatedFailureGuard,
 ) -> Option<(
     eliot_contracts::StateFence,
@@ -2111,7 +2111,7 @@ fn maintenance_notification_candidate(
 async fn evaluate_and_emit_maintenance_notification(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
-    observation: MaintenanceObservation,
+    observation: &MaintenanceObservation,
     failure_guard: &mut RepeatedFailureGuard,
 ) {
     let candidate = {
@@ -2197,7 +2197,7 @@ fn maybe_start_idle_maintenance_trigger(
             evaluate_and_emit_maintenance_notification(
                 &kernel,
                 &composition,
-                observation,
+                &observation,
                 &mut failure_guard,
             )
             .await;
@@ -2437,7 +2437,7 @@ async fn run_health_heartbeat_tick(
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
         let blocked_automation = match guard.evaluate_maintenance_trigger_with_evidence(
-            maintenance_observation(
+            &maintenance_observation(
                 MaintenanceTriggerOrigin::AdmittedObservation,
                 &[
                     format!("store_health={:?}", health.status),
@@ -4310,7 +4310,7 @@ enum ImprovementIntakeFlight {
 /// issuing a permit are all pure with respect to the Kernel.
 fn improvement_intake_artifact(
     composition: &DaemonComposition,
-    observation: MaintenanceObservation,
+    observation: &MaintenanceObservation,
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
@@ -4372,7 +4372,7 @@ fn improvement_intake_artifact(
 /// notification leg.
 async fn run_improvement_intake(
     composition: &SharedComposition,
-    observation: MaintenanceObservation,
+    observation: &MaintenanceObservation,
 ) -> Result<(), String> {
     let prepared = {
         let guard = composition.lock().await;
@@ -4458,7 +4458,7 @@ fn maybe_start_improvement_intake(
     let composition = Arc::clone(composition);
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
-            let result = run_improvement_intake(&composition, observation).await;
+            let result = run_improvement_intake(&composition, &observation).await;
             ImprovementIntakeCompletion::Settled(result)
         }),
     });

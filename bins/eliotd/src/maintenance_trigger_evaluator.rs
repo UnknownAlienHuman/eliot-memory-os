@@ -187,7 +187,7 @@ impl DaemonComposition {
     /// `MaintenanceError` unchanged.
     pub fn evaluate_maintenance_trigger(
         &self,
-        observation: MaintenanceObservation,
+        observation: &MaintenanceObservation,
     ) -> Result<AutomationTriggerDecision, DaemonError> {
         self.evaluate_maintenance_trigger_with_evidence(observation)
             .map(|(decision, _)| decision)
@@ -202,14 +202,14 @@ impl DaemonComposition {
     /// [`Self::evaluate_maintenance_trigger`].
     pub fn evaluate_maintenance_trigger_with_evidence(
         &self,
-        observation: MaintenanceObservation,
+        observation: &MaintenanceObservation,
     ) -> Result<(AutomationTriggerDecision, MaintenanceNotificationEvidence), DaemonError> {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
             ));
         }
-        let (input, notification_evidence) = self.observed_trigger_input(&observation)?;
+        let (input, notification_evidence) = self.observed_trigger_input(observation)?;
         let entry = crate::maintenance_family_catalog::entry_for(observation.family);
         let decision = self
             .governor
@@ -248,7 +248,7 @@ impl DaemonComposition {
     /// observation is never allowed to become a startup gate, a readiness
     /// gate, or a silent drop: I14.22 keeps the trigger durable and surfaces
     /// it on the next eligible startup instead.
-    pub fn note_maintenance_trigger(&self, observation: MaintenanceObservation) {
+    pub fn note_maintenance_trigger(&self, observation: &MaintenanceObservation) {
         if let Err(error) = self.evaluate_maintenance_trigger(observation) {
             let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
         }
@@ -435,7 +435,7 @@ impl DaemonComposition {
     /// its retry identity and its cursor must not advance.
     pub fn derive_maintenance_trigger_intake(
         &self,
-        observation: MaintenanceObservation,
+        observation: &MaintenanceObservation,
         parts: MaintenanceTriggerIntakeParts,
     ) -> Result<MaintenanceTriggerIntake, MaintenanceTriggerIntakeError> {
         if self.owner_session.is_none() {
@@ -446,7 +446,7 @@ impl DaemonComposition {
                 ),
             ));
         }
-        let (input, _) = self.observed_trigger_input(&observation)?;
+        let (input, _) = self.observed_trigger_input(observation)?;
         Ok(derive_trigger_intake(&TriggerIntakeRequest {
             input,
             operation: parts.operation,
@@ -580,7 +580,7 @@ impl DaemonComposition {
     pub async fn commit_maintenance_trigger_decision(
         &self,
         kernel: &Arc<DaemonKernelClient>,
-        observation: MaintenanceObservation,
+        observation: &MaintenanceObservation,
         record: &MaintenanceTriggerRecord,
         claim: &MaintenanceTriggerClaim,
     ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceDecisionCommitError> {
