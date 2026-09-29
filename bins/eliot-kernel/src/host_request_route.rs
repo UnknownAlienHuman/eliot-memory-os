@@ -2518,6 +2518,22 @@ impl KernelComposition {
             LocalReadReplay::AlreadyStaged => return Ok(()),
             LocalReadReplay::Fresh => {}
         }
+        // I7.24 W3/A2: a materially repeated expensive call on unchanged
+        // inputs without a new expected delta is a loop/no-progress signal,
+        // not a fresh dispatch. The retained per-route stage above is the
+        // kernel-owned store; the repeat is refused with the existing
+        // identity-conflict signal so it is never staged as progress.
+        if let Some(current) = super::tool_exposure::build_tool_call_request(envelope, tool) {
+            let retained = index.values().flatten().filter_map(|candidate| {
+                Some((
+                    candidate.local_read_envelope.as_ref()?,
+                    candidate.local_read_tool.as_ref()?,
+                ))
+            });
+            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
         let queued = index
             .values()
             .flatten()

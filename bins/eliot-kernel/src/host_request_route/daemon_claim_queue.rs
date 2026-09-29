@@ -86,6 +86,22 @@ impl KernelComposition {
                 return Ok(());
             }
         }
+        // I7.24 W3/A2: a materially repeated effect-capable call on unchanged
+        // inputs without a new expected delta is a loop/no-progress signal,
+        // not a fresh dispatch. The retained per-route stage above is the
+        // kernel-owned store; the repeat is refused with the existing
+        // identity-conflict signal so it is never staged as progress.
+        if let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) {
+            let retained = index.values().flatten().filter_map(|candidate| {
+                Some((
+                    candidate.campaign_packet_envelope.as_ref()?,
+                    candidate.campaign_packet_tool.as_ref()?,
+                ))
+            });
+            if crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
         let queued = index
             .values()
             .flatten()
