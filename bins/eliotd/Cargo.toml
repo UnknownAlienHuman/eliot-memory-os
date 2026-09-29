@@ -99,6 +99,7 @@ eliot-testd-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
+eliot-ors.workspace = true
 eliot-learning-contracts.workspace = true
 eliot-learning-state-view.workspace = true
 eliot-maintenance.workspace = true

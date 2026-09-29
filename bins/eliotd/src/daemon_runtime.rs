@@ -2611,34 +2611,31 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
-    let mut cold_start_discovery = if result.resolved_binding().is_some()
-        && ticket.workspace_selector.is_some()
-    {
-        Some(
-            eliotd::task_binding_admission::observe_cold_start_discovery(
-                &ticket,
-                &ticket.state_fence,
-                now.max(1),
+    let mut cold_start_discovery =
+        if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() {
+            Some(
+                eliotd::task_binding_admission::observe_cold_start_discovery(
+                    &ticket,
+                    &ticket.state_fence,
+                    now.max(1),
+                )
+                .map_err(|error| {
+                    format!(
+                        "daemon activation discovery ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?,
             )
-            .map_err(|error| {
-                format!(
-                    "daemon activation discovery ticket {}: {error}",
-                    ticket.ticket_id
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let result = if let Some(observed) = cold_start_discovery.as_mut() {
-        DaemonComposition::attach_cold_start_question(result, observed).map_err(
-            |error| {
-                format!(
-                    "daemon activation cold-start question ticket {}: {error}",
-                    ticket.ticket_id
-                )
-            },
-        )?
+        DaemonComposition::attach_cold_start_question(result, observed).map_err(|error| {
+            format!(
+                "daemon activation cold-start question ticket {}: {error}",
+                ticket.ticket_id
+            )
+        })?
     } else {
         result
     };
@@ -4938,7 +4935,7 @@ async fn trigger_accepted_cold_start(
 /// generation, admitted privacy policy, and Kernel-visible lease owner have
 /// no current producers.
 fn trigger_cold_start_controller(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
 ) -> Result<(), String> {
@@ -4976,8 +4973,12 @@ fn trigger_cold_start_controller(
             .collect::<Vec<_>>();
         return Err(format!(
             "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {}; Kernel binding owner: {}",
-            contour_result.err().unwrap_or_else(|| "available".to_owned()),
-            binding_result.err().unwrap_or_else(|| "available".to_owned()),
+            contour_result
+                .err()
+                .unwrap_or_else(|| "available".to_owned()),
+            binding_result
+                .err()
+                .unwrap_or_else(|| "available".to_owned()),
         ));
     }
 
@@ -4997,18 +4998,19 @@ fn trigger_cold_start_controller(
         )
         .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"))?;
         let question = match question {
-            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
-                code,
-                ..
-            } => code,
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. } => code,
             eliot_workscope::BootstrapScanOutcome::Completed { .. } => {
                 "scanner returned completion without an installation owner".to_owned()
             }
         };
         return Err(format!(
             "I4.4.1 AttachOrLaunch reached privacy-bounded scanner question path: {question}; Kernel contour owner: {}; Kernel binding owner: {}; privacy class, admitted boundary and policy remain absent",
-            contour_result.err().unwrap_or_else(|| "available".to_owned()),
-            binding_result.err().unwrap_or_else(|| "available".to_owned()),
+            contour_result
+                .err()
+                .unwrap_or_else(|| "available".to_owned()),
+            binding_result
+                .err()
+                .unwrap_or_else(|| "available".to_owned()),
         ));
     };
 
@@ -5022,14 +5024,14 @@ fn trigger_cold_start_controller(
             binding.clone(),
         ),
     );
-    let mut store = eliot_governor::GovernorComposition::bind_installation_scan_store(
+    let mut store = eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::bind_installation_scan_store(
         contour.installation_id(),
         contour.ors_object_ref(),
         contour.ors_generation(),
         owner,
     )
     .map_err(|error| format!("installation scan owner bind refused: {error}"))?;
-    eliot_governor::GovernorComposition::run_cold_start_trigger_scan(
+    eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::run_cold_start_trigger_scan(
         trigger,
         &mut discovery.lease,
         &discovery.key,
@@ -5046,7 +5048,6 @@ fn trigger_cold_start_controller(
     )
     .map(|_| ())
     .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
-}
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained

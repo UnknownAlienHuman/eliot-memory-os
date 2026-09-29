@@ -150,11 +150,10 @@ use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
     WorkScopeDescriptor, derive_observed_resources,
 };
-use eliot_ors::{
-    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
-    ScanDisclosureStageOutcome,
-};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_ors::{
+    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
@@ -259,7 +258,7 @@ struct KernelScanDisclosureContour {
 /// Daemon-side `ScanDisclosureRecordOwner` adapter. Every method crosses the
 /// existing authenticated Kernel client; no ORS object or in-process trait
 /// handle is passed into eliotd.
-pub(crate) struct KernelScanDisclosureRecordOwner {
+pub struct KernelScanDisclosureRecordOwner {
     kernel: Arc<super::DaemonKernelClient>,
     application_connection_id: String,
     activation_ticket_id: String,
@@ -267,7 +266,7 @@ pub(crate) struct KernelScanDisclosureRecordOwner {
 }
 
 impl KernelScanDisclosureRecordOwner {
-    pub(crate) fn new(
+    pub fn new(
         kernel: Arc<super::DaemonKernelClient>,
         application_connection_id: String,
         activation_ticket_id: String,
@@ -296,8 +295,8 @@ impl KernelScanDisclosureRecordOwner {
             .kernel
             .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
             .map_err(|error| OrsError::Contract(error.to_string()))?;
-        let response: ScanDisclosureOwnerRpcResponse = serde_json::from_value(value)
-            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
         if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
             return Err(OrsError::Contract(
                 "unsupported scan-disclosure owner response version".to_owned(),
@@ -473,7 +472,7 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
 
 /// Requests a current contour through the same authenticated Kernel owner
 /// route used by the durable record adapter.
-pub(crate) fn request_scan_disclosure_contour(
+pub fn request_scan_disclosure_contour(
     kernel: &super::DaemonKernelClient,
     application_connection_id: &str,
     activation_ticket_id: &str,
@@ -487,7 +486,7 @@ pub(crate) fn request_scan_disclosure_contour(
 
 /// Requests the authenticated Kernel owner to derive the scan binding from
 /// retained session, workspace, privacy, lease and task-selection evidence.
-pub(crate) fn request_scan_disclosure_binding(
+pub fn request_scan_disclosure_binding(
     kernel: &super::DaemonKernelClient,
     application_connection_id: &str,
     activation_ticket_id: &str,

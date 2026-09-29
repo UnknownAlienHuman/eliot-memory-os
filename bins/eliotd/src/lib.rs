@@ -1895,7 +1895,7 @@ impl DaemonComposition {
     /// observation to `trigger_cold_start_controller`, whose authenticated
     /// Kernel owner route fails closed while ORS generation, privacy policy,
     /// and lease-owner producers remain unavailable.
-    pub(crate) fn attach_cold_start_question(
+    pub fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
         observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
