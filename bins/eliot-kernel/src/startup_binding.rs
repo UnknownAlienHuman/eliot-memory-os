@@ -11,15 +11,18 @@
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
+#[cfg(windows)]
+use eliot_installation::InstallationProfile;
 use eliot_kernel::AuthorityDescriptorContour;
 #[cfg(windows)]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
 #[cfg(windows)]
 use eliot_platform_windows::{
-    NamedPipePeerProcessBinding, ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection,
-    ProfileSelectionReceipt, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
-    observe_named_pipe_peer_process, open_profile_root_leases, windows_paths_equal,
+    FileIdentity, NamedPipePeerProcessBinding, ProfileRootLeaseSet, ProfileRootRequest,
+    ProfileSelection, ProfileSelectionReceipt, ProtectedRuntimePathLease, UserOwnedPathLease,
+    UserOwnedRootLease, observe_named_pipe_peer_process, open_profile_root_leases,
+    windows_paths_equal,
 };
 
 #[cfg(windows)]
@@ -225,6 +228,98 @@ impl KernelStartupBinding {
         self.host_process_id == process_id
             && self.host_process_start == start_time_100ns
             && self.host_process_image == image_path
+    }
+
+    pub(crate) fn supervision_profile_binding(
+        &self,
+        retained_roots: Option<&ProfileRootLeaseSet>,
+    ) -> Result<(InstallationProfile, Option<(PathBuf, FileIdentity)>), String> {
+        match self.installation_profile.as_str() {
+            "system_service" => {
+                if self.profile_root_request.is_some()
+                    || self.profile_root_selection.is_some()
+                    || retained_roots.is_some()
+                {
+                    return Err(
+                        "SystemService launch received current-user profile roots".to_owned()
+                    );
+                }
+                Ok((InstallationProfile::SystemService, None))
+            }
+            "user_mode" => {
+                let request = self.profile_root_request.as_ref().ok_or_else(|| {
+                    "UserMode launch omitted its retained profile root request".to_owned()
+                })?;
+                let selection = self.profile_root_selection.as_ref().ok_or_else(|| {
+                    "UserMode launch omitted its retained profile selection".to_owned()
+                })?;
+                let retained = retained_roots.ok_or_else(|| {
+                    "UserMode launch omitted its retained profile root leases".to_owned()
+                })?;
+                if request.profile != ProfileSelection::UserMode
+                    || selection.profile != ProfileSelection::UserMode
+                    || retained.selection() != selection
+                {
+                    return Err("UserMode retained profile root identity changed".to_owned());
+                }
+                if request.repository_root.is_some() {
+                    return Err("UserMode launch received a PortableDev repository root".to_owned());
+                }
+                Ok((InstallationProfile::UserMode, None))
+            }
+            "portable_dev" => {
+                let request = self.profile_root_request.as_ref().ok_or_else(|| {
+                    "PortableDev launch omitted its retained profile root request".to_owned()
+                })?;
+                let repository_root = request.repository_root.clone().ok_or_else(|| {
+                    "PortableDev launch omitted the descriptor repository root".to_owned()
+                })?;
+                let selection = self.profile_root_selection.as_ref().ok_or_else(|| {
+                    "PortableDev launch omitted the retained profile selection".to_owned()
+                })?;
+                let retained = retained_roots.ok_or_else(|| {
+                    "PortableDev launch omitted its retained profile root leases".to_owned()
+                })?;
+                if request.profile != ProfileSelection::PortableDev
+                    || selection.profile != ProfileSelection::PortableDev
+                    || retained.selection() != selection
+                {
+                    return Err("PortableDev retained profile selection changed".to_owned());
+                }
+                let retained_selection = retained.selection();
+                let mut profile_anchors = retained_selection.roots.iter().filter(|observation| {
+                    observation.role == "runtime_state_roots.profile_anchor_root"
+                });
+                let profile_anchor = profile_anchors.next().ok_or_else(|| {
+                    "PortableDev retained profile selection omitted its repository identity"
+                        .to_owned()
+                })?;
+                if profile_anchors.next().is_some() {
+                    return Err(
+                        "PortableDev retained profile selection duplicated its repository identity"
+                            .to_owned(),
+                    );
+                }
+                if !repository_root.is_absolute()
+                    || !windows_paths_equal(&repository_root, &profile_anchor.canonical_path)
+                    || repository_root.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::CurDir | std::path::Component::ParentDir
+                        )
+                    })
+                {
+                    return Err(
+                        "PortableDev descriptor repository root is not canonical".to_owned()
+                    );
+                }
+                Ok((
+                    InstallationProfile::PortableDev,
+                    Some((repository_root, profile_anchor.identity)),
+                ))
+            }
+            _ => Err("Kernel launch profile is unsupported".to_owned()),
+        }
     }
 }
 
