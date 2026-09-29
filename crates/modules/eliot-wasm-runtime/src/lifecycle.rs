@@ -926,11 +926,20 @@ pub struct RollbackRouteProposal {
 /// committed in-flight dispositions, snapshot strategy, and compatibility
 /// flag, so the sealed decision cannot silently change after commit.
 ///
+/// The authority for identity and epoch lineage is the carried
+/// [`GenerationCutoverRecord`], not a pair of counters supplied here: its
+/// own `validate()` is applied to the original recorded value, so "newer"
+/// means the exact one-step direct child inside one epoch lineage rather
+/// than any numerically larger number.
+///
 /// # Errors
 ///
-/// Returns a typed failure when the epoch does not strictly rise (an old
-/// epoch would be revived), the target is not a distinct prior compatible
-/// generation, state is incompatible, any disposition entry is blank, or one
+/// Returns a typed failure when the carried record's own `validate()` refuses
+/// it — a blank or control-bearing identity, a new epoch outside the old
+/// epoch's lineage or not its exact one-step direct child (an old epoch
+/// would be revived), or a non-distinct generation; when the rollback target
+/// is not a strict prior generation; when state is incompatible yet a prior
+/// snapshot was selected; when any disposition entry is blank; or when one
 /// operation identity carries conflicting dispositions.
 pub fn route_rollback(
     request: &RollbackRouteRequest,
