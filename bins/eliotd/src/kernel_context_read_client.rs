@@ -83,9 +83,9 @@ use eliot_context_candidates::{
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile, PriorityPolicyIdentity,
-    ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding,
+    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile,
+    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
