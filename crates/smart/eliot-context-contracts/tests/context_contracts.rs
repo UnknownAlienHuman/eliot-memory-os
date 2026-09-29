@@ -710,7 +710,8 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     admitted.validate().expect("admitted set");
     let context = admitted.binding.clone();
     let recipe_digest = digest();
-    let fence_digest = "b".repeat(64);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&context.state_fence).expect("fence");
     let rendered: Vec<_> = admitted
         .records
         .iter()
