@@ -28,7 +28,6 @@ use eliot_notify_core::{
     watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
     watchdog_signature_payload,
 };
-#[cfg(test)]
 use eliot_notify_core::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -488,6 +487,33 @@ fn obligation_cause(
     )
 }
 
+/// Refuses a Watchdog fallback identity on the normal broker route.
+///
+/// The autonomous X-01 fallback contour carries the fixed
+/// [`eliot_notify_core::WATCHDOG_PRODUCT_ID`] /
+/// [`eliot_notify_core::WATCHDOG_SOURCE_ID`] identities and reaches the
+/// adapter only through the separately registered `--watchdog-fallback`
+/// launch, which derives every request identity from the protected
+/// declaration and the signed envelope with no caller request authority. A
+/// normal-mode parent carrying those identities is a contour crossing, so
+/// the authenticated composition fails closed before any Kernel exchange is
+/// opened. The delivery-time fallback leg requires exactly these identities,
+/// so the two contours stay disjoint in both directions: the fallback
+/// identity is never servable here, and a normal identity is never servable
+/// there.
+fn reject_fallback_identity_on_normal_route(
+    parent: &NotificationRequest,
+) -> Result<(), NotifyBuildError> {
+    if parent.context.product_id.as_str() == WATCHDOG_PRODUCT_ID
+        || parent.context.source_id.as_str() == WATCHDOG_SOURCE_ID
+    {
+        return Err(NotifyBuildError::Kernel(
+            "Watchdog fallback identity is not admissible on the normal broker route".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl NotificationComposition {
     /// Binds notification delivery to one validated `WorkScope` root.
     pub fn new(
@@ -526,6 +552,7 @@ impl NotificationComposition {
         work_root: impl Into<PathBuf>,
         parent: &NotificationRequest,
     ) -> Result<Self, NotifyBuildError> {
+        reject_fallback_identity_on_normal_route(parent)?;
         let mut client =
             KernelClient::load().map_err(|error| NotifyBuildError::Kernel(error.to_string()))?;
         let issuer: operation_identity::IssuerHandle =
@@ -545,6 +572,7 @@ impl NotificationComposition {
         parent: &NotificationRequest,
         invocation: &UserAutomationInvocation,
     ) -> Result<(Self, UserAutomationPreflightProjection), NotifyBuildError> {
+        reject_fallback_identity_on_normal_route(parent)?;
         let mut client =
             KernelClient::load().map_err(|error| NotifyBuildError::Kernel(error.to_string()))?;
         let issuer: operation_identity::IssuerHandle =
@@ -1902,15 +1930,32 @@ pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, Notif
     }
 }
 
-/// Fails closed on a foreign installation identity or a stale envelope
-/// timestamp before any request identity is derived. The rejection records
-/// the same fallback-contour degradation marker the delivery-time port
-/// refusal would have left, so the Event Log / spool obligation survives
-/// the early refusal.
+/// Fails closed on a foreign installation identity, unbound signature
+/// metadata, or a stale envelope timestamp before any request identity is
+/// derived. The rejection records the same fallback-contour degradation
+/// marker the delivery-time port refusal would have left, so the Event Log /
+/// spool obligation survives the early refusal.
+///
+/// The algorithm/domain equality here binds the envelope to the owner's
+/// published signature constants before derivation; the authoritative shape
+/// check and the cryptographic signature verification stay with the
+/// delivery-time signature port, which runs on every fallback delivery. Size
+/// is gated by `validate_fallback_envelope_size` at load, the allowed field
+/// set by `deny_unknown_fields` plus the canonical-JSON equality at load, and
+/// secrets/project content are structurally unrepresentable in the fixed
+/// five-field fallback schema.
 fn reject_foreign_or_stale_fallback_envelope(
     envelope: &SignedWatchdogFallbackEnvelope,
     material: &FallbackMaterial,
 ) -> Result<(), NotifyBuildError> {
+    if envelope.algorithm != WATCHDOG_SIGNATURE_ALGORITHM
+        || envelope.domain != WATCHDOG_SIGNATURE_DOMAIN
+    {
+        return Err(no_session_fallback_error(
+            FALLBACK_ADAPTER_UNAVAILABLE,
+            "watchdog envelope signature metadata rejected".to_owned(),
+        ));
+    }
     if envelope.envelope.installation_identity != material.declaration.installation_identity {
         return Err(no_session_fallback_error(
             FALLBACK_ADAPTER_UNAVAILABLE,

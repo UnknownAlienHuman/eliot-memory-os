@@ -16,6 +16,7 @@
 //! installer-owned record and registration route.
 
 use crate::CompositionError;
+use eliot_platform_windows::WATCHDOG_FALLBACK_TASK_NAME;
 
 /// Installer-observed fallback registration evidence carried by ensure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +52,15 @@ impl NotifyFallbackEffects for LiveNotifyFallbackEffects {
     fn register(&self) -> Result<NotifyFallbackRegistration, CompositionError> {
         let receipt = eliot_notify::register_watchdog_fallback_task()
             .map_err(|error| CompositionError::Launch(error.to_string()))?;
+        // The ensure registers exactly one task: the separately registered
+        // signed fallback. A receipt naming any other task is not this
+        // fallback, so registration fails closed here and the ensure defers
+        // with `INVALID_CONFIGURATION` rather than reporting it.
+        if receipt.task_name() != WATCHDOG_FALLBACK_TASK_NAME {
+            return Err(CompositionError::InvalidConfiguration(
+                "fallback registration named an unexpected scheduler task".to_owned(),
+            ));
+        }
         Ok(NotifyFallbackRegistration {
             task_name: receipt.task_name().to_owned(),
             verifier_sha256: receipt.verifier_sha256().to_owned(),

@@ -458,9 +458,13 @@ fn parse_root() -> Result<PathBuf, String> {
 
 /// Dispatches one broker-admitted notify delivery.
 ///
-/// The arm body lives here rather than inline so `dispatch` keeps its line
-/// budget: admit the Human state change, then launch the broker-composed
-/// delivery line through `launch_notify_deliver`.
+/// This arm and the `NotifyLaunch` arm are the only producers of a normal
+/// `eliot-notify` invocation: the generic `Launch` arm refuses any request
+/// naming the canonical notify image, and `launch_notify_deliver` admits the
+/// retained verified launch reference, refuses caller stdin, and renders the
+/// exact line the child serves. The arm body lives here rather than inline
+/// so `dispatch` keeps its line budget: admit the Human state change, then
+/// launch the broker-composed delivery line through `launch_notify_deliver`.
 fn dispatch_notify_deliver(
     composition: &mut BrokerComposition,
     request: LaunchRequest,

@@ -1391,6 +1391,17 @@ impl KernelComposition {
     }
 }
 
+/// Returns whether the operation string selects one admitted daemon route.
+///
+/// The vocabulary is closed: an operation not listed here never reaches a
+/// daemon arm and falls through to the `ProcessExecutionRequest` decode and
+/// the session fence. Issue #1781 W5: no desktop-toast operation exists in
+/// this vocabulary — Host/Kernel never display toasts directly. The only
+/// notification presence is the `bind_notify_launch_grant` delivery gate and
+/// the two `eliot.notify.state.v1` canonical-state markers; toast delivery
+/// itself happens only in the per-user `eliot-notify` adapter spawned by the
+/// authorized User Broker (or the separately registered signed Watchdog
+/// fallback), never on this dispatch path.
 fn is_daemon_operation(operation: &str) -> bool {
     matches!(
         operation,
