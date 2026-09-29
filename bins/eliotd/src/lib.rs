@@ -71,6 +71,12 @@ pub mod external_attach_reconciliation;
 pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
+/// Issue #1948: the governed source owner readback edge. Reopens the exact
+/// admitted owner document through the authenticated `GetCampaignSourceRevision`
+/// read and projects a citation only after the citation gate verifies the
+/// reopened bytes against the owner-recorded digest, byte length and excerpt
+/// digest. Called from the live `eliot.packet` retrieval-to-projection path.
+pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;

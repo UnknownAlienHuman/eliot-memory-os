@@ -328,7 +328,7 @@ async fn resolve_compile_and_bind_result(
     binding: CampaignPacketBinding,
     selectors: CampaignPacketSelectors,
 ) -> Result<eliot_protocol::HostRequestResultBody, String> {
-    let (recipe, task_plan_resolution, task_plan_record) =
+    let (recipe, task_plan_resolution, task_plan_record, task_plan_receipt) =
         match read_task_plan_recipe(kernel, &binding).await {
             Ok(read) => read,
             Err(_) => {
@@ -384,7 +384,7 @@ async fn resolve_compile_and_bind_result(
         &binding,
         &recipe,
         task_plan_resolution,
-        task_plan_record,
+        task_plan_record.clone(),
     )
     .await
     {
@@ -802,6 +802,31 @@ async fn resolve_compile_and_bind_result(
                 publication,
                 CampaignPacketGapCode::ContextRecipeUnavailable,
                 Some(CampaignSourceRole::ContextRecipe),
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
+    // Issue #1948: the Task Plan is the load-bearing source this packet is
+    // compiled from, so before it may support a compiled packet its exact
+    // admitted owner document is reopened through the governed source owner and
+    // run through the citation gate. A refusal here is a typed narrower outcome
+    // (`unsupported` / `replan` / `gap`): the packet is blocked, and the
+    // retrieved bytes are never emitted as cited support. This is a
+    // read/projection constraint and authorizes no durable mutation.
+    if let Err(refusal) = gate_task_plan_citation(&task_plan_record, &task_plan_receipt, &binding) {
+        tracing::warn!(
+            kind = ?refusal.kind,
+            reason = %refusal.reason,
+            "governed source readback refused the campaign packet citation"
+        );
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::RequiredSourceUnavailable,
+                Some(CampaignSourceRole::TaskPlan),
                 &resolved.resolutions,
                 prior.is_some() && !prior_is_current,
             ),
@@ -1305,6 +1330,15 @@ fn source_reference_from_head(head: &CampaignSourceHead) -> CampaignSourceRevisi
     }
 }
 
+/// Reads the authenticated Task Controller row that IS the task plan, together
+/// with the Kernel-authenticated owner-read receipt that binds that exact row.
+///
+/// The receipt is returned (not dropped) because the governed source readback
+/// gate (#1948) must reopen these owner bytes through that same proof: a
+/// `CampaignSourceRevisionRead::validate` `Current` read always carries a
+/// receipt, so its presence here is guaranteed by the store contract, not
+/// re-established by this function.
+#[allow(clippy::type_complexity)]
 async fn read_task_plan_recipe(
     kernel: &DaemonKernelClient,
     binding: &CampaignPacketBinding,
@@ -1313,6 +1347,7 @@ async fn read_task_plan_recipe(
         LearningStateViewRecipe,
         CampaignSourceResolution,
         CampaignSourceRecord,
+        CampaignOwnerReadReceipt,
     ),
     String,
 > {
@@ -1334,6 +1369,9 @@ async fn read_task_plan_recipe(
     }
     let source = read
         .source
+        .ok_or_else(|| CampaignPacketError::InvalidTaskPlan.to_string())?;
+    let receipt = read
+        .read_receipt
         .ok_or_else(|| CampaignPacketError::InvalidTaskPlan.to_string())?;
     let required_revision = binding
         .state_fence
@@ -1381,7 +1419,41 @@ async fn read_task_plan_recipe(
         reference: Some(reference),
         read_state_fence: read.read_state_fence,
     };
-    Ok((recipe, resolution, source))
+    Ok((recipe, resolution, source, receipt))
+}
+
+/// Gates the Task Plan citation for this packet on governed source readback.
+///
+/// Builds the active source view and workspace-view revision from the owner
+/// record that the `Current` authenticated read returned (so both the view
+/// revision and the retained-revision id are the owner-issued values, not
+/// constants), then reopens those owner bytes and runs the citation gate via
+/// [`crate::governed_source_readback::project_owner_document_citation`].
+///
+/// The `project` callback is a no-op observer here: the compiled packet already
+/// carries the view and this gate only decides whether the retrieved source may
+/// support it. It exists so the gate is invoked through `project_citation`,
+/// which runs `project` exactly once and only after verification, and so a
+/// refusal never reaches the projection step.
+fn gate_task_plan_citation(
+    record: &CampaignSourceRecord,
+    receipt: &CampaignOwnerReadReceipt,
+    binding: &CampaignPacketBinding,
+) -> Result<(), eliot_context_contracts::ReadbackRefusal> {
+    let (view, workspace_revision) =
+        crate::governed_source_readback::owner_source_view(&binding.work_scope_id, record)
+            .ok_or_else(|| {
+                eliot_context_contracts::ReadbackRefusal::gap("readback.owner.view", None)
+            })?;
+    crate::governed_source_readback::project_owner_document_citation(
+        record,
+        receipt,
+        view,
+        workspace_revision,
+        &binding.state_fence,
+        |_citation| {},
+    )
+    .map(|_citation| ())
 }
 
 fn campaign_read_request(
