@@ -653,7 +653,6 @@ pub struct SuppliedComparison {
 /// task/scope/fence and retained bytes, and derives no stronger state than the
 /// records support. It never mints, upgrades, or reissues one.
 /// ---------------------------------------------------------------------------
-
 /// One versioned source member binding a `ConflictSet` position to the
 /// immutable material the source owner retained for it.
 ///
@@ -684,7 +683,7 @@ pub struct SourceMemberRecord {
     pub source_snapshot: String,
     /// Task the member was admitted under.
     pub task_id: String,
-    /// WorkScope the member was admitted under.
+    /// `WorkScope` the member was admitted under.
     pub scope_id: String,
     /// Fence the member was admitted under.
     pub state_fence: StateFence,
@@ -713,8 +712,7 @@ impl SourceMemberRecord {
         check_bounded_text(&self.task_id, "source_member.task_id", MAX_SCOPE_BYTES)?;
         check_bounded_text(&self.scope_id, "source_member.scope_id", MAX_SCOPE_BYTES)?;
         check_digest(&self.record_digest, "source_member.record_digest")?;
-        if self.retained_bytes.is_empty() || self.retained_bytes.len() > MAX_RETAINED_SOURCE_BYTES
-        {
+        if self.retained_bytes.is_empty() || self.retained_bytes.len() > MAX_RETAINED_SOURCE_BYTES {
             return Err(ConflictAnalysisError::Bounds {
                 phase: "source_member.retained_bytes".to_owned(),
                 detail: "retained source bytes are empty or exceed their ceiling".to_owned(),
@@ -864,7 +862,10 @@ impl DimensionObservation {
     /// Validates one observed dimension value's shape and member binding.
     pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
         check_handle(&self.source, "observation.source")?;
-        check_digest(&self.source_member_digest, "observation.source_member_digest")?;
+        check_digest(
+            &self.source_member_digest,
+            "observation.source_member_digest",
+        )?;
         check_bounded_text(&self.descriptor, "observation.descriptor", MAX_TEXT_BYTES)?;
         check_bounded_text(&self.value, "observation.value", MAX_TEXT_BYTES)?;
         Ok(())
@@ -932,12 +933,10 @@ impl EvidenceRecord {
             EvidenceFreshness::ExactCandidate
                 | EvidenceFreshness::ExactCommit
                 | EvidenceFreshness::ExactQuiescedWorktree
-        )
-            && matches!(
-                self.envelope.status,
-                EpistemicStatus::Supported | EpistemicStatus::Verified
-            )
-            && self.envelope.assertability == Assertability::Assertable
+        ) && matches!(
+            self.envelope.status,
+            EpistemicStatus::Supported | EpistemicStatus::Verified
+        ) && self.envelope.assertability == Assertability::Assertable
     }
 }
 
@@ -1119,7 +1118,10 @@ impl RivalDenominator {
     #[must_use]
     pub fn derived_coverage(&self) -> EvidenceCoverage {
         if self.observed.len() == self.expected.len()
-            && self.expected.iter().all(|handle| self.observed.contains(handle))
+            && self
+                .expected
+                .iter()
+                .all(|handle| self.observed.contains(handle))
             && self.omitted.is_empty()
         {
             EvidenceCoverage::CompleteForScope
@@ -1157,7 +1159,7 @@ pub struct CausalEvidenceRecord {
     pub evidence: Vec<EvidenceRecord>,
     /// Task the record was admitted under.
     pub task_id: String,
-    /// WorkScope the record was admitted under.
+    /// `WorkScope` the record was admitted under.
     pub scope_id: String,
     /// Fence the record was admitted under.
     pub state_fence: StateFence,
@@ -1167,7 +1169,10 @@ impl CausalEvidenceRecord {
     /// Validates the record's shape, evidence, and rival denominator.
     pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
         check_handle(&self.source_handle, "causal_evidence.source_handle")?;
-        check_handle(&self.mechanism.claim_id, "causal_evidence.mechanism.claim_id")?;
+        check_handle(
+            &self.mechanism.claim_id,
+            "causal_evidence.mechanism.claim_id",
+        )?;
         check_bounded_text(
             &self.mechanism.source_revision,
             "causal_evidence.mechanism.source_revision",
@@ -1186,7 +1191,10 @@ impl CausalEvidenceRecord {
             &self.falsifier.evidence_id,
             "causal_evidence.falsifier.evidence_id",
         )?;
-        check_handle(&self.control.control_id, "causal_evidence.control.control_id")?;
+        check_handle(
+            &self.control.control_id,
+            "causal_evidence.control.control_id",
+        )?;
         check_handle(&self.control.owner, "causal_evidence.control.owner")?;
         check_handle(
             &self.control.evidence_id,
@@ -1205,7 +1213,11 @@ impl CausalEvidenceRecord {
         check_bounded_text(&self.task_id, "causal_evidence.task_id", MAX_SCOPE_BYTES)?;
         check_bounded_text(&self.scope_id, "causal_evidence.scope_id", MAX_SCOPE_BYTES)?;
         check_fence(&self.state_fence).map_err(|err| receipt_err(&err.to_string()))?;
-        bound_list_length("causal_evidence.evidence", self.evidence.len(), MAX_ENVELOPES_PER_RECORD)?;
+        bound_list_length(
+            "causal_evidence.evidence",
+            self.evidence.len(),
+            MAX_ENVELOPES_PER_RECORD,
+        )?;
         let mut evidence_ids: Vec<String> = Vec::with_capacity(self.evidence.len());
         for record in &self.evidence {
             record.validate()?;
@@ -1300,7 +1312,11 @@ impl OwnerComparison {
     /// each bound to that source's committed member digest.
     fn validate_observations(&self) -> Result<(), ConflictAnalysisError> {
         let expected = EXPECTED_COMPARISON_DIMENSIONS * 2;
-        bound_list_length("owner_comparison.observations", self.observations.len(), expected)?;
+        bound_list_length(
+            "owner_comparison.observations",
+            self.observations.len(),
+            expected,
+        )?;
         if self.observations.len() != expected {
             return Err(ConflictAnalysisError::Denominator {
                 detail: format!(
@@ -2997,15 +3013,14 @@ fn check_owner_comparison_members(
         (&comparison.first_source, &comparison.first_commitment),
         (&comparison.second_source, &comparison.second_commitment),
     ] {
-        let member = find_source_member(members, source).ok_or_else(|| {
-            ConflictAnalysisError::Binding {
+        let member =
+            find_source_member(members, source).ok_or_else(|| ConflictAnalysisError::Binding {
                 field: "owner_comparison.source_member".to_owned(),
                 detail: format!(
                     "no owner source member is admitted for position {}",
                     redact(source)
                 ),
-            }
-        })?;
+            })?;
         if member.record_digest != commitment.record_digest() {
             return Err(ConflictAnalysisError::Binding {
                 field: "owner_comparison.source_member".to_owned(),
@@ -3131,7 +3146,9 @@ fn check_evidence_joins(
         if evidence.receipt_digest == item.receipt.bundle_digest {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.receipt_digest".to_owned(),
-                detail: "the A-05 receipt attests the curation boundary only and is not causal evidence".to_owned(),
+                detail:
+                    "the A-05 receipt attests the curation boundary only and is not causal evidence"
+                        .to_owned(),
             });
         }
     }
@@ -3626,11 +3643,7 @@ fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
 ///
 /// Every comparison naming this position contributes one entry, from either
 /// side, so the mapping is symmetric.
-fn comparison_peer<'a>(
-    first: &'a str,
-    second: &'a str,
-    source_handle: &str,
-) -> Option<&'a str> {
+fn comparison_peer<'a>(first: &'a str, second: &'a str, source_handle: &str) -> Option<&'a str> {
     if first == source_handle {
         Some(second)
     } else if second == source_handle {
@@ -3645,7 +3658,7 @@ fn comparison_peer<'a>(
 /// `swapped` is the single ordering decision the pair makes; the values move
 /// with the source that declared them.
 fn pair_dimension_outcome(
-    dimension: ComparisonDimension,
+    _dimension: ComparisonDimension,
     first_value: &str,
     second_value: &str,
 ) -> DimensionOutcome {
@@ -3679,9 +3692,8 @@ fn collect_dimension_outcome(
 ) -> DimensionOutcome {
     let first = comparison.value_for(&comparison.first_source, dimension);
     let second = comparison.value_for(&comparison.second_source, dimension);
-    let (left, right) = match (first, second) {
-        (Some(left), Some(right)) => (left, right),
-        (None, _) | (_, None) => {
+    let (Some(left), Some(right)) = (first, second) else {
+        {
             unresolved.push(dimension);
             return DimensionOutcome::Unnormalizable {
                 reason: format!(
@@ -3777,8 +3789,7 @@ fn relation_note(
 /// missing value, or partial coverage yields [`CompatibilityRelation::Ambiguous`]
 /// while every declaration is preserved.
 fn derive_owner_relation(comparison: &OwnerComparison) -> DerivedRelation {
-    let mut outcomes: Vec<DimensionComparison> =
-        Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    let mut outcomes: Vec<DimensionComparison> = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
     let mut differing: Vec<ComparisonDimension> = Vec::new();
     let mut unresolved: Vec<ComparisonDimension> = Vec::new();
     for dimension in COMPARISON_DIMENSIONS {
@@ -3798,13 +3809,7 @@ fn derive_owner_relation(comparison: &OwnerComparison) -> DerivedRelation {
     } else {
         CompatibilityRelation::TypedDifference
     };
-    let note = relation_note(
-        comparison,
-        all_resolved,
-        &differing,
-        &unresolved,
-        coverage,
-    );
+    let note = relation_note(comparison, all_resolved, &differing, &unresolved, coverage);
     DerivedRelation {
         relation,
         outcomes,
@@ -3835,8 +3840,7 @@ fn owner_compatibility_entry(
         source_handle,
     )?;
     let derived = derive_owner_relation(comparison);
-    let mut unnormalizable: Vec<ComparisonDimension> =
-        comparison.unnormalizable_dimensions.clone();
+    let mut unnormalizable: Vec<ComparisonDimension> = comparison.unnormalizable_dimensions.clone();
     unnormalizable.sort();
     unnormalizable.dedup();
     let mut unsupported: Vec<ComparisonDimension> = comparison.unsupported_dimensions.clone();
@@ -3870,8 +3874,7 @@ fn legacy_compatibility_entry(
     // the digest is what keeps the two in step: otherwise two supplements
     // differing only in entry order would share a digest while emitting
     // byte-different analyses.
-    let mut outcomes: Vec<DimensionComparison> =
-        Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    let mut outcomes: Vec<DimensionComparison> = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
     let mut differing: Vec<ComparisonDimension> = Vec::new();
     let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
     for dimension in COMPARISON_DIMENSIONS {
@@ -3915,7 +3918,7 @@ fn build_compatibility(
     source_handle: &str,
     supplements: &ConflictSupplements,
 ) -> Vec<PositionCompatibility> {
-    let mut out: Vec<PositionComparison> = Vec::new();
+    let mut out: Vec<PositionCompatibility> = Vec::new();
     for comparison in &supplements.owner_records.comparisons {
         if let Some(entry) = owner_compatibility_entry(source_handle, comparison) {
             out.push(entry);
@@ -4078,13 +4081,11 @@ fn blocking_causal_leg(record: &CausalEvidenceRecord) -> Option<String> {
 /// either. Anything short of the declared state's own requirements stays
 /// [`CausalClaimState::Unknown`].
 fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
-    if let Some(gap) = blocking_causal_leg(record) {
+    if blocking_causal_leg(record).is_some() {
         return CausalClaimState::Unknown;
     }
     match record.declared_state {
-        CausalClaimState::Structural | CausalClaimState::Correlational => {
-            record.declared_state
-        }
+        CausalClaimState::Structural | CausalClaimState::Correlational => record.declared_state,
         CausalClaimState::CausalHypothesis => match record.falsifier.observed {
             FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
             _ => CausalClaimState::CausalHypothesis,
@@ -4775,9 +4776,13 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         record.control.control_id,
         record.control.evaluator_result.as_str()
     )];
-    let intervention = record.intervention.as_ref().map_or("absent", |binding| {
-        format!("{}:{}", binding.execution_id, binding.receipt_digest)
-    });
+    // `map_or` cannot unify an `&str` default with a `String` closure result,
+    // and the two branches are genuinely different types, so this is an
+    // explicit match rather than a coerced default.
+    let intervention = match record.intervention.as_ref() {
+        Some(binding) => format!("{}:{}", binding.execution_id, binding.receipt_digest),
+        None => String::from("absent"),
+    };
     parts.push(format!(
         "causal_intervention:{}:{intervention}",
         record.source_handle
