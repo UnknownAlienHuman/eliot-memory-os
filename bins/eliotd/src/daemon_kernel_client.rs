@@ -211,19 +211,13 @@ pub struct DaemonKernelClient {
 /// owner session (AUD-C02-B, Implements #1187; single-owner decision #1376).
 ///
 /// Every field is cloned from state this client already holds after the
-/// authenticated handshake: the validated `sid=..;session=..` binding string,
-/// the Kernel snapshot principal and receipt-relevant artifact digests, the
-/// local connection correlation id, and the descriptor launch nonce carried
-/// in [`KernelLaunchBinding::launch_nonce`]. No re-handshake, no secret, no
+/// authenticated handshake: the validated `sid=..;session=..` binding string
+/// and the local connection correlation id. No re-handshake, no secret, no
 /// constant, no parsing of constants.
 #[derive(Clone, Debug)]
 pub struct OwnerSessionFacts {
     pub(crate) session_binding: String,
-    pub(crate) kernel_principal: String,
     pub(crate) connection_id: String,
-    pub(crate) launch_nonce: String,
-    pub(crate) artifact_digest: String,
-    pub(crate) protected_snapshot_digest: String,
 }
 
 impl OwnerSessionFacts {
@@ -1410,8 +1404,7 @@ impl DaemonKernelClient {
     ///
     /// Read-only over held fields: the retained `sid=..;session=..` binding
     /// string (set only on successful `validate_server_hello`, never a
-    /// constant), the snapshot principal and artifact digests, the connection
-    /// id, and the descriptor launch nonce. No re-handshake, no secret.
+    /// constant) and the connection id. No re-handshake, no secret.
     /// `None` until a handshake in this process has validated a `ServerHello`,
     /// so daemon composition without a live session keeps the empty
     /// (unadmitted) controlboard behaviour.
@@ -1419,11 +1412,7 @@ impl DaemonKernelClient {
     pub fn owner_session_facts(&self) -> Option<OwnerSessionFacts> {
         Some(OwnerSessionFacts {
             session_binding: self.validated_session_binding()?,
-            kernel_principal: self.snapshot.principal.clone(),
             connection_id: self.connection_id.clone(),
-            launch_nonce: self.kernel_binding.launch_nonce.clone(),
-            artifact_digest: self.snapshot.artifact_digest.clone(),
-            protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
         })
     }
 
