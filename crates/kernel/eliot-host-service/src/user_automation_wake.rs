@@ -1,31 +1,38 @@
-//! Host-side `WakeIntent` cancellation adapter for `UserAutomation` removal.
+//! Host-side `WakeIntent` publication and cancellation adapter for
+//! `UserAutomation`.
 //!
-//! The adapter resolves only exact owner-issued targets against the canonical
-//! Host journal.  It copies the retained [`WakeRecord`] and changes its
+//! Publication writes one canonical [`WakeRecord`] per requested occurrence
+//! through the same Host journal that owns every other wake; cancellation
+//! resolves only exact owner-issued targets against that journal.  The
+//! cancellation path copies the retained [`WakeRecord`] and changes its
 //! lifecycle state to `Cancelled`; all timing, capability, safety, budget,
 //! evidence, Host fence, and existing operation fields remain journal-owned.
 //!
 //! The read path keeps a proven absence distinct from an unreadable owner.  A
-//! successful journal snapshot that holds no such wake is
+//! successful journal snapshot that holds no such wake — whether one exact
+//! occurrence or a whole published horizon — is
 //! [`UserAutomationRuntimeError::NotRetained`], a complete negative answer; a
 //! journal that could not be read is
 //! [`UserAutomationRuntimeError::Unavailable`], which proves nothing.  The two
 //! are different facts and a caller that must decide whether a retirement has
-//! anything left to cancel cannot be given the same value for both.
+//! anything left to cancel, or whether a published horizon is still retained,
+//! cannot be given the same value for both.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_host_state::{
     AppendDisposition, BackendError, HostState, HostStateJournalService, HostStateRecord,
-    IdempotencyIdentity, JournalBackend, JournalError, WakeCancellationBatchEntry,
-    WakeCancellationBatchQuery, WakeCancellationBatchQueryError, WakeCancellationBatchRecord,
-    host_owner_epoch_digest, record_checksum,
+    IdempotencyIdentity, JournalBackend, JournalError, RecordFence, ServiceSafetyClass,
+    WakeCancellationBatchEntry, WakeCancellationBatchQuery, WakeCancellationBatchQueryError,
+    WakeCancellationBatchRecord, WakeRecord, host_owner_epoch_digest, record_checksum,
 };
 use eliot_kernel_service::{
-    USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeCancellationReadback,
-    UserAutomationWakeEnumerationCoverage, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakeOccurrenceDisposition,
-    UserAutomationWakeOwnerEvidence, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    USER_AUTOMATION_KERNEL_CAPABILITY, USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION,
+    UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationCoverage,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication,
+    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
@@ -46,6 +53,116 @@ impl<'a, B: JournalBackend> HostWakeIntentAdapter<'a, B> {
 }
 
 impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> {
+    /// Publishes one bounded recurring horizon into the canonical Host wake
+    /// journal, one [`WakeRecord`] per requested occurrence.
+    ///
+    /// The occurrence denominator is the caller's. This adapter never compiles,
+    /// widens, reorders or extends it: it copies each requested entry's own
+    /// owner-contract [`WakeIntent`](eliot_runtime_contracts::WakeIntent) and
+    /// binds it to the automation, the immutable revision and its digest, the
+    /// stable occurrence identity, the owner-normalized trigger basis, the exact
+    /// State Fence, and the publication operation identity the request already
+    /// carries. Every journal field is a pure function of that request plus the
+    /// live Host activation fence, so a replay of the same publication
+    /// re-derives byte-identical records.
+    ///
+    /// Duplicate safety is the journal's own, not a second scheme here:
+    /// [`HostStateJournalService::append`] resolves a repeated
+    /// [`IdempotencyIdentity`] through the reducer's `applied_operations`
+    /// index and answers [`AppendDisposition::Replayed`] without writing a
+    /// second frame, so a restart or a repeated publication under the same
+    /// publication identity retains exactly the same wakes.
+    ///
+    /// Any journal refusal is returned as its typed error instead of a partial
+    /// acknowledgement. The owner then has no answer at all, and the caller
+    /// keeps the exact requested set and its replay handle rather than a
+    /// horizon it may report as published.
+    async fn publish_wake_horizon(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeHorizonPublication> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("Wake horizon publication: {error}")))?;
+        validate_horizon_denominator(&request)?;
+        let fence = live_activation_fence(&self.journal.snapshot().map_err(map_journal_error)?)?;
+        for entry in &request.entries {
+            let record = horizon_wake_record(&request, entry, fence.clone())?;
+            match self
+                .journal
+                .append(HostStateRecord::Wake(record))
+                .map_err(map_journal_error)?
+                .disposition()
+            {
+                AppendDisposition::Applied | AppendDisposition::Replayed => {}
+            }
+        }
+        horizon_acknowledgement(&request, request.requested_occurrence_ids(), Vec::new())
+    }
+
+    /// Reconciles one exact horizon publication with this owner's retained
+    /// records.
+    ///
+    /// The answer is only what this journal actually holds. A snapshot that was
+    /// read successfully and holds no wake published by this publication
+    /// operation is [`UserAutomationRuntimeError::NotRetained`], a complete
+    /// negative answer from the sole writer; a journal that could not be read is
+    /// [`UserAutomationRuntimeError::Unavailable`], which proves nothing. A
+    /// retained record for a requested occurrence that belongs to another
+    /// operation identity or carries another intent is a contradiction this
+    /// publication can neither answer for nor replace, and is reported as
+    /// [`UserAutomationRuntimeError::IdentityConflict`] rather than as an
+    /// acknowledgement.
+    async fn read_wake_horizon_publication(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeHorizonPublication> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("Wake horizon publication readback: {error}")))?;
+        validate_horizon_denominator(&request)?;
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        let mut acknowledged = Vec::with_capacity(request.entries.len());
+        let mut remaining = Vec::new();
+        for entry in &request.entries {
+            let operation = horizon_wake_operation_identity(&request, entry)?;
+            let mut retained = snapshot
+                .wakes
+                .iter()
+                .filter(|wake| wake.wake_id.as_str() == entry.occurrence_id.as_str());
+            let Some(wake) = retained.next() else {
+                remaining.push(entry.occurrence_id.clone());
+                continue;
+            };
+            if retained.next().is_some() {
+                return Err(UserAutomationRuntimeError::IdentityConflict);
+            }
+            if wake.operation != operation || wake.intent != entry.wake_intent {
+                return Err(UserAutomationRuntimeError::IdentityConflict);
+            }
+            // The retained value is checked by the owner's own checksum
+            // function, which re-runs `WakeRecord::validate` on the ORIGINAL
+            // record read back from this journal. Nothing is recomputed here.
+            record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
+            acknowledged.push(entry.occurrence_id.clone());
+        }
+        if acknowledged.is_empty() {
+            // The snapshot above was read successfully, so this is a complete
+            // negative answer from the sole owner of this journal: it retains no
+            // wake published by this operation. It is deliberately not
+            // `Unavailable`, and it is not proof that a lost publication call
+            // never issued its effect — only that this owner holds nothing
+            // under the identity being reconciled.
+            return Err(UserAutomationRuntimeError::NotRetained(
+                "the Host journal retains no wake published by this horizon publication operation"
+                    .to_owned(),
+            ));
+        }
+        horizon_acknowledgement(&request, acknowledged, remaining)
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,
@@ -273,6 +390,229 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             .map_err(|error| rejected(format!("Wake receipt validation: {error}")))?;
         Ok(receipt)
     }
+}
+
+/// Domain separator for the deterministic per-occurrence Host operation
+/// identity of one bounded horizon publication.
+const WAKE_HORIZON_OPERATION_DOMAIN: &str = "eliot.user_automation.wake-horizon-publication.v1";
+
+/// Checks the requested slice against the denominator the request itself
+/// declares.
+///
+/// `UserAutomationWakeHorizonPublication::validate` proves the denominator is a
+/// unique, non-empty list and the entries are well formed, but it cannot see
+/// the revision. This owner does not hold the revision either, so it checks the
+/// relation it can prove from the request alone: the published slice must be a
+/// contiguous run of the declared denominator in that denominator's own order.
+/// An occurrence outside the denominator, a gap, or a reordering is refused
+/// before any record is written, so this owner can neither widen nor reorder
+/// nor extend the publication's occurrence denominator.
+fn validate_horizon_denominator(
+    request: &UserAutomationWakeHorizonPublication,
+) -> Result<(), UserAutomationRuntimeError> {
+    let denominator = &request.denominator_occurrence_ids;
+    let start = denominator
+        .iter()
+        .position(|occurrence_id| *occurrence_id == request.entries[0].occurrence_id)
+        .ok_or_else(|| {
+            rejected("the published slice starts outside the declared occurrence denominator")
+        })?;
+    for (offset, entry) in request.entries.iter().enumerate() {
+        if denominator.get(start + offset) != Some(&entry.occurrence_id) {
+            return Err(rejected(
+                "the published slice is not a contiguous run of the declared occurrence \
+                 denominator in its own order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Returns the current Host activation fence that owns every journal record.
+///
+/// The fence is the journal's own, read from the live activation projection
+/// rather than supplied by a caller: the reducer refuses a record whose
+/// activation identity or generation is not the current one, so a wake cannot
+/// be retained under a fence this Host does not hold. A journal with no live
+/// activation has no fence to write under, which is a typed refusal here and
+/// not a synthesized one.
+fn live_activation_fence(snapshot: &HostState) -> Result<RecordFence, UserAutomationRuntimeError> {
+    snapshot
+        .activation
+        .as_ref()
+        .map(|activation| activation.fence.clone())
+        .ok_or_else(|| {
+            rejected("the Host journal retains no live activation generation to own a wake record")
+        })
+}
+
+/// Derives the Host journal operation identity of one published occurrence.
+///
+/// The identity is a pure function of the publication operation identity, the
+/// immutable revision and its digest, and the occurrence's own compiled
+/// identity, trigger key, and source digest. A replay of the same publication
+/// therefore re-derives the same identity for the same occurrence, and the
+/// journal's `applied_operations` index resolves that repeated identity to the
+/// record it already holds. That is what makes a duplicate publication a
+/// replay of one retained wake rather than a second wake; the identity is never
+/// taken from the request unchecked, and a different occurrence, revision, or
+/// publication yields a different identity.
+fn horizon_wake_operation_identity(
+    request: &UserAutomationWakeHorizonPublication,
+    entry: &UserAutomationWakeHorizonEntry,
+) -> Result<IdempotencyIdentity, UserAutomationRuntimeError> {
+    let bytes = canonical_json_bytes(&(
+        WAKE_HORIZON_OPERATION_DOMAIN,
+        request.identity.operation_id.as_str(),
+        request.identity.idempotency_key.as_str(),
+        request.automation_id.as_str(),
+        request.automation_revision.as_str(),
+        request.revision_digest.as_str(),
+        entry.occurrence_id.as_str(),
+        entry.occurrence_key.as_str(),
+        entry.source_digest.as_str(),
+    ))
+    .map_err(|error| rejected(format!("Wake horizon operation identity encoding: {error}")))?;
+    let digest = sha256_hex(&bytes);
+    Ok(IdempotencyIdentity {
+        operation_id: wake_handle(format!("ua-wake-publish:{digest}"), "operation_id")?,
+        idempotency_key: wake_handle(format!("ua-wake-publish-key:{digest}"), "idempotency_key")?,
+    })
+}
+
+/// Builds the one journal record that retains one requested occurrence.
+///
+/// The record grants nothing. `intent` is the revision's own compiled
+/// owner-contract wake intent, which I1.5 makes inert: it schedules work and
+/// carries no task, route, tool, effect, or delivery authority, and every
+/// target, capability, policy, budget, and State Fence is revalidated on wake.
+///
+/// The remaining fields are the C0-04 wake contract's opaque owner handles.
+/// They are bound to this publication's immutable content rather than to an
+/// ambient clock, which is what keeps a replay byte-identical:
+///
+/// - `reason_evidence_refs` names the compiled schedule source digest, the
+///   immutable revision digest, and the exact owner-normalized occurrence key,
+///   so the retained record cites the trigger basis it was published for;
+/// - `earliest_start`, `deadline`, and `expiry` name that same owner-normalized
+///   occurrence. The accepted revision's normalized contract supplies exactly
+///   one instant per occurrence, so this boundary derives no other time: a
+///   catch-up or deadline policy is not part of the contract being published
+///   and inventing one here would put a time in the journal that the revision
+///   never normalized;
+/// - `required_capabilities` names the existing UserAutomation kernel
+///   capability the due-wake consumer must hold, reusing the constant this
+///   operation family already spells rather than introducing a new vocabulary;
+/// - `maintenance_family` and `budget_ref` are bound to the immutable
+///   automation and revision this occurrence belongs to;
+/// - `state_fence_revalidation_ref` is the canonical digest of the exact
+///   publishing State Fence, and the intent carries that same fence.
+fn horizon_wake_record(
+    request: &UserAutomationWakeHorizonPublication,
+    entry: &UserAutomationWakeHorizonEntry,
+    fence: RecordFence,
+) -> Result<WakeRecord, UserAutomationRuntimeError> {
+    let fence_digest = sha256_hex(
+        &canonical_json_bytes(&request.state_fence)
+            .map_err(|error| rejected(format!("Wake State Fence encoding: {error}")))?,
+    );
+    Ok(WakeRecord {
+        fence,
+        operation: horizon_wake_operation_identity(request, entry)?,
+        // `UserAutomationWakeHorizonPublication::validate` has already proved
+        // that the entry's intent wake id is this occurrence, which is the
+        // identity `WakeRecord::validate` requires the record to carry.
+        wake_id: wake_handle(entry.occurrence_id.clone(), "wake_id")?,
+        intent: entry.wake_intent.clone(),
+        reason_evidence_refs: vec![
+            wake_handle(
+                format!("ua-wake-source:{}", entry.source_digest),
+                "reason_evidence_ref",
+            )?,
+            wake_handle(
+                format!("ua-wake-revision:{}", request.revision_digest),
+                "reason_evidence_ref",
+            )?,
+            wake_handle(
+                format!("ua-wake-occurrence:{}", entry.occurrence_key),
+                "reason_evidence_ref",
+            )?,
+        ],
+        earliest_start: wake_handle(
+            format!("ua-wake-earliest:{}", entry.occurrence_key),
+            "earliest_start",
+        )?,
+        deadline: wake_handle(
+            format!("ua-wake-deadline:{}", entry.occurrence_key),
+            "deadline",
+        )?,
+        expiry: wake_handle(
+            format!("ua-wake-expiry:{}", entry.occurrence_key),
+            "expiry",
+        )?,
+        required_capabilities: vec![wake_handle(
+            USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
+            "required_capability",
+        )?],
+        maintenance_family: wake_handle(
+            format!("ua-wake-family:{}", request.automation_id),
+            "maintenance_family",
+        )?,
+        safety_class: ServiceSafetyClass::ServiceSafe,
+        state_fence_revalidation_ref: wake_handle(
+            format!("ua-wake-revalidation:{fence_digest}"),
+            "state_fence_revalidation_ref",
+        )?,
+        budget_ref: wake_handle(
+            format!(
+                "ua-wake-budget:{}:{}",
+                request.revision_digest, entry.occurrence_id
+            ),
+            "budget_ref",
+        )?,
+    })
+}
+
+/// Builds the owner's acknowledgement over exactly the occurrences it retains.
+///
+/// The answer is then checked against the exact request with
+/// [`UserAutomationWakePublication::validate_for`], which re-derives the
+/// requested set from the request itself and requires the acknowledged and
+/// remaining sets to be disjoint, duplicate-free, and together exactly that
+/// set, beside the echoed publication identity and the derived retry handle. An
+/// answer this owner cannot make over the requested set is therefore a typed
+/// error, never a horizon a caller may report as published.
+fn horizon_acknowledgement(
+    request: &UserAutomationWakeHorizonPublication,
+    acknowledged: Vec<String>,
+    remaining: Vec<String>,
+) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+    let retry_handle = request
+        .retry_handle(&remaining)
+        .map_err(|error| rejected(format!("Wake horizon retry handle: {error}")))?;
+    let acknowledgement = UserAutomationWakePublication {
+        automation_id: request.automation_id.clone(),
+        automation_revision: request.automation_revision.clone(),
+        revision_digest: request.revision_digest.clone(),
+        state_fence: request.state_fence.clone(),
+        publication_operation_id: request.identity.operation_id.clone(),
+        publication_idempotency_key: request.identity.idempotency_key.clone(),
+        acknowledged_occurrence_ids: acknowledged,
+        remaining_occurrence_ids: remaining,
+        retry_handle,
+    };
+    acknowledgement
+        .validate_for(request)
+        .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+    Ok(acknowledgement)
+}
+
+fn wake_handle(
+    value: String,
+    field: &'static str,
+) -> Result<PlatformHandle, UserAutomationRuntimeError> {
+    PlatformHandle::new(value)
+        .map_err(|_| rejected(format!("wake {field} is not a valid Host handle")))
 }
 
 struct HostWakeSnapshotEvidence {
