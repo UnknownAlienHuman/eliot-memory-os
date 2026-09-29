@@ -12,10 +12,14 @@
 //! `ProgramData`-anchor dependency.
 //!
 //! The proof is structural, not textual. It revalidates the selected
-//! current-user or repository anchor, compares each resolved I3.1 role to its
-//! exact profile layout, and requires the profile to claim neither SCM
-//! supervision nor administrative authority. Non-service selection does not
-//! query, receive, or depend on a ProgramData anchor.
+//! current-user or repository anchor through the existing OS adapter, retains
+//! that anchor as a real no-follow root object wherever the OS lease contract
+//! admits it, compares each resolved I3.1 role to its exact profile layout
+//! beneath the retained object, and requires the profile to claim neither SCM
+//! supervision nor administrative authority. A layout that only matches a
+//! predictable path name is not verified root ownership and is never counted as
+//! such. Non-service selection does not query, receive, or depend on a
+//! `ProgramData` anchor.
 //!
 //! Normative basis: I3.1 (exact layouts, default profile, supervision, and
 //! owner/session binding). This module resolves no new root and mints no
@@ -29,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use super::profile_governed_roots::ProfileGovernedRoots;
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
 use super::{
-    InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
-    joined_windows_path, text,
+    InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider, joined_windows_path,
+    text,
 };
 
 /// The supervision path a selected profile is intended to use.
@@ -103,10 +107,16 @@ pub struct NoServiceProfileAuthorityProof {
     /// Whether the selected profile claims administrative authority. Always
     /// `false` for a value this type can exist for.
     pub requires_admin: bool,
-    /// Whether selection requires an OS-known ProgramData anchor. Always
+    /// Whether selection requires an OS-known `ProgramData` anchor. Always
     /// `false` for a value this type can exist for.
     pub requires_program_data_anchor: bool,
-    /// Number of I3.1 root roles whose exact profile layout was verified.
+    /// Number of I3.1 root roles whose exact profile layout was verified
+    /// against a retained, reparse-free, no-follow OS root object.
+    ///
+    /// A role is counted only when its resolved path was derived from a
+    /// retained root lease and the lease was proven to bind that same root
+    /// object. A role whose path merely equals a constructed string is not
+    /// counted; a predictable name is not ownership.
     pub verified_root_roles: u32,
 }
 
@@ -226,8 +236,8 @@ impl ProfileGovernedRoots {
 /// 3. the profile does not claim SCM supervision or administrative authority.
 ///
 /// This proof does not claim lexical exclusion from a hypothetical
-/// ProgramData path. Non-service selection receives no ProgramData anchor and
-/// makes no ProgramData known-folder query.
+/// `ProgramData` path. Non-service selection receives no `ProgramData` anchor and
+/// makes no `ProgramData` known-folder query.
 ///
 /// # Errors
 ///

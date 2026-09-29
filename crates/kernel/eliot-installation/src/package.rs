@@ -47,6 +47,10 @@ pub(super) fn validate_package_relative_text(
         })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the candidate package and effect ordering are checked in one binding gate"
+)]
 pub(super) fn validate_package_binding(
     candidate_manifest: &CandidateManifest,
     transaction_staging_root: &PlatformHandle,

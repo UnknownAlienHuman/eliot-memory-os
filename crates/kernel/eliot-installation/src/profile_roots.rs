@@ -192,9 +192,9 @@ impl InstallationRoots {
     ///
     /// `system_service` and `user_mode` retain the I3.1 durable-data root as
     /// their top-level state contour and refine it into per-installation
-    /// runtime directories. UserMode's data, config, and cache roles are
+    /// runtime directories. `UserMode`'s data, config, and cache roles are
     /// checked against the exact sibling layout derived from its retained
-    /// LocalAppData anchor. `portable_dev` is explicitly disposable, so
+    /// `LocalAppData` anchor. `portable_dev` is explicitly disposable, so
     /// profile agreement and root separation above are its complete join.
     fn validate_durable_runtime_join(
         &self,

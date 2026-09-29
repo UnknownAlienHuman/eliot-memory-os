@@ -359,7 +359,7 @@ pub enum InstallationEffectProgressState {
         /// Stable evidence/reference requiring recovery.
         pending_ref: PlatformHandle,
     },
-    /// The original committed UserMode authority intent was authoritatively
+    /// The original committed `UserMode` authority intent was authoritatively
     /// absent after a restart. This effect is terminal for this transaction:
     /// its lost in-memory seed is never regenerated under the same identity.
     NoEffectAborted {
@@ -410,7 +410,7 @@ pub struct InstallationEffectProgress {
     /// Complete typed Host Phase-B receipt, present only for
     /// `MaterializePhaseB`.
     pub phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
-    /// Original pre-write current-user UserMode authority receipt. It is
+    /// Original pre-write current-user `UserMode` authority receipt. It is
     /// committed with the intent and is never reconstructed from a later
     /// Credential Manager observation.
     pub user_mode_authority_receipt:
@@ -1268,11 +1268,7 @@ impl InstallationTransaction {
         let mut approvals = Vec::new();
         let mut roles = BTreeSet::new();
         let mut nonces = BTreeSet::<PlatformHandle>::new();
-        for (effect, progress) in self
-            .installer_effects
-            .iter()
-            .zip(&self.effect_progress)
-        {
+        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
             let InstallerEffectPlan::RegisterService {
                 effect_id,
                 role,
@@ -2992,6 +2988,10 @@ pub(super) fn decode_installation_transaction_json_from_store(
     decode_installation_transaction_json_with_policy(bytes, true)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "every current transaction progress member is checked in one wire gate"
+)]
 fn validate_current_transaction_progress(
     value: &serde_json::Value,
 ) -> Result<(), InstallationError> {
