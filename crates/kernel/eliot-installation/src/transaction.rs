@@ -2534,7 +2534,7 @@ impl InstallationTransaction {
                 // adoption block still holds; no original effect is lost, and
                 // the retained reference still records the uncertainty.
                 Err(InstallationError::IllegalTransition { .. }) => {
-                    self.pending_external_changes = evidence_refs.clone();
+                    self.pending_external_changes.clone_from(&evidence_refs);
                     self.revision = self.revision.checked_add(1).ok_or_else(|| {
                         InstallationError::InvalidField {
                             field: "revision".to_owned(),

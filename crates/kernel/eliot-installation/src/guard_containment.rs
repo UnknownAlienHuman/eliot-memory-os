@@ -85,17 +85,14 @@ impl RetainedGuardRevert {
                 field: "guard_revert".to_owned(),
                 reason: error.to_string(),
             })?;
-        match &self.reconciliation {
-            Some(reference) => {
-                if self.outcome.next_action == RequiredNextAction::ContinueNormally {
-                    return Err(InstallationError::IncompleteObservation(
-                        "a continuation-safe guard outcome cannot retain an owner reconciliation"
-                            .to_owned(),
-                    ));
-                }
-                sha256_handle(reference, "guard_revert.reconciliation")?;
+        if let Some(reference) = &self.reconciliation {
+            if self.outcome.next_action == RequiredNextAction::ContinueNormally {
+                return Err(InstallationError::IncompleteObservation(
+                    "a continuation-safe guard outcome cannot retain an owner reconciliation"
+                        .to_owned(),
+                ));
             }
-            None => {}
+            sha256_handle(reference, "guard_revert.reconciliation")?;
         }
         Ok(())
     }
