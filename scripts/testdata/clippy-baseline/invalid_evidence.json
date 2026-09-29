@@ -1,0 +1,355 @@
+{
+  "schema": "eliot.clippy-baseline.invalid-evidence.v1",
+  "issue": 838,
+  "purpose": "Finite source/diagnostic/result mutations used by the negative cases of scripts/tests/test_clippy_baseline_acceptance.py. Every entry is a deliberately invalid ledger row, ledger set, source fragment or recorded command. The acceptance suite must REJECT every one of them through the same validator it applies to real current evidence. A mutation that the suite accepts is a hole in the oracle, not a licence.",
+  "row_schema": [
+    "key",
+    "kind",
+    "path",
+    "line",
+    "lint",
+    "target_class",
+    "disposition",
+    "owner",
+    "reason",
+    "removal_condition",
+    "focused_proof",
+    "reachability"
+  ],
+  "valid_dispositions": [
+    "FIXED_MECHANICAL",
+    "FIXED_ITEM_EXPECTATION",
+    "ACCEPTED_NARROW_EXPECTATION",
+    "ALREADY_RESOLVED_CURRENT_EVIDENCE",
+    "OWNER_BLOCKED",
+    "SEPARATE_CAUSAL_ISSUE"
+  ],
+  "mutations": {
+    "row_lint_missing": {
+      "targets": "row",
+      "rejects": "a row without a lint identity cannot be reconciled to a diagnostic",
+      "record": {
+        "key": "mutation/lint-missing",
+        "kind": "current",
+        "path": "crates/eliot-app/src/mcp_stdio/task.rs",
+        "line": 1280,
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "ordered end-to-end projection scenario",
+        "removal_condition": "scenario split",
+        "focused_proof": "test_16_too_many_lines_preserves_named_ordered_scenario",
+        "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::dispatch"
+      }
+    },
+    "row_disposition_unknown": {
+      "targets": "row",
+      "rejects": "'unknown' is not a disposition; blocked is not a clean complete result",
+      "record": {
+        "key": "mutation/disposition-unknown",
+        "kind": "current",
+        "path": "crates/eliot-app/src/mcp_stdio/task.rs",
+        "line": 1280,
+        "lint": "clippy::too_many_lines",
+        "target_class": "production",
+        "disposition": "unknown",
+        "owner": "838",
+        "reason": "ordered scenario",
+        "removal_condition": "scenario split",
+        "focused_proof": "test_16_too_many_lines_preserves_named_ordered_scenario",
+        "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::dispatch"
+      }
+    },
+    "row_no_focused_proof": {
+      "targets": "row",
+      "rejects": "a non-documentation correction without a focused equivalence proof",
+      "record": {
+        "key": "mutation/no-focused-proof",
+        "kind": "current",
+        "path": "crates/eliot-app/tests/dogfood_runtime.rs",
+        "line": 510,
+        "lint": "clippy::manual_contains",
+        "target_class": "test",
+        "disposition": "FIXED_MECHANICAL",
+        "owner": "838",
+        "reason": "iter().any(.. == ..) rewritten as Vec::contains",
+        "removal_condition": "none, mechanical",
+        "focused_proof": "",
+        "reachability": "crates/eliot-app/tests/dogfood_runtime.rs::assert_codex_exec_plan"
+      }
+    },
+    "expectation_without_reason": {
+      "targets": "row",
+      "rejects": "an exception with no concrete reason",
+      "record": {
+        "key": "mutation/expect-no-reason",
+        "kind": "current",
+        "path": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs",
+        "line": 1245,
+        "lint": "clippy::expect_used",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "",
+        "removal_condition": "diagnostic assertion boundary replaced by typed result",
+        "focused_proof": "test_13_production_expectations_narrow_and_justified",
+        "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::handle_tool_call"
+      }
+    },
+    "expectation_reason_is_symmetry_only": {
+      "targets": "row",
+      "rejects": "'kept whole' / 'signature symmetry' is not a concrete reason",
+      "record": {
+        "key": "mutation/expect-symmetry-only",
+        "kind": "current",
+        "path": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs",
+        "line": 1245,
+        "lint": "clippy::expect_used",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "kept whole for signature symmetry",
+        "removal_condition": "diagnostic assertion boundary replaced by typed result",
+        "focused_proof": "test_13_production_expectations_narrow_and_justified",
+        "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::handle_tool_call"
+      }
+    },
+    "semantic_lint_suppressed": {
+      "targets": "row",
+      "rejects": "a semantic diagnostic hidden behind a suppression",
+      "record": {
+        "key": "mutation/semantic-suppressed",
+        "kind": "current",
+        "path": "bins/eliotd/src/lib.rs",
+        "line": 2002,
+        "lint": "clippy::result_large_err",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "typed DaemonError is the public error domain; boxing it would change the wire type",
+        "removal_condition": "DaemonError is boxed at the protocol boundary",
+        "focused_proof": "test_27_semantic_diagnostics_not_hidden_by_suppression",
+        "reachability": "bins/eliotd/src/lib.rs::handle_activation_claim"
+      }
+    },
+    "copy_by_ref_hot_path_exemption": {
+      "targets": "row",
+      "rejects": "'hot path' alone is an unsupported exemption for a copy-by-reference expectation",
+      "record": {
+        "key": "mutation/hot-path-only",
+        "kind": "current",
+        "path": "bins/eliot-host/src/main.rs",
+        "line": 934,
+        "lint": "clippy::trivially_copy_pass_by_ref",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "hot path, do not copy",
+        "removal_condition": "argument is passed by value",
+        "focused_proof": "test_17_copy_by_reference_expectation_has_contract_justification",
+        "reachability": "bins/eliot-host/src/main.rs::main"
+      }
+    },
+    "argument_count_derived_context": {
+      "targets": "row",
+      "rejects": "an argument-count expectation justified by a context that is re-derivable elsewhere",
+      "record": {
+        "key": "mutation/derived-argument-context",
+        "kind": "current",
+        "path": "bins/eliotd/src/lib.rs",
+        "line": 1128,
+        "lint": "clippy::too_many_arguments",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "context bundle could be regrouped from the config already loaded",
+        "removal_condition": "arguments regrouped into a typed context struct",
+        "focused_proof": "test_18_argument_count_expectation_preserves_non_rederived_context_contract",
+        "reachability": "bins/eliotd/src/lib.rs::AgentActivationResolver::resolve_agent_activation_v2"
+      }
+    },
+    "unproven_owner_claim": {
+      "targets": "row",
+      "rejects": "a retained path claimed under an owner that the current source does not prove",
+      "record": {
+        "key": "mutation/unproven-owner",
+        "kind": "current",
+        "path": "crates/eliot-app/src/host_runtime/event_and_authority.rs",
+        "line": 909,
+        "lint": "dead_code",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "#839",
+        "reason": "#839 owns the daemon wiring that will call this",
+        "removal_condition": "#839 lands the daemon wiring",
+        "focused_proof": "test_23_remaining_exact_unwired_annotations_name_owner_and_removal_condition",
+        "reachability": "NONE"
+      }
+    },
+    "reachability_from_test_only": {
+      "targets": "row",
+      "rejects": "a mapping unit test cannot be labelled daemon/production reachability",
+      "record": {
+        "key": "mutation/test-only-reachability",
+        "kind": "current",
+        "path": "bins/eliotd/src/activation_projection.rs",
+        "line": 201,
+        "lint": "dead_code",
+        "target_class": "production",
+        "disposition": "ALREADY_RESOLVED_CURRENT_EVIDENCE",
+        "owner": "838",
+        "reason": "covered by bins/eliotd/tests/activation_resolution_dispatch.rs",
+        "removal_condition": "none, resolved",
+        "focused_proof": "test_21_complete_current_projection_call_graph_and_historical_five_reconciliation",
+        "reachability": "bins/eliotd/tests/activation_resolution_dispatch.rs::activation_v2_mapping_is_reachable_from_production"
+      }
+    },
+    "out_of_scope_row_unowned": {
+      "targets": "row",
+      "rejects": "an out-of-scope diagnostic with no recorded owner disappears from accounting",
+      "record": {
+        "key": "mutation/unowned-out-of-scope",
+        "kind": "current",
+        "path": "crates/governor/eliot-coordination/src/work_lease_issuance.rs",
+        "line": 271,
+        "lint": "clippy::needless_pass_by_value",
+        "target_class": "production",
+        "disposition": "SEPARATE_CAUSAL_ISSUE",
+        "owner": "",
+        "reason": "different owner",
+        "removal_condition": "n/a",
+        "focused_proof": "test_26_other_active_source_owner_warning_gets_explicit_handoff",
+        "reachability": "crates/governor/eliot-coordination/src/lib.rs::issue_work_lease"
+      }
+    },
+    "forged_clean_claim": {
+      "targets": "set",
+      "rejects": "a recorded result claiming a clean/production/release ceiling it cannot prove",
+      "record": {
+        "claim_ceiling": "RELEASE_ACCEPTED",
+        "current_warning_count": 0,
+        "workspace_check_exit": 0,
+        "workspace_clippy_deny_exit": 0
+      }
+    },
+    "historical_count_forced": {
+      "targets": "set",
+      "rejects": "the current count restated as the historical 97 instead of derived from the base",
+      "record": {
+        "historical_total": 97,
+        "historical_test_context": 62,
+        "historical_production_context": 35,
+        "current_total": 97,
+        "current_source": "issue narrative"
+      }
+    },
+    "path_outside_whitelist": {
+      "targets": "set",
+      "rejects": "a production diff outside the frozen 28-path whitelist",
+      "record": {
+        "changed_paths": [
+          "crates/governor/eliot-coordination/src/work_lease_issuance.rs",
+          "scripts/tests/test_clippy_baseline_acceptance.py",
+          "scripts/testdata/clippy-baseline/invalid_evidence.json"
+        ]
+      }
+    },
+    "warning_downgrade": {
+      "targets": "set",
+      "rejects": "a lint level downgrade or a package/target exclusion",
+      "record": {
+        "added_lines": [
+          "clippy::expect_used = \"allow\"",
+          "expect = [\"crates/eliot-app\"]"
+        ]
+      }
+    },
+    "broad_workspace_suppression": {
+      "targets": "set",
+      "rejects": "a broad warning / Clippy-group / workspace suppression",
+      "record": {
+        "added_lines": [
+          "#![allow(warnings)]",
+          "#![allow(clippy::all)]",
+          "RUSTFLAGS=\"-A warnings\""
+        ]
+      }
+    },
+    "module_wide_dead_code": {
+      "targets": "set",
+      "rejects": "a production module-level dead_code suppression",
+      "record": {
+        "added_lines": [
+          "#![allow(dead_code)]"
+        ]
+      }
+    },
+    "api_wire_change": {
+      "targets": "set",
+      "rejects": "a public API / wire / Serde / feature / cfg change",
+      "record": {
+        "added_lines": [
+          "pub fn map_governor_outcome_to_protocol(ticket: &AgentActivationResolutionTicket, outcome: GovernorActivationOutcome, now: u64, strict: bool) -> Result<AgentActivationResolutionResult, DaemonError>",
+          "#[cfg(feature = \"legacy-mapping\")]"
+        ]
+      }
+    },
+    "doc_correction_drops_production_token": {
+      "targets": "set",
+      "rejects": "a documentation correction that removes a production token",
+      "record": {
+        "path": "crates/eliot-app/src/mcp_stdio/task.rs",
+        "before_production_tokens": ["AgentActivationResolutionResult", "map_governor_outcome_to_protocol", "HostLaunchScope"],
+        "after_production_tokens": ["AgentActivationResolutionResult", "HostLaunchScope"]
+      }
+    },
+    "buffer_correction_changes_hashed_bytes": {
+      "targets": "set",
+      "rejects": "a buffer correction that changes the exact hashed bytes or the hash result",
+      "record": {
+        "path": "crates/eliot-store/src/surreal_server.rs",
+        "before_digest_of_hashed_region": "9f2c1d0a",
+        "after_digest_of_hashed_region": "9f2c1d0b"
+      }
+    },
+    "conversion_changes_error_domain": {
+      "targets": "set",
+      "rejects": "a conversion correction that changes the error domain or the message class",
+      "record": {
+        "path": "bins/eliotd/src/activation_projection.rs",
+        "before_error_variants": ["DaemonError::StaleFence", "DaemonError::FailedInternal", "DaemonError::TaskSelectionRequired"],
+        "after_error_variants": ["DaemonError::FailedInternal", "DaemonError::TaskSelectionRequired"]
+      }
+    },
+    "secret_canary": {
+      "targets": "set",
+      "rejects": "a protected/secret canary leaking into changed diagnostics",
+      "record": {
+        "added_lines": [
+          "let api_key = \"sk-canary-838-DO-NOT-COMMIT\";"
+        ]
+      }
+    },
+    "stderr_before_structured_failure": {
+      "targets": "set",
+      "rejects": "last-resort stderr used before the structured output has failed",
+      "record": {
+        "added_lines": [
+          "eprintln!(\"dispatching activation\");",
+          "let result = map_governor_outcome_to_protocol(ticket, outcome, now)?;"
+        ]
+      }
+    },
+    "truncated_stream": {
+      "targets": "stream",
+      "rejects": "a JSON stream whose last record is a partial line",
+      "record": {
+        "note": "produced at run time by slicing the live stream; not authored evidence"
+      }
+    }
+  },
+  "real_gate_probes": {
+    "dead_function_source": "// #838 real-gate probe: one unrelated dead item in an otherwise clean module.\npub fn kept() -> u32 {\n    1\n}\n\nfn unrelated_dead_probe() -> u32 {\n    2\n}\n",
+    "clean_control_source": "// #838 real-gate probe: the same module with no dead item.\npub fn kept() -> u32 {\n    1\n}\n"
+  }
+}
