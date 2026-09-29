@@ -3229,7 +3229,7 @@ fn record_or_validate_profile_selection_receipt(
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
     let current = leases.selection().clone();
-    if let Some(original) = transaction.profile_selection_receipt.as_ref() {
+    if let Some(original) = transaction.profile_selection_receipt() {
         let matches = eliot_installation::profile_selection_receipts_match_retained_roots(
             original, &current,
         )?;
@@ -3249,7 +3249,7 @@ fn record_or_validate_profile_selection_receipt(
     leases
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    if recorded.profile_selection_receipt.is_none() {
+    if recorded.profile_selection_receipt().is_none() {
         return Err(InstallationError::IncompleteObservation(
             "profile root identities were not retained in the durable transaction".to_owned(),
         ));
