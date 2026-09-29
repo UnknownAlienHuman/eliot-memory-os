@@ -25,11 +25,16 @@
 //!
 //! Where the canonical bytes come from: a batch's [`SnapshotMember`] list
 //! supplies identities, digests and residency metadata, and is never a payload
-//! source. Each importable member's canonical logical payload is resolved
-//! through the archive/artifact owner's own carrier row, keyed by that batch's
-//! archive member digest and the member's domain-qualified logical identity, and
-//! every field of the carrier is compared against the batch's own member before
-//! the payload is used — including the owner's attested payload digest, which is
+//! source. The retained reference the batch carries is the only content input,
+//! and it reaches the port the way the owner contract intends: at admission this
+//! port *publishes* each retained member as its own carrier row, keyed by that
+//! batch's archive member digest, its admitted operation and the member's
+//! domain-qualified logical identity, and every identity field of that row is
+//! taken from the batch while only the payload, its owner-attested digest and
+//! its declared length come from the retained reference. Resolution then reads
+//! those rows back — the ones this operation wrote, under this operation's own
+//! key — and compares every field against the batch's own member before the
+//! payload is used, including the owner's attested payload digest, which is
 //! validated against the bytes the carrier actually holds. An absent carrier is
 //! an unresolved member, never a member with empty content. The resolved
 //! payloads stay private to this execution path and are re-read out of the
@@ -80,10 +85,10 @@ use eliot_store_api::{
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
     IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS,
     OperationId, OperationIdentity, OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord,
-    RequestMeta, RestoreValidationReceipt, RevisionHeadExpectation, SnapshotCompleteness,
-    SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreBackupRequest,
-    StoreError, StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation,
-    sha256_hex,
+    RequestMeta, RestoreValidationReceipt, RetainedArchiveMember, RevisionHeadExpectation,
+    SnapshotCompleteness, SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence,
+    StoreBackupRequest, StoreError, StoreMutationDisposition, canonical_json_bytes,
+    reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -275,10 +280,16 @@ impl RestoreRecordClass {
 /// The batch's [`SnapshotMember`] supplies identities, digests and residency
 /// metadata only; it is not a payload source. These rows are the owner-side
 /// carrier the resolution step reads back, and every field named here is
-/// compared against the batch's own member before the payload is used.
+/// compared against the batch's own member before the payload is used. This port
+/// publishes the row under the admitted operation, and the operation identity
+/// travels inside the document, so a row that merely exists is never this
+/// operation's evidence: its content is compared with the operation claiming it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArchiveMemberCarrier {
+    /// Admitted restore operation this carrier row was published under; a
+    /// resolution under any other operation never reads this row.
+    operation_id: String,
     /// Store id of the source snapshot this payload was captured from.
     source_store_id: String,
     /// Installation id of the source snapshot this payload was captured from.
@@ -321,6 +332,7 @@ struct ArchiveMemberCarrier {
 impl ArchiveMemberCarrier {
     /// Validates the carrier's own shape.
     fn validate(&self) -> Result<(), StoreError> {
+        reject_blank_text(&self.operation_id, "restore.carrier_operation_id")?;
         reject_blank_text(&self.source_store_id, "restore.carrier_source_store_id")?;
         reject_blank_text(
             &self.source_installation_id,
@@ -1976,18 +1988,22 @@ fn purge_scope_key(source_installation_id: &str) -> String {
 
 /// Derives the archive-member carrier row key for one batch member.
 ///
-/// The key binds the admitted archive member digest and the member's own
-/// domain-qualified logical identity, so the carrier row a batch resolves is
-/// the one the archive/artifact owner published for exactly that member under
-/// exactly that archive. A caller cannot name another member's carrier row.
+/// The key binds the admitted archive member digest, the admitted restore
+/// operation and the member's own domain-qualified logical identity, so the
+/// carrier row a batch resolves is the one this operation published for exactly
+/// that member under exactly that archive — and a row another operation
+/// published for the same member is not found, let alone reused. A caller cannot
+/// name another member's carrier row.
 fn archive_member_key(
-    archive_member_digest: &str,
+    batch: &CanonicalRestoreBatch,
     member: &eliot_store_api::SnapshotMember,
 ) -> String {
     registry_key(
         crate::client::RESTORE_KEY_ARCHIVE_MEMBER_PREFIX,
         &format!(
-            "{archive_member_digest}:{}:{}",
+            "{}:{}:{}:{}",
+            batch.archive_member_digest,
+            batch.operation.operation_id,
             member.member_id,
             member.logical_identity()
         ),
@@ -2367,19 +2383,204 @@ fn purge_observation(
     })
 }
 
+/// One carrier row this operation publishes, with the document it encodes.
+struct PublishedCarrier {
+    /// Admitted member the carrier answers for.
+    member: SnapshotMember,
+    /// Carrier document published under this operation's own key.
+    carrier: ArchiveMemberCarrier,
+    /// Durable registry row that encodes it.
+    row: RecoveryRecord,
+}
+
+/// Publishes the archive-member carrier rows this operation resolves from.
+///
+/// The port may only import a member whose canonical logical payload it holds
+/// durably under its own operation, so this is where the owner contract's
+/// retained reference becomes the carrier row [`read_archive_member`] reads
+/// back. The whole bounded set lands in one provider transaction, so resolution
+/// sees every member this operation retained or none of them — never a
+/// half-published batch that would report some members restored and leave the
+/// rest silently unresolved.
+///
+/// A member with no retained reference is not published: an absent payload is
+/// not an empty one, and the member then stays unresolved. A member that is
+/// purge-suppressed is not published either, so a record the current ledger
+/// keeps out of the destination never has its bytes staged in it.
+///
+/// Publication is create-only. A duplicate is resolved by reading this
+/// operation's own row back and comparing its content, so an exact replay of
+/// the same operation continues while a row carrying different content under
+/// this operation's key is an identity conflict.
+///
+/// The retained bytes are charged to the same bound as the commit, and charged
+/// *before* they land: a batch that would exceed the destination's byte bound is
+/// refused, never written first and refused afterwards.
+async fn publish_archive_member_carriers(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    batch: &CanonicalRestoreBatch,
+    state_fence: &StateFence,
+    cumulative_bytes: u64,
+    exposure: &mut RestoreEffectExposure,
+) -> Result<Vec<PublishedCarrier>, StoreError> {
+    let mut published: Vec<PublishedCarrier> = Vec::new();
+    for member in &batch.members {
+        // A reference edge names a canonical object; it is not one. Publishing a
+        // payload for it would let the import mint a destination record for an
+        // edge, so no carrier is published for it.
+        if member.member_type == SnapshotMemberType::Reference {
+            continue;
+        }
+        let Some(retained) = batch
+            .retained_members
+            .iter()
+            .find(|retained| retained.member_id == member.member_id)
+        else {
+            continue;
+        };
+        let carrier = carrier_for(batch, member, retained)?;
+        let (payload, value_digest) = encode_document(&carrier)?;
+        published.push(PublishedCarrier {
+            member: member.clone(),
+            carrier,
+            row: registry_row(
+                &archive_member_key(batch, member),
+                crate::client::RESTORE_SCHEMA_ARCHIVE_MEMBER,
+                state_fence,
+                1,
+                payload,
+                value_digest,
+            ),
+        });
+    }
+    if published.is_empty() {
+        return Ok(published);
+    }
+    check_cumulative_bytes(cumulative_bytes, carrier_payload_bytes(&published)?)?;
+    let bindings = carrier_bindings(&published)?;
+    match execute_restore_write(
+        transport,
+        crate::client::RESTORE_OPERATION_CARRIER_PUBLISH,
+        crate::client::restore_carrier_statement(published.len()),
+        bindings,
+        Some(&mut *exposure),
+    )
+    .await
+    {
+        Ok(()) => Ok(published),
+        Err(StoreError::IdentityConflict) => {
+            for entry in &published {
+                // A row already exists under this operation's own key. It is a
+                // replay only when it carries exactly what this operation
+                // publishes; anything else is content this operation does not
+                // own, and a row that is simply not there leaves the member
+                // unresolved rather than restored.
+                if let Some(existing) =
+                    read_archive_member(transport, config, batch, &entry.member).await?
+                {
+                    if existing != entry.carrier {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                }
+            }
+            Ok(published)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Builds the carrier document one member's retained reference publishes.
+///
+/// Every identity field is taken from the admitted batch and the member it
+/// belongs to — the operation, the source, the archive, the member identity and
+/// type, the residency domain and the archive content digest — so no caller can
+/// publish a carrier for anything but the member it travels beside. Only the
+/// payload, the owner's attested digest, its declared length, the closed class
+/// and the destination address come from the retained reference, and the class
+/// must be one this port owns: a member naming a class with no destination is
+/// refused rather than mapped onto a table.
+fn carrier_for(
+    batch: &CanonicalRestoreBatch,
+    member: &SnapshotMember,
+    retained: &RetainedArchiveMember,
+) -> Result<ArchiveMemberCarrier, StoreError> {
+    // The payload is bounded by the member's *own* declared residency length
+    // before it is parsed at all, so an over-long reference is refused instead
+    // of decoded, and the resolution step's length check has an independent
+    // expected value to compare the resolved bytes against.
+    if u64::try_from(retained.payload.len()).ok() != Some(member.residency.byte_count) {
+        return Err(StoreError::InvalidField {
+            field: "restore.retained_member_payload",
+            reason: "retained payload length does not match the member's declared byte count",
+        });
+    }
+    let class = RestoreRecordClass::parse(&retained.class).ok_or(StoreError::InvalidField {
+        field: "restore.retained_member_class",
+        reason: "retained payload names an unknown canonical class",
+    })?;
+    let payload: serde_json::Value = serde_json::from_str(&retained.payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()).into_store_error())?;
+    let carrier = ArchiveMemberCarrier {
+        operation_id: batch.operation.operation_id.as_str().to_owned(),
+        source_store_id: batch.source.store_id.clone(),
+        source_installation_id: batch.source.installation_id.clone(),
+        source_schema_generation: batch.source.schema.clone(),
+        archive_member_digest: batch.archive_member_digest.clone(),
+        member_id: member.member_id.clone(),
+        member_type: member.member_type,
+        residency_domain: residency_label(member.residency.domain).to_owned(),
+        content_digest: member.content_digest.clone(),
+        payload_digest: retained.payload_digest.clone(),
+        byte_count: retained.byte_count,
+        class,
+        record_id: retained.record_id.clone(),
+        payload,
+    };
+    carrier.validate()?;
+    Ok(carrier)
+}
+
+/// Binds one published carrier set into the carrier publication transaction.
+///
+/// The registry table and, per carrier, its derived record id and its encoded
+/// row are bound values; no row content and no identifier is interpolated into
+/// statement text, so nothing a caller supplies becomes a table or a query.
+fn carrier_bindings(
+    published: &[PublishedCarrier],
+) -> Result<serde_json::Map<String, serde_json::Value>, StoreError> {
+    let mut bindings = serde_json::Map::new();
+    bindings.insert(
+        "restore_table".to_owned(),
+        serde_json::Value::String(crate::client::RESTORE_REGISTRY_TABLE.to_owned()),
+    );
+    for (index, entry) in published.iter().enumerate() {
+        bindings.insert(
+            format!("restore_carrier_row_id{index}"),
+            serde_json::Value::String(registry_record_id(&entry.row.key)?),
+        );
+        bindings.insert(
+            format!("restore_carrier_record{index}"),
+            row_binding(&entry.row)?,
+        );
+    }
+    Ok(bindings)
+}
+
 /// Reads one archive/artifact owner carrier row for one batch member.
 ///
-/// The key is derived from the batch's archive member digest and the member's
-/// own logical identity, so a carrier row for a different member, a different
-/// archive, or a different residency domain is simply not found: nothing the
-/// caller supplies selects a row.
+/// The key is derived from the batch's archive member digest, its admitted
+/// operation and the member's own logical identity, so a carrier row for a
+/// different member, a different archive, a different operation or a different
+/// residency domain is simply not found: nothing the caller supplies selects a
+/// row, and this operation only ever reads the row it published itself.
 async fn read_archive_member(
     transport: &RpcTransport,
     config: &SurrealAdapterConfig,
     batch: &CanonicalRestoreBatch,
     member: &eliot_store_api::SnapshotMember,
 ) -> Result<Option<ArchiveMemberCarrier>, StoreError> {
-    let key = archive_member_key(&batch.archive_member_digest, member);
+    let key = archive_member_key(batch, member);
     let Some(row) = read_registry_row(
         transport,
         config,
@@ -2403,13 +2604,13 @@ async fn read_archive_member(
 
 /// Reports whether one carrier row actually answers for one batch member.
 ///
-/// Eight independent facts must agree before the payload is used: the source
-/// store, the source installation, the source schema generation, the archive
-/// commitment, the member identity, the member type, the residency domain, the
-/// archive content digest and the declared byte count. The byte count is
-/// compared against the *batch member's own* declared residency length — an
-/// independent expected value, not a second copy of the carrier's — and the
-/// payload's own digest is then validated separately in
+/// Nine independent facts must agree before the payload is used: the admitted
+/// restore operation, the source store, the source installation, the source
+/// schema generation, the archive commitment, the member identity, the member
+/// type, the residency domain, the archive content digest and the declared byte
+/// count. The byte count is compared against the *batch member's own* declared
+/// residency length — an independent expected value, not a second copy of the
+/// carrier's — and the payload's own digest is then validated separately in
 /// [`resolve_archive_members`]. Any divergence is an identity conflict, never a
 /// payload that is silently accepted because it looked plausible.
 fn carrier_answers_for(
@@ -2417,7 +2618,8 @@ fn carrier_answers_for(
     batch: &CanonicalRestoreBatch,
     member: &eliot_store_api::SnapshotMember,
 ) -> bool {
-    carrier.source_store_id == batch.source.store_id
+    carrier.operation_id == batch.operation.operation_id
+        && carrier.source_store_id == batch.source.store_id
         && carrier.source_installation_id == batch.source.installation_id
         && carrier.source_schema_generation == batch.source.schema
         && carrier.archive_member_digest == batch.archive_member_digest
@@ -3809,11 +4011,6 @@ impl SurrealStoreAdapter {
             .await?,
             StoreError::OrderingConflict,
         )?;
-        // Source resolution: every member's canonical logical payload is
-        // obtained from the archive/artifact owner's carrier rows, before any
-        // member is given a disposition. A member whose payload cannot be
-        // resolved is unresolved, never restored.
-        let resolved = resolve_archive_members(transport, &self.config, batch).await?;
         // A purge obligation applies to the archive member scope, and the
         // residency, privacy and retention domains stay separate: an obligation
         // in one domain never silently widens into another.
@@ -3825,6 +4022,27 @@ impl SurrealStoreAdapter {
             PurgeDecision::Suppressed => MemberDisposition::Suppressed,
             PurgeDecision::Unresolved => MemberDisposition::Unresolved,
         };
+        // Source resolution: every member's canonical logical payload is
+        // obtained from the archive/artifact owner's carrier rows, before any
+        // member is given a disposition. A member whose payload cannot be
+        // resolved is unresolved, never restored. The carriers are published
+        // first, under this exact admitted operation and only where the current
+        // purge ledger leaves the member servable, so resolution reads back a row
+        // this operation owns rather than one that happens to exist.
+        let published = if scope_disposition == MemberDisposition::Restored {
+            publish_archive_member_carriers(
+                transport,
+                &self.config,
+                batch,
+                &ctx.state_fence,
+                fence.document.cumulative_bytes,
+                &mut *exposure,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let resolved = resolve_archive_members(transport, &self.config, batch).await?;
         let imports: Vec<&ResolvedArchiveMember> = if scope_disposition
             == MemberDisposition::Restored
         {
@@ -3932,10 +4150,13 @@ impl SurrealStoreAdapter {
         let (payload, value_digest) = encode_document(&document)?;
         // The byte bound covers the canonical bytes this commit writes, not only
         // the bookkeeping document: a batch that imports a large payload inside a
-        // small record is still a large restore.
+        // small record is still a large restore, and the carrier rows it
+        // published for those same payloads are bytes the destination received.
         let document_bytes = u64::try_from(payload.len())
             .map_err(|_| StoreError::PayloadTooLarge)?
             .checked_add(imported_payload_bytes(&imports)?)
+            .ok_or(StoreError::PayloadTooLarge)?
+            .checked_add(carrier_payload_bytes(&published)?)
             .ok_or(StoreError::PayloadTooLarge)?;
         check_cumulative_bytes(fence.document.cumulative_bytes, document_bytes)?;
         let phase = phase_receipt(batch, denominator, now)?;
@@ -4171,6 +4392,23 @@ fn imported_payload_bytes(imports: &[&ResolvedArchiveMember]) -> Result<u64, Sto
     let mut total = 0_u64;
     for member in imports {
         let bytes = u64::try_from(canonical_digest_bytes(&member.payload)?.len())
+            .map_err(|_| StoreError::PayloadTooLarge)?;
+        total = total
+            .checked_add(bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+    }
+    Ok(total)
+}
+
+/// Tallies the retained-payload carrier bytes one apply published.
+///
+/// The publication is a real write into the destination, so it is accounted on
+/// the same byte bound as the canonical import rather than being free because it
+/// happened before the commit transaction.
+fn carrier_payload_bytes(published: &[PublishedCarrier]) -> Result<u64, StoreError> {
+    let mut total = 0_u64;
+    for entry in published {
+        let bytes = u64::try_from(entry.row.payload.len())
             .map_err(|_| StoreError::PayloadTooLarge)?;
         total = total
             .checked_add(bytes)

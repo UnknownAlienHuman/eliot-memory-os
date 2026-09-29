@@ -316,6 +316,7 @@ fn batch() -> CanonicalRestoreBatch {
         }],
         members: denominator().members,
         member_count: 3,
+        retained_members: Vec::new(),
     }
 }
 
