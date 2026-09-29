@@ -13,13 +13,25 @@
 //! with `StoreBackupRequest { context, identity, operation }`,
 //! `StoreResponse::Backup { response: StoreBackupResponse }`, and capability
 //! `CAPABILITY_STORE_BACKUP`. `StoreBackupResponse` is a closed outcome
-//! enum over #950 types verbatim — it carries no operation/fence envelope,
-//! so each method binds the answer to its admitted request: Page compares the
-//! complete handle and requested cursor; Restore/Validate compare the complete
+//! enum over #950 types — it carries no operation/fence envelope, so each
+//! method binds the answer to its admitted request: Page compares the complete
+//! handle and requested cursor, the original begin operation and exact member
+//! content, plus owner-reported page coverage; End compares the exact admitted
+//! begin operation and owner-issued handle; `PrepareDestination` requires a
+//! durable receipt bound to the exact operation/destination and its
+//! readback-confirmed admission digest; Restore/Validate compare the complete
 //! operation identity, isolated destination, archive digest, and requested
 //! member denominator; other outcomes use their operation-specific identity
 //! fields plus the outcome-carried fence where one exists (`Status`). An
 //! echoed payload or a matching row count is never a receipt.
+//!
+//! The negotiated boundary is exact EBP 1.0 (`ProtocolVersion::CURRENT`), and
+//! the authenticated handshake also pins the approved artifact/configuration
+//! hashes. This is not a separate backup-schema negotiation. If an incompatible
+//! legacy peer nevertheless answers a sent mutation using the old isolation
+//! evidence shape, `execute_raw` classifies response decode failure as
+//! `Unknown` for the exact admitted operation; it is never reported as a
+//! pre-send refusal and is never retried.
 //!
 //! Every send carries the coherent envelope identity demanded by
 //! `StoreBackupRequest::validate()`: `Begin`/`RestoreBatch`/`Validate` copy
@@ -60,16 +72,41 @@
 //! `SnapshotValidationReceipt` from restore-batch inputs), so
 //! `backup_validate` returns the wire type verbatim.
 
+use eliot_contracts::RequestId;
 use eliot_store_api::{
-    BackupOperationReconciliation, CanonicalRestoreBatch, IsolatedDestination, IsolationEvidence,
-    OperationId, OperationIdentity, RequestMeta, RestoreValidationReceipt, SnapshotBeginRequest,
-    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupOperation,
-    StoreBackupRequest, StoreBackupResponse, StoreBackupStatus, StoreError, StoreRequest,
-    StoreResponse, canonical_json_bytes, reconcile_same_operation, sha256_hex,
+    BackupOperationReconciliation, CanonicalRestoreBatch, IsolatedDestination,
+    IsolatedDestinationReceipt, OperationId, OperationIdentity, RequestMeta,
+    RestoreValidationReceipt, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotPage, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
+    StoreBackupStatus, StoreError, StoreFailure, StoreRequest, StoreResponse, canonical_json_bytes,
+    reconcile_same_operation, sha256_hex,
 };
+use thiserror::Error;
 
 use super::store_exchange::RequestFailure;
 use super::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientFault};
+
+/// Public error boundary for the backup client.
+///
+/// The original typed `StoreFailure` is preserved verbatim so callers retain
+/// its admitted operation and reconciliation instructions. Local validation,
+/// framing, and transport-unknown outcomes remain typed `StoreError` values.
+#[derive(Debug, Error)]
+pub enum StoreBackupClientError {
+    /// Local or conservatively projected Store error.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// Exact typed failure decoded from the authenticated Store response.
+    #[error("typed Store failure: {0:?}")]
+    StoreFailure(Box<StoreFailure>),
+}
+
+fn backup_request_failure(error: RequestFailure) -> StoreBackupClientError {
+    match error {
+        RequestFailure::Failure(failure) => StoreBackupClientError::StoreFailure(failure),
+        other => StoreBackupClientError::Store(other.into_store_error()),
+    }
+}
 
 /// Builds the envelope identity for a backup operation whose payload carries
 /// no admitted canonical hash (issue #975).
@@ -94,6 +131,24 @@ fn backup_derived_envelope_identity(
 }
 
 impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
+    fn backup_transport_context(
+        &self,
+        context: &RequestMeta,
+        operation: &str,
+    ) -> Result<RequestMeta, StoreBackupClientError> {
+        let counter = self
+            .request_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request_id = RequestId::new(format!(
+            "{}:{operation}:{counter}",
+            self.requirement.connection_id.as_str(),
+        ))
+        .map_err(|error| StoreBackupClientError::Store(StoreError::Foundation(error)))?;
+        let mut transport_context = context.clone();
+        transport_context.request_id = request_id;
+        Ok(transport_context)
+    }
+
     /// Opens one bounded coherent snapshot capture through the existing
     /// authenticated Store path (issue #975).
     ///
@@ -104,7 +159,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         request: SnapshotBeginRequest,
-    ) -> Result<SnapshotHandle, StoreError> {
+    ) -> Result<SnapshotHandle, StoreBackupClientError> {
         request.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
@@ -114,9 +169,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // into unknown.
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let expected_digest = request.compute_digest()?;
+        let transport_context = self.backup_transport_context(ctx, "store-backup-begin")?;
         // Coherence rule: `Begin` requires the envelope identity to equal the
         // payload's admitted `OperationIdentity` — copied verbatim, never
         // re-derived.
@@ -124,7 +180,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let admitted_identity = identity.clone();
         let idempotency_key = identity.idempotency_key.clone();
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity,
             operation: StoreBackupOperation::Begin(request),
         };
@@ -132,7 +188,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -141,23 +197,23 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::UnknownOutcome {
                         operation_id: admitted_identity.operation_id.clone(),
-                    });
+                    }
+                    .into());
                 }
                 Self::check_backup_begin(&admitted_identity, &expected_digest, &response)
+                    .map_err(Into::into)
             }
             // Once the backup mutation has crossed the transport boundary, a
             // valid response of the wrong kind is itself a typed contract
             // defect: no second send, no retry, no fallback to `Apply`.
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            // Unknown outcomes (transport loss, a peer `Unknown`, or a typed
-            // unknown-outcome failure already bound to the admitted operation)
-            // project to the typed unknown-outcome error. The peer identity is
-            // mismatch evidence only; the admitted operation stays unknown.
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
+            // Transport unknowns retain the independently admitted operation;
+            // a typed peer failure below remains its exact StoreFailure.
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
                 operation_id: admitted_identity.operation_id.clone(),
-            }),
-            Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
-            Err(error) => Err(error.into_store_error()),
+            }
+            .into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
@@ -192,18 +248,27 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     pub(super) async fn backup_page_inner(
         &self,
         ctx: &RequestMeta,
+        begin: &SnapshotBeginRequest,
         handle: SnapshotHandle,
         cursor: SnapshotCursor,
-    ) -> Result<SnapshotPage, StoreError> {
+    ) -> Result<SnapshotPage, StoreBackupClientError> {
+        begin.validate()?;
         handle.validate()?;
         cursor.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
+        if handle.snapshot_digest != begin.compute_digest()?
+            || handle.operation_id != begin.operation.operation_id
+            || handle.idempotency_key != begin.operation.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict.into());
+        }
         if cursor.handle_digest != handle.snapshot_digest {
             return Err(StoreError::InvalidField {
                 field: "snapshot.cursor",
                 reason: "cursor does not belong to this snapshot handle",
-            });
+            }
+            .into());
         }
         let admitted_handle = handle.clone();
         let admitted_cursor = cursor.clone();
@@ -211,7 +276,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // still refuses before any send, while an armed write fault survives
         // for the admitted write it was armed for.
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let admitted_operation_id = handle.operation_id.clone();
         let idempotency_key = handle.idempotency_key.clone();
@@ -220,8 +285,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // canonical hash, so the hash honestly binds the exact page
         // operation payload instead).
         let operation = StoreBackupOperation::Page { handle, cursor };
+        let transport_context = self.backup_transport_context(ctx, "store-backup-page")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity: backup_derived_envelope_identity(
                 &operation,
                 &admitted_operation_id,
@@ -233,20 +299,22 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
         match result {
             Ok(StoreResponse::Backup { response }) => {
-                Self::check_backup_page(&admitted_handle, &admitted_cursor, &response)
+                Self::check_backup_page(begin, &admitted_handle, &admitted_cursor, &response)
+                    .map_err(Into::into)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(error) => Err(error.into_store_error()),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
     fn check_backup_page(
+        begin: &SnapshotBeginRequest,
         admitted_handle: &SnapshotHandle,
         admitted_cursor: &SnapshotCursor,
         response: &StoreBackupResponse,
@@ -258,6 +326,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if &page.handle != admitted_handle || &page.cursor != admitted_cursor {
             return Err(StoreError::IdentityConflict);
         }
+        page.validate_for_begin(begin)?;
         Ok(page.clone())
     }
 
@@ -270,14 +339,22 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     pub(super) async fn backup_end_inner(
         &self,
         ctx: &RequestMeta,
+        begin: &SnapshotBeginRequest,
         handle: SnapshotHandle,
-    ) -> Result<SnapshotEndReceipt, StoreError> {
+    ) -> Result<SnapshotEndReceipt, StoreBackupClientError> {
+        begin.validate()?;
         handle.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
+        if handle.snapshot_digest != begin.compute_digest()?
+            || handle.operation_id != begin.operation.operation_id
+            || handle.idempotency_key != begin.operation.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict.into());
+        }
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let admitted_handle = handle.clone();
         let idempotency_key = handle.idempotency_key.clone();
@@ -286,8 +363,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // canonical hash, so the hash honestly binds the exact end operation
         // payload instead).
         let operation = StoreBackupOperation::End { handle };
+        let transport_context = self.backup_transport_context(ctx, "store-backup-end")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity: backup_derived_envelope_identity(
                 &operation,
                 &admitted_handle.operation_id,
@@ -299,7 +377,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -308,28 +386,48 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::UnknownOutcome {
                         operation_id: admitted_handle.operation_id.clone(),
-                    });
+                    }
+                    .into());
                 }
-                Self::check_backup_end(&admitted_handle, &response)
+                Self::check_backup_end(
+                    &begin.operation,
+                    &admitted_handle,
+                    begin.denominator.is_complete,
+                    begin.denominator.member_count(),
+                    begin.denominator.total_bytes(),
+                    &response,
+                )
+                .map_err(Into::into)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
                 operation_id: admitted_handle.operation_id.clone(),
-            }),
-            Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
-            Err(error) => Err(error.into_store_error()),
+            }
+            .into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
     fn check_backup_end(
+        admitted_operation: &OperationIdentity,
         admitted_handle: &SnapshotHandle,
+        admitted_denominator_complete: bool,
+        admitted_member_count: u64,
+        admitted_byte_count: u64,
         response: &StoreBackupResponse,
     ) -> Result<SnapshotEndReceipt, StoreError> {
         let StoreBackupResponse::EndReceipt { receipt } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         receipt.validate()?;
-        if &receipt.handle != admitted_handle {
+        if &receipt.handle != admitted_handle || &receipt.operation != admitted_operation {
+            return Err(StoreError::IdentityConflict);
+        }
+        if receipt.is_complete()
+            && (!admitted_denominator_complete
+                || receipt.member_count != admitted_member_count
+                || receipt.byte_count != admitted_byte_count)
+        {
             return Err(StoreError::IdentityConflict);
         }
         Ok(receipt.clone())
@@ -352,37 +450,22 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreError> {
+    ) -> Result<IsolatedDestinationReceipt, StoreBackupClientError> {
         destination.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
-        let admitted_evidence = destination.evidence.clone();
-        let idempotency_projection = format!(
-            "store-backup-prepare-destination:{}:{}:{}",
-            destination.destination_id,
-            destination.target_schema,
-            destination.evidence.purge_policy_revision,
-        );
+        let destination_id = destination.destination_id.clone();
+        let identity = StoreBackupRequest::prepare_destination_identity(&destination)?;
         let operation = StoreBackupOperation::PrepareDestination(destination);
-        let payload_bytes = canonical_json_bytes(&operation)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        let canonical_request_hash = sha256_hex(&payload_bytes);
-        let identity = OperationIdentity {
-            operation_id: OperationId::new(format!(
-                "store-backup-prepare-destination:{canonical_request_hash}"
-            ))
-            .map_err(StoreError::Foundation)?,
-            idempotency_key: idempotency_projection,
-            canonical_request_hash,
-        };
-        let admitted_operation_id = identity.operation_id.clone();
-        let idempotency_key = identity.idempotency_key.clone();
+        let admitted_identity = identity.clone();
+        let idempotency_key = admitted_identity.idempotency_key.clone();
+        let transport_context = self.backup_transport_context(ctx, "store-backup-prepare")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity,
             operation,
         };
@@ -390,7 +473,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -398,32 +481,37 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             Ok(StoreResponse::Backup { response }) => {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::UnknownOutcome {
-                        operation_id: admitted_operation_id.clone(),
-                    });
+                        operation_id: admitted_identity.operation_id.clone(),
+                    }
+                    .into());
                 }
-                Self::check_backup_prepare(&admitted_evidence, &response)
+                Self::check_backup_prepare(&admitted_identity, &destination_id, &response)
+                    .map_err(Into::into)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
-                operation_id: admitted_operation_id,
-            }),
-            Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
-            Err(error) => Err(error.into_store_error()),
+                operation_id: admitted_identity.operation_id.clone(),
+            }
+            .into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
     fn check_backup_prepare(
-        admitted_evidence: &IsolationEvidence,
+        admitted_identity: &OperationIdentity,
+        admitted_destination_id: &str,
         response: &StoreBackupResponse,
-    ) -> Result<IsolationEvidence, StoreError> {
-        let StoreBackupResponse::Isolation { evidence } = response else {
+    ) -> Result<IsolatedDestinationReceipt, StoreError> {
+        let StoreBackupResponse::Isolation { receipt } = response else {
             return Err(StoreError::InvalidReceipt);
         };
-        evidence.validate()?;
-        if evidence != admitted_evidence {
+        receipt.validate()?;
+        if &receipt.operation != admitted_identity
+            || receipt.destination_id != admitted_destination_id
+        {
             return Err(StoreError::IdentityConflict);
         }
-        Ok(evidence.clone())
+        Ok(receipt.clone())
     }
 
     /// Restores one bounded canonical batch into its admitted isolated
@@ -438,13 +526,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         batch: CanonicalRestoreBatch,
-    ) -> Result<RestoreValidationReceipt, StoreError> {
+    ) -> Result<RestoreValidationReceipt, StoreBackupClientError> {
         batch.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
@@ -454,8 +542,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // equal the payload's admitted `OperationIdentity` — copied verbatim.
         let identity = admitted_operation.clone();
         let idempotency_key = identity.idempotency_key.clone();
+        let transport_context = self.backup_transport_context(ctx, "store-backup-restore")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity,
             operation: StoreBackupOperation::RestoreBatch(batch),
         };
@@ -463,7 +552,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -472,7 +561,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::UnknownOutcome {
                         operation_id: admitted_operation.operation_id.clone(),
-                    });
+                    }
+                    .into());
                 }
                 Self::check_backup_restore(
                     &admitted_operation,
@@ -481,13 +571,14 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     admitted_member_count,
                     &response,
                 )
+                .map_err(Into::into)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
                 operation_id: admitted_operation.operation_id.clone(),
-            }),
-            Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
-            Err(error) => Err(error.into_store_error()),
+            }
+            .into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
@@ -504,12 +595,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         batch: CanonicalRestoreBatch,
-    ) -> Result<RestoreValidationReceipt, StoreError> {
+    ) -> Result<RestoreValidationReceipt, StoreBackupClientError> {
         batch.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
@@ -519,8 +610,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // the payload's admitted `OperationIdentity` — copied verbatim.
         let identity = admitted_operation.clone();
         let idempotency_key = identity.idempotency_key.clone();
+        let transport_context = self.backup_transport_context(ctx, "store-backup-validate")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity,
             operation: StoreBackupOperation::Validate(batch),
         };
@@ -528,7 +620,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -539,9 +631,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 &admitted_destination,
                 admitted_member_count,
                 &response,
-            ),
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(error) => Err(error.into_store_error()),
+            )
+            .map_err(Into::into),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
@@ -600,18 +693,19 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         operation_id: OperationId,
-    ) -> Result<StoreBackupStatus, StoreError> {
+    ) -> Result<StoreBackupStatus, StoreBackupClientError> {
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let idempotency_key = format!("store-backup-status:{operation_id}");
         let operation = StoreBackupOperation::Status {
             operation_id: operation_id.clone(),
         };
+        let transport_context = self.backup_transport_context(ctx, "store-backup-status")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity: backup_derived_envelope_identity(
                 &operation,
                 &operation_id,
@@ -623,16 +717,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
         match result {
-            Ok(StoreResponse::Backup { response }) => {
-                self.check_backup_status(&operation_id, &response)
-            }
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(error) => Err(error.into_store_error()),
+            Ok(StoreResponse::Backup { response }) => self
+                .check_backup_status(&operation_id, &response)
+                .map_err(Into::into),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 
@@ -666,7 +760,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         ctx: &RequestMeta,
         first: OperationIdentity,
         second: OperationIdentity,
-    ) -> Result<BackupOperationReconciliation, StoreError> {
+    ) -> Result<BackupOperationReconciliation, StoreBackupClientError> {
         // Same-operation gate before any send: cross-operation input is a
         // typed before-send refusal, never a new operation.
         reconcile_same_operation(&first, &second)?;
@@ -674,7 +768,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_requirement_fence(&ctx.state_fence)?;
         let fault = self.take_fault();
         if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::Unavailable.into());
         }
         let admitted_operation = first.clone();
         let admitted_first_digest = first.canonical_request_hash.clone();
@@ -684,8 +778,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         // identity's own idempotency key.
         let identity = first.clone();
         let idempotency_key = identity.idempotency_key.clone();
+        let transport_context = self.backup_transport_context(ctx, "store-backup-reconcile")?;
         let envelope = StoreBackupRequest {
-            context: ctx.clone(),
+            context: transport_context.clone(),
             identity,
             operation: StoreBackupOperation::Reconcile { first, second },
         };
@@ -693,7 +788,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let result = self
             .execute_raw(
                 StoreRequest::Backup { request: envelope },
-                Some(ctx),
+                Some(&transport_context),
                 &idempotency_key,
             )
             .await;
@@ -702,7 +797,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::UnknownOutcome {
                         operation_id: admitted_operation.operation_id.clone(),
-                    });
+                    }
+                    .into());
                 }
                 Self::check_backup_reconcile(
                     &admitted_operation,
@@ -710,13 +806,14 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     &admitted_second_digest,
                     &response,
                 )
+                .map_err(Into::into)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            Ok(_) => Err(StoreError::InvalidReceipt.into()),
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
                 operation_id: admitted_operation.operation_id.clone(),
-            }),
-            Err(error) if error.is_unknown_outcome_failure() => Err(error.into_store_error()),
-            Err(error) => Err(error.into_store_error()),
+            }
+            .into()),
+            Err(error) => Err(backup_request_failure(error)),
         }
     }
 

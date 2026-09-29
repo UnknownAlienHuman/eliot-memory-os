@@ -9,10 +9,12 @@
 
 mod admission_reservation;
 mod backup_snapshot;
+mod control_reserve;
 mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
 mod execution_manifest;
+mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
 mod purge_ledger;
@@ -44,6 +46,10 @@ pub use backup_snapshot::{
     OrsOperationalCursor, OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition,
     RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
 };
+pub use control_reserve::{
+    ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension, OrsPermit,
+    OrsPermitOperation, OrsReserve, OrsReserveError,
+};
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
     CutoverRouteTable, DaemonCutoverOwnership, GenerationCutoverOwnership,
@@ -56,7 +62,7 @@ pub use effect_operation_lease::{
     ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
     EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
     EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics, authorize_effect_replay,
-    deny_unleased_effect_replay,
+    deny_effect_replay_without_manifest, deny_unleased_effect_replay,
 };
 pub use execution_manifest::{
     AdmittedModuleGeneration, BoundKernelExecutionManifest, CatalogPolicyView,
@@ -66,6 +72,11 @@ pub use execution_manifest::{
     KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_kernel_execution_restart,
+};
+pub use maintenance_trigger_staging::{
+    MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
+    MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest,
+    MaintenanceTriggerStagingRoute, stage_maintenance_trigger_intake,
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
@@ -108,7 +119,7 @@ pub use status_projection::{
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
-    ScanDisclosureRecordOwner,
+    RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,

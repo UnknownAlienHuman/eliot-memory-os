@@ -1030,8 +1030,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             .await?;
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::Status {
-                revision,
-                execution: execution.projection,
+                revision: Box::new(revision),
+                execution: Box::new(execution.projection),
             },
         })
     }
@@ -1141,7 +1141,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::History {
                 automation_id: automation_id.to_owned(),
-                execution: execution.projection,
+                execution: Box::new(execution.projection),
             },
         })
     }
@@ -1175,7 +1175,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::InspectLastFailure {
                 automation_id: automation_id.to_owned(),
-                revision,
+                revision: Box::new(revision),
                 failure: None,
             },
         })
@@ -1897,7 +1897,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                         &revision.revision,
                     )
                     .await?;
-                if stored != *revision {
+                if stored != *revision.as_ref() {
                     return Err(StoreError::InvalidField {
                         field: "automation.revision",
                         reason: "stored revision diverged from the admitted revision",

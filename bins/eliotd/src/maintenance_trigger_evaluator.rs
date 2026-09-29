@@ -32,16 +32,31 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
+use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
+use eliot_governor::{CompositionError, KernelPortError, KernelTransitionPort};
 use eliot_maintenance::{
-    AutomationTriggerDecision, MaintenanceBrokerEvidence, MaintenanceBudgetEvidence,
-    MaintenanceFamily, MaintenancePolicyEvidence, MaintenanceRouteEvidence,
-    MaintenanceSafetyEvidence, MaintenanceScheduleEvidence, MaintenanceTrigger,
-    MaintenanceTriggerInput,
+    AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
+    MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
+    MaintenanceRouteEvidence, MaintenanceSafetyEvidence, MaintenanceScheduleEvidence,
+    MaintenanceTrigger, MaintenanceTriggerInput,
 };
+use eliot_protocol::{
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerClaim,
+    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError,
+};
+use eliot_store_api::{StoreError, WriteReceiptStatus};
+use thiserror::Error;
 
 use super::DaemonComposition;
 use super::DaemonError;
-use super::notification_state_emit::MaintenanceNotificationEvidence;
+use super::DaemonKernelClient;
+use super::notification_state_emit::{
+    MaintenanceNotificationEvidence, NotificationEmitError, NotificationStateEmit,
+    emit_blocked_automation_notification,
+};
 
 /// The maintenance families whose policy owner this daemon cannot yet resolve,
 /// as one constant a reader can inspect instead of a scattered `false`.
@@ -200,15 +215,23 @@ impl DaemonComposition {
         // a transported fence claim is not a current observation.
         let state_fence = self.governor.kernel_snapshot().state_fence().clone();
         let scope_ref = scope_ref_for(&state_fence);
-        // The trigger identity carries the catalog's deduplication scope, so
-        // the identity that duplicate suppression compares states which scope
-        // it is, and `MaintenanceController::admit`'s job identity inherits it.
-        let trigger_id = format!(
-            "{}:{}:{}:{scope_ref}",
-            entry.dedup.scope_name(),
-            observation.origin.as_str(),
-            observation.family
-        );
+        // The trigger identity is the catalog's canonical deduplication key,
+        // so the identity that duplicate suppression compares states which
+        // family, event, scope, subset and generation it is, and
+        // `MaintenanceController::admit`'s job identity inherits it. The board
+        // lookup and the job lookup both consume this same key. This daemon
+        // observes no subset identity, so a `FamilyScopeAndSubset` trigger
+        // fails closed here rather than coalescing work across subsets it
+        // cannot distinguish.
+        let trigger_id = entry.dedup.dedup_key(
+            &crate::maintenance_family_catalog::MaintenanceDedupIdentity {
+                family: observation.family,
+                origin: observation.origin.as_str(),
+                scope_ref: &scope_ref,
+                subset_ref: None,
+                resource_generation: state_fence.resource_generation.value(),
+            },
+        )?;
         let (input, notification_evidence) = {
             // Owner evidence for every gate (I14.22/I14.24, issue #1692). Each
             // value is derived from a Governor-owned evidence owner or held at
@@ -273,7 +296,18 @@ impl DaemonComposition {
         // dependency or absent Durable Job route that stops it today. A
         // triggered family is therefore never silently ignored, and no family
         // is ever reported as having run.
-        entry.record_start_route(&decision);
+        //
+        // The observed evidence is bound separately from the Governor
+        // projection: the trigger event, the evidence identities actually
+        // seen at this call site, and the selected policy revision travel
+        // beside the decision rather than being projected from the catalog's
+        // requirement lists, and each missing binding stays explicit.
+        let observed = crate::maintenance_family_catalog::MaintenanceObservedEvidence {
+            trigger_event: observation.origin.as_str(),
+            observed_refs: input.evidence_refs.clone(),
+            policy_revision: notification_evidence.policy.revision,
+        };
+        entry.record_start_route(&decision, observed);
         Ok((decision, notification_evidence))
     }
 
@@ -324,3 +358,293 @@ fn scope_ref_for(state_fence: &eliot_contracts::StateFence) -> String {
 /// observation and the catalog must not invent which family an observed signal
 /// concerns.
 pub const SELF_OBSERVED_FAMILY: MaintenanceFamily = MaintenanceFamily::SelfQualityDebt;
+
+/// Fail-closed refusals of the owner-side maintenance decision commit.
+///
+/// Every variant keeps its owner's own typed failure: the store contract
+/// refusal stays a [`StoreError`], canonical admission stays a
+/// [`CompositionError`], the authenticated exchange stays a
+/// [`KernelPortError`], the maintenance owner refusal stays a
+/// [`MaintenanceError`], and wire validation stays a [`ProtocolError`]. The
+/// daemon composition refusal stays a [`DaemonError`] unchanged, so readiness
+/// and evaluation denials keep their exact shape. No code is folded into
+/// prose between layers.
+#[derive(Debug, Error)]
+pub enum MaintenanceDecisionCommitError {
+    /// The store contract refused the intent commit, the commit receipt, or
+    /// the bound decision receipt inputs.
+    #[error("maintenance decision commit store: {0}")]
+    Store(#[from] StoreError),
+    /// Governor-owned canonical admission refused the commit.
+    #[error("maintenance decision commit admission: {0}")]
+    Admission(#[from] CompositionError),
+    /// The authenticated Kernel exchange refused or could not complete the
+    /// intent commit or the receipt read-back.
+    #[error("maintenance decision commit transport: {0}")]
+    Kernel(#[from] KernelPortError),
+    /// The maintenance owner refused the commit bindings (stale fence or
+    /// claim, or a malformed binding identity).
+    #[error("maintenance decision commit owner: {0}")]
+    Maintenance(#[from] MaintenanceError),
+    /// The retained record, the claim, or the bound receipt failed wire
+    /// validation, or the evaluated decision answers a different trigger.
+    #[error("maintenance decision commit protocol: {0}")]
+    Protocol(#[from] ProtocolError),
+    /// The daemon composition refused the commit (not ready, not
+    /// authenticated, or the owner's own evaluation denial).
+    #[error("maintenance decision commit daemon: {0}")]
+    Daemon(#[from] DaemonError),
+}
+
+impl DaemonComposition {
+    /// Commits one retained maintenance trigger decision before any delivery
+    /// acknowledgement (I14.22, issue #1694 W4).
+    ///
+    /// The authenticated daemon resolves the current #1692 policy and the
+    /// #1688 decision by reusing
+    /// [`Self::evaluate_maintenance_trigger_with_evidence`]: no policy or
+    /// evaluation logic is restated here. The durable downstream intent is
+    /// retained through its existing outbox owner — the canonical
+    /// notification leg for a decision that cannot start — which submits the
+    /// Governor `PreparedTransition` to the admitted `ApplyNotificationState`
+    /// route over the same authenticated daemon transport (Governor
+    /// `PreparedTransition` → Kernel → named Store transaction, I1.8). The
+    /// returned [`MaintenanceTriggerDecisionReceipt`] binds the retained
+    /// trigger identity and operation hash, the claim row revision, the
+    /// evaluator and policy revisions, the affected scope, the
+    /// job/recommendation/wake intent references, and the canonical Store
+    /// receipt identity with the digest of its exact bytes.
+    ///
+    /// A decision plus a durable downstream intent is distinct from an
+    /// executed job or a delivered notification: this method never admits or
+    /// starts a job and never delivers anything. It only records the
+    /// commitment the Kernel ledger must validate before acknowledging the
+    /// trigger.
+    ///
+    /// The commit is explicit about what it cannot do yet, and invents
+    /// nothing in its place:
+    ///
+    /// * `Ok(None)` means no durable intent was admitted — automation is off,
+    ///   the intent record already stands, or the only intent names a job
+    ///   whose canonical commit receipt is not in hand. The trigger stays
+    ///   retained under its existing claim; nothing is dropped and no receipt
+    ///   is fabricated. Recording that bound receipt into the Kernel delivery
+    ///   ledger travels the follow-up daemon-to-Kernel decision route.
+    /// * A lost or ambiguous commit receipt read-back is also `Ok(None)`:
+    ///   receipt absence during an outage is not proof of non-commit, so the
+    ///   trigger stays open for receipt-lookup reconciliation instead of
+    ///   being reported either way.
+    /// * No wake intent is bound: no wake scheduler publishes to this daemon,
+    ///   so `wake_ref` stays `None` rather than naming an owner that does not
+    ///   exist. Trigger expiry enforcement stays with the Kernel ledger
+    ///   acknowledgement, which refuses stale eligibility; this commit binds
+    ///   the live fence and the live claim deadline only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] keeping each owner's typed
+    /// refusal: stale fence or claim deadline, unknown or conflicting trigger
+    /// identity, evaluation denial, intent-commit refusal, or an unbound
+    /// commit receipt.
+    pub async fn commit_maintenance_trigger_decision(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        observation: MaintenanceObservation,
+        record: &MaintenanceTriggerRecord,
+        claim: &MaintenanceTriggerClaim,
+    ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceDecisionCommitError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceDecisionCommitError::Admission(
+                CompositionError::NotReady,
+            ));
+        }
+        if self.owner_session.is_none() {
+            return Err(MaintenanceDecisionCommitError::Daemon(
+                DaemonError::Lifecycle(
+                    "owner session is not bound; drop and re-run authenticated connect+start"
+                        .to_owned(),
+                ),
+            ));
+        }
+        record.validate()?;
+        claim.validate()?;
+        // The commit authorizes under the live admitted fence only: a claim
+        // bound to a superseded generation must fail here, never commit under
+        // it. Claim/session echo and revocation stay the Kernel ledger's check
+        // at acknowledgement time.
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        if claim.daemon_fence != live_fence {
+            return Err(MaintenanceDecisionCommitError::Maintenance(
+                MaintenanceError::FenceMismatch,
+            ));
+        }
+        if claim.claim_deadline_unix_ms < crate::unix_ms() {
+            return Err(MaintenanceDecisionCommitError::Maintenance(
+                MaintenanceError::FenceMismatch,
+            ));
+        }
+        if claim.trigger_id != record.trigger_id {
+            return Err(MaintenanceDecisionCommitError::Protocol(
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        if claim.revision == 0 {
+            return Err(MaintenanceDecisionCommitError::Maintenance(
+                MaintenanceError::InvalidField("maintenance_trigger_claim.revision"),
+            ));
+        }
+        let (decision, evidence) = self
+            .evaluate_maintenance_trigger_with_evidence(observation)
+            .map_err(MaintenanceDecisionCommitError::Daemon)?;
+        // The decision must answer this exact retained trigger: identical
+        // identity and scope. Changed content conflicts; it never re-binds.
+        if decision.trigger_id != record.trigger_id || decision.scope_ref != record.scope.reference
+        {
+            return Err(MaintenanceDecisionCommitError::Protocol(
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        // A job reference names an already-durable job only; it is bound as a
+        // reference, never admitted or started here. A blank reference binds
+        // nothing: the receipt validator would refuse it, so it is dropped up
+        // front under the same nonblank rule.
+        let job_ref = decision
+            .durable_job_ref
+            .clone()
+            .filter(|reference| is_commit_ref_text(reference));
+        // The durable downstream intent through its existing outbox owner.
+        // The leg submits the Governor prepared transition to the admitted
+        // notification route and proves the canonical commit receipt in hand;
+        // `Ok(None)` (automation off, record already standing) admits no
+        // intent and therefore binds no receipt.
+        let committed =
+            emit_blocked_automation_notification(kernel, live_fence, &decision, &evidence)
+                .await
+                .map_err(|error| match error {
+                    NotificationEmitError::Store(error) => {
+                        MaintenanceDecisionCommitError::Store(error)
+                    }
+                    NotificationEmitError::Admission(error) => {
+                        MaintenanceDecisionCommitError::Admission(error)
+                    }
+                    NotificationEmitError::Kernel(error) => {
+                        MaintenanceDecisionCommitError::Kernel(error)
+                    }
+                })?;
+        let Some(NotificationStateEmit::Committed {
+            notification_id,
+            operation_id,
+            ..
+        }) = committed
+        else {
+            return Ok(None);
+        };
+        Self::bind_committed_decision_receipt(
+            kernel,
+            record,
+            DecisionReceiptBindings {
+                claim_revision: claim.revision,
+                scope_ref: decision.scope_ref.clone(),
+                job_ref,
+                policy_revision: policy_revision(&evidence.policy),
+                notification_id,
+            },
+            operation_id,
+        )
+        .await
+    }
+
+    /// Binds the canonical commit receipt for an admitted downstream intent.
+    ///
+    /// The committed intent identity is looked up through the owning read
+    /// path rather than trusted from the request. Absence is the ambiguous
+    /// case — the commit may have happened across an outage boundary — so
+    /// this returns open instead of proof either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] for an unbound identity, a
+    /// refused or uncommitted receipt, or an unserializable receipt.
+    async fn bind_committed_decision_receipt(
+        kernel: &Arc<DaemonKernelClient>,
+        record: &MaintenanceTriggerRecord,
+        bindings: DecisionReceiptBindings,
+        operation_id: String,
+    ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceDecisionCommitError> {
+        // The exact canonical identity of the committed intent, looked up
+        // through the owning read path rather than trusted from the request.
+        // Absence here is the ambiguous case: the commit may have happened
+        // across an outage boundary, so this returns open instead of proof.
+        let operation_id = OperationId::new(operation_id).map_err(StoreError::Foundation)?;
+        let Some(receipt) = kernel.receipt(operation_id).await? else {
+            return Ok(None);
+        };
+        receipt.validate()?;
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(MaintenanceDecisionCommitError::Store(
+                StoreError::Serialization(
+                    "maintenance decision intent transition was not committed".to_owned(),
+                ),
+            ));
+        }
+        let receipt_bytes = canonical_json_bytes(&receipt)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let decision_receipt = MaintenanceTriggerDecisionReceipt {
+            wire_id: MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION,
+            trigger_id: record.trigger_id.clone(),
+            operation_hash: record.operation_hash.clone(),
+            revision: bindings.claim_revision,
+            evaluation_revision: format!("{CONTRACT_NAME}:{CONTRACT_VERSION}"),
+            policy_revision: bindings.policy_revision,
+            scope_ref: bindings.scope_ref,
+            job_ref: bindings.job_ref,
+            recommendation_ref: Some(bindings.notification_id),
+            wake_ref: None,
+            canonical_receipt_ref: receipt.operation_id.to_string(),
+            receipt_digest: sha256_hex(&receipt_bytes),
+        };
+        decision_receipt.validate()?;
+        Ok(Some(decision_receipt))
+    }
+}
+
+/// Receipt bindings carried into [`DaemonComposition::bind_committed_decision_receipt`].
+///
+/// Bundled so the helper stays within the owner argument budget; every field
+/// is the exact value the receipt validator checks.
+struct DecisionReceiptBindings {
+    /// Claim row revision the decision commits under.
+    claim_revision: u64,
+    /// Affected scope the decision answers.
+    scope_ref: String,
+    /// Already-durable job reference, if the decision named one.
+    job_ref: Option<String>,
+    /// Policy revision resolved at decision time.
+    policy_revision: String,
+    /// Committed notification intent identity.
+    notification_id: String,
+}
+
+/// Renders the opaque policy revision resolved at decision time.
+///
+/// A published Human policy revision names its own revision and digest. While
+/// no publisher exists the label records the fail-closed provenance — the
+/// registry-selected mode the evaluation actually ran under — and never a
+/// guessed publisher revision.
+fn policy_revision(policy: &MaintenancePolicyEvidence) -> String {
+    match (policy.revision, policy.digest.as_deref()) {
+        (Some(revision), Some(digest)) => format!("rev{revision}:{digest}"),
+        (Some(revision), None) => format!("rev{revision}:unpublished"),
+        (None, _) => format!("unpublished:{:?}", policy.mode()),
+    }
+}
+
+/// Mirrors the protocol's nonblank reference rule for intent bindings.
+///
+/// A blank, padded, or control-carrying reference binds nothing: the receipt
+/// validator would refuse it, so callers drop it up front instead of
+/// submitting a receipt that cannot validate.
+fn is_commit_ref_text(value: &str) -> bool {
+    !value.trim().is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}

@@ -2307,15 +2307,19 @@ pub enum StoreRecoveryRequired {
     LateDead,
 }
 
+// The cutover launch discriminator and its generation selector are read by
+// `HostComposition::cutover_generation_contour`, which the admitted #961 port
+// dispatches through `crate::backup_cutover::execute_cutover` ->
+// `activate_cutover_contour`. They carried a `dead_code` allowance only while
+// that chain had no production caller; the caller exists, so the allowance is
+// gone rather than restated.
 #[cfg(windows)]
-#[allow(dead_code)]
 enum CutoverLaunchOutcome {
     Candidate,
     Rollback { candidate_error: String },
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
 impl CutoverLaunchOutcome {
     fn activation_generation<'a>(
         &self,
@@ -5638,6 +5642,13 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         // The type-checked routing is the decision: a table marker string is
         // never followed.
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
+            // F-LOG-HOST-8 (#983 W3/W4): the live cutover dispatch contour, on
+            // the one production cutover ingress. This is the observation of the
+            // OWNER's routing decision only - it names the closed-table miss and
+            // nothing about any cutover's effect, and the refusal below is
+            // returned unchanged with the same operation and the same reason, so
+            // the owner's return value, ordering and text are untouched.
+            crate::backup_cutover::observe_live_cutover_dispatch(operation, None, false);
             return Err(refusal(
                 "no Host backup owner operation is registered for this method",
             ));
@@ -5649,10 +5660,33 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         if HostComposition::backup_dispatch_needs_cutover_admission(operation)
             != eliot_host_control_endpoint::backup::requires_cutover_admission(operation)
         {
+            // #983: a stale cutover registration is observed as exactly that and
+            // never as a cutover progress or disposition claim, because nothing
+            // ran and nothing was admitted.
+            crate::backup_cutover::observe_live_cutover_dispatch(
+                operation,
+                Some(target),
+                HostComposition::backup_dispatch_needs_cutover_admission(operation)
+                    .unwrap_or_default(),
+            );
             return Err(refusal(
                 "registered cutover admission diverges from the accepted Host backup table",
             ));
         }
+        // #983: the live cutover ADMISSION point. This records the owner's own
+        // routing and cutover-admission decision for this operation - a routed
+        // cutover proves only that it selected the cutover target, never that it
+        // activated anything, so the observed disposition stays "none" and
+        // rehearsal can never reach a cutover word from here. The typed refusal
+        // below (no separately admitted cutover body is retained) is returned
+        // unchanged: this is the leaf's nonterminal evidence, and the outer
+        // dispatch boundary owns the single terminal record per failed
+        // operation.
+        crate::backup_cutover::observe_live_cutover_dispatch(
+            operation,
+            Some(target),
+            HostComposition::backup_dispatch_needs_cutover_admission(operation).unwrap_or_default(),
+        );
         Err(refusal(match target {
             BackupDispatchTarget::Prepare => {
                 "no owner-issued admitted isolated-restore preparation is retained by this Host"
@@ -6013,9 +6047,25 @@ impl HostComposition {
     /// [`crate::backup_cutover::reconcile_cutover_outcome`] under the same
     /// operation identity, so a lost response or a crash between the
     /// registry and the journal returns the exact `Unknown` disposition
-    /// instead of a local assumption. No algorithm is reimplemented here and
-    /// no cutover is executed at Host startup: this method runs only when an
-    /// admitted cutover operation is dispatched.
+    /// instead of a local assumption, and a proven commit returns the exact
+    /// `RetirementPending` disposition instead of a bare `Committed`. No
+    /// algorithm is reimplemented here and no cutover is executed at Host
+    /// startup: this method runs only when an admitted cutover operation is
+    /// dispatched.
+    ///
+    /// # Returned disposition
+    ///
+    /// The value that reaches the command surface is this owner's own two-owner
+    /// projection, never a local assumption: the exact typed
+    /// [`crate::backup_cutover::CutoverDisposition`] with its causal
+    /// [`crate::backup_cutover::CutoverResidual`], the ORIGINAL operation
+    /// identity, and a bounded redacted evidence set. `Committed`,
+    /// `RetirementPending`, `Prepared`, `Reconciled`, `Failed`, `Unknown` and
+    /// `Requested` are all reachable here, and none of them is a Product or
+    /// Finish claim. Prior-generation retirement stays a separate explicitly
+    /// authorized step holding the returned barrier; a `RetirementPending`
+    /// result is the honest statement that the activation committed under this
+    /// operation and that retirement has not happened yet.
     ///
     /// Prior-generation process/SCM retirement remains a separate explicitly
     /// authorized
@@ -6203,17 +6253,37 @@ impl HostComposition {
             &retirement,
             coherence,
         );
-        if reconciled.disposition != CutoverDisposition::RetirementPending {
-            host_terminal.disarm();
-            return Ok((reconciled, barrier));
-        }
-        // Reached only when the projection above DID return `RetirementPending`,
-        // which requires both a coherent pair and the registry's own
-        // operation-bound receipt. A torn pair returned `Unknown` +
-        // `ConcurrentOwnerMovement` at the branch above, so the proven
-        // `Committed` never reaches here unreported.
+        // #961 AUD5/B5: the value that leaves the admitted port is THIS
+        // PROJECTION, never the pre-projection `committed` the registry CAS
+        // produced. Every disposition the command surface can observe for a
+        // proven commit is decided here: `RetirementPending` when the
+        // coherence-bracketed pair plus the registry's own operation-bound
+        // receipt establish that this operation's activation committed and no
+        // retirement has happened yet, and `Unknown` + its causal residual
+        // (including `ConcurrentOwnerMovement` for a torn pair) whenever they
+        // do not. Handing back the local `Committed` in the first case
+        // discarded the one disposition word the command surface most needs,
+        // contradicted this method's own stated observation, and made
+        // `RetirementPending` unreachable from the only port that can produce
+        // it.
+        //
+        // This is not a weaker or a louder claim. The identity is the same
+        // one: `CutoverReadback::from_request` carries the admitted body's own
+        // operation identity, and `bind_admitted_cutover_body` has already
+        // proved the presented `request.operation` EQUALS
+        // `ValidatedCutover::sealed_operation` on all three fields, so the
+        // original operation identity survives the round trip unchanged. The
+        // disposition is more specific, the residual is causal rather than a
+        // bare `None`, and the bounded evidence is the durable intent's own
+        // handles - no path list, no archive digest, no error text. Nothing
+        // here infers a Product or Finish claim from an installation status
+        // (I0.13: no audit package or status elevates it without Product
+        // Proof); the returned word is the owner-observation pair and nothing
+        // more, and the barrier still has to be presented to the separately
+        // authorized `backup_dispatch_cutover_retire` step before any prior
+        // generation is retired.
         host_terminal.disarm();
-        Ok((committed, barrier))
+        Ok((reconciled, barrier))
     }
 
     /// Exact admitted cutover disposition for one operation, read from the
@@ -7552,6 +7622,46 @@ impl HostComposition {
         )
     }
 
+    /// Resolves the approved config digest for `manifest` in the Phase-B live
+    /// domain the restart gate joins.
+    ///
+    /// I1.9 A1/GATE digest-domain bind: the journal's record-bound config
+    /// approval (`KernelReadinessObservationRecord.config_digest`) and the
+    /// relaunch descriptor (`HostJobBranches.config_digest`) both carry the
+    /// Phase-B live digest, which is intentionally distinct from the
+    /// manifest's Phase-A staged-file digest. The approved Phase-B value is
+    /// therefore read from the registry's committed activation fence, which
+    /// durably binds the active manifest's generation and Phase-A
+    /// `config_digest` to its committed `materialized_config_digest`, never
+    /// recomputed from live bytes. An absent, invalid, or foreign fence
+    /// refuses the restart as manual recovery.
+    #[cfg(windows)]
+    fn approved_phase_b_config_for_manifest(
+        &self,
+        manifest: &CandidateManifest,
+    ) -> Result<PlatformHandle, HostError> {
+        let fence = self
+            .registry
+            .last_committed_activation_fence()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Kernel restart has no committed activation fence binding the approved config; manual recovery required".to_owned(),
+                )
+            })?;
+        fence.validate().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Kernel restart refused: committed activation fence is invalid ({error}); manual recovery required"
+            ))
+        })?;
+        if fence.generation != manifest.generation || fence.config_digest != manifest.config_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel restart refused: committed activation fence does not bind the active manifest; manual recovery required".to_owned(),
+            ));
+        }
+        Ok(fence.materialized_config_digest.clone())
+    }
+
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -7656,11 +7766,16 @@ impl HostComposition {
                     .to_owned(),
             )
         })?;
+        // I1.9 A1/GATE digest-domain bind: the gate states the approved
+        // config in the Phase-B live domain, so it is resolved from the
+        // committed activation fence bound to this manifest, never from the
+        // manifest's Phase-A staged-file digest.
+        let approved_config = self.approved_phase_b_config_for_manifest(&active_manifest)?;
         require_journal_kernel_restart_record(
             &current_kernel,
             &readiness_observations,
             kernel_artifact,
-            &active_manifest.config_digest,
+            &approved_config,
             &materialized_config_digest,
             &self.host,
             &self.activation_id,
@@ -7925,6 +8040,58 @@ impl HostComposition {
         }
     }
 
+    /// (Re)binds the pending activation record's held supervision-lease
+    /// reference from the published Kernel-signed supervision-lease mirror.
+    ///
+    /// I1.5 W4 (`SupervisionLease` issuance/renewal, Host leg): a transition
+    /// into a live state holds exactly the supervision lease the mirror
+    /// proves live for this activation generation right now — no synthesised
+    /// identity, no carried predecessor — and only when the latest durable
+    /// readiness observation already admitted that same lease identity. I1.5:
+    /// "A `SupervisionLease` is issued automatically only for an observable
+    /// active obligation" and "A lease renewal ... must carry fresh observed
+    /// evidence". The admission arrives Kernel-side through the existing
+    /// renewal owner (`KernelSupervisionLeaseAuthority` refuses without
+    /// caller observation) and reaches this journal as the
+    /// `proof.supervision_lease` snapshot the readiness owner persists as
+    /// `active_supervision_lease`; binding any other mirror entry would
+    /// promote an unadmitted renewal into a live state. When the mirror
+    /// proves no live obligation, the held reference lapses to empty
+    /// instead of blocking drain or retirement on a dead lease; terminal
+    /// coverage stays in the `DrainCommitRecord` snapshot taken at
+    /// linearization. A mirror read failure, a missing admitted
+    /// predecessor, or a mirror entry the readiness owner never admitted
+    /// fails the transition closed rather than entering a live state on
+    /// uncertain supervision.
+    fn refresh_supervision_lease_binding(
+        &self,
+        next: &mut eliot_host_state::EliotActivationRecord,
+    ) -> Result<(), HostError> {
+        let Some(lease_ref) = self.live_supervision_obligation_for(next)? else {
+            next.supervision_lease_refs = Vec::new();
+            return Ok(());
+        };
+        let admitted = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .and_then(|observation| observation.active_supervision_lease.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "live supervision binding has no admitted readiness predecessor".to_owned(),
+                )
+            })?;
+        if admitted.supervision_lease_id.as_str() != lease_ref.as_str() {
+            return Err(HostError::RecoveryRequired(
+                "published supervision lease was not admitted by fresh readiness evidence"
+                    .to_owned(),
+            ));
+        }
+        next.supervision_lease_refs = vec![lease_ref];
+        Ok(())
+    }
+
     fn transition_activation(
         &mut self,
         state: ActivationState,
@@ -7933,9 +8100,14 @@ impl HostComposition {
         let current = self.journal.snapshot()?.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
-        self.append_record(HostStateRecord::Activation(transition_activation_record(
-            &current, state, label,
-        )?))?;
+        let mut next = transition_activation_record(&current, state, label)?;
+        if matches!(
+            state,
+            ActivationState::ControlReady | ActivationState::Active
+        ) {
+            self.refresh_supervision_lease_binding(&mut next)?;
+        }
+        self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
     }
 
@@ -7966,9 +8138,15 @@ impl HostComposition {
         let current = snapshot.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
-        self.append_record(HostStateRecord::Activation(
-            transition_activation_record_with_evidence(&current, state, label, &evidence)?,
-        ))?;
+        let mut next =
+            transition_activation_record_with_evidence(&current, state, label, &evidence)?;
+        if matches!(
+            state,
+            ActivationState::ControlReady | ActivationState::Active
+        ) {
+            self.refresh_supervision_lease_binding(&mut next)?;
+        }
+        self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
     }
 
@@ -8464,8 +8642,13 @@ impl HostComposition {
         Ok((prior_disposition, generation, authority))
     }
 
+    // Both of the next two are called by `HostComposition::cutover_generation_contour`
+    // on the live admitted #961 chain (`backup_dispatch_cutover` ->
+    // `crate::backup_cutover::execute_cutover` -> `activate_cutover_contour`):
+    // the prior-Kernel failure transition and the launched-Kernel activation,
+    // including the rollback reactivation arm. Their `dead_code` allowances
+    // existed only while that chain had no production caller.
     #[cfg(windows)]
-    #[allow(dead_code)]
     fn fail_current_kernel_record(&self, evidence: &str) -> Result<(), HostError> {
         let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
@@ -8476,7 +8659,6 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    #[allow(dead_code)]
     fn activate_launched_kernel(
         &mut self,
         generation: &PlatformHandle,
@@ -8845,6 +9027,22 @@ impl HostComposition {
     /// Activates one approved generation only after a bounded process cutover;
     /// a rejected candidate restores the registry's previous LKG projection.
     ///
+    /// This is the INSTALLER entry, not the #961 cutover entry. Its ordered
+    /// process work lives in [`Self::cutover_generation_contour`], which the
+    /// admitted #961 port now dispatches for real through
+    /// [`Self::backup_dispatch_cutover`] ->
+    /// [`crate::backup_cutover::execute_cutover`] ->
+    /// [`crate::backup_cutover`]'s `activate_cutover_contour`; the two owner
+    /// decisions this wrapper keeps are the staged-pending-activation
+    /// precondition and the trailing [`Self::commit_pending_durable`], and BOTH
+    /// belong to the installer. An installation cutover stages no installer
+    /// pending activation - it authorizes itself with its own durable cutover
+    /// intent and commits through the registry's operation-bound cutover CAS -
+    /// so giving this entry a #961 caller would require synthesizing a second
+    /// recovery owner, which A12.3 and A13.6 forbid. The allowance below
+    /// therefore covers this entry's own installer precondition, not the cutover
+    /// chain: the chain itself is live and carries no allowance.
+    ///
     /// # Errors
     ///
     /// Returns an error if admission is fenced, either generation is invalid,
@@ -8852,7 +9050,7 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(
         dead_code,
-        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches the contour without one"
+        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches `cutover_generation_contour` directly, under its own durable cutover intent, and stages no installer pending activation"
     )]
     fn cutover_generation(
         &mut self,
@@ -9278,11 +9476,16 @@ impl HostComposition {
             // manifest, and refuses a stale-activation record instead of
             // restarting from prior lineage. The snapshot above already fails
             // a corrupt journal.
+            // I1.9 A1/GATE digest-domain bind: the gate states the approved
+            // config in the Phase-B live domain, so it is resolved from the
+            // committed activation fence bound to this manifest, never from
+            // the manifest's Phase-A staged-file digest.
+            let approved_config = self.approved_phase_b_config_for_manifest(&active.manifest)?;
             require_journal_kernel_restart_record(
                 &current,
                 &readiness_observations,
                 kernel_artifact,
-                &active.manifest.config_digest,
+                &approved_config,
                 &materialized_config_digest,
                 &self.host,
                 &self.activation_id,

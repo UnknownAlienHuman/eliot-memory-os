@@ -55,6 +55,13 @@ const ADMITTED_WORKTREE: &str = "admitted-worktree";
 const ISOLATED_PROCESS: &str = "isolated-process";
 /// Environment class recorded for the decoder-only SCIP entry.
 const OFFLINE_DECODE: &str = "offline-decode";
+/// Work scope and state fence identity every entry binds.
+const ADMITTED_FENCE: &str = "admitted WorkScope State Fence (profile::WorkScope)";
+/// Feature identity every entry binds; no caller-selected feature text reaches
+/// an executable, so the set is fixed by the profile contract.
+const ADMITTED_FEATURES: &str = "admission-pinned feature set from the profile contract";
+/// Timeout policy identity every process entry binds.
+const ADMITTED_TIMEOUT: &str = "P-03 wall/idle timeout policy for the admitted stage";
 
 /// Failures raised while building or resolving the provider registry.
 ///
@@ -140,6 +147,29 @@ pub enum RegistryError {
         expected: String,
         /// Machine-derived observation.
         observed: String,
+    },
+    /// The instrument package disposition ledger rejected the assembly.
+    ///
+    /// The typed [`DispositionError`](crate::package_disposition::DispositionError)
+    /// is carried across the layer boundary unchanged, so a caller can still
+    /// match the exact disposition cause instead of parsing a message.
+    #[error(transparent)]
+    Disposition(#[from] crate::package_disposition::DispositionError),
+    /// One profile identity slot is unbound.
+    #[error("{instrument} leaves the {slot} identity slot unbound")]
+    IdentitySlotBlank {
+        /// Instrument contract identity.
+        instrument: String,
+        /// The unbound identity slot.
+        slot: IdentitySlot,
+    },
+    /// One profile identity slot disagrees with the entry it is bound to.
+    #[error("{instrument} records a {slot} identity that differs from the entry binding")]
+    IdentitySlotDrift {
+        /// Instrument contract identity.
+        instrument: String,
+        /// The drifted identity slot.
+        slot: IdentitySlot,
     },
 }
 
@@ -327,6 +357,318 @@ impl ExecutableIdentity {
     pub fn is_decoder_only(&self) -> bool {
         self.executable.is_none()
     }
+
+    /// The pinned executable name, or the decoder identity for a decoder-only
+    /// entry. A decoder-only entry with no recorded decoder returns the empty
+    /// string, which no recorded identity can match, so the profile identity
+    /// check fails closed instead of skipping the comparison.
+    pub fn identity_name(&self) -> &str {
+        match self.executable.as_deref() {
+            Some(name) => name,
+            None => self.decoder.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
+/// One exact identity every registry entry must bind before dispatch.
+///
+/// The slots are compared against the entry that carries them, so an entry
+/// cannot claim an identity its own source, toolchain, environment, resource,
+/// cancellation or executable binding contradicts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentitySlot {
+    /// Source snapshot identity.
+    Source,
+    /// Lockfile identity.
+    Lock,
+    /// Toolchain identity.
+    Toolchain,
+    /// Executable or decoder identity.
+    Executable,
+    /// Admitted feature set identity.
+    Features,
+    /// Environment class identity.
+    Environment,
+    /// Expected artifact identity.
+    Artifact,
+    /// Work scope and state fence identity.
+    Fence,
+    /// Admitted operation identity.
+    Operation,
+    /// Timeout policy identity.
+    Timeout,
+    /// Cancellation contract identity.
+    Cancellation,
+    /// Resource contract identity.
+    Resource,
+}
+
+impl fmt::Display for IdentitySlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Source => "source",
+            Self::Lock => "lock",
+            Self::Toolchain => "toolchain",
+            Self::Executable => "executable",
+            Self::Features => "features",
+            Self::Environment => "environment",
+            Self::Artifact => "artifact",
+            Self::Fence => "fence",
+            Self::Operation => "operation",
+            Self::Timeout => "timeout",
+            Self::Cancellation => "cancellation",
+            Self::Resource => "resource",
+        })
+    }
+}
+
+/// The exact identities one entry declares for [`REQUIRED_IDENTITY_SLOTS`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileIdentities {
+    /// Source snapshot identity.
+    pub source: String,
+    /// Lockfile identity.
+    pub lock: String,
+    /// Toolchain identity.
+    pub toolchain: String,
+    /// Executable or decoder identity.
+    pub executable: String,
+    /// Admitted feature set identity.
+    pub features: String,
+    /// Environment class identity.
+    pub environment: String,
+    /// Expected artifact identity.
+    pub artifact: String,
+    /// Work scope and state fence identity.
+    pub fence: String,
+    /// Admitted operation identity.
+    pub operation: String,
+    /// Timeout policy identity.
+    pub timeout: String,
+    /// Cancellation contract identity.
+    pub cancellation: String,
+    /// Resource contract identity.
+    pub resource: String,
+}
+
+impl ProfileIdentities {
+    /// Records one entry's declared identities.
+    #[must_use]
+    pub fn new(params: ProfileIdentityParams) -> Self {
+        Self {
+            source: params.source,
+            lock: params.lock,
+            toolchain: params.toolchain,
+            executable: params.executable,
+            features: params.features,
+            environment: params.environment,
+            artifact: params.artifact,
+            fence: params.fence,
+            operation: params.operation,
+            timeout: params.timeout,
+            cancellation: params.cancellation,
+            resource: params.resource,
+        }
+    }
+
+    /// The identity recorded for one slot.
+    pub fn slot(&self, slot: IdentitySlot) -> &str {
+        match slot {
+            IdentitySlot::Source => &self.source,
+            IdentitySlot::Lock => &self.lock,
+            IdentitySlot::Toolchain => &self.toolchain,
+            IdentitySlot::Executable => &self.executable,
+            IdentitySlot::Features => &self.features,
+            IdentitySlot::Environment => &self.environment,
+            IdentitySlot::Artifact => &self.artifact,
+            IdentitySlot::Fence => &self.fence,
+            IdentitySlot::Operation => &self.operation,
+            IdentitySlot::Timeout => &self.timeout,
+            IdentitySlot::Cancellation => &self.cancellation,
+            IdentitySlot::Resource => &self.resource,
+        }
+    }
+
+    /// Verifies the identities against the entry that carries them.
+    ///
+    /// Three checks run. The declared slot sets must partition
+    /// [`PROFILE_IDENTITY_SLOTS`]. Every entry-owned slot in
+    /// [`REQUIRED_IDENTITY_SLOTS`] must then carry a non-blank value, so an
+    /// unbound identity fails closed instead of dispatching under a blank
+    /// claim. Finally each identity the entry duplicates elsewhere is compared
+    /// against that field, so a recorded source, lock, toolchain, environment,
+    /// cancellation or resource identity cannot drift from the entry it claims
+    /// to describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::IdentitySlotBlank`] for a slot outside both
+    /// checked sets or an unbound entry-owned slot, or
+    /// [`RegistryError::IdentitySlotDrift`] when a recorded identity differs
+    /// from the entry field it duplicates.
+    pub fn verify(&self, entry: &RegistryEntry) -> Result<(), RegistryError> {
+        Self::verify_slot_partition(entry)?;
+        for slot in REQUIRED_IDENTITY_SLOTS {
+            if self.slot(slot).trim().is_empty() {
+                return Err(RegistryError::IdentitySlotBlank {
+                    instrument: entry.instrument.as_str().to_owned(),
+                    slot,
+                });
+            }
+        }
+        self.verify_attested(entry)?;
+        self.verify_against(entry, IdentitySlot::Toolchain, &entry.toolchain)?;
+        self.verify_against(
+            entry,
+            IdentitySlot::Executable,
+            entry.executable.identity_name(),
+        )?;
+        self.verify_against(entry, IdentitySlot::Environment, &entry.environment_class)?;
+        self.verify_against(
+            entry,
+            IdentitySlot::Cancellation,
+            &entry.cancellation_contract,
+        )?;
+        self.verify_against(entry, IdentitySlot::Resource, &entry.resource_contract)
+    }
+
+    /// Requires the entry-owned and caller-attested slot sets together to
+    /// cover every member of the independently declared
+    /// [`PROFILE_IDENTITY_SLOTS`] list, so a newly declared slot can never sit
+    /// outside both checked sets.
+    fn verify_slot_partition(entry: &RegistryEntry) -> Result<(), RegistryError> {
+        for slot in PROFILE_IDENTITY_SLOTS {
+            if REQUIRED_IDENTITY_SLOTS.contains(&slot) || ATTESTED_IDENTITY_SLOTS.contains(&slot) {
+                continue;
+            }
+            return Err(RegistryError::IdentitySlotBlank {
+                instrument: entry.instrument.as_str().to_owned(),
+                slot,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compares every caller-attested slot against the recorded fingerprint.
+    ///
+    /// An attested slot this loop cannot read is reported rather than skipped,
+    /// so widening [`ATTESTED_IDENTITY_SLOTS`] can never silently drop a
+    /// comparison.
+    fn verify_attested(&self, entry: &RegistryEntry) -> Result<(), RegistryError> {
+        for slot in ATTESTED_IDENTITY_SLOTS {
+            let observed: &str = match slot {
+                IdentitySlot::Source => &entry.invalidation.source,
+                IdentitySlot::Lock => &entry.invalidation.lock,
+                unreadable => {
+                    return Err(RegistryError::IdentitySlotDrift {
+                        instrument: entry.instrument.as_str().to_owned(),
+                        slot: unreadable,
+                    });
+                }
+            };
+            if self.slot(slot) == observed {
+                continue;
+            }
+            return Err(RegistryError::IdentitySlotDrift {
+                instrument: entry.instrument.as_str().to_owned(),
+                slot,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compares one recorded identity against the entry field it duplicates.
+    fn verify_against(
+        &self,
+        entry: &RegistryEntry,
+        slot: IdentitySlot,
+        observed: &str,
+    ) -> Result<(), RegistryError> {
+        if self.slot(slot) == observed {
+            return Ok(());
+        }
+        Err(RegistryError::IdentitySlotDrift {
+            instrument: entry.instrument.as_str().to_owned(),
+            slot,
+        })
+    }
+}
+
+/// Every identity slot an entry binds, in deterministic order.
+///
+/// A slot is either entry-owned ([`REQUIRED_IDENTITY_SLOTS`], which must carry
+/// a non-blank value) or caller-attested ([`ATTESTED_IDENTITY_SLOTS`], which is
+/// compared against the entry's recorded fingerprints). Both kinds are compared
+/// against the entry that carries them; neither is taken on trust.
+pub const PROFILE_IDENTITY_SLOTS: [IdentitySlot; 12] = [
+    IdentitySlot::Source,
+    IdentitySlot::Lock,
+    IdentitySlot::Toolchain,
+    IdentitySlot::Executable,
+    IdentitySlot::Features,
+    IdentitySlot::Environment,
+    IdentitySlot::Artifact,
+    IdentitySlot::Fence,
+    IdentitySlot::Operation,
+    IdentitySlot::Timeout,
+    IdentitySlot::Cancellation,
+    IdentitySlot::Resource,
+];
+
+/// The identity slots the entry itself owns and must bind to a non-blank value.
+pub const REQUIRED_IDENTITY_SLOTS: [IdentitySlot; 10] = [
+    IdentitySlot::Toolchain,
+    IdentitySlot::Executable,
+    IdentitySlot::Features,
+    IdentitySlot::Environment,
+    IdentitySlot::Artifact,
+    IdentitySlot::Fence,
+    IdentitySlot::Operation,
+    IdentitySlot::Timeout,
+    IdentitySlot::Cancellation,
+    IdentitySlot::Resource,
+];
+
+/// The identity slots that are caller-attested fingerprints rather than
+/// entry-owned constants.
+///
+/// They are still compared against the entry's recorded fingerprints, but an
+/// empty value is the honest "nothing attested" state the governed build lane
+/// already uses, so emptiness is reported as an unattested slot rather than a
+/// blank identity that could be mistaken for a bound one.
+pub const ATTESTED_IDENTITY_SLOTS: [IdentitySlot; 2] = [IdentitySlot::Source, IdentitySlot::Lock];
+
+/// The declared identity values one entry binds.
+///
+/// Fields are supplied separately from the [`RegistryEntry`] they will be
+/// compared against so the comparison is against recorded content rather than
+/// a second copy of the entry's own field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileIdentityParams {
+    /// Source snapshot identity.
+    pub source: String,
+    /// Lockfile identity.
+    pub lock: String,
+    /// Toolchain identity.
+    pub toolchain: String,
+    /// Executable or decoder identity.
+    pub executable: String,
+    /// Admitted feature set identity.
+    pub features: String,
+    /// Environment class identity.
+    pub environment: String,
+    /// Expected artifact identity.
+    pub artifact: String,
+    /// Work scope and state fence identity.
+    pub fence: String,
+    /// Admitted operation identity.
+    pub operation: String,
+    /// Timeout policy identity.
+    pub timeout: String,
+    /// Cancellation contract identity.
+    pub cancellation: String,
+    /// Resource contract identity.
+    pub resource: String,
 }
 
 /// Machine-derived executable observation bound to one instrument result.
@@ -540,6 +882,10 @@ pub struct RegistryEntry {
     pub verifier: ContractId,
     /// Fingerprints this entry was validated against.
     pub invalidation: InvalidationSet,
+    /// Exact source, toolchain, feature, environment, artifact, fence,
+    /// operation, timeout, cancellation and resource identities this entry
+    /// declares. Verified against the entry itself before dispatch.
+    pub identities: ProfileIdentities,
     /// Registry generation this entry was validated against.
     pub generation: u64,
 }
@@ -553,6 +899,18 @@ impl RegistryEntry {
     /// Registry key: the admitted instrument contract name.
     pub fn instrument_key(&self) -> &str {
         self.instrument.as_str()
+    }
+
+    /// Verifies that this entry binds every exact profile identity slot and
+    /// that the identities duplicating another entry field agree with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::IdentitySlotBlank`] for an unbound slot, or
+    /// [`RegistryError::IdentitySlotDrift`] when a recorded identity differs
+    /// from the entry field it duplicates.
+    pub fn verify_profile_identities(&self) -> Result<(), RegistryError> {
+        self.identities.verify(self)
     }
 
     /// Checks a machine-derived observation against this entry before launch.
@@ -722,7 +1080,10 @@ impl ProviderRegistry {
             scip_entry(fingerprints, generation)?,
             dotnet_entry(fingerprints, generation)?,
         ];
-        Self::build(entries, generation, normative_pair_digest)
+        let registry = Self::build(entries, generation, normative_pair_digest)?;
+        registry.verify_profile_identities()?;
+        crate::package_disposition::verify_disposition_coverage(&registry)?;
+        Ok(registry)
     }
 
     /// Resolves one invocation to exactly one current entry.
@@ -901,6 +1262,21 @@ impl ProviderRegistry {
     pub fn normative_pair_digest(&self) -> &str {
         &self.normative_pair_digest
     }
+
+    /// Verifies the declared profile identities of every registered entry.
+    ///
+    /// `ready` runs this before returning, so a caller that assembles entries
+    /// through `build` alone still gets the same guarantee before dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`RegistryEntry::verify_profile_identities`] failure.
+    pub fn verify_profile_identities(&self) -> Result<(), RegistryError> {
+        for entry in self.entries.values() {
+            entry.verify_profile_identities()?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a> IntoIterator for &'a ProviderRegistry {
@@ -963,6 +1339,9 @@ fn cargo_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(CARGO_CONTRACT_NAME)?;
+    let resource_contract = "composition-root port limits; adapter defines no capture bound";
+    let cancellation_contract =
+        "P-03 cancel/reconcile through OperationId (CargoInstrumentationAdapter)";
     Ok(RegistryEntry {
         profile: contract_id(CARGO_CONTRACT_NAME)?,
         profile_version: ContractVersion::new(
@@ -985,15 +1364,27 @@ fn cargo_entry(
         toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
-        resource_contract: "composition-root port limits; adapter defines no capture bound"
-            .to_owned(),
-        cancellation_contract:
-            "P-03 cancel/reconcile through OperationId (CargoInstrumentationAdapter)".to_owned(),
+        resource_contract: resource_contract.to_owned(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: diagnostic_id()?,
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "cargo (rust toolchain)".to_owned(),
+            executable: "cargo".to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: "cargo build/test outputs under the admitted target layout".to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "P-03 OperationId for the admitted cargo stage".to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract.to_owned(),
+        }),
         generation,
     })
 }
@@ -1008,6 +1399,10 @@ fn rustc_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(RUSTC_INSTRUMENT)?;
+    let resource_contract = format!(
+        "raw diagnostic capture bounded at {MAX_RUSTC_OUTPUT_BYTES} bytes (MAX_RUSTC_OUTPUT_BYTES)"
+    );
+    let cancellation_contract = "P-03 cancel/reconcile through OperationId (RustcAdapter)";
     Ok(RegistryEntry {
         profile: contract_id(RUSTC_INSTRUMENT)?,
         profile_version: ContractVersion::new(1, 0, 0),
@@ -1022,16 +1417,28 @@ fn rustc_entry(
         toolchain: "rustc".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
-        resource_contract: format!(
-            "raw diagnostic capture bounded at {MAX_RUSTC_OUTPUT_BYTES} bytes (MAX_RUSTC_OUTPUT_BYTES)"
-        ),
-        cancellation_contract: "P-03 cancel/reconcile through OperationId (RustcAdapter)"
-            .to_owned(),
+        resource_contract: resource_contract.clone(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: contract_id(RUSTC_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTC_INSTRUMENT)?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "rustc".to_owned(),
+            executable: RUSTC_EXECUTABLE.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle"
+                .to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "P-03 OperationId for the admitted rustc stage".to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract,
+        }),
         generation,
     })
 }
@@ -1047,6 +1454,10 @@ fn rustfmt_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(RUSTFMT_INSTRUMENT)?;
+    let resource_contract = format!(
+        "raw output capture bounded at {MAX_RUSTFMT_OUTPUT_BYTES} bytes (MAX_RUSTFMT_OUTPUT_BYTES)"
+    );
+    let cancellation_contract = "P-03 cancel/reconcile through OperationId (RustfmtAdapter)";
     Ok(RegistryEntry {
         profile: contract_id(RUSTFMT_INSTRUMENT)?,
         profile_version: ContractVersion::new(1, 0, 0),
@@ -1061,16 +1472,29 @@ fn rustfmt_entry(
         toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
-        resource_contract: format!(
-            "raw output capture bounded at {MAX_RUSTFMT_OUTPUT_BYTES} bytes (MAX_RUSTFMT_OUTPUT_BYTES)"
-        ),
-        cancellation_contract: "P-03 cancel/reconcile through OperationId (RustfmtAdapter)"
-            .to_owned(),
+        resource_contract: resource_contract.clone(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: contract_id(RUSTFMT_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTFMT_INSTRUMENT)?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "cargo (rust toolchain)".to_owned(),
+            executable: "cargo".to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact:
+                "rustfmt --check emits no artifact; the check outcome streams as raw evidence"
+                    .to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "P-03 OperationId for the admitted rustfmt stage".to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract,
+        }),
         generation,
     })
 }
@@ -1086,6 +1510,10 @@ fn nextest_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(NEXTEST_INSTRUMENT)?;
+    let resource_contract = format!(
+        "event stream capture bounded at {MAX_NEXTEST_OUTPUT_BYTES} bytes (MAX_NEXTEST_OUTPUT_BYTES)"
+    );
+    let cancellation_contract = "P-03 cancel/reconcile through OperationId (NextestAdapter)";
     Ok(RegistryEntry {
         profile: contract_id(NEXTEST_INSTRUMENT)?,
         profile_version: ContractVersion::new(1, 0, 0),
@@ -1100,16 +1528,27 @@ fn nextest_entry(
         toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
-        resource_contract: format!(
-            "event stream capture bounded at {MAX_NEXTEST_OUTPUT_BYTES} bytes (MAX_NEXTEST_OUTPUT_BYTES)"
-        ),
-        cancellation_contract: "P-03 cancel/reconcile through OperationId (NextestAdapter)"
-            .to_owned(),
+        resource_contract: resource_contract.clone(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: contract_id(NEXTEST_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(NEXTEST_INSTRUMENT)?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "cargo (rust toolchain)".to_owned(),
+            executable: "cargo".to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: "nextest test binaries under the admitted target layout; the run report is raw evidence".to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "P-03 OperationId for the admitted nextest stage".to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract,
+        }),
         generation,
     })
 }
@@ -1126,6 +1565,9 @@ fn scip_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(SCIP_INSTRUMENT)?;
+    let resource_contract =
+        format!("SCIP decode bounded at {MAX_SCIP_BYTES} bytes (MAX_SCIP_BYTES)");
+    let cancellation_contract = "not applicable: decoder-only, no operation or fence";
     Ok(RegistryEntry {
         profile: contract_id(SCIP_INSTRUMENT)?,
         profile_version: ContractVersion::new(1, 0, 0),
@@ -1140,15 +1582,28 @@ fn scip_entry(
         toolchain: "scip-indexer".to_owned(),
         targets: BTreeSet::new(),
         environment_class: OFFLINE_DECODE.to_owned(),
-        resource_contract: format!(
-            "SCIP decode bounded at {MAX_SCIP_BYTES} bytes (MAX_SCIP_BYTES)"
-        ),
-        cancellation_contract: "not applicable: decoder-only, no operation or fence".to_owned(),
+        resource_contract: resource_contract.clone(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: contract_id(SCIP_INSTRUMENT)?,
         normalizer: contract_id(SCIP_INSTRUMENT)?,
         evaluator: contract_id(SCIP_INSTRUMENT)?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "scip-indexer".to_owned(),
+            executable: SCIP_INSTRUMENT.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: OFFLINE_DECODE.to_owned(),
+            artifact: "emitted SCIP index bytes decoded in process; no child process is created"
+                .to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "decode-only operation identity; no admitted launch is required".to_owned(),
+            timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES".to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract,
+        }),
         generation,
     })
 }
@@ -1165,6 +1620,9 @@ fn dotnet_entry(
     generation: u64,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(DOTNET_CONTRACT_ID)?;
+    let resource_contract = "composition-root port limits; adapter defines no capture bound";
+    let cancellation_contract =
+        "P-03 inspect/cancel/reconcile through OperationId (DotnetMsbuildAdapter)";
     Ok(RegistryEntry {
         profile: contract_id(DOTNET_CONTRACT_ID)?,
         profile_version: ContractVersion::new(1, 0, 0),
@@ -1184,15 +1642,29 @@ fn dotnet_entry(
         toolchain: "dotnet-sdk".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
-        resource_contract: "composition-root port limits; adapter defines no capture bound"
-            .to_owned(),
-        cancellation_contract:
-            "P-03 inspect/cancel/reconcile through OperationId (DotnetMsbuildAdapter)".to_owned(),
+        resource_contract: resource_contract.to_owned(),
+        cancellation_contract: cancellation_contract.to_owned(),
         parser: diagnostic_id()?,
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: "dotnet-sdk".to_owned(),
+            executable: DOTNET_EXECUTABLE.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact:
+                "msbuild outputs under the admitted target layout; the report is raw evidence"
+                    .to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: "P-03 OperationId for the admitted msbuild stage".to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract.to_owned(),
+        }),
         generation,
     })
 }

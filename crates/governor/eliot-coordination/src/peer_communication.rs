@@ -1123,9 +1123,21 @@ fn validate_live_peer_payload(
     if sender_assigned != Some(&payload.sender_attempt_id) {
         return Err(CoordinationError::InvalidField("live_peer_payload"));
     }
-    // Live-peer payload references are `PublicReference` handles and carry no
-    // blackboard record body. The common checks below bind reference IDs to
-    // the draft's evidence/artifact handle lists.
+    // An authority/effect assertion never passes this validator: assignment,
+    // effects, finish and commands promote nothing through the peer channel,
+    // so only the existing blackboard owner's governed transition may change
+    // decision/truth/acceptance/write scope.
+    if draft.asserted.is_some() {
+        return Err(CoordinationError::PeerAuthorityRejected(
+            draft.message_id.clone(),
+        ));
+    }
+    // Live-peer payload references are typed blackboard item references: a
+    // closed blackboard category plus the item ID, the observed revision and
+    // an optional digest. They carry IDs/handles only, never a record body,
+    // and every admitted draft handle resolves to exactly one such typed
+    // reference, so item content cannot ride an untyped transcript field or
+    // an unbound handle list.
     if draft.delta_kind != Some(live_delta_kind(payload.kind))
         || draft
             .inline_text
@@ -1134,6 +1146,10 @@ fn validate_live_peer_payload(
         || (draft.inline_text.is_none() && draft.payload_handle.is_none())
         || payload.expires_at.as_deref()
             != draft.expires_at.map(|expiry| expiry.to_string()).as_deref()
+        || payload
+            .evidence_refs
+            .iter()
+            .any(|reference| PeerBoardKind::decode(&reference.kind).is_err())
         || payload.evidence_refs.iter().any(|reference| {
             !draft
                 .evidence_refs
@@ -1144,6 +1160,16 @@ fn validate_live_peer_payload(
                     .iter()
                     .any(|handle| handle == reference.id.as_str())
         })
+        || draft
+            .evidence_refs
+            .iter()
+            .chain(draft.artifact_refs.iter())
+            .any(|handle| {
+                !payload
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.id.as_str() == handle.as_str())
+            })
         || !payload.recipients.iter().any(|recipient| {
             map.resolve_recipient(recipient)
                 .is_ok_and(|entry| entry.work_item_id.as_str() == draft.work_item_id)

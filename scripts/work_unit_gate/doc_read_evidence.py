@@ -147,6 +147,7 @@ class EvidenceFailure(str, Enum):
     ROUTER_INPUT_MISMATCH = "ROUTER_INPUT_MISMATCH"
     ATTESTATION_MISSING = "ATTESTATION_MISSING"
     CHECKLIST_REQUIRED_MISSING = "CHECKLIST_REQUIRED_MISSING"
+    LOCAL_EVIDENCE_COMMITTED = "LOCAL_EVIDENCE_COMMITTED"
 
 
 class ChecklistState(str, Enum):
@@ -323,6 +324,40 @@ def _materialize_candidate(root: Path, candidate_tree: str) -> Path:
             shutil.rmtree(target, ignore_errors=True)
             _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, f"cannot extract candidate ({type(exc).__name__})")
     return target
+
+
+# ---------------------------------------------------------------------------
+# Local evidence stays out of Git (issue #2965 item 14).
+# ---------------------------------------------------------------------------
+
+# Mirror of the `.eliot*/` families `.gitignore` keeps out of Git. A gitignore
+# pattern without a slash matches at any depth, so any such path segment in
+# the final candidate tree is rejected. `.gitignore` alone is advisory
+# (`git add -f` bypasses it); the merge boundary enforces it here.
+_LOCAL_EVIDENCE_SEGMENTS = (".eliot", ".eliot-dev", ".eliot-governor")
+
+
+def _reject_committed_local_evidence(root: Path, candidate_tree: str) -> None:
+    """Fail when the final candidate tree carries committed local evidence.
+
+    `.eliot/docs-read-bundle.md` and local receipts remain ignored; only the
+    compact PR evidence travels with the PR.
+    """
+    output = _git(root, "ls-tree", "-r", "--name-only", candidate_tree)
+    offenders = sorted(
+        {
+            entry
+            for entry in (line.strip() for line in output.splitlines())
+            if entry and any(segment in _LOCAL_EVIDENCE_SEGMENTS for segment in entry.split("/"))
+        }
+    )
+    if offenders:
+        preview = ", ".join(offenders[:MAX_DIAGNOSTIC_PATHS])
+        more = "" if len(offenders) <= MAX_DIAGNOSTIC_PATHS else f" (+{len(offenders) - MAX_DIAGNOSTIC_PATHS} more)"
+        _fail(
+            EvidenceFailure.LOCAL_EVIDENCE_COMMITTED,
+            f"candidate commits local evidence that must remain ignored: {preview}{more}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +900,10 @@ def verify(
     # Shape is checked before any repository work so an absent or malformed
     # envelope is EMPTY/MALFORMED and no prose attestation can rescue it.
     envelope = _shape(_extract_envelope(pr_body))
+
+    # Item 14 precedes all content comparison: a candidate that commits local
+    # evidence can never pass, however exact its envelope otherwise is.
+    _reject_committed_local_evidence(root, candidate_tree)
 
     changed = _changed_paths(root, base_tree, candidate_tree)
     if not changed:

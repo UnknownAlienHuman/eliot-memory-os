@@ -72,13 +72,30 @@
 //! the prepared-destination receipt binds the exact configuration evidence that
 //! was proved.
 //!
-//! That projection **refuses** a presented owner lease reference, purge-ledger
-//! revision or forensic audit note, because no owner reachable from Host issues
-//! or corroborates any of them. This module passes those presented values
-//! through so the refusal is real, and it never renders a caller-authored
-//! forensic note into a receipt: [`DestinationAdmission::audit_fence_note`] and
+//! The projection is **owner-issued**: the owner lease reference comes from
+//! [`OwnerEvidence::owner_lease_ref`], which re-proves the retained
+//! protected-root lease (identity plus the object's current final path) at the
+//! moment the projection consumes it and refuses typed if the source root is no
+//! longer the object the evidence chain admitted; the configuration and
+//! generation values come from the validated approved generation, its committed
+//! activation fence and any completed Phase-B rebind; and the fence is the
+//! committed fence's authority state fence. A presented owner lease reference is
+//! a *claim* checked against that owner value and refused as
+//! [`PreparationError::InvalidRequest`] with the `owner_lease_ref` field when it
+//! differs, so a stale or foreign lease cannot reach a receipt.
+//!
+//! The projection still **refuses** a presented purge-ledger revision or
+//! forensic audit note, because no owner reachable from Host issues or
+//! corroborates either: the purge revision belongs to the ORS owner and this
+//! module opens no ORS store, and a forensic note is caller-authored. This
+//! module passes those presented values through so the refusal is real, and it
+//! never renders a caller-authored forensic note into a receipt:
+//! [`DestinationAdmission::audit_fence_note`] and
 //! [`PreparedDestination::audit_fence_note`] are therefore always absent here.
-//! I5.13 keeps the HostStateAuditFence optional for exactly this reason.
+//! I5.13 keeps the HostStateAuditFence optional for exactly this reason. No
+//! credential or secret material is read or projected: the committed fence's
+//! `credential_receipt_digest` and `host_process_nonce_digest` are visible on a
+//! record this module reads and are deliberately not extracted.
 //!
 //! # Source and API guard
 //!
@@ -240,8 +257,8 @@ pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
 /// filled with an explicit, static, truthful **absence** marker rather than an
 /// invented archive identity, which would let a reader believe a specific
 /// archive had been proved. This is the same "record the absence" treatment the
-/// owner-issued configuration projection already applies to the owner lease
-/// reference and the purge-ledger revision, and the marker is part of the
+/// owner-issued configuration projection still applies to the purge-ledger
+/// revision and the forensic audit note, and the marker is part of the
 /// record's exact-binding transition, so it cannot vary between one
 /// preparation's admission and its result.
 pub const PREPARATION_NO_SOURCE_ARCHIVE: &str = "eliot.backup.preparation.no-source-archive.v1";
@@ -593,11 +610,12 @@ pub struct DestinationAdmission {
     pub manifest_digest: String,
     /// Owner-issued configuration projection digest proved for this request
     /// (hex64). It binds the owner-approved generation, the owner authority
-    /// state fence, the owner-issued configuration/build digests and the
-    /// owner-approved profile token, and states the absence of an owner-issued
-    /// lease reference, purge-ledger revision and audit note, so the
-    /// prepared-destination receipt names the exact configuration evidence that
-    /// was proved.
+    /// state fence, the owner-issued template and retained (materialized Phase-B)
+    /// configuration digests, the complete owner-issued approved build digest
+    /// set, the owner-approved profile token and the owner-issued lease
+    /// reference, and states the absence of a purge-ledger revision and an audit
+    /// note, so the prepared-destination receipt names the exact configuration
+    /// evidence that was proved.
     pub config_projection_digest: String,
     /// Optional rendered forensic audit note.
     ///
@@ -2397,8 +2415,9 @@ fn remove_reverified_destination(
 /// [`PreparationError::FilesystemEffect`]. Owner error internals are never
 /// echoed. Staging admission and generation authority stay with
 /// [`prepare_isolated_destination`] and HostComposition delegation, and the
-/// owner lease reference a caller may present is refused by the configuration
-/// projection rather than bound from the request.
+/// owner lease reference a caller may present is a claim checked against
+/// [`OwnerEvidence::owner_lease_ref`] by the configuration projection rather
+/// than bound from the request.
 pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, PreparationError> {
     roots
         .validate()
@@ -2441,12 +2460,15 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// [`OwnerEvidence::authority_generation`]); `target_build` and
 /// `target_profile` must equal the owner-approved generation handle and
 /// profile token or the preparation is refused. A presented owner lease
-/// reference, purge-ledger revision or forensic audit note is **refused**,
-/// because no owner reachable from Host issues or corroborates any of them —
-/// lease-reference issuance and purge-ledger authority belong to a Host lease
-/// issuer and to the ORS purge-ledger owner respectively, and #954 (merged,
-/// `5e71386a`) supplies neither: its `BackupAdmissionRef` is a per-operation
-/// admission reference, not a standing owner lease. The presented
+/// reference is a claim that must equal [`OwnerEvidence::owner_lease_ref`] or
+/// the preparation is refused as stale evidence; the projected lease reference
+/// is always the owner-issued one. A presented purge-ledger revision or forensic
+/// audit note is **refused outright**, because no owner reachable from Host
+/// issues or corroborates either — purge-ledger authority belongs to the ORS
+/// purge-ledger owner, which this module does not open, and #954 (merged,
+/// `5e71386a`) supplies neither an owner lease nor a purge revision: its
+/// `BackupAdmissionRef` is a per-operation admission reference, not a standing
+/// owner lease. The presented
 /// `authority_generation` is read nowhere on this path: this lane grants it
 /// nothing, and the admission carries the owner-issued one instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2491,18 +2513,24 @@ pub struct PresentedPreparationRequest {
     pub authority_generation: u64,
     /// Owner lease reference the requester presents (bounded text).
     ///
-    /// Presenting a value is **refused** by the owner-bound configuration
-    /// projection: no owner reachable from Host issues a lease reference, so
-    /// the claim could not be corroborated and is never copied into the
-    /// projection. The field stays on the presented contract surface because
-    /// removing a #954 contract field is not this lane's decision.
+    /// A **claim** about the owner's lease, never a source of one. On the
+    /// delegated path it is checked against [`OwnerEvidence::owner_lease_ref`]:
+    /// empty (no claim) is admitted, and a value that differs from the
+    /// owner-issued reference is refused as stale evidence. The projection's own
+    /// `owner_lease_ref` is always the owner-issued side, so nothing a caller
+    /// writes here reaches the record. The field stays on the presented contract
+    /// surface because removing a #954 contract field is not this lane's
+    /// decision.
     pub owner_lease_ref: String,
     /// Purge-ledger revision the requester presents.
     ///
-    /// Presenting a nonzero value is **refused** by the owner-bound
-    /// configuration projection, for the same reason: purge-ledger authority is
-    /// owned outside Host backup preparation and no owner observed here issues a
-    /// revision, so the projection records the absence instead.
+    /// Presenting a nonzero value is still **refused** by the owner-bound
+    /// configuration projection: the revision is owner-issued by the ORS owner
+    /// and Host backup preparation opens no ORS store, so no owner observed
+    /// here issues one and the projection records the absence instead. This
+    /// refusal is unchanged by the owner-lease work — a lease is not purge-ledger
+    /// authority, and holding one does not make a caller-asserted purge revision
+    /// corroborable.
     pub purge_ledger_revision: u64,
     /// Presented build digests, each verified against owner artifacts by the
     /// configuration projection.
@@ -2562,14 +2590,15 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// owner record, project the bounded owner-issued configuration evidence
     /// through the owner-bound projector, resolve the manifest-bound owner
     /// source root, then admit and prepare idempotently. The projection is a
-    /// precondition, not an observation: a presented owner lease reference,
-    /// purge-ledger revision or forensic note is refused outright, and a stale
-    /// or mixed generation or configuration/build digest is refused, both
-    /// before any filesystem observation. The projected owner configuration
-    /// digest plus the projection digest are admitted so the
-    /// prepared-destination receipt binds the exact configuration evidence that
-    /// was proved. The caller never chooses the manifest digest, the projection
-    /// digest, or the owner lease.
+    /// precondition, not an observation: a presented purge-ledger revision or
+    /// forensic note is refused outright, a presented owner lease reference that
+    /// is not the owner-issued one is refused as stale, and a stale or mixed
+    /// generation or configuration/build digest is refused, all before any
+    /// filesystem observation. The projected owner configuration digest plus the
+    /// projection digest are admitted so the prepared-destination receipt binds
+    /// the exact configuration evidence that was proved. The caller never
+    /// chooses the manifest digest, the projection digest, the owner lease
+    /// reference, or the approved-build digest set.
     ///
     /// The admitted `authority_generation` is the owner-issued one from
     /// [`OwnerEvidence::authority_generation`], so the presented
@@ -2643,12 +2672,12 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         }
         // The owner-issued configuration projection runs AFTER the checks above
         // so #983's per-step diagnostics keep their existing precedence, and
-        // BEFORE the admission is built so a presented lease reference, purge
-        // revision or forensic note, and any stale or mixed generation or
-        // configuration/build digest, is refused before any effect. The
-        // projector re-checks the presented build digests against the
-        // owner-issued artifact set, so the loop above is a first cheap refusal
-        // and this is the authoritative one.
+        // BEFORE the admission is built so a presented purge revision or forensic
+        // note, a presented owner lease reference that is not the owner-issued
+        // one, and any stale or mixed generation or configuration/build digest
+        // is refused before any effect. The projector re-checks the presented
+        // build digests against the owner-issued artifact set, so the loop above
+        // is a first cheap refusal and this is the authoritative one.
         let projection: BackupConfigProjection = evidence
             .project_backup_configuration(request, &binding)
             .map_err(|error| note_prepare_error(OP_DELEGATE, "project_config", error, 0))?;
@@ -2755,12 +2784,28 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
 /// manifest-bound runtime roots, committed fence, and fence↔manifest
 /// agreement. The bundle owns every record it serves, so evidence cannot
 /// outlive its read and no caller input enters it.
+///
+/// It is also the owner of the **owner lease reference** the configuration
+/// projection binds ([`OwnerEvidence::owner_lease_ref`]). The `root_lease`
+/// field is a real retained [`ProtectedRootLease`] over the canonical source
+/// Host state root, held for the whole life of the bundle — the registry read
+/// gets a second, short-lived lease because
+/// [`RedbInstallationRegistry::inspect_existing_at`] consumes the one it is
+/// handed. Because the handle is retained, [`OwnerEvidence::owner_lease_ref`]
+/// can re-derive the object's current final path from that handle at
+/// projection time and refuse unless it still resolves to
+/// `canonical_host_root`; that is the property a backup manifest needs from a
+/// lease reference, and it is a decision the code makes rather than a claim
+/// about a lease it no longer holds.
 pub struct OwnerEvidence {
     registry: ApprovedGenerationRegistry,
     approved: ApprovedGeneration,
     fence: ActivationCommitFence,
     canonical_host_root: PathBuf,
     root_identity: FileIdentity,
+    /// Retained source-root lease. Never read except through
+    /// [`OwnerEvidence::owner_lease_ref`], which re-proves it first.
+    root_lease: ProtectedRootLease,
 }
 
 impl OwnerEvidence {
@@ -2769,13 +2814,19 @@ impl OwnerEvidence {
     ///
     /// Order, mirroring the `load_manifest_bound_canary_binding` precedent:
     /// absolute-path gate, protected-root lease, canonical path,
-    /// stable-identity proof, caller-root equality, read-only registry
+    /// stable-identity proof, caller-root equality, second lease for the
+    /// registry read pinned to the same object, read-only registry
     /// inspection, registry validation, active generation, manifest
     /// validation, manifest/profile agreement with the bound runtime roots,
     /// manifest-root equality, committed fence, fence validation, and
     /// fence↔manifest agreement. Any step fails closed with a static
     /// [`PreparationError`]; owner error internals are never echoed.
     /// Absence of proof is never treated as proof of absence.
+    ///
+    /// The first lease is the one RETAINED in the bundle; the registry read
+    /// consumes the second one, because
+    /// [`RedbInstallationRegistry::inspect_existing_at`] takes its lease by
+    /// value. See the `root_lease` field docs.
     ///
     /// The outcome is observed once: the static field in each refusal already
     /// names the failed inspection step, and no path or owner text is logged.
@@ -2827,7 +2878,28 @@ impl OwnerEvidence {
                 reason: "caller root differs from retained OS identity".to_owned(),
             });
         }
-        let registry = RedbInstallationRegistry::inspect_existing_at(lease).map_err(|_| {
+        // The registry read below CONSUMES the lease it is handed (A13.9 keeps
+        // the containment proof alive only for the duration of that read and
+        // returns the projection, not the store), so the registry read gets its
+        // own second lease while this one is RETAINED in the bundle. The two
+        // leases must pin the same object: without that equality the read could
+        // have happened against a different directory than the one whose
+        // identity and canonical path the rest of this chain just admitted, and
+        // the retained lease would be pinning something nobody inspected.
+        let read_lease = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("protected source root unavailable for registry read: {error}"),
+            }
+        })?;
+        if read_lease.identity() != root_identity {
+            return Err(PreparationError::IdentityConflict {
+                operation: OP_OWNER_EVIDENCE.to_owned(),
+                recorded: file_identity_text(root_identity),
+                observed: file_identity_text(read_lease.identity()),
+            });
+        }
+        let registry = RedbInstallationRegistry::inspect_existing_at(read_lease).map_err(|_| {
             PreparationError::InvalidRequest {
                 field: "source_registry",
                 reason: "owner registry inspection withheld".to_owned(),
@@ -2905,6 +2977,10 @@ impl OwnerEvidence {
             fence,
             canonical_host_root: canonical,
             root_identity,
+            // The retained lease outlives the registry read on purpose: it is
+            // the only thing that can still prove, at projection time, that the
+            // source root is the same object this chain admitted.
+            root_lease: lease,
         })
     }
 
@@ -2938,17 +3014,136 @@ impl OwnerEvidence {
     /// Binds the active generation to owner-verified build facts.
     ///
     /// The record is already validated by [`OwnerEvidence::inspect`];
-    /// [`bind_approved_build`] re-verifies it here so the binding never
-    /// depends on inspection-time state alone.
+    /// [`bind_approved_build`] re-verifies it here — the approved generation and
+    /// the committed activation fence together, including their agreement on
+    /// generation, configuration digest and authority generation — so the
+    /// binding never depends on inspection-time state alone and the retained
+    /// Phase-B configuration identity is read from the same activation the
+    /// template digest came from.
+    ///
+    /// The registry's completed Phase-B rebind is passed through so
+    /// [`ApprovedBuildBinding::retained_config_digest`] names the rebind's
+    /// config readback when one exists; see
+    /// [`ApprovedGenerationRegistry::active_phase_b_rebind`]. The registry
+    /// itself already prefers the rebind over the committed fence for the live
+    /// Phase-B supervision authority, and the retained config identity is read
+    /// the same way rather than from the older committed fence alone.
     pub fn approved_binding(&self) -> Result<ApprovedBuildBinding, PreparationError> {
-        bind_approved_build(&self.approved).map_err(projection_to_preparation)
+        bind_approved_build(
+            &self.approved,
+            &self.fence,
+            self.registry.active_phase_b_rebind(),
+        )
+        .map_err(projection_to_preparation)
+    }
+
+    /// Returns the **owner-issued** lease reference for this source, re-proving
+    /// the retained lease first.
+    ///
+    /// The value is the pinned OS file identity (volume serial + file index) of
+    /// the retained `root_lease`, rendered through the same `file_identity_text`
+    /// encoding the preparation receipts already use and prefixed so a reader
+    /// cannot mistake it for a path. It is opaque, non-secret, bounded text.
+    ///
+    /// # The retention and stability this actually provides
+    ///
+    /// [`OwnerEvidence::inspect`] retains the `ProtectedRootLease` in
+    /// `root_lease` for the whole life of the bundle and proves the identity
+    /// once, at inspection. That single inspection-time proof is **not** enough
+    /// to call the reference current, so this method re-proves it here, at the
+    /// moment the projection consumes it, and refuses rather than returning a
+    /// reference that is no longer true:
+    ///
+    /// - [`ProtectedRootLease::verify_stable_identity`] re-reads the identity
+    ///   from the retained handle and compares it with the one pinned at
+    ///   inspection, and
+    /// - [`ProtectedRootLease::canonical_path`] re-derives the object's
+    ///   **current** final path from that same handle and requires it still to
+    ///   equal `canonical_host_root`.
+    ///
+    /// The second check is the defence in depth behind the handle itself. The
+    /// lease's directory handle is opened with `FILE_SHARE_READ | FILE_SHARE_WRITE`
+    /// and **without** `FILE_SHARE_DELETE`
+    /// (`crates/kernel/eliot-platform-windows/src/protected_path.rs`), so while
+    /// this bundle holds it, Windows sharing rules do not admit a rename or
+    /// delete of the pinned directory at all. The re-derivation above therefore
+    /// confirms the object and its path rather than being the only barrier: a
+    /// handle's own file identity never changes, so an identity check alone could
+    /// not distinguish "still the admitted object" from "the admitted object,
+    /// moved". Both failures are typed [`PreparationError`]s and are observed once
+    /// at this owner boundary.
+    ///
+    /// What this does **not** claim: it does not prove the source tree's
+    /// *contents* are unchanged — files inside the pinned directory are opened
+    /// independently of this lease and are not covered by the share mode above.
+    /// It proves that, at the instant of this call, the retained lease still pins
+    /// the same object at the same path the rest of the evidence chain was
+    /// admitted against, and it keeps that object pinned for as long as this
+    /// bundle is alive.
+    ///
+    /// The retention has a consequence worth stating rather than discovering: an
+    /// operation that legitimately renames or replaces a directory inside the
+    /// protected contour can now meet a sharing violation while a preparation is
+    /// in flight, where before the lease was dropped immediately after the
+    /// registry read. That is the cost of a reference that cannot go stale, and
+    /// it is the reason the lease is retained for the whole bundle instead of
+    /// only for the read that needed it.
+    ///
+    /// This is deliberately **not** the installation-wide
+    /// `eliot_platform_windows::HostOwnerLease` mutex name. That lease is held by
+    /// `HostComposition` for the process lifetime and
+    /// `HostOwnerLease::acquire` refuses to observe an existing object — it
+    /// would also *create* one if none existed, which no backup read may do — so
+    /// this contour cannot read that name at all. Recomputing it from a
+    /// caller-supplied installation path would name a lease nobody proved was
+    /// held, which is the fabrication I5.13 forbids; naming the lease this owner
+    /// demonstrably holds and demonstrably still holds is the honest binding.
+    /// #954 merged (`5e71386a`, PR #2572) and does not close that gap either:
+    /// its `BackupAdmissionRef` is a per-operation admission reference,
+    /// documented never to grant a role on its own, so substituting it here
+    /// would put a different object under the name of the guarantee A1
+    /// requires.
+    ///
+    /// ASSUMPTION: the issue's "owner lease" is read as the lease the owner
+    /// holds over the source being captured, not specifically the
+    /// installation-wide admission mutex, because only the former is observable
+    /// from the owner that already exists on this path. If the intended guarantee
+    /// is the admission mutex specifically, this reference must be replaced by
+    /// one read from the composition-held `HostOwnerLease` at the port that
+    /// already holds it (`HostComposition::prepare_backup_destination` passes it
+    /// to `authenticate_for_owner`) — which is a change outside this file.
+    pub fn owner_lease_ref(&self) -> Result<String, PreparationError> {
+        let reverified = self
+            .root_lease
+            .verify_stable_identity()
+            .and_then(|()| self.root_lease.canonical_path())
+            .map_err(|error| {
+                protected_path_to_preparation(OP_OWNER_EVIDENCE, &self.canonical_host_root, error)
+            })
+            .and_then(|current| {
+                if windows_paths_equal(&current, &self.canonical_host_root) {
+                    Ok(current)
+                } else {
+                    Err(PreparationError::UnknownState {
+                        operation: OP_OWNER_EVIDENCE.to_owned(),
+                        reason: "retained source lease moved off the inspected root".to_owned(),
+                    })
+                }
+            });
+        match reverified {
+            Ok(_) => Ok(format!(
+                "protected-root-lease:{}",
+                file_identity_text(self.root_identity)
+            )),
+            Err(error) => Err(note_prepare_error(OP_OWNER_EVIDENCE, "lease_ref", error, 0)),
+        }
     }
 
     /// Projects the bounded owner-issued configuration evidence for one
     /// presented preparation request (issue #958, cases 958/1-4, 958/16).
     ///
     /// This is the production construction of the owner-bound projection. The
-    /// owner supplies three of its inputs and the request supplies only
+    /// owner supplies four of its inputs and the request supplies only
     /// presented evidence:
     ///
     /// - the manifest digest is the owner-issued configuration digest from
@@ -2956,19 +3151,35 @@ impl OwnerEvidence {
     /// - the projection fence is the committed activation fence's authority
     ///   state fence, so a caller cannot choose the fence its evidence is bound
     ///   to;
-    /// - the generation handle and profile token are bound inside the projector
-    ///   from the same owner record.
+    /// - the owner lease reference is [`OwnerEvidence::owner_lease_ref`], which
+    ///   re-proves the retained protected-root lease immediately before this
+    ///   method uses it, so the record names the lease this owner still holds
+    ///   over the source rather than anything the requester wrote;
+    /// - the generation handle, profile token, retained Phase-B configuration
+    ///   digest and the complete approved artifact digest set are bound inside
+    ///   the projector from the same owner records.
     ///
-    /// The presented owner lease reference, purge-ledger revision and optional
-    /// forensic note are passed through unchanged **so the projector refuses
-    /// them**: no installation record, approved generation, activation commit
-    /// fence or host-state record reachable from Host issues or corroborates any
-    /// of the three, so a presented value could only be a self-declaration. The
-    /// returned [`BackupConfigProjection`] therefore carries an empty lease
-    /// reference and a zero purge-ledger revision, and the projection digest
-    /// binds those absences explicitly. No secret-typed field exists on this
-    /// path, and a credential-shaped value fails digest or identity shape
-    /// rather than being projected.
+    /// The presented owner lease reference is still passed through unchanged,
+    /// but its role changed: it is now a **claim** the projector checks against
+    /// the owner-issued reference, and a claim that differs is refused with
+    /// [`ProjectionError::StaleEvidence`] rather than
+    /// [`ProjectionError::OwnerEvidenceUnavailable`]. Nothing about the check
+    /// itself weakened — before this change any non-empty claim was refused, and
+    /// now a claim is refused unless it equals owner evidence.
+    ///
+    /// The presented purge-ledger revision and optional forensic note are passed
+    /// through unchanged **so the projector still refuses them**: the revision is
+    /// owner-issued by the ORS owner and Host backup preparation opens no ORS
+    /// store, and no owner reachable from Host issues or corroborates a
+    /// caller-authored forensic note. The returned
+    /// [`BackupConfigProjection`] therefore carries a zero purge-ledger
+    /// revision, and the projection digest binds that absence explicitly. No
+    /// secret-typed field exists on this path and no credential-typed value is
+    /// read: the committed fence's `credential_receipt_digest` and
+    /// `host_process_nonce_digest` are not extracted, because I5.13 forbids
+    /// replaying a raw credential reference in a backup manifest. A
+    /// credential-shaped value presented by a caller fails digest or identity
+    /// shape rather than being projected.
     ///
     /// Installation identity, numeric generation and presented build digests
     /// remain caller-presented and shape-checked here, then bound into the
@@ -2976,8 +3187,10 @@ impl OwnerEvidence {
     /// `BackupCallerAuth::authenticate_for_owner` at
     /// `HostComposition::prepare_backup_destination`, which compares it against
     /// the owner-issued launch installation handle before this method runs; the
-    /// numeric generation and the build digests are compared against
-    /// owner-issued values inside the projector.
+    /// numeric generation, the lease reference and the build digests are
+    /// compared against owner-issued values inside the projector. The returned
+    /// record's `build_digests` is the complete owner-issued artifact set, not
+    /// the presented subset.
     ///
     /// `manifest_digest` is the one field that is NOT caller-presented on this
     /// path, and it is stated here rather than left to look like a check: the
@@ -2988,13 +3201,15 @@ impl OwnerEvidence {
     /// projector's contract is presented-vs-owner and other callers may supply
     /// a presented digest, but on THIS path it is a shape guard, not evidence.
     /// The configuration binding that is real evidence here comes from
-    /// `bind_approved_build` over an owner-validated record plus the presented
-    /// `build_digests` subset check, both of which compare against owner-issued
-    /// values. Nothing downstream may cite the `manifest_digest` comparison as
-    /// an owner proof for a production preparation.
+    /// `bind_approved_build` over an owner-validated approved generation and its
+    /// committed fence, the presented `build_digests` subset check against the
+    /// owner-issued approved artifact set, and the projection digest's binding of
+    /// the owner-issued retained Phase-B configuration digest. Nothing
+    /// downstream may cite the `manifest_digest` comparison as an owner proof
+    /// for a production preparation.
     ///
-    /// The arm cannot be made a real presented-vs-owner comparison from this
-    /// lane, and the reason is scope rather than design.
+    /// That `manifest_digest` arm cannot be made a real presented-vs-owner
+    /// comparison from this lane, and the reason is scope rather than design.
     /// [`PresentedPreparationRequest`] is the presented contract surface and it
     /// carries no config/policy/module manifest digest field, so there is no
     /// presented value to compare: feeding the owner value in as the presented
@@ -3004,11 +3219,12 @@ impl OwnerEvidence {
     /// [`PresentedPreparationRequest`] as an exhaustive struct literal, so a
     /// field added here would not compile that suite. Until the presented
     /// surface carries a configuration digest, T2's config-digest arm is
-    /// refused-as-evidence rather than claimed: the two owner comparisons that
-    /// ARE real on this path are the numeric `generation` arm (presented
-    /// `approved_generation` against the owner-issued authority generation) and
-    /// the `build_digests` subset arm (each presented digest against the
-    /// owner-issued approved artifact set).
+    /// refused-as-evidence rather than claimed. The owner comparisons that ARE
+    /// real on this path are the numeric `generation` arm (presented
+    /// `approved_generation` against the owner-issued authority generation), the
+    /// `owner_lease_ref` arm (a presented reference against
+    /// [`OwnerEvidence::owner_lease_ref`]) and the `build_digests` subset arm
+    /// (each presented digest against the owner-issued approved artifact set).
     pub fn project_backup_configuration(
         &self,
         request: &PresentedPreparationRequest,
@@ -3024,8 +3240,19 @@ impl OwnerEvidence {
             purge_ledger_revision: request.purge_ledger_revision,
             audit: request.audit_fence_note.clone(),
         };
-        project_backup_config_owner_bound(&config, binding, &self.fence.authority_state_fence)
-            .map_err(projection_to_preparation)
+        // The owner-issued lease reference is re-proved here, at the moment the
+        // projection consumes it, and refuses typed if the retained lease no
+        // longer pins the inspected source root. Taken BEFORE the projection so
+        // a lease that went stale is a named owner refusal rather than a
+        // projection digest naming an object that is no longer at the path.
+        let owner_lease_ref = self.owner_lease_ref()?;
+        project_backup_config_owner_bound(
+            &config,
+            binding,
+            &owner_lease_ref,
+            &self.fence.authority_state_fence,
+        )
+        .map_err(projection_to_preparation)
     }
 
     /// Returns the registry CAS revision observed at inspection time.

@@ -1056,6 +1056,13 @@ fn classify_read_outcome(outcome: ReadOutcome) -> ProjectionState {
         ReadOutcome::Unknown => ProjectionState::Unknown {
             reason: "answer does not observe the bound read identity".to_owned(),
         },
+        // A source that authoritatively states the requested subject is absent
+        // is `Missing`, which is exactly what this disposition names, and it is
+        // reported distinctly from `KnownEmpty` (an empty *result* set) and from
+        // `Unavailable` (a source that could not be read at all). It is not
+        // `Unknown`: the source did describe its absence, so this is evidence,
+        // not an absence of evidence.
+        ReadOutcome::Missing => ProjectionState::Missing,
         ReadOutcome::Stale => ProjectionState::Stale {
             reason: "answer belongs to another revision, order or fence identity".to_owned(),
         },

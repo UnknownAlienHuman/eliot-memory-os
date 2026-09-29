@@ -735,7 +735,12 @@ impl KernelComposition {
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
-                | KernelControlCommand::ReportHostStartupEvidence(_) => {}
+                | KernelControlCommand::ReportHostStartupEvidence(_)
+                // I18.53 ACT-1 (#1918): the retirement census is a read-only
+                // owner read, never a service state transition. Serving it
+                // here keeps it out of the terminal-transition path whose
+                // unauthenticated `transition` correctly refuses it.
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {}
                 command => {
                     self.apply_control_with_terminal(command.clone(), false)
                         .map_err(ControlRequestFailure::Transition)?;
@@ -748,6 +753,18 @@ impl KernelComposition {
         {
             self.promote_agent_bridge_profile(next)?;
         }
+        // I18.53 ACT-1 (#1918): serve the exact-fence retirement census from
+        // the canonical ORS owner on its dedicated wire arm. The shared
+        // envelope below already carries every other projection as `None` on
+        // this arm, which is exactly the bare-census shape the response
+        // validator and the Host retirement barrier require.
+        let runtime_lease_census = match &request.command {
+            KernelControlCommand::ReadRuntimeLeaseCensus(query) => Some(
+                self.read_runtime_lease_census(&query.state_fence, &query.supervision_lease_id)
+                    .map_err(|_| TransportError::SessionFenced)?,
+            ),
+            _ => None,
+        };
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -771,13 +788,15 @@ impl KernelComposition {
             store_rebind_receipt,
             supervision_lease,
             // #961 read-only retirement projections. The authenticated
-            // boundary below refuses `ReadRuntimeLeaseCensus` and
+            // boundary serves `ReadRuntimeLeaseCensus` from the canonical ORS
+            // owner read above (#1918 ACT-1) and still refuses
             // `ReadIntroductionRows` with a typed `InvalidField`, because no
-            // ORS owner read returns a complete runtime-lease census or a
-            // complete introduction set. A response therefore never carries
-            // either projection, and the two refusals keep the census out of
-            // readiness, activation and rebind answers by construction.
-            runtime_lease_census: None,
+            // ORS owner read returns a complete introduction set. A response
+            // therefore never carries an introduction set, and the refusal
+            // keeps introductions out of readiness, activation, rebind and
+            // census answers by construction. The census itself is served
+            // only on its dedicated wire arm, never beside another receipt.
+            runtime_lease_census,
             introduction_rows: None,
             error: None,
             payload_digest: String::new(),

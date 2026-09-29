@@ -1011,5 +1011,6 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
     assert_inventory_entries_are_live()?;
     expiry_condition_guard()?;
     facade_surface_guard()?;
+    crate::cell_declaration_registry::cell_declaration_guard()?;
     Ok(())
 }

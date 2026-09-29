@@ -58,15 +58,13 @@
 //!
 //! # Pollability and durability
 //!
-//! No owner RPC on this path crosses the network: coordinator planning,
-//! staffing policy, capability evidence, the Kernel fence snapshot, and the
-//! state-root projection are all in-process or bounded local reads, so no
-//! composition lock is ever held across an await (no await exists here) and
-//! slow owner IO cannot wedge control or shutdown. The dispatch projection
-//! is persisted under the daemon state root before `emit`, and an
-//! interrupted dispatch replays under its original identities instead of
-//! relaunching blindly; uncertain ownership is never released without an
-//! observed terminal disposition.
+//! The production queue poll snapshots its head under a short composition
+//! lock, then performs authenticated Kernel verification with owned inputs
+//! and no composition guard across the await. Until the Kernel owner retains
+//! the executable-binding digest, that check fails closed before admission,
+//! activation, or dispatch. The test-only historical dispatch projection is
+//! persisted under the daemon state root before `emit`; uncertain ownership
+//! is never released without an observed terminal disposition.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -78,10 +76,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
-    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricPorts, FabricSnapshot,
-    ModelRegistryPort, PortBindingState, Reservation, RouteRequirements, SwarmDefinition,
-    VerifiedProviderMaterial, daemon_coordinator_config,
+    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricSnapshot,
+    PortBindingState, Reservation, RouteRequirements, SwarmDefinition, VerifiedProviderMaterial,
+    daemon_coordinator_config,
 };
+#[cfg(test)]
+use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
 use crate::daemon_kernel_client::DaemonKernelClient;
 use crate::staffing_policy::{
     StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -92,6 +92,7 @@ use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerpri
 /// Solo recipe identity pinned by this slice (I10.15 first supported recipe).
 pub const SOLO_RECIPE_ID: &str = "solo-verified-v1";
 /// Accepted-interface revision reported by the solo model registry adapter.
+#[cfg(test)]
 pub const SOLO_MODEL_REGISTRY_REVISION: &str = "solo-model-registry/v1";
 /// Accepted-interface revision reported by the solo admission adapter.
 pub const SOLO_ADMISSION_AUTHORITY_REVISION: &str = "solo-admission-authority/v1";
@@ -167,10 +168,11 @@ impl SoloDelegateBody {
 
 /// Claimed provider halves of one solo delegate intake.
 ///
-/// Everything here is operation-presented: the owner halves (live fence,
-/// session binding, Governor currentness) are resolved and freshness-checked
-/// by [`crate::DaemonComposition::agent_fabric_verified_capability`] at drive
-/// time, never trusted from this value.
+/// Everything here is operation-presented. In particular, `expectation` is
+/// deserialized caller input: its route and capacity revisions are not a live
+/// Governor read. The async Kernel probe may validate the remaining claim
+/// tuple, but its echo of those revisions is not admission evidence and this
+/// path fails closed before capability construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoloClaimedHalves {
@@ -194,8 +196,8 @@ pub struct SoloClaimedHalves {
     pub worker_generation: u64,
     /// Operation fence from the operation at hand.
     pub presented_fence: eliot_contracts::StateFence,
-    /// Transitive Governor currentness the admitted operation arrived with;
-    /// its epoch is freshness-checked against the live fence at drive time.
+    /// Caller-presented revisions labeled as Governor currentness. This is
+    /// untrusted input and is never treated as a live Governor observation.
     pub expectation: eliot_kernel_service::ProviderCapabilityExpectation,
     /// Minimum replayed event sequence for restore (zero means no floor).
     pub minimum_event_sequence: u64,
@@ -308,6 +310,7 @@ struct SoloVerifiedContext {
 
 /// Owner-verified route preloaded into the solo registry adapter.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct PreloadedRoute {
     role: String,
     competence: Vec<String>,
@@ -321,10 +324,12 @@ struct PreloadedRoute {
 /// nothing, and invents no route: the fabric evidence gate plus the staffing
 /// receipt decide, and anything unstaged there refuses downstream.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct SoloModelRegistryPort {
     preloaded: Arc<Mutex<Option<PreloadedRoute>>>,
 }
 
+#[cfg(test)]
 impl SoloModelRegistryPort {
     fn new() -> Self {
         Self {
@@ -342,6 +347,7 @@ impl SoloModelRegistryPort {
     }
 }
 
+#[cfg(test)]
 impl ModelRegistryPort for SoloModelRegistryPort {
     fn resolve_route(
         &self,
@@ -668,6 +674,7 @@ fn solo_dispatch_identity(attempt_id: &str, admission_id: &str) -> String {
 }
 
 /// Derives the deterministic solo cancellation identity.
+#[cfg(test)]
 fn solo_cancellation_identity(operation_id: &str) -> String {
     format!("{operation_id}-cancel")
 }
@@ -800,6 +807,7 @@ impl SoloDriverState {
 /// `PeerChannel` and `SwarmControl` reuse the closed production ports (no
 /// accepted B-PEER/B-SWARM revision on this base); the solo driver never
 /// calls them, so solo work neither depends on nor fabricates peer success.
+#[cfg(test)]
 fn solo_fabric_ports(
     context: SoloVerifiedContext,
     kernel: &Arc<DaemonKernelClient>,
@@ -962,11 +970,10 @@ fn guard_solo_plan(plan: &StaffingPlanRequest) -> Result<(), FabricError> {
 
 /// Drives one admitted solo delegate intake to a retained dispatch.
 ///
-/// Public production entry behind the thin `DaemonComposition` wrappers:
-/// owner-verified capability, admitted-route gate, coordinator planning with
-/// the staffing receipt, then the fabric chain in order, with the dispatch
-/// projection persisted before `emit`. The returned outcome is retention
-/// evidence only.
+/// Test-only record of the previous synchronous fabric flow. Production is
+/// blocked from this path until the authenticated Kernel and executable-owner
+/// receipt legs are available.
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
 pub fn drive_solo_delegate(
@@ -1130,7 +1137,67 @@ pub fn drive_solo_delegate(
     })
 }
 
+/// Performs the authenticated Kernel provider-binding check for one solo
+/// intake without crossing into local admission, activation, or dispatch
+/// substitutes.
+///
+/// Kernel currently has no independently owner-backed executable-binding
+/// digest on its durable provider claim row. Its accepted verifier therefore
+/// cannot yet authorize construction of an `AdmittedProviderCapability` for
+/// this operation. The call below verifies the remaining exact owner tuple,
+/// then returns a typed fail-closed residual before any capability or fabric
+/// effect is created. The native-worker owner must persist and verify the
+/// executable join itself before this path can proceed.
+pub async fn drive_solo_delegate_async(
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+
+    // Preserve the useful plan-only staffing validation while the authenticated
+    // owner check runs; it does not construct a coordinator capability or
+    // reserve, activate, or dispatch work.
+    let config = daemon_coordinator_config()?;
+    let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+    verify_receipt_digest(&receipt).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+
+    kernel
+        .verify_provider_binding_async(&intake.claimed.material())
+        .await
+        .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+
+    Err(DaemonError::ProviderAdmission(FabricError::Contract(
+        "Kernel verified the claim binding, but the native-worker owner has no durable executable-binding digest for this claim; admitted provider capability and execution remain blocked"
+            .to_owned(),
+    )))
+}
+
+/// The synchronous solo path is retained only for unit tests. Production must
+/// use [`drive_solo_delegate_async`] so Kernel verification never blocks the
+/// current-thread daemon runtime.
+#[cfg(not(test))]
+pub fn drive_solo_delegate(
+    _composition: &DaemonComposition,
+    _kernel: &Arc<DaemonKernelClient>,
+    _intake: SoloDelegateIntake,
+    _now_unix_ms: u64,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    Err(DaemonError::Kernel(
+        "synchronous solo driving is disabled; use the async Kernel-verified entry point"
+            .to_owned(),
+    ))
+}
+
 /// Returns true when the persisted projection needs no further drive.
+#[cfg(test)]
 fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
     if projection.result_digest.is_some() || projection.cancellation_evidence.is_some() {
         return true;
@@ -1158,6 +1225,7 @@ fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
 /// digest, fence, epoch, attempt, receipt lanes) with a fresh live fence
 /// check at restore: the snapshot's stored binding must equal the live
 /// binding or the restore refuses instead of resuming effect authority.
+#[cfg(test)]
 fn restore_solo_fabric(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -1221,6 +1289,18 @@ fn restore_solo_fabric(
         }
     }
     Ok(fabric)
+}
+
+#[cfg(not(test))]
+fn restore_solo_fabric(
+    _composition: &DaemonComposition,
+    _kernel: &Arc<DaemonKernelClient>,
+    _projection: &SoloPersistedAttempt,
+) -> Result<AgentFabric, DaemonError> {
+    Err(DaemonError::Kernel(
+        "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
+            .to_owned(),
+    ))
 }
 
 /// Re-persists the projection after a control operation.
@@ -1415,11 +1495,13 @@ pub fn solo_enqueue(
     Ok(())
 }
 
-/// Drives at most one queued solo intake; the runtime poll hook.
+/// Test-only synchronous poll behavior. Production uses the async fail-closed
+/// poll path below.
 ///
 /// Bounded work per tick keeps control and shutdown pollable: an empty
 /// queue idles without owner IO, a busy live slot waits without overlap,
 /// and each drive is atomic with its projection persisted before emit.
+#[cfg(test)]
 pub fn solo_poll_queue(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -1452,4 +1534,70 @@ pub fn solo_poll_queue(
         operation_id: outcome.operation_id,
         dispatch_id: outcome.dispatch_id,
     })
+}
+
+/// Async runtime poll hook. It leaves the head item queued when Kernel refuses
+/// or the executable-binding owner evidence is absent, preserving the exact
+/// operation for a later fresh evaluation.
+pub async fn solo_poll_queue_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<SoloPollOutcome, DaemonError> {
+    let intake = {
+        let Ok(composition) = composition.try_lock() else {
+            return Ok(SoloPollOutcome::SlotBusy);
+        };
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        let Some(head) = state.queue.front().cloned() else {
+            return Ok(SoloPollOutcome::Idle);
+        };
+        if let Some(live) = state.live_operation.as_ref()
+            && live != &head.claimed.operation_id
+        {
+            return Ok(SoloPollOutcome::SlotBusy);
+        }
+        head
+    };
+    // The async owner call operates only on owned intake and Kernel handles.
+    // The Tokio composition guard above is out of scope across this await.
+    let outcome = drive_solo_delegate_async(kernel, intake, crate::unix_ms()).await?;
+    {
+        let composition = composition.lock().await;
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if state
+            .queue
+            .front()
+            .is_some_and(|head| head.claimed.operation_id == outcome.operation_id)
+        {
+            state.queue.pop_front();
+        }
+    }
+    Ok(SoloPollOutcome::Drove {
+        operation_id: outcome.operation_id,
+        dispatch_id: outcome.dispatch_id,
+    })
+}
+
+/// Synchronous queue polling cannot perform authenticated owner IO. It
+/// refuses without dequeuing the retained intake.
+#[cfg(not(test))]
+pub fn solo_poll_queue(
+    _composition: &DaemonComposition,
+    _kernel: &Arc<DaemonKernelClient>,
+) -> Result<SoloPollOutcome, DaemonError> {
+    Err(DaemonError::Kernel(
+        "synchronous solo polling is disabled; use the async Kernel-verified poll entry point"
+            .to_owned(),
+    ))
 }

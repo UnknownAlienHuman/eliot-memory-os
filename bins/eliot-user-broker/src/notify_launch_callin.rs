@@ -44,8 +44,8 @@
 use std::path::{Path, PathBuf};
 
 use eliot_notify::{
-    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, render_acknowledge_request,
-    resolve_notify_launch_inputs,
+    NOTIFY_IMAGE_FILE_NAME, NotificationEnvelope, NotifyLaunchError, VerifiedNotifyLaunch,
+    render_acknowledge_request, render_deliver_request, resolve_notify_launch_inputs,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
 use eliot_user_broker_core::MAX_LAUNCH_STDIN_PAYLOAD_BYTES;
@@ -469,6 +469,65 @@ pub fn render_notify_acknowledge_line(
     // The same bound the broker's own launch admission applies, checked here so
     // an over-long record is refused before a grant is asked for rather than
     // after the child exists.
+    if payload.len() > MAX_LAUNCH_STDIN_PAYLOAD_BYTES {
+        return Err(BrokerNotifyError::InvalidDeclaration);
+    }
+    Ok(payload)
+}
+
+/// One broker-admitted delivery of one canonical notification.
+///
+/// This is the broker edge's typed input for the delivery leg, symmetric with
+/// [`NotifyAcknowledge`]: it carries only what the adapter serves — the
+/// canonical envelope to project plus the typed request that binds it — and
+/// the line the child reads is composed by this broker, never caller bytes.
+/// The transition itself is applied and re-validated on the admitted
+/// Kernel-backed route inside the spawned adapter, so this struct mints no
+/// authority: a delivery with no actor is still a broker-admitted spawn of the
+/// retained verified image.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyDeliver {
+    /// The canonical envelope the adapter must project as a native toast.
+    pub envelope: NotificationEnvelope,
+    /// The typed request binding that envelope to its session, product,
+    /// source, and fence.
+    pub request: NotificationRequest,
+}
+
+/// Renders the exact one-shot standard-input line for one admitted delivery.
+///
+/// This is the composition half of I11.6:7 ("canonical notification → User
+/// Broker → native toast → authenticated local UI") for the delivery leg, just
+/// as [`render_notify_acknowledge_line`] is for the acknowledgement leg: the
+/// broker is the admitted spawner, so the broker composes the line the adapter
+/// serves. The rendering itself is [`eliot_notify::render_deliver_request`] —
+/// the adapter's own schema is the single wire vocabulary, and no second
+/// spelling of it is introduced here.
+///
+/// The trailing newline is the line-protocol frame the adapter's
+/// [`eliot_notify::parse_notify_stdin_request`] reader expects; the carriage
+/// in `SuspendedLaunchSpec::with_stdin` writes these bytes verbatim and then
+/// closes the sole parent writer, so the adapter reads this exact line and
+/// then observes deterministic EOF.
+///
+/// # Errors
+///
+/// Returns [`BrokerNotifyError::InvalidDeclaration`] when the delivery request
+/// is not a valid typed request, the line cannot be encoded, or it exceeds
+/// the bound this broker's own launch admission enforces. Every refusal is a
+/// fail-closed stable code; no payload material is echoed.
+pub fn render_notify_deliver_line(delivery: &NotifyDeliver) -> Result<String, BrokerNotifyError> {
+    delivery
+        .request
+        .validate()
+        .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
+    let line = render_deliver_request(&delivery.envelope, &delivery.request)
+        .map_err(|_| BrokerNotifyError::InvalidDeclaration)?;
+    let payload = format!("{line}\n");
+    // The same bound the broker's own launch admission applies, checked here
+    // so an over-long record is refused before a grant is asked for rather
+    // than after the child exists.
     if payload.len() > MAX_LAUNCH_STDIN_PAYLOAD_BYTES {
         return Err(BrokerNotifyError::InvalidDeclaration);
     }

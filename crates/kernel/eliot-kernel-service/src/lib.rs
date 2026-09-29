@@ -208,8 +208,8 @@ pub use storage_replacement::{
     canonical_store_route_scope,
 };
 pub use store_client::{
-    EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
-    StoreClientFaultHarness,
+    EbpCanonicalStoreClient, EbpStoreTransport, StoreBackupClientError, StoreClientError,
+    StoreClientFault, StoreClientFaultHarness,
 };
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;

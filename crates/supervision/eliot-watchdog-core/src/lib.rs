@@ -387,6 +387,7 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
 }
 
 mod health_detectors;
+mod publication;
 mod reconciliation;
 mod risk;
 mod rules;
@@ -423,6 +424,11 @@ pub use reconciliation::{
     validate_acknowledgement, validate_batch, validate_batch_freshness, validate_cursor,
 };
 
+pub use publication::{
+    AttentionPolicy, PublicationClass, PublicationDecision, PublicationIntent,
+    evaluate_publication_intent,
+};
+
 pub use rules::{
     CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
     IntegrationGapRule, IntegrationGapSensor, IntegrationGapSignalCandidate,
@@ -434,9 +440,10 @@ pub use rules::{
 pub use health_detectors::{
     AgentLoopSignal, ContextQualityBounds, ContextQualityDrift, ContextQualityObservation,
     CountDelta, CoverageGapExplanation, HealthDetection, HealthEvidenceHandles,
-    HealthNoSignalReason, HealthObservationPair, HealthSignalContext, MaintenanceDebt,
-    MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift, ObservationCoverageGap,
-    ObservationCoverageInput, PolicyBound, StateDeltaPresence, evaluate_agent_loop,
+    HealthNoSignalReason, HealthObservationPair, HealthOutputFamily, HealthSignalContext,
+    MaintenanceDebt, MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift,
+    ObservationCoverageGap, ObservationCoverageInput, PolicyBound, ProhibitedEffectAttempt,
+    ProhibitedEffectClass, ProhibitedEffectDenial, StateDeltaPresence, evaluate_agent_loop,
     evaluate_context_quality, evaluate_maintenance_debt, evaluate_memory_utility,
     evaluate_observation_coverage,
 };

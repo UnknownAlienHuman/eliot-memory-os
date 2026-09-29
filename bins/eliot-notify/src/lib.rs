@@ -19,14 +19,14 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
     DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
     G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStateMutation,
-    NotificationStatePort, NotificationStateReadRequest, NotificationStateReadResponse,
-    NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
-    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
-    UserAutomationInvocation, UserAutomationPreflightProjection, VerificationPorts,
-    WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
-    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
-    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
+    LedgerReserveOutcome, NotificationSeverity, NotificationStateMutation, NotificationStatePort,
+    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
+    NotificationStateResponse, NotifyCore, OneShotLedgerPort, ResolutionAuthorization,
+    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationPreflightProjection, VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID,
+    WatchdogSignaturePort, validate_fallback_envelope_size, validate_fallback_freshness,
+    watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
+    watchdog_signature_payload,
 };
 #[cfg(test)]
 use eliot_notify_core::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
@@ -155,6 +155,25 @@ pub fn render_acknowledge_request(
         parent: parent.clone(),
         notification_id,
         principal: principal.to_owned(),
+    })
+}
+
+/// Renders the exact one-line delivery request a spawner writes to the
+/// one-shot's stdin.
+///
+/// The bytes are the compact JSON of [`NotifyStdinRequest::Deliver`]: the
+/// spawner writes them as one stdin line and the binary parses them with
+/// [`parse_notify_stdin_request`], so writer and reader share one schema by
+/// construction. The envelope carries the canonical notification the adapter
+/// must project; authority over the delivery stays with the admitted
+/// Kernel-backed route inside the adapter, not with this line.
+pub fn render_deliver_request(
+    envelope: &NotificationEnvelope,
+    request: &NotificationRequest,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&NotifyStdinRequest::Deliver {
+        envelope: envelope.clone(),
+        request: request.clone(),
     })
 }
 
@@ -1761,6 +1780,7 @@ pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
 pub mod quiet_hours;
+pub use eliot_notify_core::NotificationEnvelope;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
@@ -1882,9 +1902,51 @@ pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, Notif
     }
 }
 
+/// Fails closed on a foreign installation identity or a stale envelope
+/// timestamp before any request identity is derived. The rejection records
+/// the same fallback-contour degradation marker the delivery-time port
+/// refusal would have left, so the Event Log / spool obligation survives
+/// the early refusal.
+fn reject_foreign_or_stale_fallback_envelope(
+    envelope: &SignedWatchdogFallbackEnvelope,
+    material: &FallbackMaterial,
+) -> Result<(), NotifyBuildError> {
+    if envelope.envelope.installation_identity != material.declaration.installation_identity {
+        return Err(no_session_fallback_error(
+            FALLBACK_ADAPTER_UNAVAILABLE,
+            "watchdog envelope installation identity rejected".to_owned(),
+        ));
+    }
+    let envelope_now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NotifyBuildError::Fallback("host clock is before Unix epoch".to_owned()))?
+        .as_millis();
+    let envelope_now_ms = u64::try_from(envelope_now_ms)
+        .map_err(|_| NotifyBuildError::Fallback("host clock exceeds request range".to_owned()))?;
+    if validate_fallback_freshness(envelope.envelope.timestamp_ms, envelope_now_ms).is_err() {
+        return Err(no_session_fallback_error(
+            FALLBACK_ADAPTER_UNAVAILABLE,
+            "watchdog envelope freshness rejected".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Loads one autonomous scheduler envelope and derives every request identity
 /// from the protected declaration and signed payload. No stdin or caller-owned
 /// [`NotificationRequest`] participates in this route.
+///
+/// Load-time gates fail closed before any request identity is derived: the
+/// lease, canonical-bytes, and size gates above, plus the envelope's
+/// installation identity against the installer declaration and the envelope
+/// timestamp against the owner freshness policy
+/// (`validate_fallback_freshness`). Signature, algorithm/key/domain binding,
+/// and digest/route binding stay with the delivery-time signature port, which
+/// runs on every fallback delivery; a load-time rejection records the same
+/// fallback-contour degradation marker the port refusal would have left, so
+/// the Event Log / spool obligation survives the early refusal (I11.6:13-14
+/// no toast promised without a session, I11.6:19 adapter loss degrades
+/// delivery only).
 pub fn load_watchdog_fallback_request()
 -> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
     let material = load_fallback_material()?;
@@ -1934,6 +1996,7 @@ pub fn load_watchdog_fallback_request()
     validate_fallback_envelope_size(&bytes).map_err(|error| {
         NotifyBuildError::Fallback(format!("watchdog envelope size rejected: {error}"))
     })?;
+    reject_foreign_or_stale_fallback_envelope(&envelope, &material)?;
     let request_hash = watchdog_request_hash(&envelope)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let request_id = watchdog_request_id(&envelope)

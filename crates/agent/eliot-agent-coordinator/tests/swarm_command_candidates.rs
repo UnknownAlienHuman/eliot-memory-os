@@ -290,6 +290,7 @@ fn happy_replace(
     let request = ReplacePreferencePolicyRequest {
         binding: binding("command-replace")?,
         account_scope: ACCOUNT.to_owned(),
+        current_policy: human_policy.clone(),
         policy: human_policy.clone(),
         expected_policy_revision: POLICY_REVISION.to_owned(),
         expected_policy_digest: probe.preference_policy_digest.clone(),
@@ -451,6 +452,7 @@ fn replace_request(
     Ok(ReplacePreferencePolicyRequest {
         binding: binding("command-replace")?,
         account_scope: ACCOUNT.to_owned(),
+        current_policy: human_policy.clone(),
         policy: human_policy.clone(),
         expected_policy_revision: POLICY_REVISION.to_owned(),
         expected_policy_digest: expected_digest.to_owned(),

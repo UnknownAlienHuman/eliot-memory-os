@@ -4,8 +4,18 @@
   "name": "eliot-governor",
   "display_name": "ELIOT Governor",
   "version": "0.1.6",
-  "description": "Connect Claude Desktop to the local ELIOT cognitive control plane.",
-  "long_description": "Read current task truth, expand exact evidence, use governed memory, delegate bounded work, and submit receipted candidate or verification results through the existing local ELIOT Governor. Claude identity never grants a permanent role.",
+  "description": "LEGACY COMPATIBILITY FIXTURE (#18): exposes the eliot-governor facade to Claude Desktop pending migration to bins/eliot-agent-bridge. Not the production Governor.",
+  "long_description": "COMPATIBILITY FIXTURE, issue #18 (Claude Desktop MCPB server entry point). Reads current task truth, expands exact evidence, uses governed memory, delegates bounded work, and submits receipted candidate or verification results through the legacy eliot-governor facade only. The production route is bins/eliot-agent-bridge + crates/surfaces/* once that owner implements this consumer's protocol (mcp stdio --host claude-desktop --instance default); eliot-agent-bridge today requires --profile/--transport/--client-declaration and implements no --host/--instance argv, and eliot-claude-sidecar is unavailable-target per integrations/claude/route-profile.json. Remove when the packaged server entry point is a current root binary under #11. Claude identity never grants a permanent role.",
+  "_legacy_compatibility": {
+    "scope": "compatibility_fixture_only",
+    "owning_issue": 18,
+    "consumer": "Claude Desktop MCPB server entry point",
+    "legacy_entry_point": "server/eliot-governor.exe",
+    "target_current_owner": "bins/eliot-agent-bridge + crates/surfaces/*",
+    "missing_protocol": "mcp stdio --host claude-desktop --instance default",
+    "owner_gap": "eliot-agent-bridge requires --profile/--transport/--client-declaration (bins/eliot-agent-bridge/src/cli_contract.rs) and has no --host/--instance argv; eliot-claude-sidecar is unavailable-target (integrations/claude/route-profile.json)",
+    "expiry": "remove when the packaged server entry point is a current root binary under #11"
+  },
   "author": {
     "name": "ELIOT Project"
   },

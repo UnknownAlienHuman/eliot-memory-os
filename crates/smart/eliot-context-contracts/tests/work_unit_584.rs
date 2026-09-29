@@ -2350,7 +2350,9 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
         .map(RenderedAtom::from_admitted)
         .collect();
     let recipe_digest = digest();
-    let fence_digest = digest();
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("canonical fence digest");
     let output_digest = ActiveUnderstandingView::canonical_output_digest(
         &admitted.binding,
         &recipe_digest,

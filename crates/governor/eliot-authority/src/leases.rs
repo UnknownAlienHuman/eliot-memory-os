@@ -274,4 +274,47 @@ impl ActionLease {
         self.remaining_uses -= 1;
         Ok(())
     }
+
+    /// Non-consuming current-standing check for one already authorized effect
+    /// at the effect boundary.
+    ///
+    /// This answers only whether the lease is still current for this exact
+    /// effect: not revoked, not expired, bound to the current work scope,
+    /// session and authority epoch, naming the same idempotency identity, and
+    /// still allowing this operation, resource and effect class. The use
+    /// budget is deliberately not re-charged: admission already consumed the
+    /// use, and this check is a read of current standing, not a second
+    /// admission.
+    pub(crate) fn still_current(
+        &self,
+        proposed: &ProposedEffect,
+        current_work_scope: &WorkScopeBinding,
+        current_session: &SessionBinding,
+        now: LogicalTime,
+    ) -> Result<(), AuthorityError> {
+        if self.revoked {
+            return Err(AuthorityError::Revoked);
+        }
+        if now >= self.expires_at {
+            return Err(AuthorityError::Expired);
+        }
+        validate_bindings(&self.authority_binding, current_work_scope, current_session)?;
+        if self.work_scope.state_fence != current_work_scope.state_fence
+            || self.session.session_id != current_session.session_id
+            || proposed.operation.state_fence != current_work_scope.state_fence
+        {
+            return Err(AuthorityError::FenceMismatch);
+        }
+        if proposed.operation.idempotency_key != self.exact_idempotency_key {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        if !self.authority_set.allows(
+            &proposed.operation_name,
+            &proposed.resource_ref,
+            proposed.operation.effect,
+        ) {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        Ok(())
+    }
 }

@@ -14,7 +14,7 @@ a readback: nothing could observe a silent byte edit or a substituted file, so a
 verdict could outlive the contract bytes it was bound to.
 
 This is the reader that closes that gap for the freeze it guards,
-`cognitive-rev12-contract-schema-freeze-2026-09-22-r6`. It is the same
+`cognitive-rev12-contract-schema-freeze-2026-09-22-r8`. It is the same
 "read the owning artifact, never a hand-copy" shape as the compile-time
 WIT/toolchain pinning in `crates/smart/eliot-context-compiler-wasm/src/
 descriptor.rs`, moved to the review lane where the whole byte sequence and the
@@ -139,7 +139,7 @@ def normalized_digest(value: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Readback the recorded r6 freeze digest.")
+    parser = argparse.ArgumentParser(description="Readback the recorded freeze digest.")
     parser.add_argument("--repo", type=Path, default=ROOT)
     parser.add_argument("--freeze", type=Path, help="freeze file; defaults to the repo-relative path")
     parser.add_argument(

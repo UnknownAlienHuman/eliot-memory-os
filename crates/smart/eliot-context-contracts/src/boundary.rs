@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_agent_contracts::AgentAttemptId;
-use eliot_contracts::{ArtifactId, ContractVersion};
+use eliot_contracts::{ArtifactId, ContractVersion, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -851,6 +851,76 @@ pub struct BoundaryMetadataSet {
     pub units: Vec<BoundaryMetadataEnvelope>,
     /// Exact input-to-output member relation for every declared transform.
     pub transforms: Vec<BoundaryTransformRelation>,
+    /// Recorded digest over the canonical envelope and member-relation payload.
+    ///
+    /// This is the ORIGINAL recorded value. `validate()` compares it against the
+    /// digest recomputed from the payload actually held, so substituted boundaries,
+    /// reordered members or same-identity changed content are rejected even when
+    /// each object would still validate on its own.
+    pub boundary_digest: String,
+}
+
+#[derive(Serialize)]
+struct CanonicalBoundaryPayload<'a> {
+    schema_version: ContractVersion,
+    units: &'a [BoundaryMetadataEnvelope],
+    transforms: &'a [BoundaryTransformRelation],
+}
+
+impl BoundaryMetadataSet {
+    fn canonical_payload(&self) -> CanonicalBoundaryPayload<'_> {
+        CanonicalBoundaryPayload {
+            schema_version: BOUNDARY_METADATA_SCHEMA_REVISION,
+            units: &self.units,
+            transforms: &self.transforms,
+        }
+    }
+
+    /// Canonical representation digest over envelopes and ordered member relations.
+    pub fn canonical_digest(&self) -> Result<String, ContextError> {
+        let bytes = canonical_json_bytes(&self.canonical_payload())
+            .map_err(|_| ContextError::InvalidField("boundary.canonical_payload"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Exact UTF-8 byte length of the canonical boundary payload.
+    ///
+    /// Boundary metadata is accounted in the same units as the rendered payload,
+    /// so a caller can add it to final byte/token accounting rather than dropping
+    /// it outside the measured surface.
+    pub fn canonical_utf8_bytes(&self) -> Result<u64, ContextError> {
+        let bytes = canonical_json_bytes(&self.canonical_payload())
+            .map_err(|_| ContextError::InvalidField("boundary.canonical_payload"))?;
+        u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)
+    }
+
+    /// Record the canonical digest over the payload held, once, at production.
+    ///
+    /// The digest is not part of the payload it covers, so a producer binds it here
+    /// instead of restating the payload shape at every call site.
+    pub fn bind_recorded_digest(mut self) -> Result<Self, ContextError> {
+        self.boundary_digest = self.canonical_digest()?;
+        Ok(self)
+    }
+
+    /// Compare the recorded digest against the payload actually held.
+    fn validate_digest_binding(&self) -> Result<(), ContextError> {
+        validate_digest(&self.boundary_digest, "boundary.boundary_digest")?;
+        if self.boundary_digest != self.canonical_digest()? {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
+        Ok(())
+    }
+    /// Validate every envelope and transform in one bounded pass.
+    ///
+    /// A payload without a bound digest is rejected here by name, so a set can
+    /// never be read as one that carries no boundary identity at all.
+    fn validate_bound_digest(&self) -> Result<(), ContextError> {
+        if self.boundary_digest.is_empty() {
+            return Err(ContextError::MissingField("boundary.boundary_digest"));
+        }
+        self.validate_digest_binding()
+    }
 }
 
 impl BoundaryMetadataSet {
@@ -889,7 +959,8 @@ impl BoundaryMetadataSet {
         }
 
         self.validate_transforms(&indices, limits, &mut total_members, &mut total_metadata)?;
-        self.validate_child_graph(&indices, limits)
+        self.validate_child_graph(&indices, limits)?;
+        self.validate_bound_digest()
     }
 
     /// Validate the bounded, acyclic child-reference graph over the whole set.

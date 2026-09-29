@@ -42,6 +42,7 @@ pub(crate) async fn dispatch_backup(
     request: StoreBackupRequest,
     failure_context: StoreFailureIdentityContext,
 ) -> Response {
+    let admitted_identity = request.identity.clone();
     let outcome = match request.operation {
         StoreBackupOperation::Begin(begin) => composition
             .backup_begin(&request.context, begin)
@@ -56,9 +57,9 @@ pub(crate) async fn dispatch_backup(
             .await
             .map(|receipt| StoreBackupResponse::EndReceipt { receipt }),
         StoreBackupOperation::PrepareDestination(destination) => composition
-            .backup_prepare_destination(&request.context, destination)
+            .backup_prepare_destination(&request.context, destination, admitted_identity)
             .await
-            .map(|evidence| StoreBackupResponse::Isolation { evidence }),
+            .map(|receipt| StoreBackupResponse::Isolation { receipt }),
         StoreBackupOperation::RestoreBatch(batch) => composition
             .backup_restore_batch(&request.context, batch)
             .await

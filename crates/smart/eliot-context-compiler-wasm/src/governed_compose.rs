@@ -31,7 +31,7 @@
 //! governed registries, and must never enter a `wasm32` guest closure. It
 //! is gated with `#[cfg(not(target_arch = "wasm32"))]` at the crate root.
 
-use crate::conversion::{GuestRequest, GuestResponse};
+use crate::conversion::{GuestRequest, GuestResponse, validate_response_shape};
 use eliot_context_admission::admit_context_with_learning;
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
@@ -201,8 +201,9 @@ pub enum HonorError {
     /// Response envelope does not echo the request it answers.
     #[error("guest response does not match its request envelope")]
     EnvelopeMismatch,
-    /// Neither result nor error is present: malformed contour output.
-    #[error("guest response carries neither result nor error")]
+    /// The exclusive result-or-error choice is violated: both a result and an
+    /// error are present, or neither is. Malformed contour output (#638).
+    #[error("guest response carries both or neither of result and error")]
     MalformedOutput,
     /// Admitted binding drifted from the requested compilation binding.
     #[error("admitted binding does not match the requested compilation")]
@@ -251,6 +252,11 @@ pub fn check_honored_output(
     {
         return Err(HonorError::EnvelopeMismatch);
     }
+    // Exclusive result-or-error choice, enforced on the typed value before the
+    // error-only return so a direct typed caller cannot smuggle a foreign
+    // result past the binding, input-digest and carriage checks below by
+    // pairing it with an error.
+    validate_response_shape(response).map_err(|_| HonorError::MalformedOutput)?;
     if response.error.is_some() {
         return Ok(());
     }

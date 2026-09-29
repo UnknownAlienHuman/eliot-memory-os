@@ -177,6 +177,17 @@ pub struct QualityDimensionResult {
 }
 
 impl QualityDimensionResult {
+    /// Whether this result is a current observed pass.
+    ///
+    /// A result that carries an invalidation handle has been invalidated by a
+    /// route, governing-instruction, source, task or verifier change, so it is a
+    /// historical grade and never a current one. The record itself stays on the
+    /// card, so the evidence it was read from is still retained and visible.
+    #[must_use]
+    pub fn is_current_pass(&self) -> bool {
+        self.invalidation.is_none() && self.state.is_pass()
+    }
+
     fn validate(&self, scorecard_binding: &ContextBinding) -> Result<(), ContextError> {
         if self.schema_version != QUALITY_RESULT_SCHEMA_VERSION
             || self.binding != *scorecard_binding
@@ -185,6 +196,17 @@ impl QualityDimensionResult {
         }
         self.state.validate()?;
         crate::validate_text(self.rule_revision.as_str(), "quality.rule_revision")?;
+        // The required member set is a set. A repeated member states no
+        // additional requirement, so a list that repeats one handle cannot
+        // stand in for the complete set the grade was taken against.
+        let mut required: BTreeSet<&ArtifactId> = BTreeSet::new();
+        if self
+            .required_evidence
+            .iter()
+            .any(|member| !required.insert(member))
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
         match &self.state {
             // A pass is exactly the whole required member set, observed, with
             // no failure and no missing or stale element. A bare valid-looking
@@ -454,7 +476,10 @@ impl QualityScorecard {
     /// [`QualityScorecard::suitability`] for the requested operation.
     pub fn all_pass(&self) -> Result<bool, ContextError> {
         self.validate()?;
-        Ok(self.results.iter().all(|result| result.state.is_pass()))
+        Ok(self
+            .results
+            .iter()
+            .all(QualityDimensionResult::is_current_pass))
     }
 
     /// Check suitability for one requested dependent decision or effect.
@@ -490,10 +515,13 @@ impl QualityScorecard {
             .chain(additional_required)
             .copied()
             .collect();
+        // A required dimension blocks when it is not a current pass. A recorded
+        // invalidation therefore blocks the same way a failure does: the grade
+        // it carried was invalidated and only reevaluation can replace it.
         let blocking = self
             .results
             .iter()
-            .filter(|result| required.contains(&result.dimension) && !result.state.is_pass())
+            .filter(|result| required.contains(&result.dimension) && !result.is_current_pass())
             .cloned()
             .collect::<Vec<_>>();
         let unresolved_applicability = self.applicability.unresolved();

@@ -19,7 +19,8 @@ use eliot_receipts::{
 };
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
+    RuntimeLease, SignedSupervisionLease, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
@@ -207,6 +208,16 @@ const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
+/// Durable `RuntimeLease` current rows for the #1918 ACT-1/A4 retirement
+/// census (I1.5). Keyed by lease identity; one row per exact-fence durable
+/// runtime lease the Kernel may retire. The durable issuance writer belongs
+/// to #1751; until it lands, the table holds no rows and the census reports
+/// that observed store fact rather than a default. This is one more table in
+/// the existing ORS table family, owned by the same `RedbRecoveryStore` and
+/// written through the same `persistence_codec`; it is not a second journal
+/// or table owner.
+const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
@@ -1234,10 +1245,11 @@ impl persistence_codec::PersistedValue for BridgeEventProjectionRow {
 /// acknowledgement (`last_acked_sequence`), and the compacted/retired
 /// boundary (`last_compacted_sequence`). The downstream application
 /// frontier stays separate in the handoff rows. A gap record explains
-/// missing coverage; it never moves any field here. The two maintenance
-/// scan continuations are separate, bounded work cursors, each tied to the
-/// exact owner revision/incarnation and recovery view it is scanning; neither
-/// changes event identity or any of the four frontiers.
+/// missing coverage; it never moves any field here. The maintenance scan
+/// cursors and reconciliation completion watermark are separate, bounded
+/// work metadata, each tied to the exact owner revision/incarnation and
+/// recovery view it covers; none changes event identity or any of the four
+/// frontiers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventHandoffScanCursor {
@@ -1248,10 +1260,61 @@ struct BridgeEventHandoffScanCursor {
     upper_sequence: u64,
 }
 
+/// Durable watermark saying the namespace's immutable position index was
+/// fully scanned through an acknowledged sequence for this exact owner and
+/// owner revision. This prevents every quiet duplicate acknowledgement from
+/// restarting at sequence zero. An owner change or handoff/position mutation
+/// at or below the watermark invalidates it; unrelated gap changes and later
+/// positions carry it to the new recovery revision atomically.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventHandoffReconcileComplete {
+    owner_revision: u64,
+    owner_incarnation: u64,
+    recovery_revision: u64,
+    through_sequence: u64,
+}
+
+impl BridgeEventHandoffReconcileComplete {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.owner_revision == 0
+            || self.owner_incarnation == 0
+            || self.recovery_revision == 0
+            || self.through_sequence == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "handoff_reconcile_complete",
+                reason: "completed scan must bind nonzero owner, recovery, and sequence state",
+            });
+        }
+        Ok(())
+    }
+}
+
 struct BridgeRetirementPage {
     eligible: Vec<(u64, String, BridgeEventHandoffRow)>,
     continuation: bool,
     after_sequence: Option<u64>,
+}
+
+struct BridgeEventHandoffReconcilePlan {
+    cursor: BridgeEventCursorRow,
+    recovery_revision: u64,
+    start_after: Option<u64>,
+    skip_scan: bool,
+}
+
+struct BridgeEventHandoffReconcilePage {
+    positions: Vec<(u64, String)>,
+    continuation: bool,
+    reconciled: u64,
+}
+
+#[derive(Clone, Copy)]
+enum BridgeEventHandoffReconcileRevisionChange {
+    Unchanged,
+    PositionChanged { earliest_sequence: u64 },
+    AcknowledgementAdvanced { acked_sequence: u64 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1359,6 +1422,16 @@ struct BridgeEventCursorRow {
     /// invalidate this scan because they change the handoff relation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_retirement_scan: Option<BridgeEventHandoffScanCursor>,
+    /// Bounded position-index progress for consumed-frontier handoff
+    /// reconciliation. It is independent of repair and terminal retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_reconcile_scan: Option<BridgeEventHandoffScanCursor>,
+    /// Completed reconciliation coverage prevents a quiet duplicate
+    /// acknowledgement from rescanning the same position prefix. This is
+    /// volatile scan metadata, not a claim that downstream obligations are
+    /// terminal or retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_reconcile_complete: Option<BridgeEventHandoffReconcileComplete>,
 }
 
 impl BridgeEventCursorRow {
@@ -1385,6 +1458,7 @@ impl BridgeEventCursorRow {
         for scan in [
             self.handoff_repair_scan.as_ref(),
             self.handoff_retirement_scan.as_ref(),
+            self.handoff_reconcile_scan.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1397,6 +1471,23 @@ impl BridgeEventCursorRow {
                     reason: "maintenance continuation must belong to the owner cursor's observed range",
                 });
             }
+        }
+        if let Some(complete) = &self.handoff_reconcile_complete {
+            complete.validate()?;
+            if self.owner_namespace.is_empty()
+                || complete.through_sequence > self.last_observed_sequence
+            {
+                return Err(OrsError::InvalidField {
+                    field: "handoff_reconcile_complete",
+                    reason: "completed scan must remain within its owner observed sequence",
+                });
+            }
+        }
+        if self.handoff_reconcile_scan.is_some() && self.handoff_reconcile_complete.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "handoff_reconcile_scan",
+                reason: "reconciliation progress must be scanning or complete, never both",
+            });
         }
         Ok(())
     }
@@ -4086,6 +4177,23 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
         RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
     }
+}
+
+/// Exact-fence retirement census rows read from the canonical ORS tables.
+///
+/// Returned by
+/// [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`]: the
+/// current supervision row bound to the presented fence and the exact-fence
+/// `RuntimeLease` current set ordered by lease id. The Kernel composes the
+/// wire census response from these rows; the store never authors the census
+/// response itself, because the response type lives in the kernel service
+/// crate, which already depends on this crate.
+#[derive(Clone, Debug)]
+pub struct RuntimeLeaseCensusRows {
+    /// Current supervision row bound to the census fence.
+    pub supervision: SupervisionLeaseSnapshot,
+    /// Exact-fence `RuntimeLease` rows ordered by lease id.
+    pub runtime_leases: Vec<RuntimeLease>,
 }
 
 impl RedbRecoveryStore {
@@ -10213,6 +10321,11 @@ impl RedbRecoveryStore {
                 ],
                 BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
             ),
+            None if scan_hit => (
+                true,
+                scan_classes,
+                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+            ),
             // No usable owner verdict for these exact bytes is not permission.
             None => (
                 true,
@@ -11515,6 +11628,8 @@ impl RedbRecoveryStore {
             last_compacted_sequence: 0,
             handoff_repair_scan: None,
             handoff_retirement_scan: None,
+            handoff_reconcile_scan: None,
+            handoff_reconcile_complete: None,
         };
         cursor.validate()?;
         {
@@ -11561,6 +11676,8 @@ impl RedbRecoveryStore {
             last_compacted_sequence: prior.as_ref().map_or(0, |row| row.last_compacted_sequence),
             handoff_repair_scan: None,
             handoff_retirement_scan: None,
+            handoff_reconcile_scan: None,
+            handoff_reconcile_complete: None,
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -13212,7 +13329,7 @@ impl RedbRecoveryStore {
                 row.validate()?;
                 if row.owner_namespace != owner.namespace
                     || row.stream_id != owner.local_stream
-                    || row.event_id != *event_id
+                    || row.event_id.as_str() != event_id.as_str()
                     || row.sequence != *sequence
                 {
                     return Err(OrsError::IntegrityProblem {
@@ -13581,6 +13698,8 @@ impl RedbRecoveryStore {
         };
         fields.remove("handoff_repair_scan");
         fields.remove("handoff_retirement_scan");
+        fields.remove("handoff_reconcile_scan");
+        fields.remove("handoff_reconcile_complete");
         let stable = serde_json::to_string(&stable)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let full_bytes = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
@@ -14634,6 +14753,12 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: prior
                 .as_ref()
                 .and_then(|row| row.handoff_retirement_scan.clone()),
+            handoff_reconcile_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_scan.clone()),
+            handoff_reconcile_complete: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_complete.clone()),
         };
         cursor.validate()?;
         {
@@ -14693,6 +14818,12 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: prior
                 .as_ref()
                 .and_then(|row| row.handoff_retirement_scan.clone()),
+            handoff_reconcile_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_scan.clone()),
+            handoff_reconcile_complete: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_complete.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -14752,6 +14883,12 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: prior
                 .as_ref()
                 .and_then(|row| row.handoff_retirement_scan.clone()),
+            handoff_reconcile_scan: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_scan.clone()),
+            handoff_reconcile_complete: prior
+                .as_ref()
+                .and_then(|row| row.handoff_reconcile_complete.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -14960,6 +15097,136 @@ impl RedbRecoveryStore {
             })
     }
 
+    /// Carries reconciliation progress across a recovery-revision change only
+    /// when the changed state cannot alter positions already covered by the
+    /// progress marker. Event/handoff mutations at or below the covered bound
+    /// invalidate it; later append and gap-only revisions do not restart an
+    /// otherwise finite scan. Ack advancement extends an in-progress scan or
+    /// converts a completion watermark into the next bounded interval.
+    fn rebind_bridge_handoff_reconcile_progress(
+        cursor: &mut BridgeEventCursorRow,
+        owner: &BridgeStreamOwnerRow,
+        previous_revision: u64,
+        updated_revision: u64,
+        change: BridgeEventHandoffReconcileRevisionChange,
+    ) -> Result<(), OrsError> {
+        if cursor.handoff_reconcile_scan.is_some() && cursor.handoff_reconcile_complete.is_some() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "reconciliation scan and completion markers overlap".to_owned(),
+            });
+        }
+        if let Some(mut scan) = cursor.handoff_reconcile_scan.take() {
+            let mut preserve = scan.owner_revision == owner.revision
+                && scan.owner_incarnation == owner.incarnation
+                && scan.recovery_revision == previous_revision;
+            if preserve {
+                match change {
+                    BridgeEventHandoffReconcileRevisionChange::Unchanged => {}
+                    BridgeEventHandoffReconcileRevisionChange::PositionChanged {
+                        earliest_sequence,
+                    } => preserve = earliest_sequence > scan.upper_sequence,
+                    BridgeEventHandoffReconcileRevisionChange::AcknowledgementAdvanced {
+                        acked_sequence,
+                    } => {
+                        preserve = acked_sequence >= scan.upper_sequence;
+                        if preserve {
+                            scan.upper_sequence = acked_sequence;
+                        }
+                    }
+                }
+            }
+            if preserve {
+                scan.recovery_revision = updated_revision;
+                cursor.handoff_reconcile_scan = Some(scan);
+            }
+        }
+
+        if let Some(mut complete) = cursor.handoff_reconcile_complete.take() {
+            let mut preserve = complete.owner_revision == owner.revision
+                && complete.owner_incarnation == owner.incarnation
+                && complete.recovery_revision == previous_revision;
+            let mut extension = None;
+            if preserve {
+                match change {
+                    BridgeEventHandoffReconcileRevisionChange::Unchanged => {}
+                    BridgeEventHandoffReconcileRevisionChange::PositionChanged {
+                        earliest_sequence,
+                    } => preserve = earliest_sequence > complete.through_sequence,
+                    BridgeEventHandoffReconcileRevisionChange::AcknowledgementAdvanced {
+                        acked_sequence,
+                    } if acked_sequence == complete.through_sequence => {}
+                    BridgeEventHandoffReconcileRevisionChange::AcknowledgementAdvanced {
+                        acked_sequence,
+                    } if acked_sequence > complete.through_sequence => {
+                        extension = Some(BridgeEventHandoffScanCursor {
+                            owner_revision: owner.revision,
+                            owner_incarnation: owner.incarnation,
+                            recovery_revision: updated_revision,
+                            after_sequence: complete.through_sequence,
+                            upper_sequence: acked_sequence,
+                        });
+                        preserve = false;
+                    }
+                    BridgeEventHandoffReconcileRevisionChange::AcknowledgementAdvanced {
+                        ..
+                    } => {
+                        preserve = false;
+                    }
+                }
+            }
+            if preserve {
+                complete.recovery_revision = updated_revision;
+                cursor.handoff_reconcile_complete = Some(complete);
+            } else if let Some(scan) = extension {
+                cursor.handoff_reconcile_scan = Some(scan);
+            }
+        }
+        if let Some(scan) = &cursor.handoff_reconcile_scan {
+            scan.validate()?;
+        }
+        if let Some(complete) = &cursor.handoff_reconcile_complete {
+            complete.validate()?;
+        }
+        Ok(())
+    }
+
+    fn rebind_bridge_handoff_reconcile_progress_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        previous_revision: u64,
+        updated_revision: u64,
+        change: BridgeEventHandoffReconcileRevisionChange,
+    ) -> Result<(), OrsError> {
+        let owner = Self::load_bridge_owner_row_in(write, namespace)?;
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Ok(());
+        }
+        let Some(mut cursor) = Self::load_bridge_cursor_row_in(write, namespace)? else {
+            return Ok(());
+        };
+        cursor.validate()?;
+        if cursor.owner_namespace != namespace || cursor.stream_id != owner.local_stream {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "position cursor does not match its admitted owner".to_owned(),
+            });
+        }
+        Self::rebind_bridge_handoff_reconcile_progress(
+            &mut cursor,
+            &owner,
+            previous_revision,
+            updated_revision,
+            change,
+        )?;
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(namespace, encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Reads one bounded page from the namespace's immutable sequence index.
     /// The one lookahead row distinguishes an exhausted page from a true
     /// continuation without scanning to the table end.
@@ -15131,6 +15398,8 @@ impl RedbRecoveryStore {
             last_compacted_sequence: row.last_compacted_sequence,
             handoff_repair_scan: row.handoff_repair_scan.clone(),
             handoff_retirement_scan: row.handoff_retirement_scan.clone(),
+            handoff_reconcile_scan: row.handoff_reconcile_scan.clone(),
+            handoff_reconcile_complete: row.handoff_reconcile_complete.clone(),
         };
         next.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -15537,10 +15806,22 @@ impl RedbRecoveryStore {
     ) -> Result<serde_json::Value, OrsError> {
         access.require(BridgeStreamRight::Append)?;
         Self::check_bridge_handoff_compatible_in(write, access, stage)?;
+        let prior_recovery_revision =
+            Self::bridge_recovery_revision_for_in(write, &access.namespace)?;
         let outcome = Self::insert_bridge_event_row_checked(
             write, access, stage, staging, provenance, now_ms,
         )?;
-        Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+        let next_recovery_revision =
+            Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+        Self::rebind_bridge_handoff_reconcile_progress_in(
+            write,
+            &access.namespace,
+            prior_recovery_revision,
+            next_recovery_revision,
+            BridgeEventHandoffReconcileRevisionChange::PositionChanged {
+                earliest_sequence: stage.sequence,
+            },
+        )?;
         Ok(outcome)
     }
 
@@ -16367,6 +16648,14 @@ impl RedbRecoveryStore {
             if item.sequence > durable {
                 return Err(OrsError::InvalidTransition);
             }
+            let prior_recovery_revision = if item.sequence > acked {
+                Some(Self::bridge_recovery_revision_for_in(
+                    &write,
+                    &access.namespace,
+                )?)
+            } else {
+                None
+            };
             if item.sequence > acked {
                 acked = item.sequence;
                 Self::write_bridge_cursors_in_checked(
@@ -16379,7 +16668,22 @@ impl RedbRecoveryStore {
             }
             let pruned = 0_u64;
             if acked > prior_acked {
-                Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                let previous_revision =
+                    prior_recovery_revision.ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_revision",
+                        reason: "acknowledgement advance lost its recovery revision".to_owned(),
+                    })?;
+                let updated_revision =
+                    Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                Self::rebind_bridge_handoff_reconcile_progress_in(
+                    &write,
+                    &access.namespace,
+                    previous_revision,
+                    updated_revision,
+                    BridgeEventHandoffReconcileRevisionChange::AcknowledgementAdvanced {
+                        acked_sequence: acked,
+                    },
+                )?;
             }
             outcomes.push(json!({
                 "namespace": access.namespace,
@@ -16909,12 +17213,22 @@ impl RedbRecoveryStore {
             owner_namespace: namespace,
         };
         row.validate()?;
+        let prior_recovery_revision =
+            Self::bridge_recovery_revision_for_in(&write, &row.owner_namespace)?;
         {
             let mut gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
             gaps.insert(key.as_str(), encode(&row)?.as_str())
                 .map_err(storage)?;
         }
-        Self::bump_bridge_recovery_revision_in(&write, &row.owner_namespace)?;
+        let updated_revision =
+            Self::bump_bridge_recovery_revision_in(&write, &row.owner_namespace)?;
+        Self::rebind_bridge_handoff_reconcile_progress_in(
+            &write,
+            &row.owner_namespace,
+            prior_recovery_revision,
+            updated_revision,
+            BridgeEventHandoffReconcileRevisionChange::Unchanged,
+        )?;
         write.commit().map_err(storage)?;
         Ok(json!({ "gap_id": parsed.gap_id, "accepted": true, "fresh": true }))
     }
@@ -17103,13 +17417,25 @@ impl RedbRecoveryStore {
                     reconcile_owner_incarnation: 0,
                 };
                 row.validate()?;
+                let prior_recovery_revision =
+                    Self::bridge_recovery_revision_for_in(&write, &access.namespace)?;
                 {
                     let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
                     handoffs
                         .insert(key.as_str(), encode(&row)?.as_str())
                         .map_err(storage)?;
                 }
-                Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                let updated_revision =
+                    Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                Self::rebind_bridge_handoff_reconcile_progress_in(
+                    &write,
+                    &access.namespace,
+                    prior_recovery_revision,
+                    updated_revision,
+                    BridgeEventHandoffReconcileRevisionChange::PositionChanged {
+                        earliest_sequence: sequence,
+                    },
+                )?;
                 json!({
                     "event_id": event_id,
                     "sequence": sequence,
@@ -17178,25 +17504,23 @@ impl RedbRecoveryStore {
         Err(OrsError::InvalidTransition)
     }
 
-    /// Binds owner-checked handed-off events to one reconciliation key
-    /// once the consumed frontier covers their sequences (issue #2729,
-    /// item 4). Only handoffs carrying the verified namespace reconcile;
-    /// legacy ownerless rows and foreign namespaces are untouched. No
-    /// cross-store atomicity with the Governor intake is claimed: this
-    /// step is idempotent, so a lost answer replays safely.
+    /// Binds a bounded page of owner-checked handoffs to one reconciliation
+    /// key once the admitted consumed frontier covers their positions (issue
+    /// #2729, item 4; #2731, item 5). The immutable position index supplies
+    /// the page; each hit is joined to its exact owner, event, sequence, and
+    /// handoff key before mutation. The durable cursor resumes after the last
+    /// scanned position, while its completion watermark prevents quiet
+    /// duplicate acknowledgements from restarting at zero. Neither marker
+    /// claims receiving-owner acceptance or downstream application. Legacy
+    /// ownerless rows are left untouched. No cross-store atomicity with the
+    /// Governor intake is claimed: this step is idempotent, so a lost answer
+    /// replays safely.
     pub fn reconcile_bridge_event_handoffs_checked(
         &self,
         namespace: &str,
         acked_sequence: u64,
         reconcile_key: &str,
     ) -> Result<serde_json::Value, OrsError> {
-        let owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
-        let access = Self::check_bridge_stream_access(
-            &owner,
-            owner.revision,
-            owner.incarnation,
-            BridgeStreamRight::Acknowledge,
-        )?;
         if acked_sequence == 0 {
             return Err(OrsError::InvalidField {
                 field: "acked_sequence",
@@ -17204,22 +17528,266 @@ impl RedbRecoveryStore {
             });
         }
         crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+        let observed_owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
+        let observed_access = Self::check_bridge_stream_access(
+            &observed_owner,
+            observed_owner.revision,
+            observed_owner.incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let mut reconciled = 0_u64;
+        let owner = Self::load_bridge_owner_row_in(&write, namespace)?;
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            observed_owner.revision,
+            observed_owner.incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
+        if access.namespace != observed_access.namespace
+            || owner.local_stream != observed_owner.local_stream
+            || owner.authority_lineage != observed_owner.authority_lineage
+            || owner.principal != observed_owner.principal
+        {
+            return Err(OrsError::StaleWriterEpoch);
+        }
+        let result = Self::reconcile_bridge_event_handoffs_in(
+            &write,
+            &access,
+            &owner,
+            acked_sequence,
+            reconcile_key,
+            now_ms,
+        )?;
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    fn reconcile_bridge_event_handoffs_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        acked_sequence: u64,
+        reconcile_key: &str,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        let plan = Self::bridge_handoff_reconcile_plan_in(write, access, owner, acked_sequence)?;
+        if plan.skip_scan {
+            return Self::persist_bridge_handoff_reconcile_result_in(
+                write,
+                access,
+                acked_sequence,
+                &plan.cursor,
+                0,
+                false,
+                None,
+            );
+        }
+        let scan = BridgeEventHandoffScanCursor {
+            owner_revision: owner.revision,
+            owner_incarnation: owner.incarnation,
+            recovery_revision: plan.recovery_revision,
+            after_sequence: plan.start_after.unwrap_or(0),
+            upper_sequence: acked_sequence,
+        };
+        scan.validate()?;
+        let (positions, continuation) = Self::bridge_handoff_position_page_in(
+            write,
+            access,
+            &scan,
+            MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY,
+        )?;
+        let reconciled = Self::reconcile_bridge_handoffs_for_positions_in(
+            write,
+            access,
+            owner,
+            &positions,
+            acked_sequence,
+            reconcile_key,
+            now_ms,
+        )?;
+        let page = BridgeEventHandoffReconcilePage {
+            positions,
+            continuation,
+            reconciled,
+        };
+        Self::finish_bridge_event_handoff_reconcile_page_in(
+            write,
+            access,
+            owner,
+            acked_sequence,
+            plan,
+            &page,
+        )
+    }
+
+    fn bridge_handoff_reconcile_plan_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        acked_sequence: u64,
+    ) -> Result<BridgeEventHandoffReconcilePlan, OrsError> {
+        let mut cursor = Self::load_bridge_cursor_row_in(write, &access.namespace)?.ok_or(
+            OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "admitted stream owner has no retained position cursor".to_owned(),
+            },
+        )?;
+        cursor.validate()?;
+        if cursor.owner_namespace != access.namespace || cursor.stream_id != owner.local_stream {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "position cursor does not match its admitted owner".to_owned(),
+            });
+        }
+        if acked_sequence > cursor.last_acked_sequence
+            || acked_sequence > cursor.last_durable_sequence
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        if acked_sequence > cursor.last_observed_sequence {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_cursor",
+                reason: "acked frontier is outside the indexed observed position range".to_owned(),
+            });
+        }
+        let recovery_revision = Self::bridge_recovery_revision_for_in(write, &access.namespace)?;
+        let valid_complete = cursor
+            .handoff_reconcile_complete
+            .as_ref()
+            .filter(|complete| {
+                complete.owner_revision == owner.revision
+                    && complete.owner_incarnation == owner.incarnation
+                    && complete.recovery_revision == recovery_revision
+            })
+            .cloned();
+        if cursor.handoff_reconcile_scan.as_ref().is_some_and(|scan| {
+            scan.owner_revision != owner.revision
+                || scan.owner_incarnation != owner.incarnation
+                || scan.recovery_revision != recovery_revision
+        }) {
+            cursor.handoff_reconcile_scan = None;
+        }
+        if valid_complete.is_none() {
+            cursor.handoff_reconcile_complete = None;
+        }
+        let completed_covers_request = valid_complete
+            .as_ref()
+            .is_some_and(|complete| complete.through_sequence >= acked_sequence);
+        let start_after = cursor
+            .handoff_reconcile_scan
+            .as_ref()
+            .map(|scan| scan.after_sequence)
+            .or_else(|| valid_complete.map(|complete| complete.through_sequence));
+        let scan_covers_request = start_after.is_some_and(|after| after >= acked_sequence);
+        let skip_scan = completed_covers_request || scan_covers_request;
+        if completed_covers_request {
+            cursor.handoff_reconcile_scan = None;
+        }
+        Ok(BridgeEventHandoffReconcilePlan {
+            cursor,
+            recovery_revision,
+            start_after,
+            skip_scan,
+        })
+    }
+
+    fn finish_bridge_event_handoff_reconcile_page_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        acked_sequence: u64,
+        mut plan: BridgeEventHandoffReconcilePlan,
+        page: &BridgeEventHandoffReconcilePage,
+    ) -> Result<serde_json::Value, OrsError> {
+        let next_revision = if page.reconciled > 0 {
+            // Handoff state and its accounted bytes share one recovery-view
+            // revision with this cursor page.
+            Self::bump_bridge_recovery_revision_in(write, &access.namespace)?
+        } else {
+            plan.recovery_revision
+        };
+        let after_sequence = if page.continuation {
+            page.positions.last().map(|(sequence, _)| *sequence).ok_or(
+                OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "reconcile continuation has no scanned position".to_owned(),
+                },
+            )?
+        } else {
+            acked_sequence
+        };
+        plan.cursor.handoff_reconcile_scan =
+            page.continuation.then_some(BridgeEventHandoffScanCursor {
+                owner_revision: owner.revision,
+                owner_incarnation: owner.incarnation,
+                recovery_revision: next_revision,
+                after_sequence,
+                upper_sequence: acked_sequence,
+            });
+        plan.cursor.handoff_reconcile_complete =
+            (!page.continuation).then_some(BridgeEventHandoffReconcileComplete {
+                owner_revision: owner.revision,
+                owner_incarnation: owner.incarnation,
+                recovery_revision: next_revision,
+                through_sequence: acked_sequence,
+            });
+        Self::persist_bridge_handoff_reconcile_result_in(
+            write,
+            access,
+            acked_sequence,
+            &plan.cursor,
+            page.reconciled,
+            page.continuation,
+            page.continuation.then_some(after_sequence),
+        )
+    }
+
+    fn persist_bridge_handoff_reconcile_result_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        acked_sequence: u64,
+        cursor: &BridgeEventCursorRow,
+        reconciled: u64,
+        continuation: bool,
+        after_sequence: Option<u64>,
+    ) -> Result<serde_json::Value, OrsError> {
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(access.namespace.as_str(), encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        drop(cursors);
+        let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, &access.namespace)?;
+        Ok(json!({
+            "namespace": access.namespace,
+            "acked_sequence": acked_sequence,
+            "reconciled": reconciled,
+            "reconcile_continuation": continuation,
+            "reconcile_after_sequence": after_sequence,
+            "handoff_scan_bytes": scan_bytes,
+        }))
+    }
+
+    fn reconcile_bridge_handoffs_for_positions_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        positions: &[(u64, String)],
+        acked_sequence: u64,
+        reconcile_key: &str,
+        now_ms: u64,
+    ) -> Result<u64, OrsError> {
+        let mut due = Vec::new();
         {
             let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            let mut due = Vec::new();
-            let prefix = format!("{}::", access.namespace);
-            let prefix_end = format!("{prefix}\u{10ffff}");
-            for entry in handoffs
-                .range(prefix.as_str()..=prefix_end.as_str())
-                .map_err(storage)?
-            {
-                let (key, value) = entry.map_err(storage)?;
+            for (sequence, event_id) in positions {
+                let key = format!("{}::{event_id}", access.namespace);
+                let Some(value) = handoffs.get(key.as_str()).map_err(storage)? else {
+                    continue;
+                };
                 let row: BridgeEventHandoffRow = decode(value.value())?;
                 row.validate()?;
-                let key = key.value();
                 if row.owner_namespace.is_empty() {
                     if key != format!("{}::{}", row.stream_id, row.event_id) {
                         return Err(OrsError::IntegrityProblem {
@@ -17232,70 +17800,45 @@ impl RedbRecoveryStore {
                 }
                 if row.owner_namespace != access.namespace
                     || row.stream_id != owner.local_stream
+                    || row.event_id != *event_id
+                    || row.sequence != *sequence
                     || key != format!("{}::{}", access.namespace, row.event_id)
                 {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "bridge_event_handoff",
-                        reason: "handoff key, owner, and stream identity disagree".to_owned(),
+                        reason: "position, handoff key, owner, and sequence disagree".to_owned(),
                     });
                 }
-                if row.owner_namespace == access.namespace
-                    && row.sequence <= acked_sequence
-                    && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF
+                if row.sequence <= acked_sequence && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF {
+                    due.push((key, row));
+                }
+            }
+        }
+        let mut reconciled = 0_u64;
+        if !due.is_empty() {
+            let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            for (key, mut row) in due {
+                if row.state != BRIDGE_EVENT_HANDOFF_HANDED_OFF
+                    || row.owner_namespace != access.namespace
                 {
-                    due.push(key.to_owned());
+                    continue;
                 }
-            }
-            if !due.is_empty() {
-                drop(handoffs);
-                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-                for key in due {
-                    let mut row: BridgeEventHandoffRow = handoffs
-                        .get(key.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode(value.value()))
-                        .transpose()?
-                        .ok_or(OrsError::InvalidField {
-                            field: "event_id",
-                            reason: "bridge event handoff disappeared during reconcile",
-                        })?;
-                    row.validate()?;
-                    if row.state != BRIDGE_EVENT_HANDOFF_HANDED_OFF
-                        || row.owner_namespace != access.namespace
-                    {
-                        continue;
-                    }
-                    BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
-                    reconcile_key.clone_into(&mut row.reconcile_key);
-                    row.reconciled_at_ms = now_ms;
-                    // Preserve the presenting stream owner's consumed
-                    // frontier and owner snapshot as reconcile metadata. This
-                    // does not prove receiving-owner acceptance and cannot
-                    // authorize retirement or claim downstream application.
-                    row.reconcile_acked_sequence = acked_sequence;
-                    row.reconcile_owner_revision = owner.revision;
-                    row.reconcile_owner_incarnation = owner.incarnation;
-                    row.validate()?;
-                    handoffs
-                        .insert(key.as_str(), encode(&row)?.as_str())
-                        .map_err(storage)?;
-                    reconciled += 1;
-                }
+                BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
+                reconcile_key.clone_into(&mut row.reconcile_key);
+                row.reconciled_at_ms = now_ms;
+                // This records the presenting stream owner's consumed
+                // frontier, not receiving-owner acceptance or application.
+                row.reconcile_acked_sequence = acked_sequence;
+                row.reconcile_owner_revision = owner.revision;
+                row.reconcile_owner_incarnation = owner.incarnation;
+                row.validate()?;
+                handoffs
+                    .insert(key.as_str(), encode(&row)?.as_str())
+                    .map_err(storage)?;
+                reconciled += 1;
             }
         }
-        if reconciled > 0 {
-            // Handoff state and its accounted bytes are visible in a finite
-            // recovery page. Move the same view revision in this transaction
-            // so a page cannot stitch old capacity with a newly reconciled
-            // handoff row.
-            Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
-        }
-        write.commit().map_err(storage)?;
-        Ok(json!({
-            "namespace": access.namespace,
-            "acked_sequence": acked_sequence,
-            "reconciled": reconciled,
-        }))
+        Ok(reconciled)
     }
 
     /// Repairs retained events lacking their required handoff during bounded
@@ -17682,6 +18225,7 @@ impl RedbRecoveryStore {
         }
         let mut now_ms = None;
         let mut repaired = 0_u64;
+        let earliest_repaired_sequence = missing.iter().map(|(_, row)| row.sequence).min();
         for (key, row) in missing {
             let handed_off_at_ms = if let Some(timestamp) = now_ms {
                 timestamp
@@ -17719,6 +18263,18 @@ impl RedbRecoveryStore {
                 scan.recovery_revision = updated_revision;
             }
             cursor.handoff_retirement_scan = None;
+            let earliest_sequence =
+                earliest_repaired_sequence.ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_handoff",
+                    reason: "repair count advanced without a repaired position".to_owned(),
+                })?;
+            Self::rebind_bridge_handoff_reconcile_progress(
+                &mut cursor,
+                &owner,
+                recovery_revision,
+                updated_revision,
+                BridgeEventHandoffReconcileRevisionChange::PositionChanged { earliest_sequence },
+            )?;
         }
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -17898,6 +18454,7 @@ impl RedbRecoveryStore {
         let retired = 0_u64;
         let mut terminalized = 0_u64;
         let mut terminalized_boundary = compacted;
+        let mut earliest_terminalized_sequence = None;
         for (_, key, row) in &eligible {
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
@@ -17948,6 +18505,10 @@ impl RedbRecoveryStore {
                 projections.remove(record_key.as_str()).map_err(storage)?;
             }
             terminalized += 1;
+            earliest_terminalized_sequence = Some(
+                earliest_terminalized_sequence
+                    .map_or(row.sequence, |earliest: u64| earliest.min(row.sequence)),
+            );
             terminalized_boundary = terminalized_boundary.max(row.sequence);
         }
         if terminalized_boundary > compacted {
@@ -17979,6 +18540,19 @@ impl RedbRecoveryStore {
                 scan.recovery_revision = updated_revision;
             }
             cursor.handoff_repair_scan = None;
+            let earliest_sequence =
+                earliest_terminalized_sequence.ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_handoff",
+                    reason: "terminalization count advanced without a terminalized position"
+                        .to_owned(),
+                })?;
+            Self::rebind_bridge_handoff_reconcile_progress(
+                &mut cursor,
+                &owner,
+                recovery_revision,
+                updated_revision,
+                BridgeEventHandoffReconcileRevisionChange::PositionChanged { earliest_sequence },
+            )?;
         }
         cursor.handoff_retirement_scan = next_scan;
         cursor.validate()?;
@@ -23519,6 +24093,77 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Exact-fence retirement census rows for the #1918 ACT-1/A4 drain gate
+    /// (I1.5, I18.53 ACT-1/ACT-4).
+    ///
+    /// Reads the current supervision row for the census identity and the
+    /// exact-fence `RuntimeLease` current set from the canonical ORS tables.
+    /// The supervision row must be bound to the presented fence; a row bound
+    /// to another fence cannot close this fence's proof (`FenceMismatch`).
+    /// An absent supervision head fails closed: it is the exact-mismatch the
+    /// Kernel census treats as unprovable, never as an expired lease.
+    /// `RuntimeLease` rows are re-validated on readback, key-checked against
+    /// their own lease identity, selected by exact fence equality, and
+    /// returned ordered by lease id, so the caller never re-sorts or
+    /// re-filters. A store that never recorded a runtime-lease table has no
+    /// durable rows to return; that observed absence is reported as the empty
+    /// set, exactly like the supervision-status `has_table` precedent, and
+    /// never as a caller-supplied default.
+    pub fn load_runtime_lease_census_by_state_fence(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        supervision_lease_id: &crate::OperationIdentity,
+    ) -> Result<RuntimeLeaseCensusRows, OrsError> {
+        let supervision = self
+            .load_current_supervision_lease(supervision_lease_id)?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "runtime_lease_census",
+                reason: "supervision head absent for census identity".to_owned(),
+            })?;
+        if supervision.record.binding.state_fence != *fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        let runtime_leases = self.load_runtime_leases_by_state_fence(fence)?;
+        Ok(RuntimeLeaseCensusRows {
+            supervision,
+            runtime_leases,
+        })
+    }
+
+    /// Reads the exact-fence `RuntimeLease` current set, ordered by lease id.
+    ///
+    /// The fence-only half of
+    /// [`Self::load_runtime_lease_census_by_state_fence`] for readers that
+    /// already established supervision coverage through their own leg, such as
+    /// the Kernel idle-lease census runtime leg.
+    pub fn load_runtime_leases_by_state_fence(
+        &self,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<Vec<RuntimeLease>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = match read.open_table(RUNTIME_LEASE_CURRENT) {
+            Ok(current) => current,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(storage(error)),
+        };
+        let mut runtime_leases = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let lease: RuntimeLease = decode(value.value())?;
+            if key.value() != lease.lease_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease_current",
+                    reason: "current key does not match lease identity".to_owned(),
+                });
+            }
+            if lease.state_fence == *fence {
+                runtime_leases.push(lease);
+            }
+        }
+        runtime_leases.sort_by(|first, second| first.lease_id.cmp(&second.lease_id));
+        Ok(runtime_leases)
+    }
+
     /// Loads the recorded effect operation lease for one exact authorized
     /// operation (issue #1885; I1.9).
     ///
@@ -23699,6 +24344,20 @@ impl RedbRecoveryStore {
             );
         };
         let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        // I1.9 (issue #1884 W1.5): an absent manifest contributes no accepted
+        // Module Catalog revision, so the request built below would fail its own
+        // view validation with a bare `InvalidField` and the caller would see an
+        // opaque field error instead of the typed disposition, the preserved
+        // evidence and the durable escalation item. The absence is asserted here,
+        // from the row this query actually loaded, and the resulting intent is
+        // persisted before this returns, so the refusal is never discarded (W5).
+        let Some(manifest) = manifest else {
+            let decision = crate::deny_effect_replay_without_manifest(&lease, observed_at_ms);
+            if let Some(item) = decision.reconciliation.as_ref() {
+                self.persist_effect_replay_reconciliation(item)?;
+            }
+            return Ok(decision);
+        };
         let request = crate::EffectReplayRequest {
             operation_id: lease.operation_id.clone(),
             manifest_module_id: lease.manifest_module_id.clone(),
@@ -23709,22 +24368,22 @@ impl RedbRecoveryStore {
             current: crate::EffectAuthorizationView {
                 authority_epoch: current_authority_epoch,
                 // Admitting Catalog/Policy revisions of the loaded manifest — the
-                // exact revisions this lease was issued against. Never
-                // defaulted; a receipt-less manifest is refused downstream as
-                // `ManifestReceiptless` and an absent one as `ManifestAbsent`.
-                catalog_revision: manifest
-                    .as_ref()
-                    .map_or(0, |recorded| recorded.admission.catalog_revision),
-                policy_revision: manifest
-                    .as_ref()
-                    .map_or(0, |recorded| recorded.admission.policy_revision),
+                // exact revisions this lease was issued against, never defaulted.
+                // Both are non-zero on any row that loaded: the read path
+                // re-validates each row through `KernelExecutionManifest::validate`,
+                // which requires a non-zero Catalog revision, a non-zero Policy
+                // revision and a non-blank admission receipt, so a receipt-less
+                // row fails closed as corruption here rather than reaching this
+                // query as a usable manifest.
+                catalog_revision: manifest.admission.catalog_revision,
+                policy_revision: manifest.admission.policy_revision,
                 catalog_view: crate::CatalogPolicyView::Unavailable,
                 revocation: crate::RevocationAcknowledgement::None,
                 delivery: lease.delivery,
             },
             observed_at_ms,
         };
-        let decision = crate::authorize_effect_replay(Some(&lease), manifest.as_ref(), &request)?;
+        let decision = crate::authorize_effect_replay(Some(&lease), Some(&manifest), &request)?;
         if let Some(item) = decision.reconciliation.as_ref() {
             self.persist_effect_replay_reconciliation(item)?;
         }

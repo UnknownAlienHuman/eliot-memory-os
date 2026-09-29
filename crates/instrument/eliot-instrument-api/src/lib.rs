@@ -868,6 +868,18 @@ pub struct InstrumentAdmissionGrant {
     pub executable_version: Option<String>,
     /// Machine-observed content digest bound at admission.
     pub content_digest: String,
+    /// Observed canonical path of the launched executable, bound at admission.
+    ///
+    /// The grant pins the exact file object the owner observed, not just its
+    /// name: a different path with the same file name cannot reuse this grant.
+    pub executable_path: String,
+    /// Admitted supply-chain receipt digest bound at admission.
+    ///
+    /// Empty when the registry admitted no receipt for the kind at this
+    /// generation; a replaced receipt changes this digest and therefore the
+    /// grant identity, so new admission invalidates without rewriting
+    /// historical run evidence.
+    pub supply_digest: String,
     /// Exact validated arguments bound by the grant.
     pub arguments: Vec<String>,
     /// Admitted environment class.
@@ -901,7 +913,7 @@ impl InstrumentAdmissionGrant {
     /// Canonical grant material shared by construction and verification.
     fn canonical_digest(&self) -> String {
         let material = format!(
-            "{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.kind_id,
             self.kind_version,
             self.kind,
@@ -911,6 +923,8 @@ impl InstrumentAdmissionGrant {
             self.executable,
             self.executable_version.as_deref().unwrap_or(""),
             self.content_digest,
+            self.executable_path,
+            self.supply_digest,
             self.arguments.join("\u{0}"),
             self.environment_class,
             self.scope_class,

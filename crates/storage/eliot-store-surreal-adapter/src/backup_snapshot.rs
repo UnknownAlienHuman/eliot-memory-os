@@ -147,7 +147,8 @@ use eliot_store_api::{
     OperationId, OperationIdentity, OrderingHead, RequestMeta, RevisionHead, ScopeId,
     SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
     SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
-    StateFence, StoreError, canonical_json_bytes, sha256_hex,
+    SnapshotPageCoverage, SnapshotPageState, StateFence, StoreError, canonical_json_bytes,
+    sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -3401,19 +3402,40 @@ fn release_terminal_record(states: &mut CaptureRegistry, digest: &str, now_ms: u
 /// denominator it would have to prove is gone, and absence of a coverage record
 /// means unknown, not complete.
 fn is_complete_capture(state: &SnapshotState) -> bool {
+    let Some(payload) = state.payload.as_ref() else {
+        return false;
+    };
+    let Ok(owner_member_count) = u64::try_from(payload.ordered_members.len()) else {
+        return false;
+    };
+    is_complete_capture_with_accounting(
+        state,
+        owner_member_count,
+        state.members_served,
+        state.bytes_served,
+        state.pages_served,
+    )
+}
+
+/// Reports completeness for an exact prospective served frontier using the
+/// independently observed denominator retained by the owner.
+fn is_complete_capture_with_accounting(
+    state: &SnapshotState,
+    owner_member_count: u64,
+    members_served: u64,
+    bytes_served: u64,
+    pages_served: u64,
+) -> bool {
     let enumeration_ran = state.enumeration.is_some();
     let known_zero = state
         .enumeration
         .is_some_and(EnumerationEvidence::is_authoritative_zero);
-    let Some(payload) = state.payload.as_ref() else {
-        return false;
-    };
     state.begin.denominator.is_complete
         && enumeration_ran
-        && payload.ordered_members.is_empty() == known_zero
-        && state.members_served == payload.ordered_members.len() as u64
-        && state.bytes_served == state.total_bytes
-        && state.pages_served == state.total_pages
+        && (owner_member_count == 0) == known_zero
+        && members_served == owner_member_count
+        && bytes_served == state.total_bytes
+        && pages_served == state.total_pages
 }
 
 /// The exact completeness and served accounting of one closing capture.
@@ -3839,6 +3861,79 @@ fn interrupt_capture(
     refusal
 }
 
+struct PageAccounting {
+    cumulative_members: u64,
+    cumulative_bytes: u64,
+    denominator_members: u64,
+    pages_served: u64,
+    state: SnapshotPageState,
+    is_last: bool,
+    next_cursor: Option<SnapshotCursor>,
+}
+
+/// Computes the prospective owner-observed coverage and continuation frontier.
+fn page_accounting(
+    state: &SnapshotState,
+    handle_digest: &str,
+    members: &[SnapshotMember],
+    owner_member_count: usize,
+    is_last: bool,
+) -> Result<PageAccounting, StoreError> {
+    let page_bytes = members.iter().try_fold(0_u64, |total, member| {
+        total
+            .checked_add(member.residency.byte_count)
+            .ok_or(StoreError::PayloadTooLarge)
+    })?;
+    let page_member_count =
+        u64::try_from(members.len()).map_err(|_| StoreError::PayloadTooLarge)?;
+    let cumulative_members = state
+        .members_served
+        .checked_add(page_member_count)
+        .ok_or(StoreError::PayloadTooLarge)?;
+    let cumulative_bytes = state
+        .bytes_served
+        .checked_add(page_bytes)
+        .ok_or(StoreError::PayloadTooLarge)?;
+    let denominator_members =
+        u64::try_from(owner_member_count).map_err(|_| StoreError::PayloadTooLarge)?;
+    let pages_served = state
+        .pages_served
+        .checked_add(1)
+        .ok_or(StoreError::PayloadTooLarge)?;
+    let next_cursor = if is_last {
+        None
+    } else {
+        Some(SnapshotCursor {
+            handle_digest: handle_digest.to_owned(),
+            page_index: pages_served,
+            cumulative_members,
+            cumulative_bytes,
+        })
+    };
+    let page_state = if !is_last {
+        SnapshotPageState::InProgress
+    } else if is_complete_capture_with_accounting(
+        state,
+        denominator_members,
+        cumulative_members,
+        cumulative_bytes,
+        pages_served,
+    ) {
+        SnapshotPageState::Complete
+    } else {
+        SnapshotPageState::Partial
+    };
+    Ok(PageAccounting {
+        cumulative_members,
+        cumulative_bytes,
+        denominator_members,
+        pages_served,
+        state: page_state,
+        is_last,
+        next_cursor,
+    })
+}
+
 /// Slices the next page out of a drift-verified capture, advances its served
 /// progress, and chains the predecessor digest. Runs under the registry lock
 /// with no awaits inside.
@@ -3890,14 +3985,16 @@ fn serve_next_page(
     }
     let members = payload.ordered_members[start..end].to_vec();
     let state = states.get(&claim.digest).ok_or(StoreError::Unavailable)?;
-    let page_bytes = members.iter().fold(0_u64, |total, member| {
-        total.saturating_add(member.residency.byte_count)
-    });
-    let cumulative_members = state.members_served.saturating_add(members.len() as u64);
-    let cumulative_bytes = state.bytes_served.saturating_add(page_bytes);
-    if cumulative_members > state.begin.bounds.max_members
-        || cumulative_bytes > state.begin.bounds.max_bytes
-        || cumulative_bytes > MAX_SNAPSHOT_BYTES
+    let accounting = page_accounting(
+        state,
+        &claim.digest,
+        &members,
+        total_members,
+        end >= total_members,
+    )?;
+    if accounting.cumulative_members > state.begin.bounds.max_members
+        || accounting.cumulative_bytes > state.begin.bounds.max_bytes
+        || accounting.cumulative_bytes > MAX_SNAPSHOT_BYTES
     {
         return Err(interrupt_capture(
             states,
@@ -3906,21 +4003,24 @@ fn serve_next_page(
             StoreError::PayloadTooLarge,
         ));
     }
-    let is_last = end >= total_members;
-    let next_cursor = if is_last {
-        None
-    } else {
-        Some(SnapshotCursor {
-            handle_digest: claim.digest.clone(),
-            page_index: state.pages_served.saturating_add(1),
-            cumulative_members,
-            cumulative_bytes,
-        })
-    };
+    let PageAccounting {
+        cumulative_members,
+        cumulative_bytes,
+        denominator_members,
+        pages_served,
+        state: page_state,
+        is_last,
+        next_cursor,
+    } = accounting;
     let page = SnapshotPage {
         handle: state.issued.clone(),
         cursor,
         members,
+        coverage: SnapshotPageCoverage {
+            state: page_state,
+            cumulative_members,
+            denominator_members,
+        },
         cumulative_bytes,
         cumulative_work: cumulative_members,
         is_last,
@@ -3935,7 +4035,7 @@ fn serve_next_page(
     let state = states
         .get_mut(&claim.digest)
         .ok_or(StoreError::Unavailable)?;
-    state.pages_served = state.pages_served.saturating_add(1);
+    state.pages_served = pages_served;
     state.members_served = cumulative_members;
     state.bytes_served = cumulative_bytes;
     state.last_digest = page_digest;

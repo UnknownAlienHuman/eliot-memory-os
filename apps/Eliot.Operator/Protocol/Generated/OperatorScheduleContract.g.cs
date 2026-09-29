@@ -26,12 +26,12 @@
 //   crates/kernel/eliot-kernel-core/src/module/notification_state.rs
 //   crates/foundation/eliot-receipts/src/lib.rs
 //   crates/kernel/eliot-platform/src/handle_nonce.rs
-// contract_source_sha256: b995a43a341c733450bf1d55af522e5341ff65ca4948798137ffbdbfeb0afd35
+// contract_source_sha256: 33d2304da1adb9d72ea994b4649eb1a8628556e7942955ee38dd2910f857a486
 // constants_source_sha256: ea50e5435dd673fd0db560e3dbee5830f8b8382bde9ba9f41061ff5c1666a511
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
 // refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
-// grammar_source_sha256: 0283a4fe812976c36ae4e22821c8b445c3b9881b516600b6727820381cb8c5a6
-// user_automation_result_schema_sha256: 97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9
+// grammar_source_sha256: 4e4d28ddd0d419e7f5b7472737432301edcfe572bec49e165367994fa04efc2a
+// user_automation_result_schema_sha256: a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -105,7 +105,7 @@ public static class OperatorScheduleContract
     public static readonly IReadOnlyList<string> GrammarFunctionDigests =
     [
         "source_digest\t72e77c33b6c5de08128633a32ad1a2ceeed345a1eeababe5cf10f0f57d7abb82",
-        "normalized_occurrences\t2568a995fe2adf9502018f9553bf3d595679d0ef478025cfde89695cff159202",
+        "normalized_occurrences\ta20e6c6520d6a3a9baed76218e7cd9199afde1cb2a0a87c5ab6be3fb8df6a128",
         "parse_occurrence\t53ee26d8c5f5363416264b0d56eb527d744dd78129c530eeb6624e95e8349b0f",
         "parse_civil_wall_clock\t5578d2b151cd928f77ced97ed589e5ab4879d7cd11e0be0f1389f973a75a0984",
         "parse_utc_offset\t355b42de90101091999ed58b7faac560e01ba9199b36fe9e1a5026cc9f410de5",
@@ -203,7 +203,7 @@ public static class OperatorScheduleContract
     /// The C# decoder source pins this value separately; changing only the
     /// generated artefact cannot widen the decoder.
     /// </summary>
-    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9";
+    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c";
 
     /// <summary>Generated public members of `UserAutomationOperatorResultEnvelope`.</summary>
     public static readonly string[] USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS =
@@ -532,6 +532,7 @@ public static class OperatorScheduleContract
         "start_at",
         "end_at",
         "next_occurrences",
+        "normalization_receipt",
     ];
 
     /// <summary>Generated public members of `AutomationWorkScope`.</summary>

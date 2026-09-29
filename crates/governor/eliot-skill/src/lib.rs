@@ -70,7 +70,7 @@ pub use activation::{
     SkillExecutionOwnerPosition, SkillHarnessActivationReceipt, SkillRetrievalStatus,
     SkillUsefulness, SourceRevision, apply_dependency_staleness, assess_execution_reconciliation,
     changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
-    detect_dependency_staleness, fold_execution_evidence, material_use_allowed,
+    detect_dependency_staleness, fold_execution_evidence, gate_material_use, material_use_allowed,
     project_execution_outcomes, qualify_useful_outcomes, record_instruction_conflict,
 };
 

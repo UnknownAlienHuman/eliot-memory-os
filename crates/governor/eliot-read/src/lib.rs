@@ -113,8 +113,13 @@
 //!                            context_inputs.rs` retains seven role reads with
 //!                            `ProjectionState` dispositions; `bins/eliotd`
 //!                            retains one bounded evidence read per admitted
-//!                            `eliot.query` pair. Both consume the resolved
-//!                            [`ReadIdentity`] instead of re-deriving freshness.
+//!                            `eliot.query` pair and routes its
+//!                            `GetCurrentEpistemicPosition` edge read through
+//!                            this owner (`experience_runtime.rs:read_current_position`).
+//!                            All of them consume the resolved [`ReadIdentity`]
+//!                            instead of re-deriving freshness: a direct
+//!                            `CanonicalReadClient::execute_named` call is no
+//!                            longer a second answer to source/fence/coverage.
 //! ```
 //!
 //! # Declared edges versus a live read (A1)
@@ -163,10 +168,14 @@
 //! `Current` is reachable by a successful read, so an empty in-memory payload
 //! can never become a successful empty or current result: a payload that
 //! carries no observation of the bound identity is `Unknown`, an operation with
-//! no activated Store handler is `NotRunning`, and a source-declared truncated
-//! coverage statement is `Partial`. `Unavailable`, `Stale` and `Conflicted`
+//! no activated Store handler is `NotRunning`, a Store catalogue that declares
+//! no manifest row for an operation this owner admits is `Missing`, and a
+//! source-declared truncated coverage statement is `Partial`. `Missing` is the
+//! only value that positively states that a looked-for subject is absent, and
+//! it is kept apart from `Unknown` on purpose: an unobserved answer is not
+//! evidence of absence. `Unavailable`, `Stale` and `Conflicted`
 //! keep their existing typed [`ReadError`] variants so the exact store identity
-//! survives; the three owner-level states travel as
+//! survives; the four owner-level states travel as
 //! [`ReadError::Outcome`]. No failure collapses into a string, a generic code,
 //! or another state.
 
@@ -198,11 +207,15 @@ use thiserror::Error;
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
 /// Current wire revision for the Governor read contract.
 ///
-/// `3.0.0` adds the retained-read identity closure ([`ReadIdentity`]), the
+/// `3.1.0` adds [`ReadOutcome::Missing`], the authoritative statement that a
+/// looked-for subject is absent, to the closed read outcome vocabulary. It is
+/// a minor revision because it adds a non-current state to an existing closed
+/// enum: no successful result changes meaning and no prior value is renumbered.
+/// `3.0.0` added the retained-read identity closure ([`ReadIdentity`]), the
 /// caller-declared order-head dependency ([`ReadOrderingBinding`]), the
 /// owner-resolved coverage identity ([`ReadCoverage`]) and the closed read
 /// outcome vocabulary ([`ReadOutcome`]).
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 1, 0);
 
 /// Closed semantic query modes from the public ELIOT query surface.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -570,10 +583,27 @@ pub enum ReadOutcome {
     Partial,
     /// `NOT_APPLICABLE`: no observation of the bound source applies to this
     /// read. Retained as a distinct closed value so an inapplicable read can
-    /// never be reported as an observed empty or a current result; the
-    /// read coverage dimension carries the same `NOT_APPLICABLE` meaning
-    /// concretely in [`ReadCoverage::NotApplicable`].
+    /// never be reported as an observed empty or a current result;
+    /// `Missing` is the other non-current value that is not an empty set.
     NotApplicable,
+    /// `MISSING`: the source answered authoritatively at this exact bound
+    /// identity and states that the requested subject is absent, so no record
+    /// for it was ever admitted.
+    ///
+    /// Distinct from every other non-current value, and the reason each of
+    /// those is not `Missing`: `Unknown` is a source that could not be
+    /// *observed* to state anything (`classify_payload_coverage` refuses an
+    /// undecodable or undescribed statement precisely because absence of
+    /// evidence is not evidence of absence), `Unavailable` is a source that
+    /// could not be reached, `NotRunning` is a source with no handler at all,
+    /// `Stale`/`Conflicted` are answers bound to another or moving identity,
+    /// and `Partial` is a bounded subset. `NotApplicable` names an observation
+    /// that does not apply rather than a subject that was looked for and not
+    /// found. Only this variant is a positive, authoritative statement that
+    /// the looked-for subject is not there — so it, and only it, may ever
+    /// discharge a required subject. It still cannot become a successful
+    /// result: `Current` remains reachable only on success.
+    Missing,
 }
 
 /// Exact caller identity that one retained read is bound to.
@@ -1246,8 +1276,9 @@ pub enum ReadError {
     /// The read produced no observation, and its non-current state is one the
     /// Store error set cannot express.
     ///
-    /// `NotRunning` (no activated Store source), `Unknown` (an answer that does
-    /// not observe the bound identity) and `Partial` (a Store-declared
+    /// `NotRunning` (no activated Store source), `Missing` (an authoritative
+    /// statement that the looked-for subject is absent), `Unknown` (an answer
+    /// that does not observe the bound identity) and `Partial` (a Store-declared
     /// truncated coverage statement) are owner-level observations rather than
     /// store transport failures, so they travel as the closed
     /// [`ReadOutcome`] value. `Unavailable`, `Stale` and `Conflicted` keep
@@ -2008,7 +2039,7 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
             provenance_rule: "exact_handles_or_read_only_unavailable_disposition",
             identity_rule: "principal_scope_fence_heads_consistency_source_schema_coverage_and_invalidation",
             ordering_rule: "declared_order_heads_must_carry_the_exact_read_fence",
-            outcome_rule: "only_current_is_successful_not_running_unknown_partial_stay_distinct",
+            outcome_rule: "only_current_is_successful_not_running_missing_unknown_partial_stay_distinct",
         },
     )
 }

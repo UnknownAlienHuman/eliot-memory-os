@@ -99,7 +99,8 @@ impl InstancePoolConfig {
 }
 
 /// Returns the canonical digest of the exact pooled engine settings for one
-/// pool capacity. The digest names the pinned Wasmtime generation, the fixed
+/// pool capacity. The digest names the pinned Wasmtime generation, the host
+/// compilation target, the guest ABI world and its WIT digest, the fixed
 /// provider settings, and the capacity numbers; it changes if and only if
 /// those settings change. Structural knobs are recorded as wasmtime
 /// defaults, never silently absorbed.
@@ -112,8 +113,14 @@ pub fn pooled_configuration_digest(pool: &InstancePoolConfig) -> Sha256Digest {
 /// so the bound settings stay inspectable in receipts and reviews.
 fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
     format!(
-        "wasmtime={PINNED_WASMTIME_VERSION};component_model=true;typed_abi=guest.run;max_wasm_stack={};max_epoch_deadline_ticks={MAX_EPOCH_DEADLINE_TICKS};allocation=pooling;pool_total_instances={};pool_max_memory_bytes={};pool_table_elements={};pool_structural=wasmtime-default;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true",
-        PROVIDER_STACK_SIZE, pool.total_instances, pool.max_memory_bytes, pool.max_table_elements,
+        "wasmtime={PINNED_WASMTIME_VERSION};target={os}/{arch};component_model=true;typed_abi=guest.run;abi_digest={abi};max_wasm_stack={};max_epoch_deadline_ticks={MAX_EPOCH_DEADLINE_TICKS};allocation=pooling;pool_total_instances={};pool_max_memory_bytes={};pool_table_elements={};pool_structural=wasmtime-default;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true",
+        PROVIDER_STACK_SIZE,
+        pool.total_instances,
+        pool.max_memory_bytes,
+        pool.max_table_elements,
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        abi = Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")).as_str(),
     )
 }
 
@@ -150,14 +157,20 @@ impl ComponentPool {
     }
 
     /// Compiles one immutable artifact under both pooled engines through
-    /// the digest-keyed cache: a cache hit returns the previously compiled
-    /// pair without recompiling; a miss compiles, inserts under the exact
-    /// key, and returns the fresh pair.
+    /// the digest-keyed cache. The presented bytes are re-hashed against
+    /// the key on every call: a key naming a different artifact than the
+    /// bytes is denied instead of serving a foreign cached component, so
+    /// the key can never bypass identity. A hit returns the previously
+    /// compiled pair without recompiling; a miss compiles, inserts under
+    /// the exact key, and returns the fresh pair.
     pub fn compile(
         &mut self,
         key: &PoolCacheKey,
         artifact: &[u8],
     ) -> Result<(Component, Component), wasmtime::Error> {
+        if Sha256Digest::of_bytes(artifact) != key.artifact {
+            return Err(wasmtime::Error::msg("pool cache key artifact mismatch"));
+        }
         if let Some(compiled) = self.cache.get(key) {
             return Ok(compiled.clone());
         }

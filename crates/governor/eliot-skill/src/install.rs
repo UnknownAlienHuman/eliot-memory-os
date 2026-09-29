@@ -549,6 +549,17 @@ pub fn install_package(
     if let Some(reason) = drift {
         catalogue.note_dependency_change(&skill_id, entry.dependencies.clone(), reason)?;
     }
+    let host_drifted = catalogue.get(&skill_id).is_some_and(|standing| {
+        standing.host_version != context.host_version
+            || standing.profile_version != context.profile_version
+    });
+    if host_drifted {
+        catalogue.mark_host_drift_stale(
+            &skill_id,
+            &context.host_version,
+            &context.profile_version,
+        )?;
+    }
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
 }

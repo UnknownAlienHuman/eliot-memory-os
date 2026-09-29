@@ -60,9 +60,10 @@ use crate::evidence_portfolio::{
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
-    INQUIRY_LANES_CONTRACT, LaneRegistration, LaneRegistrationError, LaneRegistrationParams,
-    OrderedSubjectKind, OwnerOrderingReceipt, OwnerOrderingReceiptParams, PrimaryOutcomeRule,
-    RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
+    INQUIRY_LANES_CONTRACT, InquiryLaneDiscipline, LaneEvidenceClass, LaneRegistration,
+    LaneRegistrationError, LaneRegistrationParams, OrderedSubjectKind, OwnerOrderingReceipt,
+    OwnerOrderingReceiptParams, PrimaryOutcomeRule, RegistrationDigests, SealedBlindingMapping,
+    SealedBlindingMappingParams,
 };
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
@@ -2045,8 +2046,40 @@ impl InquiryProtocolProfile {
         }
     }
 
+    /// Canonical digest over the whole revision.
+    ///
+    /// # What the `v1` -> `v2` bump changed
+    ///
+    /// The `v1` preimage named every field of this struct *except* one: it
+    /// published `state_fence` and no byte of the preimage covered it. A
+    /// revision read back after the fact could therefore carry a **substituted**
+    /// fence — a different authority epoch, resource generation or task
+    /// revision — and still re-prove its own `integrity_digest` unchanged.
+    ///
+    /// That is a real gap and not a theoretical one, because `integrity_digest`
+    /// is the identity every downstream binding compares against rather than
+    /// a free field printed beside the revision:
+    ///
+    /// - `SourceAdmissibilityRecord::is_admitted_to` admits a source to an
+    ///   evidence set on `profile_digest == profile.integrity_digest`, so a
+    ///   substituted fence inherited that same stale equality and kept admitting
+    ///   under a fence the run was never admitted under;
+    /// - `SourcePortfolio`, `CoverageReceipt`, `EvidenceFreeze`, the terminal
+    ///   record and `TaskGraphCompilationInputs` all bind this exact digest, so
+    ///   every one of them would carry the substitution forward consistently
+    ///   and none would notice it;
+    /// - `GovernorInquiryAdmissionRequest::state_fence` is the fence a
+    ///   receiving Governor would read, and it is populated from the same
+    ///   field, so the request crossing the boundary would present the
+    ///   substituted fence as the one the profile was frozen under.
+    ///
+    /// The fence is now bound through [`fence_preimage`], the shared canonical
+    /// serializer that every other record on this plane already uses for the
+    /// same value (the lane discipline outcome, the evidence freeze, the claim
+    /// audit and the terminal record), so its five components are bound by
+    /// their own contract spellings rather than by a field name chosen here.
     fn compute_integrity_digest(&self) -> String {
-        let mut preimage = String::from("inquiry-protocol-profile/v1;");
+        let mut preimage = String::from("inquiry-protocol-profile/v2;");
         push_field(&mut preimage, "profile_id", &self.profile_id);
         push_field(&mut preimage, "revision", &self.revision.to_string());
         if let Some(supersedes) = &self.supersedes {
@@ -2105,11 +2138,28 @@ impl InquiryProtocolProfile {
             "disclosure_ceiling",
             disclosure_wire(self.disclosure_ceiling),
         );
+        // The State Fence this revision is frozen under. Bound through the
+        // shared canonical serializer for the same reason the terminal record,
+        // the evidence freeze, the claim audit and the lane discipline outcome
+        // bind theirs: five typed components, each already carrying its own
+        // contract spelling, and a hand-written field list here would be
+        // coupled to that struct by hand rather than by the compiler.
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
         push_field(&mut preimage, "change_reason", &self.change_reason);
         freeze(&preimage)
     }
 
     /// Re-proves this revision's own digest.
+    ///
+    /// This is the readback check, and since the `v2` bump it is also the check
+    /// that a substituted State Fence cannot survive: the fence is inside the
+    /// preimage, so a revision whose fence was rewritten after the fact now
+    /// computes a different digest and is refused here instead of reporting
+    /// itself as the revision that was made.
     ///
     /// # Errors
     ///
@@ -2243,6 +2293,160 @@ impl GovernorInquiryAdmissionRequest {
     pub const REQUEST_KIND: &'static str = "inquiry_profile_admission";
 }
 
+/// One required independence dimension, measured over the eligible set.
+///
+/// The measurement is deliberately *not* a count. A count is exactly the shape
+/// that lets ten pages from one vendor read as ten independent sources, so each
+/// dimension is reported as the partition it actually imposes plus the
+/// dimension-specific unknown linkage, and the requirement is checked against the
+/// partition rather than against a score. Unknown linkage is preserved inside
+/// the partition and never folded into it, so a member whose family cannot be
+/// established cannot contribute a group to any of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependenceDimensionMeasurement {
+    /// The dimension this partition was measured on.
+    pub dimension: IndependenceDimension,
+    /// Distinct group identities the eligible members fall into, sorted. Two
+    /// members in the same group are dependent on this dimension.
+    pub groups: Vec<String>,
+    /// Eligible handles whose group on this dimension could not be
+    /// established. They are excluded from `groups` and never counted as
+    /// independent support.
+    pub unknown_handles: Vec<String>,
+    /// Number of groups the requirement for this dimension demands, or zero when
+    /// the requirement names none for this dimension.
+    pub required_groups: u64,
+    /// Whether the observed partition meets the dimension's own requirement.
+    ///
+    /// `false` whenever any group on this dimension is unknown, because an
+    /// unestablished group is missing evidence rather than an extra group.
+    pub meets_requirement: bool,
+    /// Digest over the measurement shape.
+    pub digest: String,
+}
+
+impl IndependenceDimensionMeasurement {
+    /// Measures one dimension over the eligible handles and their records.
+    ///
+    /// The group identity of a handle is read from the exact vetted record on
+    /// the one input that can establish it, and a handle with no record or no
+    /// value on that input lands in `unknown_handles` rather than being given a
+    /// group of its own. Duplication therefore never adds a group: two members
+    /// that restate one primary work share the work's own group identity, and
+    /// two members read off one evaluator share the evaluator's.
+    #[must_use]
+    fn measure(
+        dimension: IndependenceDimension,
+        eligible: &[String],
+        records: &BTreeMap<String, SourceRecord>,
+        required_groups: u64,
+    ) -> Self {
+        let (mut groups, mut unknown_handles) = independent_groups(dimension, eligible, records);
+        groups.sort();
+        groups.dedup();
+        unknown_handles.sort();
+        unknown_handles.dedup();
+        let observed = u64::try_from(groups.len()).unwrap_or(u64::MAX);
+        // A zero requirement means the declared profile named no minimum on this
+        // axis, so the axis is measured and published but nothing is demanded of
+        // it. A non-zero one is satisfied only by distinct known groups: an
+        // unknown group is missing evidence, never an extra group.
+        let meets_requirement =
+            required_groups == 0 || (unknown_handles.is_empty() && observed >= required_groups);
+        let mut measurement = Self {
+            dimension,
+            groups,
+            unknown_handles,
+            required_groups,
+            meets_requirement,
+            digest: String::new(),
+        };
+        measurement.digest = measurement.compute_digest();
+        measurement
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("independence-dimension/v1;");
+        push_field(&mut preimage, "dimension", self.dimension.wire_name());
+        push_count(&mut preimage, "groups", self.groups.len());
+        for group in &self.groups {
+            push_field(&mut preimage, "group", group);
+        }
+        push_count(&mut preimage, "unknown_handles", self.unknown_handles.len());
+        for handle in &self.unknown_handles {
+            push_field(&mut preimage, "unknown_handle", handle);
+        }
+        push_field(
+            &mut preimage,
+            "required_groups",
+            &self.required_groups.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "meets_requirement",
+            bool_text(self.meets_requirement),
+        );
+        freeze(&preimage)
+    }
+}
+
+/// The group identity one eligible handle falls into on one dimension, or
+/// `None` when the vetted record behind it establishes none.
+///
+/// Each dimension reads the single record field that can actually establish it,
+/// rather than a projection of the lineage root: a provider family and an
+/// evaluator family are facts about *how* the material was produced, and a
+/// shared context ancestor is a fact about what the material descends from.
+/// Falling back to the lineage root for those three would make a shared
+/// evaluator look like a shared source and would let a source-family
+/// measurement stand in for the other four.
+fn independent_groups(
+    dimension: IndependenceDimension,
+    eligible: &[String],
+    records: &BTreeMap<String, SourceRecord>,
+) -> (Vec<String>, Vec<String>) {
+    let mut groups = Vec::new();
+    let mut unknown_handles = Vec::new();
+    for handle in eligible {
+        let Some(record) = records.get(handle) else {
+            unknown_handles.push(handle.clone());
+            continue;
+        };
+        let group: Option<String> = match dimension {
+            IndependenceDimension::SourceFamily => record.lineage_root.clone(),
+            IndependenceDimension::ProviderFamily => record.provider_family.clone(),
+            IndependenceDimension::EvaluatorFamily => record.evaluator_family.clone(),
+            IndependenceDimension::SharedContextAncestor => record.transformed_from.clone(),
+            IndependenceDimension::SharedAssumptions => shared_assumption_group(record),
+        };
+        match group {
+            Some(group) => groups.push(group),
+            None => unknown_handles.push(handle.clone()),
+        }
+    }
+    (groups, unknown_handles)
+}
+
+/// The group identity shared-assumption independence falls into for one record.
+///
+/// Assumptions are a *set*, not a value, so two members share an assumption
+/// family only when their whole assumption sets are equal. A record that carries
+/// no assumption establishes none, and is therefore not placed in a shared
+/// group with another record: "no known assumption" is a statement about what was
+/// recorded, and treating it as a family would let any two unannotated members
+/// corroborate each other.
+fn shared_assumption_group(record: &SourceRecord) -> Option<String> {
+    if record.assumptions.is_empty() {
+        return None;
+    }
+    let mut preimage = String::from("assumption-family/v1;");
+    push_count(&mut preimage, "assumptions", record.assumptions.len());
+    for assumption in &record.assumptions {
+        push_field(&mut preimage, "assumption", assumption);
+    }
+    Some(freeze(&preimage))
+}
+
 /// Independence profile of one source portfolio (I21.6).
 ///
 /// Ten pages from one vendor are not ten independent sources: two outputs are
@@ -2250,6 +2454,11 @@ impl GovernorInquiryAdmissionRequest {
 /// model family, saw one parent summary, use one evaluator or inherit one
 /// mistaken assumption. Unknown lineage stays preserved and never inflates the
 /// independent count.
+///
+/// The profile measures each of those five axes separately and binds the
+/// result to the dimensions the profile actually declared, so the requirement
+/// comes from [`IndependenceBlindingPolicy::dimensions`] rather than from a
+/// hardcoded rule here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndependenceProfile {
     /// Distinct known lineage roots behind the eligible evidence set.
@@ -2262,17 +2471,39 @@ pub struct IndependenceProfile {
     pub minimum_independent_families: u64,
     /// Whether the observed independence meets the profile requirement.
     pub meets_requirement: bool,
+    /// One measurement per dimension [`IndependenceBlindingPolicy::dimensions`]
+    /// declared, in the declared order.
+    ///
+    /// The list is the declared requirement itself, not a fixed five: a profile
+    /// that declared only source and provider family carries only those two
+    /// measurements, so a consumer never has to infer which axes were in force.
+    pub dimensions: Vec<IndependenceDimensionMeasurement>,
     /// Digest over the profile shape.
     pub digest: String,
 }
 
 impl IndependenceProfile {
-    /// Derives the independence profile from the eligible handles and the exact
-    /// vetted records behind them.
+    /// Derives the independence profile from the eligible handles, the exact
+    /// vetted records behind them and the dimensions the profile declared.
+    ///
+    /// `required_dimensions` comes from
+    /// [`IndependenceBlindingPolicy::dimensions`], so the measurement is bound
+    /// to the claim and protocol rather than to a global rule, and
+    /// `minimum_independent_families` supplies the count each declared axis has
+    /// to reach. That count applies to every axis uniformly, including the two
+    /// I21.6 phrases negatively ("saw one parent summary", "inherits one
+    /// mistaken assumption"): both are partitions of the eligible set, and
+    /// "no shared ancestor" is exactly "at least one group per member", so
+    /// requiring distinct groups is the same statement in countable form.
+    ///
+    /// With no declared dimension the measurements list is empty and
+    /// `meets_requirement` falls back to the lineage-level answer, which is the
+    /// honest reading of a profile that declared no independence requirement.
     #[must_use]
     pub fn derive(
         eligible: &[String],
         records: &BTreeMap<String, SourceRecord>,
+        required_dimensions: &[IndependenceDimension],
         minimum_independent_families: u64,
     ) -> Self {
         let lineage = LineageTable::build(records);
@@ -2301,13 +2532,46 @@ impl IndependenceProfile {
         let observed = u64::try_from(independent).unwrap_or(u64::MAX);
         // Unknown lineage is preserved as an explicit count and never counted
         // as independence, so it can never satisfy the requirement.
-        let meets_requirement = unknown == 0 && observed >= minimum_independent_families;
+        let lineage_meets_requirement = unknown == 0 && observed >= minimum_independent_families;
+        let mut dimensions: Vec<IndependenceDimensionMeasurement> = required_dimensions
+            .iter()
+            .copied()
+            .map(|dimension| {
+                // The same minimum applies to every declared axis, including the
+                // two I21.6 phrases negatively: "no shared context ancestor" and
+                // "no shared assumption" are partitions of the eligible set, and
+                // each is satisfied exactly when its members form at least that
+                // many distinct groups. A zero minimum therefore names no demand
+                // on the axis while still measuring and publishing it.
+                IndependenceDimensionMeasurement::measure(
+                    dimension,
+                    eligible,
+                    records,
+                    minimum_independent_families,
+                )
+            })
+            .collect();
+        dimensions.sort_by_key(|measurement| measurement.dimension);
+        dimensions.dedup_by_key(|measurement| measurement.dimension);
+        let meets_requirement = if dimensions.is_empty() {
+            lineage_meets_requirement
+        } else {
+            // Every declared dimension must be satisfied. An axis that is
+            // unmeasured or unmet cannot be compensated by another axis meeting
+            // its own: five pages from one evaluator are not five independent
+            // sources, however many different vendors they quote.
+            lineage_meets_requirement
+                && dimensions
+                    .iter()
+                    .all(|measurement| measurement.meets_requirement)
+        };
         let mut profile = Self {
             lineage_roots,
             unknown_independence_handles,
             independent_lineages: independent,
             minimum_independent_families,
             meets_requirement,
+            dimensions,
             digest: String::new(),
         };
         profile.digest = profile.compute_digest();
@@ -2315,7 +2579,7 @@ impl IndependenceProfile {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("independence-profile/v1;");
+        let mut preimage = String::from("independence-profile/v2;");
         push_count(&mut preimage, "lineage_roots", self.lineage_roots.len());
         for root in &self.lineage_roots {
             push_field(&mut preimage, "lineage_root", root);
@@ -2343,6 +2607,15 @@ impl IndependenceProfile {
             "meets_requirement",
             bool_text(self.meets_requirement),
         );
+        push_count(&mut preimage, "dimensions", self.dimensions.len());
+        for measurement in &self.dimensions {
+            push_field(
+                &mut preimage,
+                "dimension",
+                measurement.dimension.wire_name(),
+            );
+            push_field(&mut preimage, "dimension_digest", &measurement.digest);
+        }
         freeze(&preimage)
     }
 }
@@ -2415,6 +2688,7 @@ impl SourcePortfolio {
                 independent_lineages: 0,
                 minimum_independent_families: 0,
                 meets_requirement: false,
+                dimensions: Vec::new(),
                 digest: String::new(),
             },
             digest: String::new(),
@@ -2476,6 +2750,7 @@ impl SourcePortfolio {
         portfolio.independence = IndependenceProfile::derive(
             &eligible,
             &records_by_handle,
+            &profile.independence_and_blinding_policy.dimensions,
             profile
                 .independence_and_blinding_policy
                 .minimum_independent_families,
@@ -2517,6 +2792,51 @@ impl SourcePortfolio {
         push_field(&mut preimage, "independence", &self.independence.digest);
         freeze(&preimage)
     }
+}
+
+/// Names exactly which independence axis fell short, and why.
+///
+/// The lineage-level count alone is no longer the whole story now that the
+/// profile measures every declared dimension, so the debt says which axis
+/// produced the shortfall rather than leaving a reader to re-derive it. An axis
+/// whose groups are all known but too few is reported as a count; an axis with
+/// unknown linkage is reported as unknown, because a missing group is missing
+/// evidence and never an extra group.
+fn independence_shortfall(profile: &IndependenceProfile) -> String {
+    let unmet: Vec<String> = profile
+        .dimensions
+        .iter()
+        .filter(|measurement| !measurement.meets_requirement)
+        .map(|measurement| {
+            if measurement.unknown_handles.is_empty() {
+                format!(
+                    "{}: {} distinct group(s) do not meet the declared minimum {}",
+                    measurement.dimension.wire_name(),
+                    measurement.groups.len(),
+                    measurement.required_groups
+                )
+            } else {
+                format!(
+                    "{}: {} of {} eligible member(s) have no established group",
+                    measurement.dimension.wire_name(),
+                    measurement.unknown_handles.len(),
+                    measurement.groups.len() + measurement.unknown_handles.len()
+                )
+            }
+        })
+        .collect();
+    if unmet.is_empty() {
+        return format!(
+            "observed independent lineages {} do not meet the declared minimum {}",
+            profile.independent_lineages, profile.minimum_independent_families
+        );
+    }
+    format!(
+        "observed independent lineages {} do not meet the declared minimum {}; unmet: {}",
+        profile.independent_lineages,
+        profile.minimum_independent_families,
+        unmet.join("; ")
+    )
 }
 
 /// Builds the exact vetted-record map the existing lineage owner consumes.
@@ -4756,8 +5076,34 @@ pub struct InquiryGovernance {
     pub freeze: EvidenceFreeze,
     /// Registered research debts.
     pub research_debts: Vec<ResearchDebt>,
+    /// Lane class the lane discipline decided for this run.
+    ///
+    /// I21.2 keeps grade and status orthogonal, so the class is the only thing
+    /// that separates an exploratory finding from a confirmatory claim. It is
+    /// produced by running the [`InquiryLaneDiscipline`] over the frozen evidence
+    /// of this very record on the live path, so a reader learns the class from
+    /// the discipline that authorised it rather than from the profile's declared
+    /// lane alone.
+    pub lane_discipline: LaneDisciplineOutcome,
     /// Terminal typed inquiry disposition.
     pub terminal: InquiryTerminalRecord,
+    /// The run-bound reference allowlist, re-proved and carried whole.
+    ///
+    /// Carried as the manifest itself, not only as the digest
+    /// `profile.reference_manifest_digest` publishes, because the published
+    /// digest is a claim while the manifest is the thing a reader needs in order
+    /// to **check** that claim. With only the digest on the record, the
+    /// `certified=` figure has nothing to re-derive the presented certificate
+    /// from and can only report the recorded status; with the manifest carried,
+    /// the same figure is re-derived from the run's own admission predicate and
+    /// an independent set of admitted records.
+    ///
+    /// I21.7: this is the allowlist, so a reference outside it is unsupported
+    /// text and can never become a citable source. It is re-proved here against
+    /// its own content through [`AllowedReferenceManifest::validate`] and bound
+    /// to the profile that published its digest, so a widened manifest cannot sit
+    /// beside a profile resolved under the narrower one.
+    pub run_reference_manifest: AllowedReferenceManifest,
     /// Governor-facing profile admission request.
     pub profile_admission_request: GovernorInquiryAdmissionRequest,
     /// Governor-facing source transition requests.
@@ -4856,6 +5202,11 @@ impl InquiryGovernance {
         // here means the run released no material claim, never that the audit was
         // skipped.
         let claim_audit = claim_audit_for_run(&observation, &profile, &account, &admissibility)?;
+        // The lane discipline runs on the live path, after the evidence is
+        // frozen and before the terminal record is built, so the class the
+        // terminal record publishes is the class the discipline decided over the
+        // real frozen evidence rather than a value re-derived beside it.
+        let lane_discipline = run_lane_discipline(&observation, &profile, &admissibility, &freeze)?;
         let terminal = terminal_record(
             &observation,
             &profile,
@@ -4870,6 +5221,7 @@ impl InquiryGovernance {
         let record = Self {
             inquiry_id: observation.inquiry_id,
             evidence_set_id: observation.evidence_set_id,
+            run_reference_manifest: observation.reference_manifest.clone(),
             profile_admission_request: profile.admission_request(),
             source_admission_requests: admissibility
                 .iter()
@@ -4887,6 +5239,7 @@ impl InquiryGovernance {
             obligations,
             freeze,
             research_debts,
+            lane_discipline,
             terminal,
             compilation_inputs,
         };
@@ -4923,13 +5276,8 @@ impl InquiryGovernance {
                 });
             }
         }
-        if self.compilation_inputs.profile_digest != self.profile.integrity_digest
-            || self.compilation_inputs.evidence_set_id != self.evidence_set_id
-        {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.compilation_inputs",
-            });
-        }
+        self.validate_compilation_input_binding()?;
+        self.validate_run_reference_manifest()?;
         if !self
             .profile
             .binds(&self.inquiry_id, &self.freeze.state_fence)
@@ -4956,6 +5304,7 @@ impl InquiryGovernance {
                 field: "inquiry.freeze_binding",
             });
         }
+        self.validate_lane_discipline_binding()?;
         self.validate_terminal_carried_bindings()?;
         // The claim-audit trail and the coverage map are re-proved here, not
         // carried on trust. A record that lost an audit between construction and
@@ -4971,16 +5320,114 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
-        // The Researcher half of the two-record pair a positive admitted source
-        // has to show is re-proved here rather than trusted: each
-        // Governor-facing request is an artefact that leaves this domain, and a
-        // request whose inquiry, evidence set, profile revision, source handle,
-        // source-record digest, eligibility, scope or fence was rewritten after
-        // it was built would otherwise be published beside a decision it no
-        // longer describes. The other half of the pair — the actual
-        // Governor/Kernel/Store commit receipt — is deliberately absent and this
-        // domain does not synthesize one; I21.1 puts the transition through the
-        // sole canonical writer.
+        self.validate_source_admission_requests()?;
+        for diagnostic in &self.unadmitted_references {
+            diagnostic.validate_integrity()?;
+            if diagnostic.inquiry_id != self.inquiry_id
+                || diagnostic.evidence_set_id != self.evidence_set_id
+                || diagnostic.state_fence != self.terminal.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.unadmitted_reference_binding",
+                });
+            }
+        }
+        for obligation in &self.obligations {
+            obligation.validate_integrity()?;
+        }
+        // I21.5: a recorded `VERIFIED` status is this domain's own verdict, and a
+        // verdict is only publishable if the certificate it names still re-derives
+        // from the run's own material. Two rosters are built and compared:
+        //
+        // - `recorded` is every obligation whose status this record claims is
+        //   `VERIFIED`;
+        // - `derived` is every obligation whose acceptance certificate, re-derived
+        //   from the carried manifest and the admitted source records for its own
+        //   `coverage_member`, is of the kind that obligation declares.
+        //
+        // They are built from different inputs on purpose: `recorded` reads the
+        // status field, `derived` never reads it. A writer that flipped a status
+        // to `VERIFIED` without holding a matching certificate makes `recorded`
+        // larger than `derived`; a writer that satisfied an obligation and then
+        // restated the status makes `derived` larger than `recorded`. Both are
+        // refused. Comparing one list against a restated copy of itself would
+        // prove nothing, which is why the two are produced separately.
+        let mut recorded: Vec<&str> = self
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.status == InquiryObligationStatus::Verified)
+            .map(|obligation| obligation.obligation_id.as_str())
+            .collect();
+        recorded.sort_unstable();
+        let mut derived = certified_obligations(
+            &self.run_reference_manifest,
+            &self.obligations,
+            &self.admissibility,
+        )?;
+        derived.sort_unstable();
+        if recorded != derived {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves that the work-graph compilation bundle this record carries was
+    /// compiled under this record's own inquiry, evidence set, profile revision
+    /// and lane registration.
+    ///
+    /// The work graph receives the lane and the committed registration the work
+    /// was compiled under, so a bundle that carried another lane or another
+    /// registration would let queued execution and resume present a registration
+    /// the profile does not hold. The registration identity is compared against
+    /// the profile's own `independence_and_blinding_policy.lane_registration_digest`,
+    /// which originates from the unforgeable `CommittedLaneRegistration`; the check
+    /// is therefore on the registration itself, never on
+    /// `registered_before_outcome_exposure` or on any timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming
+    /// `inquiry.compilation_inputs` when any of the four bindings disagrees.
+    fn validate_compilation_input_binding(&self) -> Result<(), InquiryError> {
+        if self.compilation_inputs.profile_digest != self.profile.integrity_digest
+            || self.compilation_inputs.evidence_set_id != self.evidence_set_id
+            || self.compilation_inputs.lane != self.profile.lane
+            || self.compilation_inputs.lane_registration_digest
+                != self
+                    .profile
+                    .independence_and_blinding_policy
+                    .lane_registration_digest
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.compilation_inputs",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the Governor-facing source-admission requests this record
+    /// carries against the admissibility records it publishes beside them.
+    ///
+    /// The Researcher half of the two-record pair a positive admitted source
+    /// has to show is re-proved here rather than trusted: each
+    /// Governor-facing request is an artefact that leaves this domain, and a
+    /// request whose inquiry, evidence set, profile revision, source handle,
+    /// source-record digest, eligibility, scope or fence was rewritten after
+    /// it was built would otherwise be published beside a decision it no
+    /// longer describes. The other half of the pair - the actual
+    /// Governor/Kernel/Store commit receipt - is deliberately absent and this
+    /// domain does not synthesize one; I21.1 puts the transition through the
+    /// sole canonical writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the request count does not match the
+    /// admissibility record count, when a request no longer re-derives its own
+    /// digest, or when a request has been swapped for a well-formed request
+    /// about a different source, decision, evidence set or fence.
+    fn validate_source_admission_requests(&self) -> Result<(), InquiryError> {
         if self.source_admission_requests.len() != self.admissibility.len() {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.source_admission_requests",
@@ -5009,19 +5456,43 @@ impl InquiryGovernance {
                 });
             }
         }
-        for diagnostic in &self.unadmitted_references {
-            diagnostic.validate_integrity()?;
-            if diagnostic.inquiry_id != self.inquiry_id
-                || diagnostic.evidence_set_id != self.evidence_set_id
-                || diagnostic.state_fence != self.terminal.state_fence
-            {
-                return Err(InquiryError::IntegrityMismatch {
-                    field: "inquiry.unadmitted_reference_binding",
-                });
-            }
-        }
-        for obligation in &self.obligations {
-            obligation.validate_integrity()?;
+        Ok(())
+    }
+
+    /// Re-proves the run-bound reference allowlist this record carries.
+    ///
+    /// I21.7: the allowlist is re-proved on the RECORD, not only on the
+    /// observation `record` was handed. `AllowedReferenceManifest::validate`
+    /// recomputes the canonical digest over the manifest's own content and
+    /// refuses a mismatch, so the manifest carried beside the published
+    /// `manifest=` digest is the one that digest was computed from. The three
+    /// bindings below then make the same manifest the one the profile, the
+    /// freeze and the terminal disposition were all bound to: comparing the
+    /// carried `digest` field against each of those is a real comparison
+    /// between two independently produced values, whereas before the manifest
+    /// was carried at all the record held only its digest and had nothing to
+    /// re-derive an admission or a certificate from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the carried manifest does not
+    /// re-derive its own published digest, or when the profile, the freeze and
+    /// the terminal disposition are not all bound to that same manifest and
+    /// fence.
+    fn validate_run_reference_manifest(&self) -> Result<(), InquiryError> {
+        self.run_reference_manifest
+            .validate()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest",
+            })?;
+        if self.run_reference_manifest.digest != self.profile.reference_manifest_digest
+            || self.run_reference_manifest.digest != self.freeze.manifest_digest
+            || self.run_reference_manifest.digest != self.terminal.manifest_digest
+            || self.run_reference_manifest.state_fence != self.terminal.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest_binding",
+            });
         }
         Ok(())
     }
@@ -5084,6 +5555,55 @@ impl InquiryGovernance {
         Ok(())
     }
 
+    /// The lane class the discipline decided is bound to the same evidence the
+    /// record froze, so a class decided over one evidence revision cannot be
+    /// published beside another.
+    ///
+    /// The outcome's own digest is re-proved first: it is an artefact that leaves
+    /// this record, and a rewritten grade, lane, handle set or fence would
+    /// otherwise be published as the discipline's own decision. Every comparison
+    /// is by content — the recorded evidence revision against
+    /// [`EvidenceFreeze::digest`], the recorded profile revision against the
+    /// profile's own integrity digest — never by a timestamp and never by a
+    /// caller flag.
+    ///
+    /// I21.2 keeps the class as the only thing separating E3 exploratory from E3
+    /// confirmatory, so a confirmatory class may only be read back from a lane
+    /// that actually committed a registration: the check is on the profile's
+    /// `CommittedLaneRegistration`, which is unforgeable, rather than on
+    /// `registered_before_outcome_exposure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first lane field
+    /// that disagrees with the composite that produced it.
+    fn validate_lane_discipline_binding(&self) -> Result<(), InquiryError> {
+        if self.lane_discipline.compute_digest() != self.lane_discipline.digest
+            || self.lane_discipline.inquiry_id != self.inquiry_id
+            || self.lane_discipline.evidence_revision_digest != self.freeze.digest
+            || self.lane_discipline.profile_digest != self.profile.integrity_digest
+            || self.lane_discipline.produced_under_grade != self.profile.evidence_grade
+            || self.lane_discipline.produced_under_lane != self.profile.lane
+            || self.lane_discipline.state_fence != self.profile.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_binding",
+            });
+        }
+        if self.lane_discipline.evidence_class.is_confirmatory()
+            && self
+                .profile
+                .independence_and_blinding_policy
+                .lane_registration_digest
+                .is_none()
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_confirmatory_without_registration",
+            });
+        }
+        Ok(())
+    }
+
     /// I21.7/I21.8: the terminal projection has to carry the evidence freeze and
     /// the unsupported-precision residue this run produced, not a copy that was
     /// restated while it was being bound. Comparing the two owners to what the
@@ -5140,15 +5660,29 @@ impl std::fmt::Display for InquiryGovernance {
     /// Governor/Kernel/Store commit receipt is the owner's, and a line that
     /// implied one would be a false proof claim under A0.3.
     ///
-    /// `certified` is the number of obligations this run recorded as satisfied by
-    /// their declared acceptance certificate, re-proved here through
-    /// [`InquiryObligation::is_verified_by_certificate`] against the kind each
-    /// obligation declares rather than read off a status alone.
+    /// `certified` is the number of obligations this run both recorded as
+    /// satisfied AND whose acceptance certificate re-derives, from the run-bound
+    /// manifest and the admitted source records, as a kind that obligation
+    /// declares. It is not a status read: see [`certified_obligations`].
     /// `certified=0` is the honest spelling of the live state whenever the run
     /// holds no admitted certificate of a declared kind for any member, and the
     /// line says that instead of omitting the figure.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
+        // `certified` is re-derived, and a re-derivation that cannot be completed
+        // has no honest numeric spelling, so it renders as `unproved` rather than
+        // as a count the run did not establish. `record` runs
+        // `validate_integrity`, which performs the same derivation and refuses the
+        // record on failure, so this arm is reachable only on a record assembled
+        // outside that path.
+        let certified = match certified_obligations(
+            &self.run_reference_manifest,
+            &self.obligations,
+            &self.admissibility,
+        ) {
+            Ok(certified) => certified.len().to_string(),
+            Err(_) => "unproved".to_owned(),
+        };
         write!(
             formatter,
             "contract={INQUIRY_GOVERNANCE_CONTRACT} version={INQUIRY_GOVERNANCE_VERSION} \
@@ -5159,7 +5693,10 @@ impl std::fmt::Display for InquiryGovernance {
              expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
-             materialisable={} deferred={} certified={} compilation_inputs={} freeze={} \
+             materialisable={} deferred={} certified={} compilation_inputs={} \
+             {} freeze={} \
+             lane_class={} lane_result={} lane_result_grade={} lane_result_lane={} \
+             lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
              claim_audits={} claim_coverage={} \
              debts={} debt_kinds={} {} \
@@ -5203,9 +5740,18 @@ impl std::fmt::Display for InquiryGovernance {
             self.obligations.len(),
             self.compilation_inputs.materialisable().len(),
             self.compilation_inputs.deferred().len(),
-            certified_obligations(&self.obligations),
+            certified,
             self.compilation_inputs.digest,
+            WorkGraphLaneProjection {
+                inputs: &self.compilation_inputs,
+            },
             self.freeze.digest,
+            self.lane_discipline.evidence_class.wire_name(),
+            self.lane_discipline.result_id,
+            self.lane_discipline.produced_under_grade,
+            self.lane_discipline.produced_under_lane.wire_name(),
+            self.lane_discipline.delivered_handle_count,
+            self.lane_discipline.digest,
             terminal.freeze.digest,
             terminal
                 .claim_audit
@@ -5289,6 +5835,258 @@ fn resolve_profile(
         None,
         "initial inquiry protocol resolution",
     )
+}
+
+/// The class of lane result one recorded inquiry run actually produced (I21.2/I21.4).
+///
+/// This is what the [`InquiryLaneDiscipline`] decided on the live path, and it is
+/// carried here so a reader of the governance record learns the lane class from
+/// the discipline that authorised it rather than from the profile's declared
+/// lane alone. The digest is over the same fields [`Display`] publishes, so the
+/// rendered line and the re-proved value cannot drift apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneDisciplineOutcome {
+    /// Class the release produced: a confirmatory claim or an exploratory
+    /// finding.
+    pub evidence_class: LaneEvidenceClass,
+    /// Stable identity of the released result.
+    pub result_id: String,
+    /// Inquiry the result belongs to.
+    pub inquiry_id: String,
+    /// Profile revision the result was produced under.
+    pub profile_id_and_revision: String,
+    /// Exact profile revision digest the result was produced under.
+    pub profile_digest: String,
+    /// Grade requirement the result was produced under.
+    pub produced_under_grade: EvidenceGrade,
+    /// Lane the result was produced under.
+    pub produced_under_lane: InquiryLane,
+    /// Exact evidence revision the result was produced from.
+    pub evidence_revision_digest: String,
+    /// Digest over the sorted delivered handles the release covered.
+    pub delivered_handle_digest: String,
+    /// Number of delivered handles the release covered.
+    pub delivered_handle_count: usize,
+    /// State Fence the result was produced under.
+    pub state_fence: StateFence,
+    /// Instant the result was recorded.
+    pub recorded_at_ms: i64,
+    /// Digest over the whole outcome.
+    pub digest: String,
+}
+
+impl LaneDisciplineOutcome {
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("inquiry-lane-discipline-outcome/v1;");
+        push_field(
+            &mut preimage,
+            "evidence_class",
+            self.evidence_class.wire_name(),
+        );
+        push_field(&mut preimage, "result_id", &self.result_id);
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(
+            &mut preimage,
+            "profile_id_and_revision",
+            &self.profile_id_and_revision,
+        );
+        push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(
+            &mut preimage,
+            "produced_under_grade",
+            &self.produced_under_grade.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "produced_under_lane",
+            self.produced_under_lane.wire_name(),
+        );
+        push_field(
+            &mut preimage,
+            "evidence_revision_digest",
+            &self.evidence_revision_digest,
+        );
+        push_field(
+            &mut preimage,
+            "delivered_handle_digest",
+            &self.delivered_handle_digest,
+        );
+        push_field(
+            &mut preimage,
+            "delivered_handle_count",
+            &self.delivered_handle_count.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
+        push_field(
+            &mut preimage,
+            "recorded_at_ms",
+            &self.recorded_at_ms.to_string(),
+        );
+        freeze(&preimage)
+    }
+}
+
+/// Renders exactly the fields `compute_digest` covers, so the published line and
+/// the re-proved value cannot drift apart.
+impl std::fmt::Display for LaneDisciplineOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "class={} result={} grade={} lane={} delivered_handles={} digest={}",
+            self.evidence_class.wire_name(),
+            self.result_id,
+            self.produced_under_grade,
+            self.produced_under_lane.wire_name(),
+            self.delivered_handle_count,
+            self.digest
+        )
+    }
+}
+
+/// Runs the [`InquiryLaneDiscipline`] over the result this run actually produced.
+///
+/// # Why this is on the live path
+///
+/// I21.4 is only an executed property if the machinery that enforces it is
+/// reached by a real run. The discipline is the one owner of the register
+/// itself — exposure, deviations, attempts, blinded deliveries, the release gate
+/// and the claim it authorises — and before this call nothing on the `R6` path
+/// ever entered it: a `LaneRegistration` was committed and published on the
+/// profile, but no lane was ever *run* against it, so the commit-before-exposure
+/// proof, the deviation classification and the release gate were code no run
+/// could execute.
+///
+/// # What it decides, and from what
+///
+/// Every input is a value this run already computed, so nothing here is
+/// asserted, guessed or supplied by a caller:
+///
+/// - the discipline is opened on the exact profile revision [`resolve_profile`]
+///   committed, which is what carries the committed lane registration;
+/// - the evidence revision released is [`EvidenceFreeze::digest`], i.e. the real
+///   frozen evidence revision, never a fresh digest computed for the release;
+/// - the delivered handles are the eligible source handles of the real
+///   admissibility disposition, which is the exact set a consumer of this record
+///   reads;
+/// - the fence is the profile's own State Fence, and the instant is the run's own
+///   assessment time.
+///
+/// # What it does NOT do
+///
+/// It mints a confirmatory claim only for a lane that actually committed a
+/// registration, and it never manufactures one. A purely exploratory lane — the
+/// only lane `select_lane` can currently produce for a governed provider run,
+/// because such a run admits no evaluator and no strong verifier — is released
+/// under [`LaneEvidenceClass::ExploratoryFinding`], which I21.4 defines as
+/// explicitly *not* a confirmation and as requiring no registration. A
+/// confirmatory release on this path additionally requires a committed
+/// registration, attested exposure coverage over every mandatory channel and
+/// blinded deliveries, none of which a single provider run can have.
+///
+/// # Errors
+///
+/// Returns the [`LaneRegistrationError`]-derived [`InquiryError`] when the
+/// discipline refuses, and [`InquiryError::IntegrityMismatch`] when the release
+/// it produced does not describe the evidence this record actually holds. The
+/// check is by content: the released evidence revision, the delivered handle
+/// count and the fence are compared against the freeze, the admissibility
+/// disposition and the profile, so a release that is merely produced and
+/// discarded cannot pass.
+fn run_lane_discipline(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    admissibility: &[SourceAdmissibilityRecord],
+    evidence_freeze: &EvidenceFreeze,
+) -> Result<LaneDisciplineOutcome, InquiryError> {
+    let mut discipline = InquiryLaneDiscipline::open(profile.clone())?;
+    let delivered_handles: BTreeSet<String> = admissibility
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| record.record.handle.clone())
+        .collect();
+    let current_fence = &profile.state_fence;
+    let release = discipline.release_outcome_material(
+        &evidence_freeze.digest,
+        &delivered_handles,
+        current_fence,
+    )?;
+    let Some(released) = release.exploratory_release() else {
+        // A confirmatory release on this path is a real authorization over a
+        // committed registration. It is not a failure, but this run has no claim
+        // to close from it here, so the record is refused rather than published
+        // with an authorization nothing consumed.
+        return Err(InquiryError::UnknownVocabulary {
+            field: "lane_discipline.confirmatory_release",
+        });
+    };
+    // The release is compared against the record by content, not by timestamp or
+    // by a caller boolean: the same evidence revision, the same count of
+    // delivered handles, the same fence. `build_exploratory_release` digests the
+    // sorted handle set, so the digest is recomputed here from the same
+    // independent source — the admissibility disposition — rather than read back
+    // from the release being checked.
+    let mut handle_preimage = String::from("lane-delivered-handles/v1;");
+    push_count(
+        &mut handle_preimage,
+        "delivered_handles",
+        delivered_handles.len(),
+    );
+    for handle in &delivered_handles {
+        push_field(&mut handle_preimage, "delivered_handle", handle);
+    }
+    if released.evidence_class != LaneEvidenceClass::ExploratoryFinding
+        || released.evidence_revision_digest != evidence_freeze.digest
+        || released.delivered_handle_count != delivered_handles.len()
+        || released.delivered_handle_digest != freeze(&handle_preimage)
+        || released.state_fence != profile.state_fence
+    {
+        return Err(InquiryError::IntegrityMismatch {
+            field: "lane_discipline.exploratory_release",
+        });
+    }
+    let result_id = format!("exploratory-finding/{}", observation.evidence_set_id);
+    let finding = discipline.record_exploratory_finding(
+        &result_id,
+        &evidence_freeze.digest,
+        observation.assessment_time_ms,
+        current_fence,
+    )?;
+    // The finding the discipline stored is re-proved against what this record is
+    // about to publish, so the class published is the class the discipline
+    // recorded and not a value recomputed beside it.
+    if finding.evidence_class() != LaneEvidenceClass::ExploratoryFinding
+        || finding.inquiry_id != observation.inquiry_id
+        || finding.profile_digest != profile.integrity_digest
+        || finding.evidence_revision_digest != evidence_freeze.digest
+        || finding.produced_under_grade != profile.evidence_grade
+        || finding.produced_under_lane != profile.lane
+        || finding.state_fence != profile.state_fence
+    {
+        return Err(InquiryError::IntegrityMismatch {
+            field: "lane_discipline.exploratory_finding",
+        });
+    }
+    let mut outcome = LaneDisciplineOutcome {
+        evidence_class: LaneEvidenceClass::ExploratoryFinding,
+        result_id,
+        inquiry_id: finding.inquiry_id.clone(),
+        profile_id_and_revision: profile.profile_id_and_revision(),
+        profile_digest: finding.profile_digest.clone(),
+        produced_under_grade: finding.produced_under_grade,
+        produced_under_lane: finding.produced_under_lane,
+        evidence_revision_digest: finding.evidence_revision_digest.clone(),
+        delivered_handle_digest: released.delivered_handle_digest.clone(),
+        delivered_handle_count: released.delivered_handle_count,
+        state_fence: finding.state_fence.clone(),
+        recorded_at_ms: finding.recorded_at_ms,
+        digest: String::new(),
+    };
+    outcome.digest = outcome.compute_digest();
+    Ok(outcome)
 }
 
 /// The contract owner that commits lane registrations into the ordering journal
@@ -6548,6 +7346,12 @@ fn open_obligations(
     for member in members {
         let mut obligation = InquiryObligation::new(InquiryObligationParams {
             obligation_id: format!("obl-{member}"),
+            // The member is carried on the record, not only inside the identity
+            // and the goal prose, so a reader holding the run's manifest and
+            // admitted records can re-derive which certificate this obligation
+            // was actually about and ask `is_verified_by_certificate` a real
+            // question instead of reading the recorded status back.
+            coverage_member: member.clone(),
             parent_question: observation.question.clone(),
             goal: format!("resolve admitted reference {member} inside the frozen scope"),
             protocol_ref: profile.profile_id_and_revision(),
@@ -6673,11 +7477,7 @@ fn research_debts(
             &observation.inquiry_id,
             profile,
             ResearchDebtKind::Replication,
-            &format!(
-                "observed independent lineages {} do not meet the declared minimum {}",
-                portfolio.independence.independent_lineages,
-                portfolio.independence.minimum_independent_families
-            ),
+            &independence_shortfall(&portfolio.independence),
             "researcher",
             "independent lineages meet the declared minimum with no unknown lineage",
             None,
@@ -7032,6 +7832,22 @@ fn candidate_source_record(
         grade: None,
         authority_domains,
         lineage_root: candidate.lineage_root.clone(),
+        // One provider generation is one provider family, and it is the exact
+        // admitted generation on the candidate rather than a label derived from
+        // it. A record with no established provider family carries `None`, which
+        // keeps it off that independence axis instead of placing it in a family
+        // of its own.
+        provider_family: (!candidate.provider_generation.is_empty())
+            .then(|| candidate.provider_generation.clone()),
+        // The evaluator that judged a retained provider artifact is the
+        // instrument-plane execution that admitted it, which the candidate names
+        // by route. It is not a claim that a human or model re-read the material.
+        evaluator_family: (!candidate.route.is_empty()).then(|| candidate.route.clone()),
+        // The retained snapshot is the material itself, so it inherits no
+        // assumption of its own beyond the refusal flag already in
+        // `content_flags`; an empty set is preserved as unknown on the
+        // shared-assumption axis rather than read as "shares no assumption".
+        assumptions: BTreeSet::new(),
         disclosure: observation.disclosure,
         content_flags,
         incentives_note: "not assessed by the admitted provider process".to_owned(),
@@ -7088,26 +7904,63 @@ fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
     .collect()
 }
 
-/// Number of obligations this run recorded as satisfied by their declared
-/// acceptance certificate.
+/// Obligation identities this run actually satisfied by an acceptance
+/// certificate it holds.
 ///
-/// Both halves are required, and neither alone is the answer: the recorded
-/// `VERIFIED` status is this domain's own verdict, and
-/// [`InquiryObligation::is_verified_by_certificate`] re-proves it against the
-/// certificate kind the obligation declares, so an obligation that was recorded
-/// verified under a kind it does not declare, or whose recorded state the
-/// certificate predicate refuses, is not published as certified. It is the
-/// read-side counterpart of the transition [`open_obligations`] performs on the
-/// build side, and it is on the live route: `eliot-mod-research` renders this
-/// line on every run.
-fn certified_obligations(obligations: &[InquiryObligation]) -> usize {
-    obligations
-        .iter()
-        .filter(|obligation| {
-            obligation.status == InquiryObligationStatus::Verified
-                && obligation.is_verified_by_certificate(obligation.acceptance_certificate_kind)
-        })
-        .count()
+/// Three things must all hold, and the first two together are the property the
+/// previous form of this function did not have:
+///
+/// 1. the obligation was **recorded** `VERIFIED` — this domain's own verdict;
+/// 2. the certificate kind **re-derived from the run's own material** for that
+///    obligation's `coverage_member` — the run-bound manifest read through
+///    [`AllowedReferenceManifest::allows`], and an admitted, integrity-re-proved,
+///    `ELIGIBLE` [`SourceAdmissibilityRecord`] carrying exact evidence spans —
+///    is of the kind the obligation **declares**; and
+/// 3. the recorded state is not one the certificate predicate refuses, so no
+///    presented kind verifies a rejected, cancelled or invalidated obligation.
+///
+/// The re-derivation is what makes this a verification rather than an echo. The
+/// previous body asked
+/// `is_verified_by_certificate(obligation.acceptance_certificate_kind)`, which
+/// hands the predicate the obligation's **own declared** kind; the kind
+/// comparison in [`InquiryObligation::is_verified_by_certificate`] then
+/// compared a value with itself and was `true` by construction, leaving the
+/// recorded status as the only thing actually being read. That is the same
+/// status-echo defect the predicate itself was corrected for, one layer up: a
+/// `VERIFIED` status asserted by a writer that never held a matching
+/// certificate published `certified=1`.
+///
+/// Here the presented kind comes from `manifest` and `admissibility`, the same
+/// two inputs [`open_obligations`] decides the build side from, so the read side
+/// and the build side answer the same question from the same admitted material
+/// and can be compared by a reader who holds neither the code nor the writer's
+/// intent. It is on the live route: `eliot-mod-research` renders this line on
+/// every run.
+///
+/// # Errors
+///
+/// Returns the first integrity failure of an admitted record whose handle is
+/// read while re-deriving a presented kind, rather than counting a certificate
+/// from a record that no longer re-proves its own digest.
+fn certified_obligations<'a>(
+    manifest: &AllowedReferenceManifest,
+    obligations: &'a [InquiryObligation],
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<Vec<&'a str>, InquiryError> {
+    let mut certified = Vec::new();
+    for obligation in obligations {
+        if obligation.status != InquiryObligationStatus::Verified {
+            continue;
+        }
+        // The member comes off the record, and the presented kind off the run's
+        // own admitted material — never off the obligation's declared kind.
+        let presented =
+            presented_acceptance_certificate(manifest, &obligation.coverage_member, admissibility)?;
+        if obligation.is_verified_by_certificate(presented) {
+            certified.push(obligation.obligation_id.as_str());
+        }
+    }
+    Ok(certified)
 }
 
 /// Stable wire spelling of the debt kinds a run registered, deduplicated and
@@ -7140,6 +7993,35 @@ fn member_list_wire(members: &[&str]) -> String {
         return "none".to_owned();
     }
     members.join(",")
+}
+
+/// The `work_graph_lane=` and `work_graph_registration=` values on the receipt
+/// line.
+///
+/// A named projection rather than two inline format arguments, so the receipt line
+/// keeps one field per value it publishes and the work-graph lane half is rendered
+/// in one place that cannot drift from the compilation bundle it reads. The lane
+/// is the closed wire name the work was compiled under and the registration is the
+/// committed registration digest the profile's own lane policy holds, or the
+/// honest `none` spelling for a run that commits no registration; no provider
+/// prose, payload body or credential is reproduced.
+struct WorkGraphLaneProjection<'a> {
+    /// The work-graph compilation bundle this record carries.
+    inputs: &'a TaskGraphCompilationInputs,
+}
+
+impl std::fmt::Display for WorkGraphLaneProjection<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "work_graph_lane={} work_graph_registration={}",
+            self.inputs.lane.wire_name(),
+            self.inputs
+                .lane_registration_digest
+                .as_deref()
+                .unwrap_or("none"),
+        )
+    }
 }
 
 /// The `claim_coverage=` value on the terminal receipt line.

@@ -47,6 +47,15 @@
 //! file the issue scopes to "minimal adapters to the accepted
 //! RestoreTarget/RestoreJournalPort only".
 //!
+//! [`RESTORE_JOURNAL_IDENTITY`] is load-bearing, not decorative: the Kernel
+//! coordinator refuses any production restore whose owner-issued
+//! [`RestoreJournalAdmission`] names a different journal identity, so the
+//! admission and the ORS namespace the adapter actually writes are the same
+//! owner channel. An admission is never taken as proof of durability on its
+//! own. [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
+//! prepare, so a rehearsal cannot be re-presented as a production run and
+//! reach cutover qualification.
+//!
 //! Capability cell: Kernel restore ownership (journal admission, isolated
 //! destination admission, effect-fence gating). Read through the restore
 //! receipt and evidence vocabulary.
@@ -639,6 +648,17 @@ pub struct PinnedDestinationAdmission {
     pub target_id: String,
     /// Owner-approved manifest evidence pinned at prepare.
     pub evidence: DestinationManifestEvidence,
+    /// Whether the execution that prepared this destination ran as rehearsal.
+    ///
+    /// Pinning the rehearsal fact at prepare is what makes "a rehearsal can
+    /// never qualify for cutover" a property of durable owner state rather
+    /// than of one caller's memory: a destination prepared by a rehearsal
+    /// carries `true` for its whole transaction, so continuing it under a
+    /// production run — and qualifying that continuation — is a refused
+    /// mismatch rather than a silent reclassification of the same bytes. A
+    /// rehearsal that prepared a destination under Host admission is
+    /// therefore structurally unable to become a cutover candidate.
+    pub rehearsal: bool,
 }
 
 // ---------------------------------------------------------------------------

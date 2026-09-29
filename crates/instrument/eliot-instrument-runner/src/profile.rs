@@ -1729,6 +1729,14 @@ pub struct AdmittedStage {
     pub external: bool,
     /// Prerequisite stage identities.
     pub depends_on: Vec<String>,
+    /// Admitted profile name this stage was compiled from.
+    ///
+    /// The gate checks the caller-supplied profile label against this
+    /// registry-derived identity: a grant never seals a caller label the
+    /// registry did not admit.
+    pub profile: String,
+    /// Exact admitted profile revision this stage was compiled from.
+    pub profile_revision: u64,
     /// Admitted spec revision bound to this stage.
     pub spec_revision: ContractVersion,
     /// Digest of the admitted spec revision.
@@ -1865,72 +1873,53 @@ impl AdmittedStage {
     /// Checks the executable identity against the admitted file, pinned
     /// version, and supply-chain receipt before launch.
     ///
-    /// Without a machine observation the request must claim no executable
-    /// facts and no receipt may pin the kind; with one, the request snapshot
-    /// must equal the observation and the observation must name the admitted
-    /// file, carry the pinned version, and match the receipt. Returns the
-    /// content digest bound into the process grant (empty when no machine
-    /// observation was admitted at this generation).
+    /// The caller must supply the launcher-observed machine identity: every
+    /// external stage launches only under an owner-observed executable, so a
+    /// missing observation never yields a launchable grant. The request
+    /// snapshot must equal the observation, and the observation must name
+    /// the admitted file, carry the pinned version, and match the receipt.
+    /// Returns the content digest bound into the process grant.
     ///
     /// # Errors
     ///
     /// Returns [`AdmissionError::ExecutableMismatch`] when the identity is
-    /// unknown, changed, or claimed without observation, or
-    /// [`AdmissionError::UnresolvedObservation`] when a pinned receipt has
-    /// no machine observation to check against.
+    /// unknown, changed, or claimed without observation.
     fn check_executable(
         &self,
         request: &InstrumentAdmissionRequest,
-        observed: Option<&ResolvedExecutableIdentity>,
+        observed: &ResolvedExecutableIdentity,
     ) -> Result<String, AdmissionError> {
-        let Some(identity) = observed else {
-            if request.executable_path.is_some()
-                || request.executable_digest.is_some()
-                || request.executable_version.is_some()
-            {
-                return Err(AdmissionError::ExecutableMismatch {
-                    detail: "request claims executable identity without machine observation"
-                        .to_owned(),
-                });
-            }
-            if self.supply_receipt.is_some() {
-                return Err(AdmissionError::UnresolvedObservation {
-                    instrument: self.spec.as_str().to_owned(),
-                });
-            }
-            return Ok(String::new());
-        };
-        if request.executable_path.as_deref() != Some(identity.canonical_path.as_str())
-            || request.executable_digest.as_deref() != Some(identity.content_digest.as_str())
-            || request.executable_version != identity.tool_version
+        if request.executable_path.as_deref() != Some(observed.canonical_path.as_str())
+            || request.executable_digest.as_deref() != Some(observed.content_digest.as_str())
+            || request.executable_version != observed.tool_version
         {
             return Err(AdmissionError::ExecutableMismatch {
                 detail: "request executable snapshot differs from machine observation".to_owned(),
             });
         }
-        if identity.executable_file_name() != self.executable.to_ascii_lowercase() {
+        if observed.executable_file_name() != self.executable.to_ascii_lowercase() {
             return Err(AdmissionError::ExecutableMismatch {
                 detail: format!(
                     "observed '{}' is not the admitted executable '{}'",
-                    identity.canonical_path, self.executable,
+                    observed.canonical_path, self.executable,
                 ),
             });
         }
         if let Some(pinned) = self.executable_version.as_deref()
-            && identity.tool_version.as_deref() != Some(pinned)
+            && observed.tool_version.as_deref() != Some(pinned)
         {
             return Err(AdmissionError::ExecutableMismatch {
                 detail: format!("observed version differs from the admitted version '{pinned}'"),
             });
         }
         if let Some(receipt) = &self.supply_receipt {
-            receipt.check_observation(identity).map_err(|error| {
+            receipt.check_observation(observed).map_err(|error| {
                 AdmissionError::ExecutableMismatch {
                     detail: error.to_string(),
                 }
             })?;
         }
-        Ok(identity.content_digest.clone())
+        Ok(observed.content_digest.clone())
     }
 
     /// Admits one typed invocation against this stage before process creation.
@@ -1938,20 +1927,26 @@ impl AdmittedStage {
     /// This is the shared pre-launch admission boundary (I10.8.3): the
     /// request carries only typed invocation facts plus the
     /// launcher-observed machine identity, never shell text or an
-    /// agent-composed command. The admitted spec, fixed argument template,
-    /// supply-chain receipt, and `profile_revision` come from the planned
-    /// stage and the owning route; the caller never supplies them. The
-    /// requested arguments must equal the admitted fixed template exactly;
-    /// an empty admitted template admits only the empty argument vector.
-    /// Success seals every bound field into an
-    /// [`InstrumentAdmissionGrant`] whose digest the launch receipt records.
+    /// agent-composed command. The admitted profile, spec, fixed argument
+    /// template, supply-chain receipt, and `profile_revision` come from the
+    /// planned stage and the owning route; the caller never supplies them.
+    /// Pure in-process stages take no process grant here: they stay on the
+    /// non-process path and are refused. Every external stage requires the
+    /// owner-observed executable identity; an empty content digest never
+    /// yields a launchable grant. The requested arguments must equal the
+    /// admitted fixed template exactly; an empty admitted template admits
+    /// only the empty argument vector. Success seals every bound field,
+    /// including the observed canonical path and the admitted supply-chain
+    /// receipt digest, into an [`InstrumentAdmissionGrant`] whose digest the
+    /// launch receipt records.
     ///
     /// # Errors
     ///
-    /// Returns [`AdmissionError`] when the kind ID is unregistered, the class
-    /// differs, an argument carries shell text or leaves the fixed template,
-    /// the executable identity is unknown or changed, or a pinned receipt
-    /// has no machine observation to check against.
+    /// Returns [`AdmissionError`] when the stage is pure, the caller labels
+    /// (profile, revision) differ from the admitted stage identity, the kind
+    /// ID is unregistered, the class differs, an argument carries shell text
+    /// or leaves the fixed template, or the executable identity is unknown,
+    /// changed, or unobserved.
     pub fn admit(
         &self,
         request: &InstrumentAdmissionRequest,
@@ -1963,6 +1958,21 @@ impl AdmittedStage {
             .map_err(|error| AdmissionError::InvalidRequest {
                 detail: error.to_string(),
             })?;
+        if !self.external {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "pure in-process stage takes no process grant".to_owned(),
+            });
+        }
+        if request.profile != self.profile {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "invocation profile differs from the admitted stage profile".to_owned(),
+            });
+        }
+        if profile_revision != self.profile_revision {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "profile revision differs from the admitted stage revision".to_owned(),
+            });
+        }
         if request.instrument.as_str() != self.spec.as_str() {
             return Err(AdmissionError::UnknownKind {
                 instrument: request.instrument.as_str().to_owned(),
@@ -1980,17 +1990,28 @@ impl AdmittedStage {
                 detail: "requested arguments differ from the admitted fixed template".to_owned(),
             });
         }
-        let content_digest = self.check_executable(request, observed)?;
+        let Some(identity) = observed else {
+            return Err(AdmissionError::UnresolvedObservation {
+                instrument: self.spec.as_str().to_owned(),
+            });
+        };
+        let content_digest = self.check_executable(request, identity)?;
         let mut grant = InstrumentAdmissionGrant {
             kind_id: self.spec.as_str().to_owned(),
             kind_version: self.kind_version,
             kind: self.kind,
-            profile: request.profile.clone(),
-            profile_revision,
+            profile: self.profile.clone(),
+            profile_revision: self.profile_revision,
             spec_digest: self.spec_digest.clone(),
             executable: self.executable.clone(),
             executable_version: self.executable_version.clone(),
             content_digest,
+            executable_path: identity.canonical_path.clone(),
+            supply_digest: self
+                .supply_receipt
+                .as_ref()
+                .map(SupplyChainReceipt::digest)
+                .unwrap_or_default(),
             arguments: request.arguments.clone(),
             environment_class: self.environment_class.clone(),
             scope_class: ADMITTED_SCOPE_CLASS.to_owned(),
@@ -2188,6 +2209,8 @@ impl<'a> ProfileCompiler<'a> {
                 required: stage.required,
                 external: stage.external,
                 depends_on: stage.depends_on.clone(),
+                profile: admitted.name.clone(),
+                profile_revision: admitted.revision,
                 spec_revision: spec.revision,
                 spec_digest: spec.digest(),
                 kind_version: spec.kind.version(),

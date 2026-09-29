@@ -7,7 +7,9 @@
 //! bytes:
 //!
 //! * the manifest is loaded from the admitted artifact location only, never
-//!   from an ambient working directory or a mutable source-tree copy;
+//!   from an ambient working directory or a mutable source-tree copy, and its
+//!   file name is qualified by the module identity because the release bundle
+//!   stages every admitted runtime artifact into one flat directory;
 //! * the file-byte digest (SHA-256 over the retained bytes) and the canonical
 //!   parsed-contract digest are two distinct identities and are both retained;
 //! * the artifact hash is taken from the accepted build identity, so a manifest
@@ -29,8 +31,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ModuleContract, RuntimeContractError};
 
-/// File name of the runtime module manifest placed beside the artifact.
-pub const MODULE_MANIFEST_FILE_NAME: &str = "module.toml";
+/// File stem of the runtime module manifest placed beside the artifact.
+///
+/// The stem is qualified by the module identity because the release bundle
+/// stages every admitted runtime artifact flat into one `runtime/` directory.
+/// A single fixed file name there would let one module's manifest be read as
+/// another's, so the manifest beside an artifact is named for the module it
+/// declares. The file is still loaded from the admitted artifact location; the
+/// name only keeps two artifacts that share one directory from sharing one
+/// manifest.
+pub const MODULE_MANIFEST_FILE_STEM: &str = "module";
+
+/// Returns the manifest file name that belongs beside one module's artifact.
+///
+/// The name is a pure function of the module identity, so the same module
+/// always resolves the same file and two modules staged into one directory
+/// never resolve each other's manifest.
+pub fn module_manifest_file_name(module_id: &ContractId) -> String {
+    format!("{MODULE_MANIFEST_FILE_STEM}.{}.toml", module_id.as_str())
+}
 
 /// The only manifest schema version this loader admits.
 ///
@@ -74,13 +93,23 @@ pub struct AdmittedModuleManifest {
     pub contract: ModuleContract,
 }
 
-/// Resolves the manifest path beside an admitted artifact.
+/// Resolves the manifest path beside an admitted artifact for one module.
 ///
 /// The artifact location is supplied by the caller from the accepted
 /// installation/launch identity. A relative or absent parent is refused: the
 /// manifest is never resolved against the process working directory, and a
-/// source-tree copy of `module.toml` is not an admitted artifact location.
-pub fn admitted_manifest_path(artifact_path: &Path) -> Result<PathBuf, RuntimeContractError> {
+/// source-tree copy of the manifest is not an admitted artifact location.
+///
+/// The resolved name is qualified by `module_id` because the release bundle
+/// stages every admitted runtime artifact flat into one directory. Without that
+/// qualification every artifact in that directory would resolve the same file,
+/// so the first module to load would answer for all of them. The module
+/// identity is the caller's own declaration of which artifact it is, not a
+/// value read out of the bytes being loaded.
+pub fn admitted_manifest_path(
+    artifact_path: &Path,
+    module_id: &ContractId,
+) -> Result<PathBuf, RuntimeContractError> {
     if !artifact_path.is_absolute() {
         return Err(RuntimeContractError::InvalidField {
             field: "artifact_path",
@@ -93,7 +122,7 @@ pub fn admitted_manifest_path(artifact_path: &Path) -> Result<PathBuf, RuntimeCo
             field: "artifact_path",
             reason: "the admitted artifact location has no parent directory",
         })?;
-    Ok(directory.join(MODULE_MANIFEST_FILE_NAME))
+    Ok(directory.join(module_manifest_file_name(module_id)))
 }
 
 /// Admits the exact retained manifest bytes against the accepted artifact

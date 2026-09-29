@@ -14,6 +14,13 @@ name = "eliot-store-surreal"
 path = "src/main.rs"
 
 [dependencies]
+# Issue #1871: the closed store bridge is the only admitted production owner of
+# the Surreal vendor edge (`config/architecture-boundaries.toml` `[store_vendor]
+# allowed_packages`), so it is the only root that can reach the adapter's
+# single-transaction `capture_ecxf_source`. It is the first admitted caller of
+# `eliot_backup::export_ecxf_package`, the single `ECXF/1` export entry, and it
+# is not in this root's `forbidden_exact` list.
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-blob.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-service.workspace = true

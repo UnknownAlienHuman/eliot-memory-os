@@ -53,6 +53,12 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+/// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
+/// route. This is the one production edge that resolves the closed selector set
+/// from the admitted envelope plus the authenticated Task Controller owner and
+/// calls `KernelContextReadClient::reconstruct_context_inputs`, the existing
+/// Governor composition edge over `GovernorContextInputs`.
+pub mod context_reconstruction_route;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -71,6 +77,12 @@ pub mod external_attach_reconciliation;
 pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
+/// Issue #1948: the governed source owner readback edge. Reopens the exact
+/// admitted owner document through the authenticated `GetCampaignSourceRevision`
+/// read and projects a citation only after the citation gate verifies the
+/// reopened bytes against the owner-recorded digest, byte length and excerpt
+/// digest. Called from the live `eliot.packet` retrieval-to-projection path.
+pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
@@ -87,6 +99,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
+pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
 pub mod notification_state_emit;
 mod observation_adapters;
@@ -118,6 +131,7 @@ pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
     ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
 };
+#[cfg(test)]
 use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
@@ -156,6 +170,9 @@ pub use capability_outcome::{
     DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,
     OutcomeDisposition, OutcomeError, SURVIVING_OPERATION_PREFIX, fallback_outcome,
     generation_challenge_outcome, project_degradation, removed_promise, surviving_operation,
+};
+pub use context_reconstruction_route::{
+    ReconstructionPrerequisite, is_context_reconstruction_query, serve_context_reconstruction,
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
@@ -247,6 +264,7 @@ pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionRead
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
+pub use notification_acknowledge_emit::emit_notification_acknowledgement;
 pub use notification_state_emit::{
     AutomationFailureKey, NotificationStateEmit, automation_failure_key,
     emit_blocked_automation_notification, notification_already_recorded,
@@ -666,6 +684,17 @@ pub struct DaemonComposition {
     /// its owner. The durable truth is the state-root projection the driver
     /// persists before emit, never this slot.
     solo_state: std::sync::Mutex<solo_agent_driver::SoloDriverState>,
+    /// The single Governor-owned durable swarm-plan attachment composition
+    /// (issue #1126 W1/A1).
+    ///
+    /// Owns exactly one [`eliot_governor::SwarmPlanAttachmentService`] over
+    /// its canonical store image, so every swarm consumer vended through
+    /// [`DaemonComposition::swarm_composition`] converges on one durable-job
+    /// owner: the first job commits, an identical replay is idempotent, and
+    /// a second job observes the canonical winner. Cross-process durability
+    /// of the store image itself follows the canonical-write envelope wiring
+    /// (remainder, #1699); this field never claims it.
+    swarm_attachment: eliot_governor::SwarmAttachmentComposition,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -872,6 +901,16 @@ fn blocked_port(
     }
 }
 
+/// Polls the shared solo queue without retaining the composition mutex during
+/// authenticated Kernel verification. The queue helper clones one intake
+/// under a short synchronous lock, then awaits with only owned inputs.
+pub async fn solo_poll_queue_async(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
+    solo_agent_driver::solo_poll_queue_async(composition, kernel).await
+}
+
 impl DaemonComposition {
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
@@ -938,6 +977,9 @@ impl DaemonComposition {
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
+            swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
+                eliot_governor::SwarmPlanAttachmentService::new(),
+            ),
         })
     }
 
@@ -1577,6 +1619,42 @@ impl DaemonComposition {
     #[must_use]
     pub const fn learning_closure(&self) -> &eliot_governor::LearningClosureService {
         &self.learning_closure
+    }
+
+    /// Borrows the single Governor-owned durable swarm attachment composition.
+    #[must_use]
+    pub const fn swarm_attachment_composition(
+        &self,
+    ) -> &eliot_governor::SwarmAttachmentComposition {
+        &self.swarm_attachment
+    }
+
+    /// Binds the daemon swarm composition over the single Governor attachment
+    /// owner (issue #1126 W1/A1 slice A: daemon composition).
+    ///
+    /// Production caller of [`swarm_composition::SwarmComposition::new`]: the
+    /// attachment half is the daemon-owned durable-job owner above, so one
+    /// Governor owner admits every swarm plan this daemon launches. The
+    /// launch-intent ledger and child runner stay explicit caller ports
+    /// because their production owners do not exist on this base: no non-test
+    /// `LaunchIntentLedger`/`ChildRunner` or `DurableWorkStore` implementation
+    /// exists (remainder #1699), and no daemon-reachable admitted
+    /// `AdapterRegistry` or one-shot `DispatchPermit` runner binding exists
+    /// without a new architecture-boundary edge (remainder #2866 items 2-4,
+    /// #22). The returned composition enforces the owner order — persist
+    /// intent before execution, reconcile before relaunch, unknown blocks
+    /// terminal — for whatever owners the caller supplies.
+    #[must_use]
+    pub fn swarm_composition<'a, L, R>(
+        &'a self,
+        ledger: &'a L,
+        runner: &'a R,
+    ) -> swarm_composition::SwarmComposition<'a, L, R>
+    where
+        L: swarm_composition::LaunchIntentLedger,
+        R: swarm_composition::ChildRunner,
+    {
+        swarm_composition::SwarmComposition::new(&self.swarm_attachment, ledger, runner)
     }
 
     /// Returns the retained protected config path, for diagnostics only.
@@ -2722,7 +2800,10 @@ impl DaemonComposition {
     /// W4/A1/A2).
     ///
     /// Per-operation resolution, mirroring [`Self::agent_fabric_plan`]:
-    /// readiness is checked first, then the owner half is resolved
+    /// Test-only pure composition helper; it does not call the Kernel
+    /// provider-capability route. Production remains blocked until that owner
+    /// receipt is validated for every claim leg. Readiness is checked first,
+    /// then the owner half is resolved
     /// exclusively from the live authenticated session — the freshly
     /// observed live fence from the caller-held [`DaemonKernelClient`] plus
     /// the validated Kernel-issued session binding threaded once via
@@ -2747,6 +2828,7 @@ impl DaemonComposition {
     /// [`DaemonError::ProviderAdmission`] carrying the fabric/coordinator
     /// owner rejection unchanged (stale, revoked, foreign, or conflicting
     /// evidence).
+    #[cfg(test)]
     pub fn agent_fabric_verified_capability(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -2760,8 +2842,8 @@ impl DaemonComposition {
         Ok(build_admitted_provider_capability(material)?)
     }
 
-    /// Constructs the one verified coordinator fabric on freshly resolved
-    /// owner material (issue #1108, production composition caller for W4).
+    /// Test-only local construction helper (issue #1108). It does not
+    /// establish the missing executable owner leg.
     ///
     /// Builds the capability through
     /// [`Self::agent_fabric_verified_capability`], then constructs the
@@ -2779,6 +2861,7 @@ impl DaemonComposition {
     /// Returns the [`Self::agent_fabric_verified_capability`] rejection, a
     /// coordinator config rejection, or the verified-construction owner
     /// rejection unchanged.
+    #[cfg(test)]
     pub fn agent_fabric_new_verified(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -2793,8 +2876,7 @@ impl DaemonComposition {
         )?)
     }
 
-    /// Restores the fabric on freshly resolved owner material in one call
-    /// (issue #1108, production composition caller for A8).
+    /// Test-only restore helper from locally resolved material (issue #1108).
     ///
     /// Resolves owner halves through the private session-bound resolution,
     /// then restores through
@@ -2809,6 +2891,7 @@ impl DaemonComposition {
     /// session, stale expectation epoch), the capability construction
     /// rejection, the coordinator owner restore rejection, or a
     /// stale-config conflict unchanged.
+    #[cfg(test)]
     pub fn agent_fabric_restore_verified(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -2856,8 +2939,7 @@ impl DaemonComposition {
         })
     }
 
-    /// Drives one verified provider operation through the production fabric
-    /// (issue #1108 W4/A2 production driver).
+    /// Test-only driver through the production fabric ports (issue #1108).
     ///
     /// Per-operation entry into the verified path: builds the production
     /// ports through [`Self::production_fabric_ports`], then constructs the
@@ -2885,6 +2967,7 @@ impl DaemonComposition {
     /// Returns the [`Self::production_fabric_ports`] readiness rejection, the
     /// [`Self::agent_fabric_new_verified`] rejection, or the route-gate
     /// rejection, each unchanged.
+    #[cfg(test)]
     pub fn drive_verified_agent_fabric(
         &mut self,
         kernel: &Arc<DaemonKernelClient>,
@@ -2919,18 +3002,17 @@ impl DaemonComposition {
         solo_agent_driver::solo_enqueue(self, intake, unix_ms())
     }
 
-    /// Drives one admitted solo delegate intake to a retained dispatch
-    /// (issue #2567).
+    /// Synchronous compatibility entry for one solo delegate intake
+    /// (issue #2567). Production returns a fail-closed async-required error;
+    /// use [`Self::solo_drive_once_async`] for Kernel-backed verification.
     ///
-    /// Thin wrapper over
-    /// [`solo_agent_driver::drive_solo_delegate`](crate::solo_agent_driver::drive_solo_delegate):
-    /// the first production caller of the verified fabric seam for the solo
-    /// slice. The outcome is retention evidence only, never completion.
+    /// Thin synchronous compatibility wrapper. Production refuses this path
+    /// because authenticated Kernel verification requires an async call.
     ///
     /// # Errors
     ///
-    /// Returns the readiness, intake, capability, route-gate, staffing,
-    /// fabric-chain, persistence, or live-slot rejection unchanged.
+    /// Production returns [`DaemonError::Kernel`] because the synchronous
+    /// path cannot perform authenticated owner verification.
     pub fn solo_drive_once(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -2939,16 +3021,31 @@ impl DaemonComposition {
         solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())
     }
 
+    /// Drives one solo delegate through the nonblocking authenticated Kernel
+    /// provider-binding check (issue #1108). Until native-worker claim records
+    /// retain an independently owner-verified executable-binding digest, this
+    /// entry fails closed before admitted capability construction or dispatch.
+    pub async fn solo_drive_once_async(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        intake: solo_agent_driver::SoloDelegateIntake,
+    ) -> Result<solo_agent_driver::SoloDriveOutcome, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        solo_agent_driver::drive_solo_delegate_async(kernel, intake, unix_ms()).await
+    }
+
     /// Drives at most one queued solo intake; the runtime poll hook
     /// (issue #2567).
     ///
-    /// Thin wrapper over
-    /// [`solo_agent_driver::solo_poll_queue`](crate::solo_agent_driver::solo_poll_queue).
-    /// Bounded work per tick keeps control and shutdown pollable.
+    /// Thin synchronous compatibility wrapper. Production refuses this path;
+    /// use [`crate::solo_poll_queue_async`] from an async cadence.
     ///
     /// # Errors
     ///
-    /// Returns the readiness or drive rejection unchanged.
+    /// Production returns [`DaemonError::Kernel`] and retains the queued item
+    /// for the asynchronous poll path.
     pub fn solo_poll_queue(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3063,6 +3160,7 @@ impl DaemonComposition {
     /// `session_binding` values are replaced with the session-observed
     /// ones. Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
+    #[cfg(test)]
     fn resolve_verified_material(
         &self,
         kernel: &Arc<DaemonKernelClient>,

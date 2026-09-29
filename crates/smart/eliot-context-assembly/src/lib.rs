@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod assemble;
+mod boundary;
 mod bounds;
 mod cite;
 mod error;
@@ -30,6 +31,10 @@ mod render;
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
 };
+pub use boundary::{
+    BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
+    assembly_boundary_limits, project_assembly_boundaries,
+};
 pub use cite::project_citation;
 pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,7 +43,8 @@ pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextOutcome, IndexPreview,
-    PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal, ReadbackRefusalKind,
-    ReadbackRequest, RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
+    IndexPreview, PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal,
+    ReadbackRefusalKind, ReadbackRequest, RenderedAtom, SelectionIntegrityProof,
+    SerializedContextMeasurement,
 };

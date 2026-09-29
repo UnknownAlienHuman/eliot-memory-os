@@ -34,14 +34,14 @@ use eliot_protocol::{
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedRestorePort, IsolationEvidence, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
-    StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth, WriteReceipt,
-    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
-    verify_canonical_request_hash,
+    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
+    NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
+    WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
+    genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -94,6 +94,16 @@ pub use schema_bootstrap_contract::{
     StoreSchemaBootstrapCommand, StoreSchemaBootstrapError, StoreSchemaBootstrapReceipt,
 };
 mod backup_dispatch;
+/// Reachable product command for one `ECXF/1` export (issue #1871).
+///
+/// Declared here rather than next to `backup_dispatch` because it is not a
+/// transport arm: it is the one-shot launch path that composes the vendor edge
+/// this process owns and calls the single `eliot_backup::export_ecxf_package`
+/// entry (I05-10, I05-13). The port it reads is `eliot_backup::EcxfSourceStore`;
+/// the coherent view behind it is the adapter's own single-transaction
+/// `capture_ecxf_source`, never a document or an argv value.
+mod ecxf_export;
+pub use ecxf_export::{EcxfExportArgs, export_ecxf_once};
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
@@ -445,6 +455,19 @@ impl StoreComposition {
     #[must_use]
     pub fn blob_owner(&self) -> &BlobRootOwner {
         &self.blob
+    }
+
+    /// Returns the one composed canonical provider adapter.
+    ///
+    /// The adapter is the closed store bridge's whole vendor edge, so it stays
+    /// crate-internal: the only admitted consumer is a read that the bridge
+    /// already owns, and no caller outside this root can reach a Surreal
+    /// handle. Issue #1871's `ECXF/1` export one-shot is that consumer — it is
+    /// the single-transaction `capture_ecxf_source` read, which proves its
+    /// fence inside the provider rather than accepting one.
+    #[must_use]
+    pub(crate) fn store_adapter(&self) -> &SurrealStoreAdapter {
+        &self.store
     }
 
     /// Bounded adapter/provider health observation.
@@ -903,7 +926,8 @@ impl StoreComposition {
         &self,
         context: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreCompositionError> {
+        operation: OperationIdentity,
+    ) -> Result<IsolatedDestinationReceipt, StoreCompositionError> {
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -911,6 +935,7 @@ impl StoreComposition {
         destination
             .validate()
             .map_err(StoreCompositionError::Store)?;
+        operation.validate().map_err(StoreCompositionError::Store)?;
         if context.state_fence != self.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
@@ -919,10 +944,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome =
-            IsolatedRestorePort::prepare_isolated_destination(&self.store, context, destination)
-                .await
-                .map_err(StoreCompositionError::Store);
+        let outcome = IsolatedRestorePort::prepare_isolated_destination(
+            &self.store,
+            context,
+            destination,
+            operation,
+        )
+        .await
+        .map_err(StoreCompositionError::Store);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))

@@ -20,9 +20,9 @@ use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGeneration
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
-    IsolationEvidence, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
-    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
     RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
@@ -41,6 +41,8 @@ mod store_backup_client;
 mod store_exchange;
 
 use store_exchange::RequestFailure;
+
+pub use store_backup_client::StoreBackupClientError;
 
 /// Transport boundary used by the neutral EBP store client.
 ///
@@ -1021,7 +1023,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         request: SnapshotBeginRequest,
-    ) -> Result<SnapshotHandle, StoreError> {
+    ) -> Result<SnapshotHandle, StoreBackupClientError> {
         self.backup_begin_inner(ctx, request).await
     }
 
@@ -1032,10 +1034,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     pub async fn backup_page(
         &self,
         ctx: &RequestMeta,
+        begin: &SnapshotBeginRequest,
         handle: SnapshotHandle,
         cursor: SnapshotCursor,
-    ) -> Result<SnapshotPage, StoreError> {
-        self.backup_page_inner(ctx, handle, cursor).await
+    ) -> Result<SnapshotPage, StoreBackupClientError> {
+        self.backup_page_inner(ctx, begin, handle, cursor).await
     }
 
     /// Closes one capture with its owner-issued end receipt (issue #975).
@@ -1045,9 +1048,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     pub async fn backup_end(
         &self,
         ctx: &RequestMeta,
+        begin: &SnapshotBeginRequest,
         handle: SnapshotHandle,
-    ) -> Result<SnapshotEndReceipt, StoreError> {
-        self.backup_end_inner(ctx, handle).await
+    ) -> Result<SnapshotEndReceipt, StoreBackupClientError> {
+        self.backup_end_inner(ctx, begin, handle).await
     }
 
     /// Prepares one isolated restore destination (issue #975).
@@ -1058,7 +1062,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreError> {
+    ) -> Result<IsolatedDestinationReceipt, StoreBackupClientError> {
         self.backup_prepare_destination_inner(ctx, destination)
             .await
     }
@@ -1072,7 +1076,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         batch: CanonicalRestoreBatch,
-    ) -> Result<RestoreValidationReceipt, StoreError> {
+    ) -> Result<RestoreValidationReceipt, StoreBackupClientError> {
         self.backup_restore_batch_inner(ctx, batch).await
     }
 
@@ -1087,7 +1091,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         batch: CanonicalRestoreBatch,
-    ) -> Result<RestoreValidationReceipt, StoreError> {
+    ) -> Result<RestoreValidationReceipt, StoreBackupClientError> {
         self.backup_validate_inner(ctx, batch).await
     }
 
@@ -1099,7 +1103,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         ctx: &RequestMeta,
         operation_id: OperationId,
-    ) -> Result<StoreBackupStatus, StoreError> {
+    ) -> Result<StoreBackupStatus, StoreBackupClientError> {
         self.backup_status_inner(ctx, operation_id).await
     }
 
@@ -1113,7 +1117,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         ctx: &RequestMeta,
         first: OperationIdentity,
         second: OperationIdentity,
-    ) -> Result<BackupOperationReconciliation, StoreError> {
+    ) -> Result<BackupOperationReconciliation, StoreBackupClientError> {
         self.backup_reconcile_inner(ctx, first, second).await
     }
 }

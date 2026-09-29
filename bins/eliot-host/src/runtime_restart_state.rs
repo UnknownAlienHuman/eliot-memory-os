@@ -226,6 +226,52 @@ fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
 }
 
 #[cfg(windows)]
+fn remove_receipt_confirmed_runtime_restart_pending(
+    host_state_root: &Path,
+    dir: &Path,
+    receipt: &HostKernelRestartReceipt,
+) -> Result<(), HostError> {
+    // Shared receipt-confirmed pending cleanup for both new publication and
+    // exact replay. The exact receipt is already validated by the caller;
+    // confirm its directory entry is durable with the existing checked sync
+    // before touching pending evidence, then remove only this operation's
+    // pending record and commit the cleanup. NotFound is idempotent cleanup;
+    // any other removal or directory-commit failure stays an explicit error.
+    // The receipt itself is never rewritten and unrelated files are never
+    // touched; conflicting pending evidence is left in place and fails
+    // closed.
+    sync_runtime_restart_store_dir(dir)?;
+    let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
+    let Some(identity) = read_runtime_restart_pending_identity(&pending)? else {
+        return Ok(());
+    };
+    if identity.mutation_digest() != receipt.mutation_digest.as_str() {
+        host_restart_observe("host.restart pending conflict preserved observed");
+        return Err(HostError::RecoveryRequired(
+            "runtime restart pending record conflicts with the durable receipt".to_owned(),
+        ));
+    }
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_attempt");
+    match std::fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            host_restart_observe("host.restart pending removal failed observed");
+            return Err(HostError::RecoveryRequired(format!(
+                "runtime restart pending cleanup failed: {error}"
+            )));
+        }
+    }
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_done");
+    sync_runtime_restart_store_dir(dir)?;
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_dir_sync_success");
+    Ok(())
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_lines)]
 pub(super) fn persist_runtime_restart_pending(
     host_state_root: &Path,
@@ -382,9 +428,12 @@ pub(super) fn persist_runtime_restart_receipt(
             })?;
         existing.validate().map_err(HostError::RecoveryRequired)?;
         if existing == *receipt {
-            // An earlier attempt may have linked this record and then failed its
-            // directory sync; confirm the entry is durable before treating it as published.
-            sync_runtime_restart_store_dir(&dir)?;
+            // An earlier publication may have stranded its pending cleanup
+            // (failed removal or interruption after the receipt commit).
+            // Resume it through the shared receipt-confirmed path: exact
+            // replay re-confirms the directory entry and retries the pending
+            // removal instead of reporting success with pending still present.
+            remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, &existing)?;
             host_restart_observe("host.restart receipt replay observed");
             return Ok(());
         }
@@ -477,24 +526,7 @@ pub(super) fn persist_runtime_restart_receipt(
     ordering::record("receipt_durable_before_pending_remove");
     // Receipt is durable before pending removal.
     host_restart_observe("host.restart receipt durable observed");
-    let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
-    #[cfg(all(test, windows))]
-    ordering::record("pending_remove_attempt");
-    match std::fs::remove_file(&pending) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            host_restart_observe("host.restart pending removal failed observed");
-            return Err(HostError::RecoveryRequired(format!(
-                "runtime restart pending cleanup failed: {error}"
-            )));
-        }
-    }
-    #[cfg(all(test, windows))]
-    ordering::record("pending_remove_done");
-    sync_runtime_restart_store_dir(&dir)?;
-    #[cfg(all(test, windows))]
-    ordering::record("pending_remove_dir_sync_success");
+    remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)?;
     host_restart_observe("host.restart receipt published observed");
     Ok(())
 }

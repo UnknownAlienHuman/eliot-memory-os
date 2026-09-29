@@ -2327,10 +2327,11 @@ pub fn initialize_result(version: NegotiatedWireVersion, server_version: &str) -
 ///
 /// Discovery carries no owner-supplied task conditions, so no task-relative
 /// narrowing applies here: the bridge never mints task, role, grant, or
-/// capability facts. Task-bound publication compiles a decision from real
-/// owner facts (#1745) and renders through
-/// [`tools_list_result_for_permitted_surface`], which shares the single
-/// projection below, so discovery and task-relative listings cannot drift.
+/// capability facts. Discovery still renders through
+/// [`tools_list_result_for_permitted_surface`] with an empty withheld set,
+/// so discovery and task-relative listings share one projection entry and
+/// cannot drift. Task-bound publication compiles a decision from real
+/// owner facts (#1745) and renders through the same entry.
 pub fn tools_list_result() -> Result<Value, WireRejection> {
     let schemas = published_mcp_tool_surface().map_err(|_| {
         WireRejection::new(
@@ -2338,15 +2339,20 @@ pub fn tools_list_result() -> Result<Value, WireRejection> {
             "generated tool schemas are unavailable",
         )
     })?;
-    render_tool_list_surface(&schemas)
+    tools_list_result_for_permitted_surface(&PermittedTaskSurface {
+        permitted: schemas,
+        withheld: Vec::new(),
+    })
 }
 
 /// Builds a task-relative `tools/list` result from a #1745 permitted subset.
 ///
-/// The subset arrives already derived from a decision compiled over
-/// owner-supplied task conditions; this entry only projects it through the
-/// same envelopes, identity `_meta`, dialect record, and budget binding as
-/// discovery, so withheld methods stay absent without a second projection.
+/// This entry is the single funnel for every advertised listing: discovery
+/// arrives with the owner-joined descriptors and an empty withheld set,
+/// while task-bound publication arrives already derived from a decision
+/// compiled over owner-supplied task conditions. Both project through the
+/// same envelopes, identity `_meta`, dialect record, and budget binding,
+/// so withheld methods stay absent without a second projection.
 pub fn tools_list_result_for_permitted_surface(
     surface: &PermittedTaskSurface,
 ) -> Result<Value, WireRejection> {

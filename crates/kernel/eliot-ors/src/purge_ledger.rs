@@ -33,7 +33,7 @@ pub const PURGE_LEDGER_RECORD_TYPE: &str = "purge_ledger";
 /// the ledger-wide revision the owner allocated when it applied that purge.
 ///
 /// The row carries no purged content, exactly like the ledger entry it holds:
-/// `A12.08` requires the purge ledger to preserve a non-revealing record and
+/// `A12.8` requires the purge ledger to preserve a non-revealing record and
 /// deletion scope without reconstructing the content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +42,7 @@ pub struct PurgeLedgerRecord {
     /// another version fails its read closed instead of being reinterpreted as
     /// the same applied purge.
     pub contract_version: u16,
-    /// Ledger-wide revision the owner allocated for this purge.
+    /// Ledger-wide revision of this purge.
     ///
     /// It is the position of this purge in the owner's own applied sequence:
     /// never a value the caller proposed, and never a count recomputed over the

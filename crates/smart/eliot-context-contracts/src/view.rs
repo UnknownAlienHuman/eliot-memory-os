@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityScorecard,
+    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityDimension,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
     SerializedContextMeasurement,
 };
 
@@ -238,6 +239,13 @@ impl ActiveUnderstandingView {
         if self.binding != admitted.binding {
             return Err(ContextError::InvalidFence);
         }
+        // The admitted economy receipt carries the recipe commitment produced by
+        // admission.  A view built from a different recipe must not validate
+        // against this admitted set, so the two digests are compared here rather
+        // than only hashed into the view's own payload.
+        if self.recipe_digest != admitted.economy.recipe_digest {
+            return Err(ContextError::IdentityConflict);
+        }
         let expected_omissions: BTreeSet<_> = admitted.economy.displaced.iter().cloned().collect();
         let actual_omissions: BTreeSet<_> =
             self.selection.omission_evidence.iter().cloned().collect();
@@ -289,10 +297,42 @@ impl ActiveUnderstandingView {
         Ok(())
     }
 
+    /// Check this exact view's readiness for one requested dependent decision
+    /// or effect, using the one shared rule.
+    ///
+    /// [`ActiveUnderstandingView::validate`] stays structural integrity. This is
+    /// the separate, operation-scoped readiness fact a direct View consumer
+    /// reads, so a deserialized view cannot reach an effect by satisfying
+    /// structure alone. The view is validated first, so a refusal names a view
+    /// that describes no gradeable packet as
+    /// [`QualityRefusalKind::InvalidScorecard`] instead of quietly returning a
+    /// grade from a mutated view.
+    pub fn suitability(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+    ) -> Result<QualitySuitability, QualityRefusal> {
+        self.validate().map_err(|_| QualityRefusal {
+            kind: QualityRefusalKind::InvalidScorecard,
+            operation,
+            blocking: Vec::new(),
+            unresolved_applicability: Vec::new(),
+        })?;
+        self.quality.suitability(operation, additional_required)
+    }
+
     /// Detect any post-assembly mutation or injected non-admitted content.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.selection.validate()?;
+        // The view carries its own `fence_digest`, so re-hashing that string
+        // only proves internal consistency.  Recompute it from the State Fence
+        // the view claims to have been compiled against, so a well-shaped but
+        // unrelated digest cannot be re-sealed into a valid view.
+        let expected_fence_digest = crate::canonical_fence_digest(&self.binding.state_fence)?;
+        if self.fence_digest != expected_fence_digest {
+            return Err(ContextError::InvalidFence);
+        }
         let derived_output_digest = Self::canonical_output_digest(
             &self.binding,
             &self.recipe_digest,

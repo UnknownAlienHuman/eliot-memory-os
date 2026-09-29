@@ -266,6 +266,27 @@ pub struct AuthorizedEffect {
     pub receipt_obligations: Vec<ReceiptObligation>,
 }
 
+/// Sealed executable dispatch for one authorized effect.
+///
+/// Produced only by [`EffectAuthorizer::admit_effect_execution`], after the
+/// stored authorization has been joined to the current revocation overlay, the
+/// actual lease and the actual executor. Its field is private, so a
+/// caller-constructed [`AuthorizedEffect`] cannot be presented to an executor
+/// as executable authority: the executor receives this value or nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedEffectDispatch {
+    authorized: AuthorizedEffect,
+}
+
+impl SealedEffectDispatch {
+    /// The exact authorization this dispatch carries, including the bound
+    /// operation identity, payload digest, lease and executor boundary.
+    #[must_use]
+    pub fn authorized(&self) -> &AuthorizedEffect {
+        &self.authorized
+    }
+}
+
 /// Current validity of an authorized (pending) effect under I12.20 influence
 /// revocation.
 ///
@@ -523,10 +544,19 @@ impl EffectAuthorizer {
             .authorized_by_idempotency
             .get(&proposed.operation.idempotency_key)
         {
-            if same_logical_effect(&existing.proposal, &proposed) {
-                return Ok(existing.clone());
+            if !same_logical_effect(&existing.proposal, &proposed) {
+                return Err(AuthorityError::IdentityConflict);
             }
-            return Err(AuthorityError::IdentityConflict);
+            // The stored executor and lease are distinct material from the
+            // proposal fields: replaying the same logical request under a
+            // different executor or a different lease is a substituted
+            // identity, not the same decision.
+            if existing.executor_boundary != executor_boundary
+                || existing.lease_id != lease.lease_id
+            {
+                return Err(AuthorityError::IdentityConflict);
+            }
+            return Ok(existing.clone());
         }
         lease.authorize(&proposed, current_work_scope, current_session, now)?;
         let authorized = AuthorizedEffect {
@@ -674,6 +704,70 @@ impl EffectAuthorizer {
     /// rewriting the historical admission record it annotates.
     pub fn contest_annotations(&self) -> &[ContestedEffectAnnotation] {
         &self.contest_annotations
+    }
+
+    /// Checks current permission at the effect boundary and seals the
+    /// dispatch that may reach the executor.
+    ///
+    /// This is the join step, not a second admission: it never re-charges a
+    /// lease and never writes the ledger. In order it requires that
+    ///
+    /// 1. the presented authorization is the exact stored record for its
+    ///    idempotency key, compared by content — an absent or substituted
+    ///    authorization is refused;
+    /// 2. the actual lease is the exact lease that authorized it;
+    /// 3. the observing executor is the exact authorized executor boundary;
+    /// 4. no current revocation challenge is open against the authorization
+    ///    (an uncontested stored key is admissible by construction, so this
+    ///    is a real contest read, not an absent-key default);
+    /// 5. the lease is still current for this exact effect against the
+    ///    current work scope, session, epoch and `now`.
+    ///
+    /// A historical authorization read back after a revocation, an expired
+    /// lease or a lease substitution therefore yields no dispatch, so a
+    /// replayed authorization cannot renew permission to execute now.
+    pub fn admit_effect_execution(
+        &self,
+        authorized: &AuthorizedEffect,
+        lease: &ActionLease,
+        current_work_scope: &WorkScopeBinding,
+        current_session: &SessionBinding,
+        executor_boundary: &str,
+        now: LogicalTime,
+    ) -> Result<SealedEffectDispatch, AuthorityError> {
+        let stored = self
+            .authorized_by_idempotency
+            .get(&authorized.proposal.operation.idempotency_key)
+            .ok_or(AuthorityError::StaleEffectAuthority(
+                "effect_authorization_absent",
+            ))?;
+        if stored != authorized {
+            return Err(AuthorityError::StaleEffectAuthority(
+                "effect_authorization_substituted",
+            ));
+        }
+        if stored.lease_id != lease.lease_id {
+            return Err(AuthorityError::StaleEffectAuthority(
+                "effect_lease_substituted",
+            ));
+        }
+        if stored.executor_boundary != executor_boundary {
+            return Err(AuthorityError::StaleEffectAuthority(
+                "effect_executor_substituted",
+            ));
+        }
+        if self
+            .dependent_effect_state(stored.proposal.operation.idempotency_key.as_str())
+            .is_contested()
+        {
+            return Err(AuthorityError::StaleEffectAuthority(
+                "effect_authorization_contested",
+            ));
+        }
+        lease.still_current(&stored.proposal, current_work_scope, current_session, now)?;
+        Ok(SealedEffectDispatch {
+            authorized: stored.clone(),
+        })
     }
 }
 

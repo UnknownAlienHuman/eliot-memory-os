@@ -713,6 +713,36 @@ pub const fn material_use_allowed(status: SkillStatus) -> bool {
     !matches!(status, SkillStatus::Stale | SkillStatus::Quarantined)
 }
 
+/// Material-use gate binding stored status to live dependency staleness.
+///
+/// The bridge activation path runs this before Material use: a Skill whose
+/// stored status already blocks Material work is refused, and so is a Skill
+/// whose pinned dependency versions disagree with the currently registered
+/// versions — even when the stored status still reads `Current`, because the
+/// change has not been recorded yet. Passage returns only for a usable
+/// standing against the live set; a drifted Skill passes again only after
+/// revalidation or explicit scoped/provisional admission through the
+/// governed lifecycle path.
+pub fn gate_material_use(
+    status: SkillStatus,
+    pinned: &[DependencyVersion],
+    current: &[DependencyVersion],
+) -> Result<(), SkillError> {
+    if !material_use_allowed(status) {
+        return Err(SkillError::InvalidField {
+            field: "entry.status",
+            reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
+        });
+    }
+    if detect_dependency_staleness(pinned, current).is_some() {
+        return Err(SkillError::InvalidField {
+            field: "entry.dependencies",
+            reason: "dependency versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    Ok(())
+}
+
 /// Names of dependencies whose pinned versions disagree, for ledger detail.
 /// Returns an empty set when the sets agree.
 #[must_use]
@@ -1735,9 +1765,10 @@ mod tests {
         assert!(!summary.retrieved, "never retrieved");
         assert!(!summary.delivered, "never delivered");
         assert!(!summary.activated, "never activated");
-        assert!(
-            !summary.useful,
-            "packet inclusion without activation is never useful"
+        assert_eq!(
+            summary.useful,
+            SkillUsefulness::Unknown,
+            "unobserved activation has no owner-qualified usefulness finding"
         );
         assert_eq!(
             summary.adhered,
