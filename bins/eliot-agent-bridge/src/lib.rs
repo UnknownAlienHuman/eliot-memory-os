@@ -83,7 +83,7 @@ use kernel_activation_client::KernelHostActivationPort;
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
-pub use kernel_host_request_client::KernelHostRequestClient;
+pub use kernel_host_request_client::{KernelHostRequestClient, OwnerDryRunPreview};
 use kernel_host_request_client::ReplayCacheEntry;
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{

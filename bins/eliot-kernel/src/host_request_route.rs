@@ -154,8 +154,9 @@ fn observe_trace_seal(manifest: &TraceManifest) {
 ///
 /// Names follow the `agent_activation_*` daemon-operation style. The payload
 /// carries the exact envelope under `envelope` (plus the exact admission
-/// receipt under `receipt` for rehydrate, or the typed resolve query under
-/// `query` for resolve); the operation string only selects which closed entry — admit, cancel, reconcile, rehydrate, or resolve — consumes it.
+/// receipt under `receipt` for rehydrate, the typed resolve query under
+/// `query` for resolve, or the exact canonical tool bytes under `tool` for
+/// invoke-read and preview); the operation string only selects which closed entry — admit, cancel, reconcile, rehydrate, resolve, invoke-read, or preview — consumes it.
 /// There is no generic JSON command dispatch: the envelope is decoded as the
 /// typed [`HostRequestEnvelope`] (with its canonical digest check) and the
 /// envelope kind is re-enforced by the callee.
@@ -184,6 +185,22 @@ pub(crate) const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_reques
 /// digest-only in spirit; the tool bytes only prove the presented operation
 /// is the admitted one.
 pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
+/// Closed dry-run preview entry for invocation dry runs (issue #1939, I7.17).
+///
+/// Carries a lookup-only `Status` envelope (never a parent: previews stage
+/// nothing) plus the exact canonical tool bytes it previews. The entry runs
+/// the existing invoke-read validator and lane checks over immutable owner
+/// inputs only: it never stages a row, issues a receipt, enqueues a pair,
+/// advances state, or runs provider work. Tools in a serving read lane
+/// (`query`, `skill`, `campaign-packet`, `state`) answer the exact preview
+/// with its source/currentness ceiling; every other tool answers the typed
+/// unsupported value with the best static preview and an explicit
+/// no-simulation statement.
+pub(crate) const AGENT_HOST_REQUEST_PREVIEW_OPERATION: &str = "agent_host_request_preview";
+/// Source identity emitted on every preview-entry answer (issue #1939, I7.17).
+pub(crate) const HOST_REQUEST_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
+/// Route label answered when the previewed tool has no serving read lane.
+pub(crate) const HOST_REQUEST_PREVIEW_ROUTE_WITHHELD: &str = "withheld-no-simulator";
 
 /// Closed agent-bridge event-delivery entries (Implements #2561, I7.2/I7.23).
 ///
@@ -264,6 +281,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
             | AGENT_HOST_REQUEST_RESOLVE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            | AGENT_HOST_REQUEST_PREVIEW_OPERATION
             | AGENT_BRIDGE_EVENT_FORWARD_OPERATION
             | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
             | AGENT_BRIDGE_EVENT_GAP_OPERATION
@@ -1179,6 +1197,64 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok((receipt, record))
+    }
+
+    /// Answers one invocation dry-run preview without staging, receipt, or
+    /// dispatch (issue #1939, I7.17).
+    ///
+    /// Observation-only entry: the envelope must be the lookup-only `Status`
+    /// kind with no parent, and the same read-only gates as the resolve entry
+    /// prove the presenting connection, application binding, service profile,
+    /// descriptor, and fence are current. The existing invoke-read validator
+    /// ([`host_request_tool_from_payload`] linkage plus
+    /// [`check_local_read_admission`] / [`check_local_state_admission`] lane
+    /// checks) then runs over immutable owner inputs only: no row is staged,
+    /// no receipt is issued, no pair is enqueued, no audit event is observed,
+    /// and no provider work runs. Tools in a serving read lane answer the
+    /// exact preview with its source/currentness ceiling; every other tool
+    /// answers the typed unsupported value. No operation identity is minted
+    /// on any path: the echoed digest names the request, never an operation.
+    fn preview_host_request(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        if envelope.kind != HostRequestKind::Status {
+            return Err(TransportError::SessionFenced);
+        }
+        if envelope.identity.parent_operation_id.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        let (descriptor, _) = self.host_request_connection_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(envelope, None)?;
+        self.host_request_service_gate(&descriptor, envelope)?;
+        {
+            let profile = self
+                .agent_bridge_profile
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            if envelope.descriptor_sha256 != profile.admission.descriptor_sha256
+                || envelope.state_fence != profile.admission.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let lane = match check_local_read_admission(envelope, tool) {
+            Ok(LocalReadAdmission::Query(_)) => Some("query"),
+            Ok(LocalReadAdmission::Skill) => Some("skill"),
+            Ok(LocalReadAdmission::CampaignPacket { .. }) => Some("campaign-packet"),
+            Err(_) => match check_local_state_admission(envelope, tool) {
+                Ok(_) => Some("state"),
+                Err(_) => None,
+            },
+        };
+        match lane {
+            Some(lane) => host_request_preview_response(envelope, lane),
+            None => Ok(host_request_preview_unsupported_response(envelope)),
+        }
     }
 
     /// Rehydrates one previously admitted host request after restart or an
@@ -5351,6 +5427,10 @@ impl KernelComposition {
                     // shape, no duplicated body, no frame-ceiling risk.
                     host_request_admitted_response(&receipt, &record)
                 }
+                AGENT_HOST_REQUEST_PREVIEW_OPERATION => {
+                    let tool = host_request_tool_from_payload(payload)?;
+                    self.preview_host_request(envelope, &tool)?
+                }
                 _ => return Err(TransportError::SessionFenced),
             })
         })();
@@ -8192,6 +8272,90 @@ pub(crate) fn host_request_resolve_unresolved_response(
     serde_json::json!({
         "status": "known",
         "value": value,
+        "recovery": null,
+    })
+}
+
+/// Derives the owner-confirmed scope echo for one preview answer.
+///
+/// The trusted envelope scope (work scope else session — never an MCP
+/// argument), mirroring [`trusted_local_read_scope`]; absent only when the
+/// envelope carries neither, which its own validation already refuses.
+fn preview_envelope_scope(envelope: &HostRequestEnvelope) -> Option<String> {
+    envelope
+        .identity
+        .work_scope_id
+        .clone()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .clone()
+                .filter(|session| !session.trim().is_empty())
+        })
+}
+
+/// Typed dry-run preview answer for a tool in a serving read lane
+/// (issue #1939, I7.17).
+///
+/// The exact preview: the validated lane, the would-be invoke-read route
+/// entry, the request digest, capability, payload digest, envelope scope,
+/// connection, and the exact owner fence as the currentness ceiling, all
+/// under [`HOST_REQUEST_PREVIEW_SOURCE`]. No operation identity is minted:
+/// the echoed `envelope_sha256` names the request, never an operation.
+pub(crate) fn host_request_preview_response(
+    envelope: &HostRequestEnvelope,
+    lane: &'static str,
+) -> Result<serde_json::Value, TransportError> {
+    let fence = serde_json::to_value(&envelope.state_fence)
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "preview": "dry_run_preview",
+            "lane": lane,
+            "route": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION,
+            "envelope_sha256": envelope.envelope_sha256.as_str(),
+            "capability": envelope.identity.capability.as_str(),
+            "payload_sha256": envelope.identity.payload_sha256.as_str(),
+            "scope": preview_envelope_scope(envelope),
+            "connection_id": envelope.connection_id.as_str(),
+            "state_fence": fence,
+            "source": HOST_REQUEST_PREVIEW_SOURCE,
+        },
+        "recovery": null,
+    }))
+}
+
+/// Typed dry-run answer for a tool with no serving read lane
+/// (issue #1939, I7.17).
+///
+/// `DRY_RUN_UNSUPPORTED` with the best static preview: the request digest,
+/// capability, payload digest, envelope scope, connection, and fence echo
+/// what was presented without claiming the target accepted, staged, or
+/// simulated anything. The route stays withheld and no operation identity
+/// is minted.
+pub(crate) fn host_request_preview_unsupported_response(
+    envelope: &HostRequestEnvelope,
+) -> serde_json::Value {
+    let fence = serde_json::to_value(&envelope.state_fence).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "preview": "dry_run_unsupported",
+            "lane": null,
+            "route": HOST_REQUEST_PREVIEW_ROUTE_WITHHELD,
+            "envelope_sha256": envelope.envelope_sha256.as_str(),
+            "capability": envelope.identity.capability.as_str(),
+            "payload_sha256": envelope.identity.payload_sha256.as_str(),
+            "scope": preview_envelope_scope(envelope),
+            "connection_id": envelope.connection_id.as_str(),
+            "state_fence": fence,
+            "source": HOST_REQUEST_PREVIEW_SOURCE,
+        },
         "recovery": null,
     })
 }
