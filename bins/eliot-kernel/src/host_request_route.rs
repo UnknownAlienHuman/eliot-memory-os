@@ -1105,8 +1105,18 @@ impl KernelComposition {
                 }
             };
             // Issue #1837: durable audit evidence for the routing decision.
+            // Issue #1839 (I16.4 capability discovery/probe/admission): the
+            // requested capability was probed against the daemon-claimable
+            // lanes; a discovered lane records discovery plus admission.
+            self.audit_observe(AuditEventDraft::capability_probe(envelope));
             if let Some(lane) = routed_lane {
                 self.audit_observe(AuditEventDraft::route_invoke_read_routed(
+                    envelope, &receipt, lane,
+                ));
+                self.audit_observe(AuditEventDraft::capability_lane_discovered(
+                    envelope, &receipt, lane,
+                ));
+                self.audit_observe(AuditEventDraft::capability_admission(
                     envelope, &receipt, lane,
                 ));
             } else if let Some(reason) = mismatch_reason {
@@ -2915,6 +2925,14 @@ impl KernelComposition {
             observation.presented_attempt_id,
             observation.presented_generation,
             retired,
+        ));
+        // Issue #1839 (I16.4 capability expiry): the fenced capability
+        // bound to the claim expired with the same absolute deadline.
+        self.audit_observe(AuditEventDraft::capability_expiry(
+            observation.session,
+            observation.stored,
+            observation.lane,
+            observation.phase,
         ));
         Err(TransportError::Timeout)
     }

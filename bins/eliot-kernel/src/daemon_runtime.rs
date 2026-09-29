@@ -325,11 +325,24 @@ impl KernelComposition {
                 self.close_restarted_daemon_descendant(gateway, &owner, receipt)
                     .await
             }
+            ProcessLifecycle::Quarantined => {
+                // Issue #1839 (I16.4 quarantine): the previous lineage is
+                // fenced for manual recovery, so restart recovery refuses it
+                // instead of adopting a quarantined process.
+                self.audit_observe(AuditEventDraft::process_daemon_status(
+                    AuditEventKind::PROCESS_QUARANTINED,
+                    Some(receipt),
+                    "previous_process_quarantined:restart_refused",
+                    self.current_state_fence().as_ref(),
+                ));
+                Err(KernelBuildError::Service(
+                    "eliotd previous process is quarantined for manual recovery".to_owned(),
+                ))
+            }
             ProcessLifecycle::Created
             | ProcessLifecycle::Starting
             | ProcessLifecycle::Cancelling
-            | ProcessLifecycle::UnknownOutcome
-            | ProcessLifecycle::Quarantined => Err(KernelBuildError::Service(
+            | ProcessLifecycle::UnknownOutcome => Err(KernelBuildError::Service(
                 "eliotd previous process is not in a known terminal state".to_owned(),
             )),
         }
@@ -537,6 +550,17 @@ impl KernelComposition {
         let attempt = self.daemon_recovery_attempts.fetch_add(1, Ordering::AcqRel);
         if attempt >= ELIOTD_MAX_RECOVERY_ATTEMPTS {
             let reason = "eliotd bounded recovery budget is exhausted".to_owned();
+            // Issue #1839 (I16.4 restart-intensity exhaustion): the bounded
+            // recovery budget admitted no further restart for this lineage.
+            let detail = format!(
+                "recovery_budget_exhausted:attempt={attempt}:maximum={ELIOTD_MAX_RECOVERY_ATTEMPTS}"
+            );
+            self.audit_observe(AuditEventDraft::process_daemon_status(
+                AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED,
+                previous_receipt.as_ref(),
+                &detail,
+                self.current_state_fence().as_ref(),
+            ));
             return Err(self.daemon_failure_error(reason));
         }
         if let Some(receipt) = previous_receipt.as_ref() {
@@ -594,6 +618,19 @@ impl KernelComposition {
         };
         self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
             .await?;
+        // Issue #1839 (I16.4 restart): the recovered generation restarted
+        // after its previous process closed; the launch commit itself stays
+        // on `process.launch_committed`.
+        let detail = format!(
+            "recovered_generation={}",
+            launched.accepted_generation().get()
+        );
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_RESTARTED,
+            Some(&launched),
+            &detail,
+            self.current_state_fence().as_ref(),
+        ));
         Ok(launched)
     }
 
@@ -776,6 +813,14 @@ impl KernelComposition {
         // Issue #1837: durable audit evidence for process lifecycle.
         self.audit_observe(AuditEventDraft::process_daemon_status(
             AuditEventKind::PROCESS_FAILED,
+            receipt.as_ref(),
+            reason,
+            self.current_state_fence().as_ref(),
+        ));
+        // Issue #1839 (I16.4 crash): the same observed failure is a crash
+        // transition, distinct from the failure disposition above.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_CRASHED,
             receipt.as_ref(),
             reason,
             self.current_state_fence().as_ref(),

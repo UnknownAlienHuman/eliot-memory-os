@@ -367,6 +367,18 @@ impl AuditEventKind {
     /// A requested route diverged from the actual serving lane and the work
     /// was rejected without queueing or binding (issue #1839).
     pub const ROUTE_MISMATCH: &'static str = "route.mismatch";
+    /// A serving lane was discovered for one requested capability (issue
+    /// #1839; I16.4 capability discovery).
+    pub const CAPABILITY_DISCOVERY: &'static str = "capability.discovery";
+    /// One requested capability was probed against the daemon-claimable
+    /// lanes (issue #1839; I16.4 capability probe).
+    pub const CAPABILITY_PROBE: &'static str = "capability.probe";
+    /// One requested capability was admitted into its serving lane queue
+    /// (issue #1839; I16.4 capability admission).
+    pub const CAPABILITY_ADMISSION: &'static str = "capability.admission";
+    /// The fenced capability bound to one claim expired with its absolute
+    /// deadline (issue #1839; I16.4 capability expiry).
+    pub const CAPABILITY_EXPIRY: &'static str = "capability.expiry";
     /// First governed claim minted a fencing lease for one pair.
     pub const LEASE_CLAIM_CREATED: &'static str = "lease.claim_created";
     /// Same-owner re-claim returned the identical current capability.
@@ -439,6 +451,26 @@ impl AuditEventKind {
     pub const PROCESS_FAILED: &'static str = "process.failed";
     /// The descendant-closure receipt observed for one launched child.
     pub const PROCESS_DESCENDANT_CLOSED: &'static str = "process.descendant_closed";
+    /// Daemon admissions quiesced ahead of drain/stop (issue #1839; I16.4
+    /// quiesce).
+    pub const PROCESS_QUIESCED: &'static str = "process.quiesced";
+    /// One supervised daemon process stopped at its shutdown terminal
+    /// (issue #1839; I16.4 stop).
+    pub const PROCESS_STOPPED: &'static str = "process.stopped";
+    /// An authenticated daemon crash was observed (issue #1839; I16.4
+    /// crash).
+    pub const PROCESS_CRASHED: &'static str = "process.crashed";
+    /// One supervised daemon generation restarted after recovery (issue
+    /// #1839; I16.4 restart).
+    pub const PROCESS_RESTARTED: &'static str = "process.restarted";
+    /// The bounded daemon recovery budget was exhausted, so no further
+    /// restart is admitted (issue #1839; I16.4 restart-intensity
+    /// exhaustion).
+    pub const PROCESS_RESTART_INTENSITY_EXHAUSTED: &'static str =
+        "process.restart_intensity_exhausted";
+    /// One daemon lineage was quarantined for manual recovery (issue #1839;
+    /// I16.4 quarantine).
+    pub const PROCESS_QUARANTINED: &'static str = "process.quarantined";
     /// Ordered safe shutdown was requested.
     pub const SHUTDOWN_DRAIN_REQUESTED: &'static str = "shutdown.drain_requested";
     /// The drain commit decision linearized.
@@ -453,6 +485,10 @@ impl AuditEventKind {
         Self::QUEUE_LOCAL_READ_ENQUEUED,
         Self::ROUTE_INVOKE_READ_ROUTED,
         Self::ROUTE_MISMATCH,
+        Self::CAPABILITY_DISCOVERY,
+        Self::CAPABILITY_PROBE,
+        Self::CAPABILITY_ADMISSION,
+        Self::CAPABILITY_EXPIRY,
         Self::LEASE_CLAIM_CREATED,
         Self::LEASE_CLAIM_RECONFIRMED,
         Self::LEASE_CLAIM_REASSIGNED,
@@ -485,6 +521,12 @@ impl AuditEventKind {
         Self::PROCESS_DEGRADED,
         Self::PROCESS_FAILED,
         Self::PROCESS_DESCENDANT_CLOSED,
+        Self::PROCESS_QUIESCED,
+        Self::PROCESS_STOPPED,
+        Self::PROCESS_CRASHED,
+        Self::PROCESS_RESTARTED,
+        Self::PROCESS_RESTART_INTENSITY_EXHAUSTED,
+        Self::PROCESS_QUARANTINED,
         Self::SHUTDOWN_DRAIN_REQUESTED,
         Self::SHUTDOWN_DRAIN_COMMITTED,
         Self::SHUTDOWN_TERMINAL_PUBLISHED,
@@ -529,6 +571,9 @@ impl AuditEventKind {
             | Self::CANCEL_CONFIRMED
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
+            | Self::PROCESS_CRASHED
+            | Self::PROCESS_RESTART_INTENSITY_EXHAUSTED
+            | Self::PROCESS_QUARANTINED
             | Self::SHUTDOWN_DRAIN_REQUESTED
             | Self::SHUTDOWN_DRAIN_COMMITTED
             | Self::SHUTDOWN_TERMINAL_PUBLISHED => AuditAssuranceClass::Critical,
@@ -1082,6 +1127,111 @@ impl AuditEventDraft {
                 "requested_route": stored.capability_ref.as_str(),
                 "actual_lane": lane,
                 "disposition": "rejected_submit_refused",
+            }),
+        }
+    }
+
+    /// Returns the capability-probe draft for one admitted invoke-read
+    /// (issue #1839; I16.4 capability probe).
+    ///
+    /// The requested capability was probed against the daemon-claimable
+    /// lanes; whether a lane was discovered and the capability admitted is
+    /// recorded by the discovery/admission drafts, so a probe with no
+    /// follow-up is itself evidence of a rejected capability.
+    #[must_use]
+    pub fn capability_probe(envelope: &HostRequestEnvelope) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::CAPABILITY_PROBE,
+            lineage,
+            body: serde_json::json!({
+                "requested_capability": envelope.identity.capability,
+                "disposition": "probed",
+            }),
+        }
+    }
+
+    /// Returns the capability-discovery draft for one routed invoke-read
+    /// (issue #1839; I16.4 capability discovery).
+    ///
+    /// A serving lane was discovered for the requested capability; the
+    /// queue admission itself is recorded by the admission draft.
+    #[must_use]
+    pub fn capability_lane_discovered(
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+        lane: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        lineage.fill_route_receipt_actual(&receipt.receipt_sha256);
+        Self {
+            kind: AuditEventKind::CAPABILITY_DISCOVERY,
+            lineage,
+            body: serde_json::json!({
+                "requested_capability": envelope.identity.capability,
+                "discovered_lane": lane,
+                "receipt_sha256": receipt.receipt_sha256,
+            }),
+        }
+    }
+
+    /// Returns the capability-admission draft for one queued invoke-read
+    /// (issue #1839; I16.4 capability admission).
+    ///
+    /// The requested capability was admitted into its discovered serving
+    /// lane queue under the admission receipt.
+    #[must_use]
+    pub fn capability_admission(
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+        lane: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        lineage.fill_route_receipt_actual(&receipt.receipt_sha256);
+        Self {
+            kind: AuditEventKind::CAPABILITY_ADMISSION,
+            lineage,
+            body: serde_json::json!({
+                "requested_capability": envelope.identity.capability,
+                "actual_lane": lane,
+                "receipt_sha256": receipt.receipt_sha256,
+                "disposition": "admitted_queued",
+            }),
+        }
+    }
+
+    /// Returns the capability-expiry draft for one deadline-passed claim
+    /// (issue #1839; I16.4 capability expiry).
+    ///
+    /// The fenced attempt capability bound to the claim expired with its
+    /// absolute deadline; `phase` names the route leg that detected the
+    /// expiry (`admission`, `submit`, or `defer`), matching the paired
+    /// lease-expiry record.
+    #[must_use]
+    pub fn capability_expiry(
+        session: Option<&Session>,
+        stored: &HostRequestRecord,
+        lane: &'static str,
+        phase: &'static str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_stored(stored);
+        if let Some(session) = session {
+            lineage.fill_daemon_leg(session);
+        }
+        Self {
+            kind: AuditEventKind::CAPABILITY_EXPIRY,
+            lineage,
+            body: serde_json::json!({
+                "capability": stored.capability_ref.as_str(),
+                "lane": lane,
+                "phase": phase,
+                "request_digest": stored.request_digest,
+                "deadline_unix_ms": stored.deadline_unix_ms,
+                "durable_state": format!("{:?}", stored.state),
             }),
         }
     }
