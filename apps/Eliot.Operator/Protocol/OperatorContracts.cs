@@ -82,6 +82,37 @@ public static class OperatorProtocol
     public const int MaxPageCollections = 512;
 }
 
+/// The exact closed projection vocabulary the owner admits on
+/// `eliot_operator_query` (`OperatorProjectionKind` in
+/// `crates/eliot-types/src/cognition.rs`, snake_case serde; same 13 values
+/// in the `projection` enum of `crates/eliot-app/src/mcp_stdio/catalog.rs`).
+/// `user_automation` is deliberately absent: it owns a typed command route
+/// but no canonical listing projection, so a page tag naming it must never
+/// be sent as a query projection. The query path refuses anything outside
+/// this set before a byte is written to the pipe.
+public static class OperatorProjectionNames
+{
+    private static readonly string[] Admitted =
+    [
+        "overview",
+        "tasks_work",
+        "task_cognition",
+        "memory_explorer",
+        "causal_provenance",
+        "schema_contracts",
+        "query_lab",
+        "experience_skills",
+        "sleep_meta",
+        "agents_routing",
+        "autonomy",
+        "approvals",
+        "timeline_operations"
+    ];
+
+    public static bool IsAdmittedProjection(string? projection) =>
+        projection is not null && Admitted.Contains(projection, StringComparer.Ordinal);
+}
+
 /// One closed serializer profile for every Operator surface. `Web` defaults
 /// alone leave three surfaces open, so they are closed explicitly here:
 /// unmapped members are refused instead of silently ignored, duplicate names

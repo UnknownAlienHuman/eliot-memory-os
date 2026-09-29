@@ -64,6 +64,14 @@ public sealed partial class MainWindow : Window
 
     private async void Refresh_OnClick(object sender, RoutedEventArgs e) => await RefreshProjectionAsync();
     private void Cancel_OnClick(object sender, RoutedEventArgs e) => ViewModel.CancelActiveRequest();
+
+    private void CancelAccelerator_OnInvoked(
+        KeyboardAccelerator sender,
+        KeyboardAcceleratorInvokedEventArgs args)
+    {
+        ViewModel.CancelActiveRequest();
+        args.Handled = true;
+    }
     private async void ApplyFilter_OnClick(object sender, RoutedEventArgs e) => await RefreshProjectionAsync();
     private void SaveFilter_OnClick(object sender, RoutedEventArgs e) => ViewModel.SaveCurrentFilter();
 

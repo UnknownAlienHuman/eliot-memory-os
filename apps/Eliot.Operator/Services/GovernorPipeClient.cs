@@ -203,9 +203,17 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     }
 
     /// The page request is bounded locally: an unbounded page size or cursor
-    /// never leaves the UI.
+    /// never leaves the UI, and a projection outside the owner-admitted
+    /// vocabulary never reaches the wire. The page tag and the query
+    /// projection share one string type, so a tag without an owner
+    /// projection (notably `user_automation`) is refused here rather than
+    /// failing later as an owner rejection.
     private static void RequireBoundedPageRequest(OperatorQueryRequest request)
     {
+        if (!OperatorProjectionNames.IsAdmittedProjection(request.Projection))
+        {
+            throw new OperatorProtocolException("query_request", "projection_not_admitted");
+        }
         if (request.PageSize is < OperatorProtocol.MinPageSize or > OperatorProtocol.MaxPageSize)
         {
             throw new OperatorProtocolException("query_request", "page_size_cap");
