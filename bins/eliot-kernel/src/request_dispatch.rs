@@ -1936,10 +1936,23 @@ enum PriorVerification {
 /// trade is taken deliberately, and for the fact that the successor path has no
 /// operator surface today.
 ///
-/// What the pair is NOT is an owner-issued capability: nothing here proves the
-/// owner would have authorised THIS caller to reconcile THAT operation, because
+/// The pair is a POINTER, never an authorization on its own: both halves were
+/// already on the wire in the predecessor's own `ok` reply, so their shape and
+/// even their value prove nothing by themselves. What authorizes the
+/// reconciliation is [`owner_reproves_predecessor_operation`] — the capture
+/// owner, re-deciding the presented bytes on this call, must land on exactly the
+/// operation the named row holds — together with the scope, lineage and
+/// principal joins. The pair selects WHICH row is read; the owner decides
+/// whether that row is the operation the caller is reconciling.
+///
+/// What the pair still is NOT is an owner-ISSUED, one-shot succession capability:
 /// no owner issues a backup-verify succession or reconciliation receipt on this
-/// product. That owner is `backup-capture-owner (#959)`, which is OPEN.
+/// product, so there is no due time and no single-use consumption, and a holder
+/// of the pair may reconcile the same operation again. That residual belongs to
+/// `backup-capture-owner (#959)`, which is OPEN. It is a narrower claim than
+/// "the owner did not authorise this reconciliation": the owner does re-prove
+/// that the reconciled operation IS the named operation, and it does so over the
+/// whole archive content, not over a correlation the caller chose.
 struct VerifySuccessorEvidence {
     /// The predecessor operation's durable namespace key.
     predecessor_namespace_digest: String,
