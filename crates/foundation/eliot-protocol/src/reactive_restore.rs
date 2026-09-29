@@ -99,7 +99,7 @@ pub struct ReactiveLedgerMutationReply {
     /// Exact committed ledger bytes read back from the canonical owner.
     pub ledger_json: String,
     /// Store-issued receipt envelope proving the write outcome.
-    pub receipt: eliot_contracts::ReceiptEnvelope,
+    pub receipt: eliot_receipts::ReceiptEnvelope,
     /// True when the same operation identity was already committed.
     pub replayed: bool,
 }
